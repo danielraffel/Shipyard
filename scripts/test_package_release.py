@@ -218,6 +218,38 @@ class PackageReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "companion binary"):
                 package_release.package(args)
 
+    def test_packaging_rejects_semantic_version_mismatch_before_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary = root / "shipyard"
+            binary.write_text("#!/bin/sh\necho 'shipyard 0.127.0'\n", encoding="utf-8")
+            binary.chmod(0o755)
+            companion = root / "shipyard-workstream-provider"
+            companion.write_text(
+                "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.1'\n",
+                encoding="utf-8",
+            )
+            companion.chmod(0o755)
+            dist = root / "dist"
+            args = package_release.parse_args(
+                [
+                    "--skip-build",
+                    "--binary",
+                    str(binary),
+                    "--companion-binary",
+                    str(companion),
+                    "--target",
+                    "linux-x64",
+                    "--dist-dir",
+                    str(dist),
+                ]
+            )
+
+            with self.assertRaisesRegex(SystemExit, "version mismatch"):
+                package_release.package(args)
+
+            self.assertFalse(dist.exists())
+
     def test_signed_dmg_stages_and_signs_both_binaries(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

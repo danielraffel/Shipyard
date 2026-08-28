@@ -162,6 +162,11 @@ job imports a Developer ID identity into an ephemeral keychain, resolves
 the identity by Team ID, and runs `scripts/release-macos-local.sh
 --ci-mode --upload`.
 
+`--ci-mode` does not weaken publication closure: an upload still requires the
+DMG to mount and launch both binaries, the full Linux/Windows/macOS asset set
+and checksum entries to be visible, and the public installer E2E to pass. Any
+failure re-drafts the release, including one that was already public.
+
 Required CI secret names:
 
 | Secret | What |

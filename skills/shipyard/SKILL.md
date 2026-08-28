@@ -1440,6 +1440,10 @@ The v0.127.0+ installer manages `shipyard` and
 `shipyard-workstream-provider` as one version-matched pair. A partial install
 must be reported without an implicit plugin upgrade, and rollback to an older
 tag must remove the provider introduced by the newer release.
+The pair is valid only when both launch from the same install directory and
+report the exact same parsed semantic version. Installer replacement and
+pre-provider rollback are transactions: preserve and restore both old binaries
+and the alias on any move, remove, or post-move smoke failure.
 
 ### CI routing profiles
 

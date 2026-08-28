@@ -63,13 +63,6 @@ if [ -z "$MIN_VERSION" ]; then
   exit 0
 fi
 
-INSTALLED=$(shipyard --version 2>/dev/null | awk 'NF{print $NF}' | head -1 | sed 's/^v//')
-if [ -z "$INSTALLED" ]; then
-  exit 0
-fi
-
-MIN_CMP="${MIN_VERSION#v}"
-
 # Pure-shell version compare via sort -V. If MIN_CMP sorts first or
 # is equal to INSTALLED, installed is >= min (no action).
 version_gte() {
@@ -78,10 +71,51 @@ version_gte() {
     [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]
 }
 
-if version_gte "$INSTALLED" "0.127.0" \
-    && ! command -v shipyard-workstream-provider &>/dev/null; then
+binary_semver() {
+  binary="$1"
+  label="$2"
+  output="$("$binary" --version 2>/dev/null)" || return 1
+  printf '%s\n' "$output" | awk -v expected="$label" '
+    NR == 1 && NF == 2 && $1 == expected {
+      version = $2
+      sub(/^v/, "", version)
+      if (version ~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/) {
+        parsed = version
+      }
+    }
+    NR > 1 { invalid = 1 }
+    END { if (!invalid && parsed != "") print parsed }
+  '
+}
+
+CLI_PATH="$(command -v shipyard)"
+INSTALLED="$(binary_semver "$CLI_PATH" shipyard)" || INSTALLED=""
+if [ -z "$INSTALLED" ]; then
+  exit 0
+fi
+
+MIN_CMP="${MIN_VERSION#v}"
+
+PAIR_PROBLEM=""
+if version_gte "$INSTALLED" "0.127.0"; then
+  CLI_DIR="$(dirname "$CLI_PATH")"
+  PROVIDER_PATH="${CLI_DIR}/shipyard-workstream-provider"
+  if [ ! -x "$PROVIDER_PATH" ]; then
+    PAIR_PROBLEM="same-directory executable shipyard-workstream-provider is missing"
+  else
+    PROVIDER_VERSION="$(binary_semver \
+      "$PROVIDER_PATH" shipyard-workstream-provider)" || PROVIDER_VERSION=""
+    if [ -z "$PROVIDER_VERSION" ]; then
+      PAIR_PROBLEM="same-directory shipyard-workstream-provider is not launchable"
+    elif [ "$PROVIDER_VERSION" != "$INSTALLED" ]; then
+      PAIR_PROBLEM="binary versions differ (shipyard=${INSTALLED}, provider=${PROVIDER_VERSION})"
+    fi
+  fi
+fi
+
+if [ -n "$PAIR_PROBLEM" ]; then
   echo ""
-  echo "[Shipyard] Installation is incomplete: shipyard-workstream-provider is missing."
+  echo "[Shipyard] Installation is incomplete: ${PAIR_PROBLEM}."
   echo "[Shipyard] Re-run your normal installer or project pin repair; the plugin will not surprise-upgrade an existing CLI."
   echo ""
 fi

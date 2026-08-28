@@ -10,7 +10,6 @@ set -euo pipefail
 #   SHIPYARD_CURL_BIN         Absolute curl binary selected by the updater
 #   SHIPYARD_DRY_RUN          Print resolved settings and exit
 #   SHIPYARD_SKIP_DOWNLOAD    Reuse an existing binary in install dir
-#   SHIPYARD_SKIP_SMOKE       Skip post-install --version smoke
 #   SHIPYARD_REPO             Override release repo
 #   SHIPYARD_GITHUB_TOKEN     Optional token for private release repos
 
@@ -189,17 +188,18 @@ prepare_macos_binary() {
 smoke_binary_or_repair() {
     binary="$1"
     binary_label="$2"
-    if [ "${SHIPYARD_SKIP_SMOKE:-0}" = "1" ]; then
-        return 0
-    fi
-    if "${binary}" --version >/dev/null 2>&1; then
+    version="$(binary_semver "${binary}" "${binary_label}")" || version=""
+    if [ -n "${version}" ]; then
+        printf '%s\n' "${version}"
         return 0
     fi
     if [ "${OS}" = "macos" ]; then
         xattr -d com.apple.provenance "${binary}" 2>/dev/null || true
         sleep 1
     fi
-    if "${binary}" --version >/dev/null 2>&1; then
+    version="$(binary_semver "${binary}" "${binary_label}")" || version=""
+    if [ -n "${version}" ]; then
+        printf '%s\n' "${version}"
         return 0
     fi
     if [ "${OS}" = "macos" ] \
@@ -213,11 +213,30 @@ smoke_binary_or_repair() {
             codesign --force --sign - "${binary}" 2>/dev/null || true
         fi
     fi
-    if ! "${binary}" --version >/dev/null 2>&1; then
+    version="$(binary_semver "${binary}" "${binary_label}")" || version=""
+    if [ -z "${version}" ]; then
         echo "ERROR: ${binary_label} installed but failed post-install smoke." >&2
-        echo "Run '${binary} --version' manually for details." >&2
+        echo "Expected '${binary_label} <semantic-version>' from '${binary} --version'." >&2
         exit 1
     fi
+    printf '%s\n' "${version}"
+}
+
+binary_semver() {
+    binary="$1"
+    binary_label="$2"
+    output="$("${binary}" --version 2>/dev/null)" || return 1
+    printf '%s\n' "${output}" | awk -v label="${binary_label}" '
+        NR == 1 && NF == 2 && $1 == label {
+            version = $2
+            sub(/^v/, "", version)
+            if (version ~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/) {
+                parsed = version
+            }
+        }
+        NR > 1 { invalid = 1 }
+        END { if (!invalid && parsed != "") print parsed }
+    '
 }
 
 DMG_URL=""
@@ -308,7 +327,42 @@ DEST="${INSTALL_DIR}/${BINARY_NAME}"
 STAGED_DEST="${INSTALL_DIR}/.${BINARY_NAME}.install.$$"
 PROVIDER_DEST="${INSTALL_DIR}/${PROVIDER_BINARY_NAME}"
 STAGED_PROVIDER_DEST="${INSTALL_DIR}/.${PROVIDER_BINARY_NAME}.install.$$"
-trap 'rm -f "${STAGED_DEST:-}" "${STAGED_PROVIDER_DEST:-}"' EXIT
+BACKUP_DEST="${INSTALL_DIR}/.${BINARY_NAME}.backup.$$"
+BACKUP_PROVIDER_DEST="${INSTALL_DIR}/.${PROVIDER_BINARY_NAME}.backup.$$"
+BACKUP_ALIAS="${INSTALL_DIR}/.${ALIAS_NAME}.backup.$$"
+TRANSACTION_ACTIVE=0
+HAD_DEST=0
+HAD_PROVIDER_DEST=0
+HAD_ALIAS=0
+
+cleanup_install_transaction() {
+    status=$?
+    set +e
+    if [ "${TRANSACTION_ACTIVE}" = "1" ]; then
+        if [ -e "${BACKUP_DEST}" ] || [ -L "${BACKUP_DEST}" ]; then
+            rm -f "${DEST}"
+            mv -f "${BACKUP_DEST}" "${DEST}"
+        elif [ "${HAD_DEST}" = "0" ]; then
+            rm -f "${DEST}"
+        fi
+        if [ -e "${BACKUP_PROVIDER_DEST}" ] || [ -L "${BACKUP_PROVIDER_DEST}" ]; then
+            rm -f "${PROVIDER_DEST}"
+            mv -f "${BACKUP_PROVIDER_DEST}" "${PROVIDER_DEST}"
+        elif [ "${HAD_PROVIDER_DEST}" = "0" ]; then
+            rm -f "${PROVIDER_DEST}"
+        fi
+        if [ -e "${BACKUP_ALIAS}" ] || [ -L "${BACKUP_ALIAS}" ]; then
+            rm -f "${INSTALL_DIR}/${ALIAS_NAME}"
+            mv -f "${BACKUP_ALIAS}" "${INSTALL_DIR}/${ALIAS_NAME}"
+        elif [ "${HAD_ALIAS}" = "0" ]; then
+            rm -f "${INSTALL_DIR}/${ALIAS_NAME}"
+        fi
+    fi
+    rm -f "${STAGED_DEST}" "${STAGED_PROVIDER_DEST}" \
+        "${BACKUP_DEST}" "${BACKUP_PROVIDER_DEST}" "${BACKUP_ALIAS}"
+    exit "${status}"
+}
+trap cleanup_install_transaction EXIT
 if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" = "1" ]; then
     if [ ! -f "${DEST}" ]; then
         echo "SHIPYARD_SKIP_DOWNLOAD=1 but ${DEST} does not exist." >&2
@@ -368,10 +422,27 @@ if [ "${REQUIRE_PROVIDER}" = "1" ]; then
 fi
 
 prepare_macos_binary "${STAGED_DEST}"
-smoke_binary_or_repair "${STAGED_DEST}" "${BINARY_NAME}"
+STAGED_VERSION="$(smoke_binary_or_repair "${STAGED_DEST}" "${BINARY_NAME}")"
 if [ "${REQUIRE_PROVIDER}" = "1" ]; then
     prepare_macos_binary "${STAGED_PROVIDER_DEST}"
-    smoke_binary_or_repair "${STAGED_PROVIDER_DEST}" "${PROVIDER_BINARY_NAME}"
+    STAGED_PROVIDER_VERSION="$(smoke_binary_or_repair \
+        "${STAGED_PROVIDER_DEST}" "${PROVIDER_BINARY_NAME}")"
+    if [ "${STAGED_VERSION}" != "${STAGED_PROVIDER_VERSION}" ]; then
+        echo "ERROR: release binary version mismatch: ${BINARY_NAME}=${STAGED_VERSION} ${PROVIDER_BINARY_NAME}=${STAGED_PROVIDER_VERSION}." >&2
+        exit 1
+    fi
+fi
+
+if [ -e "${DEST}" ] || [ -L "${DEST}" ]; then HAD_DEST=1; fi
+if [ -e "${PROVIDER_DEST}" ] || [ -L "${PROVIDER_DEST}" ]; then HAD_PROVIDER_DEST=1; fi
+if [ -e "${INSTALL_DIR}/${ALIAS_NAME}" ] || [ -L "${INSTALL_DIR}/${ALIAS_NAME}" ]; then HAD_ALIAS=1; fi
+TRANSACTION_ACTIVE=1
+if [ "${HAD_DEST}" = "1" ]; then mv -f "${DEST}" "${BACKUP_DEST}"; fi
+if [ "${HAD_PROVIDER_DEST}" = "1" ]; then
+    mv -f "${PROVIDER_DEST}" "${BACKUP_PROVIDER_DEST}"
+fi
+if [ "${HAD_ALIAS}" = "1" ]; then
+    mv -f "${INSTALL_DIR}/${ALIAS_NAME}" "${BACKUP_ALIAS}"
 fi
 mv -f "${STAGED_DEST}" "${DEST}"
 if [ "${REQUIRE_PROVIDER}" = "1" ]; then
@@ -380,10 +451,17 @@ else
     rm -f "${PROVIDER_DEST}"
 fi
 ln -sf "${DEST}" "${INSTALL_DIR}/${ALIAS_NAME}"
-smoke_binary_or_repair "${DEST}" "${BINARY_NAME}"
+INSTALLED_VERSION="$(smoke_binary_or_repair "${DEST}" "${BINARY_NAME}")"
 if [ "${REQUIRE_PROVIDER}" = "1" ]; then
-    smoke_binary_or_repair "${PROVIDER_DEST}" "${PROVIDER_BINARY_NAME}"
+    INSTALLED_PROVIDER_VERSION="$(smoke_binary_or_repair \
+        "${PROVIDER_DEST}" "${PROVIDER_BINARY_NAME}")"
+    if [ "${INSTALLED_VERSION}" != "${INSTALLED_PROVIDER_VERSION}" ]; then
+        echo "ERROR: installed binary version mismatch: ${BINARY_NAME}=${INSTALLED_VERSION} ${PROVIDER_BINARY_NAME}=${INSTALLED_PROVIDER_VERSION}." >&2
+        exit 1
+    fi
 fi
+TRANSACTION_ACTIVE=0
+rm -f "${BACKUP_DEST}" "${BACKUP_PROVIDER_DEST}" "${BACKUP_ALIAS}"
 
 echo ""
 echo "Installed ${BINARY_NAME} to ${DEST}"

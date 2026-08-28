@@ -400,6 +400,9 @@ Shipyard releases from v0.127.0 onward are a binary pair. Keep the historical
 `shipyard-workstream-provider-<platform>` assets on Linux and Windows, and put
 both signed binaries in the single macOS DMG. Packaging and mounted-DMG smoke
 must run both `--version` probes before publication.
+Publication also requires exact pair-version equality, every Linux/Windows
+companion asset and checksum entry, plus a public installer E2E; `--ci-mode`
+cannot bypass these closure gates, and failure must re-draft the release.
 
 ### External contribution execution
 

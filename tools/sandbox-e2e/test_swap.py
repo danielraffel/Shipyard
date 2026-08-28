@@ -342,9 +342,12 @@ def test_install_script_skip_download_preserves_production_binary_names(
     install_dir = sandbox.home_dir / "install-bin"
     install_dir.mkdir()
     shutil.copy2(sandbox.binary_path, install_dir / BINARY_NAME)
+    cli_version = subprocess.check_output(
+        [str(sandbox.binary_path), "--version"], text=True
+    ).split()[-1]
     provider = install_dir / "shipyard-workstream-provider"
     provider.write_text(
-        "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.0'\n",
+        f"#!/bin/sh\necho 'shipyard-workstream-provider {cli_version}'\n",
         encoding="utf-8",
     )
     provider.chmod(0o755)
@@ -426,10 +429,13 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
         "  esac\n"
         "done\n"
         "if [ -n \"$out\" ]; then\n"
+        "  label='shipyard'\n"
+        "  case \"$out\" in *workstream-provider*) label='shipyard-workstream-provider' ;; esac\n"
         "  cat > \"$out\" <<'SCRIPT'\n"
         "#!/bin/sh\n"
-        "echo 'shipyard 9.9.9'\n"
+        "echo \"__LABEL__ 9.9.9\"\n"
         "SCRIPT\n"
+        "  sed -i.bak \"s/__LABEL__/$label/\" \"$out\" && rm -f \"$out.bak\"\n"
         "  exit 0\n"
         "fi\n"
         "cat <<'JSON'\n"
@@ -466,6 +472,204 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
     assert not list(install_dir.glob(f".{BINARY_NAME}.install.*"))
     assert (install_dir / "shipyard-workstream-provider").exists()
     assert not list(install_dir.glob(".shipyard-workstream-provider.install.*"))
+
+
+@pytest.mark.installer
+def test_install_script_rejects_mismatched_pair_before_mutation(
+    sandbox: Sandbox,
+) -> None:
+    install_dir = sandbox.home_dir / "install-bin-mismatch"
+    install_dir.mkdir()
+    binary = install_dir / BINARY_NAME
+    binary.write_text("#!/bin/sh\necho 'shipyard 0.127.0'\n", encoding="utf-8")
+    binary.chmod(0o755)
+    provider = install_dir / "shipyard-workstream-provider"
+    provider.write_text(
+        "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.1'\n",
+        encoding="utf-8",
+    )
+    provider.chmod(0o755)
+    original_binary = binary.read_bytes()
+    original_provider = provider.read_bytes()
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "install.sh")],
+        cwd=sandbox.work_dir,
+        env={
+            "HOME": str(sandbox.home_dir),
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_SKIP_DOWNLOAD": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "version mismatch" in result.stderr
+    assert binary.read_bytes() == original_binary
+    assert provider.read_bytes() == original_provider
+
+
+@pytest.mark.installer
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX command fakes")
+def test_install_script_restores_pair_when_second_move_fails(
+    sandbox: Sandbox,
+) -> None:
+    install_dir = sandbox.home_dir / "install-bin-second-move"
+    install_dir.mkdir()
+    binary = install_dir / BINARY_NAME
+    provider = install_dir / "shipyard-workstream-provider"
+    binary.write_text("#!/bin/sh\necho 'shipyard 0.127.0'\n# old-cli\n", encoding="utf-8")
+    provider.write_text(
+        "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.0'\n# old-provider\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    provider.chmod(0o755)
+    alias = install_dir / "sy"
+    alias.symlink_to("old-target")
+    original_binary = binary.read_bytes()
+    original_provider = provider.read_bytes()
+    marker = sandbox.work_dir / "mv-failed"
+    fake_mv = sandbox.bin_dir / "mv"
+    fake_mv.write_text(
+        "#!/bin/sh\n"
+        "older=''\nprevious=''\n"
+        "for arg in \"$@\"; do older=\"$previous\"; previous=\"$arg\"; done\n"
+        f"if echo \"$older\" | grep -q 'workstream-provider.install' && [ ! -f '{marker}' ]; then\n"
+        f"  touch '{marker}'\n  exit 73\nfi\n"
+        "exec /bin/mv \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_mv.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "install.sh")],
+        cwd=sandbox.work_dir,
+        env={
+            "HOME": str(sandbox.home_dir),
+            "PATH": f"{sandbox.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_SKIP_DOWNLOAD": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert binary.read_bytes() == original_binary
+    assert provider.read_bytes() == original_provider
+    assert alias.is_symlink() and str(alias.readlink()) == "old-target"
+
+
+@pytest.mark.installer
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX command fakes")
+def test_install_script_restores_pair_when_rollback_remove_fails(
+    sandbox: Sandbox,
+) -> None:
+    install_dir = sandbox.home_dir / "install-bin-remove-failure"
+    install_dir.mkdir()
+    binary = install_dir / BINARY_NAME
+    provider = install_dir / "shipyard-workstream-provider"
+    shutil.copy2(sandbox.binary_path, binary)
+    provider.write_text("old-provider\n", encoding="utf-8")
+    original_binary = binary.read_bytes()
+    original_provider = provider.read_bytes()
+    marker = sandbox.work_dir / "rm-failed"
+    fake_rm = sandbox.bin_dir / "rm"
+    fake_rm.write_text(
+        "#!/bin/sh\n"
+        "last=''\nfor arg in \"$@\"; do last=\"$arg\"; done\n"
+        f"if [ \"$last\" = '{provider}' ] && [ ! -f '{marker}' ]; then\n"
+        f"  touch '{marker}'\n  exit 74\nfi\n"
+        "exec /bin/rm \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_rm.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "install.sh")],
+        cwd=sandbox.work_dir,
+        env={
+            "HOME": str(sandbox.home_dir),
+            "PATH": f"{sandbox.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_SKIP_DOWNLOAD": "1",
+            "SHIPYARD_VERSION": "v0.126.2",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert binary.read_bytes() == original_binary
+    assert provider.read_bytes() == original_provider
+
+
+@pytest.mark.installer
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX shell fakes")
+def test_install_script_restores_pair_when_post_move_smoke_fails(
+    sandbox: Sandbox,
+) -> None:
+    install_dir = sandbox.home_dir / "install-bin-post-smoke"
+    install_dir.mkdir()
+    binary = install_dir / BINARY_NAME
+    provider = install_dir / "shipyard-workstream-provider"
+    binary.write_text("#!/bin/sh\necho 'shipyard 0.126.9'\n", encoding="utf-8")
+    provider.write_text(
+        "#!/bin/sh\necho 'shipyard-workstream-provider 0.126.9'\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    provider.chmod(0o755)
+    original_binary = binary.read_bytes()
+    original_provider = provider.read_bytes()
+    fake_curl = sandbox.bin_dir / "curl"
+    fake_curl.write_text(
+        "#!/bin/sh\n"
+        "out=''\nwrite_out=0\n"
+        "while [ \"$#\" -gt 0 ]; do\n"
+        "  case \"$1\" in -o) out=\"$2\"; shift 2 ;; -w) write_out=1; shift 2 ;; -*) shift ;; *) shift ;; esac\n"
+        "done\n"
+        "if [ -n \"$out\" ]; then\n"
+        "  if echo \"$out\" | grep -q 'workstream-provider'; then\n"
+        "    cat > \"$out\" <<'SCRIPT'\n#!/bin/sh\n"
+        "case \"$0\" in *.install.*) echo 'shipyard-workstream-provider 0.127.0' ;; *) exit 9 ;; esac\nSCRIPT\n"
+        "  else\n"
+        "    printf '%s\n' '#!/bin/sh' \"echo 'shipyard 0.127.0'\" > \"$out\"\n"
+        "  fi\n  exit 0\nfi\n"
+        "cat <<'JSON'\n"
+        "{\"assets\":[{\"name\":\"shipyard-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-linux-arm64\"},{\"name\":\"shipyard-workstream-provider-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-workstream-provider-linux-arm64\"}]}\n"
+        "JSON\n"
+        "if [ \"$write_out\" -eq 1 ]; then printf '200\n'; fi\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "install.sh")],
+        cwd=sandbox.work_dir,
+        env={
+            "HOME": str(sandbox.home_dir),
+            "PATH": f"{sandbox.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_CURL_BIN": str(fake_curl),
+            "SHIPYARD_VERSION": "v0.127.0",
+            "SHIPYARD_INSTALL_TEST_UNAME_S": "Linux",
+            "SHIPYARD_INSTALL_TEST_UNAME_M": "aarch64",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert binary.read_bytes() == original_binary
+    assert provider.read_bytes() == original_provider
 
 
 @pytest.mark.installer

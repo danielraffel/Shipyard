@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import os
 import platform
+import re
 import secrets
 import shlex
 import shutil
@@ -22,6 +23,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DIST_DIR = ROOT / "dist" / "release"
 BIN_NAME = "shipyard"
 COMPANION_BIN_NAME = "shipyard-workstream-provider"
+SEMVER_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
 NOTARY_WAIT_TIMEOUT = "45m"
 SENSITIVE_FLAGS = {"--password", "-p", "-P", "-k"}
 SENSITIVE_ENV_NAMES = (
@@ -261,9 +267,47 @@ def build_release(cargo_target: str | None) -> None:
 
 def smoke_binary(binary: Path, expected_name: str = BIN_NAME) -> str:
     output = run([str(binary), "--version"], capture=True)
-    if expected_name not in output:
-        raise SystemExit(f"Version smoke failed for {binary}: {output!r}")
+    parse_binary_version(output, expected_name, source=str(binary))
     return output
+
+
+def parse_binary_version(output: str, expected_name: str, *, source: str) -> str:
+    fields = output.split()
+    if len(fields) != 2 or fields[0] != expected_name:
+        raise SystemExit(f"Version smoke failed for {source}: {output!r}")
+    version = fields[1].removeprefix("v")
+    if not SEMVER_RE.fullmatch(version):
+        raise SystemExit(f"Invalid semantic version from {source}: {output!r}")
+    return version
+
+
+def require_matching_pair_versions(
+    primary_output: str, companion_output: str
+) -> None:
+    primary_version = parse_binary_version(
+        primary_output, BIN_NAME, source=BIN_NAME
+    )
+    companion_version = parse_binary_version(
+        companion_output, COMPANION_BIN_NAME, source=COMPANION_BIN_NAME
+    )
+    if primary_version != companion_version:
+        raise SystemExit(
+            "Release binary version mismatch: "
+            f"{BIN_NAME}={primary_version} "
+            f"{COMPANION_BIN_NAME}={companion_version}"
+        )
+
+
+def smoke_binary_pair(
+    primary: Path,
+    companion: Path,
+    primary_name: str = BIN_NAME,
+    companion_name: str = COMPANION_BIN_NAME,
+) -> str:
+    primary_output = smoke_binary(primary, primary_name)
+    companion_output = smoke_binary(companion, companion_name)
+    require_matching_pair_versions(primary_output, companion_output)
+    return f"{primary_output}\n{companion_output}"
 
 
 def sign_binary(path: Path) -> None:
@@ -538,7 +582,12 @@ def smoke_dmg(path: Path, binary_names: tuple[str, ...], *, ci_mode: bool) -> st
                 return f"DMG mount skipped in CI mode: {error}"
             raise
         try:
-            return "\n".join(smoke_binary(mount / name, name) for name in binary_names)
+            if len(binary_names) != 2:
+                raise SystemExit("DMG smoke requires the Shipyard binary pair")
+            return smoke_binary_pair(
+                mount / binary_names[0],
+                mount / binary_names[1],
+            )
         finally:
             subprocess.run(
                 ["hdiutil", "detach", str(mount)],
@@ -599,12 +648,7 @@ def package(args: argparse.Namespace) -> list[Path]:
         raise SystemExit(f"Built binary not found: {binary}")
     if not companion_binary.exists():
         raise SystemExit(f"Built companion binary not found: {companion_binary}")
-    smoke = "\n".join(
-        (
-            smoke_binary(binary, BIN_NAME),
-            smoke_binary(companion_binary, COMPANION_BIN_NAME),
-        )
-    )
+    smoke = smoke_binary_pair(binary, companion_binary)
 
     tag = args.tag or "dev"
     output_dir = args.dist_dir / tag
@@ -648,7 +692,7 @@ def package(args: argparse.Namespace) -> list[Path]:
                 verify_signing_probe()
                 sign_binary(artifact)
         if not args.no_smoke:
-            smoke = smoke_binary(artifact)
+            primary_smoke = smoke_binary(artifact)
         artifacts.append(artifact)
         companion_artifact = output_dir / artifact_filename(
             args.companion_artifact_prefix, target
@@ -659,9 +703,10 @@ def package(args: argparse.Namespace) -> list[Path]:
                 sign_binary(companion_artifact)
         if not args.no_smoke:
             companion_smoke = smoke_binary(
-                companion_artifact, args.companion_artifact_prefix
+                companion_artifact, COMPANION_BIN_NAME
             )
-            smoke = f"{smoke}\n{companion_smoke}"
+            require_matching_pair_versions(primary_smoke, companion_smoke)
+            smoke = f"{primary_smoke}\n{companion_smoke}"
         artifacts.append(companion_artifact)
 
     for artifact in artifacts:
