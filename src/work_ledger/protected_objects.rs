@@ -420,6 +420,25 @@ fn open_object_directory(
         .ok_or_else(|| WorkLedgerError::Refused("protected object directory is missing".to_owned()))
 }
 
+#[cfg(not(unix))]
+fn try_open_object_directory(
+    parent: &std::path::Path,
+    create: bool,
+) -> WorkLedgerResult<Option<std::fs::File>> {
+    match std::fs::symlink_metadata(parent.join(PROTECTED_OBJECT_DIRECTORY)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(WorkLedgerError::Refused(
+                "protected objects require no-follow file descriptors on this platform".to_owned(),
+            ))
+        }
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(WorkLedgerError::Refused(
+            "protected objects require no-follow file descriptors on this platform".to_owned(),
+        )),
+    }
+}
+
 #[cfg(unix)]
 fn verify_directory_binding(
     parent: &std::path::Path,

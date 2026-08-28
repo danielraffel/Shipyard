@@ -11,6 +11,28 @@ fn ledger_with_work() -> (TempDir, WorkLedger, String) {
     (temp, ledger, work_id)
 }
 
+#[cfg(not(unix))]
+#[test]
+fn unsupported_platform_allows_absent_storage_but_refuses_an_observed_directory() {
+    let (temp, ledger, _work_id) = ledger_with_work();
+    assert_eq!(
+        ledger.status().expect("absent storage").protected_objects,
+        0
+    );
+
+    fs::create_dir(temp.path().join("work-ledger/protected-objects"))
+        .expect("protected object directory fixture");
+    let error = ledger
+        .status()
+        .expect_err("observed storage must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("require no-follow file descriptors"),
+        "unexpected refusal: {error}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn protected_object_round_trip_is_exact_idempotent_and_profile_addressable() {
