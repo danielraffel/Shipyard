@@ -1672,6 +1672,11 @@ Reconcile resume records even when the authoritative terminal-handoff update is
 a no-op so legacy ledgers backfill on restart. Publish or roll back both maps as
 one crash-consistent ledger image, and keep `dispatch_enabled=false` until the
 outbox, acknowledgment, and physical canary gates are separately complete.
+For the ledger gate, prove all terminal outbox shapes reject a NULL receipt
+kind on a fresh database and after every supported legacy migration. Do not
+rely on `receipt_kind = 'value'` alone inside a SQLite CHECK: NULL makes the
+expression pass. Only unstarted lease expiry may requeue; any delivery-started
+expiry becomes uncertain and requires reconciliation before another attempt.
 
 **Detached daemon temp roots must not depend on the launching shell.** A daemon
 started from launchd or a minimal SSH environment may inherit no `TMPDIR`.

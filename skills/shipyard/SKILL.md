@@ -1295,6 +1295,17 @@ graph or cost evidence from check names.
 The future transactional wake API derives a deterministic wake ID from the
 complete work/owner generation and delivery fence; a caller-supplied identity
 that does not match that derivation is rejected before commit.
+Delivery is claimed with a bounded lease and exact adapter-generation fence.
+Only an unstarted expired claim may requeue; a started delivery expires to an
+uncertain terminal receipt and must never be retried automatically. Accepted,
+uncertain, definitive pre-delivery failure, and reconciled non-delivery
+receipts atomically record their typed receipt and work transition. Preserve
+the explicit `receipt_kind IS NOT NULL` terminal-state constraints in both the
+fresh schema and every legacy rebuild: SQLite treats a NULL CHECK expression as
+passing, so equality checks alone do not enforce a typed terminal receipt.
+Schema v1/v2 migrations may preserve only pending wakes and otherwise refuse
+for explicit reconciliation; migration and simulated rebuild failures must
+leave the old version and rows intact.
 The route must also resolve to a protected, integrity-valid record for the same
 exact head and generations. Terminal runtime (cmux or opted-in HerdR), agent
 session, and provider routing (explicit Direct, Subrouter, or CLIProxyAPI) are

@@ -289,7 +289,8 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
                AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
                AND claim_payload_json IS NOT NULL
                AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
-               AND delivery_started_at IS NOT NULL AND receipt_kind = 'accepted'
+               AND delivery_started_at IS NOT NULL
+               AND receipt_kind IS NOT NULL AND receipt_kind = 'accepted'
                AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
              OR
              (state = 'uncertain'
@@ -297,7 +298,8 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
                AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
                AND claim_payload_json IS NOT NULL
                AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
-               AND delivery_started_at IS NOT NULL AND receipt_kind = 'uncertain'
+               AND delivery_started_at IS NOT NULL
+               AND receipt_kind IS NOT NULL AND receipt_kind = 'uncertain'
                AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
              OR
              (state = 'failed'
@@ -305,6 +307,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
                AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
                AND claim_payload_json IS NOT NULL
                AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND receipt_kind IS NOT NULL
                AND ((delivery_started_at IS NULL
                      AND receipt_kind = 'definitive_pre_delivery_failure')
                     OR (delivery_started_at IS NOT NULL
@@ -416,7 +419,8 @@ fn upgrade_v2_outbox(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResul
                AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
                AND claim_payload_json IS NOT NULL
                AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
-               AND delivery_started_at IS NOT NULL AND receipt_kind = 'accepted'
+               AND delivery_started_at IS NOT NULL
+               AND receipt_kind IS NOT NULL AND receipt_kind = 'accepted'
                AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
              OR
              (state = 'uncertain'
@@ -424,7 +428,8 @@ fn upgrade_v2_outbox(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResul
                AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
                AND claim_payload_json IS NOT NULL
                AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
-               AND delivery_started_at IS NOT NULL AND receipt_kind = 'uncertain'
+               AND delivery_started_at IS NOT NULL
+               AND receipt_kind IS NOT NULL AND receipt_kind = 'uncertain'
                AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
              OR
              (state = 'failed'
@@ -432,6 +437,7 @@ fn upgrade_v2_outbox(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResul
                AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
                AND claim_payload_json IS NOT NULL
                AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND receipt_kind IS NOT NULL
                AND ((delivery_started_at IS NULL
                      AND receipt_kind = 'definitive_pre_delivery_failure')
                     OR (delivery_started_at IS NOT NULL

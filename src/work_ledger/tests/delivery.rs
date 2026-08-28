@@ -493,6 +493,45 @@ fn outbox_shape_constraints_reject_untyped_delivery_state() {
     assert_eq!(state, "pending");
 }
 
+fn assert_terminal_receipt_kind_is_required(ledger: &WorkLedger, wake_id: &str) {
+    let connection = ledger.connect_read_write().expect("connection");
+    for (state, delivery_started_at) in [
+        ("acknowledged", Some("2026-08-28T12:00:01Z")),
+        ("uncertain", Some("2026-08-28T12:00:01Z")),
+        ("failed", None),
+        ("failed", Some("2026-08-28T12:00:01Z")),
+    ] {
+        let result = connection.execute(
+            "UPDATE outbox SET state = ?1,
+                    claim_id = 'claim', claimant_ref = 'opaque:sha256:claimant',
+                    claim_attempt = 1, claim_identity_digest = 'identity',
+                    claim_payload_json = x'7b7d',
+                    claimed_at = '2026-08-28T12:00:00Z',
+                    lease_expires_at = '2026-08-28T12:00:30Z',
+                    delivery_started_at = ?2, receipt_kind = NULL,
+                    receipt_digest = 'receipt',
+                    completed_at = '2026-08-28T12:00:02Z'
+              WHERE wake_id = ?3",
+            params![state, delivery_started_at, wake_id],
+        );
+        assert!(result.is_err(), "{state} must reject a NULL receipt kind");
+    }
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM outbox WHERE wake_id = ?1",
+            [wake_id],
+            |row| row.get(0),
+        )
+        .expect("state after rejected terminal writes");
+    assert_eq!(state, "pending");
+}
+
+#[test]
+fn fresh_v3_outbox_rejects_null_receipt_kind_for_every_terminal_state() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    assert_terminal_receipt_kind_is_required(&ledger, &wake_id);
+}
+
 fn install_exact_v2_outbox(ledger: &WorkLedger) {
     let connection = ledger.connect_read_write().expect("connection");
     connection
@@ -540,6 +579,34 @@ fn v2_pending_outbox_migrates_to_v3_without_losing_wake() {
         )
         .expect("preserved wake");
     assert_eq!(row, ("pending".to_owned(), 0, None));
+    assert_terminal_receipt_kind_is_required(&migrated, &wake_id);
+}
+
+#[test]
+fn full_v1_pending_outbox_migrates_to_v3_with_terminal_receipt_constraints() {
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    install_exact_v2_outbox(&ledger);
+    let connection = ledger.connect_read_write().expect("connection");
+    connection
+        .execute("DELETE FROM route_records", [])
+        .expect("remove route records from the exact positive v1 fixture");
+    drop(connection);
+    super::persistence::install_exact_v1_registry_schema(&ledger, &[]);
+    drop(ledger);
+
+    let migrated = WorkLedger::open(temp.path()).expect("migrate full v1 ledger");
+    let connection = migrated.connect_read_only().expect("connection");
+    assert_eq!(schema_version(&connection).expect("version"), 3);
+    let row: (String, u64, Option<String>) = connection
+        .query_row(
+            "SELECT state, claim_attempt, claim_id FROM outbox WHERE wake_id = ?1",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("preserved v1 wake");
+    assert_eq!(row, ("pending".to_owned(), 0, None));
+    drop(connection);
+    assert_terminal_receipt_kind_is_required(&migrated, &wake_id);
 }
 
 #[test]
