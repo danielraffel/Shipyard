@@ -42,6 +42,8 @@ use crate::reconcile::{
 #[cfg(unix)]
 use crate::registrar::{Registrar, RegistrarError, WEBHOOK_SCOPE_COMMAND};
 #[cfg(unix)]
+use crate::shadow_scheduler::{ShadowDaemonLane, ShadowTransitionEvidence};
+#[cfg(unix)]
 use crate::ship_resume::{AbandonReport, AbandonedShipState, sweep_orphaned_ship_states};
 use crate::ship_state::ShipStateStore;
 #[cfg(unix)]
@@ -217,6 +219,13 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut previous_states = ship_state_map(&ship_dir);
     let mut next_ship_state_scan_at = Instant::now() + SHIP_STATE_SCAN_INTERVAL;
     let mut registration_sync = RegistrationSyncState::default();
+    let mut shadow_lane = ShadowDaemonLane::new(
+        config.mode,
+        config.global_dir.clone(),
+        config.state_dir.clone(),
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        Instant::now(),
+    );
     let mut execution_supervisor = ExecutionSupervisor::new(
         std::env::current_exe()?,
         config.mode,
@@ -237,6 +246,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             &last_event_at,
             &ship_dir,
             &mut previous_states,
+            &mut shadow_lane,
         );
         sync_tunnel_registration(
             &tunnel_runtime,
@@ -252,6 +262,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             reconcile_window = result.window;
             publish_reconcile_events(&server, &last_event_at, &result.report);
             publish_abandon_events(&server, &last_event_at, &result.abandon);
+        }
+
+        for evidence in shadow_lane.tick(Instant::now()) {
+            publish_shadow_transition(&server, &last_event_at, &evidence);
         }
 
         let now = Instant::now();
@@ -367,8 +381,10 @@ fn drain_webhook_events(
     last_event_at: &Arc<Mutex<Option<f64>>>,
     ship_dir: &Path,
     previous_states: &mut BTreeMap<(String, u64), ShipState>,
+    shadow_lane: &mut ShadowDaemonLane,
 ) {
     while let Ok(event) = webhook_rx.try_recv() {
+        shadow_lane.note_webhook(&event, Instant::now());
         let archived_event =
             archive_closed_pull_request_ship_state(&event, ship_dir, previous_states);
         publish_daemon_event(server, last_event_at, event);
@@ -376,6 +392,32 @@ fn drain_webhook_events(
             publish_daemon_event(server, last_event_at, archived_event);
         }
     }
+}
+
+#[cfg(unix)]
+fn publish_shadow_transition(
+    server: &IpcServer,
+    last_event_at: &Arc<Mutex<Option<f64>>>,
+    evidence: &ShadowTransitionEvidence,
+) {
+    let event = serde_json::json!({
+        "kind": "shadow_observation_transition",
+        "payload": {
+            "transition": evidence.transition,
+            "trigger": evidence.trigger,
+            "api_requests": evidence.api_requests,
+            "elapsed_ms": evidence.elapsed_ms,
+            "fetch_errors": evidence.fetch_errors,
+            "activation_enabled": false,
+            "dispatch_enabled": false,
+            "model_calls": 0,
+        }
+    });
+    // IPC remains a convenience; the daemon's supervised stderr sink is the
+    // retained, subscriber-independent audit trail for transition-only shadow
+    // evidence. The payload is redacted before it reaches this boundary.
+    eprintln!("{}", serde_json::to_string(&event).unwrap_or_default());
+    publish_daemon_event(server, last_event_at, event);
 }
 
 #[cfg(unix)]

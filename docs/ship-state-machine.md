@@ -769,8 +769,10 @@ every repository's primary platform explicitly (Pulp, Forge, and
 Vellum use macOS), defaults to independent compatibility lanes, and records the
 complete compatibility-lane inventory and the subset with declared artifact
 dependencies. Unknown lanes fail closed. Other cross-lane
-blocking requires evidenced shared-integrity fault. The
-shadow scheduler does not consume the policy in this phase.
+blocking requires evidenced shared-integrity fault. The read-only shadow
+observer consumes policy only for explicit repository enrollment and attaches
+the exact revision to evidence; policy cannot activate, dispatch, or make a
+blocking decision in this phase.
 
 ## External dependency matrix
 

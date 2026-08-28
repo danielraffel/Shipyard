@@ -175,6 +175,26 @@ impl GhClient {
         cwd: &Path,
         supervision: GhSupervision,
     ) -> Result<Command, GhPrepareError> {
+        self.prepare_privileged_command_inner(cwd, supervision, None)
+    }
+
+    /// Prepare a privileged native `gh` command while bounding token-helper
+    /// execution for an unattended daemon lane.
+    pub(crate) fn prepare_privileged_command_with_auth_timeout(
+        &self,
+        cwd: &Path,
+        supervision: GhSupervision,
+        auth_timeout: Duration,
+    ) -> Result<Command, GhPrepareError> {
+        self.prepare_privileged_command_inner(cwd, supervision, Some(auth_timeout))
+    }
+
+    fn prepare_privileged_command_inner(
+        &self,
+        cwd: &Path,
+        supervision: GhSupervision,
+        auth_timeout: Option<Duration>,
+    ) -> Result<Command, GhPrepareError> {
         let binary = self.resolve_privileged_gh_binary()?;
         let mut command = match supervision {
             GhSupervision::Supervised => crate::supervised::gh_supervised(Some(&binary)),
@@ -186,7 +206,7 @@ impl GhClient {
             .env("LC_ALL", "C")
             .env("GH_HOST", "github.com")
             .env("GH_PROMPT_DISABLED", "1");
-        if let Some(token) = self.resolve_token(cwd)? {
+        if let Some(token) = self.resolve_token_with_timeout(cwd, auth_timeout)? {
             command.env(GH_TOKEN_ENV, token.token);
         }
         Ok(command)
@@ -361,11 +381,28 @@ impl GhClient {
     /// Callers can validate the returned sanitized summary before granting
     /// authority without a time-of-check/time-of-use helper re-resolution.
     pub(crate) fn pin_command_auth(&mut self, cwd: &Path) -> Result<GhAuthSummary, GhPrepareError> {
+        self.pin_command_auth_inner(cwd, None)
+    }
+
+    /// Pin command auth while bounding helper execution for unattended work.
+    pub(crate) fn pin_command_auth_with_timeout(
+        &mut self,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<GhAuthSummary, GhPrepareError> {
+        self.pin_command_auth_inner(cwd, Some(timeout))
+    }
+
+    fn pin_command_auth_inner(
+        &mut self,
+        cwd: &Path,
+        timeout: Option<Duration>,
+    ) -> Result<GhAuthSummary, GhPrepareError> {
         let GhAuthSource::Command { .. } = &self.auth.source else {
             return self.auth_summary(cwd, GhAuthPolicy::Default);
         };
         let token = self
-            .resolve_token(cwd)?
+            .resolve_token_with_timeout(cwd, timeout)?
             .expect("command auth should resolve a token");
         let summary = GhAuthSummary {
             source: GhAuthSourceSummary::Command,

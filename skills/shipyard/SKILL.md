@@ -1249,6 +1249,43 @@ import is intended. Import is idempotent, redacted, and fail-closed: it selects
 canonical fields and opaque digests from legacy stores, leaves those stores
 authoritative and untouched, and cannot schedule, wake, call a model, mutate
 GitHub, or project to Linear. Both activation and dispatch remain disabled.
+The daemon does run a subscriber-independent **read-only shadow observer** over
+policy-covered native nonterminal exact PR heads; inert `shadow_imported`
+history is never scheduled. Relevant webhooks debounce for two
+seconds with a ten-second maximum burst age; overflow is requeued. A missed-
+event catch-up samples at most eight exact targets every five minutes in
+deterministic round-robin order. The same target has a 30-second webhook
+cooldown, no more than four reads run concurrently, and a rolling-hour
+240-request ceiling reserves worst-case pagination before target selection.
+Worst-case cost is reserved durably before a pass and reconciled to actual cost
+afterward; in-flight and recent usage is conservatively restored on restart. A
+shared one-minute deadline covers auth preparation and reads so a slow endpoint
+cannot starve later triggers.
+Multiple ledger records for one
+exact `(repo, PR, head)` cost one bounded paginated observation. Provenance is
+exhaustive through 1,000 contexts and fails closed beyond that bound; API cost
+counts every GraphQL page.
+The daemon loads only its trusted machine-global configuration, selects exact-
+repository App auth, and bounds token-helper preparation separately; repository
+and local overlays cannot replace unattended auth. Non-App command credentials
+fail closed, and one repository-scoped App installation token is pinned per
+target observation. The token reaches only the
+configured validated native privileged `gh` under a cleared child environment;
+a preparation failure
+does not count as a GitHub request. Baselines and unchanged snapshots stay
+silent; a changed snapshot publishes `shadow_observation_transition` to IPC and
+the retained supervised daemon stderr log with the
+exact-head fence, policy revision, API-request count, elapsed milliseconds, and
+`model_calls=0`. This path has no GitHub write, ledger write, outbox wake,
+Linear projection, model, activation, or dispatch capability. Fetch failure and
+recovery emit once per state change with a stable redacted class; repeated
+failures do not spam logs or expose command output.
+Treat `failed_checks` as observation only, never as permission to use
+`gh run rerun --failed`. Active rerun planning must first carry exact failed job
+IDs, preview the dependency closure, estimate worker-minutes against a
+revision-fenced per-repository ceiling, and refuse when closure is unknown or
+exceeds the classified failed-job set. Shadow observation must not invent that
+graph or cost evidence from check names.
 The future transactional wake API derives a deterministic wake ID from the
 complete work/owner generation and delivery fence; a caller-supplied identity
 that does not match that derivation is rejected before commit.
@@ -1269,8 +1306,12 @@ apply requires the exact current revision. The primary platform is explicit
 `--compatibility-lane` inventory and independent compatibility scheduling.
 Repeat `--declared-dependency-lane` only for an inventoried lane with a real
 artifact dependency; unknown lanes fail closed and other
-cross-lane blocking requires evidenced shared-integrity fault. This remains an
-inspectable shadow and cannot influence scheduling in the current phase.
+cross-lane blocking requires evidenced shared-integrity fault. A policy row
+enrolls that repository in shadow observation and is attached to evidence, but
+cannot influence GitHub or queue state in the current phase. Keep separate
+revision-fenced rows for `generous-corp/pulp`, `generous-corp/forge`, and
+`generous-corp/vellum`; change one row when a repository needs a different
+platform or dependency rule rather than changing a fleet-wide default.
 
 The preferred unattended credential has Commit statuses and Issues read/write.
 A local read-oriented GitHub App that receives the exact integration-permission

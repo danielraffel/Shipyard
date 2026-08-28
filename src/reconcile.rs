@@ -9,9 +9,10 @@ use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -98,7 +99,9 @@ pub struct ReconciledShipState {
 /// Error returned while fetching GitHub check rollup data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReconcileFetchError {
-    /// `gh` could not be spawned or waited on.
+    /// `gh` could not be started, so no GitHub request was attempted.
+    Spawn(String),
+    /// A started `gh` process could not be waited on or captured.
     Io(String),
     /// `gh` did not finish inside the reconcile timeout.
     Timeout(String),
@@ -113,13 +116,34 @@ pub enum ReconcileFetchError {
 impl Display for ReconcileFetchError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(message)
+            Self::Spawn(message)
+            | Self::Io(message)
             | Self::Timeout(message)
             | Self::Command(message)
             | Self::Parse(message)
             | Self::Prepare(message) => formatter.write_str(message),
         }
     }
+}
+
+/// Exhaustive producer-provenanced check snapshot plus exact API cost.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProvenancedCheckRollup {
+    /// Live pull-request head.
+    pub head_sha: String,
+    /// Complete check/status nodes across all fetched pages.
+    pub checks: Vec<Value>,
+    /// GraphQL requests that crossed the command boundary.
+    pub api_requests: usize,
+}
+
+/// Provenanced fetch failure with requests spent before failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProvenancedFetchError {
+    /// Stable typed fetch failure.
+    pub error: ReconcileFetchError,
+    /// GraphQL requests that crossed the command boundary.
+    pub api_requests: usize,
 }
 
 impl Error for ReconcileFetchError {}
@@ -369,36 +393,215 @@ pub fn fetch_head_and_status_check_rollup_with_config(
 ///
 /// Metadata-only authority must bind configured contexts to the GitHub App or
 /// status creator that produced them. The ordinary `gh pr view` rollup omits
-/// that identity, so this stricter query fails closed when more than one page
-/// would be required.
+/// that identity, so this stricter query paginates a bounded exhaustive set.
 pub fn fetch_head_and_provenanced_status_check_rollup_with_config(
     config: &LoadedConfig,
     cwd: &Path,
     repo: &str,
     pr: u64,
 ) -> Result<(String, Vec<Value>), ReconcileFetchError> {
-    const QUERY: &str = r"query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name status conclusion checkSuite{app{databaseId slug}}} ... on StatusContext{context state creator{__typename login ... on User{databaseId} ... on Bot{databaseId} ... on Organization{databaseId}}}}}}}}}";
-    let (owner, name) = repo.split_once('/').ok_or_else(|| {
-        ReconcileFetchError::Prepare(format!("invalid repository identity '{repo}'"))
-    })?;
     let gh_client = GhClient::from_loaded_config(config).map_err(|error| {
         ReconcileFetchError::Prepare(format!(
             "failed to load GitHub auth config while reconciling PR #{pr} ({repo}): {error}"
         ))
     })?;
-    let mut command = gh_client
-        .prepare_command(
+    fetch_head_and_provenanced_status_check_rollup_with_client(
+        &gh_client, cwd, repo, pr, None, None,
+    )
+    .map(|rollup| (rollup.head_sha, rollup.checks))
+    .map_err(|failure| failure.error)
+}
+
+/// Fetch complete hosted-check provenance using exact repository auth routing
+/// and a bounded token-helper deadline.
+pub fn fetch_head_and_provenanced_status_check_rollup_for_repo_with_config(
+    config: &LoadedConfig,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+    auth_timeout: Duration,
+) -> Result<ProvenancedCheckRollup, ProvenancedFetchError> {
+    let gh_client =
+        GhClient::from_loaded_config(config).map_err(|error| ProvenancedFetchError {
+            error: ReconcileFetchError::Prepare(format!(
+                "failed to load GitHub auth config while reconciling PR #{pr} ({repo}): {error}"
+            )),
+            api_requests: 0,
+        })?;
+    fetch_head_and_provenanced_status_check_rollup_for_repo_with_client(
+        &gh_client,
+        cwd,
+        repo,
+        pr,
+        auth_timeout,
+        Duration::from_mins(1),
+    )
+}
+
+/// Fetch complete provenance from a reusable GitHub client. Each target gets
+/// an exact repository override and pins one bounded App installation token
+/// before pagination so concurrent repositories cannot evict each other.
+pub fn fetch_head_and_provenanced_status_check_rollup_for_repo_with_client(
+    gh_client: &GhClient,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+    auth_timeout: Duration,
+    observation_timeout: Duration,
+) -> Result<ProvenancedCheckRollup, ProvenancedFetchError> {
+    let deadline = Instant::now() + observation_timeout;
+    let mut repo_client = gh_client
+        .clone()
+        .with_repo_override(repo)
+        .map_err(|error| ProvenancedFetchError {
+            error: ReconcileFetchError::Prepare(error.to_string()),
+            api_requests: 0,
+        })?;
+    let summary = repo_client
+        .pin_command_auth_with_timeout(
+            cwd,
+            auth_timeout.min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .map_err(|error| ProvenancedFetchError {
+            error: ReconcileFetchError::Prepare(error.to_string()),
+            api_requests: 0,
+        })?;
+    if summary.token_kind.as_deref() != Some("github-app-installation") {
+        return Err(ProvenancedFetchError {
+            error: ReconcileFetchError::Prepare(
+                "shadow observation requires repository-scoped GitHub App installation auth"
+                    .to_owned(),
+            ),
+            api_requests: 0,
+        });
+    }
+    fetch_head_and_provenanced_status_check_rollup_with_client(
+        &repo_client,
+        cwd,
+        repo,
+        pr,
+        Some(auth_timeout),
+        Some(deadline),
+    )
+}
+
+fn fetch_head_and_provenanced_status_check_rollup_with_client(
+    gh_client: &GhClient,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+    auth_timeout: Option<Duration>,
+    deadline: Option<Instant>,
+) -> Result<ProvenancedCheckRollup, ProvenancedFetchError> {
+    const MAX_PAGES: usize = 10;
+    const QUERY: &str = r"query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid statusCheckRollup{contexts(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name status conclusion checkSuite{app{databaseId slug}}} ... on StatusContext{context state creator{__typename login ... on User{databaseId} ... on Bot{databaseId} ... on Organization{databaseId}}}}}}}}}";
+    let (owner, name) = repo.split_once('/').ok_or_else(|| ProvenancedFetchError {
+        error: ReconcileFetchError::Prepare(format!("invalid repository identity '{repo}'")),
+        api_requests: 0,
+    })?;
+    let mut api_requests = 0;
+    let mut cursor = None::<String>;
+    let mut expected_head = None::<String>;
+    let mut checks = Vec::new();
+    for _ in 0..MAX_PAGES {
+        let parsed = fetch_provenanced_page(
+            gh_client,
+            cwd,
+            owner,
+            name,
+            repo,
+            pr,
+            cursor.as_deref(),
+            auth_timeout,
+            QUERY,
+            api_requests,
+            deadline,
+        )?;
+        api_requests += 1;
+        if expected_head
+            .as_ref()
+            .is_some_and(|head| head != &parsed.head_sha)
+        {
+            return Err(ProvenancedFetchError {
+                error: ReconcileFetchError::Parse(
+                    "pull-request head changed during provenanced pagination".to_owned(),
+                ),
+                api_requests,
+            });
+        }
+        expected_head.get_or_insert(parsed.head_sha);
+        checks.extend(parsed.checks);
+        if !parsed.has_next_page {
+            return Ok(ProvenancedCheckRollup {
+                head_sha: expected_head.unwrap_or_default(),
+                checks,
+                api_requests,
+            });
+        }
+        cursor = parsed.end_cursor;
+        if cursor.is_none() {
+            return Err(ProvenancedFetchError {
+                error: ReconcileFetchError::Parse(
+                    "provenanced hosted-check page omitted end cursor".to_owned(),
+                ),
+                api_requests,
+            });
+        }
+    }
+    Err(ProvenancedFetchError {
+        error: ReconcileFetchError::Parse(
+            "provenanced hosted-check observation exceeded bounded 1000-context budget".to_owned(),
+        ),
+        api_requests,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_provenanced_page(
+    gh_client: &GhClient,
+    cwd: &Path,
+    owner: &str,
+    name: &str,
+    repo: &str,
+    pr: u64,
+    cursor: Option<&str>,
+    auth_timeout: Option<Duration>,
+    query: &str,
+    api_requests: usize,
+    deadline: Option<Instant>,
+) -> Result<ProvenancedPage, ProvenancedFetchError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(ProvenancedFetchError {
+            error: ReconcileFetchError::Timeout(
+                "shadow observation exceeded its complete-pass deadline".to_owned(),
+            ),
+            api_requests,
+        });
+    }
+    let prepared = match auth_timeout {
+        Some(timeout) => gh_client.prepare_privileged_command_with_auth_timeout(
+            cwd,
+            GhSupervision::Unsupervised,
+            deadline.map_or(timeout, |deadline| {
+                timeout.min(deadline.saturating_duration_since(Instant::now()))
+            }),
+        ),
+        None => gh_client.prepare_command(
             cwd,
             None,
             GhSupervision::Unsupervised,
             GhAuthPolicy::Default,
-        )
-        .map_err(|error| ReconcileFetchError::Prepare(error.to_string()))?;
+        ),
+    };
+    let mut command = prepared.map_err(|error| ProvenancedFetchError {
+        error: ReconcileFetchError::Prepare(error.to_string()),
+        api_requests,
+    })?;
     command.args([
         "api",
         "graphql",
         "-f",
-        &format!("query={QUERY}"),
+        &format!("query={query}"),
         "-F",
         &format!("owner={owner}"),
         "-F",
@@ -406,49 +609,113 @@ pub fn fetch_head_and_provenanced_status_check_rollup_with_config(
         "-F",
         &format!("number={pr}"),
     ]);
-    let capture = run_capture(command, RECONCILE_FETCH_TIMEOUT)?;
+    if let Some(cursor) = cursor {
+        command.args(["-f", &format!("cursor={cursor}")]);
+    }
+    let request_timeout = deadline.map_or(RECONCILE_FETCH_TIMEOUT, |deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(RECONCILE_FETCH_TIMEOUT)
+    });
+    if request_timeout.is_zero() {
+        return Err(ProvenancedFetchError {
+            error: ReconcileFetchError::Timeout(
+                "shadow observation exceeded its complete-pass deadline".to_owned(),
+            ),
+            api_requests,
+        });
+    }
+    let capture = run_capture(command, request_timeout).map_err(|error| {
+        let crossed_boundary = !matches!(error, ReconcileFetchError::Spawn(_));
+        ProvenancedFetchError {
+            error,
+            api_requests: api_requests + usize::from(crossed_boundary),
+        }
+    })?;
+    parse_provenanced_page(&capture, repo, pr).map_err(|error| ProvenancedFetchError {
+        error,
+        api_requests: api_requests + 1,
+    })
+}
+
+#[derive(Debug)]
+struct ProvenancedPage {
+    head_sha: String,
+    checks: Vec<Value>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+fn parse_provenanced_page(
+    capture: &CommandCapture,
+    repo: &str,
+    pr: u64,
+) -> Result<ProvenancedPage, ReconcileFetchError> {
     if capture.timed_out {
         return Err(ReconcileFetchError::Timeout(format!(
-            "provenanced hosted-check query timed out for PR #{pr} ({repo})"
+            "gh api graphql timed out while observing PR #{pr} ({repo})"
         )));
     }
     if capture.returncode != Some(0) {
         return Err(ReconcileFetchError::Command(format!(
-            "provenanced hosted-check query failed for PR #{pr} ({repo}): {}",
+            "gh api graphql failed while observing PR #{pr} ({repo}): {}",
             capture.stderr_or_stdout()
         )));
     }
-    let value: Value = serde_json::from_str(&capture.stdout)
-        .map_err(|error| ReconcileFetchError::Parse(error.to_string()))?;
-    let pull = value
-        .pointer("/data/repository/pullRequest")
-        .ok_or_else(|| {
-            ReconcileFetchError::Parse("provenanced hosted-check response omitted PR".to_owned())
-        })?;
-    let head = pull
-        .get("headRefOid")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let contexts = pull.pointer("/statusCheckRollup/contexts").ok_or_else(|| {
-        ReconcileFetchError::Parse("provenanced hosted-check response omitted contexts".to_owned())
+    let value = serde_json::from_str::<Value>(&capture.stdout).map_err(|error| {
+        ReconcileFetchError::Parse(format!("failed to parse gh api graphql JSON: {error}"))
     })?;
-    if contexts
-        .pointer("/pageInfo/hasNextPage")
-        .and_then(Value::as_bool)
-        != Some(false)
+    if value
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
     {
         return Err(ReconcileFetchError::Parse(
-            "provenanced hosted-check observation is not exhaustive".to_owned(),
+            "gh api graphql returned partial-data errors".to_owned(),
         ));
     }
-    let nodes = contexts
+    let pull = value
+        .pointer("/data/repository/pullRequest")
+        .ok_or_else(|| ReconcileFetchError::Parse("missing pullRequest object".to_owned()))?;
+    let head_sha = pull
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .filter(|head| !head.is_empty())
+        .ok_or_else(|| ReconcileFetchError::Parse("missing pull-request head".to_owned()))?
+        .to_owned();
+    if pull.get("statusCheckRollup").is_none_or(Value::is_null) {
+        return Ok(ProvenancedPage {
+            head_sha,
+            checks: Vec::new(),
+            has_next_page: false,
+            end_cursor: None,
+        });
+    }
+    let contexts = pull
+        .pointer("/statusCheckRollup/contexts")
+        .ok_or_else(|| ReconcileFetchError::Parse("missing status-check contexts".to_owned()))?;
+    let checks = contexts
         .get("nodes")
         .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| {
-            ReconcileFetchError::Parse("provenanced hosted-check nodes are invalid".to_owned())
-        })?;
-    Ok((head.to_owned(), nodes))
+        .ok_or_else(|| ReconcileFetchError::Parse("missing status-check nodes".to_owned()))?
+        .clone();
+    let page_info = contexts
+        .get("pageInfo")
+        .ok_or_else(|| ReconcileFetchError::Parse("missing status-check pageInfo".to_owned()))?;
+    let has_next_page = page_info
+        .get("hasNextPage")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ReconcileFetchError::Parse("missing hasNextPage".to_owned()))?;
+    let end_cursor = page_info
+        .get("endCursor")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(ProvenancedPage {
+        head_sha,
+        checks,
+        has_next_page,
+        end_cursor,
+    })
 }
 
 fn fetch_head_and_status_check_rollup_with_client(
@@ -663,21 +930,53 @@ fn run_capture(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| ReconcileFetchError::Io(format!("failed to start gh: {error}")))?;
-    let timed_out = child
-        .wait_timeout(timeout)
-        .map_err(|error| ReconcileFetchError::Io(format!("failed to wait for gh: {error}")))?
-        .is_none();
+        .map_err(|error| ReconcileFetchError::Spawn(format!("failed to start gh: {error}")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ReconcileFetchError::Io("failed to capture gh stdout".to_owned()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ReconcileFetchError::Io("failed to capture gh stderr".to_owned()))?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let timed_out = match child.wait_timeout(timeout) {
+        Ok(status) => status.is_none(),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(ReconcileFetchError::Io(format!(
+                "failed to wait for gh: {error}"
+            )));
+        }
+    };
     if timed_out {
         let _ = child.kill();
     }
-    let output = child.wait_with_output().map_err(|error| {
-        ReconcileFetchError::Io(format!("failed to capture gh output: {error}"))
-    })?;
+    let status = child
+        .wait()
+        .map_err(|error| ReconcileFetchError::Io(format!("failed to reap gh: {error}")))?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| ReconcileFetchError::Io("gh stdout reader panicked".to_owned()))?
+        .map_err(|error| ReconcileFetchError::Io(format!("failed to read gh stdout: {error}")))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| ReconcileFetchError::Io("gh stderr reader panicked".to_owned()))?
+        .map_err(|error| ReconcileFetchError::Io(format!("failed to read gh stderr: {error}")))?;
     Ok(CommandCapture {
-        returncode: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        returncode: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
     })
 }
@@ -687,8 +986,9 @@ mod tests {
     use chrono::{Duration, TimeZone};
 
     use super::{
-        ReconcileFetchError, ReconcileTransition, ReconcileWindow,
-        reconcile_active_ship_states_with, reconcile_ship_state,
+        CommandCapture, ReconcileFetchError, ReconcileTransition, ReconcileWindow,
+        fetch_provenanced_page, parse_provenanced_page, reconcile_active_ship_states_with,
+        reconcile_ship_state, run_capture,
     };
     use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
 
@@ -697,6 +997,103 @@ mod tests {
             .with_ymd_and_hms(2026, 4, 25, 7, 0, 0)
             .single()
             .expect("valid time")
+    }
+
+    #[test]
+    fn provenanced_page_requires_cursor_metadata_and_preserves_nodes() {
+        let capture = CommandCapture {
+            returncode: Some(0),
+            stdout: serde_json::json!({
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid": "a".repeat(40),
+                    "statusCheckRollup": {"contexts": {
+                        "pageInfo": {"hasNextPage": true, "endCursor": "cursor-100"},
+                        "nodes": [{"__typename": "CheckRun", "name": "macos"}]
+                    }}
+                }}}
+            })
+            .to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        let page = parse_provenanced_page(&capture, "owner/repo", 42).expect("page");
+        assert_eq!(page.head_sha, "a".repeat(40));
+        assert!(page.has_next_page);
+        assert_eq!(page.end_cursor.as_deref(), Some("cursor-100"));
+        assert_eq!(page.checks.len(), 1);
+    }
+
+    #[test]
+    fn provenanced_page_accepts_a_null_rollup_as_no_checks() {
+        let capture = CommandCapture {
+            returncode: Some(0),
+            stdout: serde_json::json!({
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid": "b".repeat(40),
+                    "statusCheckRollup": null
+                }}}
+            })
+            .to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        let page = parse_provenanced_page(&capture, "owner/repo", 43).expect("page");
+        assert_eq!(page.head_sha, "b".repeat(40));
+        assert!(page.checks.is_empty());
+        assert!(!page.has_next_page);
+    }
+
+    #[test]
+    fn provenanced_page_rejects_partial_graphql_data() {
+        let capture = CommandCapture {
+            returncode: Some(0),
+            stdout: serde_json::json!({
+                "errors": [{"message": "field forbidden"}],
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid": "b".repeat(40),
+                    "statusCheckRollup": null
+                }}}
+            })
+            .to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        assert!(matches!(
+            parse_provenanced_page(&capture, "owner/repo", 43),
+            Err(ReconcileFetchError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn expired_complete_pass_deadline_attempts_no_request() {
+        let client = crate::gh::GhClient::ambient();
+        let failure = fetch_provenanced_page(
+            &client,
+            std::path::Path::new("."),
+            "owner",
+            "repo",
+            "owner/repo",
+            43,
+            None,
+            None,
+            "query",
+            7,
+            Some(std::time::Instant::now()),
+        )
+        .expect_err("deadline");
+        assert!(matches!(failure.error, ReconcileFetchError::Timeout(_)));
+        assert_eq!(failure.api_requests, 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_capture_drains_output_larger_than_a_pipe_buffer() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "head -c 200000 /dev/zero"]);
+        let capture = run_capture(command, std::time::Duration::from_secs(5)).expect("capture");
+        assert!(!capture.timed_out);
+        assert_eq!(capture.returncode, Some(0));
+        assert_eq!(capture.stdout.len(), 200_000);
     }
 
     fn run(target: &str, status: &str) -> DispatchedRun {
