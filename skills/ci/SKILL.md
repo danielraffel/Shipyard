@@ -258,11 +258,10 @@ a genuinely broken source (presentation only — operational auth still never
 silently falls back). A `token_command` using `{repo_slug}`/`{repo_name}` that
 can't resolve in a repo-less context (`doctor`) reads as **green** with a
 hint to pin `--repo <owner>/<name>` for account-wide Apps, because it resolves
-normally inside a repo. The **daemon** resolves `{repo_slug}` from its served
-`--repo` (the registrar hints it), so live-mode webhook registration mints a
-token from a repo-less CWD instead of failing on "placeholder requires
-remote.origin.url" (which left live mode stuck on "updates paused"). Any other
-resolution failure stays **red** and now tells
+normally inside a repo. The **daemon** forces `{repo_slug}` to its exact served
+`--repo`, outranking any unrelated GitHub checkout in the daemon's CWD, so
+live-mode webhook registration always mints for the repository being registered.
+Any other resolution failure stays **red** and now tells
 gh-only users they can simply drop `[github.auth]` to use ambient `gh`. The
 `nsc` row is likewise optional: green "not configured (optional)" unless a
 Namespace provider is configured (`cloud.provider` or a per-target `provider`).
@@ -302,6 +301,13 @@ after mint/cache resolution but before native `gh` executes the command. Bind
 their `GHAPP_REAL_GH`/merge probe to the wrapper's selected native binary, and
 dispatch the PR-close guard for every command so its REST/GraphQL/issue aliases
 cannot bypass inspection.
+
+Webhook registration treats a persisted hook ID as durable provenance, but a
+successful authenticated route may prove that ID stale with an exact PATCH
+HTTP 404. Only then re-list the repository by the exact callback URL: create on
+zero matches, patch and adopt one match, and fail closed on duplicates. Commit
+the replacement ID atomically only after remote reconciliation succeeds. Never
+apply this recovery to 401/403, scope failures, or generic API errors.
 
 ## Supervised-Push Signal (`SHIPYARD_PR_RUNNING=1`)
 

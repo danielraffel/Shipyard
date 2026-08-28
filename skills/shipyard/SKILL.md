@@ -507,6 +507,13 @@ the token in process argv. Guards that query GitHub must receive the same
 repo-routed token and exact native binary as the guarded command and still run
 before native `gh`; the PR-close guard inspects every command shape itself.
 
+If an authenticated exact PATCH returns HTTP 404 for a persisted webhook ID,
+the registrar may repair only that stale-provenance case. Re-list hooks by the
+exact callback URL, create when none match, patch and adopt when exactly one
+matches, and fail closed when multiple hooks match. Persist the replacement ID
+atomically only after the remote operation succeeds. A 401/403, missing scope,
+or generic API failure must not trigger reconciliation or local replacement.
+
 The standalone App helper must remain usable from stripped SSH/daemon
 environments without weakening TLS. It first uses Python's default trust store.
 Only after a real certificate-verification failure and proof that there is no
@@ -525,12 +532,12 @@ When debugging GitHub behavior:
   (optional)" unless a Namespace provider is configured, and a `{repo_slug}`
   `token_command` that can't resolve in a repo-less context (doctor) is
   green with a "pin `--repo`" hint rather than a red "misconfigured". The
-  **daemon** no longer hits this: webhook registration passes the served
-  `--repo` as a `{repo_slug}` hint (`GhClient::with_repo_hint`), so a
-  `{repo_slug}` `token_command` mints a token from the daemon's repo-less CWD
-  instead of looping on "placeholder requires remote.origin.url" with live mode
-  stuck on "updates paused". The
-  `gh-scope` row is also green-informational for App/Env/helper tokens (scopes
+  **daemon** no longer hits this: webhook registration forces the served
+  `--repo` as the exact `{repo_slug}` override (`GhClient::with_repo_override`),
+  outranking any unrelated GitHub checkout in the daemon's CWD. A repo-routed
+  `token_command` therefore mints for the repository being registered rather
+  than looping on missing provenance or selecting the wrong App installation.
+  The `gh-scope` row is also green-informational for App/Env/helper tokens (scopes
   not inspectable locally), keeping the "verify Actions: Read/write" reminder.
 - Check `.shipyard/config.toml`, `.shipyard.local/config.toml`, and global
   config for `[github.auth]` before assuming ambient `gh auth status` explains

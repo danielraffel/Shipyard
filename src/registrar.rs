@@ -260,27 +260,20 @@ impl Registrar {
         gh_binary: Option<&Path>,
     ) -> Result<u64, RegistrarError> {
         if let Some(hook_id) = self.by_repo.get(repo).copied() {
-            update_hook(client, &self.cwd, gh_binary, repo, hook_id, url, secret)?;
-            return Ok(hook_id);
+            match update_hook(client, &self.cwd, gh_binary, repo, hook_id, url, secret) {
+                Ok(()) => return Ok(hook_id),
+                Err(HookUpdateError::NotFound(_)) => {
+                    let replacement =
+                        reconcile_exact_hook(client, &self.cwd, gh_binary, repo, url, secret)?;
+                    self.commit_registration(repo, replacement)?;
+                    return Ok(replacement);
+                }
+                Err(error) => return Err(error.into_registrar()),
+            }
         }
 
-        let matching = list_matching_hooks(client, &self.cwd, gh_binary, repo, url)?;
-        let hook_id = match matching.as_slice() {
-            [] => create_hook(client, &self.cwd, gh_binary, repo, url, secret)?,
-            [hook_id] => {
-                update_hook(client, &self.cwd, gh_binary, repo, *hook_id, url, secret)?;
-                *hook_id
-            }
-            _ => {
-                return Err(RegistrarError::AmbiguousRemoteHooks {
-                    repo: repo.to_owned(),
-                    url: url.to_owned(),
-                    hook_ids: matching,
-                });
-            }
-        };
-        self.by_repo.insert(repo.to_owned(), hook_id);
-        self.save()?;
+        let hook_id = reconcile_exact_hook(client, &self.cwd, gh_binary, repo, url, secret)?;
+        self.commit_registration(repo, hook_id)?;
         Ok(hook_id)
     }
 
@@ -321,13 +314,24 @@ impl Registrar {
     }
 
     fn save(&self) -> Result<(), RegistrarError> {
+        self.save_map(&self.by_repo)
+    }
+
+    fn commit_registration(&mut self, repo: &str, hook_id: u64) -> Result<(), RegistrarError> {
+        let mut next = self.by_repo.clone();
+        next.insert(repo.to_owned(), hook_id);
+        self.save_map(&next)?;
+        self.by_repo = next;
+        Ok(())
+    }
+
+    fn save_map(&self, by_repo: &BTreeMap<String, u64>) -> Result<(), RegistrarError> {
         let _writer_domain =
             crate::writer_domain_lease::acquire_for_protected_path(&self.state_path)?;
         if let Some(parent) = self.state_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let payload = self
-            .by_repo
+        let payload = by_repo
             .iter()
             .map(|(repo, hook_id)| RegistrationRecord {
                 repo: repo.clone(),
@@ -355,8 +359,8 @@ impl Registrar {
             .ok_or_else(|| RegistrarError::GhUnavailable("gh CLI not found on PATH".to_owned()))
     }
 
-    /// Build the configured `gh` client, hinting `repo` for a `{repo_slug}`
-    /// token-command placeholder (the daemon's CWD isn't a GitHub checkout).
+    /// Build the configured `gh` client, forcing the served `repo` for every
+    /// repository placeholder even if the daemon's CWD is a GitHub checkout.
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn configured_gh_client_optional(
         &self,
@@ -372,11 +376,41 @@ impl Registrar {
             let client = GhClient::from_cwd(self.mode, &self.cwd)
                 .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))?;
             let client = match repo {
-                Some(slug) => client.with_repo_hint(slug),
+                Some(slug) => configure_repo_target(client, slug)?,
                 None => client,
             };
             Ok(Some(client))
         }
+    }
+}
+
+fn configure_repo_target(client: GhClient, repo: &str) -> Result<GhClient, RegistrarError> {
+    client
+        .with_repo_override(repo)
+        .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))
+}
+
+fn reconcile_exact_hook(
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
+    repo: &str,
+    url: &str,
+    secret: &str,
+) -> Result<u64, RegistrarError> {
+    let matching = list_matching_hooks(client, cwd, gh_binary, repo, url)?;
+    match matching.as_slice() {
+        [] => create_hook(client, cwd, gh_binary, repo, url, secret),
+        [hook_id] => {
+            update_hook(client, cwd, gh_binary, repo, *hook_id, url, secret)
+                .map_err(HookUpdateError::into_registrar)?;
+            Ok(*hook_id)
+        }
+        _ => Err(RegistrarError::AmbiguousRemoteHooks {
+            repo: repo.to_owned(),
+            url: url.to_owned(),
+            hook_ids: matching,
+        }),
     }
 }
 
@@ -488,6 +522,29 @@ fn list_matching_hooks(
     Ok(matches)
 }
 
+enum HookUpdateError {
+    NotFound(String),
+    Registrar(RegistrarError),
+}
+
+impl HookUpdateError {
+    fn into_registrar(self) -> RegistrarError {
+        match self {
+            Self::NotFound(output) => RegistrarError::GhFailed {
+                action: "patch",
+                output,
+            },
+            Self::Registrar(error) => error,
+        }
+    }
+}
+
+impl From<RegistrarError> for HookUpdateError {
+    fn from(error: RegistrarError) -> Self {
+        Self::Registrar(error)
+    }
+}
+
 fn update_hook(
     client: &GhClient,
     cwd: &Path,
@@ -496,7 +553,7 @@ fn update_hook(
     hook_id: u64,
     url: &str,
     secret: &str,
-) -> Result<(), RegistrarError> {
+) -> Result<(), HookUpdateError> {
     let body = json!({
         "config": {
             "url": url,
@@ -515,6 +572,7 @@ fn update_hook(
             "api",
             "-X",
             "PATCH",
+            "--include",
             "-H",
             "Accept: application/vnd.github+json",
             "--input",
@@ -523,10 +581,45 @@ fn update_hook(
         ],
         Some(&body.to_string()),
     )?;
+    let included = parse_included_response(&output.stdout);
     if output.status != 0 {
-        return Err(classify_gh_failure("patch", output.combined_output()));
+        let combined = output.combined_output();
+        if included
+            .as_ref()
+            .is_some_and(|response| response.status == 404)
+        {
+            return Err(HookUpdateError::NotFound(combined));
+        }
+        return Err(classify_gh_failure("patch", combined).into());
     }
-    validate_updated_hook(hook_id, url, &output.stdout)
+    let included = included.ok_or_else(|| RegistrarError::GhFailed {
+        action: "patch",
+        output: "gh api --include response omitted the HTTP status".to_owned(),
+    })?;
+    Ok(validate_updated_hook(hook_id, url, included.body)?)
+}
+
+struct IncludedResponse<'a> {
+    status: u16,
+    body: &'a str,
+}
+
+fn parse_included_response(output: &str) -> Option<IncludedResponse<'_>> {
+    let header_end = output
+        .find("\r\n\r\n")
+        .map(|index| (index, 4))
+        .or_else(|| output.find("\n\n").map(|index| (index, 2)))?;
+    let status = output[..header_end.0]
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(IncludedResponse {
+        status,
+        body: &output[header_end.0 + header_end.1..],
+    })
 }
 
 fn validate_updated_hook(hook_id: u64, url: &str, output: &str) -> Result<(), RegistrarError> {
@@ -766,7 +859,12 @@ mod tests {
 
     use super::Registrar;
     #[cfg(unix)]
-    use super::{RegistrarError, RuntimeMode, SUBSCRIBED_EVENTS, WEBHOOK_SCOPE_COMMAND};
+    use super::{
+        GhAuthPolicy, GhClient, GhSupervision, RegistrarError, RuntimeMode, SUBSCRIBED_EVENTS,
+        WEBHOOK_SCOPE_COMMAND,
+    };
+    #[cfg(unix)]
+    use crate::config::{LoadedConfig, LocalOverlaySource};
 
     #[test]
     fn corrupt_state_loads_as_empty() {
@@ -778,6 +876,73 @@ mod tests {
         let registrar = Registrar::new(temp.path());
 
         assert!(registrar.all().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_registrar_target_overrides_daemon_checkout_repo() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let checkout = temp.path().join("repo-a");
+        fs::create_dir(&checkout).expect("checkout");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(&checkout)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "git@github.com:checkout/repo-a.git",
+                ])
+                .current_dir(&checkout)
+                .status()
+                .expect("git remote")
+                .success()
+        );
+
+        let helper = temp.path().join("token-helper");
+        let routed_repo = temp.path().join("routed-repo");
+        fs::write(
+            &helper,
+            format!(
+                "printf '%s' \"$1\" > {}\nprintf '%s\\n' '{{\"token\":\"ghs_target\",\"expires_at\":\"2099-01-01T00:00:00Z\"}}'\n",
+                shell_quote(&routed_repo)
+            ),
+        )
+        .expect("helper");
+        let config = LoadedConfig {
+            data: format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/sh\", \"{}\", \"{{repo_slug}}\"]\n",
+                helper.display()
+            )
+            .parse()
+            .expect("config"),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        };
+        let client = GhClient::from_loaded_config(&config).expect("configured client");
+        let client = super::configure_repo_target(client, "target/repo-b").expect("target");
+        client
+            .prepare_command(
+                &checkout,
+                Some(Path::new("/bin/true")),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+            )
+            .expect("prepare exact target");
+
+        assert_eq!(
+            fs::read_to_string(routed_repo).expect("routed repo"),
+            "target/repo-b"
+        );
     }
 
     #[cfg(unix)]
@@ -855,6 +1020,120 @@ mod tests {
 
         assert!(third_args.contains("-X DELETE"));
         assert!(third_args.contains("repos/owner/repo/hooks/4242"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_persisted_hook_404_creates_and_atomically_replaces_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_registration(temp.path(), 9999);
+        let gh = write_gh_stub(temp.path(), GhStubMode::StalePatch404);
+        let mut registrar = stub_registrar(temp.path());
+
+        let hook_id = registrar
+            .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
+            .expect("replace stale hook");
+
+        assert_eq!(hook_id, 4242);
+        assert_eq!(registrar.all().get("owner/repo"), Some(&4242));
+        assert!(read_log(temp.path(), "args-1").contains("hooks/9999"));
+        assert!(read_log(temp.path(), "args-2").contains("--paginate --slurp"));
+        assert!(read_log(temp.path(), "args-3").contains("-X POST"));
+        assert_eq!(persisted_hook_id(temp.path()), 4242);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_persisted_hook_404_adopts_one_exact_url_and_replaces_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_registration(temp.path(), 9999);
+        let gh = write_gh_stub(temp.path(), GhStubMode::StalePatch404AdoptExact);
+        let mut registrar = stub_registrar(temp.path());
+
+        let hook_id = registrar
+            .ensure_registered_with_gh(
+                "owner/repo",
+                "https://example.test/webhook",
+                "rotated-secret",
+                &gh,
+            )
+            .expect("adopt exact replacement");
+
+        assert_eq!(hook_id, 7331);
+        assert!(read_log(temp.path(), "args-3").contains("hooks/7331"));
+        assert_eq!(persisted_hook_id(temp.path()), 7331);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_persisted_hook_keeps_old_id_when_replacement_patch_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_registration(temp.path(), 9999);
+        let gh = write_gh_stub(temp.path(), GhStubMode::StalePatch404AdoptFails);
+        let mut registrar = stub_registrar(temp.path());
+
+        let error = registrar
+            .ensure_registered_with_gh(
+                "owner/repo",
+                "https://example.test/webhook",
+                "rotated-secret",
+                &gh,
+            )
+            .expect_err("replacement patch must succeed before local commit");
+
+        assert!(matches!(error, RegistrarError::GhFailed { .. }));
+        assert_eq!(registrar.all().get("owner/repo"), Some(&9999));
+        assert_eq!(persisted_hook_id(temp.path()), 9999);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_persisted_hook_404_fails_closed_for_duplicate_exact_urls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_registration(temp.path(), 9999);
+        let gh = write_gh_stub(temp.path(), GhStubMode::StalePatch404Ambiguous);
+        let mut registrar = stub_registrar(temp.path());
+
+        let error = registrar
+            .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
+            .expect_err("ambiguous replacements must fail closed");
+
+        assert!(matches!(error, RegistrarError::AmbiguousRemoteHooks { .. }));
+        assert_eq!(registrar.all().get("owner/repo"), Some(&9999));
+        assert_eq!(persisted_hook_id(temp.path()), 9999);
+        assert!(!temp.path().join("args-3").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_hook_non_404_patch_failures_do_not_reconcile_or_replace_id() {
+        for mode in [
+            GhStubMode::StalePatch401,
+            GhStubMode::StalePatch403,
+            GhStubMode::StalePatch500,
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            write_registration(temp.path(), 9999);
+            let gh = write_gh_stub(temp.path(), mode);
+            let mut registrar = stub_registrar(temp.path());
+
+            let error = registrar
+                .ensure_registered_with_gh(
+                    "owner/repo",
+                    "https://example.test/webhook",
+                    "secret",
+                    &gh,
+                )
+                .expect_err("non-404 must fail closed");
+
+            assert!(matches!(
+                error,
+                RegistrarError::AuthDegraded { .. } | RegistrarError::GhFailed { .. }
+            ));
+            assert_eq!(registrar.all().get("owner/repo"), Some(&9999));
+            assert_eq!(persisted_hook_id(temp.path()), 9999);
+            assert!(!temp.path().join("args-2").exists());
+        }
     }
 
     #[cfg(unix)]
@@ -1148,6 +1427,13 @@ mod tests {
         AdoptPatchIncomplete,
         Ambiguous,
         WrongUrl,
+        StalePatch404,
+        StalePatch404AdoptExact,
+        StalePatch404AdoptFails,
+        StalePatch404Ambiguous,
+        StalePatch401,
+        StalePatch403,
+        StalePatch500,
         Delete404,
         MissingId,
         MissingWebhookScope,
@@ -1170,6 +1456,13 @@ mod tests {
             | GhStubMode::AdoptPatchIncomplete
             | GhStubMode::Ambiguous
             | GhStubMode::WrongUrl
+            | GhStubMode::StalePatch404
+            | GhStubMode::StalePatch404AdoptExact
+            | GhStubMode::StalePatch404AdoptFails
+            | GhStubMode::StalePatch404Ambiguous
+            | GhStubMode::StalePatch401
+            | GhStubMode::StalePatch403
+            | GhStubMode::StalePatch500
             | GhStubMode::Delete404
             | GhStubMode::MissingWebhookScope
             | GhStubMode::Unauthorized
@@ -1185,46 +1478,20 @@ mod tests {
             | GhStubMode::AdoptPatchIncomplete
             | GhStubMode::Ambiguous
             | GhStubMode::WrongUrl
+            | GhStubMode::StalePatch404
+            | GhStubMode::StalePatch404AdoptExact
+            | GhStubMode::StalePatch404AdoptFails
+            | GhStubMode::StalePatch404Ambiguous
+            | GhStubMode::StalePatch401
+            | GhStubMode::StalePatch403
+            | GhStubMode::StalePatch500
             | GhStubMode::MissingId
             | GhStubMode::MissingWebhookScope
             | GhStubMode::Unauthorized
             | GhStubMode::AnonRateLimit => "  *\" -X DELETE \"*) exit 0 ;;",
         };
-        let create_branch = match mode {
-            GhStubMode::MissingWebhookScope => String::from(
-                "  *\" -X POST \"*) printf 'missing scope: admin:repo_hook\\n' >&2; exit 1 ;;",
-            ),
-            GhStubMode::Unauthorized => String::from(
-                "  *\" -X POST \"*) printf 'HTTP 401: Bad credentials (https://api.github.com/repos/owner/repo/hooks)\\n' >&2; exit 1 ;;",
-            ),
-            GhStubMode::AnonRateLimit => String::from(
-                "  *\" -X POST \"*) printf 'HTTP 403: API rate limit exceeded for 203.0.113.7. (But here is the good news: Authenticated requests get a higher rate limit.)\\n' >&2; exit 1 ;;",
-            ),
-            GhStubMode::Ok
-            | GhStubMode::AdoptExisting
-            | GhStubMode::AdoptPatchFails
-            | GhStubMode::AdoptPatchIncomplete
-            | GhStubMode::Ambiguous
-            | GhStubMode::WrongUrl
-            | GhStubMode::Delete404
-            | GhStubMode::MissingId => {
-                format!("  *\" -X POST \"*) printf '%s\\n' '{create_response}' ;;")
-            }
-        };
-        let list_response = match mode {
-            GhStubMode::AdoptExisting
-            | GhStubMode::AdoptPatchFails
-            | GhStubMode::AdoptPatchIncomplete => {
-                r#"[[{"id":7331,"name":"web","active":false,"events":["push"],"config":{"url":"https://example.test/webhook"}}]]"#
-            }
-            GhStubMode::Ambiguous => {
-                r#"[[{"id":7332,"name":"web","config":{"url":"https://example.test/webhook"}},{"id":7331,"name":"web","config":{"url":"https://example.test/webhook"}}]]"#
-            }
-            GhStubMode::WrongUrl => {
-                r#"[[{"id":7331,"name":"web","config":{"url":"https://other.test/webhook"}}]]"#
-            }
-            _ => "[[]]",
-        };
+        let create_branch = gh_stub_create_branch(mode, create_response);
+        let list_response = gh_stub_list_response(mode);
         let script = format!(
             r#"#!/bin/sh
 set -eu
@@ -1247,21 +1514,79 @@ esac
             create_branch = create_branch,
             delete_branch = delete_branch,
             list_response = list_response,
-            patch_branch = match mode {
-                GhStubMode::AdoptPatchFails => {
-                    "printf 'patch failed\\n' >&2; exit 1 ;;"
-                }
-                GhStubMode::AdoptPatchIncomplete => {
-                    "printf '%s\\n' '{\"active\":true,\"events\":[\"push\"],\"config\":{\"url\":\"https://example.test/webhook\"}}' ;;"
-                }
-                _ => "cat \"$LOG_DIR/stdin-$COUNT\" ;;",
-            },
+            patch_branch = gh_stub_patch_branch(mode),
         );
         // Invoke a stable system executable and let it read a closed per-test
         // script from the isolated cwd. This avoids racing Linux exec against
         // a freshly generated executable while preserving the exact gh argv.
         fs::write(temp.join("api"), script).expect("write gh stub script");
         PathBuf::from("/bin/sh")
+    }
+
+    #[cfg(unix)]
+    fn gh_stub_create_branch(mode: GhStubMode, create_response: &str) -> String {
+        match mode {
+            GhStubMode::MissingWebhookScope => String::from(
+                "  *\" -X POST \"*) printf 'missing scope: admin:repo_hook\\n' >&2; exit 1 ;;",
+            ),
+            GhStubMode::Unauthorized => String::from(
+                "  *\" -X POST \"*) printf 'HTTP 401: Bad credentials (https://api.github.com/repos/owner/repo/hooks)\\n' >&2; exit 1 ;;",
+            ),
+            GhStubMode::AnonRateLimit => String::from(
+                "  *\" -X POST \"*) printf 'HTTP 403: API rate limit exceeded for 203.0.113.7. (But here is the good news: Authenticated requests get a higher rate limit.)\\n' >&2; exit 1 ;;",
+            ),
+            _ => format!("  *\" -X POST \"*) printf '%s\\n' '{create_response}' ;;"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn gh_stub_list_response(mode: GhStubMode) -> &'static str {
+        match mode {
+            GhStubMode::AdoptExisting
+            | GhStubMode::AdoptPatchFails
+            | GhStubMode::AdoptPatchIncomplete
+            | GhStubMode::StalePatch404AdoptExact
+            | GhStubMode::StalePatch404AdoptFails => {
+                r#"[[{"id":7331,"name":"web","active":false,"events":["push"],"config":{"url":"https://example.test/webhook"}}]]"#
+            }
+            GhStubMode::Ambiguous | GhStubMode::StalePatch404Ambiguous => {
+                r#"[[{"id":7332,"name":"web","config":{"url":"https://example.test/webhook"}},{"id":7331,"name":"web","config":{"url":"https://example.test/webhook"}}]]"#
+            }
+            GhStubMode::WrongUrl => {
+                r#"[[{"id":7331,"name":"web","config":{"url":"https://other.test/webhook"}}]]"#
+            }
+            _ => "[[]]",
+        }
+    }
+
+    #[cfg(unix)]
+    fn gh_stub_patch_branch(mode: GhStubMode) -> &'static str {
+        match mode {
+            GhStubMode::AdoptPatchFails => "printf 'patch failed\\n' >&2; exit 1 ;;",
+            GhStubMode::AdoptPatchIncomplete => {
+                "printf 'HTTP/2.0 200 OK\\r\\ncontent-type: application/json\\r\\n\\r\\n%s\\n' '{\"active\":true,\"events\":[\"push\"],\"config\":{\"url\":\"https://example.test/webhook\"}}' ;;"
+            }
+            GhStubMode::StalePatch404
+            | GhStubMode::StalePatch404AdoptExact
+            | GhStubMode::StalePatch404Ambiguous => {
+                "case \" $* \" in *\"hooks/9999\"*) printf 'HTTP/2.0 404 Not Found\\r\\ncontent-type: application/json\\r\\n\\r\\n{}\\n'; printf 'gh: Not Found (HTTP 404)\\n' >&2; exit 1 ;; *) printf 'HTTP/2.0 200 OK\\r\\ncontent-type: application/json\\r\\n\\r\\n'; cat \"$LOG_DIR/stdin-$COUNT\" ;; esac ;;"
+            }
+            GhStubMode::StalePatch404AdoptFails => {
+                "case \" $* \" in *\"hooks/9999\"*) printf 'HTTP/2.0 404 Not Found\\r\\ncontent-type: application/json\\r\\n\\r\\n{}\\n'; printf 'gh: Not Found (HTTP 404)\\n' >&2; exit 1 ;; *) printf 'HTTP/2.0 500 Internal Server Error\\r\\n\\r\\n'; printf 'replacement patch failed\\n' >&2; exit 1 ;; esac ;;"
+            }
+            GhStubMode::StalePatch401 => {
+                "printf 'HTTP/2.0 401 Unauthorized\\r\\n\\r\\n'; printf 'HTTP 401: Bad credentials\\n' >&2; exit 1 ;;"
+            }
+            GhStubMode::StalePatch403 => {
+                "printf 'HTTP/2.0 403 Forbidden\\r\\n\\r\\n'; printf 'HTTP 403: Forbidden\\n' >&2; exit 1 ;;"
+            }
+            GhStubMode::StalePatch500 => {
+                "printf 'HTTP/2.0 500 Internal Server Error\\r\\n\\r\\n'; printf 'HTTP 500: proxy preserved an earlier HTTP 404 diagnostic\\n' >&2; exit 1 ;;"
+            }
+            _ => {
+                "printf 'HTTP/2.0 200 OK\\r\\ncontent-type: application/json\\r\\n\\r\\n'; cat \"$LOG_DIR/stdin-$COUNT\" ;;"
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1277,5 +1602,29 @@ esac
     #[cfg(unix)]
     fn read_json_log(temp: &Path, name: &str) -> Value {
         serde_json::from_str(&read_log(temp, name)).expect(name)
+    }
+
+    #[cfg(unix)]
+    fn write_registration(temp: &Path, hook_id: u64) {
+        let path = temp.join("daemon/registrations.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "repo": "owner/repo",
+                "hook_id": hook_id,
+            }]))
+            .expect("serialize"),
+        )
+        .expect("registration");
+    }
+
+    #[cfg(unix)]
+    fn persisted_hook_id(temp: &Path) -> u64 {
+        let records: Value = serde_json::from_slice(
+            &fs::read(temp.join("daemon/registrations.json")).expect("registrations"),
+        )
+        .expect("records");
+        records[0]["hook_id"].as_u64().expect("hook id")
     }
 }
