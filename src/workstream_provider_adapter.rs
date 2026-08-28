@@ -153,12 +153,28 @@ fn handle_request(
     runner: &mut impl CmuxRunner,
 ) -> ProviderWrapperResponseV1 {
     if let Err(code) = validate_adapter_request(request) {
-        return response(request, rejected(code));
+        let outcome = match request.operation {
+            ProviderWrapperOperationV1::Submit => rejected(code),
+            ProviderWrapperOperationV1::Reconcile => uncertain(code),
+        };
+        return response(request, outcome);
     }
     match runner.verify() {
-        Err(RunnerFailure::Untrusted) => return response(request, rejected("cmux-untrusted")),
+        Err(RunnerFailure::Untrusted) => {
+            let outcome = match request.operation {
+                ProviderWrapperOperationV1::Submit => rejected("cmux-untrusted"),
+                ProviderWrapperOperationV1::Reconcile => uncertain("cmux-untrusted"),
+            };
+            return response(request, outcome);
+        }
         Err(RunnerFailure::Unavailable) => {
-            return response(request, retryable("cmux-unavailable-before-create"));
+            let outcome = match request.operation {
+                ProviderWrapperOperationV1::Submit => retryable("cmux-unavailable-before-create"),
+                ProviderWrapperOperationV1::Reconcile => {
+                    uncertain("cmux-unavailable-during-reconcile")
+                }
+            };
+            return response(request, outcome);
         }
         Ok(()) => {}
     }

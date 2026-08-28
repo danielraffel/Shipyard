@@ -6,6 +6,12 @@ use super::*;
 use crate::provider_wrapper::{
     FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderLaunchOptionsV1,
 };
+use crate::work_ledger::{
+    DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
+    FreshAgentResumeExpectation, NativePublicationRequest, ProviderAdapter, ProviderCapability,
+    ProviderLaunchRequest, ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult, WakeEnvelope,
+    WakeProfileResolver, WorkLedger,
+};
 
 const UUID: &str = "123E4567-E89B-12D3-A456-426614174000";
 const OTHER_WINDOW_UUID: &str = "923E4567-E89B-12D3-A456-426614174000";
@@ -445,4 +451,300 @@ fn untrusted_cmux_and_unsupported_provider_refuse_before_any_command() {
         ProviderWrapperOutcomeV1::Rejected { .. }
     ));
     assert!(runner.calls.is_empty());
+}
+
+#[test]
+fn reconcile_preflight_failures_preserve_uncertainty() {
+    let reconcile = request("codex", ProviderWrapperOperationV1::Reconcile);
+    for verification in [RunnerFailure::Unavailable, RunnerFailure::Untrusted] {
+        let mut runner = FakeRunner {
+            verification: Some(Err(verification)),
+            ..FakeRunner::default()
+        };
+        let response = handle_request(&reconcile, &mut runner);
+        assert!(matches!(
+            response.outcome,
+            ProviderWrapperOutcomeV1::Uncertain { .. }
+        ));
+        assert_eq!(
+            response.idempotency_key,
+            reconcile.delivery_fence.idempotency_key
+        );
+        assert!(runner.calls.is_empty());
+    }
+
+    let unsupported = request("other", ProviderWrapperOperationV1::Reconcile);
+    let mut runner = FakeRunner::default();
+    let response = handle_request(&unsupported, &mut runner);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(
+        response.idempotency_key,
+        unsupported.delivery_fence.idempotency_key
+    );
+    assert!(runner.calls.is_empty());
+}
+
+#[derive(Clone)]
+struct LedgerProfile {
+    digest: String,
+    bytes: Vec<u8>,
+}
+
+impl FreshAgentLaunchProfile for LedgerProfile {
+    fn provider_id(&self) -> &str {
+        "codex"
+    }
+
+    fn provider_launch_options(&self) -> FreshAgentProviderLaunchOptions {
+        FreshAgentProviderLaunchOptions {
+            model_id: Some("gpt-5.6-sol".to_owned()),
+        }
+    }
+
+    fn profile_digest(&self) -> crate::work_ledger::WorkLedgerResult<String> {
+        Ok(self.digest.clone())
+    }
+
+    fn permits_fresh_agent(&self) -> bool {
+        true
+    }
+
+    fn protected_profile_bytes(&self) -> crate::work_ledger::WorkLedgerResult<Vec<u8>> {
+        Ok(self.bytes.clone())
+    }
+
+    fn resume_expectation(&self) -> Option<FreshAgentResumeExpectation<'_>> {
+        Some(FreshAgentResumeExpectation {
+            workstream_handle: "GEN-43",
+            context_url: Some("https://linear.example/GEN-43"),
+            plan_sha256: "2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f",
+            root_revision: 0,
+            issue_revision: 0,
+            projection_revision: 1,
+            material_event_revision: 0,
+            checkpoint_id: "checkpoint-gen43",
+            checkpoint_generation: 1,
+            checkpoint_digest: "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f",
+            repository: "generous-corp/shipyard",
+            head_sha: "4444444444444444444444444444444444444444",
+            expected_resume_context_digest: "5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+            success_continuation_digest: "6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f",
+            failure_continuation_digest: "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+        })
+    }
+}
+
+struct LedgerResolver(LedgerProfile);
+
+impl WakeProfileResolver for LedgerResolver {
+    type Profile = LedgerProfile;
+
+    fn resolve(
+        &mut self,
+        _wake: &WakeEnvelope,
+    ) -> crate::work_ledger::WorkLedgerResult<Self::Profile> {
+        Ok(self.0.clone())
+    }
+}
+
+#[derive(Default)]
+struct LedgerCmuxAdapter {
+    launch_fence: Option<DeliveryFence>,
+    reconcile_fence: Option<DeliveryFence>,
+    wrapper_keys: Vec<String>,
+    create_count: usize,
+}
+
+impl LedgerCmuxAdapter {
+    fn wrapper_request(
+        fence: &DeliveryFence,
+        operation: ProviderWrapperOperationV1,
+    ) -> ProviderWrapperRequestV1 {
+        let mut request = request("codex", operation);
+        request.delivery_fence = ProviderDeliveryFenceV1 {
+            wake_id: fence.wake_id.clone(),
+            work_item_id: fence.work_item_id.clone(),
+            work_generation: fence.work_generation,
+            owner_generation: fence.owner_generation,
+            route_ref: fence.route_ref.clone(),
+            payload_digest: fence.payload_digest.clone(),
+            attempt: fence.attempt,
+            consumer_epoch: fence.consumer_epoch,
+            consumer_owner_ref: fence.consumer_owner_ref.clone(),
+            idempotency_key: String::new(),
+        };
+        request.delivery_fence.bind_idempotency_key();
+        request
+    }
+
+    fn map(response: ProviderWrapperResponseV1) -> ProviderOutcome {
+        match response.outcome {
+            ProviderWrapperOutcomeV1::Delivered { .. } => ProviderOutcome::Delivered {
+                receipt: b"delivered".to_vec(),
+            },
+            ProviderWrapperOutcomeV1::Retryable { .. } => ProviderOutcome::Retryable {
+                evidence: b"retryable".to_vec(),
+            },
+            ProviderWrapperOutcomeV1::Uncertain { .. } => ProviderOutcome::Uncertain {
+                evidence: b"uncertain".to_vec(),
+            },
+            ProviderWrapperOutcomeV1::Rejected { .. } => ProviderOutcome::Rejected {
+                evidence: b"rejected".to_vec(),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for LedgerCmuxAdapter {
+    fn capability(&self, provider_id: &str) -> Option<ProviderCapability> {
+        (provider_id == "codex").then(|| ProviderCapability {
+            adapter_id: ADAPTER_ID.to_owned(),
+            fresh_agent_launch: true,
+            idempotent_launch: true,
+        })
+    }
+
+    fn launch(&mut self, launch: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+        self.launch_fence = Some(launch.fence.clone());
+        let request = Self::wrapper_request(launch.fence, ProviderWrapperOperationV1::Submit);
+        self.wrapper_keys
+            .push(request.delivery_fence.idempotency_key.clone());
+        let mut runner = FakeRunner {
+            results: VecDeque::from([
+                windows(&[UUID]),
+                list(serde_json::json!([])),
+                Err(RunnerFailure::Unavailable),
+            ]),
+            ..FakeRunner::default()
+        };
+        let response = handle_request(&request, &mut runner);
+        self.create_count += runner
+            .calls
+            .iter()
+            .filter(|call| {
+                call.get(3..5) == Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+            })
+            .count();
+        Self::map(response)
+    }
+
+    fn reconcile(&mut self, fence: &DeliveryFence) -> ProviderOutcome {
+        self.reconcile_fence = Some(fence.clone());
+        let request = Self::wrapper_request(fence, ProviderWrapperOperationV1::Reconcile);
+        self.wrapper_keys
+            .push(request.delivery_fence.idempotency_key.clone());
+        let mut runner = FakeRunner {
+            verification: Some(Err(RunnerFailure::Unavailable)),
+            ..FakeRunner::default()
+        };
+        let response = handle_request(&request, &mut runner);
+        assert!(runner.calls.is_empty());
+        Self::map(response)
+    }
+}
+
+#[test]
+fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
+    let temp = tempfile::tempdir().expect("temp");
+    let profile_bytes = b"strict-test-profile".to_vec();
+    let profile_digest = hex::encode(Sha256::digest(&profile_bytes));
+    let policy = crate::workstream_continuation_config::WorkstreamContinuationConfig {
+        origin_machine: "m5".to_owned(),
+        repositories: vec!["generous-corp/shipyard".to_owned()],
+        provider_wrapper: ProviderWrapperConfig {
+            executable_path: PathBuf::from("/opt/shipyard/cmux-provider"),
+            executable_sha256: "8".repeat(64),
+            provider_id: "codex".to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            deadline_seconds: 15,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 65_536,
+        },
+    };
+    let publication = NativePublicationRequest {
+        repository: "generous-corp/shipyard".to_owned(),
+        pull_request: 43,
+        head_sha: "4".repeat(40),
+        workstream_handle: "GEN-43".to_owned(),
+        context_url: Some("https://linear.example/GEN-43".to_owned()),
+        origin_machine: "m5".to_owned(),
+        owner_id: "owner-gen43".to_owned(),
+        owner_generation: 1,
+        agent_provider: "codex".to_owned(),
+        agent_session_id: "session-gen43".to_owned(),
+        route_id: "route-gen43".to_owned(),
+        profile_generation: 1,
+        profile_revision: 1,
+        profile_provider: "codex".to_owned(),
+        profile_digest: profile_digest.clone(),
+        protected_profile_bytes: profile_bytes.clone(),
+        success_continuation_digest: "6".repeat(64),
+        failure_continuation_digest: "7".repeat(64),
+    };
+    let report =
+        WorkLedger::plan_or_apply_native_continuation(temp.path(), &publication, &policy, true)
+            .expect("publish wake");
+    let profile = LedgerProfile {
+        digest: profile_digest,
+        bytes: profile_bytes,
+    };
+    let mut resolver = LedgerResolver(profile.clone());
+    let mut adapter = LedgerCmuxAdapter::default();
+    let ledger = WorkLedger::open_existing(temp.path())
+        .expect("open ledger")
+        .expect("ledger exists");
+    let consumer = WakeConsumerPolicy {
+        activation_enabled: true,
+        dispatch_enabled: true,
+        authorized_repositories: vec!["generous-corp/shipyard".to_owned()],
+    };
+    assert_eq!(
+        ledger
+            .consume_one_wake(consumer.clone(), &mut resolver, &mut adapter)
+            .expect("uncertain submit"),
+        WakeDeliveryResult::Uncertain
+    );
+    drop(ledger);
+
+    let reopened = WorkLedger::open_existing(temp.path())
+        .expect("reopen ledger")
+        .expect("ledger exists");
+    assert_eq!(
+        reopened
+            .reconcile_uncertain_wake(&consumer, &report.wake_id, &mut adapter)
+            .expect("unavailable reconciliation"),
+        WakeDeliveryResult::Uncertain
+    );
+    drop(reopened);
+
+    let reopened = WorkLedger::open_existing(temp.path())
+        .expect("reopen after reconciliation")
+        .expect("ledger exists");
+    assert_eq!(
+        reopened
+            .next_uncertain_wake_id(&consumer)
+            .expect("uncertain selection"),
+        Some(report.wake_id.clone())
+    );
+    let mut resolver = LedgerResolver(profile);
+    assert_eq!(
+        reopened
+            .consume_one_wake(consumer, &mut resolver, &mut adapter)
+            .expect("no pending retry"),
+        WakeDeliveryResult::Empty
+    );
+    let launch_fence = adapter.launch_fence.as_ref().expect("launch fence");
+    let reconcile_fence = adapter.reconcile_fence.as_ref().expect("reconcile fence");
+    assert_eq!(launch_fence.attempt, 1);
+    assert_eq!(reconcile_fence.attempt, 1);
+    assert_eq!(
+        launch_fence.idempotency_key,
+        reconcile_fence.idempotency_key
+    );
+    assert_eq!(adapter.wrapper_keys.len(), 2);
+    assert_eq!(adapter.wrapper_keys[0], adapter.wrapper_keys[1]);
+    assert_eq!(adapter.create_count, 1);
 }

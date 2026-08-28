@@ -64,6 +64,8 @@ pub(crate) use dispatch::{
     FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
     ProviderOutcome, StoredProviderRequest, WakeConsumerPolicy, WakeDeliveryResult,
 };
+#[cfg(test)]
+pub(crate) use dispatch::{WakeEnvelope, WakeProfileResolver};
 mod lifecycle;
 mod native_publication;
 mod observation;
