@@ -128,14 +128,28 @@ Before any scheduler or shard integration is enabled:
 M5 must never be a required shard while roaming. Its availability is additive,
 not part of the minimum completion set.
 
-## Logs and retention
+## Measurements, logs, and retention
 
-Future integration must write bounded structured records containing artifact
-and manifest digests, source head/tree, producer fence, source/destination host,
-LAN or tailnet route, cache hits/misses by generation, bytes total/reused/sent,
-verified resume offset, setup/transfer/verification duration, free-space
-observation, outcome, and reassignment reason. Never log credentials or raw
-rsync environment.
+`parallel_proof_canary_receipt` now defines the compact, shadow-only measurement
+record for the first Pulp macOS canary. It binds the complete proof-manifest
+digest, repository/head/tree, encoded artifact and layout digests, exact builder
+and worker observations plus session generations, authenticated LAN route, full/resumed/object-
+reuse byte accounting, exact cache generations, and a clearly labeled
+untrusted claim of avoided bytes retained only for later reconciliation. Setup/
+transfer/verification/dispatch/shard/worker timings, submit-to-receipt wall
+clock, and the digest of a separately validated same-proof single-host control
+receipt. Routine canaries require
+`model_calls=0`. The receipt reports the 120-second-and-10-percent speed floor
+and 15-percent transport-overhead ceiling without becoming merge authority.
+The speed gate does not consume the cache-byte claim. Promotion-grade avoided-
+byte evidence still requires a controller-owned cache measurement receipt.
+
+This is a pure receipt schema, not a persistence claim. Integration must publish
+its domain-separated digest and exact bytes through a controller-owned,
+crash-consistent immutable store before calling the evidence retained. Never
+log credentials, private paths, or raw rsync environment. Failed and reassigned
+attempts still need bounded transition records; they must not be rewritten into
+a successful compact receipt.
 
 Rotate transfer logs with Shipyard's bounded log-retention primitives. Keep the
 terminal receipt and compact metrics longer than verbose transport logs; retain

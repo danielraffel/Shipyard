@@ -781,6 +781,16 @@ as though no destination exists.
 The proof does not select a host or dispatch a shard. A roaming/offline worker
 is additive only and must be excluded or reassigned without blocking the
 minimum completion set.
+The pure `parallel_proof_canary_receipt` schema records exact proof/artifact,
+exact admitted host observations/session generations, route, transfer/resume/
+object-reuse bytes, exact cache-generation use, worker-minutes, wall-time evidence,
+and a separately validated same-proof control-receipt digest. It requires zero model calls,
+reports the measured speed/overhead gate, and never authorizes a merge. A
+receipt digest alone is not durable publication; persist its exact bytes through
+the controller-owned immutable record store before claiming retained evidence.
+Avoided cache bytes remain an explicitly untrusted diagnostic claim and are
+excluded from the speed gate until a controller-owned cache measurement receipt
+binds them.
 Follow [`docs/artifact-transport.md`](../../docs/artifact-transport.md) before
 integrating it with a scheduler.
 
