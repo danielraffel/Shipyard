@@ -127,12 +127,52 @@ not participate at all; drain them and prove exact-binary fleet convergence
 before trusting the audit.
 
 On macOS, advisory-lock contention can briefly appear before `lsof` reports its
-holder. The guardian may observe only that exact no-holder/contended state for a
-bounded stable-idle window while continuously fencing the production PID/start
-identity, binary hash, configuration, and active-worker set. Any reported holder,
-identity drift, new worker, persistent contention, or deadline remains a hard
-failure. Sandbox failure artifacts must stay inside the explicit canary or
-runner temp root; never glob protected system temp trees.
+holder, and a corrected daemon can briefly be the sole reported holder while it
+finishes one mutation-scoped write. The guardian may observe only those exact
+no-holder or production-PID-only contended states for a bounded stable-idle
+window while continuously fencing the production PID/start identity, binary
+hash, configuration, and active-worker set. Stable idle selects the corrected
+preserve path. Only uninterrupted exact production-PID ownership through the
+bound plus exact IPC-reported running-daemon version `0.108.1` selects the legacy
+quiesce/restore path, and the current installed artifact must independently
+report that same exact version before a destructive stop so restoration is
+possible. The post-observation peer, disk-version, identity, and final-holder
+proofs share one aggregate deadline so guardian readiness remains within the
+workflow receipt budget. Known-corrected, unknown, or running/disk-mismatched versions fail closed under
+persistent contention and are never stopped on duration alone. Any
+foreign/additional or missing holder sample, identity drift, new worker,
+changing or ambiguous ownership, or deadline that does not prove one of those
+two states remains a hard failure. Production stop/control must run from stable
+`/` with explicit production state
+authority, never from a repository checkout that can be unavailable.
+Restore retries must adopt an already-live
+exact matching production daemon before spawning, but only after bounded
+same-connection macOS `LOCAL_PEERPID`-fenced IPC status response and original
+stdio identity proof, with repository, version, and active-worker probes all
+bound to the explicit production state root rather than candidate or HOME
+defaults, so a
+post-spawn verification error cannot launch a duplicate or accept a
+hung/misdirected process. Retain a live/uncertain restore child across cleanup
+retries, but clear a child only after its exit is authoritative so the next
+retry can replace it. Retain the machine-wide canary lease from any production
+stop request across partial quiesce or restore failure and in the final failure
+receipt; release it only after exact
+production identity is verified, so another canary cannot overlap an uncertain
+detached restore child. Before adopting a different exact production daemon, terminate and
+authoritatively reap Shipyard's own retained restore child so it cannot later
+acquire the lifetime lock and replace the verified owner. A restored v0.108.1
+daemon must report that exact version over same-peer IPC and additionally prove
+stable PID-only kernel contention on its lifetime lock before the guardian
+releases the host lease, with repository/worker authority and exact process
+identity revalidated after the lock proof. IPC readiness or an open descriptor
+alone is not enough. After any stop request, never adopt the original PID/start
+generation as restored while it remains alive; wait boundedly for it to exit,
+then spawn or adopt only a different exact generation. If the corrected daemon
+was never stopped and the canary fails before its mutation-fence audit, recover
+by proving the exact unchanged production identity and stable idle state without
+misreporting the mutation fence as passed, then release the lease. Sandbox failure
+artifacts must stay inside the explicit canary or runner temp root; never glob
+protected system temp trees.
 
 After cleanup, treat a single daemon IPC status miss as an observation rather
 than proof of death: use a bounded status window that continuously rechecks the

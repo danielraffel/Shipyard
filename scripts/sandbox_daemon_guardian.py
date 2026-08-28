@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -29,6 +30,25 @@ class GuardianError(RuntimeError):
     """Fail-closed canary transaction error."""
 
 
+class RetainedWriterDomain(GuardianError):
+    """The production writer domain remained contended through an idle wait."""
+
+    def __init__(
+        self,
+        holders: tuple[int, ...],
+        *,
+        continuously_contended: bool,
+        continuous_production_ownership: bool,
+    ) -> None:
+        self.holders = holders
+        self.continuously_contended = continuously_contended
+        self.continuous_production_ownership = continuous_production_ownership
+        super().__init__(
+            "production daemon retained the writer-domain lock through the "
+            f"bounded idle wait: {holders!r}"
+        )
+
+
 class OwnerEnded(RuntimeError):
     """The Actions owner exited or was cancelled before writing done."""
 
@@ -38,6 +58,7 @@ CORRECTED_TRANSITION = "corrected-idle-preserve-fence"
 WRITER_DOMAIN_OVERLAP_EXIT_CODE = 75
 WRITER_DOMAIN_OVERLAP_CLASSIFICATION = "sandbox_writer_domain_overlap"
 PROTECTED_STDIO_PATH_ENV = "SHIPYARD_PROTECTED_STDIO_PATH"
+LEGACY_LIFETIME_LOCK_VERSION = "0.108.1"
 
 
 @dataclass(frozen=True)
@@ -429,7 +450,8 @@ def _wait_for_idle_writer_domain(
     timeout: float = 10.0,
     poll_interval: float = 0.1,
     stable_observations: int = 3,
-    verify_production: Optional[Callable[[float], object]] = None,
+    initial_holders: Optional[tuple[int, ...]] = None,
+    verify_production: Optional[Callable[[Optional[float]], object]] = None,
     diagnostic_root: Optional[Path] = None,
 ) -> None:
     """Distinguish a transient production mutation from a lifetime lock.
@@ -443,12 +465,17 @@ def _wait_for_idle_writer_domain(
     deadline = time.monotonic() + timeout
     stable = 0
     last_holders: tuple[int, ...] = ()
+    continuously_contended = True
+    continuous_production_ownership = (
+        initial_holders == (production_pid,) if initial_holders is not None else True
+    )
 
     def fail_if_expired() -> None:
         if time.monotonic() >= deadline:
-            raise GuardianError(
-                "corrected daemon retained the writer-domain lock through the "
-                f"bounded idle wait: {last_holders!r}"
+            raise RetainedWriterDomain(
+                last_holders,
+                continuously_contended=continuously_contended,
+                continuous_production_ownership=continuous_production_ownership,
             )
 
     while True:
@@ -467,6 +494,8 @@ def _wait_for_idle_writer_domain(
             diagnostic_root=diagnostic_root,
         )
         last_holders = holders
+        if holders != (production_pid,):
+            continuous_production_ownership = False
         foreign_holders = tuple(pid for pid in holders if pid != production_pid)
         if foreign_holders:
             raise GuardianError(
@@ -474,8 +503,11 @@ def _wait_for_idle_writer_domain(
                 f"{foreign_holders!r}"
             )
         if not _exclusive_lock_is_contended(path):
+            continuously_contended = False
             stable += 1
             if stable >= stable_observations:
+                if verify_production is not None:
+                    verify_production(deadline)
                 fail_if_expired()
                 return
         else:
@@ -498,6 +530,124 @@ def _select_transition(
         "ambiguous production writer-domain state: "
         f"pid={production_pid}, holders={holders!r}, contended={contended}"
     )
+
+
+def _select_transition_after_bounded_observation(
+    path: Path,
+    production_pid: int,
+    holders: tuple[int, ...],
+    contended: bool,
+    *,
+    verify_production: Optional[Callable[[Optional[float]], object]] = None,
+    installed_version: Optional[Callable[[Optional[float]], str]] = None,
+    diagnostic_root: Optional[Path] = None,
+) -> str:
+    """Classify a contended production-only lock without guessing its lifetime.
+
+    A corrected daemon can momentarily look exactly like a legacy daemon while
+    it persists one mutation.  Stable idle observations prove the corrected
+    path; continuous, exact production ownership through the bounded window
+    proves the compatibility quiesce/restore path.
+    """
+    if not contended or holders not in ((), (production_pid,)):
+        return _select_transition(production_pid, holders, contended)
+    try:
+        _wait_for_idle_writer_domain(
+            path,
+            production_pid,
+            initial_holders=holders,
+            verify_production=verify_production,
+            diagnostic_root=diagnostic_root,
+        )
+    except RetainedWriterDomain as error:
+        if (
+            error.holders != (production_pid,)
+            or not error.continuously_contended
+            or not error.continuous_production_ownership
+        ):
+            raise GuardianError(
+                "ambiguous production writer-domain state after bounded observation: "
+                f"pid={production_pid}, holders={error.holders!r}, "
+                f"continuously_contended={error.continuously_contended}, "
+                "continuous_production_ownership="
+                f"{error.continuous_production_ownership}"
+            ) from error
+        if installed_version is None:
+            raise GuardianError(
+                "persistent production writer-domain ownership lacks trusted "
+                "installed-version evidence"
+            ) from error
+        final_deadline = time.monotonic() + 15.0
+        version = installed_version(final_deadline)
+        if version != LEGACY_LIFETIME_LOCK_VERSION:
+            raise GuardianError(
+                "persistent production writer-domain ownership is not a known "
+                f"legacy lifetime-lock build: version={version!r}"
+            ) from error
+        if verify_production is not None:
+            verify_production(final_deadline)
+        final_holders = _lock_holders(
+            path,
+            deadline=final_deadline,
+            retry_after_timeout=verify_production,
+            diagnostic_root=diagnostic_root,
+        )
+        final_contended = _exclusive_lock_is_contended(path)
+        if verify_production is not None:
+            verify_production(final_deadline)
+        _bounded_timeout(final_deadline)
+        if final_holders == (production_pid,) and final_contended:
+            return LEGACY_TRANSITION
+        raise GuardianError(
+            "ambiguous production writer-domain state after bounded observation: "
+            f"pid={production_pid}, holders={final_holders!r}, "
+            f"contended={final_contended}"
+        ) from error
+    return CORRECTED_TRANSITION
+
+
+def _running_daemon_version(
+    snapshot: ProcessSnapshot,
+    installed: Path,
+    state_dir: Path,
+    deadline: Optional[float] = None,
+) -> str:
+    status = _peer_verified_daemon_status(
+        state_dir, snapshot.pid, deadline=deadline
+    )
+    version = status.get("shipyard_version")
+    if status.get("running") is not True or not isinstance(version, str) or not version:
+        raise GuardianError("production daemon did not report a trusted running version")
+    installed_version = _installed_cli_version(
+        snapshot, installed, deadline=deadline
+    )
+    if installed_version != version:
+        raise GuardianError(
+            "running and installed Shipyard versions differ: "
+            f"running={version!r}, installed={installed_version!r}"
+        )
+    return version
+
+
+def _installed_cli_version(
+    snapshot: ProcessSnapshot,
+    installed: Path,
+    *,
+    deadline: Optional[float] = None,
+) -> str:
+    environment = dict(snapshot.environment)
+    environment.pop(PROTECTED_STDIO_PATH_ENV, None)
+    result = _run(
+        [str(installed), "--version"],
+        cwd="/",
+        env=environment,
+        timeout=_bounded_timeout(deadline),
+    )
+    prefix = "shipyard "
+    output = result.stdout.strip()
+    if not output.startswith(prefix) or not output[len(prefix) :]:
+        raise GuardianError(f"installed Shipyard returned invalid version: {output!r}")
+    return output[len(prefix) :]
 
 
 def _repo_args(argv: tuple[str, ...]) -> tuple[str, ...]:
@@ -558,16 +708,72 @@ def _json_command(
     return value
 
 
+def _peer_verified_daemon_status(
+    state_dir: Path,
+    expected_pid: int,
+    *,
+    deadline: Optional[float] = None,
+) -> dict[str, object]:
+    """Read status over the same Unix connection whose peer PID is verified."""
+    operation_deadline = deadline if deadline is not None else time.monotonic() + 15.0
+    socket_path = state_dir / "daemon" / "daemon.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(_bounded_timeout(operation_deadline))
+        connection.connect(str(socket_path))
+        peer_pid = connection.getsockopt(0, 2)  # macOS SOL_LOCAL / LOCAL_PEERPID
+        if peer_pid != expected_pid:
+            raise GuardianError(
+                f"daemon socket peer pid differs: expected={expected_pid}, actual={peer_pid}"
+            )
+        connection.settimeout(_bounded_timeout(operation_deadline))
+        connection.sendall(b'{"type":"status"}\n')
+        buffered = b""
+        while True:
+            connection.settimeout(_bounded_timeout(operation_deadline))
+            chunk = connection.recv(65536)
+            if not chunk:
+                raise GuardianError("daemon socket closed before a status frame")
+            buffered += chunk
+            if len(buffered) > 1024 * 1024:
+                raise GuardianError("daemon status response exceeded one MiB")
+            while b"\n" in buffered:
+                raw_line, buffered = buffered.split(b"\n", 1)
+                try:
+                    frame = json.loads(raw_line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise GuardianError("daemon socket returned invalid JSON") from error
+                if not isinstance(frame, dict):
+                    raise GuardianError("daemon socket returned a non-object frame")
+                frame_type = frame.get("type")
+                if frame_type == "hello":
+                    continue
+                if frame_type != "status":
+                    raise GuardianError(
+                        f"daemon socket returned unexpected frame: {frame_type!r}"
+                    )
+                if connection.getsockopt(0, 2) != expected_pid:
+                    raise GuardianError("daemon socket peer pid changed during status read")
+                # A same-connection status frame is the daemon's readiness
+                # proof. `running` is a CLI wrapper field, not part of the raw
+                # v0.108.1-compatible IPC payload.
+                return {**frame, "running": True}
+
+
 def _active_runs(
     snapshot: ProcessSnapshot,
     installed: Path,
     *,
+    state_dir: Path,
     deadline: Optional[float] = None,
     diagnostic_root: Optional[Path] = None,
 ) -> tuple[str, ...]:
     status = _json_command(
         snapshot,
         installed,
+        "--mode",
+        "shipyard",
+        "--state-dir",
+        str(state_dir),
         "status",
         deadline=deadline,
         diagnostic_root=diagnostic_root,
@@ -584,14 +790,19 @@ def _configured_repos(
     *,
     deadline: Optional[float] = None,
     diagnostic_root: Optional[Path] = None,
+    state_dir: Optional[Path] = None,
 ) -> tuple[str, ...]:
-    status = _json_command(
-        snapshot,
-        installed,
-        "daemon",
-        "status",
-        deadline=deadline,
-        diagnostic_root=diagnostic_root,
+    status = (
+        _peer_verified_daemon_status(state_dir, snapshot.pid, deadline=deadline)
+        if state_dir is not None
+        else _json_command(
+            snapshot,
+            installed,
+            "daemon",
+            "status",
+            deadline=deadline,
+            diagnostic_root=diagnostic_root,
+        )
     )
     configured = status.get("configured_repos")
     if isinstance(configured, list):
@@ -627,6 +838,7 @@ def run_lifecycle(
         failure = error
 
     cleanup_failures: list[str] = []
+    restoration_failed = False
     for enabled, name, action in (
         (candidate_started, "stop candidate", stop_candidate),
         (quiesced, "restore production", restore),
@@ -634,10 +846,14 @@ def run_lifecycle(
     ):
         if not enabled:
             continue
+        if name == "release lease" and restoration_failed:
+            continue
         try:
             action()
         except Exception as error:
             cleanup_failures.append(f"{name}: {type(error).__name__}: {error}")
+            if name == "restore production":
+                restoration_failed = True
 
     if cleanup_failures:
         prefix = f"{type(failure).__name__}: {failure}; " if failure else ""
@@ -659,6 +875,7 @@ class Guardian:
         self.final_receipt = Path(args.final_receipt)
         self.lease_dir = Path(args.lease_dir)
         self.production_pid_file = Path(args.production_pid_file)
+        self.production_state_dir = self.production_pid_file.parent.parent
         self.audit_ready_file = self.root / "exclusive-audit-ready"
         self.mutation_receipt = self.root / "mutation-fence.json"
         self.mutation_guard_path = (
@@ -668,11 +885,13 @@ class Guardian:
         self.mutation_probe_output = self.root / "unexpected-mutation-ran"
         self.snapshot: Optional[ProcessSnapshot] = None
         self.candidate_process: Optional[subprocess.Popen] = None
+        self.restoration_process: Optional[subprocess.Popen] = None
         self.restored_pid: Optional[int] = None
         self.final_production_start_time: Optional[str] = None
         self.owner_start = _process_start(args.owner_pid)
         self.stop_requested = False
         self.lease_owned = False
+        self.production_stop_requested = False
         self.production_quiesced = False
         self.production_restored = False
         self.production_preserved = False
@@ -708,12 +927,18 @@ class Guardian:
         self.installed_hash = _sha256(self.installed)
         self.candidate_hash = _sha256(self.candidate)
         self.configured_repos = _configured_repos(
-            snapshot, self.installed, diagnostic_root=self.root
+            snapshot,
+            self.installed,
+            diagnostic_root=self.root,
+            state_dir=self.production_state_dir,
         )
         if self.configured_repos != _repo_args(snapshot.argv):
             raise GuardianError("daemon status configured_repos disagrees with exact argv")
         self.worker_ids = _active_runs(
-            snapshot, self.installed, diagnostic_root=self.root
+            snapshot,
+            self.installed,
+            state_dir=self.production_state_dir,
+            diagnostic_root=self.root,
         )
         if self.worker_ids:
             raise GuardianError(
@@ -726,33 +951,38 @@ class Guardian:
             diagnostic_root=self.root,
         )
         old_contended = _exclusive_lock_is_contended(self.lock_path)
-        if not old_holders and old_contended:
-            # lsof can briefly lag an advisory-lock owner. Treat this one
-            # otherwise-unclassifiable state as a bounded observation window,
-            # while continuously fencing the exact production identity and
-            # allowing only the exact production PID to finish a transient
-            # mutation. Every other ambiguous state still fails immediately in
-            # _select_transition.
-            _wait_for_idle_writer_domain(
-                self.lock_path,
-                snapshot.pid,
-                verify_production=self.verify_unchanged_production,
-                diagnostic_root=self.root,
-            )
-            self.transition_path = CORRECTED_TRANSITION
-        else:
-            self.transition_path = _select_transition(
-                snapshot.pid,
-                old_holders,
-                old_contended,
-            )
+        self.transition_path = _select_transition_after_bounded_observation(
+            self.lock_path,
+            snapshot.pid,
+            old_holders,
+            old_contended,
+            verify_production=self.verify_unchanged_production,
+            installed_version=lambda deadline: _running_daemon_version(
+                snapshot,
+                self.installed,
+                self.production_state_dir,
+                deadline=deadline,
+            ),
+            diagnostic_root=self.root,
+        )
         self.old_lifetime_lock_owned = self.transition_path == LEGACY_TRANSITION
         if self.transition_path == CORRECTED_TRANSITION:
             return
 
+        # Arm restoration before invoking the CLI: it can send stop IPC and
+        # then time out before returning, while production exits asynchronously.
+        self.production_stop_requested = True
         stop_result = _run(
-            [str(self.installed), "--mode", "shipyard", "daemon", "stop"],
-            cwd=snapshot.cwd,
+            [
+                str(self.installed),
+                "--mode",
+                "shipyard",
+                "--state-dir",
+                str(self.production_state_dir),
+                "daemon",
+                "stop",
+            ],
+            cwd="/",
             env=snapshot.environment,
             check=False,
         )
@@ -877,7 +1107,11 @@ class Guardian:
             time.sleep(0.25)
 
     def assert_process_identity(
-        self, actual: ProcessSnapshot, *, require_same_pid: bool
+        self,
+        actual: ProcessSnapshot,
+        *,
+        require_same_pid: bool,
+        require_same_stdio: bool = False,
     ) -> None:
         expected = self.snapshot
         if expected is None:
@@ -893,6 +1127,12 @@ class Guardian:
             or actual.cwd != expected.cwd
         ):
             raise GuardianError("production daemon process identity differs from snapshot")
+        if require_same_stdio and (
+            actual.stdin_path != expected.stdin_path
+            or actual.stdout_path != expected.stdout_path
+            or actual.stderr_path != expected.stderr_path
+        ):
+            raise GuardianError("restored daemon stdio identity differs from snapshot")
 
     def verify_unchanged_production(
         self, deadline: Optional[float] = None
@@ -916,6 +1156,7 @@ class Guardian:
                 self.installed,
                 deadline=deadline,
                 diagnostic_root=self.root,
+                state_dir=self.production_state_dir,
             )
             != self.configured_repos
         ):
@@ -926,6 +1167,7 @@ class Guardian:
             _active_runs(
                 current,
                 self.installed,
+                state_dir=self.production_state_dir,
                 deadline=deadline,
                 diagnostic_root=self.root,
             )
@@ -996,13 +1238,21 @@ class Guardian:
         self.assert_process_identity(current, require_same_pid=True)
         if (
             _configured_repos(
-                current, self.installed, diagnostic_root=self.root
+                current,
+                self.installed,
+                diagnostic_root=self.root,
+                state_dir=self.production_state_dir,
             )
             != self.configured_repos
         ):
             raise GuardianError("corrected production configured repositories changed")
         if (
-            _active_runs(current, self.installed, diagnostic_root=self.root)
+            _active_runs(
+                current,
+                self.installed,
+                state_dir=self.production_state_dir,
+                diagnostic_root=self.root,
+            )
             != self.worker_ids
         ):
             raise GuardianError("corrected production active workers changed")
@@ -1072,11 +1322,13 @@ class Guardian:
         else:
             self.restore_legacy_production()
 
-    def verify_preserved_production(self) -> None:
+    def verify_preserved_production(
+        self, *, require_mutation_fence: bool = True
+    ) -> None:
         snapshot = self.snapshot
         if snapshot is None:
             raise GuardianError("production snapshot is unavailable")
-        if not self.mutation_fence_proved:
+        if require_mutation_fence and not self.mutation_fence_proved:
             raise GuardianError("corrected transition lacks exclusive-audit mutation proof")
         if _sha256(self.installed) != self.installed_hash:
             raise GuardianError("installed production binary changed during canary")
@@ -1087,13 +1339,21 @@ class Guardian:
         self.assert_process_identity(current, require_same_pid=True)
         if (
             _configured_repos(
-                current, self.installed, diagnostic_root=self.root
+                current,
+                self.installed,
+                diagnostic_root=self.root,
+                state_dir=self.production_state_dir,
             )
             != self.configured_repos
         ):
             raise GuardianError("preserved configured repository authority differs")
         if (
-            _active_runs(current, self.installed, diagnostic_root=self.root)
+            _active_runs(
+                current,
+                self.installed,
+                state_dir=self.production_state_dir,
+                diagnostic_root=self.root,
+            )
             != self.worker_ids
         ):
             raise GuardianError("preserved active worker ownership differs")
@@ -1115,72 +1375,256 @@ class Guardian:
             return
         if _sha256(self.installed) != self.installed_hash:
             raise GuardianError("installed production binary changed during canary")
-        stdin = open(snapshot.stdin_path, "rb", buffering=0)
-        stdout = open(snapshot.stdout_path, "ab", buffering=0)
-        stderr = stdout if snapshot.stderr_path == snapshot.stdout_path else open(
-            snapshot.stderr_path, "ab", buffering=0
-        )
-        process = subprocess.Popen(
-            list(snapshot.argv),
-            executable=snapshot.executable,
-            cwd=snapshot.cwd,
-            env=snapshot.environment,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
-        )
+        try:
+            existing_pid = int(
+                self.production_pid_file.read_text(encoding="utf-8").strip()
+            )
+        except (FileNotFoundError, ValueError):
+            existing_pid = None
+        if existing_pid is not None and _pid_alive(existing_pid):
+            same_stop_requested_generation = False
+            if self.production_stop_requested and existing_pid == snapshot.pid:
+                current_generation = snapshot_process(existing_pid)
+                same_stop_requested_generation = (
+                    current_generation.start_time == snapshot.start_time
+                )
+            if same_stop_requested_generation:
+                stop_deadline = time.monotonic() + 15.0
+                while _pid_alive(existing_pid) and time.monotonic() < stop_deadline:
+                    time.sleep(0.1)
+                if _pid_alive(existing_pid):
+                    raise GuardianError(
+                        f"stop-requested production pid {existing_pid} is still exiting"
+                    )
+            else:
+                retained = self.restoration_process
+                if retained is not None and retained.pid != existing_pid:
+                    self.stop_conflicting_restoration_process(retained)
+                self.verify_and_adopt_restored_production(existing_pid)
+                return
+        process = self.restoration_process
+        if process is not None and process.poll() is not None:
+            self.restoration_process = None
+            process = None
+        if process is None:
+            stdin = open(snapshot.stdin_path, "rb", buffering=0)
+            stdout = open(snapshot.stdout_path, "ab", buffering=0)
+            stderr = stdout if snapshot.stderr_path == snapshot.stdout_path else open(
+                snapshot.stderr_path, "ab", buffering=0
+            )
+            try:
+                process = subprocess.Popen(
+                    list(snapshot.argv),
+                    executable=snapshot.executable,
+                    cwd=snapshot.cwd,
+                    env=snapshot.environment,
+                    stdin=stdin,
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_new_session=True,
+                )
+            finally:
+                stdin.close()
+                stdout.close()
+                if stderr is not stdout:
+                    stderr.close()
+            self.restoration_process = process
         deadline = time.monotonic() + 15.0
         restored_pid = None
         while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise GuardianError(f"restored daemon exited with {process.returncode}")
+            returncode = process.poll()
+            if returncode is not None:
+                self.restoration_process = None
+                raise GuardianError(f"restored daemon exited with {returncode}")
             try:
                 restored_pid = int(self.production_pid_file.read_text(encoding="utf-8").strip())
             except (FileNotFoundError, ValueError):
                 time.sleep(0.1)
                 continue
             if restored_pid == process.pid:
-                try:
-                    status = _json_command(snapshot, self.installed, "daemon", "status")
-                except (GuardianError, json.JSONDecodeError):
-                    time.sleep(0.1)
-                    continue
-                if status.get("running") is True:
-                    break
+                self.verify_and_adopt_restored_production(process.pid)
+                return
             time.sleep(0.1)
-        if restored_pid != process.pid:
-            raise GuardianError("restored daemon did not own the production pid file")
-        restored = snapshot_process(process.pid)
-        self.assert_process_identity(restored, require_same_pid=False)
+        raise GuardianError("restored daemon did not own the production pid file")
+
+    def stop_conflicting_restoration_process(
+        self, process: subprocess.Popen
+    ) -> None:
+        """Authoritatively reap Shipyard's retained child before adopting another."""
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
+        if process.poll() is None or _pid_alive(process.pid):
+            raise GuardianError(
+                f"conflicting retained restore child {process.pid} survived cleanup"
+            )
+        self.restoration_process = None
+
+    def verify_and_adopt_restored_production(self, restored_pid: int) -> None:
+        def verify_restored_identity(deadline: float) -> ProcessSnapshot:
+            _bounded_timeout(deadline)
+            current_pid = int(
+                self.production_pid_file.read_text(encoding="utf-8").strip()
+            )
+            if current_pid != restored_pid:
+                raise GuardianError("restored daemon did not own the production pid file")
+            current = snapshot_process(restored_pid, deadline=deadline)
+            self.assert_process_identity(
+                current, require_same_pid=False, require_same_stdio=True
+            )
+            _bounded_timeout(deadline)
+            return current
+
+        deadline = time.monotonic() + 15.0
+        restored: Optional[ProcessSnapshot] = None
+        while time.monotonic() < deadline:
+            restored = verify_restored_identity(deadline)
+            try:
+                status = _peer_verified_daemon_status(
+                    self.production_state_dir,
+                    restored_pid,
+                    deadline=deadline,
+                )
+            except (GuardianError, OSError, socket.timeout):
+                time.sleep(0.1)
+                continue
+            if status.get("running") is True:
+                version = status.get("shipyard_version")
+                if version != LEGACY_LIFETIME_LOCK_VERSION:
+                    raise GuardianError(
+                        "restored daemon did not report the exact legacy "
+                        f"version: {version!r}"
+                    )
+                break
+            time.sleep(0.1)
+        else:
+            raise GuardianError(
+                f"restored daemon pid {restored_pid} never reported running"
+            )
+        assert restored is not None
+        current = verify_restored_identity(deadline)
+        if current.start_time != restored.start_time:
+            raise GuardianError("restored daemon identity changed during status verification")
+        restored = current
         if (
             _configured_repos(
-                restored, self.installed, diagnostic_root=self.root
+                restored,
+                self.installed,
+                diagnostic_root=self.root,
+                state_dir=self.production_state_dir,
             )
             != self.configured_repos
         ):
             raise GuardianError("restored configured repository authority differs")
         if (
-            _active_runs(restored, self.installed, diagnostic_root=self.root)
+            _active_runs(
+                restored,
+                self.installed,
+                state_dir=self.production_state_dir,
+                diagnostic_root=self.root,
+            )
             != self.worker_ids
         ):
             raise GuardianError("restored active worker ownership differs")
-        restored_holders = _lock_holders(self.lock_path, diagnostic_root=self.root)
-        if restored_holders != (process.pid,) or not _exclusive_lock_is_contended(
-            self.lock_path
+        lock_deadline = time.monotonic() + 15.0
+        stable_lifetime_lock = 0
+        while time.monotonic() < lock_deadline:
+            current = verify_restored_identity(lock_deadline)
+            if current.start_time != restored.start_time:
+                raise GuardianError("restored daemon identity changed before lock proof")
+            restored_holders = _lock_holders(
+                self.lock_path,
+                deadline=lock_deadline,
+                retry_after_timeout=lambda retry_deadline: verify_restored_identity(
+                    retry_deadline
+                ),
+                diagnostic_root=self.root,
+            )
+            foreign_holders = tuple(
+                pid for pid in restored_holders if pid != restored_pid
+            )
+            if foreign_holders:
+                raise GuardianError(
+                    "foreign process entered restored legacy writer domain: "
+                    f"{foreign_holders!r}"
+                )
+            restored_contended = _exclusive_lock_is_contended(self.lock_path)
+            current = verify_restored_identity(lock_deadline)
+            if current.start_time != restored.start_time:
+                raise GuardianError("restored daemon identity changed during lock proof")
+            _bounded_timeout(lock_deadline)
+            if restored_holders == (restored_pid,) and restored_contended:
+                stable_lifetime_lock += 1
+                if stable_lifetime_lock >= 3:
+                    break
+            else:
+                stable_lifetime_lock = 0
+            time.sleep(0.1)
+        else:
+            raise GuardianError(
+                f"restored legacy daemon pid {restored_pid} did not prove stable "
+                "lifetime-lock ownership"
+            )
+        if (
+            _configured_repos(
+                current,
+                self.installed,
+                deadline=lock_deadline,
+                state_dir=self.production_state_dir,
+            )
+            != self.configured_repos
         ):
             raise GuardianError(
-                f"restored daemon pid {process.pid} is not the sole lifetime-lock owner: {restored_holders!r}"
+                "restored configured repository authority changed during lock proof"
             )
-        self.restored_pid = process.pid
+        if (
+            _active_runs(
+                current,
+                self.installed,
+                state_dir=self.production_state_dir,
+                deadline=lock_deadline,
+            )
+            != self.worker_ids
+        ):
+            raise GuardianError("restored active workers changed during lock proof")
+        current = verify_restored_identity(lock_deadline)
+        if current.start_time != restored.start_time:
+            raise GuardianError("restored daemon identity changed after lock proof")
+        _bounded_timeout(lock_deadline)
+        self.restored_pid = restored_pid
         self.final_production_start_time = restored.start_time
         self.production_restored = True
         self.production_identity_verified = True
 
     def release(self) -> None:
+        if self.restoration_outstanding():
+            raise GuardianError(
+                "refusing to release host lease before production identity is verified"
+            )
         if self.lease_owned:
             os.rmdir(self.lease_dir)
             self.lease_owned = False
+
+    def restoration_outstanding(self) -> bool:
+        return (
+            hasattr(self, "transition_path")
+            and not self.production_identity_verified
+            and (
+                self.production_stop_requested
+                or self.production_quiesced
+                or self.transition_path == CORRECTED_TRANSITION
+            )
+        )
 
     def run(self) -> int:
         signal.signal(signal.SIGTERM, self.request_stop)
@@ -1214,22 +1658,24 @@ class Guardian:
                     cleanup_failures.append(
                         f"stop candidate: {type(error).__name__}: {error}"
                     )
-            transition_selected = hasattr(self, "transition_path")
-            if (
-                transition_selected
-                and not self.production_identity_verified
-                and (
-                    self.production_quiesced
-                    or self.transition_path == CORRECTED_TRANSITION
-                )
-            ):
+            restoration_outstanding = self.restoration_outstanding()
+            if restoration_outstanding:
                 try:
-                    self.finalize_production()
+                    if (
+                        self.transition_path == CORRECTED_TRANSITION
+                        and not self.mutation_fence_proved
+                    ):
+                        self.verify_preserved_production(
+                            require_mutation_fence=False
+                        )
+                    else:
+                        self.finalize_production()
                 except Exception as error:
                     cleanup_failures.append(
                         f"restore production: {type(error).__name__}: {error}"
                     )
-            if self.lease_owned:
+            restoration_outstanding = self.restoration_outstanding()
+            if self.lease_owned and not restoration_outstanding:
                 try:
                     self.release()
                 except Exception as error:
@@ -1250,6 +1696,7 @@ class Guardian:
                     "production_restored": self.production_restored,
                     "production_preserved": self.production_preserved,
                     "production_identity_verified": self.production_identity_verified,
+                    "lease_retained": self.lease_owned,
                     "transition_path": getattr(self, "transition_path", None),
                     "old_production_pid": self.snapshot.pid if self.snapshot else None,
                     "old_production_start_time": (
