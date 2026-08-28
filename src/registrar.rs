@@ -759,10 +759,6 @@ fn validate_gh_binary(path: &Path) -> Result<(), RegistrarError> {
 mod tests {
     use std::fs;
     #[cfg(unix)]
-    use std::io::Write as _;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
     use std::path::{Path, PathBuf};
 
     #[cfg(unix)]
@@ -770,7 +766,7 @@ mod tests {
 
     use super::Registrar;
     #[cfg(unix)]
-    use super::{RegistrarError, SUBSCRIBED_EVENTS, WEBHOOK_SCOPE_COMMAND};
+    use super::{RegistrarError, RuntimeMode, SUBSCRIBED_EVENTS, WEBHOOK_SCOPE_COMMAND};
 
     #[test]
     fn corrupt_state_loads_as_empty() {
@@ -789,7 +785,7 @@ mod tests {
     fn creates_updates_deletes_and_persists_hooks() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::Ok);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let hook_id = registrar
             .ensure_registered_with_gh(
@@ -807,7 +803,7 @@ mod tests {
         assert_eq!(records[0]["repo"], "owner/repo");
         assert_eq!(records[0]["hook_id"], 4242);
 
-        let mut reloaded = Registrar::new(temp.path());
+        let mut reloaded = stub_registrar(temp.path());
         let hook_id = reloaded
             .ensure_registered_with_gh(
                 "owner/repo",
@@ -866,7 +862,7 @@ mod tests {
     fn delete_404_is_treated_as_success() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::Delete404);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
         registrar
             .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
             .expect("create");
@@ -883,7 +879,7 @@ mod tests {
     fn create_requires_parseable_hook_id() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::MissingId);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let error = registrar
             .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
@@ -898,7 +894,7 @@ mod tests {
     fn missing_local_provenance_adopts_one_exact_remote_hook_transactionally() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::AdoptExisting);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let hook_id = registrar
             .ensure_registered_with_gh(
@@ -926,7 +922,7 @@ mod tests {
     fn exact_url_adoption_rejects_partial_patch_response_without_local_commit() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::AdoptPatchIncomplete);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let error = registrar
             .ensure_registered_with_gh(
@@ -952,7 +948,7 @@ mod tests {
     fn missing_local_provenance_does_not_persist_when_exact_hook_update_fails() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::AdoptPatchFails);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let error = registrar
             .ensure_registered_with_gh(
@@ -983,7 +979,7 @@ mod tests {
     fn missing_local_provenance_ignores_non_exact_remote_hook_url() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::WrongUrl);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let hook_id = registrar
             .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
@@ -998,17 +994,20 @@ mod tests {
     fn missing_local_provenance_fails_closed_for_ambiguous_exact_hooks() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::Ambiguous);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let error = registrar
             .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
             .expect_err("ambiguous remote provenance");
 
-        assert!(matches!(
-            error,
-            RegistrarError::AmbiguousRemoteHooks { ref hook_ids, .. }
-                if hook_ids == &vec![7331, 7332]
-        ));
+        assert!(
+            matches!(
+                error,
+                RegistrarError::AmbiguousRemoteHooks { ref hook_ids, .. }
+                    if hook_ids == &vec![7331, 7332]
+            ),
+            "unexpected error: {error:?}"
+        );
         assert!(registrar.all().is_empty());
         assert!(
             !temp.path().join("args-2").exists(),
@@ -1022,7 +1021,7 @@ mod tests {
     fn create_missing_webhook_scope_is_actionable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::MissingWebhookScope);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let error = registrar
             .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
@@ -1038,13 +1037,16 @@ mod tests {
     fn create_http_401_is_auth_degraded() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::Unauthorized);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let error = registrar
             .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
             .expect_err("unauthorized");
 
-        assert!(error.is_auth_degraded(), "401 should be auth-degraded");
+        assert!(
+            error.is_auth_degraded(),
+            "401 should be auth-degraded, got {error:?}"
+        );
         assert!(!error.is_missing_webhook_scope());
         assert!(
             error
@@ -1060,7 +1062,7 @@ mod tests {
     fn create_anonymous_rate_limit_is_auth_degraded() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::AnonRateLimit);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
 
         let error = registrar
             .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
@@ -1126,11 +1128,11 @@ mod tests {
     fn unregister_without_gh_removes_local_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::Ok);
-        let mut registrar = Registrar::new(temp.path());
+        let mut registrar = stub_registrar(temp.path());
         registrar
             .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
             .expect("create");
-        fs::remove_file(&gh).expect("remove gh");
+        fs::remove_file(temp.path().join("api")).expect("remove gh script");
 
         registrar.unregister("owner/repo").expect("unregister");
 
@@ -1154,8 +1156,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn stub_registrar(temp: &Path) -> Registrar {
+        Registrar::new_with_context(RuntimeMode::Shipyard, temp, temp)
+    }
+
+    #[cfg(unix)]
     fn write_gh_stub(temp: &Path, mode: GhStubMode) -> PathBuf {
-        let gh = temp.join("gh");
         let create_response = match mode {
             GhStubMode::MissingId => "{}",
             GhStubMode::Ok
@@ -1251,19 +1257,11 @@ esac
                 _ => "cat \"$LOG_DIR/stdin-$COUNT\" ;;",
             },
         );
-        publish_executable_stub(temp, &gh, &script);
-        gh
-    }
-
-    #[cfg(unix)]
-    fn publish_executable_stub(temp: &Path, destination: &Path, script: &str) {
-        // Publish only after the writer closes; opening the final executable
-        // immediately before exec can surface Linux ETXTBSY under coverage.
-        let mut staged = tempfile::NamedTempFile::new_in(temp).expect("stage gh stub");
-        staged.write_all(script.as_bytes()).expect("write gh stub");
-        staged.flush().expect("flush gh stub");
-        fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o755)).expect("chmod");
-        staged.persist(destination).expect("publish gh stub");
+        // Invoke a stable system executable and let it read a closed per-test
+        // script from the isolated cwd. This avoids racing Linux exec against
+        // a freshly generated executable while preserving the exact gh argv.
+        fs::write(temp.join("api"), script).expect("write gh stub script");
+        PathBuf::from("/bin/sh")
     }
 
     #[cfg(unix)]

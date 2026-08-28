@@ -2,7 +2,9 @@
 
 use super::{BTreeMap, Digest, ImportCandidate, ImportReport, Sha256};
 #[cfg(any(unix, test))]
-use super::{Value, WorkLedgerError, WorkLedgerResult, opaque_ref};
+use super::{Value, opaque_ref};
+#[cfg(unix)]
+use super::{WorkLedgerError, WorkLedgerResult};
 #[cfg(any(unix, test))]
 use crate::record_identity::canonical_repository_slug;
 
