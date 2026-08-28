@@ -60,6 +60,28 @@ struct ShadowBudgetEntry {
     api_requests: usize,
 }
 
+const SHADOW_BASELINE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ShadowBaselineEntry {
+    repo: String,
+    pr: u64,
+    expected_head_sha: String,
+    snapshot_digest: Option<String>,
+    failure_class: Option<String>,
+    policy_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct ShadowObserverBaseline {
+    schema_version: u32,
+    entries: Vec<ShadowBaselineEntry>,
+    #[serde(skip)]
+    snapshots: BTreeMap<(String, u64, String), String>,
+    #[serde(skip)]
+    failed_targets: BTreeMap<(String, u64, String), (String, u64)>,
+}
+
 /// Why one bounded observation pass was scheduled.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -237,6 +259,8 @@ pub struct ShadowDaemonLane {
     ledger_error: Option<String>,
     next_ledger_retry_at: Option<Instant>,
     budget_path: PathBuf,
+    baseline_path: PathBuf,
+    baseline_error: Option<String>,
     budget_entries: Vec<ShadowBudgetEntry>,
     reserved_requests: Option<usize>,
     health_path: PathBuf,
@@ -255,6 +279,7 @@ impl ShadowDaemonLane {
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let budget_path = state_dir.join("shadow-observer-budget.json");
+        let baseline_path = state_dir.join("shadow-observer-baseline.json");
         let health_path = state_dir.join("shadow-observer-health.json");
         let (budget_entries, restored_requests) = match load_request_budget(&budget_path) {
             Ok(entries) => {
@@ -280,6 +305,18 @@ impl ShadowDaemonLane {
         health.reserved_requests = 0;
         health.rolling_hour_requests = restored_requests;
         let mut scheduler = ShadowScheduler::new(now);
+        let baseline_error = match load_observer_baseline(&baseline_path) {
+            Ok(baseline) => {
+                scheduler.snapshots = baseline.snapshots;
+                scheduler.failed_targets = baseline.failed_targets;
+                None
+            }
+            Err(error) => {
+                health.last_failure_at = Some(epoch_seconds());
+                health.last_failure_class = Some("baseline_state_unavailable".to_owned());
+                Some(error)
+            }
+        };
         scheduler.periodic_cursor = health.periodic_cursor;
         let wall_now = epoch_seconds();
         for entry in &budget_entries {
@@ -301,6 +338,8 @@ impl ShadowDaemonLane {
             ledger_error: None,
             next_ledger_retry_at: None,
             budget_path,
+            baseline_path,
+            baseline_error,
             budget_entries,
             reserved_requests: None,
             health_path,
@@ -385,6 +424,14 @@ impl ShadowDaemonLane {
     }
 
     fn targets(&mut self, now: Instant) -> Option<Vec<ShadowPrTarget>> {
+        if let Some(error) = &self.baseline_error {
+            if self.ledger_error.as_deref() != Some(error) {
+                eprintln!("shipyard daemon: shadow baseline unavailable: {error}");
+                self.ledger_error = Some(error.clone());
+            }
+            self.next_ledger_retry_at = Some(now + Duration::from_secs(5));
+            return None;
+        }
         match WorkLedger::open_existing(&self.state_dir) {
             Ok(Some(ledger)) => match ledger.shadow_pr_targets() {
                 Ok(targets) => {
@@ -467,7 +514,25 @@ impl ShadowDaemonLane {
                     failure_class.or_else(|| Some("fetch_failed".to_owned()));
             }
         });
+        let prior_snapshots = self.scheduler.snapshots.clone();
+        let prior_failed_targets = self.scheduler.failed_targets.clone();
         let transitions = self.scheduler.finish_pass_at(report, now);
+        if let Err(error) = save_observer_baseline(
+            &self.baseline_path,
+            &self.scheduler.snapshots,
+            &self.scheduler.failed_targets,
+        ) {
+            self.scheduler.snapshots = prior_snapshots;
+            self.scheduler.failed_targets = prior_failed_targets;
+            eprintln!("shipyard daemon: shadow baseline persistence failed: {error}");
+            let failed_at = epoch_seconds();
+            self.update_health(|health| {
+                health.last_failure_at = Some(failed_at);
+                health.last_failure_class = Some("baseline_persistence".to_owned());
+            });
+            self.refresh_schedule_health(now);
+            return Vec::new();
+        }
         self.refresh_schedule_health(now);
         transitions
             .into_iter()
@@ -1157,6 +1222,113 @@ fn save_request_budget(path: &Path, entries: &[ShadowBudgetEntry]) -> Result<(),
     Ok(())
 }
 
+fn load_observer_baseline(path: &Path) -> Result<ShadowObserverBaseline, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ShadowObserverBaseline {
+                schema_version: SHADOW_BASELINE_SCHEMA_VERSION,
+                ..ShadowObserverBaseline::default()
+            });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut baseline = serde_json::from_slice::<ShadowObserverBaseline>(&bytes)
+        .map_err(|error| error.to_string())?;
+    if baseline.schema_version != SHADOW_BASELINE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported shadow observer baseline schema {}",
+            baseline.schema_version
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for entry in &baseline.entries {
+        let key = (
+            entry.repo.clone(),
+            entry.pr,
+            entry.expected_head_sha.clone(),
+        );
+        let valid_identity = !entry.repo.is_empty()
+            && entry.pr > 0
+            && entry.expected_head_sha.len() == 40
+            && entry
+                .expected_head_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit());
+        let valid_snapshot = entry.snapshot_digest.as_ref().is_none_or(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        let valid_failure = match (&entry.failure_class, entry.policy_revision) {
+            (None, None) => true,
+            (Some(class), Some(revision)) => !class.is_empty() && revision > 0,
+            _ => false,
+        };
+        if !valid_identity
+            || !valid_snapshot
+            || !valid_failure
+            || (entry.snapshot_digest.is_none() && entry.failure_class.is_none())
+            || !seen.insert(key.clone())
+        {
+            return Err("invalid shadow observer baseline entry".to_owned());
+        }
+        if let Some(digest) = &entry.snapshot_digest {
+            baseline.snapshots.insert(key.clone(), digest.clone());
+        }
+        if let (Some(class), Some(revision)) = (&entry.failure_class, entry.policy_revision) {
+            baseline
+                .failed_targets
+                .insert(key, (class.clone(), revision));
+        }
+    }
+    Ok(baseline)
+}
+
+fn save_observer_baseline(
+    path: &Path,
+    snapshots: &BTreeMap<(String, u64, String), String>,
+    failed_targets: &BTreeMap<(String, u64, String), (String, u64)>,
+) -> Result<(), String> {
+    let keys = snapshots
+        .keys()
+        .chain(failed_targets.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let entries = keys
+        .into_iter()
+        .map(|key| ShadowBaselineEntry {
+            repo: key.0.clone(),
+            pr: key.1,
+            expected_head_sha: key.2.clone(),
+            snapshot_digest: snapshots.get(&key).cloned(),
+            failure_class: failed_targets.get(&key).map(|value| value.0.clone()),
+            policy_revision: failed_targets.get(&key).map(|value| value.1),
+        })
+        .collect();
+    let baseline = ShadowObserverBaseline {
+        schema_version: SHADOW_BASELINE_SCHEMA_VERSION,
+        entries,
+        snapshots: BTreeMap::new(),
+        failed_targets: BTreeMap::new(),
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| "shadow baseline path has no parent".to_owned())?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), &baseline)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temporary.persist(path).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn worker_panic_report(
     trigger: ShadowTrigger,
     targets: &[ShadowPrTarget],
@@ -1537,6 +1709,120 @@ mod tests {
         assert_eq!(
             transitions[0].previous_snapshot_digest.as_deref(),
             Some(report.observations[0].snapshot_digest.as_str())
+        );
+    }
+
+    #[test]
+    fn observation_baseline_survives_restart_and_detects_offline_change() {
+        let state = tempfile::tempdir().expect("state");
+        let path = state.path().join("shadow-observer-baseline.json");
+        let expected = target("generous-corp/pulp", 148, 'a');
+        let initial = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| Ok((expected.head_sha.clone(), Vec::new())),
+        );
+        let mut before_restart = ShadowScheduler::new(Instant::now());
+        assert!(before_restart.finish_pass(&initial).is_empty());
+        save_observer_baseline(
+            &path,
+            &before_restart.snapshots,
+            &before_restart.failed_targets,
+        )
+        .expect("persist baseline");
+
+        let restored = load_observer_baseline(&path).expect("restore baseline");
+        let mut after_restart = ShadowScheduler::new(Instant::now());
+        after_restart.snapshots = restored.snapshots;
+        after_restart.failed_targets = restored.failed_targets;
+        let changed = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| {
+                Ok((
+                    expected.head_sha.clone(),
+                    vec![serde_json::json!({
+                        "name": "macOS",
+                        "status": "COMPLETED",
+                        "conclusion": "FAILURE"
+                    })],
+                ))
+            },
+        );
+
+        let transitions = after_restart.finish_pass(&changed);
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].kind,
+            ShadowObservationTransitionKind::SnapshotChanged
+        );
+        assert_eq!(
+            transitions[0].previous_snapshot_digest.as_deref(),
+            Some(initial.observations[0].snapshot_digest.as_str())
+        );
+    }
+
+    #[test]
+    fn failed_baseline_survives_restart_and_emits_recovery() {
+        let state = tempfile::tempdir().expect("state");
+        let path = state.path().join("shadow-observer-baseline.json");
+        let expected = target("generous-corp/pulp", 149, 'a');
+        let failed = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| Err(ReconcileFetchError::Timeout("offline".to_owned())),
+        );
+        let mut before_restart = ShadowScheduler::new(Instant::now());
+        assert_eq!(before_restart.finish_pass(&failed).len(), 1);
+        save_observer_baseline(
+            &path,
+            &before_restart.snapshots,
+            &before_restart.failed_targets,
+        )
+        .expect("persist failed baseline");
+
+        let restored = load_observer_baseline(&path).expect("restore failed baseline");
+        let mut after_restart = ShadowScheduler::new(Instant::now());
+        after_restart.snapshots = restored.snapshots;
+        after_restart.failed_targets = restored.failed_targets;
+        let recovered = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| Ok((expected.head_sha.clone(), Vec::new())),
+        );
+
+        let transitions = after_restart.finish_pass(&recovered);
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].kind,
+            ShadowObservationTransitionKind::FetchRecovered
+        );
+    }
+
+    #[test]
+    fn malformed_baseline_blocks_observation_without_replacement() {
+        let state = tempfile::tempdir().expect("state");
+        let path = state.path().join("shadow-observer-baseline.json");
+        fs::write(&path, b"not-json").expect("malformed baseline");
+        let original = fs::read(&path).expect("original bytes");
+        let now = Instant::now();
+        let mut lane = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            now,
+        );
+
+        assert!(lane.tick(now).is_empty());
+        assert_eq!(fs::read(&path).expect("preserved bytes"), original);
+        assert_eq!(
+            lane.health
+                .lock()
+                .expect("health")
+                .last_failure_class
+                .as_deref(),
+            Some("baseline_state_unavailable")
         );
     }
 

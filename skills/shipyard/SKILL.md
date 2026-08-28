@@ -1266,6 +1266,11 @@ age, and reserved/actual rolling-hour request accounting. Read it under
 `shadow_observer` in `shipyard daemon status --json`; `stalled=true` means the
 recorded in-flight age exceeded the complete-pass deadline. Status is local and
 free of GitHub/model calls, and unchanged passes still emit no event.
+Successful snapshot and failed-fetch baselines are also private, atomic, and
+restart-durable. The first catch-up after an offline interval must compare
+against that exact baseline so an offline check change or recovery is emitted;
+malformed baseline state blocks observation instead of being absorbed as a new
+silent baseline.
 The detached daemon and its foreground runtime use the persistent
 `state_dir/daemon` directory for registrar and observer child-process cwd; never
 retain a launch worktree as daemon runtime authority because normal worktree
