@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use fs2::FileExt;
+use rusqlite::params_from_iter;
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::record_event;
@@ -25,10 +26,12 @@ use super::{
 };
 
 /// Runtime switches are intentionally unavailable through the CLI in this phase.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WakeConsumerPolicy {
     pub(crate) activation_enabled: bool,
     pub(crate) dispatch_enabled: bool,
+    /// Canonical, sorted lowercase GitHub repositories this consumer owns.
+    pub(crate) authorized_repositories: Vec<String>,
 }
 
 /// The exact launch-profile surface used by the provider boundary.
@@ -173,6 +176,7 @@ pub(crate) struct WakeEnvelope {
     pub(crate) owner_generation: u64,
     pub(crate) route_ref: String,
     pub(crate) payload_digest: String,
+    pub(crate) repository: String,
     state: String,
 }
 
@@ -274,7 +278,10 @@ fn stored_resume_expectation(
 }
 
 fn is_exact_git_sha(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl WorkLedger {
@@ -290,13 +297,9 @@ impl WorkLedger {
         R: WakeProfileResolver,
         A: ProviderAdapter,
     {
-        if !policy.activation_enabled || !policy.dispatch_enabled {
-            return Err(WorkLedgerError::Refused(
-                "wake activation and dispatch must both be explicitly enabled".to_owned(),
-            ));
-        }
+        validate_consumer_policy(&policy)?;
         let consumer = acquire_consumer_lease(&self.path)?;
-        let Some(wake) = self.next_wake()? else {
+        let Some(wake) = self.next_wake(&policy)? else {
             return Ok(WakeDeliveryResult::Empty);
         };
         let profile = resolver.resolve(&wake)?;
@@ -350,6 +353,11 @@ impl WorkLedger {
                 "fresh-agent launch profile lacks immutable resume authority".to_owned(),
             )
         })?)?;
+        if crate::evidence::canonical_repository(&resume.repository) != wake.repository {
+            return Err(WorkLedgerError::Refused(
+                "launch profile repository does not match selected work".to_owned(),
+            ));
+        }
         let profile_object = self.put_protected_object(
             &wake.work_item_id,
             ProtectedObjectKind::LaunchProfile,
@@ -386,6 +394,7 @@ impl WorkLedger {
                 }
             }
         } else {
+            self.mark_delivery_launched(&fence)?;
             adapter.launch(ProviderLaunchRequest {
                 fence: &fence,
                 argv: profile.launch_argv(),
@@ -394,18 +403,291 @@ impl WorkLedger {
         self.finalize_wake(&fence, outcome)
     }
 
-    fn next_wake(&self) -> WorkLedgerResult<Option<WakeEnvelope>> {
+    fn mark_delivery_launched(&self, fence: &DeliveryFence) -> WorkLedgerResult<()> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_claim(&transaction, fence)?;
+        let changed = transaction.execute(
+            "UPDATE provider_deliveries SET state = 'launched', updated_at = ?1
+             WHERE delivery_id = ?2 AND wake_id = ?3 AND attempt = ?4
+               AND activation_id = ?5 AND adapter_id = ?6
+               AND idempotency_key = ?7 AND request_object_ref = ?8
+               AND state = 'prepared'",
+            params![
+                Utc::now().to_rfc3339(),
+                fence.delivery_id,
+                fence.wake_id,
+                fence.attempt,
+                fence.activation_id,
+                fence.adapter_id,
+                fence.idempotency_key,
+                fence.request_object_ref,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "provider delivery changed before submit".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reconcile one uncertain provider delivery by its original idempotency
+    /// fence. This API never invokes `launch`.
+    pub(crate) fn reconcile_uncertain_wake<A: ProviderAdapter>(
+        &self,
+        policy: &WakeConsumerPolicy,
+        wake_id: &str,
+        adapter: &mut A,
+    ) -> WorkLedgerResult<WakeDeliveryResult> {
+        validate_consumer_policy(policy)?;
+        let _consumer = acquire_consumer_lease(&self.path)?;
+        let (fence, repository) = self.uncertain_fence(wake_id)?;
+        if policy
+            .authorized_repositories
+            .binary_search(&repository)
+            .is_err()
+        {
+            return Err(WorkLedgerError::Refused(
+                "uncertain delivery repository is not authorized".to_owned(),
+            ));
+        }
+        let capability = adapter.capability(&fence.provider_id).ok_or_else(|| {
+            WorkLedgerError::Refused(
+                "provider capability is unavailable for reconciliation".to_owned(),
+            )
+        })?;
+        if capability.adapter_id != fence.adapter_id {
+            return Err(WorkLedgerError::Refused(
+                "provider adapter changed before evidence reconciliation".to_owned(),
+            ));
+        }
+        let outcome = adapter.reconcile(&fence);
+        self.finalize_uncertain_wake(&fence, outcome)
+    }
+
+    /// Select at most one current uncertain delivery for a permitted repository.
+    pub(crate) fn next_uncertain_wake_id(
+        &self,
+        policy: &WakeConsumerPolicy,
+    ) -> WorkLedgerResult<Option<String>> {
+        validate_consumer_policy(policy)?;
+        let connection = self.connect_read_only()?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let placeholders = std::iter::repeat_n("?", policy.authorized_repositories.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT wake.wake_id
+             FROM outbox wake
+             JOIN work_items work ON work.id = wake.work_item_id
+             JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+             WHERE wake.state = 'uncertain' AND delivery.state = 'uncertain'
+               AND work.phase = 'dispatching'
+               AND work.work_generation = wake.work_generation
+               AND work.owner_generation = wake.owner_generation
+               AND lower(work.repo) IN ({placeholders})
+             ORDER BY wake.updated_at, wake.wake_id LIMIT 1"
+        );
+        connection
+            .query_row(
+                &sql,
+                params_from_iter(policy.authorized_repositories.iter()),
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn uncertain_fence(&self, wake_id: &str) -> WorkLedgerResult<(DeliveryFence, String)> {
         let connection = self.connect_read_only()?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
         connection
             .query_row(
-                "SELECT wake_id, work_item_id, work_generation, owner_generation,
-                        route_ref, payload_digest, state
-                 FROM outbox WHERE state IN ('claimed', 'pending')
-                 ORDER BY CASE state WHEN 'claimed' THEN 0 ELSE 1 END,
-                          created_at, wake_id LIMIT 1",
-                [],
+                "SELECT wake.work_item_id, wake.work_generation, wake.owner_generation,
+                        wake.route_ref, wake.payload_digest, delivery.attempt,
+                        claim.epoch, claim.owner_ref, delivery.activation_id,
+                        delivery.delivery_id, delivery.request_object_ref, wake.profile_ref,
+                        delivery.adapter_id, delivery.provider_id, delivery.idempotency_key,
+                        lower(work.repo)
+                 FROM outbox wake
+                 JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+                 JOIN wake_claim_epochs claim
+                   ON claim.wake_id = delivery.wake_id AND claim.attempt = delivery.attempt
+                  AND claim.epoch = (SELECT max(epoch) FROM wake_claim_epochs
+                                     WHERE wake_id = delivery.wake_id
+                                       AND attempt = delivery.attempt)
+                 JOIN work_items work ON work.id = wake.work_item_id
+                 WHERE wake.wake_id = ?1 AND wake.state = 'uncertain'
+                   AND delivery.state = 'uncertain'
+                   AND work.phase = 'dispatching'
+                   AND work.work_generation = wake.work_generation
+                   AND work.owner_generation = wake.owner_generation",
+                [wake_id],
+                |row| {
+                    Ok((
+                        DeliveryFence {
+                            wake_id: wake_id.to_owned(),
+                            work_item_id: row.get(0)?,
+                            work_generation: row.get(1)?,
+                            owner_generation: row.get(2)?,
+                            route_ref: row.get(3)?,
+                            payload_digest: row.get(4)?,
+                            attempt: row.get(5)?,
+                            consumer_epoch: row.get(6)?,
+                            consumer_owner_ref: row.get(7)?,
+                            activation_id: row.get(8)?,
+                            delivery_id: row.get(9)?,
+                            request_object_ref: row.get(10)?,
+                            profile_ref: row.get(11)?,
+                            adapter_id: row.get(12)?,
+                            provider_id: row.get(13)?,
+                            idempotency_key: row.get(14)?,
+                        },
+                        row.get(15)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                WorkLedgerError::Refused(
+                    "wake is not an exact uncertain provider delivery".to_owned(),
+                )
+            })
+    }
+
+    fn finalize_uncertain_wake(
+        &self,
+        fence: &DeliveryFence,
+        outcome: ProviderOutcome,
+    ) -> WorkLedgerResult<WakeDeliveryResult> {
+        let (state, result, response_bytes) = match outcome {
+            ProviderOutcome::Delivered { receipt } => {
+                ("delivered", WakeDeliveryResult::Delivered, receipt)
+            }
+            ProviderOutcome::Retryable { evidence } => {
+                ("retry", WakeDeliveryResult::Retrying, evidence)
+            }
+            ProviderOutcome::Uncertain { evidence } => {
+                ("uncertain", WakeDeliveryResult::Uncertain, evidence)
+            }
+            ProviderOutcome::Rejected { evidence } => {
+                ("failed", WakeDeliveryResult::Failed, evidence)
+            }
+        };
+        let outcome_digest = digest(&response_bytes);
+        let response = self.put_protected_object(
+            &fence.work_item_id,
+            ProtectedObjectKind::ProviderReceipt,
+            None,
+            &outcome_digest,
+            &response_bytes,
+        )?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        let attempt_changed = transaction.execute(
+            "UPDATE wake_attempts SET state = ?1, outcome_digest = ?2, finished_at = ?3
+             WHERE wake_id = ?4 AND attempt = ?5 AND state = 'uncertain'
+               AND adapter_id = ?6",
+            params![
+                state,
+                outcome_digest,
+                now,
+                fence.wake_id,
+                fence.attempt,
+                fence.adapter_id,
+            ],
+        )?;
+        let delivery_changed = transaction.execute(
+            "UPDATE provider_deliveries
+             SET state = ?1, receipt_object_ref = ?2, updated_at = ?3,
+                 delivered_at = CASE WHEN ?1 = 'delivered' THEN ?3 ELSE NULL END
+             WHERE delivery_id = ?4 AND wake_id = ?5 AND attempt = ?6
+               AND idempotency_key = ?7 AND state = 'uncertain'",
+            params![
+                state,
+                response.object_ref,
+                now,
+                fence.delivery_id,
+                fence.wake_id,
+                fence.attempt,
+                fence.idempotency_key,
+            ],
+        )?;
+        let outbox_state = if state == "retry" { "pending" } else { state };
+        let wake_changed = transaction.execute(
+            "UPDATE outbox SET state = ?1, transport_receipt_digest = ?2,
+                    provider_delivery_id = CASE WHEN ?1 = 'delivered' THEN ?3 ELSE NULL END,
+                    updated_at = ?4
+             WHERE wake_id = ?5 AND state = 'uncertain'",
+            params![
+                outbox_state,
+                outcome_digest,
+                fence.delivery_id,
+                now,
+                fence.wake_id
+            ],
+        )?;
+        if attempt_changed != 1 || delivery_changed != 1 || wake_changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "uncertain delivery changed during evidence reconciliation".to_owned(),
+            ));
+        }
+        if state == "failed" {
+            transition_dispatch_failure(
+                &transaction,
+                fence,
+                &outcome_digest,
+                &now,
+                "provider_reconciliation_failed",
+            )?;
+        }
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    fn next_wake(&self, policy: &WakeConsumerPolicy) -> WorkLedgerResult<Option<WakeEnvelope>> {
+        let connection = self.connect_read_only()?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let placeholders = std::iter::repeat_n("?", policy.authorized_repositories.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT wake.wake_id, wake.work_item_id, wake.work_generation,
+                    wake.owner_generation, wake.route_ref, wake.payload_digest,
+                    wake.state, lower(work.repo)
+             FROM outbox wake
+             JOIN work_items work ON work.id = wake.work_item_id
+             WHERE wake.state IN ('claimed', 'pending')
+               AND lower(work.repo) IN ({placeholders})
+             ORDER BY CASE wake.state WHEN 'claimed' THEN 0 ELSE 1 END,
+                      wake.created_at, wake.wake_id LIMIT 1"
+        );
+        connection
+            .query_row(
+                &sql,
+                params_from_iter(policy.authorized_repositories.iter()),
                 |row| {
                     Ok(WakeEnvelope {
                         wake_id: row.get(0)?,
@@ -415,6 +697,7 @@ impl WorkLedger {
                         route_ref: row.get(4)?,
                         payload_digest: row.get(5)?,
                         state: row.get(6)?,
+                        repository: row.get(7)?,
                     })
                 },
             )
@@ -530,12 +813,17 @@ impl WorkLedger {
                 fence.wake_id, fence.attempt, capability.adapter_id
             ),
         );
-        let idempotency_key = opaque_ref(
-            "delivery-key",
-            &format!(
-                "shipyard-provider-idempotency-v1\n{}\n{}\n{}",
-                fence.wake_id, fence.attempt, capability.adapter_id
-            ),
+        let idempotency_key = digest(
+            format!(
+                "shipyard-provider-idempotency-v1\n{}\n{}\n{}\n{}\n{}\n{}",
+                fence.wake_id,
+                fence.attempt,
+                capability.adapter_id,
+                provider_id,
+                fence.profile_ref,
+                fence.payload_digest,
+            )
+            .as_bytes(),
         );
         let request = StoredProviderRequest {
             schema_version: 1,
@@ -574,12 +862,28 @@ impl WorkLedger {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_claim(&transaction, &fence)?;
         let now = Utc::now().to_rfc3339();
-        let existing_activation: Option<(String, u64, u64, String)> = transaction
+        let original_claim: (u64, String) = transaction.query_row(
+            "SELECT epoch, owner_ref FROM wake_claim_epochs
+             WHERE wake_id = ?1 AND attempt = ?2 AND kind = 'claim'
+             ORDER BY epoch LIMIT 1",
+            params![fence.wake_id, fence.attempt],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let existing_activation: Option<(String, u64, u64, u64, String, String)> = transaction
             .query_row(
-                "SELECT work_item_id, work_generation, owner_generation, state
+                "SELECT work_item_id, work_generation, owner_generation, epoch, owner_ref, state
                  FROM activation_epochs WHERE activation_id = ?1",
                 [&activation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
         match existing_activation {
@@ -594,16 +898,18 @@ impl WorkLedger {
                         fence.work_item_id,
                         fence.work_generation,
                         fence.owner_generation,
-                        fence.attempt,
-                        fence.consumer_owner_ref,
+                        original_claim.0,
+                        original_claim.1,
                         now,
                     ],
                 )?;
             }
-            Some((work, work_generation, owner_generation, state))
+            Some((work, work_generation, owner_generation, epoch, owner_ref, state))
                 if work == fence.work_item_id
                     && work_generation == fence.work_generation
                     && owner_generation == fence.owner_generation
+                    && epoch == original_claim.0
+                    && owner_ref == original_claim.1
                     && state == "active" => {}
             Some(_) => {
                 return Err(WorkLedgerError::Refused(
@@ -611,10 +917,19 @@ impl WorkLedger {
                 ));
             }
         }
-        let existing_delivery: Option<(String, u64, String, String, String, String)> = transaction
+        let existing_delivery: Option<(
+            String,
+            u64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = transaction
             .query_row(
                 "SELECT wake_id, attempt, activation_id, adapter_id,
-                        idempotency_key, request_object_ref
+                        idempotency_key, request_object_ref, provider_id, state
                  FROM provider_deliveries WHERE delivery_id = ?1",
                 [&delivery_id],
                 |row| {
@@ -625,18 +940,12 @@ impl WorkLedger {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
             .optional()?;
-        let exact_delivery = (
-            fence.wake_id.clone(),
-            fence.attempt,
-            activation_id.clone(),
-            capability.adapter_id.clone(),
-            idempotency_key.clone(),
-            request_object.object_ref.clone(),
-        );
         match existing_delivery {
             None => {
                 transaction.execute(
@@ -658,7 +967,23 @@ impl WorkLedger {
                     ],
                 )?;
             }
-            Some(existing) if existing == exact_delivery => {}
+            Some((
+                wake_id,
+                attempt,
+                existing_activation,
+                adapter_id,
+                existing_idempotency,
+                request_ref,
+                existing_provider,
+                state,
+            )) if wake_id == fence.wake_id
+                && attempt == fence.attempt
+                && existing_activation == activation_id
+                && adapter_id == capability.adapter_id
+                && existing_idempotency == idempotency_key
+                && request_ref == request_object.object_ref
+                && existing_provider == provider_id
+                && matches!(state.as_str(), "prepared" | "launched") => {}
             Some(_) => {
                 return Err(WorkLedgerError::Refused(
                     "provider delivery collides with different authority".to_owned(),
@@ -756,7 +1081,13 @@ impl WorkLedger {
                     provider_delivery_id = CASE WHEN ?1 = 'delivered' THEN ?3 ELSE NULL END,
                     updated_at = ?4, acknowledged_at = NULL
              WHERE wake_id = ?5 AND state = 'claimed'",
-            params![outbox_state, outcome_digest, fence.delivery_id, now, fence.wake_id],
+            params![
+                outbox_state,
+                outcome_digest,
+                fence.delivery_id,
+                now,
+                fence.wake_id
+            ],
         )?;
         if changed != 1 {
             return Err(WorkLedgerError::Refused(
@@ -772,6 +1103,15 @@ impl WorkLedger {
             return Err(WorkLedgerError::Refused(
                 "provider activation no longer matches during finalization".to_owned(),
             ));
+        }
+        if state == "failed" {
+            transition_dispatch_failure(
+                &transaction,
+                fence,
+                &outcome_digest,
+                &now,
+                "provider_delivery_failed",
+            )?;
         }
         transaction.commit()?;
         Ok(result)
@@ -811,9 +1151,80 @@ impl WorkLedger {
                 "wake changed during pre-delivery failure".to_owned(),
             ));
         }
+        transition_dispatch_failure(
+            &transaction,
+            fence,
+            &evidence_digest,
+            &now,
+            "provider_refused_before_delivery",
+        )?;
         transaction.commit()?;
         Ok(WakeDeliveryResult::Failed)
     }
+}
+
+fn validate_consumer_policy(policy: &WakeConsumerPolicy) -> WorkLedgerResult<()> {
+    if !policy.activation_enabled || !policy.dispatch_enabled {
+        return Err(WorkLedgerError::Refused(
+            "wake activation and dispatch must both be explicitly enabled".to_owned(),
+        ));
+    }
+    if policy.authorized_repositories.is_empty()
+        || policy.authorized_repositories.len() > 256
+        || policy.authorized_repositories.iter().any(|repository| {
+            repository != &repository.to_ascii_lowercase()
+                || repository.trim() != repository
+                || repository.split('/').count() != 2
+                || repository.split('/').any(str::is_empty)
+        })
+        || !policy
+            .authorized_repositories
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        return Err(WorkLedgerError::Refused(
+            "wake consumer repositories must be a nonempty sorted canonical allowlist".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn transition_dispatch_failure(
+    transaction: &Transaction<'_>,
+    fence: &DeliveryFence,
+    evidence_digest: &str,
+    now: &str,
+    event_kind: &str,
+) -> WorkLedgerResult<()> {
+    let changed = transaction.execute(
+        "UPDATE work_items SET phase = 'actionable', work_generation = work_generation + 1,
+                updated_at = ?1
+         WHERE id = ?2 AND phase = 'dispatching'
+           AND work_generation = ?3 AND owner_generation = ?4",
+        params![
+            now,
+            fence.work_item_id,
+            fence.work_generation,
+            fence.owner_generation,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(WorkLedgerError::Refused(
+            "failed delivery work generation changed before recovery".to_owned(),
+        ));
+    }
+    record_event(
+        transaction,
+        &fence.work_item_id,
+        fence.work_generation + 1,
+        fence.owner_generation,
+        event_kind,
+        Some(LifecycleState::Dispatching),
+        LifecycleState::Actionable,
+        evidence_digest,
+        now,
+    )?;
+    Ok(())
 }
 
 fn validate_claim_candidate(

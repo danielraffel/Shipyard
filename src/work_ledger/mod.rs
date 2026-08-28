@@ -49,14 +49,16 @@ macro_rules! candidate_params {
     };
 }
 
+#[allow(dead_code)] // Activated only by the later daemon/provider integration slice.
+mod delivery_ownership;
 #[allow(dead_code)] // Activation remains false; this is the inert Phase 3 consumer contract.
 mod dispatch;
-mod delivery_ownership;
 mod importer;
-pub(crate) use dispatch::{FreshAgentLaunchProfile, FreshAgentResumeExpectation};
+#[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
 pub(crate) use delivery_ownership::{
-    AgentContextReceipt, AgentOwnershipReceipt, AgentReturnExpectation, AgentReturnReceipt,
+    AgentContextReceipt, AgentReturnExpectation, AgentReturnReceipt,
 };
+pub(crate) use dispatch::{FreshAgentLaunchProfile, FreshAgentResumeExpectation};
 mod lifecycle;
 mod observation;
 mod persistence;

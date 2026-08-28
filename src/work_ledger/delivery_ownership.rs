@@ -79,9 +79,10 @@ impl WorkLedger {
     ) -> WorkLedgerResult<AgentOwnershipReceipt> {
         let authority = self.delivered_authority(wake_id)?;
         let (_, request_bytes) = self.open_protected_object(&authority.request_object_ref)?;
-        let request: StoredProviderRequest = serde_json::from_slice(&request_bytes).map_err(|_| {
-            WorkLedgerError::Refused("provider request authority is malformed".to_owned())
-        })?;
+        let request: StoredProviderRequest =
+            serde_json::from_slice(&request_bytes).map_err(|_| {
+                WorkLedgerError::Refused("provider request authority is malformed".to_owned())
+            })?;
         let receipt: AgentContextReceipt = serde_json::from_slice(receipt_bytes).map_err(|_| {
             WorkLedgerError::Refused("agent context receipt is malformed".to_owned())
         })?;
@@ -243,8 +244,13 @@ impl WorkLedger {
                 [ownership_id],
                 |row| {
                     Ok((
-                        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                        row.get(4)?, row.get(5)?, row.get(6)?,
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -258,9 +264,10 @@ impl WorkLedger {
             ));
         }
         let (_, request_bytes) = self.open_protected_object(&authority.5)?;
-        let request: StoredProviderRequest = serde_json::from_slice(&request_bytes).map_err(|_| {
-            WorkLedgerError::Refused("provider request authority is malformed".to_owned())
-        })?;
+        let request: StoredProviderRequest =
+            serde_json::from_slice(&request_bytes).map_err(|_| {
+                WorkLedgerError::Refused("provider request authority is malformed".to_owned())
+            })?;
         if expected.checkpoint_generation <= request.resume.checkpoint_generation
             || expected.checkpoint_digest == request.resume.checkpoint_digest
             || expected.repository != request.resume.repository
@@ -377,9 +384,14 @@ impl WorkLedger {
                    ON profile.work_item_id = wake.work_item_id
                   AND profile.profile_ref = wake.profile_ref
                  JOIN work_items work ON work.id = wake.work_item_id
-                 WHERE wake.wake_id = ?1 AND wake.state = 'delivered'
-                   AND delivery.state = 'delivered' AND work.phase = 'dispatching'
-                   AND work.work_generation = wake.work_generation
+                 WHERE wake.wake_id = ?1 AND wake.state IN ('delivered', 'acknowledged')
+                   AND delivery.state = 'delivered'
+                   AND ((wake.state = 'delivered' AND work.phase = 'dispatching'
+                         AND work.work_generation = wake.work_generation)
+                        OR (wake.state = 'acknowledged' AND work.phase = 'agent_owned_repair'
+                            AND work.work_generation = wake.work_generation + 1)
+                        OR (wake.state = 'acknowledged' AND work.phase = 'returned'
+                            AND work.work_generation = wake.work_generation + 2))
                    AND work.owner_generation = wake.owner_generation",
                 [wake_id],
                 |row| {
@@ -436,7 +448,7 @@ fn validate_return_expectation(expected: &AgentReturnExpectation) -> WorkLedgerR
         || !expected
             .head_sha
             .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(WorkLedgerError::Refused(
             "agent return expectation is malformed".to_owned(),

@@ -123,6 +123,15 @@ impl crate::work_ledger::FreshAgentLaunchProfile for LaunchProfileV1 {
         })
     }
 
+    fn protected_profile_bytes(&self) -> crate::work_ledger::WorkLedgerResult<Vec<u8>> {
+        launch_profile_protected_bytes(self).map_err(|error| {
+            crate::work_ledger::WorkLedgerError::Refused(format!(
+                "launch profile is invalid: {}",
+                error.message()
+            ))
+        })
+    }
+
     fn permits_fresh_agent(&self) -> bool {
         matches!(
             self.recovery_policy,
@@ -316,13 +325,18 @@ fn validate_context_url(value: &str) -> Result<(), CliFailure> {
 }
 
 pub(super) fn launch_profile_digest(profile: &LaunchProfileV1) -> Result<String, CliFailure> {
+    let bytes = launch_profile_protected_bytes(profile)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn launch_profile_protected_bytes(profile: &LaunchProfileV1) -> Result<Vec<u8>, CliFailure> {
     validate_launch_profile(profile)?;
-    let bytes = serde_json::to_vec(profile)
+    let canonical = serde_json::to_vec(profile)
         .map_err(|error| CliFailure::new(1, format!("serialize launch profile: {error}")))?;
-    let mut digest = Sha256::new();
-    digest.update(b"shipyard-launch-profile-v1\0");
-    digest.update(bytes);
-    Ok(hex::encode(digest.finalize()))
+    let mut bytes = Vec::with_capacity(b"shipyard-launch-profile-v1\0".len() + canonical.len());
+    bytes.extend_from_slice(b"shipyard-launch-profile-v1\0");
+    bytes.extend_from_slice(&canonical);
+    Ok(bytes)
 }
 
 pub(super) fn launch_profile_integrity_hash(
@@ -688,6 +702,22 @@ mod tests {
         assert_eq!(bootstrap.head_sha, profile.worktree.head_sha);
 
         let original = launch_profile_digest(&profile).expect("original digest");
+        let protected = launch_profile_protected_bytes(&profile).expect("protected bytes");
+        assert_eq!(
+            protected.strip_prefix(b"shipyard-launch-profile-v1\0"),
+            Some(
+                serde_json::to_vec(&profile)
+                    .expect("canonical json")
+                    .as_slice()
+            )
+        );
+        assert_eq!(original, hex::encode(Sha256::digest(&protected)));
+        assert!(
+            !protected
+                .strip_prefix(b"shipyard-launch-profile-v1\0")
+                .expect("single prefix")
+                .starts_with(b"shipyard-launch-profile-v1\0")
+        );
         let mut changed = profile.clone();
         changed
             .continuation_bootstrap

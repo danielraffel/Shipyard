@@ -10,6 +10,7 @@ struct TestProfile {
     provider: String,
     argv: Vec<String>,
     digest: String,
+    repository: String,
     permits_fresh: bool,
     route_profile_ref: Option<String>,
 }
@@ -29,6 +30,30 @@ impl FreshAgentLaunchProfile for TestProfile {
 
     fn permits_fresh_agent(&self) -> bool {
         self.permits_fresh
+    }
+
+    fn protected_profile_bytes(&self) -> WorkLedgerResult<Vec<u8>> {
+        Ok(b"profile".to_vec())
+    }
+
+    fn resume_expectation(&self) -> Option<FreshAgentResumeExpectation<'_>> {
+        Some(FreshAgentResumeExpectation {
+            workstream_handle: "GEN-43",
+            context_url: Some("https://linear.app/generous/issue/GEN-43"),
+            plan_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            root_revision: 0,
+            issue_revision: 0,
+            projection_revision: 4,
+            material_event_revision: 0,
+            checkpoint_id: "wsc_test",
+            checkpoint_generation: 1,
+            checkpoint_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            repository: &self.repository,
+            head_sha: "0123456789012345678901234567890123456789",
+            expected_resume_context_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            success_continuation_digest: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            failure_continuation_digest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        })
     }
 
     fn route_profile_ref(&self) -> WorkLedgerResult<String> {
@@ -75,11 +100,11 @@ impl Adapter {
                 fresh_agent_launch: true,
                 idempotent_launch: idempotent,
             }),
-            launch_outcomes: vec![ProviderOutcome::Acknowledged {
-                receipt_digest: digest(b"launch receipt"),
+            launch_outcomes: vec![ProviderOutcome::Delivered {
+                receipt: b"launch receipt".to_vec(),
             }],
-            reconcile_outcome: ProviderOutcome::Acknowledged {
-                receipt_digest: digest(b"reconciled receipt"),
+            reconcile_outcome: ProviderOutcome::Delivered {
+                receipt: b"reconciled receipt".to_vec(),
             },
             launched_argv: Vec::new(),
             launch_fences: Vec::new(),
@@ -116,13 +141,27 @@ fn active_policy() -> WakeConsumerPolicy {
     WakeConsumerPolicy {
         activation_enabled: true,
         dispatch_enabled: true,
+        authorized_repositories: vec!["danielraffel/pulp".to_owned()],
     }
 }
 
 fn setup_wake() -> (tempfile::TempDir, WorkLedger, TestProfile, String, String) {
     let temp = tempfile::TempDir::new().expect("temp");
     let ledger = WorkLedger::open(temp.path()).expect("ledger");
-    let candidate = sample_candidate();
+    let (profile, work_id, wake_id) = add_wake(&ledger, sample_candidate());
+    (temp, ledger, profile, work_id, wake_id)
+}
+
+fn add_wake(ledger: &WorkLedger, candidate: ImportCandidate) -> (TestProfile, String, String) {
+    add_wake_labeled(ledger, candidate, "", true)
+}
+
+fn add_wake_labeled(
+    ledger: &WorkLedger,
+    candidate: ImportCandidate,
+    route_suffix: &str,
+    register_adapter: bool,
+) -> (TestProfile, String, String) {
     let work_id = candidate.work_id.clone();
     ledger.import(&[candidate]).expect("import");
     ledger
@@ -143,8 +182,10 @@ fn setup_wake() -> (tempfile::TempDir, WorkLedger, TestProfile, String, String) 
             .transition_with_wake(&work_id, generation, 3, state, None)
             .expect("transition");
     }
-    let (route, agent_adapter) = sample_route(&work_id, 5);
-    ledger.register_adapter(&agent_adapter).expect("adapter");
+    let (route, agent_adapter) = sample_route_labeled(&work_id, 5, route_suffix);
+    if register_adapter {
+        ledger.register_adapter(&agent_adapter).expect("adapter");
+    }
     ledger.register_route(&route).expect("route");
     let profile = TestProfile {
         provider: "subrouter".to_owned(),
@@ -154,6 +195,7 @@ fn setup_wake() -> (tempfile::TempDir, WorkLedger, TestProfile, String, String) 
             "--prompt=value with spaces;$(never-a-shell)".to_owned(),
         ],
         digest: digest(b"profile"),
+        repository: "danielraffel/pulp".to_owned(),
         permits_fresh: true,
         route_profile_ref: None,
     };
@@ -169,7 +211,7 @@ fn setup_wake() -> (tempfile::TempDir, WorkLedger, TestProfile, String, String) 
     ledger
         .transition_with_wake(&work_id, 5, 3, LifecycleState::Dispatching, Some(&wake))
         .expect("dispatch transition");
-    (temp, ledger, profile, work_id, wake_id)
+    (profile, work_id, wake_id)
 }
 
 fn outbox_state(ledger: &WorkLedger, wake_id: &str) -> String {
@@ -184,8 +226,41 @@ fn outbox_state(ledger: &WorkLedger, wake_id: &str) -> String {
         .expect("outbox state")
 }
 
+fn context_receipt() -> AgentContextReceipt {
+    AgentContextReceipt {
+        workstream_handle: "GEN-43".to_owned(),
+        context_url: Some("https://linear.app/generous/issue/GEN-43".to_owned()),
+        plan_sha256: "a".repeat(64),
+        root_revision: 0,
+        issue_revision: 0,
+        material_event_revision: 0,
+        projection_revision: 4,
+        checkpoint_id: "wsc_test".to_owned(),
+        checkpoint_generation: 1,
+        checkpoint_digest: "b".repeat(64),
+        repository: "danielraffel/pulp".to_owned(),
+        head_sha: "0123456789012345678901234567890123456789".to_owned(),
+        resume_context_digest: "c".repeat(64),
+        success_continuation_digest: "d".repeat(64),
+        failure_continuation_digest: "e".repeat(64),
+    }
+}
+
+fn deliver_wake(ledger: &WorkLedger, profile: TestProfile) -> (String, String) {
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut adapter = Adapter::successful(true);
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+            .expect("deliver"),
+        WakeDeliveryResult::Delivered
+    );
+    let fence = adapter.launch_fences.pop().expect("delivery fence");
+    (fence.wake_id, fence.delivery_id)
+}
+
 #[test]
-fn success_passes_exact_launch_profile_argv_and_atomically_acknowledges() {
+fn success_passes_exact_argv_and_persists_delivery_without_claiming_agent_ownership() {
     let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
     let mut resolver = Resolver {
         profile: profile.clone(),
@@ -196,11 +271,11 @@ fn success_passes_exact_launch_profile_argv_and_atomically_acknowledges() {
         ledger
             .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
             .expect("consume"),
-        WakeDeliveryResult::Acknowledged
+        WakeDeliveryResult::Delivered
     );
     assert_eq!(adapter.launched_argv, vec![profile.argv]);
     assert_eq!(adapter.launch_fences.len(), 1);
-    assert_eq!(outbox_state(&ledger, &wake_id), "acknowledged");
+    assert_eq!(outbox_state(&ledger, &wake_id), "delivered");
     let connection = ledger.connect_read_only().expect("connection");
     let work: (String, u64) = connection
         .query_row(
@@ -209,7 +284,7 @@ fn success_passes_exact_launch_profile_argv_and_atomically_acknowledges() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("work state");
-    assert_eq!(work, ("agent_owned_repair".to_owned(), 7));
+    assert_eq!(work, ("dispatching".to_owned(), 6));
     let attempt: (String, bool) = connection
         .query_row(
             "SELECT state, finished_at IS NOT NULL FROM wake_attempts WHERE wake_id = ?1",
@@ -217,7 +292,211 @@ fn success_passes_exact_launch_profile_argv_and_atomically_acknowledges() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("attempt");
-    assert_eq!(attempt, ("acknowledged".to_owned(), true));
+    assert_eq!(attempt, ("delivered".to_owned(), true));
+    let delivery: (String, String, usize) = connection
+        .query_row(
+            "SELECT delivery.state, activation.state, length(delivery.idempotency_key)
+             FROM provider_deliveries delivery
+             JOIN activation_epochs activation
+               ON activation.activation_id = delivery.activation_id
+             WHERE delivery.wake_id = ?1",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("durable delivery");
+    assert_eq!(
+        delivery,
+        ("delivered".to_owned(), "released".to_owned(), 64)
+    );
+    assert_eq!(ledger.status().expect("status").protected_objects, 3);
+}
+
+#[test]
+fn repository_allowlist_skips_unauthorized_wake_without_mutation_or_starvation() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("ledger");
+    let mut unauthorized = sample_candidate();
+    unauthorized.repo = Some("attacker/private".to_owned());
+    let (_unauthorized_profile, _unauthorized_work, unauthorized_wake) =
+        add_wake(&ledger, unauthorized);
+
+    let mut allowed = sample_candidate();
+    allowed.work_id = opaque_ref("wi", "allowed shipyard continuation");
+    allowed.repo = Some("generous-corp/shipyard".to_owned());
+    allowed.source_ref = opaque_ref("src", "allowed shipyard continuation");
+    allowed.content_digest = digest(b"allowed shipyard continuation");
+    let (mut allowed_profile, _allowed_work, allowed_wake) =
+        add_wake_labeled(&ledger, allowed, "allowed", false);
+    allowed_profile.repository = "generous-corp/shipyard".to_owned();
+    let policy = WakeConsumerPolicy {
+        activation_enabled: true,
+        dispatch_enabled: true,
+        authorized_repositories: vec!["generous-corp/shipyard".to_owned()],
+    };
+    let mut resolver = Resolver {
+        profile: allowed_profile,
+        calls: 0,
+    };
+    let mut adapter = Adapter::successful(true);
+
+    assert_eq!(
+        ledger
+            .consume_one_wake(policy, &mut resolver, &mut adapter)
+            .expect("consume allowed wake"),
+        WakeDeliveryResult::Delivered
+    );
+    assert_eq!(resolver.calls, 1);
+    assert_eq!(outbox_state(&ledger, &allowed_wake), "delivered");
+    assert_eq!(outbox_state(&ledger, &unauthorized_wake), "pending");
+}
+
+#[test]
+fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
+    let (_temp, ledger, profile, work_id, _wake_id) = setup_wake();
+    let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
+    let context_bytes = serde_json::to_vec(&context_receipt()).expect("context receipt");
+    let ownership = ledger
+        .acknowledge_agent_context(&wake_id, &context_bytes)
+        .expect("context acknowledgement");
+    assert_eq!(outbox_state(&ledger, &wake_id), "acknowledged");
+    let replay = ledger
+        .acknowledge_agent_context(&wake_id, &context_bytes)
+        .expect("ack replay");
+    assert_eq!(replay, ownership);
+
+    let expected = AgentReturnExpectation {
+        checkpoint_id: "wsc_returned".to_owned(),
+        checkpoint_generation: 2,
+        checkpoint_digest: "1".repeat(64),
+        repository: "danielraffel/pulp".to_owned(),
+        head_sha: "1234567890123456789012345678901234567890".to_owned(),
+        evidence_digest: "2".repeat(64),
+    };
+    let return_bytes = serde_json::to_vec(&AgentReturnReceipt {
+        checkpoint_id: expected.checkpoint_id.clone(),
+        checkpoint_generation: expected.checkpoint_generation,
+        checkpoint_digest: expected.checkpoint_digest.clone(),
+        repository: expected.repository.clone(),
+        head_sha: expected.head_sha.clone(),
+        evidence_digest: expected.evidence_digest.clone(),
+        remotely_acknowledged: true,
+    })
+    .expect("return receipt");
+    let returned = ledger
+        .return_agent_ownership(
+            &ownership.ownership_id,
+            &delivery_id,
+            7,
+            &expected,
+            &return_bytes,
+        )
+        .expect("ownership return");
+    let return_replay = ledger
+        .return_agent_ownership(
+            &ownership.ownership_id,
+            &delivery_id,
+            7,
+            &expected,
+            &return_bytes,
+        )
+        .expect("return replay");
+    assert_eq!(return_replay, returned);
+    let work: (String, u64) = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT phase, work_generation FROM work_items WHERE id = ?1",
+            [&work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("returned work");
+    assert_eq!(work, ("returned".to_owned(), 8));
+}
+
+#[test]
+fn context_and_return_receipts_refuse_drift_without_partial_transition() {
+    let (_temp, ledger, profile, _work_id, _wake_id) = setup_wake();
+    let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
+    let mut wrong_context = context_receipt();
+    wrong_context.checkpoint_digest = "f".repeat(64);
+    assert!(
+        ledger
+            .acknowledge_agent_context(
+                &wake_id,
+                &serde_json::to_vec(&wrong_context).expect("wrong receipt"),
+            )
+            .is_err()
+    );
+    assert_eq!(outbox_state(&ledger, &wake_id), "delivered");
+    let context_bytes = serde_json::to_vec(&context_receipt()).expect("context receipt");
+    let ownership = ledger
+        .acknowledge_agent_context(&wake_id, &context_bytes)
+        .expect("valid acknowledgement");
+    let expected = AgentReturnExpectation {
+        checkpoint_id: "wsc_returned".to_owned(),
+        checkpoint_generation: 2,
+        checkpoint_digest: "1".repeat(64),
+        repository: "danielraffel/pulp".to_owned(),
+        head_sha: "1234567890123456789012345678901234567890".to_owned(),
+        evidence_digest: "2".repeat(64),
+    };
+    let mut wrong_return = AgentReturnReceipt {
+        checkpoint_id: expected.checkpoint_id.clone(),
+        checkpoint_generation: expected.checkpoint_generation,
+        checkpoint_digest: expected.checkpoint_digest.clone(),
+        repository: expected.repository.clone(),
+        head_sha: "2234567890123456789012345678901234567890".to_owned(),
+        evidence_digest: expected.evidence_digest.clone(),
+        remotely_acknowledged: true,
+    };
+    assert!(
+        ledger
+            .return_agent_ownership(
+                &ownership.ownership_id,
+                &opaque_ref("pd", "wrong delivery"),
+                7,
+                &expected,
+                &serde_json::to_vec(&wrong_return).expect("wrong return"),
+            )
+            .is_err()
+    );
+    assert!(
+        ledger
+            .return_agent_ownership(
+                &ownership.ownership_id,
+                &delivery_id,
+                7,
+                &expected,
+                &serde_json::to_vec(&wrong_return).expect("wrong head"),
+            )
+            .is_err()
+    );
+    wrong_return.head_sha = expected.head_sha.clone();
+    wrong_return.checkpoint_generation = 1;
+    assert!(
+        ledger
+            .return_agent_ownership(
+                &ownership.ownership_id,
+                &delivery_id,
+                7,
+                &expected,
+                &serde_json::to_vec(&wrong_return).expect("stale checkpoint"),
+            )
+            .is_err()
+    );
+    wrong_return.checkpoint_generation = expected.checkpoint_generation;
+    wrong_return.remotely_acknowledged = false;
+    assert!(
+        ledger
+            .return_agent_ownership(
+                &ownership.ownership_id,
+                &delivery_id,
+                7,
+                &expected,
+                &serde_json::to_vec(&wrong_return).expect("unacknowledged checkpoint"),
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -227,10 +506,10 @@ fn retry_is_durable_and_uses_a_new_attempt_without_changing_generation() {
     let mut adapter = Adapter::successful(true);
     adapter.launch_outcomes = vec![
         ProviderOutcome::Retryable {
-            error_digest: digest(b"temporary provider refusal"),
+            evidence: b"temporary provider refusal".to_vec(),
         },
-        ProviderOutcome::Acknowledged {
-            receipt_digest: digest(b"second attempt receipt"),
+        ProviderOutcome::Delivered {
+            receipt: b"second attempt receipt".to_vec(),
         },
     ];
     assert_eq!(
@@ -254,7 +533,7 @@ fn retry_is_durable_and_uses_a_new_attempt_without_changing_generation() {
         ledger
             .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
             .expect("second"),
-        WakeDeliveryResult::Acknowledged
+        WakeDeliveryResult::Delivered
     );
     let attempts: Vec<(u64, String)> = {
         let connection = ledger.connect_read_only().expect("connection");
@@ -269,8 +548,35 @@ fn retry_is_durable_and_uses_a_new_attempt_without_changing_generation() {
     };
     assert_eq!(
         attempts,
-        vec![(1, "retry".to_owned()), (2, "acknowledged".to_owned())]
+        vec![(1, "retry".to_owned()), (2, "delivered".to_owned())]
     );
+}
+
+#[test]
+fn definitive_provider_rejection_returns_work_to_actionable() {
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut adapter = Adapter::successful(true);
+    adapter.launch_outcomes = vec![ProviderOutcome::Rejected {
+        evidence: b"definitive provider rejection".to_vec(),
+    }];
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+            .expect("rejection"),
+        WakeDeliveryResult::Failed
+    );
+    assert_eq!(outbox_state(&ledger, &wake_id), "failed");
+    let work: (String, u64) = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT phase, work_generation FROM work_items WHERE id = ?1",
+            [&work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("actionable work");
+    assert_eq!(work, ("actionable".to_owned(), 7));
 }
 
 #[test]
@@ -294,7 +600,7 @@ fn restart_reconciles_idempotent_claim_without_duplicate_launch() {
         ledger
             .consume_one_wake(active_policy(), &mut resolver, &mut restarted)
             .expect("reconcile"),
-        WakeDeliveryResult::Acknowledged
+        WakeDeliveryResult::Delivered
     );
     assert!(restarted.launched_argv.is_empty());
     assert_eq!(restarted.reconcile_fences.len(), 1);
@@ -330,6 +636,43 @@ fn non_idempotent_restart_becomes_uncertain_without_launch_or_reconcile() {
     assert!(restarted.launched_argv.is_empty());
     assert!(restarted.reconcile_fences.is_empty());
     assert_eq!(outbox_state(&ledger, &wake_id), "uncertain");
+    assert_eq!(
+        ledger
+            .next_uncertain_wake_id(&active_policy())
+            .expect("select uncertain wake"),
+        Some(wake_id.clone())
+    );
+    let original_idempotency = interrupted
+        .launch_fences
+        .first()
+        .expect("original launch fence")
+        .idempotency_key
+        .clone();
+    let mut wrong_adapter = Adapter::successful(false);
+    wrong_adapter
+        .capability
+        .as_mut()
+        .expect("capability")
+        .adapter_id = "wrong-adapter".to_owned();
+    assert!(
+        ledger
+            .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut wrong_adapter)
+            .is_err()
+    );
+    assert!(wrong_adapter.reconcile_fences.is_empty());
+    assert_eq!(
+        ledger
+            .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut restarted)
+            .expect("evidence reconciliation"),
+        WakeDeliveryResult::Delivered
+    );
+    assert!(restarted.launched_argv.is_empty());
+    assert_eq!(restarted.reconcile_fences.len(), 1);
+    assert_eq!(
+        restarted.reconcile_fences[0].idempotency_key,
+        original_idempotency
+    );
+    assert_eq!(outbox_state(&ledger, &wake_id), "delivered");
 }
 
 #[test]
@@ -379,7 +722,7 @@ fn stale_generation_refuses_before_provider_launch() {
 
 #[test]
 fn missing_provider_capability_fails_durably_without_launch() {
-    let (_temp, ledger, profile, _work_id, wake_id) = setup_wake();
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
     let mut resolver = Resolver { profile, calls: 0 };
     let mut adapter = Adapter::successful(true);
     adapter.capability = None;
@@ -391,6 +734,16 @@ fn missing_provider_capability_fails_durably_without_launch() {
     );
     assert!(adapter.launched_argv.is_empty());
     assert_eq!(outbox_state(&ledger, &wake_id), "failed");
+    let phase: String = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT phase FROM work_items WHERE id = ?1",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("work phase");
+    assert_eq!(phase, "actionable");
 }
 
 #[test]
@@ -446,8 +799,8 @@ fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() 
         fn launch(&mut self, _request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
             self.entered.send(()).expect("announce provider entry");
             self.release.recv().expect("release provider");
-            ProviderOutcome::Acknowledged {
-                receipt_digest: digest(b"barrier launch receipt"),
+            ProviderOutcome::Delivered {
+                receipt: b"barrier launch receipt".to_vec(),
             }
         }
 
@@ -491,7 +844,7 @@ fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() 
     release_tx.send(()).expect("release launch");
     assert_eq!(
         first.join().expect("consumer thread").expect("consume"),
-        WakeDeliveryResult::Acknowledged
+        WakeDeliveryResult::Delivered
     );
 
     let claims: Vec<(u64, String)> = {
