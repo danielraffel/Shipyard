@@ -12,14 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 
 use super::lifecycle::record_event;
 use super::registry::validated_route_matches_launch;
 use super::route::OpaqueRef;
 use super::{
-    LifecycleState, OptionalExtension, Transaction, TransactionBehavior, Utc, WorkLedger,
-    WorkLedgerError, WorkLedgerResult, configure_durable, create_database_file_no_follow, digest,
-    opaque_ref, params, validate_digest, validate_token, verify_integrity, verify_supported_schema,
+    LifecycleState, OptionalExtension, ProtectedObjectKind, Transaction, TransactionBehavior, Utc,
+    WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable,
+    create_database_file_no_follow, digest, opaque_ref, params, validate_digest, validate_token,
+    verify_integrity, verify_supported_schema,
 };
 
 /// Runtime switches are intentionally unavailable through the CLI in this phase.
@@ -57,6 +59,13 @@ pub(crate) trait FreshAgentLaunchProfile {
     fn launch_argv(&self) -> &[String];
     fn profile_digest(&self) -> WorkLedgerResult<String>;
     fn permits_fresh_agent(&self) -> bool;
+
+    /// Exact immutable profile bytes whose digest is `profile_digest`.
+    fn protected_profile_bytes(&self) -> WorkLedgerResult<Vec<u8>> {
+        Err(WorkLedgerError::Refused(
+            "launch profile does not expose exact protected bytes".to_owned(),
+        ))
+    }
 
     fn resume_expectation(&self) -> Option<FreshAgentResumeExpectation<'_>> {
         None
@@ -98,6 +107,13 @@ pub(crate) struct DeliveryFence {
     pub(crate) attempt: u64,
     pub(crate) consumer_epoch: u64,
     pub(crate) consumer_owner_ref: String,
+    pub(crate) activation_id: String,
+    pub(crate) delivery_id: String,
+    pub(crate) request_object_ref: String,
+    pub(crate) profile_ref: String,
+    pub(crate) adapter_id: String,
+    pub(crate) provider_id: String,
+    pub(crate) idempotency_key: String,
 }
 
 /// Host-local live ownership for the complete resolve/claim/provider/finalize
@@ -134,10 +150,10 @@ pub(crate) struct ProviderLaunchRequest<'a> {
 /// Typed provider outcome. Digests refer to protected receipts or diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderOutcome {
-    Acknowledged { receipt_digest: String },
-    Retryable { error_digest: String },
-    Uncertain { evidence_digest: String },
-    Rejected { error_digest: String },
+    Delivered { receipt: Vec<u8> },
+    Retryable { evidence: Vec<u8> },
+    Uncertain { evidence: Vec<u8> },
+    Rejected { evidence: Vec<u8> },
 }
 
 /// Machine-local adapter. `reconcile` inspects an already-claimed idempotency key;
@@ -164,10 +180,101 @@ pub(crate) struct WakeEnvelope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WakeDeliveryResult {
     Empty,
-    Acknowledged,
+    Delivered,
     Retrying,
     Uncertain,
     Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StoredResumeExpectation {
+    pub(super) workstream_handle: String,
+    pub(super) context_url: Option<String>,
+    pub(super) plan_sha256: String,
+    pub(super) root_revision: u64,
+    pub(super) issue_revision: u64,
+    pub(super) material_event_revision: u64,
+    pub(super) projection_revision: u64,
+    pub(super) checkpoint_id: String,
+    pub(super) checkpoint_generation: u64,
+    pub(super) checkpoint_digest: String,
+    pub(super) repository: String,
+    pub(super) head_sha: String,
+    pub(super) expected_resume_context_digest: String,
+    pub(super) success_continuation_digest: String,
+    pub(super) failure_continuation_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StoredProviderRequest {
+    pub(super) schema_version: u32,
+    pub(super) wake_id: String,
+    pub(super) attempt: u64,
+    pub(super) adapter_id: String,
+    pub(super) provider_id: String,
+    pub(super) idempotency_key: String,
+    pub(super) profile_ref: String,
+    pub(super) profile_object_ref: String,
+    pub(super) profile_digest: String,
+    pub(super) argv: Vec<String>,
+    pub(super) resume: StoredResumeExpectation,
+}
+
+fn stored_resume_expectation(
+    value: FreshAgentResumeExpectation<'_>,
+) -> WorkLedgerResult<StoredResumeExpectation> {
+    validate_digest("resume plan digest", value.plan_sha256)?;
+    validate_digest("resume checkpoint digest", value.checkpoint_digest)?;
+    validate_digest(
+        "expected resume context digest",
+        value.expected_resume_context_digest,
+    )?;
+    validate_digest(
+        "success continuation digest",
+        value.success_continuation_digest,
+    )?;
+    validate_digest(
+        "failure continuation digest",
+        value.failure_continuation_digest,
+    )?;
+    if value.projection_revision == 0
+        || value.checkpoint_generation == 0
+        || value.workstream_handle.is_empty()
+        || value.workstream_handle.len() > 128
+        || value.checkpoint_id.is_empty()
+        || value.checkpoint_id.len() > 128
+        || value.repository.is_empty()
+        || value.repository.len() > 512
+        || !is_exact_git_sha(value.head_sha)
+        || value.context_url.is_some_and(|url| url.len() > 4096)
+    {
+        return Err(WorkLedgerError::Refused(
+            "fresh-agent resume authority is incomplete or malformed".to_owned(),
+        ));
+    }
+    Ok(StoredResumeExpectation {
+        workstream_handle: value.workstream_handle.to_owned(),
+        context_url: value.context_url.map(ToOwned::to_owned),
+        plan_sha256: value.plan_sha256.to_owned(),
+        root_revision: value.root_revision,
+        issue_revision: value.issue_revision,
+        material_event_revision: value.material_event_revision,
+        projection_revision: value.projection_revision,
+        checkpoint_id: value.checkpoint_id.to_owned(),
+        checkpoint_generation: value.checkpoint_generation,
+        checkpoint_digest: value.checkpoint_digest.to_owned(),
+        repository: value.repository.to_owned(),
+        head_sha: value.head_sha.to_owned(),
+        expected_resume_context_digest: value.expected_resume_context_digest.to_owned(),
+        success_continuation_digest: value.success_continuation_digest.to_owned(),
+        failure_continuation_digest: value.failure_continuation_digest.to_owned(),
+    })
+}
+
+fn is_exact_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl WorkLedger {
@@ -207,7 +314,7 @@ impl WorkLedger {
                 profile.provider_id(),
                 &profile_ref,
                 &consumer,
-                digest(b"fresh-agent recovery is not authorized by the launch profile"),
+                b"fresh-agent recovery is not authorized by the launch profile".to_vec(),
             );
         }
         let Some(capability) = adapter.capability(profile.provider_id()) else {
@@ -217,7 +324,7 @@ impl WorkLedger {
                 profile.provider_id(),
                 &profile_ref,
                 &consumer,
-                digest(b"provider adapter capability is unavailable"),
+                b"provider adapter capability is unavailable".to_vec(),
             );
         };
         validate_token("provider adapter ID", &capability.adapter_id)?;
@@ -228,29 +335,54 @@ impl WorkLedger {
                 profile.provider_id(),
                 &profile_ref,
                 &consumer,
-                digest(b"provider adapter lacks fresh-agent capability"),
+                b"provider adapter lacks fresh-agent capability".to_vec(),
             );
         }
 
-        let (fence, recovered_claim, claim_idempotent) = self.claim_wake(
+        let profile_bytes = profile.protected_profile_bytes()?;
+        if digest(&profile_bytes) != profile_digest {
+            return Err(WorkLedgerError::Refused(
+                "protected launch profile bytes do not match its digest".to_owned(),
+            ));
+        }
+        let resume = stored_resume_expectation(profile.resume_expectation().ok_or_else(|| {
+            WorkLedgerError::Refused(
+                "fresh-agent launch profile lacks immutable resume authority".to_owned(),
+            )
+        })?)?;
+        let profile_object = self.put_protected_object(
+            &wake.work_item_id,
+            ProtectedObjectKind::LaunchProfile,
+            Some(&profile_ref),
+            &profile_digest,
+            &profile_bytes,
+        )?;
+
+        let (claim_fence, recovered_claim, claim_idempotent) = self.claim_wake(
             &wake,
             &capability,
             &profile_ref,
             profile.provider_id(),
             &consumer,
         )?;
+        let fence = self.prepare_delivery(
+            claim_fence,
+            &capability,
+            profile.provider_id(),
+            profile.launch_argv(),
+            resume,
+            &profile_object.object_ref,
+        )?;
         let outcome = if recovered_claim {
             if claim_idempotent {
                 adapter.reconcile(&fence)
             } else {
                 ProviderOutcome::Uncertain {
-                    evidence_digest: digest(
-                        format!(
-                            "non-idempotent claimed wake after restart\n{}",
-                            fence.wake_id
-                        )
-                        .as_bytes(),
-                    ),
+                    evidence: format!(
+                        "non-idempotent claimed wake after restart\n{}",
+                        fence.wake_id
+                    )
+                    .into_bytes(),
                 }
             }
         } else {
@@ -297,7 +429,7 @@ impl WorkLedger {
         provider_kind: &str,
         profile_ref: &str,
         consumer: &ConsumerLease,
-        error_digest: String,
+        evidence: Vec<u8>,
     ) -> WorkLedgerResult<WakeDeliveryResult> {
         validate_token("provider adapter ID", adapter_id)?;
         let capability = ProviderCapability {
@@ -307,7 +439,7 @@ impl WorkLedger {
         };
         let (fence, _, _) =
             self.claim_wake(wake, &capability, profile_ref, provider_kind, consumer)?;
-        self.finalize_wake(&fence, ProviderOutcome::Rejected { error_digest })
+        self.finalize_without_delivery(&fence, &evidence)
     }
 
     /// Return `(fence, recovered_claim, claim_idempotent)`. `recovered_claim`
@@ -332,6 +464,16 @@ impl WorkLedger {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let recovered_claim =
             validate_claim_candidate(&transaction, wake, profile_ref, provider_kind)?;
+        let profile_changed = transaction.execute(
+            "UPDATE outbox SET profile_ref = ?1
+             WHERE wake_id = ?2 AND (profile_ref IS NULL OR profile_ref = ?1)",
+            params![profile_ref, wake.wake_id],
+        )?;
+        if profile_changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "wake launch profile binding changed before claim".to_owned(),
+            ));
+        }
         let (attempt, claim_idempotent, consumer_epoch) = claim_attempt(
             &transaction,
             wake,
@@ -351,10 +493,186 @@ impl WorkLedger {
                 attempt,
                 consumer_epoch,
                 consumer_owner_ref: consumer.owner_ref.clone(),
+                activation_id: String::new(),
+                delivery_id: String::new(),
+                request_object_ref: String::new(),
+                profile_ref: profile_ref.to_owned(),
+                adapter_id: capability.adapter_id.clone(),
+                provider_id: provider_kind.to_owned(),
+                idempotency_key: String::new(),
             },
             recovered_claim,
             claim_idempotent,
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_delivery(
+        &self,
+        mut fence: DeliveryFence,
+        capability: &ProviderCapability,
+        provider_id: &str,
+        argv: &[String],
+        resume: StoredResumeExpectation,
+        profile_object_ref: &str,
+    ) -> WorkLedgerResult<DeliveryFence> {
+        let activation_id = opaque_ref(
+            "ae",
+            &format!(
+                "shipyard-activation-v1\n{}\n{}\n{}\n{}",
+                fence.wake_id, fence.attempt, fence.work_generation, fence.owner_generation
+            ),
+        );
+        let delivery_id = opaque_ref(
+            "pd",
+            &format!(
+                "shipyard-provider-delivery-v1\n{}\n{}\n{}",
+                fence.wake_id, fence.attempt, capability.adapter_id
+            ),
+        );
+        let idempotency_key = opaque_ref(
+            "delivery-key",
+            &format!(
+                "shipyard-provider-idempotency-v1\n{}\n{}\n{}",
+                fence.wake_id, fence.attempt, capability.adapter_id
+            ),
+        );
+        let request = StoredProviderRequest {
+            schema_version: 1,
+            wake_id: fence.wake_id.clone(),
+            attempt: fence.attempt,
+            adapter_id: capability.adapter_id.clone(),
+            provider_id: provider_id.to_owned(),
+            idempotency_key: idempotency_key.clone(),
+            profile_ref: fence.profile_ref.clone(),
+            profile_object_ref: profile_object_ref.to_owned(),
+            profile_digest: fence.payload_digest.clone(),
+            argv: argv.to_vec(),
+            resume,
+        };
+        let request_bytes = serde_json::to_vec(&request).map_err(|error| {
+            WorkLedgerError::Refused(format!("provider request is not serializable: {error}"))
+        })?;
+        let request_digest = digest(&request_bytes);
+        let request_object = self.put_protected_object(
+            &fence.work_item_id,
+            ProtectedObjectKind::ProviderRequest,
+            None,
+            &request_digest,
+            &request_bytes,
+        )?;
+
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_claim(&transaction, &fence)?;
+        let now = Utc::now().to_rfc3339();
+        let existing_activation: Option<(String, u64, u64, String)> = transaction
+            .query_row(
+                "SELECT work_item_id, work_generation, owner_generation, state
+                 FROM activation_epochs WHERE activation_id = ?1",
+                [&activation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        match existing_activation {
+            None => {
+                transaction.execute(
+                    "INSERT INTO activation_epochs
+                     (activation_id, work_item_id, work_generation, owner_generation,
+                      epoch, owner_ref, state, acquired_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+                    params![
+                        activation_id,
+                        fence.work_item_id,
+                        fence.work_generation,
+                        fence.owner_generation,
+                        fence.attempt,
+                        fence.consumer_owner_ref,
+                        now,
+                    ],
+                )?;
+            }
+            Some((work, work_generation, owner_generation, state))
+                if work == fence.work_item_id
+                    && work_generation == fence.work_generation
+                    && owner_generation == fence.owner_generation
+                    && state == "active" => {}
+            Some(_) => {
+                return Err(WorkLedgerError::Refused(
+                    "activation epoch collides with different authority".to_owned(),
+                ));
+            }
+        }
+        let existing_delivery: Option<(String, u64, String, String, String, String)> = transaction
+            .query_row(
+                "SELECT wake_id, attempt, activation_id, adapter_id,
+                        idempotency_key, request_object_ref
+                 FROM provider_deliveries WHERE delivery_id = ?1",
+                [&delivery_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let exact_delivery = (
+            fence.wake_id.clone(),
+            fence.attempt,
+            activation_id.clone(),
+            capability.adapter_id.clone(),
+            idempotency_key.clone(),
+            request_object.object_ref.clone(),
+        );
+        match existing_delivery {
+            None => {
+                transaction.execute(
+                    "INSERT INTO provider_deliveries
+                     (delivery_id, wake_id, attempt, activation_id, provider_id,
+                      adapter_id, idempotency_key, request_object_ref, state,
+                      created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'prepared', ?9, ?9)",
+                    params![
+                        delivery_id,
+                        fence.wake_id,
+                        fence.attempt,
+                        activation_id,
+                        provider_id,
+                        capability.adapter_id,
+                        idempotency_key,
+                        request_object.object_ref,
+                        now,
+                    ],
+                )?;
+            }
+            Some(existing) if existing == exact_delivery => {}
+            Some(_) => {
+                return Err(WorkLedgerError::Refused(
+                    "provider delivery collides with different authority".to_owned(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        fence.activation_id = activation_id;
+        fence.delivery_id = delivery_id;
+        fence.request_object_ref = request_object.object_ref;
+        fence.adapter_id = capability.adapter_id.clone();
+        fence.provider_id = provider_id.to_owned();
+        fence.idempotency_key = idempotency_key;
+        Ok(fence)
     }
 
     fn finalize_wake(
@@ -362,23 +680,28 @@ impl WorkLedger {
         fence: &DeliveryFence,
         outcome: ProviderOutcome,
     ) -> WorkLedgerResult<WakeDeliveryResult> {
-        let (state, result, outcome_digest) = match outcome {
-            ProviderOutcome::Acknowledged { receipt_digest } => (
-                "acknowledged",
-                WakeDeliveryResult::Acknowledged,
-                receipt_digest,
-            ),
-            ProviderOutcome::Retryable { error_digest } => {
-                ("retry", WakeDeliveryResult::Retrying, error_digest)
+        let (state, result, response_bytes) = match outcome {
+            ProviderOutcome::Delivered { receipt } => {
+                ("delivered", WakeDeliveryResult::Delivered, receipt)
             }
-            ProviderOutcome::Uncertain { evidence_digest } => {
-                ("uncertain", WakeDeliveryResult::Uncertain, evidence_digest)
+            ProviderOutcome::Retryable { evidence } => {
+                ("retry", WakeDeliveryResult::Retrying, evidence)
             }
-            ProviderOutcome::Rejected { error_digest } => {
-                ("failed", WakeDeliveryResult::Failed, error_digest)
+            ProviderOutcome::Uncertain { evidence } => {
+                ("uncertain", WakeDeliveryResult::Uncertain, evidence)
+            }
+            ProviderOutcome::Rejected { evidence } => {
+                ("failed", WakeDeliveryResult::Failed, evidence)
             }
         };
-        validate_digest("provider outcome digest", &outcome_digest)?;
+        let outcome_digest = digest(&response_bytes);
+        let response = self.put_protected_object(
+            &fence.work_item_id,
+            ProtectedObjectKind::ProviderReceipt,
+            None,
+            &outcome_digest,
+            &response_bytes,
+        )?;
         let parent = self
             .path
             .parent()
@@ -392,18 +715,6 @@ impl WorkLedger {
         verify_claim(&transaction, fence)?;
         let now = Utc::now().to_rfc3339();
         let outbox_state = if state == "retry" { "pending" } else { state };
-        let changed = transaction.execute(
-            "UPDATE outbox SET state = ?1, transport_receipt_digest = ?2,
-                    updated_at = ?3,
-                    acknowledged_at = CASE WHEN ?1 = 'acknowledged' THEN ?3 ELSE NULL END
-             WHERE wake_id = ?4 AND state = 'claimed'",
-            params![outbox_state, outcome_digest, now, fence.wake_id],
-        )?;
-        if changed != 1 {
-            return Err(WorkLedgerError::Refused(
-                "wake claim no longer matches during finalization".to_owned(),
-            ));
-        }
         let attempt_changed = transaction.execute(
             "UPDATE wake_attempts SET state = ?1, outcome_digest = ?2, finished_at = ?3
              WHERE wake_id = ?4 AND attempt = ?5 AND state = 'claimed'",
@@ -414,38 +725,94 @@ impl WorkLedger {
                 "wake attempt no longer matches during finalization".to_owned(),
             ));
         }
-        if state == "acknowledged" {
-            let work_changed = transaction.execute(
-                "UPDATE work_items SET phase = 'agent_owned_repair',
-                        work_generation = work_generation + 1, updated_at = ?1
-                 WHERE id = ?2 AND phase = 'dispatching'
-                   AND work_generation = ?3 AND owner_generation = ?4",
-                params![
-                    now,
-                    fence.work_item_id,
-                    fence.work_generation,
-                    fence.owner_generation,
-                ],
-            )?;
-            if work_changed != 1 {
-                return Err(WorkLedgerError::Refused(
-                    "wake work generation changed before acknowledgement".to_owned(),
-                ));
-            }
-            record_event(
-                &transaction,
-                &fence.work_item_id,
-                fence.work_generation + 1,
-                fence.owner_generation,
-                "wake_acknowledged",
-                Some(LifecycleState::Dispatching),
-                LifecycleState::AgentOwnedRepair,
-                &outcome_digest,
-                &now,
-            )?;
+        let delivery_changed = transaction.execute(
+            "UPDATE provider_deliveries
+             SET state = ?1, receipt_object_ref = ?2, updated_at = ?3,
+                 delivered_at = CASE WHEN ?1 = 'delivered' THEN ?3 ELSE NULL END
+             WHERE delivery_id = ?4 AND wake_id = ?5 AND attempt = ?6
+               AND activation_id = ?7 AND adapter_id = ?8
+               AND idempotency_key = ?9 AND request_object_ref = ?10
+               AND state IN ('prepared', 'launched')",
+            params![
+                state,
+                response.object_ref,
+                now,
+                fence.delivery_id,
+                fence.wake_id,
+                fence.attempt,
+                fence.activation_id,
+                fence.adapter_id,
+                fence.idempotency_key,
+                fence.request_object_ref,
+            ],
+        )?;
+        if delivery_changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "provider delivery no longer matches during finalization".to_owned(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE outbox SET state = ?1, transport_receipt_digest = ?2,
+                    provider_delivery_id = CASE WHEN ?1 = 'delivered' THEN ?3 ELSE NULL END,
+                    updated_at = ?4, acknowledged_at = NULL
+             WHERE wake_id = ?5 AND state = 'claimed'",
+            params![outbox_state, outcome_digest, fence.delivery_id, now, fence.wake_id],
+        )?;
+        if changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "wake claim no longer matches during finalization".to_owned(),
+            ));
+        }
+        let activation_changed = transaction.execute(
+            "UPDATE activation_epochs SET state = 'released', released_at = ?1
+             WHERE activation_id = ?2 AND state = 'active'",
+            params![now, fence.activation_id],
+        )?;
+        if activation_changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "provider activation no longer matches during finalization".to_owned(),
+            ));
         }
         transaction.commit()?;
         Ok(result)
+    }
+
+    fn finalize_without_delivery(
+        &self,
+        fence: &DeliveryFence,
+        evidence: &[u8],
+    ) -> WorkLedgerResult<WakeDeliveryResult> {
+        let evidence_digest = digest(evidence);
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_claim(&transaction, fence)?;
+        let now = Utc::now().to_rfc3339();
+        let attempt_changed = transaction.execute(
+            "UPDATE wake_attempts SET state = 'failed', outcome_digest = ?1, finished_at = ?2
+             WHERE wake_id = ?3 AND attempt = ?4 AND state = 'claimed'",
+            params![evidence_digest, now, fence.wake_id, fence.attempt],
+        )?;
+        let wake_changed = transaction.execute(
+            "UPDATE outbox SET state = 'failed', transport_receipt_digest = ?1,
+                    updated_at = ?2, acknowledged_at = NULL
+             WHERE wake_id = ?3 AND state = 'claimed'",
+            params![evidence_digest, now, fence.wake_id],
+        )?;
+        if attempt_changed != 1 || wake_changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "wake changed during pre-delivery failure".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(WakeDeliveryResult::Failed)
     }
 }
 
