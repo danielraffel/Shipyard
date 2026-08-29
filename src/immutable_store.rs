@@ -70,6 +70,34 @@ pub(crate) struct ImmutableByteStore {
 }
 
 impl ImmutableByteStore {
+    /// Open an existing store without creating, migrating, reconciling, or
+    /// deleting anything. Missing or unsafe storage is refused.
+    pub(crate) fn open_read_only(
+        root: impl Into<PathBuf>,
+        max_record_bytes: usize,
+    ) -> Result<Self, ImmutableStoreError> {
+        let root = root.into();
+        if max_record_bytes == 0
+            || root.file_name().is_none()
+            || root
+                .components()
+                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+        {
+            return Err(ImmutableStoreError::InvalidRoot);
+        }
+        validate_real_directory(&root, true)?;
+        #[cfg(unix)]
+        let directory = Arc::new(open_directory_nofollow(&root)?);
+        #[cfg(unix)]
+        validate_private_directory_file(&root, &directory)?;
+        Ok(Self {
+            root,
+            #[cfg(unix)]
+            directory,
+            max_record_bytes,
+        })
+    }
+
     pub(crate) fn open(
         root: impl Into<PathBuf>,
         max_record_bytes: usize,
@@ -167,6 +195,36 @@ impl ImmutableByteStore {
     pub(crate) fn contains(&self, logical_key: &str) -> Result<bool, ImmutableStoreError> {
         self.verify_directory_binding()?;
         self.contains_name(&Self::record_name(logical_key, "json"))
+    }
+
+    /// Read every committed immutable JSON record after revalidating the
+    /// directory binding. Callers retain responsibility for typed filtering.
+    pub(crate) fn list_records(&self) -> Result<Vec<Vec<u8>>, ImmutableStoreError> {
+        self.verify_directory_binding()?;
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(ImmutableStoreError::UnsafePath(entry.path()));
+            };
+            if Path::new(name).extension().and_then(|value| value.to_str()) == Some("json") {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        if names.len() > MAX_DIRECTORY_ENTRIES {
+            return Err(ImmutableStoreError::LimitExceeded {
+                max: MAX_DIRECTORY_ENTRIES,
+                found: names.len(),
+            });
+        }
+        let mut records = Vec::with_capacity(names.len());
+        for name in names {
+            records.push(self.read_name(&name)?);
+        }
+        self.verify_directory_binding()?;
+        Ok(records)
     }
 
     fn record_name(logical_key: &str, extension: &str) -> String {

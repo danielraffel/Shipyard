@@ -223,11 +223,17 @@ pub(super) enum Command {
     #[command(name = "parallel-proof-canary")]
     ParallelProofCanary {
         /// Private strict JSON invocation file with exact proof and policy authority.
-        #[arg(long)]
-        request: PathBuf,
+        #[arg(long, required_unless_present = "status")]
+        request: Option<PathBuf>,
         /// Execute the digest-pinned adapter. Omit for no execution or mutation.
-        #[arg(long)]
+        #[arg(long, requires = "request", conflicts_with_all = ["status", "cancel"])]
         apply: bool,
+        /// Inspect one durable canary job without launching or polling.
+        #[arg(long, value_name = "JOB_ID", conflicts_with_all = ["request", "apply", "cancel"])]
+        status: Option<String>,
+        /// Request bounded cancellation using the authority in --request.
+        #[arg(long, value_name = "JOB_ID", requires = "request", conflicts_with_all = ["apply", "status"])]
+        cancel: Option<String>,
     },
     /// Clean up old logs, bundles, evidence, and optional ship-state.
     Cleanup {
@@ -2277,7 +2283,7 @@ mod tests {
         .expect("parallel-proof canary plan");
         assert!(matches!(
             planned.command,
-            Command::ParallelProofCanary { request, apply: false }
+            Command::ParallelProofCanary { request: Some(request), apply: false, status: None, cancel: None }
                 if request == Path::new("/private/canary.json")
         ));
         let applied = Cli::try_parse_from([
@@ -2293,6 +2299,12 @@ mod tests {
             Command::ParallelProofCanary { apply: true, .. }
         ));
         assert!(Cli::try_parse_from(["shipyard", "parallel-proof-canary"]).is_err());
+        let status =
+            Cli::try_parse_from(["shipyard", "parallel-proof-canary", "--status", "job-1"])
+                .expect("status without request");
+        assert!(
+            matches!(status.command, Command::ParallelProofCanary { status: Some(job), .. } if job == "job-1")
+        );
     }
 
     #[test]

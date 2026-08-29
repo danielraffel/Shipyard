@@ -20,6 +20,7 @@ use crate::parallel_proof_canary_receipt::ArtifactDeliveryMode;
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 160;
 const MAX_HEARTBEATS: u32 = 128;
 const MAX_LOG_SEGMENTS: u32 = 32;
@@ -45,6 +46,18 @@ pub enum ApprovedCanaryOperation {
         worker_host_id: String,
         /// Digest of the complete proof manifest, inventory, and plan.
         manifest_sha256: Sha256Digest,
+        /// Digest of the exact private invocation bytes admitted by the controller.
+        request_sha256: Sha256Digest,
+        /// Digest of the immutable release/build artifact authority.
+        release_sha256: Sha256Digest,
+        /// Authenticated builder session generation, fencing reconnects.
+        builder_session_generation: u64,
+        /// Authenticated worker session generation, fencing reconnects.
+        worker_session_generation: u64,
+        /// Digest of the exact required cache-generation authority.
+        cache_authority_sha256: Sha256Digest,
+        /// Digest of both authenticated staging roots, classes, and reserves.
+        storage_authority_sha256: Sha256Digest,
         /// Exact manifest-bound encoded artifact size.
         artifact_bytes_total: u64,
         /// Digest of trusted machine-global invocation authority.
@@ -63,6 +76,8 @@ impl ApprovedCanaryOperation {
             target_triple,
             builder_host_id,
             worker_host_id,
+            builder_session_generation,
+            worker_session_generation,
             artifact_bytes_total,
             ..
         } = self;
@@ -78,7 +93,11 @@ impl ApprovedCanaryOperation {
         validate_id(target_triple, "canary job target triple")?;
         validate_id(builder_host_id, "canary job builder host")?;
         validate_id(worker_host_id, "canary job worker host")?;
-        if builder_host_id == worker_host_id || *artifact_bytes_total == 0 {
+        if builder_host_id == worker_host_id
+            || *builder_session_generation == 0
+            || *worker_session_generation == 0
+            || *artifact_bytes_total == 0
+        {
             return Err(ParallelProofError::InvalidField(
                 "canary job distinct hosts",
             ));
@@ -575,6 +594,7 @@ pub struct CanaryJobTransition {
 #[derive(Clone, Debug)]
 pub struct CanaryJobStore {
     records: ImmutableByteStore,
+    inputs: ImmutableByteStore,
     artifacts: ImmutableByteStore,
     logs: ImmutableByteStore,
 }
@@ -588,11 +608,64 @@ impl CanaryJobStore {
         Ok(Self {
             records: ImmutableByteStore::open(root.join("records"), MAX_RECORD_BYTES)
                 .map_err(map_store_error)?,
+            inputs: ImmutableByteStore::open(root.join("inputs"), MAX_INPUT_BYTES)
+                .map_err(map_store_error)?,
             artifacts: ImmutableByteStore::open(root.join("artifacts"), MAX_RECORD_BYTES)
                 .map_err(map_store_error)?,
             logs: ImmutableByteStore::open(root.join("logs"), MAX_RECORD_BYTES)
                 .map_err(map_store_error)?,
         })
+    }
+
+    /// Load one snapshot without creating, migrating, reconciling, or deleting
+    /// storage. This is the only legal backing for a read-only status query.
+    pub fn load_read_only(
+        root: impl Into<PathBuf>,
+        job_id: &str,
+    ) -> Result<CanaryJobSnapshot, ParallelProofError> {
+        let root = root.into();
+        let records = ImmutableByteStore::open_read_only(root.join("records"), MAX_RECORD_BYTES)
+            .map_err(map_store_error)?;
+        let artifacts =
+            ImmutableByteStore::open_read_only(root.join("artifacts"), MAX_RECORD_BYTES)
+                .map_err(map_store_error)?;
+        load_snapshot_from_stores(&records, &artifacts, job_id)
+    }
+
+    /// Persist the exact private invocation bytes before daemon admission.
+    pub fn record_input(
+        &self,
+        job: &ApprovedCanaryJob,
+        bytes: &[u8],
+    ) -> Result<StoreWriteOutcome, ParallelProofError> {
+        job.validate()?;
+        let ApprovedCanaryOperation::ParallelProofDistributedShadow { request_sha256, .. } =
+            &job.operation;
+        if Sha256Digest::of_bytes(bytes) != *request_sha256 {
+            return Err(ParallelProofError::BindingMismatch(
+                "canary job request bytes",
+            ));
+        }
+        self.inputs
+            .put(&input_key(&job.job_id), bytes)
+            .map_err(map_store_error)
+    }
+
+    /// Load the exact immutable invocation, rejecting envelope drift.
+    pub fn load_input(&self, job: &ApprovedCanaryJob) -> Result<Vec<u8>, ParallelProofError> {
+        job.validate()?;
+        let bytes = self
+            .inputs
+            .load(&input_key(&job.job_id))
+            .map_err(map_store_error)?;
+        let ApprovedCanaryOperation::ParallelProofDistributedShadow { request_sha256, .. } =
+            &job.operation;
+        if Sha256Digest::of_bytes(&bytes) != *request_sha256 {
+            return Err(ParallelProofError::BindingMismatch(
+                "canary job request bytes",
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Persist immutable intent before any backend launch is legal.
@@ -646,48 +719,30 @@ impl CanaryJobStore {
         Ok(snapshot)
     }
 
+    /// Enumerate exact nonterminal job identifiers for one daemon tick.
+    /// Receipt records share the immutable directory and are ignored only when
+    /// they do not carry an envelope's `owner` and `operation` fields.
+    pub fn pending_job_ids(&self) -> Result<Vec<String>, ParallelProofError> {
+        let mut job_ids = Vec::new();
+        for bytes in self.records.list_records().map_err(map_store_error)? {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if value.get("owner").is_none() || value.get("operation").is_none() {
+                continue;
+            }
+            let job: ApprovedCanaryJob = serde_json::from_value(value)?;
+            job.validate()?;
+            let snapshot = self.load(&job.job_id)?;
+            if !snapshot.is_terminal() {
+                job_ids.push(job.job_id);
+            }
+        }
+        job_ids.sort();
+        job_ids.dedup();
+        Ok(job_ids)
+    }
+
     fn load_receipt_chain(&self, job_id: &str) -> Result<CanaryJobSnapshot, ParallelProofError> {
-        validate_id(job_id, "canary job id")?;
-        let job: ApprovedCanaryJob = serde_json::from_slice(
-            &self
-                .records
-                .load(&envelope_key(job_id))
-                .map_err(map_store_error)?,
-        )?;
-        job.validate()?;
-        if job.job_id != job_id {
-            return Err(ParallelProofError::CorruptRecord(
-                "canary job logical key".to_owned(),
-            ));
-        }
-        let job_sha256 = job.digest()?;
-        let mut receipts = Vec::new();
-        let maximum = job.max_heartbeat_receipts + 5;
-        for sequence in 0..maximum {
-            let bytes = match self.records.load(&receipt_key(job_id, sequence)) {
-                Ok(bytes) => bytes,
-                Err(ImmutableStoreError::Missing(_)) => break,
-                Err(error) => return Err(map_store_error(error)),
-            };
-            let receipt: CanaryJobReceipt = serde_json::from_slice(&bytes)?;
-            validate_receipt(&job, &receipts, &receipt, &job_sha256)?;
-            receipts.push(receipt);
-        }
-        if receipts.is_empty() {
-            return Err(ParallelProofError::CorruptRecord(
-                "canary job missing prepared receipt".to_owned(),
-            ));
-        }
-        if self
-            .records
-            .contains(&receipt_key(job_id, maximum))
-            .map_err(map_store_error)?
-        {
-            return Err(ParallelProofError::CorruptRecord(
-                "canary job receipt limit".to_owned(),
-            ));
-        }
-        Ok(CanaryJobSnapshot { job, receipts })
+        load_receipt_chain_from_store(&self.records, job_id)
     }
 
     /// Persist an authenticated cancel request without overwriting a contradiction.
@@ -1080,6 +1135,80 @@ impl CanaryJobStore {
             )
             .map_err(map_store_error)
     }
+}
+
+fn load_snapshot_from_stores(
+    records: &ImmutableByteStore,
+    artifacts: &ImmutableByteStore,
+    job_id: &str,
+) -> Result<CanaryJobSnapshot, ParallelProofError> {
+    let snapshot = load_receipt_chain_from_store(records, job_id)?;
+    if let CanaryJobReceiptState::Terminal {
+        outcome: CanaryJobTerminalOutcome::Succeeded,
+        artifact: Some(artifact),
+        ..
+    } = &snapshot.latest().receipt
+    {
+        let bytes = artifacts
+            .load(&artifact_key(job_id))
+            .map_err(map_store_error)?;
+        let response: CanaryJobResponse = serde_json::from_slice(&bytes)?;
+        let (launch_nonce_sha256, _) = active_identity(&snapshot)?;
+        response.validate(&snapshot.job, launch_nonce_sha256)?;
+        if bytes.len() != artifact.bytes as usize
+            || Sha256Digest::of_bytes(&bytes) != artifact.content_sha256
+        {
+            return Err(ParallelProofError::CorruptRecord(
+                "canary job success artifact".to_owned(),
+            ));
+        }
+    }
+    Ok(snapshot)
+}
+
+fn load_receipt_chain_from_store(
+    records: &ImmutableByteStore,
+    job_id: &str,
+) -> Result<CanaryJobSnapshot, ParallelProofError> {
+    validate_id(job_id, "canary job id")?;
+    let job: ApprovedCanaryJob = serde_json::from_slice(
+        &records
+            .load(&envelope_key(job_id))
+            .map_err(map_store_error)?,
+    )?;
+    job.validate()?;
+    if job.job_id != job_id {
+        return Err(ParallelProofError::CorruptRecord(
+            "canary job logical key".to_owned(),
+        ));
+    }
+    let job_sha256 = job.digest()?;
+    let mut receipts = Vec::new();
+    let maximum = job.max_heartbeat_receipts + 5;
+    for sequence in 0..maximum {
+        let bytes = match records.load(&receipt_key(job_id, sequence)) {
+            Ok(bytes) => bytes,
+            Err(ImmutableStoreError::Missing(_)) => break,
+            Err(error) => return Err(map_store_error(error)),
+        };
+        let receipt: CanaryJobReceipt = serde_json::from_slice(&bytes)?;
+        validate_receipt(&job, &receipts, &receipt, &job_sha256)?;
+        receipts.push(receipt);
+    }
+    if receipts.is_empty() {
+        return Err(ParallelProofError::CorruptRecord(
+            "canary job missing prepared receipt".to_owned(),
+        ));
+    }
+    if records
+        .contains(&receipt_key(job_id, maximum))
+        .map_err(map_store_error)?
+    {
+        return Err(ParallelProofError::CorruptRecord(
+            "canary job receipt limit".to_owned(),
+        ));
+    }
+    Ok(CanaryJobSnapshot { job, receipts })
 }
 
 /// Persist intent and launch exactly once. A replay only returns durable state.
@@ -1894,6 +2023,10 @@ fn envelope_key(job_id: &str) -> String {
     format!("job-{job_id}-envelope")
 }
 
+fn input_key(job_id: &str) -> String {
+    format!("job-{job_id}-input")
+}
+
 fn receipt_key(job_id: &str, sequence: u32) -> String {
     format!("job-{job_id}-receipt-{sequence:03}")
 }
@@ -1963,6 +2096,12 @@ mod tests {
                 builder_host_id: "m3".to_owned(),
                 worker_host_id: "m1".to_owned(),
                 manifest_sha256: digest("manifest"),
+                request_sha256: digest("request"),
+                release_sha256: digest("release"),
+                builder_session_generation: 11,
+                worker_session_generation: 12,
+                cache_authority_sha256: digest("cache-authority"),
+                storage_authority_sha256: digest("storage-authority"),
                 artifact_bytes_total: 1_024,
                 invocation_authority_sha256: digest("authority"),
                 adapter_executable_sha256: digest("adapter"),
@@ -2832,6 +2971,55 @@ mod tests {
             store.submit(&contradiction),
             Err(ParallelProofError::ImmutableConflict(_))
         ));
+    }
+
+    #[test]
+    fn immutable_input_and_pending_index_survive_store_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CanaryJobStore::open(temp.path()).unwrap();
+        let mut exact_job = job();
+        let bytes = b"exact-private-invocation";
+        let ApprovedCanaryOperation::ParallelProofDistributedShadow { request_sha256, .. } =
+            &mut exact_job.operation;
+        *request_sha256 = Sha256Digest::of_bytes(bytes);
+        store.record_input(&exact_job, bytes).unwrap();
+        store.submit(&exact_job).unwrap();
+        drop(store);
+
+        let reopened = CanaryJobStore::open(temp.path()).unwrap();
+        assert_eq!(reopened.load_input(&exact_job).unwrap(), bytes);
+        assert_eq!(
+            reopened.pending_job_ids().unwrap(),
+            vec![exact_job.job_id.clone()]
+        );
+
+        let mut contradiction = exact_job.clone();
+        let ApprovedCanaryOperation::ParallelProofDistributedShadow { request_sha256, .. } =
+            &mut contradiction.operation;
+        *request_sha256 = digest("different-request");
+        assert!(matches!(
+            reopened.load_input(&contradiction),
+            Err(ParallelProofError::BindingMismatch(
+                "canary job request bytes"
+            ))
+        ));
+
+        let large = vec![b'x'; 2 * 1024 * 1024];
+        let mut large_job = job();
+        large_job.job_id = "canary-large-input".to_owned();
+        let ApprovedCanaryOperation::ParallelProofDistributedShadow { request_sha256, .. } =
+            &mut large_job.operation;
+        *request_sha256 = Sha256Digest::of_bytes(&large);
+        reopened.record_input(&large_job, &large).unwrap();
+        assert_eq!(reopened.load_input(&large_job).unwrap(), large);
+    }
+
+    #[test]
+    fn read_only_status_open_never_creates_missing_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("absent-jobs");
+        assert!(CanaryJobStore::load_read_only(&missing, "job-1").is_err());
+        assert!(!missing.exists());
     }
 
     #[test]

@@ -450,13 +450,20 @@ where
                 stdout,
             );
         }
-        Command::ParallelProofCanary { request, apply } => {
+        Command::ParallelProofCanary {
+            request,
+            apply,
+            status,
+            cancel,
+        } => {
             let config =
                 LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
                     .map_err(|error| CliFailure::new(2, error.to_string()))?;
             return parallel_proof_canary_command(
-                &request,
+                request.as_deref(),
                 apply,
+                status.as_deref(),
+                cancel.as_deref(),
                 &config,
                 &runtime_paths.state_dir,
                 stdout,

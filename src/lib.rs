@@ -103,6 +103,8 @@ pub mod parallel_proof_canary_controller;
 pub mod parallel_proof_canary_driver;
 /// Restart-reconcilable, session-independent execution custody for protected canary jobs.
 pub mod parallel_proof_canary_job;
+/// Typed daemon-supervisor adapter for restartable parallel-proof canary jobs.
+pub mod parallel_proof_canary_job_adapter;
 /// Immutable measurement receipts for the default-off Pulp macOS sharding canary.
 pub mod parallel_proof_canary_receipt;
 /// Authenticated companion protocol for read-only remote M1 cache observation.
