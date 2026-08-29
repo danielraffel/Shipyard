@@ -779,6 +779,11 @@ mod tests {
                     max_stdout_bytes: 1024,
                     max_stderr_bytes: 1024,
                 },
+                terminal_trust: Box::new(
+                    crate::workstream_continuation_config::TerminalTrustConfig {
+                        cmux_signing_team_id: "7WLXT3NR37".to_owned(),
+                    },
+                ),
             },
         }
     }

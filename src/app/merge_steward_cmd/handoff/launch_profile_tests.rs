@@ -210,6 +210,9 @@ fn continuation_activation() -> ReadyWorkstreamActivation {
                 max_stdout_bytes: 65_536,
                 max_stderr_bytes: 65_536,
             },
+            terminal_trust: Box::new(crate::workstream_continuation_config::TerminalTrustConfig {
+                cmux_signing_team_id: "7WLXT3NR37".to_owned(),
+            }),
         },
     }
 }

@@ -16,8 +16,8 @@ use crate::identity::RuntimeMode;
 use crate::provider_wrapper::{
     CmuxEndpointV1, FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderDeliveryTargetV1,
     ProviderLaunchOptionsV1, ProviderWrapperEnvironment, ProviderWrapperOperationV1,
-    ProviderWrapperRequestV1, ProviderWrapperRunResult, provider_wrapper_execution_supported,
-    run_provider_wrapper,
+    ProviderWrapperRequestV1, ProviderWrapperRunResult, TerminalEndpointV1,
+    provider_wrapper_execution_supported, run_provider_wrapper,
 };
 use crate::terminal_delivery_authority::{
     ProductionTerminalEvidenceAdapter, TerminalCapabilityRefusal, TerminalEvidenceAdapter,
@@ -685,22 +685,23 @@ impl WorkLedgerProviderAdapter<'_> {
             idempotency_key: String::new(),
         };
         delivery_fence.bind_idempotency_key();
-        let cmux_endpoint = match mutation_endpoint {
+        let terminal_endpoint = match mutation_endpoint {
             TerminalMutationEndpoint::Cmux {
                 executable_path,
                 socket_path,
-            } => CmuxEndpointV1 {
+            } => TerminalEndpointV1::Cmux(CmuxEndpointV1 {
                 executable_path: executable_path.clone(),
                 socket_path: socket_path.clone(),
-            },
+                signing_team_id: self.config.terminal_trust.cmux_signing_team_id.clone(),
+            }),
         };
         Ok(ProviderWrapperRequestV1 {
-            schema_version: 1,
+            schema_version: crate::provider_wrapper::PROVIDER_WRAPPER_SCHEMA_VERSION,
             operation,
             provider_id: stored.provider_id,
             adapter_id: stored.adapter_id,
             delivery_fence,
-            cmux_endpoint,
+            terminal_endpoint,
             delivery_target,
             protected_route: profile.protected_resume_route(fence.payload_digest.clone()),
             resume_expectation: FreshResumeExpectationV1 {
@@ -1068,6 +1069,11 @@ mod tests {
                     max_stdout_bytes: 1024,
                     max_stderr_bytes: 1024,
                 },
+                terminal_trust: Box::new(
+                    crate::workstream_continuation_config::TerminalTrustConfig {
+                        cmux_signing_team_id: "7WLXT3NR37".to_owned(),
+                    },
+                ),
             },
         })
     }

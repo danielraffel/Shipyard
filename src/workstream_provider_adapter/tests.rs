@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use super::*;
 use crate::provider_wrapper::{
     CmuxEndpointV1, FreshResumeExpectationV1, ProtectedProviderRouteV1, ProviderDeliveryFenceV1,
-    ProviderLaunchOptionsV1, ProviderReasoningEffortV1,
+    ProviderLaunchOptionsV1, ProviderReasoningEffortV1, TerminalEndpointV1,
 };
 use crate::work_ledger::{
     DeliveryAuthorization, DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
@@ -37,7 +37,7 @@ fn native_absolute_test_path(leaf: &str) -> String {
 struct FakeRunner {
     subrouter_verification: Option<Result<(), &'static str>>,
     verification: Option<Result<(), RunnerFailure>>,
-    bound_endpoints: Vec<CmuxEndpointV1>,
+    bound_endpoints: Vec<TerminalEndpointV1>,
     results: VecDeque<Result<CommandResult, RunnerFailure>>,
     calls: Vec<Vec<String>>,
     private_launches: Vec<String>,
@@ -49,7 +49,7 @@ fn private_launch_path(command: &str) -> Option<PathBuf> {
     ))
 }
 
-impl CmuxRunner for FakeRunner {
+impl TerminalRunner for FakeRunner {
     fn verify_subrouter(
         &mut self,
         _request: &ProviderWrapperRequestV1,
@@ -64,7 +64,7 @@ impl CmuxRunner for FakeRunner {
         prepare_private_launch(request, false)
     }
 
-    fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
+    fn bind(&mut self, endpoint: &TerminalEndpointV1) -> Result<(), RunnerFailure> {
         self.bound_endpoints.push(endpoint.clone());
         self.verification.take().unwrap_or(Ok(()))
     }
@@ -197,16 +197,17 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
     };
     fence.bind_idempotency_key();
     ProviderWrapperRequestV1 {
-        schema_version: 1,
+        schema_version: PROVIDER_WRAPPER_SCHEMA_VERSION,
         operation,
         delivery_target: ProviderDeliveryTargetV1::FreshCheckpoint,
         provider_id: provider.to_owned(),
         adapter_id: ADAPTER_ID.to_owned(),
         delivery_fence: fence,
-        cmux_endpoint: CmuxEndpointV1 {
+        terminal_endpoint: TerminalEndpointV1::Cmux(CmuxEndpointV1 {
             executable_path: "/test/cmux-a".to_owned(),
             socket_path: "/test/cmux-a.sock".to_owned(),
-        },
+            signing_team_id: "7WLXT3NR37".to_owned(),
+        }),
         protected_route: ProtectedProviderRouteV1 {
             argv: vec![
                 "/opt/subrouter".to_owned(),
@@ -795,10 +796,11 @@ fn profile_route_drift_refuses_before_terminal_enumeration() {
 fn each_request_binds_enumeration_and_mutation_to_its_exact_cmux_endpoint() {
     let first = request("codex", ProviderWrapperOperationV1::Reconcile);
     let mut second = first.clone();
-    second.cmux_endpoint = CmuxEndpointV1 {
+    second.terminal_endpoint = TerminalEndpointV1::Cmux(CmuxEndpointV1 {
         executable_path: "/test/cmux-b".into(),
         socket_path: "/test/cmux-b.sock".into(),
-    };
+        signing_team_id: "ABCDEFGHIJ".into(),
+    });
     let mut runner = FakeRunner {
         results: VecDeque::from([
             windows(&[UUID]),
@@ -817,8 +819,39 @@ fn each_request_binds_enumeration_and_mutation_to_its_exact_cmux_endpoint() {
     }
     assert_eq!(
         runner.bound_endpoints,
-        vec![first.cmux_endpoint, second.cmux_endpoint]
+        vec![first.terminal_endpoint, second.terminal_endpoint]
     );
+}
+
+#[test]
+fn herdr_shape_never_falls_back_to_cmux_even_with_declared_proofs() {
+    let mut request = request("codex", ProviderWrapperOperationV1::Submit);
+    request.terminal_endpoint = TerminalEndpointV1::HerdR {
+        socket_path: "/test/herdr.sock".into(),
+        server_incarnation: Some("server-epoch-1".into()),
+        direct_fresh_launch_proven: true,
+    };
+    let mut runner = FakeRunner::default();
+    let response = handle_request(&request, &mut runner);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Rejected { .. }
+    ));
+    assert!(runner.bound_endpoints.is_empty());
+    assert!(runner.calls.is_empty());
+}
+
+#[test]
+fn request_cannot_select_a_different_cmux_signing_identity() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let TerminalEndpointV1::Cmux(endpoint) = &request.terminal_endpoint else {
+        panic!("cmux fixture");
+    };
+    assert_eq!(
+        verify_cmux_signing_policy(endpoint, "ABCDEFGHIJ"),
+        Err(RunnerFailure::Untrusted)
+    );
+    assert_eq!(verify_cmux_signing_policy(endpoint, "7WLXT3NR37"), Ok(()));
 }
 
 #[test]
@@ -936,7 +969,10 @@ fn untrusted_cmux_and_direct_provider_fallback_refuse_before_any_command() {
 #[test]
 fn production_cmux_adapter_refuses_before_running_any_cmux_command() {
     let request = request("codex", ProviderWrapperOperationV1::Submit);
-    let response = handle_request(&request, &mut ProductionCmuxRunner::default());
+    let response = handle_request(
+        &request,
+        &mut ProductionCmuxRunner::new("7WLXT3NR37".to_owned()),
+    );
     assert!(matches!(
         response.outcome,
         ProviderWrapperOutcomeV1::Retryable { .. }
@@ -1204,6 +1240,9 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
             max_stdout_bytes: 65_536,
             max_stderr_bytes: 65_536,
         },
+        terminal_trust: Box::new(crate::workstream_continuation_config::TerminalTrustConfig {
+            cmux_signing_team_id: "7WLXT3NR37".to_owned(),
+        }),
     };
     let publication = NativePublicationRequest {
         repository: "generous-corp/shipyard".to_owned(),

@@ -26,19 +26,19 @@ use sha2::{Digest, Sha256};
 
 use crate::process::run_output_until;
 use crate::provider_wrapper::{
-    CmuxEndpointV1, NotAcceptedV1, ProviderAcceptanceV1, ProviderDeliveryTargetV1,
-    ProviderWrapperOperationV1, ProviderWrapperOutcomeV1, ProviderWrapperRequestV1,
-    ProviderWrapperResponseV1, UnknownV1, validate_request,
+    CmuxEndpointV1, NotAcceptedV1, PROVIDER_WRAPPER_SCHEMA_VERSION, ProviderAcceptanceV1,
+    ProviderDeliveryTargetV1, ProviderWrapperOperationV1, ProviderWrapperOutcomeV1,
+    ProviderWrapperRequestV1, ProviderWrapperResponseV1, TerminalEndpointV1, UnknownV1,
+    validate_request,
 };
-use crate::workstream_continuation_config::ProviderWrapperConfig;
+use crate::workstream_continuation_config::{
+    ProviderWrapperConfig, load_trusted_terminal_trust_config,
+};
 
-const SCHEMA_VERSION: u32 = 1;
 const ADAPTER_ID: &str = "cmux-workstream-v1";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "macos")]
 const CODESIGN: &str = "/usr/bin/codesign";
-#[cfg(target_os = "macos")]
-const MANAFLOW_TEAM_ID: &str = "7WLXT3NR37";
 const COMMAND_DEADLINE: Duration = Duration::from_secs(15);
 #[cfg(not(test))]
 const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_secs(5);
@@ -56,8 +56,13 @@ pub fn run_stdio() -> Result<(), String> {
         return Err("request exceeds the bounded input limit".to_owned());
     }
     let request: ProviderWrapperRequestV1 =
-        serde_json::from_slice(&bytes).map_err(|_| "request is not strict v1 JSON".to_owned())?;
-    let response = handle_request(&request, &mut ProductionCmuxRunner::default());
+        serde_json::from_slice(&bytes).map_err(|_| "request is not strict v2 JSON".to_owned())?;
+    let terminal_trust = load_trusted_terminal_trust_config()
+        .map_err(|_| "trusted terminal policy is unavailable".to_owned())?;
+    let response = handle_request(
+        &request,
+        &mut ProductionCmuxRunner::new(terminal_trust.cmux_signing_team_id),
+    );
     let canonical =
         serde_json::to_vec(&response).map_err(|_| "response cannot be serialized".to_owned())?;
     let mut stdout = std::io::stdout().lock();
@@ -138,29 +143,39 @@ struct CommandResult {
     stdout: Vec<u8>,
 }
 
-trait CmuxRunner {
+trait TerminalRunner {
     fn verify_subrouter(&mut self, request: &ProviderWrapperRequestV1) -> Result<(), &'static str>;
     fn prepare_private_launch(
         &mut self,
         request: &ProviderWrapperRequestV1,
     ) -> Result<PrivateLaunch, &'static str>;
-    fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure>;
+    fn bind(&mut self, endpoint: &TerminalEndpointV1) -> Result<(), RunnerFailure>;
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunnerFailure {
     Unavailable,
+    CapabilityUnproven,
     #[cfg(any(target_os = "macos", test))]
     Untrusted,
 }
 
-#[derive(Default)]
 struct ProductionCmuxRunner {
     endpoint: Option<CmuxEndpointV1>,
+    trusted_signing_team_id: String,
 }
 
-impl CmuxRunner for ProductionCmuxRunner {
+impl ProductionCmuxRunner {
+    fn new(trusted_signing_team_id: String) -> Self {
+        Self {
+            endpoint: None,
+            trusted_signing_team_id,
+        }
+    }
+}
+
+impl TerminalRunner for ProductionCmuxRunner {
     fn verify_subrouter(&mut self, request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
         verify_subrouter_executable(request)
     }
@@ -172,10 +187,15 @@ impl CmuxRunner for ProductionCmuxRunner {
         prepare_private_launch(request, true)
     }
 
-    fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
-        verify_authorized_cmux(endpoint)?;
-        self.endpoint = Some(endpoint.clone());
-        Ok(())
+    fn bind(&mut self, endpoint: &TerminalEndpointV1) -> Result<(), RunnerFailure> {
+        match endpoint {
+            TerminalEndpointV1::Cmux(endpoint) => {
+                verify_authorized_cmux(endpoint, &self.trusted_signing_team_id)?;
+                self.endpoint = Some(endpoint.clone());
+                Ok(())
+            }
+            TerminalEndpointV1::HerdR { .. } => Err(RunnerFailure::CapabilityUnproven),
+        }
     }
 
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure> {
@@ -199,9 +219,13 @@ impl CmuxRunner for ProductionCmuxRunner {
 }
 
 #[cfg(target_os = "macos")]
-fn verify_authorized_cmux(endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
+fn verify_authorized_cmux(
+    endpoint: &CmuxEndpointV1,
+    trusted_signing_team_id: &str,
+) -> Result<(), RunnerFailure> {
     use std::os::unix::fs::FileTypeExt;
 
+    verify_cmux_signing_policy(endpoint, trusted_signing_team_id)?;
     let cli = Path::new(&endpoint.executable_path);
     let socket = Path::new(&endpoint.socket_path);
     let cli_metadata = fs::metadata(cli).map_err(|_| RunnerFailure::Unavailable)?;
@@ -219,8 +243,9 @@ fn verify_authorized_cmux(endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure
     {
         return Err(RunnerFailure::Untrusted);
     }
-    let requirement =
-        format!("=anchor apple generic and certificate leaf[subject.OU] = \"{MANAFLOW_TEAM_ID}\"");
+    let requirement = format!(
+        "=anchor apple generic and certificate leaf[subject.OU] = \"{trusted_signing_team_id}\""
+    );
     let output = Command::new(CODESIGN)
         .args([
             OsStr::new("--verify"),
@@ -241,13 +266,27 @@ fn verify_authorized_cmux(endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure
 }
 
 #[cfg(not(target_os = "macos"))]
-fn verify_authorized_cmux(_endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
+fn verify_authorized_cmux(
+    _endpoint: &CmuxEndpointV1,
+    _trusted_signing_team_id: &str,
+) -> Result<(), RunnerFailure> {
     Err(RunnerFailure::Unavailable)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn verify_cmux_signing_policy(
+    endpoint: &CmuxEndpointV1,
+    trusted_signing_team_id: &str,
+) -> Result<(), RunnerFailure> {
+    if endpoint.signing_team_id != trusted_signing_team_id {
+        return Err(RunnerFailure::Untrusted);
+    }
+    Ok(())
 }
 
 fn handle_request(
     request: &ProviderWrapperRequestV1,
-    runner: &mut impl CmuxRunner,
+    runner: &mut impl TerminalRunner,
 ) -> ProviderWrapperResponseV1 {
     if let Err(code) = validate_adapter_request(request) {
         let outcome = match request.operation {
@@ -256,25 +295,11 @@ fn handle_request(
         };
         return response(request, outcome);
     }
-    match runner.bind(&request.cmux_endpoint) {
-        #[cfg(any(target_os = "macos", test))]
-        Err(RunnerFailure::Untrusted) => {
-            let outcome = match request.operation {
-                ProviderWrapperOperationV1::Submit => rejected("cmux-untrusted"),
-                ProviderWrapperOperationV1::Reconcile => uncertain("cmux-untrusted"),
-            };
-            return response(request, outcome);
-        }
-        Err(RunnerFailure::Unavailable) => {
-            let outcome = match request.operation {
-                ProviderWrapperOperationV1::Submit => retryable("cmux-unavailable-before-create"),
-                ProviderWrapperOperationV1::Reconcile => {
-                    uncertain("cmux-unavailable-during-reconcile")
-                }
-            };
-            return response(request, outcome);
-        }
-        Ok(()) => {}
+    if let Some(outcome) = terminal_capability_refusal(request) {
+        return response(request, outcome);
+    }
+    if let Some(outcome) = bind_terminal(request, runner) {
+        return response(request, outcome);
     }
     if let ProviderDeliveryTargetV1::OriginalSession { surface_id } = &request.delivery_target {
         return response(
@@ -355,6 +380,50 @@ fn handle_request(
     )
 }
 
+fn bind_terminal(
+    request: &ProviderWrapperRequestV1,
+    runner: &mut impl TerminalRunner,
+) -> Option<ProviderWrapperOutcomeV1> {
+    match runner.bind(&request.terminal_endpoint) {
+        Err(RunnerFailure::CapabilityUnproven) => {
+            let outcome = match request.operation {
+                ProviderWrapperOperationV1::Submit => rejected("terminal-capability-unproven"),
+                ProviderWrapperOperationV1::Reconcile => uncertain("terminal-capability-unproven"),
+            };
+            Some(outcome)
+        }
+        #[cfg(any(target_os = "macos", test))]
+        Err(RunnerFailure::Untrusted) => {
+            let outcome = match request.operation {
+                ProviderWrapperOperationV1::Submit => rejected("cmux-untrusted"),
+                ProviderWrapperOperationV1::Reconcile => uncertain("cmux-untrusted"),
+            };
+            Some(outcome)
+        }
+        Err(RunnerFailure::Unavailable) => {
+            let outcome = match request.operation {
+                ProviderWrapperOperationV1::Submit => retryable("cmux-unavailable-before-create"),
+                ProviderWrapperOperationV1::Reconcile => {
+                    uncertain("cmux-unavailable-during-reconcile")
+                }
+            };
+            Some(outcome)
+        }
+        Ok(()) => None,
+    }
+}
+
+fn terminal_capability_refusal(
+    request: &ProviderWrapperRequestV1,
+) -> Option<ProviderWrapperOutcomeV1> {
+    matches!(request.terminal_endpoint, TerminalEndpointV1::HerdR { .. }).then(|| {
+        match request.operation {
+            ProviderWrapperOperationV1::Submit => rejected("herdr-capability-unproven"),
+            ProviderWrapperOperationV1::Reconcile => uncertain("herdr-capability-unproven"),
+        }
+    })
+}
+
 #[cfg(unix)]
 fn verify_subrouter_executable(request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
     const MAX_SUBROUTER_BYTES: u64 = 128 * 1024 * 1024;
@@ -402,7 +471,7 @@ fn verify_subrouter_executable(_: &ProviderWrapperRequestV1) -> Result<(), &'sta
 
 fn reconcile_existing_workspace(
     request: &ProviderWrapperRequestV1,
-    runner: &mut impl CmuxRunner,
+    runner: &mut impl TerminalRunner,
     workspace_id: &str,
     description: &str,
 ) -> ProviderWrapperOutcomeV1 {
@@ -420,7 +489,7 @@ fn reconcile_existing_workspace(
 
 fn deliver_to_original_session(
     request: &ProviderWrapperRequestV1,
-    runner: &mut impl CmuxRunner,
+    runner: &mut impl TerminalRunner,
     surface_id: &str,
 ) -> ProviderWrapperOutcomeV1 {
     let Some(surface_id) = canonical_uuid(surface_id) else {
@@ -499,7 +568,7 @@ fn validate_adapter_request(request: &ProviderWrapperRequestV1) -> Result<(), &'
 }
 
 fn list_matching_workspaces(
-    runner: &mut impl CmuxRunner,
+    runner: &mut impl TerminalRunner,
     description: &str,
 ) -> Result<Vec<String>, &'static str> {
     let windows_result = runner
@@ -889,7 +958,7 @@ struct SurfaceResumeEvidence {
 }
 
 fn session_bindings_for_workspace(
-    runner: &mut impl CmuxRunner,
+    runner: &mut impl TerminalRunner,
     workspace_id: &str,
     provider_id: &str,
 ) -> Result<Vec<AgentSessionBinding>, &'static str> {
@@ -928,7 +997,7 @@ fn session_bindings_for_workspace(
 }
 
 fn session_binding_for_surface(
-    runner: &mut impl CmuxRunner,
+    runner: &mut impl TerminalRunner,
     workspace_id: &str,
     surface_id: &str,
     provider_id: &str,
@@ -1043,7 +1112,7 @@ fn response(
     outcome: ProviderWrapperOutcomeV1,
 ) -> ProviderWrapperResponseV1 {
     ProviderWrapperResponseV1 {
-        schema_version: SCHEMA_VERSION,
+        schema_version: PROVIDER_WRAPPER_SCHEMA_VERSION,
         operation: request.operation,
         provider_id: request.provider_id.clone(),
         adapter_id: request.adapter_id.clone(),

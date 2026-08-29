@@ -27,13 +27,16 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use crate::process::ProcessTree;
 use crate::workstream_continuation_config::ProviderWrapperConfig;
+use crate::workstream_continuation_config::registered_provider_route_shape;
 
 #[cfg(unix)]
 mod execution_sentinel;
 #[cfg(unix)]
 use execution_sentinel::terminate_sentinel_processes;
 
-const SCHEMA_VERSION: u32 = 1;
+/// Wire version 2 introduces tagged terminal endpoints. It is deliberately
+/// incompatible with the cmux-only v1 request so mixed deployments refuse.
+pub(crate) const PROVIDER_WRAPPER_SCHEMA_VERSION: u32 = 2;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WRAPPER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 4 * 1024;
@@ -168,7 +171,7 @@ pub(crate) struct ProviderWrapperRequestV1 {
     pub(crate) adapter_id: String,
     pub(crate) delivery_fence: ProviderDeliveryFenceV1,
     /// Exact terminal endpoint accepted by the one-shot delivery authority.
-    pub(crate) cmux_endpoint: CmuxEndpointV1,
+    pub(crate) terminal_endpoint: TerminalEndpointV1,
     /// Whether this operation targets the proven live original session or a
     /// separately-authorized checkpoint-only replacement.
     pub(crate) delivery_target: ProviderDeliveryTargetV1,
@@ -184,6 +187,21 @@ pub(crate) struct ProviderWrapperRequestV1 {
 pub(crate) struct CmuxEndpointV1 {
     pub(crate) executable_path: String,
     pub(crate) socket_path: String,
+    /// Apple signing team accepted by trusted machine-global product policy.
+    pub(crate) signing_team_id: String,
+}
+
+/// Terminal-neutral transport authority. A registered shape is not activation:
+/// each adapter must still prove its capabilities before any terminal action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "adapter", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum TerminalEndpointV1 {
+    Cmux(CmuxEndpointV1),
+    HerdR {
+        socket_path: String,
+        server_incarnation: Option<String>,
+        direct_fresh_launch_proven: bool,
+    },
 }
 
 /// Prompt-free provider route retained only inside protected execution.
@@ -432,7 +450,7 @@ pub(crate) fn validate_request(
     config: &ProviderWrapperConfig,
     request: &ProviderWrapperRequestV1,
 ) -> Result<(), ProviderWrapperRefusal> {
-    if request.schema_version != SCHEMA_VERSION
+    if request.schema_version != PROVIDER_WRAPPER_SCHEMA_VERSION
         || request.provider_id != config.provider_id
         || request.adapter_id != config.adapter_id
     {
@@ -525,7 +543,7 @@ pub(crate) fn validate_request(
             "fresh-resume head must be an exact lowercase 40-hex commit",
         ));
     }
-    validate_cmux_endpoint(&request.cmux_endpoint)?;
+    validate_terminal_endpoint(&request.terminal_endpoint)?;
     if let ProviderDeliveryTargetV1::OriginalSession { surface_id } = &request.delivery_target {
         validate_token(surface_id)?;
     }
@@ -548,7 +566,44 @@ fn validate_cmux_endpoint(endpoint: &CmuxEndpointV1) -> Result<(), ProviderWrapp
             ));
         }
     }
+    if endpoint.signing_team_id.len() != 10
+        || !endpoint
+            .signing_team_id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(refusal("cmux signing team identity is invalid"));
+    }
     Ok(())
+}
+
+fn validate_terminal_endpoint(endpoint: &TerminalEndpointV1) -> Result<(), ProviderWrapperRefusal> {
+    match endpoint {
+        TerminalEndpointV1::Cmux(endpoint) => validate_cmux_endpoint(endpoint),
+        TerminalEndpointV1::HerdR {
+            socket_path,
+            server_incarnation,
+            direct_fresh_launch_proven,
+        } => {
+            validate_value(socket_path)?;
+            let path = Path::new(socket_path);
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            {
+                return Err(refusal("HerdR endpoint must be a normalized absolute path"));
+            }
+            let Some(incarnation) = server_incarnation else {
+                return Err(refusal("HerdR server incarnation proof is required"));
+            };
+            validate_token(incarnation)?;
+            if !direct_fresh_launch_proven {
+                return Err(refusal("HerdR direct fresh-launch proof is required"));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_protected_route(
@@ -559,6 +614,9 @@ fn validate_protected_route(
     const MAX_ROUTE_ENVIRONMENT: usize = 16;
 
     let route = &request.protected_route;
+    if registered_provider_route_shape(&request.provider_id).is_none() {
+        return Err(refusal("provider has no registered Subrouter route shape"));
+    }
     validate_digest(&route.executable_sha256)?;
     validate_digest(&route.profile_digest)?;
     if route.profile_digest != request.delivery_fence.payload_digest
@@ -1258,7 +1316,7 @@ fn map_response(
         Ok(response) => response,
         Err(_) => return Ok(uncertain("provider-wrapper-malformed-response")),
     };
-    if response.schema_version != SCHEMA_VERSION
+    if response.schema_version != PROVIDER_WRAPPER_SCHEMA_VERSION
         || response.operation != request.operation
         || response.provider_id != request.provider_id
         || response.adapter_id != request.adapter_id
@@ -1359,15 +1417,16 @@ mod tests {
         };
         fence.bind_idempotency_key();
         ProviderWrapperRequestV1 {
-            schema_version: 1,
+            schema_version: PROVIDER_WRAPPER_SCHEMA_VERSION,
             operation,
             delivery_target: ProviderDeliveryTargetV1::FreshCheckpoint,
             provider_id: "codex".into(),
             adapter_id: "codex-wrapper-v1".into(),
-            cmux_endpoint: CmuxEndpointV1 {
+            terminal_endpoint: TerminalEndpointV1::Cmux(CmuxEndpointV1 {
                 executable_path: native_absolute_test_path("cmux"),
                 socket_path: native_absolute_test_path("cmux.sock"),
-            },
+                signing_team_id: "7WLXT3NR37".into(),
+            }),
             protected_route: ProtectedProviderRouteV1 {
                 argv: vec![
                     "/opt/subrouter".into(),
@@ -1559,7 +1618,7 @@ mod tests {
     fn response_mapping_never_conflates_acceptance_with_resume_ack() {
         let request = request(ProviderWrapperOperationV1::Submit);
         let response = ProviderWrapperResponseV1 {
-            schema_version: 1,
+            schema_version: PROVIDER_WRAPPER_SCHEMA_VERSION,
             operation: request.operation,
             provider_id: request.provider_id.clone(),
             adapter_id: request.adapter_id.clone(),
@@ -1587,7 +1646,7 @@ mod tests {
     fn protected_receipt_uses_canonical_response_not_provider_raw_bytes() {
         let request = request(ProviderWrapperOperationV1::Submit);
         let response = ProviderWrapperResponseV1 {
-            schema_version: 1,
+            schema_version: PROVIDER_WRAPPER_SCHEMA_VERSION,
             operation: request.operation,
             provider_id: request.provider_id.clone(),
             adapter_id: request.adapter_id.clone(),
@@ -1700,7 +1759,7 @@ mod tests {
             _ => unreachable!(),
         };
         let response = ProviderWrapperResponseV1 {
-            schema_version: 1,
+            schema_version: PROVIDER_WRAPPER_SCHEMA_VERSION,
             operation: request.operation,
             provider_id: request.provider_id.clone(),
             adapter_id: request.adapter_id.clone(),
@@ -1766,7 +1825,7 @@ mod tests {
         let submit_count = directory.path().join("submit.count");
         let reconcile_count = directory.path().join("reconcile.count");
         let response = ProviderWrapperResponseV1 {
-            schema_version: 1,
+            schema_version: PROVIDER_WRAPPER_SCHEMA_VERSION,
             operation: ProviderWrapperOperationV1::Reconcile,
             provider_id: reconcile.provider_id.clone(),
             adapter_id: reconcile.adapter_id.clone(),
@@ -2050,5 +2109,52 @@ mod tests {
             Some("high"),
             Some("session-a")
         ));
+    }
+
+    #[test]
+    fn registered_subrouter_routes_include_qwen_agy_and_kimi_without_claiming_execution() {
+        for provider in ["qwen", "agy", "kimi"] {
+            assert!(registered_provider_route_shape(provider).is_some());
+            let mut request = request(ProviderWrapperOperationV1::Submit);
+            request.provider_id = provider.to_owned();
+            request.protected_route.argv[1] = provider.to_owned();
+            request.protected_route.fresh_argv[1] = provider.to_owned();
+            let mut config = config(Path::new("/does/not/matter"), digest("unused"));
+            config.provider_id = provider.to_owned();
+            assert!(validate_request(&config, &request).is_ok(), "{provider}");
+        }
+        assert_eq!(registered_provider_route_shape("unregistered"), None);
+    }
+
+    #[test]
+    fn herdr_endpoint_requires_both_incarnation_and_direct_launch_proof() {
+        let config = config(Path::new("/does/not/matter"), digest("unused"));
+        let mut request = request(ProviderWrapperOperationV1::Submit);
+        request.terminal_endpoint = TerminalEndpointV1::HerdR {
+            socket_path: native_absolute_test_path("herdr.sock"),
+            server_incarnation: None,
+            direct_fresh_launch_proven: true,
+        };
+        assert!(validate_request(&config, &request).is_err());
+        request.terminal_endpoint = TerminalEndpointV1::HerdR {
+            socket_path: native_absolute_test_path("herdr.sock"),
+            server_incarnation: Some("server-epoch-1".into()),
+            direct_fresh_launch_proven: false,
+        };
+        assert!(validate_request(&config, &request).is_err());
+        request.terminal_endpoint = TerminalEndpointV1::HerdR {
+            socket_path: native_absolute_test_path("herdr.sock"),
+            server_incarnation: Some("server-epoch-1".into()),
+            direct_fresh_launch_proven: true,
+        };
+        assert!(validate_request(&config, &request).is_ok());
+    }
+
+    #[test]
+    fn cmux_only_v1_wire_requests_refuse_instead_of_cross_decoding() {
+        let config = config(Path::new("/does/not/matter"), digest("unused"));
+        let mut request = request(ProviderWrapperOperationV1::Submit);
+        request.schema_version = 1;
+        assert!(validate_request(&config, &request).is_err());
     }
 }
