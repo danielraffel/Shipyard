@@ -520,6 +520,15 @@ impl PulpMacCacheProbeEvidence {
             Some((policy.assessed_at_ms, policy.maximum_observation_age_ms)),
             true,
         )?;
+        if self.worker.iter().any(|receipt| {
+            receipt.remote_authority.as_ref().is_some_and(|authority| {
+                authority.authority.source_host_id != policy.builder_host_id
+            })
+        }) {
+            return Err(CacheObserverError::Invalid(
+                "remote cache authority source host".to_owned(),
+            ));
+        }
         validate_receipts_precede_assessment(&self.worker, self.assessed_at_ms)?;
         Ok(())
     }
@@ -563,7 +572,8 @@ impl PulpMacCacheProbeEvidence {
             .iter()
             .filter_map(|receipt| receipt.remote_authority.as_ref());
         let authority = authorities.next()?;
-        if authority.authority.route != CanaryRoute::Lan
+        if authority.authority.source_host_id != policy.builder_host_id
+            || authority.authority.route != CanaryRoute::Lan
             || !authority.proves(
                 worker_host_observation_sha256,
                 artifact_bytes_total,
@@ -1631,6 +1641,48 @@ mod tests {
             .remote_worker_authority(&policy, &host_digest("m1"), 1)
             .expect("each manifest-bound transport may differ under one controller fence");
         assert_eq!(authority.authority.host_session_generation, 7);
+    }
+
+    #[test]
+    fn persisted_remote_authority_refuses_a_different_builder_source() {
+        let root = cache_tree();
+        let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+        let policy = policy(&manifest);
+        let mut worker = receipt("m1", root.path(), manifest.clone(), 995);
+        let mut authority = remote_authority(995);
+        authority.source_host_id = "other-builder".to_owned();
+        worker.remote_authority = Some(test_remote_authority_receipt(
+            authority,
+            root.path().to_str().unwrap(),
+            &manifest,
+            995,
+            1,
+        ));
+        let evidence = PulpMacCacheProbeEvidence {
+            schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,
+            correlation_id: "wrong-remote-source".to_owned(),
+            repository_id: policy.repository_id,
+            repository: policy.repository.clone(),
+            target: policy.target.clone(),
+            target_triple: policy.target_triple.clone(),
+            builder_host_id: policy.builder_host_id.clone(),
+            worker_host_id: policy.worker_host_id.clone(),
+            assessed_at_ms: 1_000,
+            builder: vec![receipt("m3", root.path(), manifest, 990)],
+            worker: vec![worker],
+            model_calls: 0,
+        };
+
+        assert!(matches!(
+            evidence.validate(&policy),
+            Err(CacheObserverError::Invalid(field))
+                if field == "remote cache authority source host"
+        ));
+        assert!(
+            evidence
+                .remote_worker_authority(&policy, &host_digest("m1"), 1)
+                .is_none()
+        );
     }
 
     #[test]
