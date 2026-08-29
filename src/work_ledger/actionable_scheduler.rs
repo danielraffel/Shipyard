@@ -171,6 +171,7 @@ impl WorkLedger {
                         None,
                         projection,
                         Some(terminal_disposition),
+                        None,
                     )?;
                     changed = advanced;
                     work = self

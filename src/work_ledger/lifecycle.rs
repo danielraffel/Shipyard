@@ -182,6 +182,27 @@ impl WorkLedger {
             wake,
             None,
             None,
+            None,
+        )
+    }
+
+    pub(super) fn transition_with_wake_and_delivery_receipt(
+        &self,
+        work_id: &str,
+        expected_work_generation: u64,
+        expected_owner_generation: u64,
+        wake: &WakeIntent,
+        delivery_receipt_digest: &str,
+    ) -> WorkLedgerResult<bool> {
+        self.transition_with_wake_and_projection(
+            work_id,
+            expected_work_generation,
+            expected_owner_generation,
+            LifecycleState::Dispatching,
+            Some(wake),
+            None,
+            None,
+            Some(("canary_terminal_wake_delivery", delivery_receipt_digest)),
         )
     }
 
@@ -195,6 +216,7 @@ impl WorkLedger {
         wake: Option<&WakeIntent>,
         explicit_projection: Option<ProjectionIntentKind>,
         terminal_disposition: Option<&str>,
+        audit_event: Option<(&str, &str)>,
     ) -> WorkLedgerResult<bool> {
         validate_opaque_ref("work_id", work_id, "wi")?;
         let parent = self
@@ -263,16 +285,22 @@ impl WorkLedger {
                 params![terminal_digest, now, work_id],
             )?;
         }
-        let event_payload = wake.map_or_else(
-            || digest(b"state-only-transition"),
-            |intent| intent.payload_digest.clone(),
+        let event_payload = audit_event.map_or_else(
+            || {
+                wake.map_or_else(
+                    || digest(b"state-only-transition"),
+                    |intent| intent.payload_digest.clone(),
+                )
+            },
+            |(_, payload_digest)| payload_digest.to_owned(),
         );
+        let event_kind = audit_event.map_or("lifecycle_transition", |(kind, _)| kind);
         record_event(
             &transaction,
             work_id,
             expected_work_generation + 1,
             expected_owner_generation,
-            "lifecycle_transition",
+            event_kind,
             Some(current),
             next,
             &event_payload,
@@ -568,7 +596,7 @@ fn validate_wake(
     Ok(())
 }
 
-fn deterministic_wake_id(
+pub(crate) fn deterministic_wake_id(
     work_id: &str,
     work_generation: u64,
     owner_generation: u64,

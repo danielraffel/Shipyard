@@ -18,7 +18,9 @@ use crate::parallel_proof_canary_driver::ArtifactDeliveryObservation;
 use crate::parallel_proof_canary_driver::DistributedExecutionObservation;
 use crate::parallel_proof_canary_receipt::ArtifactDeliveryMode;
 
-const SCHEMA_VERSION: u32 = 1;
+const CURRENT_JOB_SCHEMA_VERSION: u32 = 2;
+const LEGACY_JOB_SCHEMA_VERSION: u32 = 1;
+const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 160;
@@ -158,6 +160,30 @@ pub struct CanaryWakePredicate {
     pub on_actionable_failure: bool,
 }
 
+/// Exact existing native continuation authority selected before job admission.
+///
+/// This record deliberately contains no route construction inputs. The native
+/// work ledger must already contain the exact work, staged route, and protected
+/// launch profile. Canary completion may only consume that authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryNativeContinuationBinding {
+    /// Binding schema, independent of the canary job and receipt schemas.
+    pub schema_version: u32,
+    /// Exact existing native work item.
+    pub work_item_id: String,
+    /// Native work generation observed at canary admission.
+    pub work_generation: u64,
+    /// Exact native owner generation.
+    pub owner_generation: u64,
+    /// Existing staged route selected by native publication.
+    pub route_ref: String,
+    /// Existing protected launch-profile reference.
+    pub profile_ref: String,
+    /// Digest of the exact protected profile bytes used as the wake payload.
+    pub payload_digest: String,
+}
+
 /// Bounded redacted log segmentation policy.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +224,9 @@ pub struct ApprovedCanaryJob {
     pub cancellation: CanaryCancellationPolicy,
     /// Terminal wake classification.
     pub wake: CanaryWakePredicate,
+    /// Existing native continuation authority. Required by schema v2 jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_continuation: Option<CanaryNativeContinuationBinding>,
     /// Redacted rotated log bounds.
     pub logs: CanaryLogPolicy,
 }
@@ -205,9 +234,18 @@ pub struct ApprovedCanaryJob {
 impl ApprovedCanaryJob {
     /// Validate every bound and timing relationship.
     pub fn validate(&self) -> Result<(), ParallelProofError> {
-        if self.schema_version != SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            LEGACY_JOB_SCHEMA_VERSION | CURRENT_JOB_SCHEMA_VERSION
+        ) {
             return Err(ParallelProofError::UnsupportedSchemaVersion(
                 self.schema_version,
+            ));
+        }
+        if (self.schema_version == CURRENT_JOB_SCHEMA_VERSION) != self.native_continuation.is_some()
+        {
+            return Err(ParallelProofError::InvalidField(
+                "canary native continuation binding",
             ));
         }
         validate_id(&self.job_id, "canary job id")?;
@@ -235,6 +273,23 @@ impl ApprovedCanaryJob {
             return Err(ParallelProofError::InvalidField("canary job policy"));
         }
         self.operation.validate()?;
+        if let Some(binding) = &self.native_continuation
+            && (binding.schema_version != 1
+                || binding.work_generation == 0
+                || binding.owner_generation == 0
+                || binding.work_item_id.is_empty()
+                || binding.route_ref.is_empty()
+                || binding.profile_ref.is_empty()
+                || binding.payload_digest.len() != 64
+                || !binding
+                    .payload_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(ParallelProofError::InvalidField(
+                "canary native continuation binding",
+            ));
+        }
         self.operation.digest()?;
         Ok(())
     }
@@ -242,7 +297,14 @@ impl ApprovedCanaryJob {
     /// Digest of every immutable execution input and predicate.
     pub fn digest(&self) -> Result<Sha256Digest, ParallelProofError> {
         self.validate()?;
-        domain_digest("shipyard.canary-job.envelope.v1", self)
+        domain_digest(
+            if self.schema_version == LEGACY_JOB_SCHEMA_VERSION {
+                "shipyard.canary-job.envelope.v1"
+            } else {
+                "shipyard.canary-job.envelope.v2"
+            },
+            self,
+        )
     }
 }
 
@@ -437,6 +499,12 @@ pub struct CanaryWakeAcknowledgement {
     pub controller_id: String,
     /// Approval authority reused for wake acknowledgement.
     pub approval_sha256: Sha256Digest,
+    /// Deterministic native outbox identity proven before acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_wake_id: Option<String>,
+    /// Digest of the exact native delivery receipt and terminal receipt link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_delivery_sha256: Option<Sha256Digest>,
     /// Controller acknowledgement timestamp.
     pub acknowledged_at_ms: u64,
 }
@@ -541,7 +609,7 @@ pub struct CanaryJobReceipt {
 impl CanaryJobReceipt {
     /// Digest the complete receipt after structural validation.
     pub fn digest(&self) -> Result<Sha256Digest, ParallelProofError> {
-        if self.schema_version != SCHEMA_VERSION
+        if self.schema_version != RECEIPT_SCHEMA_VERSION
             || (self.sequence == 0) != self.previous_receipt_sha256.is_none()
         {
             return Err(ParallelProofError::CorruptRecord(
@@ -686,7 +754,7 @@ impl CanaryJobStore {
             &(job_sha256.clone(), &job.owner.controller_incarnation),
         )?;
         let prepared = CanaryJobReceipt {
-            schema_version: SCHEMA_VERSION,
+            schema_version: RECEIPT_SCHEMA_VERSION,
             job_sha256,
             sequence: 0,
             previous_receipt_sha256: None,
@@ -848,7 +916,7 @@ impl CanaryJobStore {
             )?;
             let previous = snapshot.latest();
             let receipt = CanaryJobReceipt {
-                schema_version: SCHEMA_VERSION,
+                schema_version: RECEIPT_SCHEMA_VERSION,
                 job_sha256: snapshot.job.digest()?,
                 sequence: previous.sequence + 1,
                 previous_receipt_sha256: Some(previous.digest()?),
@@ -914,7 +982,7 @@ impl CanaryJobStore {
             ));
         };
         let receipt = CanaryJobReceipt {
-            schema_version: SCHEMA_VERSION,
+            schema_version: RECEIPT_SCHEMA_VERSION,
             job_sha256: snapshot.job.digest()?,
             sequence: previous.sequence + 1,
             previous_receipt_sha256: Some(previous.digest()?),
@@ -974,6 +1042,7 @@ impl CanaryJobStore {
             || acknowledgement.controller_id != snapshot.job.owner.controller_id
             || acknowledgement.approval_sha256 != snapshot.job.owner.approval_sha256
             || acknowledgement.acknowledged_at_ms < *completed_at_ms
+            || !valid_native_wake_acknowledgement(&snapshot.job, acknowledgement)
         {
             return Err(ParallelProofError::AuthenticationFailed);
         }
@@ -1117,6 +1186,7 @@ impl CanaryJobStore {
                     || acknowledgement.controller_id != snapshot.job.owner.controller_id
                     || acknowledgement.approval_sha256 != snapshot.job.owner.approval_sha256
                     || acknowledgement.acknowledged_at_ms < *completed_at_ms
+                    || !valid_native_wake_acknowledgement(&snapshot.job, &acknowledgement)
                 {
                     return Err(ParallelProofError::AuthenticationFailed);
                 }
@@ -1139,7 +1209,7 @@ impl CanaryJobStore {
         }
         let previous = snapshot.latest();
         let next = CanaryJobReceipt {
-            schema_version: SCHEMA_VERSION,
+            schema_version: RECEIPT_SCHEMA_VERSION,
             job_sha256: snapshot.job.digest()?,
             sequence: previous.sequence + 1,
             previous_receipt_sha256: Some(previous.digest()?),
@@ -1158,7 +1228,7 @@ impl CanaryJobStore {
     ) -> Result<(CanaryJobSnapshot, StoreWriteOutcome), ParallelProofError> {
         let previous = snapshot.latest();
         let claim = CanaryJobReceipt {
-            schema_version: SCHEMA_VERSION,
+            schema_version: RECEIPT_SCHEMA_VERSION,
             job_sha256: snapshot.job.digest()?,
             sequence: previous.sequence + 1,
             previous_receipt_sha256: Some(previous.digest()?),
@@ -1696,6 +1766,84 @@ fn selected_for_wake(job: &ApprovedCanaryJob, outcome: CanaryJobTerminalOutcome)
     }
 }
 
+fn valid_native_wake_acknowledgement(
+    job: &ApprovedCanaryJob,
+    acknowledgement: &CanaryWakeAcknowledgement,
+) -> bool {
+    match (
+        job.schema_version,
+        acknowledgement.native_wake_id.as_deref(),
+        acknowledgement.native_delivery_sha256.as_ref(),
+    ) {
+        (LEGACY_JOB_SCHEMA_VERSION, None, None) => true,
+        (CURRENT_JOB_SCHEMA_VERSION, Some(wake_id), Some(delivery_sha256)) => job
+            .native_continuation
+            .as_ref()
+            .and_then(|binding| {
+                native_wake_delivery_digest(
+                    binding,
+                    &acknowledgement.job_sha256,
+                    &acknowledgement.receipt_sha256,
+                    wake_id,
+                )
+                .ok()
+            })
+            .is_some_and(|expected| expected == *delivery_sha256),
+        _ => false,
+    }
+}
+
+/// Bind the native outbox identity to the exact canary terminal receipt.
+pub(crate) fn native_wake_delivery_digest(
+    binding: &CanaryNativeContinuationBinding,
+    job_sha256: &Sha256Digest,
+    terminal_receipt_sha256: &Sha256Digest,
+    wake_id: &str,
+) -> Result<Sha256Digest, ParallelProofError> {
+    let expected_wake_id = native_wake_id(binding)?;
+    if binding.schema_version != 1
+        || binding.work_generation == 0
+        || binding.owner_generation == 0
+        || wake_id != expected_wake_id
+    {
+        return Err(ParallelProofError::InvalidField(
+            "canary native wake delivery",
+        ));
+    }
+    Ok(Sha256Digest::of_bytes(
+        format!(
+            "shipyard.canary-native-wake-delivery.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            job_sha256.as_str(),
+            terminal_receipt_sha256.as_str(),
+            binding.work_item_id,
+            binding.work_generation,
+            binding.owner_generation,
+            binding.route_ref,
+            binding.profile_ref,
+            binding.payload_digest,
+            wake_id,
+        )
+        .as_bytes(),
+    ))
+}
+
+fn native_wake_id(binding: &CanaryNativeContinuationBinding) -> Result<String, ParallelProofError> {
+    let dispatch_generation =
+        binding
+            .work_generation
+            .checked_add(2)
+            .ok_or(ParallelProofError::InvalidField(
+                "canary native work generation",
+            ))?;
+    Ok(crate::work_ledger::deterministic_wake_id(
+        &binding.work_item_id,
+        dispatch_generation,
+        binding.owner_generation,
+        &binding.route_ref,
+        &binding.payload_digest,
+    ))
+}
+
 fn retryable_transition(
     snapshot: CanaryJobSnapshot,
     retryable_failure_sha256: Sha256Digest,
@@ -2130,7 +2278,7 @@ mod tests {
 
     fn job() -> ApprovedCanaryJob {
         ApprovedCanaryJob {
-            schema_version: SCHEMA_VERSION,
+            schema_version: LEGACY_JOB_SCHEMA_VERSION,
             job_id: "canary-job-1".to_owned(),
             correlation_id: "canary-correlation-1".to_owned(),
             owner: CanaryJobOwner {
@@ -2175,6 +2323,7 @@ mod tests {
                 on_success: true,
                 on_actionable_failure: true,
             },
+            native_continuation: None,
             logs: CanaryLogPolicy {
                 segment_bytes: 1024,
                 max_segments: 3,
@@ -2538,6 +2687,8 @@ mod tests {
                     receipt_sha256: replay.snapshot.latest().digest().unwrap(),
                     controller_id: job.owner.controller_id.clone(),
                     approval_sha256: job.owner.approval_sha256.clone(),
+                    native_wake_id: None,
+                    native_delivery_sha256: None,
                     acknowledged_at_ms: 2_200,
                 },
             )
@@ -2545,6 +2696,77 @@ mod tests {
         let acknowledged = reconcile_canary_job(&store, &job.job_id, 2_300, &mut backend).unwrap();
         assert!(!acknowledged.wake);
         assert_eq!(acknowledged.wake_receipt_sequence, None);
+    }
+
+    #[test]
+    fn schema_v2_wake_ack_requires_native_delivery_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CanaryJobStore::open(temp.path().join("jobs")).unwrap();
+        let mut job = job();
+        job.schema_version = CURRENT_JOB_SCHEMA_VERSION;
+        job.native_continuation = Some(CanaryNativeContinuationBinding {
+            schema_version: 1,
+            work_item_id: format!("wi_{}", "a".repeat(64)),
+            work_generation: 4,
+            owner_generation: 1,
+            route_ref: format!("route_{}", "b".repeat(64)),
+            profile_ref: format!("opaque:sha256:{}", "c".repeat(64)),
+            payload_digest: "d".repeat(64),
+        });
+        store.submit(&job).unwrap();
+        let prepared = store.load(&job.job_id).unwrap();
+        let CanaryJobReceiptState::Prepared {
+            launch_nonce_sha256,
+        } = &prepared.latest().receipt
+        else {
+            panic!("expected prepared receipt");
+        };
+        store
+            .claim_launch(&prepared, launch_nonce_sha256.clone(), 1_100)
+            .unwrap();
+        let mut backend = FakeBackend {
+            discovery: Some(Ok(CanaryProcessObservation::Missing)),
+            ..FakeBackend::default()
+        };
+        let terminal = reconcile_canary_job(&store, &job.job_id, 1_200, &mut backend).unwrap();
+        let base = CanaryWakeAcknowledgement {
+            job_sha256: job.digest().unwrap(),
+            receipt_sha256: terminal.snapshot.latest().digest().unwrap(),
+            controller_id: job.owner.controller_id.clone(),
+            approval_sha256: job.owner.approval_sha256.clone(),
+            native_wake_id: None,
+            native_delivery_sha256: None,
+            acknowledged_at_ms: 1_300,
+        };
+        assert!(matches!(
+            store.acknowledge_wake(&job.job_id, &base),
+            Err(ParallelProofError::AuthenticationFailed)
+        ));
+        store
+            .acknowledge_wake(
+                &job.job_id,
+                &CanaryWakeAcknowledgement {
+                    native_wake_id: Some(
+                        native_wake_id(job.native_continuation.as_ref().unwrap()).unwrap(),
+                    ),
+                    native_delivery_sha256: Some(
+                        native_wake_delivery_digest(
+                            job.native_continuation.as_ref().unwrap(),
+                            &base.job_sha256,
+                            &base.receipt_sha256,
+                            &native_wake_id(job.native_continuation.as_ref().unwrap()).unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                    ..base
+                },
+            )
+            .unwrap();
+        assert!(
+            !reconcile_canary_job(&store, &job.job_id, 1_400, &mut backend)
+                .unwrap()
+                .wake
+        );
     }
 
     #[test]
@@ -3125,7 +3347,7 @@ mod tests {
         store.submit(&job).unwrap();
         let prepared = store.load(&job.job_id).unwrap().latest().clone();
         let heartbeat = CanaryJobReceipt {
-            schema_version: SCHEMA_VERSION,
+            schema_version: RECEIPT_SCHEMA_VERSION,
             job_sha256: job.digest().unwrap(),
             sequence: 1,
             previous_receipt_sha256: Some(prepared.digest().unwrap()),

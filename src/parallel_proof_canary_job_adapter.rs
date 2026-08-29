@@ -644,6 +644,7 @@ pub(crate) fn record_worker_completion(
 pub(crate) struct DaemonCanaryJobRuntime {
     store: crate::parallel_proof_canary_job::CanaryJobStore,
     backend: DaemonCanaryJobBackend<ShipyardCanaryProcessSupervisor>,
+    state_dir: PathBuf,
     next_tick_at_ms: u64,
     next_job_after: Option<String>,
 }
@@ -683,6 +684,7 @@ impl DaemonCanaryJobRuntime {
         Ok(Some(Self {
             store,
             backend: DaemonCanaryJobBackend::new(supervisor),
+            state_dir: state_dir.to_path_buf(),
             next_tick_at_ms: 0,
             next_job_after: None,
         }))
@@ -740,7 +742,7 @@ impl DaemonCanaryJobRuntime {
                                         requested_at_ms: now_ms,
                                     },
                                 )
-                                .map(|_| ())
+                                .map(|_| None)
                                 .map_err(|error| error.to_string())
                         })
                 } else {
@@ -750,7 +752,7 @@ impl DaemonCanaryJobRuntime {
                         now_ms,
                         &mut self.backend,
                     )
-                    .map(|_| ())
+                    .map(Some)
                     .map_err(|error| error.to_string())
                 }
             } else {
@@ -760,11 +762,19 @@ impl DaemonCanaryJobRuntime {
                     now_ms,
                     &mut self.backend,
                 )
-                .map(|_| ())
+                .map(Some)
                 .map_err(|error| error.to_string())
             };
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
+            match result {
+                Ok(Some(transition)) if transition.wake => {
+                    if let Err(error) = self.deliver_terminal_wake(&transition, now_ms) {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
         self.next_tick_at_ms = now_ms.saturating_add(next_interval_ms);
@@ -773,6 +783,52 @@ impl DaemonCanaryJobRuntime {
             processed_jobs,
             warning: first_error,
         })
+    }
+
+    fn deliver_terminal_wake(
+        &self,
+        transition: &crate::parallel_proof_canary_job::CanaryJobTransition,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let binding = transition
+            .snapshot
+            .job
+            .native_continuation
+            .as_ref()
+            .ok_or_else(|| {
+                "terminal canary wake lacks admitted native continuation authority".to_owned()
+            })?;
+        let ledger = crate::work_ledger::WorkLedger::open_existing(&self.state_dir)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "native work ledger is unavailable for canary wake".to_owned())?;
+        let job_sha256 = transition
+            .snapshot
+            .job
+            .digest()
+            .map_err(|error| error.to_string())?;
+        let terminal_receipt_sha256 = transition
+            .snapshot
+            .latest()
+            .digest()
+            .map_err(|error| error.to_string())?;
+        let delivery = ledger
+            .deliver_canary_terminal_wake(binding, &job_sha256, &terminal_receipt_sha256)
+            .map_err(|error| error.to_string())?;
+        self.store
+            .acknowledge_wake(
+                &transition.snapshot.job.job_id,
+                &crate::parallel_proof_canary_job::CanaryWakeAcknowledgement {
+                    job_sha256,
+                    receipt_sha256: terminal_receipt_sha256,
+                    controller_id: transition.snapshot.job.owner.controller_id.clone(),
+                    approval_sha256: transition.snapshot.job.owner.approval_sha256.clone(),
+                    native_wake_id: Some(delivery.wake_id),
+                    native_delivery_sha256: Some(delivery.receipt_sha256),
+                    acknowledged_at_ms: now_ms,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -849,6 +905,7 @@ mod tests {
                 on_success: true,
                 on_actionable_failure: true,
             },
+            native_continuation: None,
             logs: CanaryLogPolicy {
                 segment_bytes: 1024,
                 max_segments: 2,

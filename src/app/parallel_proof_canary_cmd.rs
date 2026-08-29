@@ -23,11 +23,12 @@ use crate::parallel_proof_canary_driver::{
 use crate::parallel_proof_canary_job::{
     ApprovedCanaryJob, ApprovedCanaryOperation, CanaryCancellationPolicy,
     CanaryCancellationRequest, CanaryJobOwner, CanaryJobReceiptState, CanaryJobStore,
-    CanaryLogPolicy, CanarySuccessPredicate, CanaryWakePredicate,
+    CanaryLogPolicy, CanaryNativeContinuationBinding, CanarySuccessPredicate, CanaryWakePredicate,
 };
 use crate::parallel_proof_canary_job_adapter::daemon_supports_canary_jobs;
 
-const INVOCATION_SCHEMA: u32 = 1;
+const LEGACY_INVOCATION_SCHEMA: u32 = 1;
+const CURRENT_INVOCATION_SCHEMA: u32 = 2;
 const MAX_INVOCATION_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -167,6 +168,7 @@ fn run_parallel_proof_canary_worker(
         || snapshot.job.owner.controller_id != invocation.custody.controller_id
         || snapshot.job.owner.controller_incarnation != invocation.custody.controller_incarnation
         || snapshot.job.owner.approval_sha256 != invocation.custody.approval_sha256
+        || snapshot.job.native_continuation != invocation.custody.native_continuation
         || *repository_id != invocation.policy.repository_id
         || *repository != invocation.policy.repository
         || *target != invocation.policy.target
@@ -302,6 +304,8 @@ struct CanaryCustodyAuthority {
     cancellation_grace_ms: u64,
     log_segment_bytes: u32,
     max_log_segments: u32,
+    #[serde(default)]
+    native_continuation: Option<CanaryNativeContinuationBinding>,
 }
 
 #[derive(Serialize)]
@@ -374,7 +378,10 @@ pub(super) fn parallel_proof_canary_command<W: std::io::Write>(
         &invocation.plan,
     )
     .map_err(|error| canary_failure(&error))?;
-    if invocation.schema_version != INVOCATION_SCHEMA {
+    if !matches!(
+        invocation.schema_version,
+        LEGACY_INVOCATION_SCHEMA | CURRENT_INVOCATION_SCHEMA
+    ) {
         return Err(CliFailure::new(2, "unsupported canary invocation schema"));
     }
     if let Some(job_id) = cancel {
@@ -489,6 +496,14 @@ pub(super) fn parallel_proof_canary_command<W: std::io::Write>(
             "parallel-proof canary apply authority does not match the exact request",
         ));
     }
+    if invocation.schema_version != CURRENT_INVOCATION_SCHEMA
+        || invocation.custody.native_continuation.is_none()
+    {
+        return Err(CliFailure::new(
+            2,
+            "parallel-proof canary apply requires schema-v2 native continuation authority",
+        ));
+    }
     if invocation.custody.release_sha256
         != authority_digest(&(
             &invocation.manifest.build,
@@ -529,6 +544,16 @@ pub(super) fn parallel_proof_canary_command<W: std::io::Write>(
     crate::writer_domain_lease::ensure_protected_dir_all(&store_parent)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let custody = &invocation.custody;
+    let native_continuation = custody
+        .native_continuation
+        .clone()
+        .ok_or_else(|| CliFailure::new(2, "canary native continuation authority is missing"))?;
+    let ledger = crate::work_ledger::WorkLedger::open_existing(state_dir)
+        .map_err(|error| CliFailure::new(2, error.to_string()))?
+        .ok_or_else(|| CliFailure::new(2, "native work ledger is unavailable"))?;
+    ledger
+        .verify_canary_continuation_binding(&native_continuation)
+        .map_err(|error| CliFailure::new(2, error.to_string()))?;
     let worker_executable_sha256 = crate::parallel_proof_canary_job_adapter::executable_digest(
         &std::env::current_exe().map_err(|error| CliFailure::new(1, error.to_string()))?,
     )
@@ -538,7 +563,7 @@ pub(super) fn parallel_proof_canary_command<W: std::io::Write>(
         .digest(&invocation.inventory, &invocation.plan)
         .map_err(|error| canary_failure(&error))?;
     let job = ApprovedCanaryJob {
-        schema_version: 1,
+        schema_version: 2,
         job_id: custody.job_id.clone(),
         correlation_id: invocation.correlation_id.clone(),
         owner: CanaryJobOwner {
@@ -583,6 +608,7 @@ pub(super) fn parallel_proof_canary_command<W: std::io::Write>(
             on_success: true,
             on_actionable_failure: true,
         },
+        native_continuation: Some(native_continuation),
         logs: CanaryLogPolicy {
             segment_bytes: custody.log_segment_bytes,
             max_segments: custody.max_log_segments,

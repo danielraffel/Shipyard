@@ -50,6 +50,7 @@ macro_rules! candidate_params {
 }
 
 mod actionable_scheduler;
+mod canary_wake;
 #[allow(dead_code)] // Live cmux/HerdR proof remains default-off until upstream contracts ship.
 mod delivery_authority;
 #[allow(dead_code)] // Some ownership lifecycle operations remain future-facing.
@@ -116,6 +117,7 @@ pub(crate) use actionable_scheduler::{NativeStewardApplyReport, NativeStewardDis
 use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};
+pub(crate) use lifecycle::deterministic_wake_id;
 pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};
 #[allow(unused_imports)] // Consumed by the CLI/runtime integration follow-up.
 pub(crate) use native_publication::{
