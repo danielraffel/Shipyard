@@ -114,6 +114,7 @@ pub mod prepared_state;
 mod process;
 /// Proof gates for applying a routing profile to GitHub variables.
 pub mod profile_apply;
+pub(crate) mod provider_wrapper;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
 /// Crash-safe, opt-in recovery of exact ship work missing from the queue.

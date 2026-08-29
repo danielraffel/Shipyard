@@ -58,6 +58,8 @@ mod persistence;
 mod policy;
 #[allow(dead_code)] // Consumed by native provider publication after the shadow schema lands.
 mod protected_objects;
+#[allow(dead_code)] // Activated by the later default-off continuation consumer.
+mod provider_publication;
 mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.
 mod route;

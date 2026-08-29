@@ -3,6 +3,12 @@ use chrono::{Duration as ChronoDuration, TimeZone};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+use crate::provider_wrapper::{
+    FreshResumeExpectationV1, ProtectedProviderResponseV1, ProviderAcceptanceV1,
+    ProviderLaunchOptionsV1, ProviderWrapperConfig, ProviderWrapperOperationV1,
+    ProviderWrapperOutcomeV1, ProviderWrapperResponseV1,
+};
+
 fn at(second: u32) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2030, 8, 28, 12, 0, second)
         .single()
@@ -145,6 +151,266 @@ fn pending_delivery() -> (TempDir, WorkLedger, String, String, AdapterBindingRec
         .expect("dispatching");
     set_time(&ledger, at(0));
     (temp, ledger, work_id, wake_id, adapter)
+}
+
+fn provider_config(claim: &DeliveryClaim) -> ProviderWrapperConfig {
+    ProviderWrapperConfig {
+        executable_path: std::path::PathBuf::from("/usr/bin/false"),
+        executable_sha256: claim.route.executable_sha256.clone(),
+        provider_id: claim.route.agent_kind.clone(),
+        adapter_id: "subrouter".to_owned(),
+        deadline_seconds: 30,
+        max_stdout_bytes: 64 * 1024,
+        max_stderr_bytes: 64 * 1024,
+    }
+}
+
+fn resume_expectation(claim: &DeliveryClaim) -> FreshResumeExpectationV1 {
+    FreshResumeExpectationV1 {
+        workstream_handle: "GEN-14".to_owned(),
+        context_url: Some("https://linear.app/generous-corp/issue/GEN-14/status".to_owned()),
+        plan_sha256: digest(b"plan"),
+        root_revision: 0,
+        issue_revision: 0,
+        material_event_revision: 0,
+        projection_revision: 4,
+        checkpoint_id: "checkpoint-1".to_owned(),
+        checkpoint_generation: 1,
+        checkpoint_digest: digest(b"checkpoint"),
+        repository: "danielraffel/shipyard".to_owned(),
+        worktree_path: "/Volumes/Workshop/Code/shipyard".to_owned(),
+        head_sha: claim.head_sha.clone(),
+        expected_resume_context_digest: digest(b"resume"),
+        success_continuation_digest: digest(b"success"),
+        failure_continuation_digest: digest(b"failure"),
+    }
+}
+
+fn head_authority(
+    claim: &DeliveryClaim,
+) -> super::super::provider_publication::RepositoryHeadAuthorityV1 {
+    super::super::provider_publication::RepositoryHeadAuthorityV1 {
+        repository_id: "R_kgDOR9hrGw".to_owned(),
+        installation_ref: OpaqueRef::derive("github-app-installation", b"shipyard")
+            .as_str()
+            .to_owned(),
+        repository: "danielraffel/shipyard".to_owned(),
+        head_sha: claim.head_sha.clone(),
+        observed_at: claim.claimed_at,
+        receipt_digest: digest(b"authenticated exact head"),
+    }
+}
+
+fn provider_response(
+    request: &super::super::provider_publication::PublishedProviderRequest,
+) -> ProtectedProviderResponseV1 {
+    let wrapper = &request.request.wrapper;
+    let response = ProviderWrapperResponseV1 {
+        schema_version: 1,
+        operation: wrapper.operation,
+        provider_id: wrapper.provider_id.clone(),
+        adapter_id: wrapper.adapter_id.clone(),
+        idempotency_key: wrapper.delivery_fence.idempotency_key.clone(),
+        outcome: ProviderWrapperOutcomeV1::Delivered {
+            acceptance: ProviderAcceptanceV1::ProviderSessionAccepted,
+            provider_session_ref: "session:codex:accepted-1".to_owned(),
+            receipt_digest: digest(b"provider receipt"),
+        },
+    };
+    let canonical_bytes = serde_json::to_vec(&response).expect("response bytes");
+    ProtectedProviderResponseV1 {
+        response_digest: digest(&canonical_bytes),
+        canonical_bytes,
+    }
+}
+
+#[test]
+fn provider_request_is_crash_replay_safe_and_preserves_route_axes() {
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    let config = provider_config(&claim);
+    let request = ledger
+        .publish_native_provider_request(
+            &claim,
+            ProviderWrapperOperationV1::Submit,
+            &config,
+            head_authority(&claim),
+            resume_expectation(&claim),
+            ProviderLaunchOptionsV1::default(),
+        )
+        .expect("publish request");
+
+    let reopened = WorkLedger::open(temp.path()).expect("reopen after simulated crash");
+    let replay = reopened
+        .publish_native_provider_request(
+            &claim,
+            ProviderWrapperOperationV1::Submit,
+            &config,
+            head_authority(&claim),
+            resume_expectation(&claim),
+            ProviderLaunchOptionsV1::default(),
+        )
+        .expect("replay request");
+
+    assert_eq!(request.object, replay.object);
+    assert_eq!(request.digest, replay.digest);
+    assert_eq!(request.canonical_bytes, replay.canonical_bytes);
+    assert!(matches!(
+        request.request.route.terminal,
+        TerminalRoute::Cmux { .. }
+    ));
+    assert!(matches!(
+        request.request.route.provider,
+        ProviderRoute::Subrouter { .. }
+    ));
+    assert_eq!(request.request.route.account_ref, claim.route.account_ref);
+    assert_eq!(request.request.route.model_ref, claim.route.model_ref);
+    assert_eq!(
+        request.request.route.session_headers_sha256,
+        claim.route.session_headers_sha256
+    );
+    assert_eq!(
+        request.request.route.route_revision,
+        claim.route.route_revision
+    );
+}
+
+#[test]
+fn provider_request_refuses_stale_claim_and_direct_fallback() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    let mut stale = claim.clone();
+    stale.work_generation += 1;
+    assert!(
+        ledger
+            .publish_native_provider_request(
+                &stale,
+                ProviderWrapperOperationV1::Submit,
+                &provider_config(&claim),
+                head_authority(&claim),
+                resume_expectation(&claim),
+                ProviderLaunchOptionsV1::default(),
+            )
+            .is_err()
+    );
+
+    let mut stale_authority = head_authority(&claim);
+    stale_authority.observed_at = claim.claimed_at - ChronoDuration::seconds(301);
+    assert!(
+        ledger
+            .publish_native_provider_request(
+                &claim,
+                ProviderWrapperOperationV1::Submit,
+                &provider_config(&claim),
+                stale_authority,
+                resume_expectation(&claim),
+                ProviderLaunchOptionsV1::default(),
+            )
+            .is_err()
+    );
+
+    let mut direct = provider_config(&claim);
+    direct.adapter_id = "direct".to_owned();
+    assert!(
+        ledger
+            .publish_native_provider_request(
+                &claim,
+                ProviderWrapperOperationV1::Submit,
+                &direct,
+                head_authority(&claim),
+                resume_expectation(&claim),
+                ProviderLaunchOptionsV1::default(),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn provider_receipt_is_exact_and_replay_safe_before_acknowledgment() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    let request = ledger
+        .publish_native_provider_request(
+            &claim,
+            ProviderWrapperOperationV1::Submit,
+            &provider_config(&claim),
+            head_authority(&claim),
+            resume_expectation(&claim),
+            ProviderLaunchOptionsV1::default(),
+        )
+        .expect("request");
+    let started = start_at(&ledger, &claim, at(1)).expect("start");
+    let response = provider_response(&request);
+    let receipt = ledger
+        .publish_native_provider_receipt(&started, &request, &response)
+        .expect("receipt");
+    let replay = ledger
+        .publish_native_provider_receipt(&started, &request, &response)
+        .expect("receipt replay");
+
+    assert_eq!(receipt.object, replay.object);
+    assert_ne!(receipt.digest, response.response_digest);
+    let (_record, receipt_bytes) = ledger
+        .open_protected_object(&receipt.object.object_ref)
+        .expect("open protected receipt");
+    let attested: super::super::provider_publication::NativeProviderReceiptV1 =
+        serde_json::from_slice(&receipt_bytes).expect("decode attested receipt");
+    assert_eq!(attested.request_digest, request.digest);
+    assert_eq!(attested.route_integrity, claim.route.route_integrity);
+    assert_eq!(attested.routing_generation, claim.route.route_revision);
+    assert_eq!(
+        attested.agent_adapter_generation,
+        claim.route.agent.adapter.generation
+    );
+
+    let mut mismatched = response.clone();
+    let mut decoded: ProviderWrapperResponseV1 =
+        serde_json::from_slice(&mismatched.canonical_bytes).expect("decode");
+    decoded.idempotency_key = digest(b"wrong fence");
+    mismatched.canonical_bytes = serde_json::to_vec(&decoded).expect("re-encode");
+    mismatched.response_digest = digest(&mismatched.canonical_bytes);
+    assert!(
+        ledger
+            .publish_native_provider_receipt(&started, &request, &mismatched)
+            .is_err()
+    );
+
+    let mut cross_delivery = request.clone();
+    cross_delivery.request.wrapper.delivery_fence.work_item_id = "work-other".to_owned();
+    cross_delivery
+        .request
+        .wrapper
+        .delivery_fence
+        .bind_idempotency_key();
+    cross_delivery.canonical_bytes =
+        serde_json::to_vec(&cross_delivery.request).expect("cross-delivery request bytes");
+    cross_delivery.digest = digest(&cross_delivery.canonical_bytes);
+    assert!(
+        ledger
+            .publish_native_provider_receipt(&started, &cross_delivery, &response)
+            .is_err()
+    );
 }
 
 #[test]

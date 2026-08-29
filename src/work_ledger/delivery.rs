@@ -186,7 +186,7 @@ impl DeliveryClaim {
         Ok(self)
     }
 
-    fn validate_identity(&self) -> WorkLedgerResult<()> {
+    pub(super) fn validate_identity(&self) -> WorkLedgerResult<()> {
         if self.schema_version != DELIVERY_SCHEMA_VERSION {
             return Err(WorkLedgerError::Refused(
                 "unsupported delivery claim schema".to_owned(),
@@ -222,7 +222,7 @@ impl StartedDelivery {
         Ok(self)
     }
 
-    fn validate_identity(&self) -> WorkLedgerResult<()> {
+    pub(super) fn validate_identity(&self) -> WorkLedgerResult<()> {
         self.claim.validate_identity()?;
         if self.clone().finalize()?.start_identity_digest != self.start_identity_digest {
             return Err(WorkLedgerError::Refused(
@@ -1000,13 +1000,13 @@ impl WorkLedger {
         Ok(disposition)
     }
 
-    fn writer_parent(&self) -> WorkLedgerResult<&std::path::Path> {
+    pub(super) fn writer_parent(&self) -> WorkLedgerResult<&std::path::Path> {
         self.path
             .parent()
             .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))
     }
 
-    fn delivery_connection(&self) -> WorkLedgerResult<rusqlite::Connection> {
+    pub(super) fn delivery_connection(&self) -> WorkLedgerResult<rusqlite::Connection> {
         let connection = self.connect_read_write()?;
         configure_durable(&connection)?;
         verify_supported_schema(&connection)?;
@@ -1317,7 +1317,7 @@ fn native_session(provenance: &RouteProvenanceRecord) -> &NativeSessionRoute {
     }
 }
 
-fn verify_claim(
+pub(super) fn verify_claim(
     transaction: &Transaction<'_>,
     claim: &DeliveryClaim,
     expected_state: &str,
@@ -1388,7 +1388,7 @@ fn verify_claim(
     Ok(())
 }
 
-fn verify_started(
+pub(super) fn verify_started(
     transaction: &Transaction<'_>,
     started: &StartedDelivery,
 ) -> WorkLedgerResult<()> {
