@@ -595,14 +595,19 @@ mod tests {
             .env("SHIPYARD_DROP_TEST_PID", &pid_path);
         let tree = super::ProcessTree::spawn(&mut command).expect("spawn process tree");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !pid_path.exists() && Instant::now() < deadline {
+        let pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_path)
+                && let Ok(pid) = contents.trim().parse::<u32>()
+                && pid > 0
+            {
+                break pid.to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid was not recorded completely"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(pid_path.exists(), "descendant pid was not recorded");
-        let pid = std::fs::read_to_string(&pid_path)
-            .expect("descendant pid")
-            .trim()
-            .to_owned();
+        };
 
         drop(tree);
 

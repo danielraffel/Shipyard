@@ -2016,9 +2016,12 @@ mod tests {
         let request = request(ProviderWrapperOperationV1::Submit);
         let directory = tempfile::tempdir().unwrap();
         let detached_pid = directory.path().join("detached-success.pid");
+        let detached_pid_staging = directory.path().join("detached-success.pid.tmp");
         let body = format!(
-            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; }} \
+            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); rename(\"{}\", \"{}\"); sleep(30); return 0; }} \
              for (int i = 0; i < 5000 && access(\"{}\", F_OK) != 0; ++i) usleep(1000); {}",
+            detached_pid_staging.display(),
+            detached_pid_staging.display(),
             detached_pid.display(),
             detached_pid.display(),
             response_program(&request, "delivered"),
