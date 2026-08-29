@@ -1118,11 +1118,125 @@ fn digest_archive_chunks(
 }
 
 /// Read-only outcome of authenticating an interrupted partial artifact.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResumeDisposition {
     Restart,
     Append { verified_bytes: u64 },
     CompletePendingFinalVerification,
+}
+
+/// Revalidated content identity for the exact prefix retained by an applied
+/// resume plan.
+///
+/// This value can only be obtained while the transfer lease is held and the
+/// partial still matches the opaque plan. It is observation evidence, not
+/// permission to invoke a transport.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct PreparedResumeEvidence {
+    artifact_sha256: String,
+    artifact_size_bytes: u64,
+    manifest_sha256: String,
+    session: String,
+    disposition: ResumeDisposition,
+    verified_prefix_bytes: u64,
+    verified_prefix_sha256: String,
+}
+
+/// Payload counters parsed from one successful rsync `--stats` report.
+///
+/// Protocol overhead remains separate from artifact bytes. `literal_data_bytes`
+/// is the transport-origin counter used for canary artifact-byte accounting.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct RsyncTransferStats {
+    total_file_size_bytes: u64,
+    total_transferred_file_size_bytes: u64,
+    literal_data_bytes: u64,
+    matched_data_bytes: u64,
+    total_bytes_sent: u64,
+    total_bytes_received: u64,
+}
+
+/// Exact payload-byte accounting bound to a previously authenticated prefix.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct ReceiverPullStatsEvidence {
+    prepared: PreparedResumeEvidence,
+    stats: RsyncTransferStats,
+    artifact_bytes_total: u64,
+    artifact_bytes_reused: u64,
+    artifact_bytes_transferred: u64,
+}
+
+impl PreparedResumeEvidence {
+    /// Manifest-bound complete encoded artifact size.
+    #[must_use]
+    pub fn artifact_size_bytes(&self) -> u64 {
+        self.artifact_size_bytes
+    }
+
+    /// Applied resume behavior authenticated by this evidence.
+    #[must_use]
+    pub fn disposition(&self) -> ResumeDisposition {
+        self.disposition
+    }
+
+    /// Exact number of authenticated prefix bytes retained.
+    #[must_use]
+    pub fn verified_prefix_bytes(&self) -> u64 {
+        self.verified_prefix_bytes
+    }
+
+    /// SHA-256 of the complete retained prefix, including the empty prefix.
+    #[must_use]
+    pub fn verified_prefix_sha256(&self) -> &str {
+        &self.verified_prefix_sha256
+    }
+}
+
+impl RsyncTransferStats {
+    /// Artifact payload bytes reported as literal transport data.
+    #[must_use]
+    pub fn literal_data_bytes(&self) -> u64 {
+        self.literal_data_bytes
+    }
+
+    /// Total receiver-side bytes, including rsync protocol overhead.
+    #[must_use]
+    pub fn total_bytes_received(&self) -> u64 {
+        self.total_bytes_received
+    }
+}
+
+impl ReceiverPullStatsEvidence {
+    /// Authenticated prefix state captured before receiver-pull.
+    #[must_use]
+    pub fn prepared(&self) -> &PreparedResumeEvidence {
+        &self.prepared
+    }
+
+    /// Complete parsed rsync transport counters.
+    #[must_use]
+    pub fn stats(&self) -> &RsyncTransferStats {
+        &self.stats
+    }
+
+    /// Manifest-bound encoded artifact size.
+    #[must_use]
+    pub fn artifact_bytes_total(&self) -> u64 {
+        self.artifact_bytes_total
+    }
+
+    /// Authenticated prefix bytes reused by this pull.
+    #[must_use]
+    pub fn artifact_bytes_reused(&self) -> u64 {
+        self.artifact_bytes_reused
+    }
+
+    /// Literal payload bytes newly transferred by this pull.
+    #[must_use]
+    pub fn artifact_bytes_transferred(&self) -> u64 {
+        self.artifact_bytes_transferred
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1161,6 +1275,169 @@ impl ResumePlan {
             }
         }
     }
+}
+
+/// Revalidate an applied resume plan and capture its exact retained-prefix
+/// identity immediately before receiver-pull command construction.
+pub fn prepared_resume_evidence(
+    transfer: &ArtifactTransferLease,
+    manifest: &ArtifactManifest,
+    plan: &ResumePlan,
+) -> Result<PreparedResumeEvidence, Error> {
+    manifest.validate()?;
+    validate_transfer_binding(transfer, manifest)?;
+    validate_prepared_resume(transfer, plan)?;
+    let verified_prefix_sha256 = plan.prepared_sha256.clone().ok_or_else(|| {
+        Error::Invalid("prepared resume plan has no authenticated content digest".into())
+    })?;
+    Ok(PreparedResumeEvidence {
+        artifact_sha256: manifest.artifact_sha256.clone(),
+        artifact_size_bytes: manifest.artifact_size_bytes,
+        manifest_sha256: manifest.canonical_sha256()?,
+        session: transfer.session.clone(),
+        disposition: plan.disposition(),
+        verified_prefix_bytes: plan.observed_length,
+        verified_prefix_sha256,
+    })
+}
+
+/// Parse the bounded stable fields emitted by one successful rsync/openrsync
+/// `--stats` process result. The output is consumed so a failed process or a
+/// detached raw stdout buffer cannot mint transport evidence.
+pub fn parse_rsync_transfer_stats(
+    output: std::process::Output,
+) -> Result<RsyncTransferStats, Error> {
+    const MAX_RSYNC_STATS_BYTES: usize = 16 * 1024;
+    let std::process::Output {
+        status,
+        stdout,
+        stderr: _,
+    } = output;
+    if !status.success() {
+        return Err(Error::Invalid(
+            "rsync stats require a successful process result".into(),
+        ));
+    }
+    if stdout.len() > MAX_RSYNC_STATS_BYTES {
+        return Err(Error::Invalid("rsync stats output is too large".into()));
+    }
+    let stdout = std::str::from_utf8(&stdout)
+        .map_err(|_| Error::Invalid("rsync stats output is not UTF-8".into()))?;
+    let mut total_file_size_bytes = None;
+    let mut total_transferred_file_size_bytes = None;
+    let mut literal_data_bytes = None;
+    let mut matched_data_bytes = None;
+    let mut total_bytes_sent = None;
+    let mut total_bytes_received = None;
+    for line in stdout.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let slot = match key.trim() {
+            "Total file size" => &mut total_file_size_bytes,
+            "Total transferred file size" => &mut total_transferred_file_size_bytes,
+            "Literal data" => &mut literal_data_bytes,
+            "Matched data" => &mut matched_data_bytes,
+            "Total bytes sent" => &mut total_bytes_sent,
+            "Total bytes received" => &mut total_bytes_received,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err(Error::Invalid(format!(
+                "rsync stats contains duplicate {key} counter"
+            )));
+        }
+        let numeric = value.trim().strip_suffix(" bytes").unwrap_or(value.trim());
+        *slot =
+            Some(parse_rsync_decimal(numeric).map_err(|()| {
+                Error::Invalid(format!("rsync stats has malformed {key} counter"))
+            })?);
+    }
+    let missing =
+        |field: &'static str| Error::Invalid(format!("rsync stats is missing {field} counter"));
+    Ok(RsyncTransferStats {
+        total_file_size_bytes: total_file_size_bytes.ok_or_else(|| missing("total file size"))?,
+        total_transferred_file_size_bytes: total_transferred_file_size_bytes
+            .ok_or_else(|| missing("total transferred file size"))?,
+        literal_data_bytes: literal_data_bytes.ok_or_else(|| missing("literal data"))?,
+        matched_data_bytes: matched_data_bytes.ok_or_else(|| missing("matched data"))?,
+        total_bytes_sent: total_bytes_sent.ok_or_else(|| missing("total bytes sent"))?,
+        total_bytes_received: total_bytes_received
+            .ok_or_else(|| missing("total bytes received"))?,
+    })
+}
+
+fn parse_rsync_decimal(value: &str) -> Result<u64, ()> {
+    if !value.contains(',') {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(());
+        }
+        return value.parse().map_err(|_| ());
+    }
+    let mut groups = value.split(',');
+    let first = groups.next().ok_or(())?;
+    if first.is_empty() || first.len() > 3 || !first.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(());
+    }
+    let mut normalized = first.to_owned();
+    let mut saw_group = false;
+    for group in groups {
+        saw_group = true;
+        if group.len() != 3 || !group.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(());
+        }
+        normalized.push_str(group);
+    }
+    if !saw_group {
+        return Err(());
+    }
+    normalized.parse().map_err(|_| ())
+}
+
+/// Bind parsed transport-origin counters to an authenticated pre-transfer
+/// prefix. This does not claim final artifact verification or publication.
+pub fn bind_receiver_pull_stats(
+    prepared: PreparedResumeEvidence,
+    stats: RsyncTransferStats,
+) -> Result<ReceiverPullStatsEvidence, Error> {
+    let artifact_bytes_total = prepared.artifact_size_bytes;
+    let prefix_matches_disposition = match prepared.disposition {
+        ResumeDisposition::Restart => prepared.verified_prefix_bytes == 0,
+        ResumeDisposition::Append { verified_bytes } => {
+            verified_bytes != 0 && verified_bytes == prepared.verified_prefix_bytes
+        }
+        ResumeDisposition::CompletePendingFinalVerification => false,
+    };
+    if prepared.artifact_sha256.is_empty()
+        || prepared.manifest_sha256.is_empty()
+        || prepared.session.is_empty()
+        || !prefix_matches_disposition
+        || artifact_bytes_total == 0
+        || prepared.verified_prefix_bytes > artifact_bytes_total
+        || stats.total_file_size_bytes != artifact_bytes_total
+        || stats.matched_data_bytes != 0
+    {
+        return Err(Error::Invalid(
+            "rsync stats do not match the authenticated transfer prefix".into(),
+        ));
+    }
+    let remaining = artifact_bytes_total - prepared.verified_prefix_bytes;
+    if stats.literal_data_bytes != remaining
+        || stats.total_transferred_file_size_bytes < stats.literal_data_bytes
+        || stats.total_transferred_file_size_bytes > artifact_bytes_total
+        || stats.total_bytes_received < stats.literal_data_bytes
+    {
+        return Err(Error::Invalid(
+            "rsync stats do not prove exact receiver-pull payload bytes".into(),
+        ));
+    }
+    Ok(ReceiverPullStatsEvidence {
+        artifact_bytes_total,
+        artifact_bytes_reused: prepared.verified_prefix_bytes,
+        artifact_bytes_transferred: stats.literal_data_bytes,
+        prepared,
+        stats,
+    })
 }
 
 /// Authenticate full chunks and bind the only safe resume action to an active transfer lease.
@@ -2522,6 +2799,28 @@ mod tests {
         sha256_bytes(bytes)
     }
 
+    #[cfg(unix)]
+    fn rsync_output(success: bool, stdout: Vec<u8>) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            stdout,
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn rsync_output(success: bool, stdout: Vec<u8>) -> std::process::Output {
+        use std::os::windows::process::ExitStatusExt;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(u32::from(!success)),
+            stdout,
+            stderr: Vec::new(),
+        }
+    }
+
     fn fixture(bytes: &[u8]) -> ArtifactManifest {
         let entries = vec![
             LayoutEntry::Directory {
@@ -2912,6 +3211,114 @@ mod tests {
         ))
         .unwrap();
         assert!(!command.args.iter().any(|arg| arg == "--append"));
+    }
+
+    #[test]
+    fn prepared_prefix_and_openrsync_stats_bind_exact_payload_bytes() {
+        let bytes = vec![6; TEST_CHUNK_SIZE * 2];
+        let manifest = fixture(&bytes);
+        let temp = TempDir::new().unwrap();
+        let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let transfer = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "resume-stats")
+            .unwrap();
+        fs::write(transfer.partial_path(), &bytes[..TEST_CHUNK_SIZE]).unwrap();
+        let prepared = apply_resume_plan(
+            &transfer,
+            &manifest,
+            plan_verified_resume(&transfer, &manifest).unwrap(),
+        )
+        .unwrap();
+        let prefix = prepared_resume_evidence(&transfer, &manifest, &prepared).unwrap();
+        assert_eq!(prefix.verified_prefix_bytes, MIN_CHUNK_SIZE);
+        assert_eq!(
+            prefix.verified_prefix_sha256,
+            digest(&bytes[..TEST_CHUNK_SIZE])
+        );
+
+        let remaining = bytes.len() as u64 - MIN_CHUNK_SIZE;
+        let stats = parse_rsync_transfer_stats(rsync_output(
+            true,
+            format!(
+                "Number of files: 1\nTotal file size: {} bytes\nTotal transferred file size: {} bytes\nLiteral data: {} bytes\nMatched data: 0 bytes\nTotal bytes sent: 42\nTotal bytes received: {}\n",
+                bytes.len(),
+                bytes.len(),
+                remaining,
+                remaining + 73
+            )
+            .into_bytes(),
+        ))
+        .unwrap();
+        let evidence = bind_receiver_pull_stats(prefix, stats).unwrap();
+        assert_eq!(evidence.artifact_bytes_reused, MIN_CHUNK_SIZE);
+        assert_eq!(evidence.artifact_bytes_transferred, remaining);
+        assert_eq!(
+            evidence
+                .artifact_bytes_reused
+                .checked_add(evidence.artifact_bytes_transferred),
+            Some(evidence.artifact_bytes_total)
+        );
+
+        let fresh = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "full-stats")
+            .unwrap();
+        let fresh_prepared = apply_resume_plan(
+            &fresh,
+            &manifest,
+            plan_verified_resume(&fresh, &manifest).unwrap(),
+        )
+        .unwrap();
+        let fresh_prefix = prepared_resume_evidence(&fresh, &manifest, &fresh_prepared).unwrap();
+        let full_stats = parse_rsync_transfer_stats(rsync_output(
+            true,
+            format!(
+                "Total file size: {} bytes\nTotal transferred file size: {} bytes\nLiteral data: {} bytes\nMatched data: 0 bytes\nTotal bytes sent: 42\nTotal bytes received: {}\n",
+                bytes.len(),
+                bytes.len(),
+                bytes.len(),
+                bytes.len() + 73
+            )
+            .into_bytes(),
+        ))
+        .unwrap();
+        let full = bind_receiver_pull_stats(fresh_prefix, full_stats).unwrap();
+        assert_eq!(full.artifact_bytes_reused, 0);
+        assert_eq!(full.artifact_bytes_transferred, bytes.len() as u64);
+    }
+
+    #[test]
+    fn rsync_stats_parser_rejects_claims_without_complete_exact_counters() {
+        let duplicate = b"Total file size: 10 bytes\nTotal file size: 10 bytes\nTotal transferred file size: 10 bytes\nLiteral data: 10 bytes\nMatched data: 0 bytes\nTotal bytes sent: 5\nTotal bytes received: 15\n";
+        assert!(parse_rsync_transfer_stats(rsync_output(true, duplicate.to_vec())).is_err());
+        let missing = b"Total file size: 10 bytes\nLiteral data: 10 bytes\n";
+        assert!(parse_rsync_transfer_stats(rsync_output(true, missing.to_vec())).is_err());
+        let complete = b"Total file size: 10 bytes\nTotal transferred file size: 10 bytes\nLiteral data: 10 bytes\nMatched data: 0 bytes\nTotal bytes sent: 5\nTotal bytes received: 15\n";
+        assert!(parse_rsync_transfer_stats(rsync_output(false, complete.to_vec())).is_err());
+        for malformed in ["1,0", "12,,345", ",10", "1234,567"] {
+            let claims = format!(
+                "Total file size: {malformed} bytes\nTotal transferred file size: 10 bytes\nLiteral data: 10 bytes\nMatched data: 0 bytes\nTotal bytes sent: 5\nTotal bytes received: 15\n"
+            );
+            assert!(parse_rsync_transfer_stats(rsync_output(true, claims.into_bytes())).is_err());
+        }
+
+        let prepared = PreparedResumeEvidence {
+            artifact_sha256: "a".repeat(64),
+            artifact_size_bytes: 10,
+            manifest_sha256: "b".repeat(64),
+            session: "stats".to_owned(),
+            disposition: ResumeDisposition::Append { verified_bytes: 5 },
+            verified_prefix_bytes: 5,
+            verified_prefix_sha256: "c".repeat(64),
+        };
+        let mismatched = RsyncTransferStats {
+            total_file_size_bytes: 10,
+            total_transferred_file_size_bytes: 10,
+            literal_data_bytes: 10,
+            matched_data_bytes: 0,
+            total_bytes_sent: 5,
+            total_bytes_received: 15,
+        };
+        assert!(bind_receiver_pull_stats(prepared, mismatched).is_err());
     }
 
     #[test]
