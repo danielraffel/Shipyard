@@ -2066,7 +2066,13 @@ mod tests {
             &request,
         )
         .unwrap();
-        assert!(matches!(result, ProviderWrapperRunResult::Uncertain { .. }));
+        assert!(matches!(
+            result,
+            ProviderWrapperRunResult::Uncertain {
+                evidence_digest,
+                response_receipt: None,
+            } if evidence_digest == digest("provider-wrapper-descendant-violation")
+        ));
         let child_pid = fs::read_to_string(&detached_pid).unwrap();
         assert_pid_eventually_not_running(
             &child_pid,

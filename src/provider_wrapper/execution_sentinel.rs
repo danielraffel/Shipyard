@@ -75,6 +75,7 @@ fn signal(pid: u32, signal: &str) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn sentinel_processes(path: &Path, _deadline: Instant) -> Option<BTreeSet<u32>> {
     let expected = path.canonicalize().ok()?;
+    let current_uid = linux_effective_uid(&std::fs::read_to_string("/proc/self/status").ok()?)?;
     let mut pids = BTreeSet::new();
     for entry in std::fs::read_dir("/proc").ok()? {
         let entry = entry.ok()?;
@@ -85,18 +86,49 @@ fn sentinel_processes(path: &Path, _deadline: Instant) -> Option<BTreeSet<u32>> 
         else {
             continue;
         };
-        let Ok(descriptors) = std::fs::read_dir(entry.path().join("fd")) else {
-            continue;
+        let status = match std::fs::read_to_string(entry.path().join("status")) {
+            Ok(status) => status,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        if descriptors
-            .filter_map(Result::ok)
-            .filter_map(|descriptor| std::fs::read_link(descriptor.path()).ok())
-            .any(|target| target == expected)
-        {
-            pids.insert(pid);
+        let process_uid = linux_effective_uid(&status)?;
+        let same_uid = process_uid == current_uid;
+        let descriptors = match std::fs::read_dir(entry.path().join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound || !same_uid => continue,
+            Err(_) => return None,
+        };
+        for descriptor in descriptors {
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound || !same_uid => continue,
+                Err(_) => return None,
+            };
+            match std::fs::read_link(descriptor.path()) {
+                Ok(target) if target == expected => {
+                    pids.insert(pid);
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound || !same_uid => {}
+                Err(_) => return None,
+            }
         }
     }
     Some(pids)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_effective_uid(status: &str) -> Option<u32> {
+    let mut values = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace();
+    let _real = values.next()?.parse::<u32>().ok()?;
+    let effective = values.next()?.parse::<u32>().ok()?;
+    let _saved = values.next()?.parse::<u32>().ok()?;
+    let _filesystem = values.next()?.parse::<u32>().ok()?;
+    values.next().is_none().then_some(effective)
 }
 
 #[cfg(target_os = "macos")]
@@ -105,18 +137,88 @@ fn sentinel_processes(path: &Path, deadline: Instant) -> Option<BTreeSet<u32>> {
     command.args(["-t", "--"]).arg(path);
     let output =
         crate::process::run_output_until(&mut command, deadline, "provider sentinel scan").ok()?;
-    // lsof exits 1 when the file has no holders; its empty output is proof.
-    String::from_utf8(output.stdout)
+    parse_lsof_output(output.status.code(), &output.stdout, &output.stderr)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_lsof_output(
+    status_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<BTreeSet<u32>> {
+    if status_code == Some(1) && stdout.is_empty() && stderr.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    if status_code != Some(0) || stdout.is_empty() || !stderr.is_empty() {
+        return None;
+    }
+    let pids = std::str::from_utf8(stdout)
         .ok()?
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::parse)
         .collect::<Result<BTreeSet<u32>, _>>()
-        .ok()
+        .ok()?;
+    (!pids.is_empty() && pids.iter().all(|pid| *pid != 0)).then_some(pids)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn sentinel_processes(_path: &Path, _deadline: Instant) -> Option<BTreeSet<u32>> {
     None
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::parse_lsof_output;
+
+    #[test]
+    fn lsof_output_accepts_only_exact_holder_or_no_match_shapes() {
+        assert_eq!(
+            parse_lsof_output(Some(0), b"42\n7\n42\n", b"")
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [7, 42]
+        );
+        assert!(parse_lsof_output(Some(1), b"", b"").unwrap().is_empty());
+
+        for (status, stdout, stderr) in [
+            (Some(0), b"".as_slice(), b"".as_slice()),
+            (Some(0), b"\n".as_slice(), b"".as_slice()),
+            (Some(0), b"0\n".as_slice(), b"".as_slice()),
+            (Some(0), b"invalid\n".as_slice(), b"".as_slice()),
+            (Some(0), b"42\n".as_slice(), b"warning".as_slice()),
+            (Some(1), b"42\n".as_slice(), b"".as_slice()),
+            (Some(1), b"".as_slice(), b"error".as_slice()),
+            (Some(2), b"".as_slice(), b"".as_slice()),
+            (None, b"".as_slice(), b"".as_slice()),
+        ] {
+            assert!(
+                parse_lsof_output(status, stdout, stderr).is_none(),
+                "accepted status={status:?}, stdout={stdout:?}, stderr={stderr:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::linux_effective_uid;
+
+    #[test]
+    fn proc_status_requires_one_complete_uid_row() {
+        assert_eq!(
+            linux_effective_uid("Name:\twrapper\nUid:\t501\t502\t503\t504\n"),
+            Some(502)
+        );
+        for status in [
+            "Name:\twrapper\n",
+            "Uid:\t501\t502\t503\n",
+            "Uid:\t501\t502\t503\t504\t505\n",
+            "Uid:\t501\tinvalid\t503\t504\n",
+        ] {
+            assert_eq!(linux_effective_uid(status), None);
+        }
+    }
 }
