@@ -171,10 +171,15 @@ fn handle_request(
         }
     };
     match listed.as_slice() {
-        [workspace_id] => {
+        [workspace] => {
             return response(
                 request,
-                reconcile_existing_workspace(request, terminal, workspace_id, &description),
+                reconcile_existing_workspace(
+                    request,
+                    terminal,
+                    &workspace.workspace_id,
+                    &description,
+                ),
             );
         }
         [] => {}
@@ -200,13 +205,17 @@ fn handle_request(
         return response(request, rejected(code));
     }
 
+    if let Err(code) = require_workspace_create_capability(terminal) {
+        return response(request, retryable(code));
+    }
     let private_launch = match provider.prepare_launch(request) {
         Ok(launch) => launch,
         Err(code) => return response(request, rejected(code)),
     };
     let (args, private_launch) = create_args(request, &description, private_launch);
-    // cmux creates the workspace before it sends `--command` to the surface.
-    // From this invocation onward every failure is an ambiguous acceptance.
+    // Raw workspace.create executes initial_command during terminal
+    // construction, after cmux has injected its protected workspace/surface
+    // identity. From this invocation onward every failure is ambiguous.
     let created_result = terminal.run(&args);
     if !private_launch.wait_until_consumed(PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE) {
         return response(request, uncertain("cmux-private-launch-not-consumed"));
@@ -218,19 +227,36 @@ fn handle_request(
     let Ok(created) = parse_created_workspace(&created.stdout) else {
         return response(request, uncertain("cmux-create-response-invalid"));
     };
-    response(
-        request,
-        match session_binding_for_surface(
-            terminal,
+    let listed = match list_matching_workspaces(terminal, &description) {
+        Ok(listed) => listed,
+        Err(code) => return response(request, uncertain(code)),
+    };
+    if listed.as_slice()
+        != [WorkspaceMatch {
+            window_id: created.window_id.clone(),
+            workspace_id: created.workspace_id.clone(),
+        }]
+    {
+        return response(request, uncertain("cmux-created-workspace-fence-mismatch"));
+    }
+    let bindings =
+        match session_bindings_for_workspace(terminal, &created.workspace_id, &request.provider_id)
+        {
+            Ok(bindings) => bindings,
+            Err(code) => return response(request, uncertain(code)),
+        };
+    let outcome = match bindings.as_slice() {
+        [binding] if binding.surface_id == created.surface_id => delivered(
+            request,
             &created.workspace_id,
-            &created.surface_id,
-            &request.provider_id,
-        ) {
-            Ok(Some(binding)) => delivered(request, &created.workspace_id, &description, &binding),
-            Ok(None) => uncertain("cmux-session-binding-not-yet-visible"),
-            Err(code) => uncertain(code),
-        },
-    )
+            &description,
+            &binding.binding,
+        ),
+        [] => uncertain("cmux-session-binding-not-yet-visible"),
+        [_] => uncertain("cmux-created-surface-binding-mismatch"),
+        _ => uncertain("multiple-provider-session-bindings"),
+    };
+    response(request, outcome)
 }
 
 fn bind_terminal(
@@ -289,7 +315,7 @@ fn reconcile_existing_workspace(
             Err(code) => return uncertain(code),
         };
     match bindings.as_slice() {
-        [binding] => delivered(request, workspace_id, description, binding),
+        [binding] => delivered(request, workspace_id, description, &binding.binding),
         [] => uncertain("cmux-session-binding-not-yet-visible"),
         _ => uncertain("multiple-provider-session-bindings"),
     }
@@ -378,7 +404,7 @@ fn validate_adapter_request(request: &ProviderWrapperRequestV1) -> Result<(), &'
 fn list_matching_workspaces(
     terminal: &mut impl TerminalTransport,
     description: &str,
-) -> Result<Vec<String>, &'static str> {
+) -> Result<Vec<WorkspaceMatch>, &'static str> {
     let windows_result = terminal
         .run(&cmux_prefix(["list-windows"]))
         .map_err(|_| "cmux-window-list-unavailable")?;
@@ -416,13 +442,22 @@ fn list_matching_workspaces(
         }
         for workspace in listed.workspaces {
             if workspace.description.as_deref() == Some(description) {
-                matches
-                    .push(canonical_uuid(&workspace.id).ok_or("cmux-list-workspace-id-invalid")?);
+                matches.push(WorkspaceMatch {
+                    window_id: window_id.clone(),
+                    workspace_id: canonical_uuid(&workspace.id)
+                        .ok_or("cmux-list-workspace-id-invalid")?,
+                });
             }
         }
     }
     matches.sort();
     Ok(matches)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WorkspaceMatch {
+    window_id: String,
+    workspace_id: String,
 }
 
 #[derive(Deserialize)]
@@ -438,27 +473,105 @@ fn cmux_prefix<const N: usize>(tail: [&str; N]) -> Vec<String> {
         .collect()
 }
 
+#[derive(Deserialize)]
+struct SystemCapabilities {
+    protocol: String,
+    version: u64,
+    methods: Vec<String>,
+    capabilities: Vec<String>,
+}
+
+fn require_workspace_create_capability(
+    terminal: &mut impl TerminalTransport,
+) -> Result<(), &'static str> {
+    let mut args = cmux_prefix(["rpc", "system.capabilities"]);
+    args.push("{}".to_owned());
+    let result = terminal
+        .run(&args)
+        .map_err(|_| "cmux-create-capability-unavailable")?;
+    if !result.success {
+        return Err("cmux-create-capability-refused");
+    }
+    let capabilities: SystemCapabilities = serde_json::from_slice(&result.stdout)
+        .map_err(|_| "cmux-create-capability-response-invalid")?;
+    if capabilities.protocol != "cmux-socket"
+        || capabilities.version != 2
+        || !capabilities
+            .methods
+            .iter()
+            .any(|method| method == "workspace.create")
+        || !capabilities
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace.task_create.v1")
+    {
+        return Err("cmux-create-capability-unproven");
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct WorkspaceCreateParams<'a> {
+    operation_id: String,
+    initial_command: &'a str,
+    cwd: &'a str,
+    title: String,
+    description: &'a str,
+    focus: bool,
+    eager_load_terminal: bool,
+}
+
+fn workspace_create_operation_id(idempotency_key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"shipyard-cmux-workspace-create-operation-id-v1\0");
+    digest.update(idempotency_key.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
 fn create_args(
     request: &ProviderWrapperRequestV1,
     description: &str,
     private_launch: PrivateLaunch,
 ) -> (Vec<String>, PrivateLaunch) {
-    let mut args = cmux_prefix(["workspace", "create"]);
-    args.extend([
-        "--name".to_owned(),
-        format!(
+    let params = WorkspaceCreateParams {
+        operation_id: workspace_create_operation_id(&request.delivery_fence.idempotency_key),
+        initial_command: &private_launch.command,
+        cwd: &request.resume_expectation.worktree_path,
+        title: format!(
             "{} — tracked workstream",
             request.resume_expectation.workstream_handle
         ),
-        "--description".to_owned(),
-        description.to_owned(),
-        "--cwd".to_owned(),
-        request.resume_expectation.worktree_path.clone(),
-        "--focus".to_owned(),
-        "false".to_owned(),
-        "--command".to_owned(),
-        private_launch.command.clone(),
-    ]);
+        description,
+        focus: false,
+        eager_load_terminal: true,
+    };
+    let canonical = serde_json::to_string(&params)
+        .expect("workspace create parameters contain only serializable values");
+    let mut args = cmux_prefix(["rpc", "workspace.create"]);
+    args.push(canonical);
     (args, private_launch)
 }
 
@@ -477,11 +590,13 @@ struct ListedWorkspace {
 
 #[derive(Deserialize)]
 struct CreatedWorkspace {
+    window_id: String,
     workspace_id: String,
     surface_id: String,
 }
 
 struct CreatedWorkspaceIds {
+    window_id: String,
     workspace_id: String,
     surface_id: String,
 }
@@ -489,9 +604,10 @@ struct CreatedWorkspaceIds {
 fn parse_created_workspace(bytes: &[u8]) -> Result<CreatedWorkspaceIds, ()> {
     let created: CreatedWorkspace = serde_json::from_slice(bytes).map_err(|_| ())?;
     // cmux adds informational fields (currently `window_id` and `group_id`) to
-    // this response. Acceptance depends only on the two required UUIDs, so
+    // this response. Acceptance depends only on the three required UUIDs, so
     // tolerate additive metadata while validating those identifiers strictly.
     Ok(CreatedWorkspaceIds {
+        window_id: canonical_uuid(&created.window_id).ok_or(())?,
         workspace_id: canonical_uuid(&created.workspace_id).ok_or(())?,
         surface_id: canonical_uuid(&created.surface_id).ok_or(())?,
     })
@@ -521,6 +637,11 @@ struct AgentSessionBinding {
     remote_workspace_id: Option<String>,
 }
 
+struct SessionBindingMatch {
+    surface_id: String,
+    binding: AgentSessionBinding,
+}
+
 impl AgentSessionBinding {
     fn is_local(&self) -> bool {
         self.execution_location.as_deref() == Some("local")
@@ -541,7 +662,7 @@ fn session_bindings_for_workspace(
     terminal: &mut impl TerminalTransport,
     workspace_id: &str,
     provider_id: &str,
-) -> Result<Vec<AgentSessionBinding>, &'static str> {
+) -> Result<Vec<SessionBindingMatch>, &'static str> {
     let mut args = cmux_prefix(["surface-health"]);
     args.extend(["--workspace".to_owned(), workspace_id.to_owned()]);
     let result = terminal
@@ -570,7 +691,10 @@ fn session_bindings_for_workspace(
         if let Some(binding) =
             session_binding_for_surface(terminal, workspace_id, surface_id, provider_id)?
         {
-            bindings.push(binding);
+            bindings.push(SessionBindingMatch {
+                surface_id: surface_id.clone(),
+                binding,
+            });
         }
     }
     Ok(bindings)

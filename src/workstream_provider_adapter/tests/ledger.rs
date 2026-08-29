@@ -155,6 +155,7 @@ impl ProviderAdapter for LedgerCmuxAdapter {
             results: VecDeque::from([
                 windows(&[UUID]),
                 list(serde_json::json!([])),
+                workspace_create_capabilities(),
                 Err(RunnerFailure::Unavailable),
             ]),
             ..FakeRunner::default()
@@ -164,7 +165,7 @@ impl ProviderAdapter for LedgerCmuxAdapter {
             .calls
             .iter()
             .filter(|call| {
-                call.get(3..5) == Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+                call.get(3..5) == Some(["rpc".to_owned(), "workspace.create".to_owned()].as_slice())
             })
             .count();
         Self::map(response)

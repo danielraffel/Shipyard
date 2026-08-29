@@ -71,7 +71,11 @@ fn cmux_transport_choice_is_orthogonal_to_subrouter_provider_route() {
         results: VecDeque::from([
             windows(&[UUID]),
             list(serde_json::json!([])),
+            workspace_create_capabilities(),
             created(),
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
             session_evidence(Some("claude")),
         ]),
         ..FakeRunner::default()
@@ -319,6 +323,7 @@ fn pre_create_refusal_is_retryable_but_post_create_refusal_is_uncertain() {
         results: VecDeque::from([
             windows(&[UUID]),
             list(serde_json::json!([])),
+            workspace_create_capabilities(),
             Ok(CommandResult {
                 success: false,
                 stdout: Vec::new(),
@@ -331,9 +336,10 @@ fn pre_create_refusal_is_retryable_but_post_create_refusal_is_uncertain() {
         after_create.outcome,
         ProviderWrapperOutcomeV1::Uncertain { .. }
     ));
-    assert_eq!(create_refusal.calls.len(), 3);
-    let create = &create_refusal.calls[2];
-    let command = &create[create.iter().position(|arg| arg == "--command").unwrap() + 1];
+    assert_eq!(create_refusal.calls.len(), 4);
+    let create = &create_refusal.calls[3];
+    let params: serde_json::Value = serde_json::from_str(&create[5]).unwrap();
+    let command = params["initial_command"].as_str().unwrap();
     assert!(!private_launch_path(command).unwrap().exists());
 }
 

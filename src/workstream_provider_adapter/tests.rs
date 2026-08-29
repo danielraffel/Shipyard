@@ -62,8 +62,16 @@ impl TerminalTransport for FakeRunner {
             .results
             .pop_front()
             .expect("test runner must provide one result per call");
-        if let Some(index) = args.iter().position(|argument| argument == "--command")
-            && let Some(path) = private_launch_path(&args[index + 1])
+        let initial_command = (args.get(3).map(String::as_str) == Some("rpc")
+            && args.get(4).map(String::as_str) == Some("workspace.create"))
+        .then(|| {
+            serde_json::from_str::<serde_json::Value>(&args[5]).unwrap()["initial_command"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        });
+        if let Some(command) = initial_command
+            && let Some(path) = private_launch_path(&command)
         {
             self.private_launches
                 .push(std::fs::read_to_string(&path).unwrap());
@@ -149,6 +157,15 @@ fn created() -> Result<CommandResult, RunnerFailure> {
     }))
 }
 
+fn workspace_create_capabilities() -> Result<CommandResult, RunnerFailure> {
+    successful_json(serde_json::json!({
+        "protocol": "cmux-socket",
+        "version": 2,
+        "methods": ["workspace.create"],
+        "capabilities": ["workspace.task_create.v1"]
+    }))
+}
+
 #[test]
 fn live_create_shape_accepts_additive_metadata_and_requires_uuid_ids() {
     let bytes = serde_json::to_vec(&serde_json::json!({
@@ -171,6 +188,29 @@ fn live_create_shape_accepts_additive_metadata_and_requires_uuid_ids() {
     }))
     .unwrap();
     assert!(parse_created_workspace(&invalid).is_err());
+}
+
+#[test]
+fn operation_id_is_stable_payload_bound_rfc9562_uuid_v8() {
+    let first = request("codex", ProviderWrapperOperationV1::Submit);
+    let same = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut changed = request("codex", ProviderWrapperOperationV1::Submit);
+    changed.delivery_fence.payload_digest = "2".repeat(64);
+    changed.delivery_fence.bind_idempotency_key();
+
+    let first_id = workspace_create_operation_id(&first.delivery_fence.idempotency_key);
+    assert_eq!(
+        first_id,
+        workspace_create_operation_id(&same.delivery_fence.idempotency_key)
+    );
+    assert_ne!(
+        first_id,
+        workspace_create_operation_id(&changed.delivery_fence.idempotency_key)
+    );
+    assert_eq!(first_id.len(), 36);
+    assert_eq!(&first_id[14..15], "8");
+    assert!(matches!(&first_id[19..20], "8" | "9" | "a" | "b"));
+    assert_eq!(first_id.matches('-').count(), 4);
 }
 
 fn surface_health(surface_ids: &[&str]) -> Result<CommandResult, RunnerFailure> {
@@ -345,7 +385,7 @@ fn live_original_session_is_woken_in_place_without_workspace_or_provider_creatio
     assert_eq!(runner.calls[2][0], "send-key");
     assert!(runner.private_launches.is_empty());
     assert!(runner.calls.iter().all(|call| {
-        call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+        call.get(3..5) != Some(["rpc".to_owned(), "workspace.create".to_owned()].as_slice())
     }));
 }
 
@@ -448,8 +488,103 @@ fn workspace_created_before_agent_hook_session_is_not_accepted() {
     ));
     assert_eq!(runner.calls.len(), 4);
     assert!(runner.calls.iter().all(|call| {
-        call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+        call.get(3..5) != Some(["rpc".to_owned(), "workspace.create".to_owned()].as_slice())
     }));
+}
+
+#[test]
+fn missing_raw_create_capability_refuses_before_private_launch_or_mutation() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            successful_json(serde_json::json!({
+                "protocol": "cmux-socket",
+                "version": 2,
+                "methods": ["workspace.create"],
+                "capabilities": []
+            })),
+        ]),
+        ..FakeRunner::default()
+    };
+    let mut provider = FakeProviderLaunchAuthority::default();
+
+    let response = handle_request(&request, &mut runner, &mut provider);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Retryable { .. }
+    ));
+    assert_eq!(provider.verify_calls, 1);
+    assert_eq!(provider.prepare_calls, 0);
+    assert_eq!(runner.calls[2][3..5], ["rpc", "system.capabilities"]);
+    assert!(runner.private_launches.is_empty());
+    assert!(runner.calls.iter().all(|call| {
+        call.get(3..5) != Some(["rpc".to_owned(), "workspace.create".to_owned()].as_slice())
+    }));
+}
+
+#[test]
+fn post_create_window_and_workspace_fence_mismatch_is_uncertain() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            workspace_create_capabilities(),
+            created(),
+            windows(&[OTHER_WINDOW_UUID]),
+            list_for_window(
+                OTHER_WINDOW_UUID,
+                serde_json::json!([workspace(&description(&request))]),
+            ),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_with_default_provider(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 6);
+    assert_eq!(runner.private_launches.len(), 1);
+}
+
+#[test]
+fn post_create_multiple_agent_bindings_are_never_delivered() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut second_evidence = session_evidence(Some("codex")).unwrap().stdout;
+    let mut second_value: serde_json::Value = serde_json::from_slice(&second_evidence).unwrap();
+    second_value["surface_id"] = serde_json::json!(OTHER_WINDOW_UUID);
+    second_evidence = serde_json::to_vec(&second_value).unwrap();
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            workspace_create_capabilities(),
+            created(),
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID, OTHER_WINDOW_UUID]),
+            session_evidence(Some("codex")),
+            Ok(CommandResult {
+                success: true,
+                stdout: second_evidence,
+            }),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_with_default_provider(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 9);
 }
 
 #[test]
@@ -484,6 +619,7 @@ fn lost_create_response_reconciles_without_second_create() {
         results: VecDeque::from([
             windows(&[UUID]),
             list(serde_json::json!([])),
+            workspace_create_capabilities(),
             Err(RunnerFailure::Unavailable),
         ]),
         ..FakeRunner::default()
@@ -493,8 +629,8 @@ fn lost_create_response_reconciles_without_second_create() {
         submit_response.outcome,
         ProviderWrapperOutcomeV1::Uncertain { .. }
     ));
-    assert_eq!(submit_runner.calls.len(), 3);
-    assert_eq!(submit_runner.calls[2][3..5], ["workspace", "create"]);
+    assert_eq!(submit_runner.calls.len(), 4);
+    assert_eq!(submit_runner.calls[3][3..5], ["rpc", "workspace.create"]);
 
     let mut reconcile = submit.clone();
     reconcile.operation = ProviderWrapperOperationV1::Reconcile;
@@ -515,7 +651,7 @@ fn lost_create_response_reconciles_without_second_create() {
     assert_delivered(&reconciled, "codex");
     assert_eq!(reconcile_runner.calls.len(), 5);
     assert!(reconcile_runner.calls.iter().all(|call| {
-        call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+        call.get(3..5) != Some(["rpc".to_owned(), "workspace.create".to_owned()].as_slice())
     }));
 }
 
@@ -542,6 +678,7 @@ fn delayed_workspace_visibility_keeps_one_fence_and_never_creates_again() {
         results: VecDeque::from([
             windows(&[UUID]),
             list(serde_json::json!([])),
+            workspace_create_capabilities(),
             Err(RunnerFailure::Unavailable),
         ]),
         ..FakeRunner::default()
@@ -585,7 +722,7 @@ fn delayed_workspace_visibility_keeps_one_fence_and_never_creates_again() {
         .chain(&hidden_runner.calls)
         .chain(&visible_runner.calls)
         .filter(|call| {
-            call.get(3..5) == Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+            call.get(3..5) == Some(["rpc".to_owned(), "workspace.create".to_owned()].as_slice())
         })
         .count();
     assert_eq!(create_count, 1);
@@ -600,21 +737,22 @@ fn same_title_with_wrong_description_does_not_replay() {
             list(serde_json::json!([workspace(
                 "shipyard-workstream-delivery:wrong"
             )])),
+            workspace_create_capabilities(),
             created(),
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
             session_evidence(Some("codex")),
         ]),
         ..FakeRunner::default()
     };
     let response = handle_with_default_provider(&request, &mut runner);
     assert_delivered(&response, "codex");
-    assert_eq!(runner.calls.len(), 4);
-    let create = &runner.calls[2];
-    assert_eq!(create[3..5], ["workspace", "create"]);
-    let description_index = create
-        .iter()
-        .position(|arg| arg == "--description")
-        .unwrap();
-    assert_eq!(create[description_index + 1], description(&request));
+    assert_eq!(runner.calls.len(), 8);
+    let create = &runner.calls[3];
+    assert_eq!(create[3..5], ["rpc", "workspace.create"]);
+    let params: serde_json::Value = serde_json::from_str(&create[5]).unwrap();
+    assert_eq!(params["description"], description(&request));
 }
 
 #[test]
@@ -628,19 +766,32 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
         results: VecDeque::from([
             windows(&[UUID]),
             list(serde_json::json!([])),
+            workspace_create_capabilities(),
             created(),
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
             session_evidence(Some("codex")),
         ]),
         ..FakeRunner::default()
     };
     let response = handle_with_default_provider(&request, &mut runner);
     assert_delivered(&response, "codex");
-    let create = &runner.calls[2];
+    let create = &runner.calls[3];
     assert_eq!(create[..3], ["--json", "--id-format", "uuids"]);
-    let cwd_index = create.iter().position(|arg| arg == "--cwd").unwrap();
-    assert_eq!(create[cwd_index + 1], quoted_worktree);
-    let command_index = create.iter().position(|arg| arg == "--command").unwrap();
-    let command = &create[command_index + 1];
+    assert_eq!(create[3..5], ["rpc", "workspace.create"]);
+    let params: serde_json::Value = serde_json::from_str(&create[5]).unwrap();
+    assert_eq!(params["cwd"], quoted_worktree);
+    assert_eq!(params["description"], description(&request));
+    assert_eq!(params["title"], "GEN-43 — tracked workstream");
+    assert_eq!(params["focus"], false);
+    assert_eq!(params["eager_load_terminal"], true);
+    assert_eq!(params.as_object().unwrap().len(), 7);
+    assert_eq!(
+        params["operation_id"],
+        workspace_create_operation_id(&request.delivery_fence.idempotency_key)
+    );
+    let command = params["initial_command"].as_str().unwrap();
     let launch = &runner.private_launches[0];
     assert!(!private_launch_path(command).unwrap().exists());
     assert!(!command.contains("private-secret"));
@@ -659,6 +810,10 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
         assert!(launch.contains(command_name));
     }
     assert!(launch.contains("Never put receipt JSON or secrets in argv"));
+    assert!(runner.calls.iter().all(|call| {
+        call.get(3..5) != Some(["rpc".to_owned(), "surface.send_text".to_owned()].as_slice())
+            && call.first().map(String::as_str) != Some("send")
+    }));
 }
 
 #[cfg(unix)]
