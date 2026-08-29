@@ -1,10 +1,13 @@
 //! Durable, restartable worker-tree termination transactions.
 
+#[cfg(unix)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -359,6 +362,10 @@ fn frozen_snapshot_is_safe(transaction: &TerminationTransaction) -> io::Result<b
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Unix safety probe is fallible and callers share one cross-platform API"
+)]
 fn frozen_snapshot_is_safe(_transaction: &TerminationTransaction) -> io::Result<bool> {
     Ok(false)
 }
@@ -383,22 +390,27 @@ fn snapshot_is_dead(transaction: &TerminationTransaction) -> io::Result<bool> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Unix liveness probe is fallible and callers share one cross-platform API"
+)]
 fn snapshot_is_dead(_transaction: &TerminationTransaction) -> io::Result<bool> {
     Ok(false)
 }
 
+#[cfg(unix)]
 fn resume_frozen_tree(transaction: &TerminationTransaction) {
-    #[cfg(unix)]
-    {
-        let mut pids = transaction
-            .descendants
-            .iter()
-            .map(|identity| identity.pid)
-            .collect::<Vec<_>>();
-        pids.push(transaction.root_pid);
-        resume_pids(&pids.into_iter().collect());
-    }
+    let mut pids = transaction
+        .descendants
+        .iter()
+        .map(|identity| identity.pid)
+        .collect::<Vec<_>>();
+    pids.push(transaction.root_pid);
+    resume_pids(&pids.into_iter().collect());
 }
+
+#[cfg(not(unix))]
+fn resume_frozen_tree(_transaction: &TerminationTransaction) {}
 
 #[cfg(unix)]
 fn resume_pids(pids: &BTreeSet<u32>) {

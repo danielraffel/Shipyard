@@ -46,6 +46,13 @@ enum WorkerObservation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProcessLiveness {
+    #[cfg_attr(
+        windows,
+        expect(
+            dead_code,
+            reason = "Windows ownership probing is unsupported and therefore never proves a process alive"
+        )
+    )]
     Alive,
     Dead,
     Unknown,
@@ -1162,7 +1169,7 @@ fn signal_process_tree(pid: u32) -> io::Result<Vec<u32>> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn terminate_process_group(pid: u32) -> bool {
     signal_process_tree(pid).is_ok()
 }
@@ -1475,6 +1482,7 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::host_pool::{HostPoolLeaseRequest, HostPoolLeaseStore, default_lease_path};
     use crate::job::{JobKind, Priority, TargetResult, TargetStatus, ValidationMode};
     use crate::queue_request::{
@@ -1690,6 +1698,7 @@ mod tests {
         job
     }
 
+    #[cfg(unix)]
     fn host_pool_lease_request(job_id: &str) -> HostPoolLeaseRequest {
         HostPoolLeaseRequest {
             pool_name: "local_macs".to_owned(),
@@ -2263,6 +2272,7 @@ mod tests {
         assert_eq!(lease_store.leases().expect("leases").len(), 1);
     }
 
+    #[cfg(unix)]
     #[derive(Clone, Copy, Debug)]
     enum TerminationCrashBoundary {
         TreeDeadBeforeLeaseRelease,
