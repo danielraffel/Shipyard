@@ -33,10 +33,11 @@ committed. Shipyard refuses `--launch-profile` in its default bump-apply mode
 because a new bump commit would invalidate the profile's exact-head authority.
 
 When trusted machine-global continuation is enabled, apply mode publishes the
-exact profile and waits for the live daemon to complete its fenced provider
-delivery before returning `monitoring_transferred=true`. A missing, disabled,
-refused, wrong-machine, or unauthorized consumer fails closed and leaves
-`wake_consumer_available=false`.
+exact profile as a zero-wake durable daemon obligation before returning
+`monitoring_transferred=true`. Provider delivery does not control transfer or
+agent disposition. A missing, disabled, refused, wrong-machine, or unauthorized
+consumer fails closed and leaves `wake_consumer_available=false`. See
+`post-handoff-disposition.md` for the optional task-graph-proven pause contract.
 
 The JSON schema is intentionally composed only of strings, argv arrays, exact
 provenance, and a recovery-policy enum:
@@ -142,6 +143,16 @@ Restart reconciliation inspects the same idempotency fence; an unproven outcome
 remains `uncertain` and is never blindly relaunched. A successful
 acknowledgement advances the same canonical work item to agent-owned repair in
 the final transaction.
+
+Before provider I/O, native publication binds the exact PR head, base ref, base
+SHA, GitHub App installation identity, and a live terminal capability. cmux
+authority requires a unique local process/surface match plus the exact native
+checkpoint from `surface resume show`; workspace moves are evidence updates,
+not identity changes. Stored labels never authorize delivery. HerdR is an
+explicit capability request but remains refused until its runtime exposes an
+equivalent independently observable server/process/checkpoint contract.
+Subrouter/account/model/resume argv remain digest-bound; refusal never falls
+back to direct Codex.
 
 Activation is explicit trusted machine-global policy and default-off. The
 subscriber-independent daemon owns delivery only after exact handoff

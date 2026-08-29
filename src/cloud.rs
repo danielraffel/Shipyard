@@ -191,14 +191,12 @@ pub struct RunMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitHubError {
     message: String,
-    command_failed: bool,
 }
 
 impl GitHubError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            command_failed: false,
         }
     }
 
@@ -214,15 +212,7 @@ impl GitHubError {
                 "gh {} failed with status {status}: {stderr}",
                 args.join(" ")
             ),
-            command_failed: true,
         }
-    }
-
-    pub(crate) fn is_integration_permission_denial(&self) -> bool {
-        self.command_failed
-            && self
-                .message
-                .contains("Resource not accessible by integration")
     }
 }
 
@@ -339,6 +329,22 @@ impl GitHubActions {
                 .map_err(|error| format!("failed to scope GitHub auth to explicit repo: {error}"))
         });
         self
+    }
+
+    /// Confirm the configured credential is a repository-scoped GitHub App
+    /// installation token without exposing token material.
+    pub(crate) fn app_installation_id(&self) -> Result<u64, GitHubError> {
+        #[cfg(test)]
+        if self.gh_binary_override.is_some() {
+            return Ok(42);
+        }
+        let client = self
+            .gh
+            .as_ref()
+            .map_err(|error| GitHubError::command_failed(&[], None, error.as_bytes()))?;
+        client
+            .app_installation_id(&self.cwd)
+            .map_err(|error| GitHubError::command_failed(&[], None, error.to_string().as_bytes()))
     }
 
     #[cfg(all(test, unix))]
@@ -752,40 +758,6 @@ impl GitHubActions {
             .output()
             .map_err(|error| {
                 GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
-            })?;
-        if !output.status.success() {
-            return Err(GitHubError::command_failed(
-                args,
-                output.status.code(),
-                &output.stderr,
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-
-    /// Run one low-volume GitHub mutation with ambient `gh` credentials.
-    /// Callers must first attempt configured auth and restrict fallback to an
-    /// explicit integration-permission rejection.
-    pub(crate) fn run_gh_ambient(&self, args: &[String]) -> Result<String, GitHubError> {
-        let client = self
-            .gh
-            .as_ref()
-            .map_err(|error| GitHubError::new(error.clone()))?;
-        let output = client
-            .prepare_command(
-                &self.cwd,
-                self.gh_binary_override.as_deref(),
-                GhSupervision::Unsupervised,
-                GhAuthPolicy::AmbientOnly,
-            )
-            .map_err(|error| GitHubError::new(format!("failed to prepare ambient gh: {error}")))?
-            .args(args)
-            .output()
-            .map_err(|error| {
-                GitHubError::new(format!(
-                    "failed to run ambient gh {}: {error}",
-                    args.join(" ")
-                ))
             })?;
         if !output.status.success() {
             return Err(GitHubError::command_failed(
@@ -1713,41 +1685,6 @@ cache_ttl_seconds = 300
             local_dir: None,
             local_overlay_source: LocalOverlaySource::None,
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ambient_fallback_preserves_configured_direct_gh_binary() {
-        let temp = TempDir::new().expect("tempdir");
-        let helper = temp.path().join("token-helper");
-        write_executable(&helper, "#!/bin/sh\nprintf ghs_app_token\n");
-        let ambient_gh = temp.path().join("gh");
-        std::os::unix::fs::symlink("/bin/echo", &ambient_gh).expect("native gh fixture");
-        let text = format!(
-            r#"
-[github.auth]
-source = "command"
-token_command = ["{}"]
-cache_ttl_seconds = 300
-ambient_gh_binary = "{}"
-"#,
-            helper.display(),
-            ambient_gh.display()
-        );
-        let config = LoadedConfig {
-            data: text.parse().expect("parse config"),
-            global_dir: temp.path().join("global"),
-            project_dir: None,
-            local_dir: None,
-            local_overlay_source: LocalOverlaySource::None,
-        };
-        let actions = super::GitHubActions::from_loaded_config(temp.path(), &config);
-
-        let output = actions
-            .run_gh_ambient(&["api".to_owned(), "identity-proof".to_owned()])
-            .expect("configured ambient gh");
-
-        assert_eq!(output.trim(), "api identity-proof");
     }
 
     #[cfg(unix)]

@@ -78,6 +78,8 @@ pub(super) fn render_json<W: Write>(
                         "context_url": receipt.context_url,
                         "monitoring_transferred": receipt.monitoring_transferred,
                         "wake_consumer_available": receipt.monitoring_transferred,
+                        "agent_disposition": receipt.agent_disposition,
+                        "pause_required": receipt.pause_required,
                         "publication_work_id": receipt.publication_work_id,
                         "publication_route_ref": receipt.publication_route_ref,
                         "publication_wake_id": receipt.publication_wake_id,

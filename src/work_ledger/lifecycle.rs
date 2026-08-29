@@ -1,6 +1,7 @@
 //! Lifecycle transitions, continuation contracts, and transactional wake publication.
 #![allow(dead_code)] // Native lifecycle activation follows the shadow phase.
 
+use super::projection_intents::ProjectionIntentKind;
 use super::registry::validated_route_exists;
 use super::{
     OptionalExtension, Transaction, TransactionBehavior, Utc, WorkLedger, WorkLedgerError,
@@ -172,7 +173,51 @@ impl WorkLedger {
         expected_owner_generation: u64,
         next: LifecycleState,
         wake: Option<&WakeIntent>,
-    ) -> WorkLedgerResult<()> {
+    ) -> WorkLedgerResult<bool> {
+        self.transition_with_wake_and_projection(
+            work_id,
+            expected_work_generation,
+            expected_owner_generation,
+            next,
+            wake,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub(super) fn transition_with_wake_and_delivery_receipt(
+        &self,
+        work_id: &str,
+        expected_work_generation: u64,
+        expected_owner_generation: u64,
+        wake: &WakeIntent,
+        delivery_receipt_digest: &str,
+    ) -> WorkLedgerResult<bool> {
+        self.transition_with_wake_and_projection(
+            work_id,
+            expected_work_generation,
+            expected_owner_generation,
+            LifecycleState::Dispatching,
+            Some(wake),
+            None,
+            None,
+            Some(("canary_terminal_wake_delivery", delivery_receipt_digest)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn transition_with_wake_and_projection(
+        &self,
+        work_id: &str,
+        expected_work_generation: u64,
+        expected_owner_generation: u64,
+        next: LifecycleState,
+        wake: Option<&WakeIntent>,
+        explicit_projection: Option<ProjectionIntentKind>,
+        terminal_disposition: Option<&str>,
+        audit_event: Option<(&str, &str)>,
+    ) -> WorkLedgerResult<bool> {
         validate_opaque_ref("work_id", work_id, "wi")?;
         let parent = self
             .path
@@ -193,6 +238,12 @@ impl WorkLedger {
             next,
             wake.is_some(),
         )?;
+        if next == LifecycleState::Terminal
+            && defer_terminal_while_provider_io_is_unresolved(&transaction, work_id, &now)?
+        {
+            transaction.commit()?;
+            return Ok(false);
+        }
         let changed = transaction.execute(
             "UPDATE work_items SET phase = ?1, work_generation = work_generation + 1,
                     updated_at = ?2
@@ -220,23 +271,75 @@ impl WorkLedger {
                 &now,
             )?;
         }
-        let event_payload = wake.map_or_else(
-            || digest(b"state-only-transition"),
-            |intent| intent.payload_digest.clone(),
+        if next == LifecycleState::Terminal {
+            // A terminal steward transition suppresses every not-yet-claimed
+            // wake in the same transaction as the work generation fence. A
+            // claimed wake is excluded: its provider boundary may already be
+            // in flight, but the terminal work phase prevents any new claim or
+            // fresh authority from being minted.
+            let terminal_digest = digest(b"terminal-work-suppressed-pending-wake");
+            transaction.execute(
+                "UPDATE outbox SET state = 'failed', transport_receipt_digest = ?1,
+                        updated_at = ?2, acknowledged_at = NULL
+                  WHERE work_item_id = ?3 AND state = 'pending'",
+                params![terminal_digest, now, work_id],
+            )?;
+        }
+        let event_payload = audit_event.map_or_else(
+            || {
+                wake.map_or_else(
+                    || digest(b"state-only-transition"),
+                    |intent| intent.payload_digest.clone(),
+                )
+            },
+            |(_, payload_digest)| payload_digest.to_owned(),
         );
+        let event_kind = audit_event.map_or("lifecycle_transition", |(kind, _)| kind);
         record_event(
             &transaction,
             work_id,
             expected_work_generation + 1,
             expected_owner_generation,
-            "lifecycle_transition",
+            event_kind,
             Some(current),
             next,
             &event_payload,
             &now,
         )?;
+        let projection_kind = explicit_projection.or(match next {
+            LifecycleState::Managed
+            | LifecycleState::Dispatching
+            | LifecycleState::AgentOwnedRepair => Some(ProjectionIntentKind::Handoff),
+            LifecycleState::Waiting => Some(ProjectionIntentKind::Waiting),
+            LifecycleState::Actionable => Some(ProjectionIntentKind::Actionable),
+            LifecycleState::Returned => Some(ProjectionIntentKind::NewHead),
+            LifecycleState::ShadowImported
+            | LifecycleState::Published
+            | LifecycleState::Ready
+            | LifecycleState::Terminal => None,
+        });
+        let projection_bound: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workstream_projection_bindings WHERE work_item_id = ?1)",
+            [work_id],
+            |row| row.get(0),
+        )?;
+        if projection_bound && let Some(kind) = projection_kind {
+            Self::stage_projection_intent(
+                &transaction,
+                work_id,
+                expected_work_generation + 1,
+                expected_owner_generation,
+                kind,
+                "lifecycle_transition",
+                Some(current.as_str()),
+                next.as_str(),
+                &event_payload,
+                terminal_disposition,
+                &now,
+            )?;
+        }
         transaction.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Publish or revise both continuation outcomes under one revision fence.
@@ -308,6 +411,70 @@ impl WorkLedger {
         transaction.commit()?;
         Ok(next_revision)
     }
+}
+
+/// Suppress work that has not crossed the provider boundary while preserving
+/// launched or uncertain work for reconciliation. Returning `true` defers the
+/// terminal lifecycle advance until that reconciliation resolves; it never
+/// authorizes a new submit.
+fn defer_terminal_while_provider_io_is_unresolved(
+    transaction: &Transaction<'_>,
+    work_id: &str,
+    now: &str,
+) -> WorkLedgerResult<bool> {
+    let terminal_digest = digest(b"terminal-work-suppressed-unlaunched-wake");
+    transaction.execute(
+        "UPDATE wake_attempts SET state = 'failed', outcome_digest = ?1, finished_at = ?2
+          WHERE state = 'claimed' AND wake_id IN (
+                SELECT wake.wake_id FROM outbox wake
+                 WHERE wake.work_item_id = ?3 AND wake.state = 'claimed'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM provider_deliveries delivery
+                        WHERE delivery.wake_id = wake.wake_id
+                          AND delivery.state = 'launched'
+                   )
+          )",
+        params![terminal_digest, now, work_id],
+    )?;
+    transaction.execute(
+        "UPDATE provider_deliveries SET state = 'failed', updated_at = ?1
+          WHERE state = 'prepared' AND wake_id IN (
+                SELECT wake_id FROM outbox WHERE work_item_id = ?2
+          )",
+        params![now, work_id],
+    )?;
+    transaction.execute(
+        "UPDATE activation_epochs SET state = 'released', released_at = ?1
+          WHERE state = 'active' AND activation_id IN (
+                SELECT delivery.activation_id FROM provider_deliveries delivery
+                 JOIN outbox wake ON wake.wake_id = delivery.wake_id
+                WHERE wake.work_item_id = ?2 AND delivery.state = 'failed'
+          )",
+        params![now, work_id],
+    )?;
+    transaction.execute(
+        "UPDATE outbox SET state = 'failed', transport_receipt_digest = ?1,
+                updated_at = ?2, acknowledged_at = NULL
+          WHERE work_item_id = ?3 AND state IN ('pending', 'claimed')
+            AND NOT EXISTS (
+                SELECT 1 FROM provider_deliveries delivery
+                 WHERE delivery.wake_id = outbox.wake_id
+                   AND delivery.state = 'launched'
+            )",
+        params![terminal_digest, now, work_id],
+    )?;
+    let unresolved: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM outbox wake
+            JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+           WHERE wake.work_item_id = ?1
+             AND ((wake.state = 'claimed' AND delivery.state = 'launched')
+               OR (wake.state = 'uncertain' AND delivery.state = 'uncertain'))
+        )",
+        [work_id],
+        |row| row.get(0),
+    )?;
+    Ok(unresolved)
 }
 
 fn validate_transition(
@@ -429,7 +596,7 @@ fn validate_wake(
     Ok(())
 }
 
-fn deterministic_wake_id(
+pub(crate) fn deterministic_wake_id(
     work_id: &str,
     work_generation: u64,
     owner_generation: u64,

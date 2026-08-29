@@ -46,7 +46,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Shadow-plan changed-surface tests for an exact PR head | `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n> --target <name>` (base-owned literal tests only; full suite remains authoritative; identity mismatch hard-fails, ambiguity falls back full) |
 | Authorize an exact metadata-only PR without a native worker | Configure trusted machine-global `[metadata_authority]` plus one repository entry containing a narrow path allowlist and exact required hosted checks. `shipyard pr` emits an immutable exact base/head/tree/path/check/policy receipt and queues zero native targets only when every observation agrees; unknown paths, stale/pending checks, SHA drift, or policy ambiguity preserve full validation or refuse execution. Project config cannot activate or widen this tier. |
 | Read one exact shadow-comparison result | `shipyard --json changed-surface-trial-status --repo <owner/repo> --pr <n> --target <name> --head <sha>` (read-only; exit 3 collecting, 0 ready, 1 rejected; validates exact receipt identity plus conservative timing/savings and never promotes policy or merge readiness) |
-| Assess the first Pulp macOS sharding canary | Library-only and default-off: the pure `parallel_proof_canary` contract accepts only Pulp's exact numeric repository identity and slug plus an independently observed `mac` target, M3 build + fresh M1 LAN eligibility, authenticated persistent normalized staging roots, exact host-local cache generations, preserved CTest topology, manifest-bound timing evidence, material predicted savings, and an exact non-rounded transfer-overhead ceiling. It cannot dispatch work or authorize a merge; M5 remains optional and excluded until roaming recovery is separately proven. |
+| Assess a macOS sharding canary | Default-off: `shipyard parallel-proof-canary --request <absolute-private-json>` is a no-execution/no-mutation plan unless `--apply` is explicit. Apply requires trusted machine-global policy pinning a native adapter digest, full invocation-authority digest, bounds, repository/target, and exact builder/worker identities. The controller completes the proof-bound same-host control before distributed work, rechecks session/storage fences, binds actual transfer and interrupted-resume counters, forces avoided-byte claims and model calls to zero, records distributed-started before mutation, and no-overwrite publishes evidence. Core has no Pulp commands or personal host defaults; installed adapter configuration and physical fleet proof remain required. Neither surface authorizes a merge. |
 | Produce a canonical shadow CTest inventory | Library-only: translate bounded CTest JSON-v1 with an independent exhaustive count/sorted-ID digest, exact configuration, bounded controller-owned capabilities, and explicit host/fleet scope for every resource lock. Filtered, ambiguous, disabled, non-executable, `REQUIRED_FILES`-dependent, or unsupported graphs fail closed. This does not invoke CTest, dispatch work, or authorize a merge. |
 | Assess one-host Pulp M3 build-once consumption | Library-only and default-off: bind exactly one successful configure/build receipt to the exact source, toolchain, canonical CTest inventory, proof manifest, and compact artifact content address; require same-session M3 consumption with zero configure/build invocations and exact sorted executed-set reconciliation. The existing full gate remains authoritative, and this cannot run commands, dispatch cross-host work, publish a check, or authorize a merge. |
 | Show run logs | `shipyard logs <job_id> --json` |
@@ -63,12 +63,16 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Runner provisioning: audit host-class and local PATH drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels, fatally rejects advisory/required label overlap, and strictly checks every in-scope local runner's `.path` against Shipyard's canonical system-first value; malformed/unreadable local inventory fails closed; exit 1 on drift). New/service-less registration preserves that PATH through `config.sh`; drain and stop/uninstall a service-installed runner before reconciliation because Shipyard never stops live capacity implicitly. |
 | **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` + `tart get` per `[host_class.*]`, using configured `tart_home` as `TART_HOME`; counts only running macOS/darwin VMs; `free = Σ max(0, cap − running_macos)`; fail-closed, exit 1 if any host/VM OS unreadable) |
 | **Runner fleet visibility: exact-head queue/release liveness** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (bounded pagination; stable auth/rate/truncation reasons; detects optional/superseded capacity owners and cleared enrollment) |
-| **Roll one exact Shipyard release across the fleet** | Configure absolute `host_class.<name>.shipyard_bin` and remote `github_cli` paths, explicit `shipyard_mode`/`shipyard_global_dir`/`shipyard_state_dir`, plus self-contained machine-global command auth; review `shipyard runner fleet-update --to vX.Y.Z --json`, then add `--apply`. Exact-tag installer bootstrap supports older remote binaries, each supervised host attempt runs under a stripped environment, times out after ten minutes, and refreshes the exact configured daemon only after verified install. |
+| **Roll one exact Shipyard release across the fleet** | Configure absolute `host_class.<name>.shipyard_bin` and remote `github_cli` paths, explicit `shipyard_mode`/`shipyard_global_dir`/`shipyard_state_dir`, plus self-contained machine-global command auth. Review `shipyard runner fleet-update --to vX.Y.Z --host-class <class> --json`, then add `--apply`; repeat the selector for an ordered subset or use explicit `--all-hosts`. Before any host, Shipyard binds the annotated tag's full tag-object/commit/tree OIDs, release ID, exact checksum-manifest and macOS DMG SHA-256, and `release.yml` build-provenance attestations, closes the mint window, and freezes that authority for every selected host. Missing attestations, manifest/source drift, implicit/duplicate hosts, authority/asset receipt mismatch, cross-host pair-hash mismatch, mixed CLI/provider pairs, or a companion retained by legacy rollback fail closed. Receipts preserve complete authority plus before/after paths, versions, double hashes, daemon identity, and configured repositories; rollout stops at the first failure. |
 | **Supply non-secret machine paths to every fresh worktree** | Track exact `[project].repository` plus `validation.<name>.machine_environment = ["NAME"]`; put each host's absolute path under machine-global `[repository_environment."OWNER/REPO"]`. Names must end in `_DIR`, `_FILE`, `_HOME`, `_PATH`, or `_ROOT`; secret-like names remain rejected even with one of those suffixes. Shipyard binds the case-sensitive GitHub origin, ignores repo/local attempts to supply values, rejects relative values, and snapshots resolved values under owner-protected queue state for session-independent execution. |
 | **Maintain Pulp's expiring disposable-Linux route** | `shipyard runner local-linux-lease --repo Generous-Corp/pulp [--apply] [--watch --interval-secs 60] [--json]` (dry-run by default; profile-derived exact labels; queued matching jobs reserve idle slots; renews only for unreserved online idle ephemeral capacity; unhealthy/unreadable clears; 15-minute maximum TTL; no workflow or MQ mutation) |
 | **Gate TartCI JIT registration on an exact stale-run census** | `shipyard runner admission-clean --repo <owner/repo> --base main --labels self-hosted,<exact-labels> --apply --json` (flat versioned TartCI contract: 0=`admit`, 3=`defer`, 1=operational error, 2=invalid configuration; only managed queued PR/merge-group runs whose immutable head is superseded and whose queued job labels are a subset of the prospective runner may block or be cancelled; a non-authority host never mutates) |
 | **Cross-repo merge-on-green stewardship** | Prefer atomic submission: configure `[merge_steward].auto_handoff = true` on the protected base branch and use `shipyard pr [--workstream-id <id>] [--context-url <url>]` (a PR branch cannot opt itself in); otherwise hand off one immutable head with `shipyard runner steward-handoff --repo <owner/repo> --pr <n> --head <sha> --workstream-id <id> [--context-url <url>] --apply`, then reconcile with `shipyard runner steward --repo <owner/pulp> --repo <owner/forge> --repo <owner/vellum> [--json]` (dry-run by default; only PRs carrying both the `shipyard:managed` label and a successful `shipyard/steward-handoff` status on their current head may be mutated, so apply mode explicitly labels old backlog `shipyard:unmanaged` without adopting it and exact handoff removes that explanatory label; `--apply` requires the trusted machine-global mutation authority, obeys central `HOLD`, serializes and write-ahead audits every GitHub mutation, emits one deduplicated `shipyard:needs-agent` plus `shipyard/steward-recovery` failure signal for semantic blockers, resumes durable exact-run pending cancellations before planning, re-enrolls only the current exact green head, and preserves native queue order unless the separately default-off `--recover-hosted-setup-eviction-priority` flag has a durable pre-removal witness plus exact linked required GitHub-hosted setup-only provider-DNS failure proof for one once-per-removal/run `jump: true`; it refuses mutation without authoritative required-check governance and refuses client-side direct merge when GitHub cannot atomically bind the validated base revision, bounds transient reruns with both write-ahead intent and GitHub's durable `run_attempt`, cancels only queued runs whose immutable PR/merge-group head is provably superseded, and may preempt one exact allow-listed advisory Pulp workflow holding `pulp-preamble` after a 15-minute exact-front pool wait; same-head duplicates, required workflows, pushes, unknown work, and unmanaged PRs are never cancelled; opt out with `shipyard:no-auto-merge` or disable preemption with `--no-preempt-capacity`) |
-| **Publish an exact agent continuation** | Add `--launch-profile <private-json>` to `shipyard pr` or `runner steward-handoff`. `LaunchProfileV1` binds exact prompt-free launch/resume argv plus typed provider/account/model/reasoning effort, checkpoint, bootstrap, and worktree provenance. With trusted machine-global activation, Shipyard publishes the native wake transactionally and reports `wake_consumer_available=true`; any refusal leaves monitoring with the origin. Private fields are never projected to GitHub/Linear. See `docs/launch-profile.md`. |
+| **Publish an exact agent continuation** | Add `--launch-profile <private-json>` to `shipyard pr` or `runner steward-handoff`. `LaunchProfileV1` binds exact prompt-free launch/resume argv plus typed provider/account/model/reasoning effort, checkpoint, bootstrap, and worktree provenance. With trusted machine-global activation, Shipyard transactionally publishes a zero-wake daemon obligation and reports `monitoring_transferred=true`; any refusal leaves monitoring with the origin. `continue` is the default; `pause` also requires `--task-graph` proof. Private fields are never projected to GitHub/Linear. See `docs/launch-profile.md` and `docs/post-handoff-disposition.md`. |
+
+Native delivery also requires fresh exact-head/base-SHA GitHub App installation
+authority and a live terminal checkpoint. cmux workspace moves preserve surface
+identity; static labels and HerdR environment metadata do not grant authority.
 
 | **Triage a steward exception without a resident agent** | `shipyard runner recovery-worker` inspects/revalidates one durable exact-head request without launching a model; add `--apply` for one bounded phase-1 classification attempt, or `--drain --apply` for the bounded current snapshot. Policy is machine-global only; Shipyard constructs a tool-disabled argv, clears the inherited environment, uses a global model lease and overall deadline, and accepts strict JSON that can classify/escalate but cannot authorize repairs, paths, or tests. Provider/quota failures terminalize; unsafe findings escalate; neither blocks unrelated PRs. |
 | **Inspect the canonical lifecycle migration shadow** | `shipyard work-ledger status --json` never creates storage. `shipyard work-ledger import --json` emits a deterministic, redacted, no-write plan; add `--apply` only to populate the SQLite/WAL shadow idempotently. Legacy stores remain authoritative and untouched; activation and dispatch remain false. |
@@ -1048,11 +1052,14 @@ An intentional replacement must use the explicit transfer option with the same
 immutable work identity; Shipyard increments the ownership generation and
 rejects ambiguous provider context, head drift, or competing route ownership.
 
-An exact launch profile plus enabled trusted consumer publishes a native wake
-before the command reports `wake_consumer_available=true`. Without that exact
-receipt, apply-mode pause is rejected, `monitoring_transferred` remains false,
-and the originating agent retains the last monitor. Do not terminate a goal or
-claim Shipyard owns the watch solely because a basic handoff receipt exists.
+An exact launch profile plus enabled trusted consumer publishes a zero-wake
+native ledger obligation before the command reports
+`monitoring_transferred=true`. Provider delivery is not part of that boundary.
+The originating agent stops monitor-only children after transfer and continues
+independent runnable work. It parks only for the exact tuple
+`monitoring_transferred=true`, `agent_disposition=pause`, and
+`pause_required=true`, after `--after-handoff pause --task-graph` proves no
+independent runnable node remains. See `docs/post-handoff-disposition.md`.
 Status reconciliation is bounded and
 paginated, selects the newest matching status, and reconciles uncertain writes
 before retrying so a restart cannot blindly duplicate the public handoff.
@@ -1578,8 +1585,15 @@ stage exits naturally. Automatic already-merged cancellation is stricter: it
 requires typed repository/PR/exact-head proof, durably freezes and proves the
 whole process tree dead before releasing capacity, and generation-CAS removes
 only the terminating worker's receipt. A restart resumes that transaction; it
-must preserve any replacement generation that appeared after a deferred job
-returned to pending.
+does not require the separate receipt after the exact frozen-tree transaction
+is durable, but it must preserve and refuse any present replacement generation.
+A missing receipt without a durable termination transaction remains fenced for
+agent recovery because root absence cannot prove reparented descendants dead.
+Once an exact AlreadyMerged cancellation proof is stored, the daemon stops
+repeating the remote merged-head observation and proceeds only through local
+termination recovery. A deferred transaction follows the same crash phases and
+returns the original job to pending exactly once after tree death and lease
+release.
 
 ### Gate-script path resolution
 
@@ -1674,6 +1688,20 @@ Reconcile resume records even when the authoritative terminal-handoff update is
 a no-op so legacy ledgers backfill on restart. Publish or roll back both maps as
 one crash-consistent ledger image, and keep `dispatch_enabled=false` until the
 outbox, acknowledgment, and physical canary gates are separately complete.
+
+**Pulp macOS cache readiness is exact and default-off.** Generate cache
+identities from the complete read-only no-follow tree inventory; a directory
+name or `claimed_bytes_avoided` is not evidence. Probe all required M3
+generations before M1, require exact policy inventory and freshness on both,
+and persist paired zero-model evidence without overwrite. Remote M1 proof must
+cross the protected digest-pinned companion transport and bind exact
+host/session/route/capability/staging/reserve/terminal/manifest authority plus
+carrier-origin byte, digest, and monotonic timing counters. Use only the
+explicit pinned strict-SSH carrier: LAN first, independently pinned Tailnet
+only after a transport failure, and never ambient SSH/config. Tailnet cache
+measurements cannot close the LAN/session gate. The proof supplies no authority
+beyond its exact receipt and never authorizes cache mutation or canary execution. See
+`docs/pulp-mac-cache-readiness.md`.
 
 **Detached daemon temp roots must not depend on the launching shell.** A daemon
 started from launchd or a minimal SSH environment may inherit no `TMPDIR`.

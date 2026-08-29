@@ -36,7 +36,9 @@ on:
         type: string
 
 permissions:
+  attestations: write
   contents: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -160,6 +162,15 @@ jobs:
           cd release
           sha256sum -- * > checksums.sha256
 
+      - name: Attest non-macOS release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release/shipyard-linux-*
+            release/shipyard-windows-*.exe
+            release/shipyard-workstream-provider-linux-*
+            release/shipyard-workstream-provider-windows-*.exe
+
       - name: Create draft GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -241,6 +252,11 @@ jobs:
             --tag "${{ github.ref_name }}" \
             --upload \
             --ci-mode
+
+      - name: Attest signed and notarized macOS release asset
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/${{ github.ref_name }}/shipyard-macos-arm64.dmg
 
       - name: Restore user keychains and delete ephemeral signing keychain
         if: always()

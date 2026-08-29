@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io;
 #[cfg(unix)]
@@ -27,13 +27,18 @@ use serde_json::Value;
 #[cfg(unix)]
 use chrono::Utc;
 
+use crate::actionable_wake_producer::{ActionableWakeProducer, ActionableWakeProducerStatus};
 use crate::config::LoadedConfig;
+#[cfg(unix)]
+use crate::custody_transport::CustodyTransportRuntime;
 use crate::daemon_ipc::read_daemon_status;
 #[cfg(unix)]
 use crate::daemon_ipc::{IpcServer, IpcState, github_auth_degraded_message};
 #[cfg(unix)]
 use crate::execution_supervisor::ExecutionSupervisor;
 use crate::identity::RuntimeMode;
+#[cfg(unix)]
+use crate::paths::RuntimePaths;
 #[cfg(unix)]
 use crate::reconcile::{
     RECONCILE_INTERVAL_SECONDS, ReconcileReport, ReconcileTransition, ReconcileWindow,
@@ -49,12 +54,16 @@ use crate::ship_state::ShipStateStore;
 #[cfg(unix)]
 use crate::ship_state::{DispatchedRun, ShipState};
 #[cfg(unix)]
+use crate::transition_projection_runner::TransitionProjectionRuntime;
+#[cfg(unix)]
 use crate::tunnel::{
     TailscaleFunnelBackend, TunnelSnapshot, TunnelSupervisorHooks, TunnelSupervisorPolicy,
     TunnelSupervisorState, supervise_tunnel,
 };
 #[cfg(unix)]
 use crate::webhook::{decode_webhook_event, is_valid_signature};
+#[cfg(unix)]
+use crate::work_ledger::WorkLedger;
 #[cfg(unix)]
 use crate::workstream_continuation_runtime::{
     ContinuationRuntimeStatus, WorkstreamContinuationRuntime,
@@ -195,18 +204,55 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let registration = Arc::new(RegistrationState::new(registrar));
     let registration_error = Arc::new(Mutex::new(None::<String>));
     let execution_error = Arc::new(Mutex::new(None::<String>));
+    let transition_projection_error = Arc::new(Mutex::new(None::<String>));
+    let custody_transport_error = Arc::new(Mutex::new(None::<String>));
     let continuation_status = Arc::new(Mutex::new(ContinuationRuntimeStatus::default()));
+    let actionable_producer_status = Arc::new(Mutex::new(ActionableWakeProducerStatus::default()));
     let ship_dir = config.state_dir.join("ship");
     let ship_dir_for_list = ship_dir.clone();
+    let (mut canary_job_runtime, canary_job_init_error) =
+        match crate::config::LoadedConfig::load_machine_global_from_dir(config.global_dir.clone()) {
+            Ok(loaded) => {
+                match crate::parallel_proof_canary_job_adapter::DaemonCanaryJobRuntime::from_config(
+                    std::env::current_exe()?,
+                    config.mode,
+                    config.global_dir.clone(),
+                    &config.state_dir,
+                    &loaded,
+                ) {
+                    Ok(runtime) => (runtime, None),
+                    Err(error) => (None, Some(format!("parallel_proof_canary_job: {error}"))),
+                }
+            }
+            Err(error) => (
+                None,
+                Some(format!("parallel_proof_canary_job config: {error}")),
+            ),
+        };
+    let mut canary_diagnostic = canary_job_init_error.clone();
+    let canary_capabilities = Arc::new(Mutex::new(
+        canary_job_runtime.as_ref().map_or_else(Vec::new, |_| {
+            vec![crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY.to_owned()]
+        }),
+    ));
+    if let Some(error) = canary_job_init_error.as_ref()
+        && let Ok(mut last_error) = execution_error.lock()
+    {
+        *last_error = Some(error.clone());
+    }
 
     let status_provider = daemon_status_provider(
         Arc::clone(&registration),
         repos.clone(),
         Arc::clone(&registration_error),
         Arc::clone(&execution_error),
+        Arc::clone(&transition_projection_error),
+        Arc::clone(&custody_transport_error),
         Arc::clone(&continuation_status),
+        Arc::clone(&actionable_producer_status),
         Arc::clone(&last_event_at),
         Arc::clone(&tunnel_runtime.snapshot),
+        Arc::clone(&canary_capabilities),
     );
     let mut server = IpcServer::new(daemon_dir.join("daemon.sock"), status_provider)
         .with_stop_request(move || {
@@ -240,17 +286,64 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     );
     let mut continuation_runtime =
         WorkstreamContinuationRuntime::for_daemon(config.mode, config.state_dir.clone());
+    let mut actionable_producer = ActionableWakeProducer::new(config.state_dir.clone());
+    let mut transition_projection_runtime = TransitionProjectionRuntime::for_daemon(
+        config.mode,
+        config.global_dir.clone(),
+        config.state_dir.clone(),
+    );
+    let mut custody_transport_runtime = CustodyTransportRuntime::for_daemon(
+        config.mode,
+        config.global_dir.clone(),
+        config.state_dir.clone(),
+    );
+    if let Ok(mut published) = transition_projection_error.lock() {
+        *published = transition_projection_runtime.diagnostic_error();
+    }
+    let configured_policy_repositories = WorkLedger::open_existing(&config.state_dir)
+        .and_then(|ledger| ledger.map_or_else(|| Ok(Vec::new()), |ledger| ledger.repo_policies()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|policy| policy.repo)
+        .collect::<BTreeSet<_>>();
+    for repository in &repos {
+        if configured_policy_repositories.contains(repository) {
+            actionable_producer.mark_ready(repository, 0, "");
+        } else {
+            actionable_producer.mark_disabled(repository, "repo_policy_absent");
+        }
+    }
+    let steward_paths = RuntimePaths::current_with_overrides(
+        config.mode,
+        Some(config.global_dir.clone()),
+        Some(config.state_dir.clone()),
+    );
+    let steward_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut pending_steward_targets = native_steward_inventory(&config.state_dir);
+    let (steward_tx, steward_rx) = mpsc::channel::<DaemonStewardResult>();
+    let mut steward_in_flight = false;
+    if let Ok(mut published) = custody_transport_error.lock() {
+        *published = custody_transport_runtime.diagnostic_error();
+    }
+    if let Ok(mut published) = actionable_producer_status.lock() {
+        *published = actionable_producer.status();
+    }
     while running.load(Ordering::Acquire) {
         let supervisor_error = execution_supervisor
             .tick()
             .err()
             .map(|error| format!("execution_supervisor: {error}"));
-        if let Ok(mut last_error) = execution_error.lock() {
-            *last_error = supervisor_error;
+        if let Some(runtime) = canary_job_runtime.as_mut() {
+            let result =
+                runtime.tick(u64::try_from(Utc::now().timestamp_millis()).unwrap_or(u64::MAX));
+            if let Ok(mut capabilities) = canary_capabilities.lock() {
+                update_canary_runtime_health(result, &mut capabilities, &mut canary_diagnostic);
+            }
         }
-        continuation_runtime.tick();
-        if let Ok(mut published) = continuation_status.lock() {
-            *published = continuation_runtime.status();
+        if let Ok(mut last_error) = execution_error.lock() {
+            *last_error = supervisor_error
+                .or_else(|| canary_diagnostic.clone())
+                .or_else(|| canary_job_init_error.clone());
         }
         drain_webhook_events(
             &webhook_rx,
@@ -275,9 +368,97 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             publish_reconcile_events(&server, &last_event_at, &result.report);
             publish_abandon_events(&server, &last_event_at, &result.abandon);
         }
+        while let Ok(completed) = steward_rx.try_recv() {
+            steward_in_flight = false;
+            if completed.result.is_err() {
+                actionable_producer.mark_uncertain(
+                    &completed.repository,
+                    completed.pull_request,
+                    &completed.head_sha,
+                );
+            } else {
+                actionable_producer.mark_ready(
+                    &completed.repository,
+                    completed.pull_request,
+                    &completed.head_sha,
+                );
+            }
+        }
 
-        for evidence in shadow_lane.tick(Instant::now()) {
+        let shadow_transitions = shadow_lane.tick(Instant::now());
+        for observation in shadow_lane.take_completed_observations() {
+            pending_steward_targets.insert((
+                observation.repo,
+                observation.pr,
+                observation.expected_head_sha,
+            ));
+        }
+        if !steward_in_flight
+            && let Some((repository, pull_request, head_sha)) = pending_steward_targets.pop_first()
+        {
+            let status = actionable_producer.mark_in_flight(&repository, pull_request, &head_sha);
+            if let Ok(mut published) = actionable_producer_status.lock() {
+                *published = status;
+            }
+            let result = WorkLedger::open_existing(&config.state_dir)
+                .and_then(|ledger| {
+                    ledger.map_or_else(
+                        || Ok(None),
+                        |ledger| {
+                            ledger.native_steward_base_ref(&repository, pull_request, &head_sha)
+                        },
+                    )
+                })
+                .map_err(|error| error.to_string())
+                .and_then(|base_ref| {
+                    base_ref.ok_or_else(|| "exact native steward target is unavailable".to_owned())
+                });
+            if let Ok(base_ref) = result {
+                steward_in_flight = true;
+                start_daemon_steward_worker(
+                    config.mode,
+                    steward_paths.clone(),
+                    steward_cwd.clone(),
+                    repository,
+                    pull_request,
+                    head_sha,
+                    base_ref,
+                    steward_tx.clone(),
+                );
+            } else {
+                actionable_producer.mark_uncertain(&repository, pull_request, &head_sha);
+            }
+        }
+        for evidence in shadow_transitions {
+            if evidence.transition.observation.is_none() {
+                let producer_status = actionable_producer.process(&evidence);
+                if let Ok(mut published) = actionable_producer_status.lock() {
+                    *published = producer_status;
+                }
+            }
             publish_shadow_transition(&server, &last_event_at, &evidence);
+        }
+        // Reconstruct durable terminal stewardship before the consumer may
+        // claim a persisted wake. This ordering is required on the very first
+        // post-restart loop as well as ordinary daemon cycles.
+        actionable_producer.reconcile_durable_terminals();
+        if let Ok(mut published) = actionable_producer_status.lock() {
+            *published = actionable_producer.status();
+        }
+        custody_transport_runtime.prepare_native_obligations();
+        if custody_transport_runtime.permits_local_continuation() {
+            continuation_runtime.tick();
+        }
+        transition_projection_runtime.tick();
+        custody_transport_runtime.tick();
+        if let Ok(mut published) = custody_transport_error.lock() {
+            *published = custody_transport_runtime.diagnostic_error();
+        }
+        if let Ok(mut published) = transition_projection_error.lock() {
+            *published = transition_projection_runtime.diagnostic_error();
+        }
+        if let Ok(mut published) = continuation_status.lock() {
+            *published = continuation_runtime.status();
         }
 
         let now = Instant::now();
@@ -325,6 +506,77 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
 }
 
 #[cfg(unix)]
+fn update_canary_runtime_health(
+    result: Result<crate::parallel_proof_canary_job_adapter::DaemonCanaryTickReport, String>,
+    capabilities: &mut Vec<String>,
+    diagnostic: &mut Option<String>,
+) {
+    match result {
+        Ok(report) if report.ran => {
+            *diagnostic = report
+                .warning
+                .map(|warning| format!("parallel_proof_canary_job warning: {warning}"));
+            *capabilities = vec![
+                crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY.to_owned(),
+            ];
+        }
+        Ok(_) => {}
+        Err(error) => {
+            *diagnostic = Some(format!("parallel_proof_canary_job: {error}"));
+            capabilities.clear();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn native_steward_inventory(state_dir: &Path) -> BTreeSet<(String, u64, String)> {
+    WorkLedger::open_existing(state_dir)
+        .and_then(|ledger| {
+            ledger.map_or_else(|| Ok(Vec::new()), |ledger| ledger.native_steward_targets())
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(unix)]
+struct DaemonStewardResult {
+    repository: String,
+    pull_request: u64,
+    head_sha: String,
+    result: Result<(), String>,
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn start_daemon_steward_worker(
+    mode: RuntimeMode,
+    runtime_paths: RuntimePaths,
+    cwd: PathBuf,
+    repository: String,
+    pull_request: u64,
+    head_sha: String,
+    base_ref: String,
+    sender: mpsc::Sender<DaemonStewardResult>,
+) {
+    thread::spawn(move || {
+        let result = crate::app::daemon_steward_repository(
+            mode,
+            &runtime_paths,
+            &cwd,
+            &repository,
+            &base_ref,
+        );
+        let _ = sender.send(DaemonStewardResult {
+            repository,
+            pull_request,
+            head_sha,
+            result,
+        });
+    });
+}
+
+#[cfg(unix)]
 struct RegistrationState {
     registrar: Mutex<Registrar>,
     // Status must never wait behind synchronous GitHub webhook I/O. Publish a
@@ -356,14 +608,19 @@ impl RegistrationState {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // Independent snapshots avoid status blocking on live I/O.
 fn daemon_status_provider(
     registration: Arc<RegistrationState>,
     configured_repos: Vec<String>,
     registration_error: Arc<Mutex<Option<String>>>,
     execution_error: Arc<Mutex<Option<String>>>,
+    transition_projection_error: Arc<Mutex<Option<String>>>,
+    custody_transport_error: Arc<Mutex<Option<String>>>,
     continuation_status: Arc<Mutex<ContinuationRuntimeStatus>>,
+    actionable_producer_status: Arc<Mutex<ActionableWakeProducerStatus>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
     tunnel_snapshot: Arc<Mutex<TunnelSnapshot>>,
+    capabilities: Arc<Mutex<Vec<String>>>,
 ) -> impl Fn() -> IpcState + Send + Sync + 'static {
     move || {
         let tunnel = tunnel_snapshot
@@ -377,16 +634,35 @@ fn daemon_status_provider(
             last_event_at: last_event_at.lock().ok().and_then(|guard| *guard),
             registered_repos: registration.published_repos(),
             configured_repos: configured_repos.clone(),
+            capabilities: capabilities
+                .lock()
+                .map_or_else(|_| Vec::new(), |guard| guard.clone()),
             rate_limit: None,
             workstream_continuation: continuation_status.lock().map_or_else(
                 |_| ContinuationRuntimeStatus::default(),
+                |guard| guard.clone(),
+            ),
+            actionable_wake_producer: actionable_producer_status.lock().map_or_else(
+                |_| ActionableWakeProducerStatus::default(),
                 |guard| guard.clone(),
             ),
             last_error: registration_error
                 .lock()
                 .ok()
                 .and_then(|guard| guard.clone())
-                .or_else(|| execution_error.lock().ok().and_then(|guard| guard.clone())),
+                .or_else(|| execution_error.lock().ok().and_then(|guard| guard.clone()))
+                .or_else(|| {
+                    transition_projection_error
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                })
+                .or_else(|| {
+                    custody_transport_error
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                }),
         }
     }
 }
@@ -425,9 +701,11 @@ fn publish_shadow_transition(
             "api_requests": evidence.api_requests,
             "elapsed_ms": evidence.elapsed_ms,
             "fetch_errors": evidence.fetch_errors,
-            "activation_enabled": false,
-            "dispatch_enabled": false,
-            "model_calls": 0,
+            "observer_only": {
+                "activation_enabled": false,
+                "dispatch_enabled": false,
+                "model_calls": 0,
+            },
         }
     });
     // IPC remains a convenience; the daemon's supervised stderr sink is the
@@ -1726,7 +2004,7 @@ mod tests {
         daemon_tunnel_config, handle_webhook_request, load_or_create_webhook_secret,
         parse_tunnel_enabled, pid_alive, prepare_daemon_temp_dir,
         process_looks_like_shipyard_daemon, reconcile_healed_event, run_blocking, ship_state_map,
-        should_start_reconcile, start_tunnel_runtime, stop_running,
+        should_start_reconcile, start_tunnel_runtime, stop_running, update_canary_runtime_health,
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{read_daemon_ship_state_list, read_daemon_status};
@@ -1902,11 +2180,17 @@ mod tests {
             vec!["owner/repo".to_owned(), "owner/pending".to_owned()],
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(
                 crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
             )),
+            Arc::new(Mutex::new(
+                crate::actionable_wake_producer::ActionableWakeProducerStatus::default(),
+            )),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(TunnelSnapshot::inactive())),
+            Arc::new(Mutex::new(Vec::new())),
         );
 
         let registrar_io = registration.registrar.lock().expect("registrar lock");
@@ -1919,6 +2203,87 @@ mod tests {
 
         assert_eq!(status.registered_repos, vec!["owner/repo"]);
         assert_eq!(status.configured_repos, vec!["owner/repo", "owner/pending"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_surfaces_transition_projection_drain_failure() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let registration = Arc::new(RegistrationState::new(Registrar::new(state_dir.path())));
+        let projection_error = Arc::new(Mutex::new(Some(
+            "transition-projection-intent-drain-state-mutation".to_owned(),
+        )));
+        let provider = daemon_status_provider(
+            registration,
+            Vec::new(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            projection_error,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(
+                crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
+            )),
+            Arc::new(Mutex::new(
+                crate::actionable_wake_producer::ActionableWakeProducerStatus::default(),
+            )),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(TunnelSnapshot::inactive())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+
+        assert_eq!(
+            provider().last_error.as_deref(),
+            Some("transition-projection-intent-drain-state-mutation")
+        );
+    }
+
+    #[test]
+    fn canary_capability_recovers_after_a_later_clean_tick() {
+        let mut capabilities =
+            vec![crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY.to_owned()];
+        let mut diagnostic = None;
+        update_canary_runtime_health(
+            Err("transient store failure".to_owned()),
+            &mut capabilities,
+            &mut diagnostic,
+        );
+        assert!(capabilities.is_empty());
+        assert!(
+            diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("transient store failure")
+        );
+
+        update_canary_runtime_health(
+            Ok(
+                crate::parallel_proof_canary_job_adapter::DaemonCanaryTickReport {
+                    ran: true,
+                    processed_jobs: 1,
+                    warning: Some("one corrupt record was isolated".to_owned()),
+                },
+            ),
+            &mut capabilities,
+            &mut diagnostic,
+        );
+        assert_eq!(
+            capabilities,
+            vec![crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY]
+        );
+        assert!(diagnostic.as_deref().unwrap().contains("corrupt record"));
+
+        update_canary_runtime_health(
+            Ok(
+                crate::parallel_proof_canary_job_adapter::DaemonCanaryTickReport {
+                    ran: true,
+                    processed_jobs: 0,
+                    warning: None,
+                },
+            ),
+            &mut capabilities,
+            &mut diagnostic,
+        );
+        assert!(diagnostic.is_none());
     }
 
     #[cfg(unix)]

@@ -851,6 +851,9 @@ pub(super) fn fetch_run_jobs_before(
 
 pub(super) fn parse_job(value: &Value) -> Result<StewardJob, String> {
     Ok(StewardJob {
+        // Older fixture/ledger observations may not carry a job ID. They stay
+        // readable as zero, but zero can never authorize the stale-run wedge.
+        id: value.get("id").and_then(Value::as_u64).unwrap_or(0),
         name: value
             .get("name")
             .and_then(Value::as_str)

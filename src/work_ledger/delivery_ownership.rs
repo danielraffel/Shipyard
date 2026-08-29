@@ -473,6 +473,26 @@ impl WorkLedger {
             &receipt_digest,
             &now,
         )?;
+        let projection_bound: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workstream_projection_bindings WHERE work_item_id = ?1)",
+            [&authority.work_item_id],
+            |row| row.get(0),
+        )?;
+        if projection_bound {
+            Self::stage_projection_intent(
+                &transaction,
+                &authority.work_item_id,
+                authority.work_generation + 1,
+                authority.owner_generation,
+                super::projection_intents::ProjectionIntentKind::Handoff,
+                "agent_context_acknowledged",
+                Some(LifecycleState::Dispatching.as_str()),
+                LifecycleState::AgentOwnedRepair.as_str(),
+                &receipt_digest,
+                None,
+                &now,
+            )?;
+        }
         transaction.commit()?;
         Ok(AgentOwnershipReceipt {
             ownership_id,
@@ -566,10 +586,11 @@ impl WorkLedger {
         }
         if expected.checkpoint_generation <= request.resume.checkpoint_generation
             || expected.checkpoint_digest == request.resume.checkpoint_digest
+            || expected.head_sha == request.resume.head_sha
             || expected.repository != request.resume.repository
         {
             return Err(WorkLedgerError::Refused(
-                "agent return does not prove a newer checkpoint on the expected repository"
+                "agent return does not prove a newer checkpoint and exact head on the expected repository"
                     .to_owned(),
             ));
         }
@@ -585,13 +606,22 @@ impl WorkLedger {
         verify_supported_schema(&preflight)?;
         verify_integrity(&preflight)?;
         let transaction = preflight.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: (String, String, u64, u64) = transaction.query_row(
-            "SELECT ownership.state, work.phase, work.work_generation, work.owner_generation
+        let current: (String, String, u64, u64, Option<String>) = transaction.query_row(
+            "SELECT ownership.state, work.phase, work.work_generation, work.owner_generation,
+                    work.head_sha
              FROM agent_ownership ownership
              JOIN work_items work ON work.id = ownership.work_item_id
              WHERE ownership.ownership_id = ?1 AND ownership.delivery_id = ?2",
             params![ownership_id, expected_delivery_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
         if current.0 == "returned" && current.1 == LifecycleState::Returned.as_str() {
             let exact_object: Option<String> = transaction
@@ -625,6 +655,7 @@ impl WorkLedger {
                 LifecycleState::AgentOwnedRepair.as_str().to_owned(),
                 expected_work_generation,
                 authority.3,
+                Some(request.resume.head_sha.clone()),
             )
         {
             return Err(WorkLedgerError::Refused(
@@ -644,13 +675,22 @@ impl WorkLedger {
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: (String, String, u64, u64) = transaction.query_row(
-            "SELECT ownership.state, work.phase, work.work_generation, work.owner_generation
+        let current: (String, String, u64, u64, Option<String>) = transaction.query_row(
+            "SELECT ownership.state, work.phase, work.work_generation, work.owner_generation,
+                    work.head_sha
              FROM agent_ownership ownership
              JOIN work_items work ON work.id = ownership.work_item_id
              WHERE ownership.ownership_id = ?1 AND ownership.delivery_id = ?2",
             params![ownership_id, expected_delivery_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
         if current.0 == "returned" && current.1 == LifecycleState::Returned.as_str() {
             let exact_event: bool = transaction.query_row(
@@ -674,6 +714,7 @@ impl WorkLedger {
                 LifecycleState::AgentOwnedRepair.as_str().to_owned(),
                 expected_work_generation,
                 authority.3,
+                Some(request.resume.head_sha.clone()),
             )
         {
             return Err(WorkLedgerError::Refused(
@@ -688,10 +729,17 @@ impl WorkLedger {
         )?;
         let work_changed = transaction.execute(
             "UPDATE work_items SET phase = 'returned', work_generation = work_generation + 1,
-                    updated_at = ?1
-             WHERE id = ?2 AND phase = 'agent_owned_repair'
-               AND work_generation = ?3 AND owner_generation = ?4",
-            params![now, authority.0, expected_work_generation, authority.3],
+                    head_sha = ?2, updated_at = ?1
+             WHERE id = ?3 AND phase = 'agent_owned_repair'
+               AND work_generation = ?4 AND owner_generation = ?5 AND head_sha = ?6",
+            params![
+                now,
+                expected.head_sha,
+                authority.0,
+                expected_work_generation,
+                authority.3,
+                request.resume.head_sha,
+            ],
         )?;
         if ownership_changed != 1 || work_changed != 1 {
             return Err(WorkLedgerError::Refused(
@@ -709,6 +757,36 @@ impl WorkLedger {
             &receipt_digest,
             &now,
         )?;
+        let projection_bound: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workstream_projection_bindings WHERE work_item_id = ?1)",
+            [&authority.0],
+            |row| row.get(0),
+        )?;
+        if projection_bound {
+            let rebound = transaction.execute(
+                "UPDATE workstream_projection_bindings SET exact_head = ?1
+                  WHERE work_item_id = ?2 AND exact_head = ?3",
+                params![expected.head_sha, authority.0, request.resume.head_sha],
+            )?;
+            if rebound != 1 {
+                return Err(WorkLedgerError::Refused(
+                    "workstream projection exact-head binding changed during return".to_owned(),
+                ));
+            }
+            Self::stage_projection_intent(
+                &transaction,
+                &authority.0,
+                expected_work_generation + 1,
+                authority.3,
+                super::projection_intents::ProjectionIntentKind::NewHead,
+                "agent_ownership_returned",
+                Some(LifecycleState::AgentOwnedRepair.as_str()),
+                LifecycleState::Returned.as_str(),
+                &receipt_digest,
+                None,
+                &now,
+            )?;
+        }
         transaction.commit()?;
         Ok(AgentOwnershipReceipt {
             ownership_id: ownership_id.to_owned(),

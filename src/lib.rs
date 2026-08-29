@@ -2,6 +2,8 @@
 
 //! Core library for Shipyard.
 
+#[cfg(unix)]
+mod actionable_wake_producer;
 /// CLI entrypoint and command dispatch.
 pub mod app;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.
@@ -31,12 +33,14 @@ pub mod cloud_records;
 pub mod config;
 /// Pure, fail-closed translation from CTest JSON-v1 metadata into a canonical test inventory.
 pub mod ctest_inventory;
+pub(crate) mod custody_transport;
 /// Unix socket IPC primitives for daemon subscribers and status reads.
 pub mod daemon_ipc;
 /// Minimal daemon runtime and lifecycle helpers.
 pub mod daemon_runtime;
 /// Shared daemon/CLI version comparison helpers.
 pub mod daemon_version;
+pub(crate) mod daemon_worker_capacity;
 /// Typed dependency-channel policy and immutable consumer locks.
 pub mod dependency;
 /// Phase 1 failure diagnostics for cloud (GitHub Actions) targets.
@@ -65,6 +69,7 @@ pub mod host_health;
 pub mod host_pool;
 /// Product naming and runtime-mode identity.
 pub mod identity;
+pub(crate) mod immutable_store;
 /// Project initialization and ecosystem detection.
 pub mod init_config;
 /// Job and target-result domain types used by executors and queues.
@@ -91,6 +96,21 @@ pub mod output;
 pub mod parallel_proof;
 /// Default-off admission policy for the first Pulp macOS sharding canary.
 pub mod parallel_proof_canary;
+pub(crate) mod parallel_proof_canary_adapter;
+/// Default-off immutable cache-generation observation and evidence foundation.
+pub mod parallel_proof_canary_cache;
+/// Read-only physical-readiness observations for the Pulp macOS canary.
+pub mod parallel_proof_canary_controller;
+/// Default-off controller driver for measured Pulp macOS shadow receipts.
+pub mod parallel_proof_canary_driver;
+/// Restart-reconcilable, session-independent execution custody for protected canary jobs.
+pub mod parallel_proof_canary_job;
+/// Typed daemon-supervisor adapter for restartable parallel-proof canary jobs.
+pub mod parallel_proof_canary_job_adapter;
+/// Immutable measurement receipts for the default-off Pulp macOS sharding canary.
+pub mod parallel_proof_canary_receipt;
+/// Authenticated companion protocol for read-only remote M1 cache observation.
+pub mod parallel_proof_canary_remote_cache;
 /// Default-off one-host build-once consumption proof for the Pulp M3 shadow canary.
 pub mod parallel_proof_one_host;
 /// Filesystem path resolution for isolated and compatible modes.
@@ -150,11 +170,17 @@ pub mod ship_retry;
 pub mod ship_state;
 /// GitHub stacked pull request discovery and initial fail-closed policy.
 pub mod stacked_pr;
+/// Pulp-specific stale PR workflow concurrency-wedge classification.
+pub mod stale_pr_wedge;
 /// Subprocess helpers that mark supervised child processes with
 /// `SHIPYARD_PR_RUNNING=1` (issue #266). Used by every `git` / `gh`
 /// spawn site that participates in the supervised PR / ship / merge
 /// pipeline; diagnostic subcommands deliberately skip this.
 pub mod supervised;
+mod terminal_delivery_authority;
+/// Optional local outbox and adapter contract for external transition projection.
+pub mod transition_projection;
+pub(crate) mod transition_projection_runner;
 /// Working-tree drift detection shared by future `shipyard run` wiring.
 pub mod tree_drift;
 /// Tunnel readiness, Tailscale probe decoding, and supervisor retry policy.
@@ -173,6 +199,7 @@ pub mod watch;
 pub mod webhook;
 /// Shadow-only canonical work-item ledger and legacy-state importer.
 pub mod work_ledger;
+pub(crate) mod worker_process_custody;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;
 pub(crate) mod workstream_activation_loader;

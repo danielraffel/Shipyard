@@ -25,6 +25,8 @@ SPEC.loader.exec_module(guardian)
 
 class GuardianLifecycleTests(unittest.TestCase):
     def make_guardian(self, root: Path) -> guardian.Guardian:
+        production_pid_file = root / "production-state" / "daemon" / "daemon.pid"
+        production_pid_file.parent.mkdir(parents=True, exist_ok=True)
         return guardian.Guardian(
             Namespace(
                 owner_pid=os.getpid(),
@@ -37,7 +39,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                 ready_receipt=str(root / "ready.json"),
                 final_receipt=str(root / "final.json"),
                 lease_dir=str(root / "lease"),
-                production_pid_file=str(root / "production.pid"),
+                production_pid_file=str(production_pid_file),
             )
         )
 
@@ -367,7 +369,31 @@ class GuardianLifecycleTests(unittest.TestCase):
 
             self.assertEqual(holders.call_count, 4)
             self.assertEqual(contention.call_count, 4)
-            self.assertEqual(len(verified), 4)
+            self.assertEqual(len(verified), 5)
+
+    def test_stable_idle_revalidates_after_final_contention_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "writer.lock"
+            verify = mock.Mock(
+                side_effect=[
+                    None,
+                    None,
+                    None,
+                    guardian.GuardianError("final-sample identity drift"),
+                ]
+            )
+            with mock.patch.object(
+                guardian, "_lock_holders", return_value=(4242,)
+            ), mock.patch.object(
+                guardian, "_exclusive_lock_is_contended", return_value=False
+            ), mock.patch.object(guardian.time, "sleep"):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "final-sample identity drift"
+                ):
+                    guardian._wait_for_idle_writer_domain(
+                        path, 4242, verify_production=verify
+                    )
+            self.assertEqual(verify.call_count, 4)
 
     def test_ambiguous_no_holder_wait_rejects_persistent_contention(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -511,7 +537,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                         guardian, "snapshot_process", return_value=snapshot
                     )
                 )
-                stack.enter_context(
+                configured = stack.enter_context(
                     mock.patch.object(
                         guardian, "_configured_repos", return_value=("owner/repo",)
                     )
@@ -533,6 +559,11 @@ class GuardianLifecycleTests(unittest.TestCase):
             self.assertEqual(active.transition_path, guardian.CORRECTED_TRANSITION)
             self.assertFalse(active.production_quiesced)
             self.assertFalse(active.old_lifetime_lock_owned)
+            self.assertEqual(
+                configured.call_args.kwargs["state_dir"],
+                active.production_pid_file.parent.parent,
+            )
+            self.assertNotEqual(active.production_state_dir, active.state_dir)
             run.assert_not_called()
 
     def test_preflight_routes_only_no_holder_contention_through_bounded_wait(
@@ -595,16 +626,750 @@ class GuardianLifecycleTests(unittest.TestCase):
             wait.assert_called_once_with(
                 active.lock_path,
                 snapshot.pid,
+                initial_holders=(),
                 verify_production=active.verify_unchanged_production,
                 diagnostic_root=active.root,
             )
             run.assert_not_called()
+
+    def test_preflight_observes_transient_production_holder_without_stopping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.candidate.write_bytes(b"candidate")
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(
+                    str(active.installed),
+                    "--mode",
+                    "shipyard",
+                    "daemon",
+                    "run",
+                    "--repo",
+                    "owner/repo",
+                ),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "snapshot_process", return_value=snapshot
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_configured_repos", return_value=("owner/repo",)
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(guardian, "_active_runs", return_value=())
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_lock_holders", return_value=(snapshot.pid,)
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_exclusive_lock_is_contended", return_value=True
+                    )
+                )
+                wait = stack.enter_context(
+                    mock.patch.object(guardian, "_wait_for_idle_writer_domain")
+                )
+                stop = stack.enter_context(mock.patch.object(guardian, "_run"))
+                active.preflight_and_transition()
+
+            self.assertEqual(active.transition_path, guardian.CORRECTED_TRANSITION)
+            self.assertFalse(active.production_quiesced)
+            self.assertFalse(active.old_lifetime_lock_owned)
+            wait.assert_called_once_with(
+                active.lock_path,
+                snapshot.pid,
+                initial_holders=(snapshot.pid,),
+                verify_production=active.verify_unchanged_production,
+                diagnostic_root=active.root,
+            )
+            stop.assert_not_called()
+
+    def test_persistent_production_holder_selects_legacy_after_bounded_wait(self) -> None:
+        path = Path("/tmp/writer.lock")
+        verify = mock.Mock()
+        installed_version = mock.Mock(
+            return_value=guardian.LEGACY_LIFETIME_LOCK_VERSION
+        )
+        retained = guardian.RetainedWriterDomain(
+            (4242,),
+            continuously_contended=True,
+            continuous_production_ownership=True,
+        )
+        with mock.patch.object(
+            guardian, "_wait_for_idle_writer_domain", side_effect=retained
+        ), mock.patch.object(
+            guardian, "_lock_holders", return_value=(4242,)
+        ) as holders, mock.patch.object(
+            guardian, "_exclusive_lock_is_contended", return_value=True
+        ):
+            self.assertEqual(
+                guardian._select_transition_after_bounded_observation(
+                    path,
+                    4242,
+                    (4242,),
+                    True,
+                    verify_production=verify,
+                    installed_version=installed_version,
+                ),
+                guardian.LEGACY_TRANSITION,
+            )
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual(verify.call_args_list[0], verify.call_args_list[1])
+        self.assertIsInstance(verify.call_args.args[0], float)
+        shared_deadline = verify.call_args.args[0]
+        installed_version.assert_called_once_with(shared_deadline)
+        self.assertEqual(holders.call_args.kwargs["deadline"], shared_deadline)
+
+    def test_persistent_then_single_idle_sample_fails_ambiguous(self) -> None:
+        retained = guardian.RetainedWriterDomain(
+            (4242,),
+            continuously_contended=True,
+            continuous_production_ownership=True,
+        )
+        with mock.patch.object(
+            guardian, "_wait_for_idle_writer_domain", side_effect=retained
+        ), mock.patch.object(
+            guardian, "_lock_holders", return_value=(4242,)
+        ), mock.patch.object(
+            guardian, "_exclusive_lock_is_contended", return_value=False
+        ):
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "ambiguous production writer-domain state"
+            ):
+                guardian._select_transition_after_bounded_observation(
+                    Path("/tmp/writer.lock"),
+                    4242,
+                    (4242,),
+                    True,
+                    verify_production=mock.Mock(),
+                    installed_version=lambda _deadline: guardian.LEGACY_LIFETIME_LOCK_VERSION,
+                )
+
+    def test_legacy_stop_targets_proven_production_state_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.candidate.write_bytes(b"candidate")
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            stop_result = mock.Mock(returncode=0, stdout="", stderr="")
+            with mock.patch.object(
+                guardian, "snapshot_process", return_value=snapshot
+            ), mock.patch.object(
+                guardian, "_configured_repos", return_value=()
+            ), mock.patch.object(
+                guardian, "_active_runs", return_value=()
+            ), mock.patch.object(
+                guardian, "_lock_holders", side_effect=[(4242,), ()]
+            ), mock.patch.object(
+                guardian, "_exclusive_lock_is_contended", side_effect=[True, False]
+            ), mock.patch.object(
+                guardian,
+                "_select_transition_after_bounded_observation",
+                return_value=guardian.LEGACY_TRANSITION,
+            ), mock.patch.object(
+                guardian, "_pid_alive", return_value=False
+            ), mock.patch.object(
+                guardian, "_run", return_value=stop_result
+            ) as run:
+                active.preflight_and_transition()
+
+            command = run.call_args.args[0]
+            self.assertEqual(
+                command,
+                [
+                    str(active.installed),
+                    "--mode",
+                    "shipyard",
+                    "--state-dir",
+                    str(active.production_state_dir),
+                    "daemon",
+                    "stop",
+                ],
+            )
+            self.assertNotIn(str(active.state_dir), command)
+            self.assertEqual(run.call_args.kwargs["cwd"], "/")
+
+    def test_persistent_corrected_version_never_selects_legacy(self) -> None:
+        retained = guardian.RetainedWriterDomain(
+            (4242,),
+            continuously_contended=True,
+            continuous_production_ownership=True,
+        )
+        with mock.patch.object(
+            guardian, "_wait_for_idle_writer_domain", side_effect=retained
+        ):
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "not a known legacy lifetime-lock build"
+            ):
+                guardian._select_transition_after_bounded_observation(
+                    Path("/tmp/writer.lock"),
+                    4242,
+                    (4242,),
+                    True,
+                    installed_version=lambda _deadline: "0.126.0",
+                )
+
+    def test_legacy_gate_uses_running_daemon_version(self) -> None:
+        snapshot = guardian.ProcessSnapshot(
+            pid=4242,
+            executable="/tmp/shipyard",
+            argv=("/tmp/shipyard", "daemon", "run"),
+            environment={"HOME": "/tmp"},
+            cwd="/tmp",
+            stdin_path="/dev/null",
+            stdout_path="/tmp/daemon.log",
+            stderr_path="/tmp/daemon.log",
+            start_time="Sat Aug 22 00:00:00 2026",
+        )
+        with mock.patch.object(
+            guardian,
+            "_peer_verified_daemon_status",
+            return_value={"running": True, "shipyard_version": "0.108.1"},
+        ) as status, mock.patch.object(
+            guardian, "_installed_cli_version", return_value="0.108.1"
+        ) as installed_version:
+            self.assertEqual(
+                guardian._running_daemon_version(
+                    snapshot, Path(snapshot.executable), Path("/tmp/state")
+                ),
+                "0.108.1",
+            )
+        status.assert_called_once_with(
+            Path("/tmp/state"), snapshot.pid, deadline=None
+        )
+        installed_version.assert_called_once_with(
+            snapshot, Path(snapshot.executable), deadline=None
+        )
+
+    def test_active_worker_probe_targets_exact_production_state(self) -> None:
+        snapshot = guardian.ProcessSnapshot(
+            pid=4242,
+            executable="/tmp/shipyard",
+            argv=("/tmp/shipyard", "daemon", "run"),
+            environment={"HOME": "/tmp/home"},
+            cwd="/tmp",
+            stdin_path="/dev/null",
+            stdout_path="/tmp/daemon.log",
+            stderr_path="/tmp/daemon.log",
+            start_time="Sat Aug 22 00:00:00 2026",
+        )
+        result = mock.Mock(
+            stdout=json.dumps({"active_runs": [{"id": "run-b"}, {"id": "run-a"}]})
+        )
+        with mock.patch.object(guardian, "_run", return_value=result) as run:
+            self.assertEqual(
+                guardian._active_runs(
+                    snapshot,
+                    Path(snapshot.executable),
+                    state_dir=Path("/proven/production"),
+                ),
+                ("run-a", "run-b"),
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                snapshot.executable,
+                "--cwd",
+                "/",
+                "--json",
+                "--mode",
+                "shipyard",
+                "--state-dir",
+                "/proven/production",
+                "status",
+            ],
+        )
+        self.assertNotIn("/candidate/state", command)
+
+    def test_running_legacy_with_newer_disk_image_never_stops_production(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.candidate.write_bytes(b"candidate")
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            retained = guardian.RetainedWriterDomain(
+                (snapshot.pid,),
+                continuously_contended=True,
+                continuous_production_ownership=True,
+            )
+            with mock.patch.object(
+                guardian, "snapshot_process", return_value=snapshot
+            ), mock.patch.object(
+                guardian, "_configured_repos", return_value=()
+            ), mock.patch.object(
+                guardian, "_active_runs", return_value=()
+            ), mock.patch.object(
+                guardian, "_lock_holders", return_value=(snapshot.pid,)
+            ), mock.patch.object(
+                guardian, "_exclusive_lock_is_contended", return_value=True
+            ), mock.patch.object(
+                guardian, "_wait_for_idle_writer_domain", side_effect=retained
+            ), mock.patch.object(
+                guardian,
+                "_peer_verified_daemon_status",
+                return_value={
+                    "running": True,
+                    "shipyard_version": guardian.LEGACY_LIFETIME_LOCK_VERSION,
+                },
+            ), mock.patch.object(
+                guardian, "_installed_cli_version", return_value="0.126.0"
+            ), mock.patch.object(guardian, "_run") as stop:
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "running and installed.*differ"
+                ):
+                    active.preflight_and_transition()
+
+            stop.assert_not_called()
+            self.assertFalse(active.production_stop_requested)
+
+    def test_peer_verified_status_rejects_foreign_socket_responder(self) -> None:
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.getsockopt.return_value = 7331
+        with mock.patch.object(
+            guardian.socket, "socket", return_value=connection
+        ):
+            with self.assertRaisesRegex(
+                guardian.GuardianError,
+                "expected=4242, actual=7331",
+            ):
+                guardian._peer_verified_daemon_status(
+                    Path("/tmp/state"), 4242
+                )
+        connection.connect.assert_called_once_with("/tmp/state/daemon/daemon.sock")
+        connection.sendall.assert_not_called()
+
+    def test_peer_verified_status_accepts_hello_then_status_from_exact_peer(self) -> None:
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.getsockopt.return_value = 4242
+        connection.recv.return_value = (
+            b'{"type":"hello"}\n'
+            b'{"type":"status","shipyard_version":"0.108.1"}\n'
+        )
+        with mock.patch.object(guardian.socket, "socket", return_value=connection):
+            self.assertEqual(
+                guardian._peer_verified_daemon_status(Path("/tmp/state"), 4242),
+                {
+                    "type": "status",
+                    "shipyard_version": "0.108.1",
+                    "running": True,
+                },
+            )
+        connection.sendall.assert_called_once_with(b'{"type":"status"}\n')
+        self.assertEqual(connection.getsockopt.call_count, 2)
+
+    def test_peer_verified_status_recomputes_timeout_before_each_frame(self) -> None:
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.getsockopt.return_value = 4242
+        connection.recv.return_value = b'{"type":"hello"}\n'
+        with mock.patch.object(
+            guardian.socket, "socket", return_value=connection
+        ), mock.patch.object(
+            guardian.time, "monotonic", side_effect=[1.0, 2.0, 9.75, 10.1]
+        ):
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "verification deadline expired"
+            ):
+                guardian._peer_verified_daemon_status(
+                    Path("/tmp/state"), 4242, deadline=10.0
+                )
+        self.assertEqual(
+            [call.args[0] for call in connection.settimeout.call_args_list],
+            [9.0, 8.0, 0.25],
+        )
+        connection.recv.assert_called_once_with(65536)
+
+    def test_peer_verified_status_default_budget_rejects_endless_hello(self) -> None:
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.getsockopt.return_value = 4242
+        connection.recv.return_value = b'{"type":"hello"}\n'
+        with mock.patch.object(
+            guardian.socket, "socket", return_value=connection
+        ), mock.patch.object(
+            guardian.time,
+            "monotonic",
+            side_effect=[0.0, 0.1, 0.2, 14.9, 15.1],
+        ):
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "verification deadline expired"
+            ):
+                guardian._peer_verified_daemon_status(Path("/tmp/state"), 4242)
+        self.assertEqual(connection.settimeout.call_count, 3)
+        connection.recv.assert_called_once_with(65536)
+
+    def test_no_holder_sample_never_proves_legacy_ownership(self) -> None:
+        retained = guardian.RetainedWriterDomain(
+            (4242,),
+            continuously_contended=True,
+            continuous_production_ownership=False,
+        )
+        with mock.patch.object(
+            guardian, "_wait_for_idle_writer_domain", side_effect=retained
+        ):
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "continuous_production_ownership=False"
+            ):
+                guardian._select_transition_after_bounded_observation(
+                    Path("/tmp/writer.lock"),
+                    4242,
+                    (),
+                    True,
+                    installed_version=lambda _deadline: guardian.LEGACY_LIFETIME_LOCK_VERSION,
+                )
+
+    def test_intermittent_idle_timeout_never_selects_legacy(self) -> None:
+        path = Path("/tmp/writer.lock")
+        retained = guardian.RetainedWriterDomain(
+            (4242,),
+            continuously_contended=False,
+            continuous_production_ownership=True,
+        )
+        with mock.patch.object(
+            guardian, "_wait_for_idle_writer_domain", side_effect=retained
+        ):
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "continuously_contended=False"
+            ):
+                guardian._select_transition_after_bounded_observation(
+                    path, 4242, (4242,), True
+                )
+
+    def test_bounded_transition_observation_rejects_foreign_or_identity_drift(
+        self,
+    ) -> None:
+        path = Path("/tmp/writer.lock")
+        with self.assertRaisesRegex(
+            guardian.GuardianError, "ambiguous production writer-domain state"
+        ):
+            guardian._select_transition_after_bounded_observation(
+                path, 4242, (4242, 7331), True
+            )
+
+        with mock.patch.object(
+            guardian,
+            "_wait_for_idle_writer_domain",
+            side_effect=guardian.GuardianError("production identity drift"),
+        ):
+            with self.assertRaisesRegex(guardian.GuardianError, "identity drift"):
+                guardian._select_transition_after_bounded_observation(
+                    path,
+                    4242,
+                    (4242,),
+                    True,
+                    verify_production=mock.Mock(),
+                )
 
     def test_pre_cutover_lifetime_lock_selects_quiesce_restore_path(self) -> None:
         self.assertEqual(
             guardian._select_transition(4242, (4242,), True),
             guardian.LEGACY_TRANSITION,
         )
+
+    def test_restore_retry_adopts_matching_live_daemon_without_second_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.installed_hash = guardian._sha256(active.installed)
+            active.production_pid_file.write_text("7331\n", encoding="utf-8")
+            active.lock_path = root / "writer.lock"
+            active.configured_repos = ("owner/repo",)
+            active.worker_ids = ()
+            active.snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(
+                    str(active.installed),
+                    "--mode",
+                    "shipyard",
+                    "daemon",
+                    "run",
+                    "--repo",
+                    "owner/repo",
+                ),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            restored = guardian.ProcessSnapshot(
+                pid=7331,
+                executable=active.snapshot.executable,
+                argv=active.snapshot.argv,
+                environment=active.snapshot.environment,
+                cwd=active.snapshot.cwd,
+                stdin_path=active.snapshot.stdin_path,
+                stdout_path=active.snapshot.stdout_path,
+                stderr_path=active.snapshot.stderr_path,
+                start_time="Sat Aug 22 00:05:00 2026",
+            )
+            with mock.patch.object(
+                guardian, "_pid_alive", return_value=True
+            ), mock.patch.object(
+                guardian, "snapshot_process", return_value=restored
+            ), mock.patch.object(
+                guardian,
+                "_peer_verified_daemon_status",
+                return_value={
+                    "running": True,
+                    "shipyard_version": guardian.LEGACY_LIFETIME_LOCK_VERSION,
+                },
+            ), mock.patch.object(
+                guardian, "_configured_repos", return_value=active.configured_repos
+            ), mock.patch.object(
+                guardian, "_active_runs", return_value=active.worker_ids
+            ), mock.patch.object(
+                guardian, "_lock_holders", return_value=(restored.pid,)
+            ), mock.patch.object(
+                guardian, "_exclusive_lock_is_contended", return_value=True
+            ), mock.patch.object(guardian.subprocess, "Popen") as popen:
+                active.restore_legacy_production()
+
+            popen.assert_not_called()
+            self.assertEqual(active.restored_pid, restored.pid)
+            self.assertEqual(active.final_production_start_time, restored.start_time)
+            self.assertTrue(active.production_restored)
+            self.assertTrue(active.production_identity_verified)
+
+    def test_spawn_path_delegates_directly_to_peer_verified_adoption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.installed_hash = guardian._sha256(active.installed)
+            active.snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            spawned = mock.Mock(pid=7331)
+            spawned.poll.return_value = None
+            active.production_pid_file.write_text("7331\n", encoding="utf-8")
+            with mock.patch.object(
+                guardian, "_pid_alive", return_value=False
+            ), mock.patch.object(
+                guardian.subprocess, "Popen", return_value=spawned
+            ), mock.patch.object(
+                active, "verify_and_adopt_restored_production"
+            ) as adopt, mock.patch.object(
+                guardian, "_json_command"
+            ) as cli_status, mock.patch.object(
+                guardian.time, "monotonic", side_effect=[0.0, 0.0]
+            ):
+                active.restore_legacy_production()
+
+            adopt.assert_called_once_with(spawned.pid)
+            cli_status.assert_not_called()
+
+    def test_restore_adoption_requires_running_ipc_and_exact_stdio(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.installed_hash = guardian._sha256(active.installed)
+            active.production_pid_file.write_text("7331\n", encoding="utf-8")
+            active.lock_path = root / "writer.lock"
+            active.configured_repos = ("owner/repo",)
+            active.worker_ids = ()
+            active.snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path=str(root / "daemon.log"),
+                stderr_path=str(root / "daemon.log"),
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            restored = guardian.ProcessSnapshot(
+                pid=7331,
+                executable=active.snapshot.executable,
+                argv=active.snapshot.argv,
+                environment=active.snapshot.environment,
+                cwd=active.snapshot.cwd,
+                stdin_path=active.snapshot.stdin_path,
+                stdout_path=active.snapshot.stdout_path,
+                stderr_path=active.snapshot.stderr_path,
+                start_time="Sat Aug 22 00:05:00 2026",
+            )
+            with mock.patch.object(
+                guardian, "snapshot_process", return_value=restored
+            ), mock.patch.object(
+                guardian, "_peer_verified_daemon_status", return_value={"running": False}
+            ), mock.patch.object(
+                guardian.time, "monotonic", side_effect=[0.0, 0.0, 16.0]
+            ), mock.patch.object(guardian.time, "sleep"):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError,
+                    "never reported running|verification deadline expired",
+                ):
+                    active.verify_and_adopt_restored_production(restored.pid)
+
+            wrong_stdio = guardian.ProcessSnapshot(
+                **{**restored.__dict__, "stdout_path": str(root / "other.log")}
+            )
+            with mock.patch.object(
+                guardian, "snapshot_process", return_value=wrong_stdio
+            ):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "stdio identity differs"
+                ):
+                    active.verify_and_adopt_restored_production(wrong_stdio.pid)
+
+            for reported_version in (None, "0.126.0"):
+                with self.subTest(reported_version=reported_version):
+                    status = {"running": True}
+                    if reported_version is not None:
+                        status["shipyard_version"] = reported_version
+                    with mock.patch.object(
+                        guardian, "snapshot_process", return_value=restored
+                    ), mock.patch.object(
+                        guardian,
+                        "_peer_verified_daemon_status",
+                        return_value=status,
+                    ):
+                        with self.assertRaisesRegex(
+                            guardian.GuardianError, "exact legacy version"
+                        ):
+                            active.verify_and_adopt_restored_production(restored.pid)
+
+            with mock.patch.object(
+                guardian, "snapshot_process", return_value=restored
+            ), mock.patch.object(
+                guardian,
+                "_peer_verified_daemon_status",
+                return_value={
+                    "running": True,
+                    "shipyard_version": guardian.LEGACY_LIFETIME_LOCK_VERSION,
+                },
+            ), mock.patch.object(
+                guardian, "_configured_repos", return_value=active.configured_repos
+            ), mock.patch.object(
+                guardian, "_active_runs", return_value=active.worker_ids
+            ), mock.patch.object(
+                guardian.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 16.0]
+            ):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError,
+                    "stable lifetime-lock ownership|verification deadline expired",
+                ):
+                    active.verify_and_adopt_restored_production(restored.pid)
+
+            with mock.patch.object(
+                guardian, "snapshot_process", return_value=restored
+            ), mock.patch.object(
+                guardian,
+                "_peer_verified_daemon_status",
+                return_value={
+                    "running": True,
+                    "shipyard_version": guardian.LEGACY_LIFETIME_LOCK_VERSION,
+                },
+            ), mock.patch.object(
+                guardian,
+                "_configured_repos",
+                side_effect=[active.configured_repos, ("other/repo",)],
+            ), mock.patch.object(
+                guardian, "_active_runs", return_value=active.worker_ids
+            ), mock.patch.object(
+                guardian, "_lock_holders", return_value=(restored.pid,)
+            ), mock.patch.object(
+                guardian, "_exclusive_lock_is_contended", return_value=True
+            ), mock.patch.object(guardian.time, "sleep"):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError,
+                    "repository authority changed during lock proof",
+                ):
+                    active.verify_and_adopt_restored_production(restored.pid)
+
+            active.production_pid_file.unlink()
+            active.restoration_process = None
+            process = mock.Mock(pid=8442)
+            process.poll.return_value = None
+            with mock.patch.object(
+                guardian.subprocess, "Popen", return_value=process
+            ) as popen, mock.patch.object(
+                guardian.time,
+                "monotonic",
+                side_effect=[0.0, 16.0, 20.0, 36.0],
+            ):
+                for _ in range(2):
+                    with self.assertRaisesRegex(
+                        guardian.GuardianError,
+                        "did not own the production pid file",
+                    ):
+                        active.restore_legacy_production()
+            popen.assert_called_once()
+            self.assertIs(active.restoration_process, process)
+
+            dead_process = mock.Mock(pid=9553)
+            dead_process.poll.return_value = 2
+            active.restoration_process = dead_process
+            replacement = mock.Mock(pid=9664)
+            replacement.poll.return_value = None
+            with mock.patch.object(
+                guardian.subprocess, "Popen", return_value=replacement
+            ) as replacement_spawn, mock.patch.object(
+                guardian.time, "monotonic", side_effect=[40.0, 56.0]
+            ):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "did not own the production pid file"
+                ):
+                    active.restore_legacy_production()
+            replacement_spawn.assert_called_once()
+            self.assertIs(active.restoration_process, replacement)
 
     def test_post_cutover_ambiguous_lock_state_fails_closed(self) -> None:
         for holders, contended in [
@@ -707,7 +1472,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             ["acquire", "quiesce", "start", "wait", "stop", "restore", "release"],
         )
 
-    def test_failed_restore_cannot_skip_lease_release(self) -> None:
+    def test_failed_restore_retains_lease_for_outer_retry(self) -> None:
         events: list[str] = []
 
         def failed_restore() -> None:
@@ -729,8 +1494,251 @@ class GuardianLifecycleTests(unittest.TestCase):
 
         self.assertEqual(
             events,
-            ["acquire", "quiesce", "start", "wait", "stop", "restore", "release"],
+            ["acquire", "quiesce", "start", "wait", "stop", "restore"],
         )
+
+    def test_final_failed_restore_publishes_and_retains_host_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            active.transition_path = guardian.LEGACY_TRANSITION
+            active.production_quiesced = True
+            active.lease_dir.mkdir()
+            active.lease_owned = True
+            with mock.patch.object(
+                guardian,
+                "run_lifecycle",
+                side_effect=guardian.GuardianError("initial restore failed"),
+            ), mock.patch.object(
+                active,
+                "finalize_production",
+                side_effect=guardian.GuardianError("retry restore failed"),
+            ) as restore, mock.patch.object(
+                active, "release", wraps=active.release
+            ) as release, mock.patch.object(
+                guardian.signal, "signal"
+            ):
+                self.assertEqual(active.run(), 1)
+
+            restore.assert_called_once()
+            release.assert_not_called()
+            receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
+            self.assertTrue(receipt["lease_retained"])
+            self.assertFalse(receipt["lease_removed"])
+            self.assertTrue(active.lease_dir.is_dir())
+
+    def test_partial_quiesce_failure_cannot_release_host_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+
+            def partial_quiesce() -> None:
+                active.transition_path = guardian.LEGACY_TRANSITION
+                active.production_stop_requested = True
+                active.production_quiesced = True
+                raise guardian.GuardianError("post-stop holder check failed")
+
+            with self.assertRaisesRegex(
+                guardian.GuardianError,
+                "release lease.*before production identity is verified",
+            ):
+                guardian.run_lifecycle(
+                    active.acquire,
+                    partial_quiesce,
+                    mock.Mock(),
+                    mock.Mock(),
+                    mock.Mock(),
+                    mock.Mock(),
+                    active.release,
+                )
+
+            self.assertTrue(active.lease_owned)
+            self.assertTrue(active.lease_dir.is_dir())
+
+    def test_stop_timeout_attempts_outer_restore_and_retains_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.candidate.write_bytes(b"candidate")
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            with mock.patch.object(
+                guardian, "snapshot_process", return_value=snapshot
+            ), mock.patch.object(
+                guardian, "_configured_repos", return_value=()
+            ), mock.patch.object(
+                guardian, "_active_runs", return_value=()
+            ), mock.patch.object(
+                guardian, "_lock_holders", return_value=(snapshot.pid,)
+            ), mock.patch.object(
+                guardian, "_exclusive_lock_is_contended", return_value=True
+            ), mock.patch.object(
+                guardian,
+                "_select_transition_after_bounded_observation",
+                return_value=guardian.LEGACY_TRANSITION,
+            ), mock.patch.object(
+                guardian,
+                "_run",
+                side_effect=subprocess.TimeoutExpired(["shipyard", "daemon", "stop"], 15),
+            ), mock.patch.object(
+                active,
+                "finalize_production",
+                side_effect=guardian.GuardianError("outer restore unresolved"),
+            ) as restore, mock.patch.object(guardian.signal, "signal"):
+                self.assertEqual(active.run(), 1)
+
+            restore.assert_called_once()
+            self.assertTrue(active.production_stop_requested)
+            self.assertTrue(active.lease_owned)
+            receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
+            self.assertTrue(receipt["lease_retained"])
+            self.assertFalse(receipt["lease_removed"])
+
+    def test_stop_pending_original_daemon_is_never_adopted_as_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.installed_hash = guardian._sha256(active.installed)
+            active.snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            active.production_stop_requested = True
+            with mock.patch.object(
+                guardian, "_pid_alive", return_value=True
+            ), mock.patch.object(
+                guardian, "snapshot_process", return_value=active.snapshot
+            ), mock.patch.object(
+                guardian.time, "monotonic", side_effect=[0.0, 0.0, 16.0]
+            ), mock.patch.object(
+                guardian.time, "sleep"
+            ), mock.patch.object(
+                active, "verify_and_adopt_restored_production"
+            ) as adopt:
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "still exiting"
+                ):
+                    active.restore_legacy_production()
+            adopt.assert_not_called()
+
+    def test_stop_requested_pid_reuse_with_new_generation_can_be_adopted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.installed_hash = guardian._sha256(active.installed)
+            active.snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            new_generation = guardian.ProcessSnapshot(
+                **{
+                    **active.snapshot.__dict__,
+                    "start_time": "Sat Aug 22 00:01:00 2026",
+                }
+            )
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            active.production_stop_requested = True
+            with mock.patch.object(
+                guardian, "_pid_alive", return_value=True
+            ), mock.patch.object(
+                guardian, "snapshot_process", return_value=new_generation
+            ), mock.patch.object(
+                active, "verify_and_adopt_restored_production"
+            ) as adopt:
+                active.restore_legacy_production()
+            adopt.assert_called_once_with(new_generation.pid)
+
+    def test_adoption_reaps_different_retained_restore_child_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.installed_hash = guardian._sha256(active.installed)
+            active.snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            active.production_pid_file.write_text("7331\n", encoding="utf-8")
+            retained = mock.Mock(pid=8442)
+            retained.poll.side_effect = [None, 0]
+            retained.wait.return_value = 0
+            active.restoration_process = retained
+            with mock.patch.object(
+                guardian, "_pid_alive", side_effect=[True, False]
+            ), mock.patch.object(
+                active, "verify_and_adopt_restored_production"
+            ) as adopt:
+                active.restore_legacy_production()
+
+            retained.terminate.assert_called_once()
+            retained.wait.assert_called_once_with(timeout=5)
+            adopt.assert_called_once_with(7331)
+            self.assertIsNone(active.restoration_process)
+
+    def test_untouched_corrected_failure_verifies_then_releases_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            active.transition_path = guardian.CORRECTED_TRANSITION
+            active.lease_dir.mkdir()
+            active.lease_owned = True
+
+            def prove_untouched(*, require_mutation_fence: bool = True) -> None:
+                self.assertFalse(require_mutation_fence)
+                active.production_preserved = True
+                active.production_identity_verified = True
+
+            with mock.patch.object(
+                guardian,
+                "run_lifecycle",
+                side_effect=guardian.GuardianError("candidate start failed"),
+            ), mock.patch.object(
+                active,
+                "verify_preserved_production",
+                side_effect=prove_untouched,
+            ) as verify, mock.patch.object(
+                active, "release", wraps=active.release
+            ) as release, mock.patch.object(guardian.signal, "signal"):
+                self.assertEqual(active.run(), 1)
+
+            verify.assert_called_once_with(require_mutation_fence=False)
+            release.assert_called_once()
+            self.assertFalse(active.lease_owned)
+            receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
+            self.assertFalse(receipt["lease_retained"])
+            self.assertTrue(receipt["lease_removed"])
 
     def test_repo_and_mode_authority_come_from_exact_argv(self) -> None:
         argv = (

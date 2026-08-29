@@ -1,18 +1,29 @@
-//! Idempotent native publication of one exact fresh-agent continuation wake.
+//! Idempotent native publication of one exact continuation authority.
+//!
+//! Publication is deliberately inert: it records identity, checkpoint,
+//! route, profile, and continuation contracts, but it never creates a wake.
+//! The daemon's exact-head actionable producer is the sole bridge from a
+//! managed record to `dispatching` plus one transactional outbox row.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
 use super::dispatch::{FreshAgentLaunchProfile, WakeEnvelope, WakeProfileResolver};
 use super::registry::RouteRegistration;
 use super::route::{
-    AdapterAxis, AdapterBindingRecord, AgentRoute, AgentRouteRecord, LaunchProfileRecord,
-    NativeSessionRoute, OpaqueRef, ProviderRoute, ProviderRouteRecord, RouteProvenanceRecord,
-    Sha256Digest, TerminalRoute, TerminalRouteRecord,
+    AdapterAxis, AdapterBindingRecord, AgentName, AgentRoute, AgentRouteRecord,
+    LaunchProfileRecord, NativeDeliveryAuthorityRecord, NativeSessionRoute, OpaqueRef,
+    ProviderRoute, ProviderRouteRecord, RouteProvenanceRecord, Sha256Digest, TerminalRoute,
+    TerminalRouteRecord,
 };
 use super::{
     ContinuationSet, ImportCandidate, LifecycleState, OptionalExtension, WorkLedger,
     WorkLedgerError, WorkLedgerResult, digest, opaque_ref, params, validate_digest,
 };
+use crate::terminal_delivery_authority::TerminalCapabilityRequest;
 use crate::workstream_continuation_config::WorkstreamContinuationConfig;
 
 /// Complete normalized authority needed to publish one native continuation.
@@ -21,13 +32,28 @@ pub(crate) struct NativePublicationRequest {
     pub(crate) repository: String,
     pub(crate) pull_request: u64,
     pub(crate) head_sha: String,
+    pub(crate) base_ref: String,
+    pub(crate) base_sha: String,
+    pub(crate) github_installation_id: u64,
+    pub(crate) repo_policy_revision: u64,
+    pub(crate) terminal_authority: TerminalCapabilityRequest,
     pub(crate) workstream_handle: String,
+    pub(crate) plan_sha256: String,
+    pub(crate) root_revision: u64,
+    pub(crate) issue_revision: u64,
+    pub(crate) projection_revision: u64,
+    pub(crate) material_event_revision: u64,
     pub(crate) context_url: Option<String>,
     pub(crate) origin_machine: String,
     pub(crate) owner_id: String,
     pub(crate) owner_generation: u64,
     pub(crate) agent_provider: String,
     pub(crate) agent_session_id: String,
+    pub(crate) route_account: String,
+    pub(crate) route_model: String,
+    pub(crate) route_wrapper: String,
+    pub(crate) native_resume_digest: String,
+    pub(crate) route_environment_digest: String,
     pub(crate) route_id: String,
     pub(crate) profile_generation: u64,
     pub(crate) profile_revision: u64,
@@ -47,6 +73,18 @@ pub(crate) struct NativePublicationReport {
     pub(crate) route_ref: String,
     pub(crate) wake_id: String,
     pub(crate) profile_digest: String,
+    pub(crate) repo_policy_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativePolicyBindingV1 {
+    schema_version: u32,
+    repository: String,
+    pull_request: u64,
+    head_sha: String,
+    repo_policy_revision: u64,
+    work_id: String,
 }
 
 /// Exact protected-profile lookup used by the daemon's typed decoder.
@@ -96,6 +134,7 @@ impl WorkLedger {
     /// after the daemon has completed a fenced provider delivery. Merely
     /// claiming, retrying, or becoming uncertain is not enough to let the
     /// originating agent relinquish the final monitoring obligation.
+    #[cfg(test)]
     pub(crate) fn native_wake_consumer_owns(&self, wake_id: &str) -> WorkLedgerResult<bool> {
         let connection = self.connect_read_only()?;
         let observed: Option<(String, bool)> = connection
@@ -126,14 +165,15 @@ impl WorkLedger {
         // Authorization must precede even SQLite creation. A refused machine,
         // repository, or malformed profile is not a native ledger event.
         validate_request(request, policy)?;
-        let ledger = if apply {
-            Self::open(state_dir)?
-        } else {
-            Self::open_existing(state_dir)?.unwrap_or_else(|| Self {
-                path: Self::path_at(state_dir),
-            })
-        };
-        ledger.publish_native_continuation(request, policy, apply)
+        let ledger = Self::open_existing(state_dir)?.ok_or_else(|| {
+            WorkLedgerError::Refused("explicit repository policy is unavailable".to_owned())
+        })?;
+        ledger.verify_repo_policy_revision(&request.repository, request.repo_policy_revision)?;
+        let report = ledger.publish_native_continuation(request, policy, apply)?;
+        if apply {
+            persist_native_policy_binding(state_dir, request, &report)?;
+        }
+        Ok(report)
     }
 
     /// Plan or apply one exact native publication. Replays return the same IDs.
@@ -153,14 +193,20 @@ impl WorkLedger {
             route_ref: identities.route_ref.clone(),
             wake_id: identities.wake_id.clone(),
             profile_digest: request.profile_digest.clone(),
+            repo_policy_revision: request.repo_policy_revision,
         };
-        if !apply || replay {
+        if !apply {
+            return Ok(report);
+        }
+        if replay {
+            self.verify_exact_shadow_target(request)?;
             return Ok(report);
         }
 
         self.ensure_native_work_item(request, &identities)?;
+        self.ensure_projection_binding(request, &identities.work_id)?;
         self.ensure_continuations(request, &identities.work_id)?;
-        self.advance_to_actionable(&identities.work_id, request.owner_generation)?;
+        self.advance_to_managed(&identities.work_id, request.owner_generation)?;
 
         let (route, adapters) = native_route(request, policy, &identities)?;
         for adapter in &adapters {
@@ -175,33 +221,12 @@ impl WorkLedger {
             &request.protected_profile_bytes,
         )?;
 
-        let (phase, generation) = self.native_phase(&identities.work_id)?;
-        if phase == LifecycleState::Actionable.as_str() {
-            let wake = super::WakeIntent::new(
-                &identities.work_id,
-                generation + 1,
-                request.owner_generation,
-                identities.route_ref.clone(),
-                request.profile_digest.clone(),
-            )?;
-            if wake.wake_id != identities.wake_id {
-                return Err(WorkLedgerError::Refused(
-                    "native publication wake identity drifted".to_owned(),
-                ));
-            }
-            self.transition_with_wake(
-                &identities.work_id,
-                generation,
-                request.owner_generation,
-                LifecycleState::Dispatching,
-                Some(&wake),
-            )?;
-        }
         if !self.publication_is_exact(request, &identities)? {
             return Err(WorkLedgerError::Refused(
                 "native publication was not exact after apply".to_owned(),
             ));
         }
+        self.verify_exact_shadow_target(request)?;
         Ok(report)
     }
 
@@ -250,7 +275,7 @@ impl WorkLedger {
             repo: Some(request.repository.clone()),
             pr: Some(request.pull_request),
             head_sha: Some(request.head_sha.clone()),
-            base_ref: None,
+            base_ref: Some(request.base_ref.clone()),
             goal_id: Some(opaque_ref("goal", &request.workstream_handle)),
             goal_generation: 1,
             lane: Some("fresh_agent_continuation".to_owned()),
@@ -272,6 +297,24 @@ impl WorkLedger {
         };
         self.import_candidates(&[candidate])?;
         Ok(())
+    }
+
+    fn ensure_projection_binding(
+        &self,
+        request: &NativePublicationRequest,
+        work_id: &str,
+    ) -> WorkLedgerResult<()> {
+        self.bind_workstream_projection(
+            work_id,
+            &request.workstream_handle,
+            &request.plan_sha256,
+            request.root_revision,
+            request.issue_revision,
+            request.projection_revision,
+            request.material_event_revision,
+            &request.repository,
+            &request.head_sha,
+        )
     }
 
     fn ensure_continuations(
@@ -314,15 +357,15 @@ impl WorkLedger {
         Ok(())
     }
 
-    fn advance_to_actionable(&self, work_id: &str, owner_generation: u64) -> WorkLedgerResult<()> {
+    fn advance_to_managed(&self, work_id: &str, owner_generation: u64) -> WorkLedgerResult<()> {
         loop {
             let (phase, generation) = self.native_phase(work_id)?;
             let next = match phase.as_str() {
                 "shadow_imported" => LifecycleState::Published,
                 "published" => LifecycleState::Ready,
                 "ready" => LifecycleState::Managed,
-                "managed" => LifecycleState::Actionable,
-                "actionable" | "dispatching" | "agent_owned_repair" | "returned" | "terminal" => {
+                "managed" | "waiting" | "actionable" | "dispatching" | "agent_owned_repair"
+                | "returned" | "terminal" => {
                     return Ok(());
                 }
                 _ => {
@@ -398,7 +441,7 @@ impl WorkLedger {
             )
             .optional()?;
         match existing {
-            None => self.register_route(route),
+            None => self.register_staged_route(route),
             Some(integrity) if integrity == route.envelope_integrity => Ok(()),
             Some(_) => Err(WorkLedgerError::Refused(
                 "native publication route identity collides".to_owned(),
@@ -452,33 +495,261 @@ impl WorkLedger {
         }
         if !matches!(
             phase.as_str(),
-            "dispatching" | "agent_owned_repair" | "returned" | "terminal"
+            "managed"
+                | "waiting"
+                | "actionable"
+                | "dispatching"
+                | "agent_owned_repair"
+                | "returned"
+                | "terminal"
         ) {
             return Ok(false);
         }
-        let exact_wake: Option<bool> = connection
+        let exact_route: Option<bool> = connection
             .query_row(
-                "SELECT work_item_id = ?2 AND route_ref = ?3 AND payload_digest = ?4
-                 FROM outbox WHERE wake_id = ?1",
+                "SELECT work_item_id = ?2 AND head_sha = ?3 AND owner_generation = ?4
+                 FROM route_records WHERE route_ref = ?1",
                 params![
-                    identities.wake_id,
-                    identities.work_id,
                     identities.route_ref,
-                    request.profile_digest,
+                    identities.work_id,
+                    request.head_sha,
+                    request.owner_generation,
                 ],
                 |row| row.get(0),
             )
             .optional()?;
-        if exact_wake == Some(true) {
-            Ok(true)
-        } else if exact_wake.is_none() {
-            Ok(false)
+        if exact_route != Some(true) {
+            return if exact_route.is_none() {
+                Ok(false)
+            } else {
+                Err(WorkLedgerError::Refused(
+                    "native publication route identity collides".to_owned(),
+                ))
+            };
+        }
+        let exact_profile: bool = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM protected_objects
+                WHERE work_item_id = ?1 AND kind = 'launch_profile'
+                  AND profile_ref = ?2 AND content_digest = ?3
+             )",
+            params![
+                identities.work_id,
+                identities.profile_ref,
+                request.profile_digest
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(exact_profile)
+    }
+
+    fn verify_exact_shadow_target(
+        &self,
+        request: &NativePublicationRequest,
+    ) -> WorkLedgerResult<()> {
+        self.verify_repo_policy_revision(&request.repository, request.repo_policy_revision)?;
+        let targets = self.shadow_pr_targets()?;
+        let matches = targets
+            .iter()
+            .filter(|target| {
+                target.repo == request.repository
+                    && target.pr == request.pull_request
+                    && target.head_sha == request.head_sha
+                    && target.policy.revision == request.repo_policy_revision
+            })
+            .count();
+        if matches != 1 {
+            return Err(WorkLedgerError::Refused(
+                "native publication is not visible as one exact shadow target".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn verify_native_policy_binding(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+) -> WorkLedgerResult<()> {
+    let binding = read_native_policy_binding(state_dir, repository, pull_request, head_sha)?
+        .ok_or_else(|| {
+            WorkLedgerError::Refused("native policy binding is unavailable".to_owned())
+        })?;
+    if binding.schema_version != 1
+        || binding.repository != repository
+        || binding.pull_request != pull_request
+        || binding.head_sha != head_sha
+        || binding.repo_policy_revision == 0
+    {
+        return Err(WorkLedgerError::Refused(
+            "native policy binding is invalid".to_owned(),
+        ));
+    }
+    let ledger = WorkLedger::open_existing(state_dir)?
+        .ok_or_else(|| WorkLedgerError::Refused("native work ledger is unavailable".to_owned()))?;
+    ledger.verify_repo_policy_revision(repository, binding.repo_policy_revision)?;
+    Ok(())
+}
+
+pub(crate) fn bind_legacy_native_policy(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+    work_id: &str,
+) -> WorkLedgerResult<()> {
+    let ledger = WorkLedger::open_existing(state_dir)?
+        .ok_or_else(|| WorkLedgerError::Refused("native work ledger is unavailable".to_owned()))?;
+    let policy = ledger.repo_policy(repository)?.ok_or_else(|| {
+        WorkLedgerError::Refused("explicit repository policy is unavailable".to_owned())
+    })?;
+    let exact_targets = ledger
+        .shadow_pr_targets()?
+        .into_iter()
+        .filter(|target| {
+            target.repo == repository
+                && target.pr == pull_request
+                && target.head_sha == head_sha
+                && target.policy.revision == policy.revision
+        })
+        .count();
+    let exact_work: bool = ledger.connect_read_only()?.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = ?1
+          AND kind = 'terminal_handoff' AND lower(repo) = lower(?2)
+          AND pr = ?3 AND lower(head_sha) = lower(?4)
+          AND phase IN ('managed', 'waiting', 'actionable', 'dispatching',
+                        'agent_owned_repair', 'returned'))",
+        params![work_id, repository, pull_request, head_sha],
+        |row| row.get(0),
+    )?;
+    if exact_targets != 1 || !exact_work {
+        return Err(WorkLedgerError::Refused(
+            "legacy publication is not one exact managed shadow target".to_owned(),
+        ));
+    }
+    let binding = NativePolicyBindingV1 {
+        schema_version: 1,
+        repository: repository.to_owned(),
+        pull_request,
+        head_sha: head_sha.to_owned(),
+        repo_policy_revision: policy.revision,
+        work_id: work_id.to_owned(),
+    };
+    persist_native_policy_binding_value(state_dir, repository, pull_request, head_sha, &binding)
+}
+
+fn native_policy_binding_path(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+) -> PathBuf {
+    let key = digest(format!("{repository}\n{pull_request}\n{head_sha}").as_bytes());
+    state_dir
+        .join("work-ledger")
+        .join("native-policy-bindings")
+        .join(format!("{key}.json"))
+}
+
+fn persist_native_policy_binding(
+    state_dir: &Path,
+    request: &NativePublicationRequest,
+    report: &NativePublicationReport,
+) -> WorkLedgerResult<()> {
+    let binding = NativePolicyBindingV1 {
+        schema_version: 1,
+        repository: request.repository.clone(),
+        pull_request: request.pull_request,
+        head_sha: request.head_sha.clone(),
+        repo_policy_revision: request.repo_policy_revision,
+        work_id: report.work_id.clone(),
+    };
+    persist_native_policy_binding_value(
+        state_dir,
+        &request.repository,
+        request.pull_request,
+        &request.head_sha,
+        &binding,
+    )
+}
+
+fn persist_native_policy_binding_value(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+    binding: &NativePolicyBindingV1,
+) -> WorkLedgerResult<()> {
+    let path = native_policy_binding_path(state_dir, repository, pull_request, head_sha);
+    let directory = path.parent().ok_or_else(|| {
+        WorkLedgerError::Refused("native policy binding has no parent".to_owned())
+    })?;
+    crate::writer_domain_lease::ensure_protected_dir_all(directory)?;
+    let _writer = crate::writer_domain_lease::acquire_for_protected_path(directory)?;
+    if let Some(existing) =
+        read_native_policy_binding(state_dir, repository, pull_request, head_sha)?
+    {
+        return if existing == *binding {
+            Ok(())
         } else {
             Err(WorkLedgerError::Refused(
-                "native publication wake identity collides".to_owned(),
+                "native policy binding changed".to_owned(),
             ))
-        }
+        };
     }
+    let bytes = serde_json::to_vec(binding).map_err(|_| {
+        WorkLedgerError::Refused("native policy binding cannot be serialized".to_owned())
+    })?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".native-policy-")
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+    temporary.as_file_mut().write_all(&bytes)?;
+    temporary.as_file_mut().sync_all()?;
+    crate::queue::replace_file_with_windows_retry(temporary.path(), &path)?;
+    OpenOptions::new().read(true).open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn read_native_policy_binding(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+) -> WorkLedgerResult<Option<NativePolicyBindingV1>> {
+    let path = native_policy_binding_path(state_dir, repository, pull_request, head_sha);
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > 16 * 1024
+    {
+        return Err(WorkLedgerError::Refused(
+            "native policy binding metadata is unsafe".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 {
+        return Err(WorkLedgerError::Refused(
+            "native policy binding is oversized".to_owned(),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| WorkLedgerError::Refused("native policy binding is malformed".to_owned()))
 }
 
 struct PublicationIdentities {
@@ -517,12 +788,24 @@ impl PublicationIdentities {
             .to_owned();
         let publication_digest = digest(
             format!(
-                "shipyard-native-publication-authority-v1\n{authority_seed}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                "shipyard-native-publication-authority-v3\n{authority_seed}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 request.context_url.as_deref().unwrap_or(""),
+                request.plan_sha256,
+                request.root_revision,
+                request.issue_revision,
+                request.projection_revision,
+                request.material_event_revision,
+                request.base_ref,
+                request.base_sha,
+                request.github_installation_id,
                 request.origin_machine,
                 request.owner_id,
                 request.agent_provider,
                 request.agent_session_id,
+                request.route_account,
+                request.route_model,
+                request.route_wrapper,
+                request.native_resume_digest,
                 request.route_id,
                 request.profile_generation,
                 request.profile_revision,
@@ -554,31 +837,60 @@ fn validate_request(
     request: &NativePublicationRequest,
     policy: &WorkstreamContinuationConfig,
 ) -> WorkLedgerResult<()> {
+    let (terminal_provider, terminal_session) = match &request.terminal_authority {
+        TerminalCapabilityRequest::Cmux {
+            provider_kind,
+            native_session_id,
+            ..
+        }
+        | TerminalCapabilityRequest::HerdR {
+            provider_kind,
+            native_session_id,
+            ..
+        } => (provider_kind, native_session_id),
+    };
     if !policy.allows_repository(&request.repository)
         || request.origin_machine != policy.origin_machine
         || request.pull_request == 0
+        || request.github_installation_id == 0
         || request.owner_generation == 0
         || request.profile_generation == 0
         || request.profile_revision == 0
         || request.profile_generation != request.owner_generation
-        || !matches!(request.agent_provider.as_str(), "codex" | "claude")
+        || (!matches!(request.agent_provider.as_str(), "codex" | "claude")
+            && AgentName::parse(request.agent_provider.clone()).is_err())
         || request.profile_provider != policy.provider_wrapper.provider_id
         || request.profile_digest != digest(&request.protected_profile_bytes)
         || request.protected_profile_bytes.is_empty()
         || request.protected_profile_bytes.len() > 1_048_576
         || request.workstream_handle.is_empty()
         || request.workstream_handle.len() > 128
+        || request.projection_revision == 0
         || request.owner_id.is_empty()
         || request.owner_id.len() > 512
         || request.agent_session_id.is_empty()
         || request.agent_session_id.len() > 512
+        || terminal_provider != &request.agent_provider
+        || terminal_session != &request.agent_session_id
         || request.route_id.is_empty()
+        || request.route_wrapper.is_empty()
+        || std::path::Path::new(&request.route_wrapper)
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some("subrouter")
         || request.route_id.len() > 512
         || request.head_sha.len() != 40
         || !request
             .head_sha
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || request.base_sha.len() != 40
+        || !request
+            .base_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || request.base_ref.is_empty()
+        || request.base_ref.len() > 255
         || request.context_url.as_deref().is_some_and(|url| {
             url.is_empty() || url.len() > 4096 || url.chars().any(char::is_control)
         })
@@ -588,6 +900,12 @@ fn validate_request(
         ));
     }
     validate_digest("native profile digest", &request.profile_digest)?;
+    validate_digest("native projection plan digest", &request.plan_sha256)?;
+    validate_digest("native resume digest", &request.native_resume_digest)?;
+    validate_digest(
+        "native route environment digest",
+        &request.route_environment_digest,
+    )?;
     validate_digest(
         "native success continuation digest",
         &request.success_continuation_digest,
@@ -599,6 +917,7 @@ fn validate_request(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn native_route(
     request: &NativePublicationRequest,
     policy: &WorkstreamContinuationConfig,
@@ -618,7 +937,8 @@ fn native_route(
         )
         .as_bytes(),
     );
-    let wrapper_ref = OpaqueRef::derive("provider-wrapper", wrapper.executable_sha256.as_bytes());
+    let provider_wrapper_ref =
+        OpaqueRef::derive("provider-wrapper", wrapper.executable_sha256.as_bytes());
     let terminal = adapter(
         AdapterAxis::Terminal,
         "session_host",
@@ -633,29 +953,32 @@ fn native_route(
         digest(request.agent_session_id.as_bytes()),
         digest(b"fresh-agent-resume"),
     )?;
-    let provider = adapter(
-        AdapterAxis::Provider,
-        &wrapper.provider_id,
-        wrapper.executable_sha256.clone(),
-        config_digest.clone(),
-        digest(format!("{}\nfresh_agent\nidempotent", wrapper.adapter_id).as_bytes()),
-    )?;
     let session = NativeSessionRoute {
         native_session_ref: OpaqueRef::derive(
             "native-session",
             request.agent_session_id.as_bytes(),
         ),
-        native_resume_ref: OpaqueRef::derive("native-resume", request.workstream_handle.as_bytes()),
-        account_ref: OpaqueRef::derive("account", request.agent_provider.as_bytes()),
-        model_ref: OpaqueRef::derive("model", b"fresh-agent"),
-        wrapper_ref: wrapper_ref.clone(),
-        session_headers_ref: OpaqueRef::derive("session-headers", request.route_id.as_bytes()),
-        session_headers_sha256: Sha256Digest::of_bytes(request.route_id.as_bytes()),
+        native_resume_ref: OpaqueRef::derive(
+            "native-resume",
+            request.native_resume_digest.as_bytes(),
+        ),
+        account_ref: OpaqueRef::derive("account", request.route_account.as_bytes()),
+        model_ref: OpaqueRef::derive("model", request.route_model.as_bytes()),
+        wrapper_ref: provider_wrapper_ref.clone(),
+        session_headers_ref: OpaqueRef::derive(
+            "session-headers-and-routing-wrapper",
+            request.route_environment_digest.as_bytes(),
+        ),
+        session_headers_sha256: Sha256Digest::parse(request.route_environment_digest.clone())
+            .map_err(route_error)?,
     };
     let agent_route = match request.agent_provider.as_str() {
         "codex" => AgentRoute::Codex { session },
         "claude" => AgentRoute::Claude { session },
-        _ => unreachable!("validated agent provider"),
+        provider => AgentRoute::Named {
+            name: AgentName::parse(provider.to_owned()).map_err(route_error)?,
+            session,
+        },
     };
     let provenance = RouteProvenanceRecord::new(
         TerminalRouteRecord::new(TerminalRoute::Registered {
@@ -663,21 +986,33 @@ fn native_route(
             route_ref: OpaqueRef::derive("terminal-route", request.route_id.as_bytes()),
         }),
         AgentRouteRecord::new(agent.clone(), agent_route).map_err(route_error)?,
-        ProviderRouteRecord::new(ProviderRoute::Registered {
-            adapter: provider.clone(),
-            route_ref: OpaqueRef::derive("provider-route", wrapper.adapter_id.as_bytes()),
+        ProviderRouteRecord::new(ProviderRoute::Subrouter {
+            server_ref: OpaqueRef::derive("subrouter-server", request.route_wrapper.as_bytes()),
+            route_ref: OpaqueRef::derive(
+                "subrouter-route",
+                request.native_resume_digest.as_bytes(),
+            ),
         }),
         LaunchProfileRecord::new(
             OpaqueRef::parse(identities.profile_ref.clone()).map_err(route_error)?,
             request.profile_generation,
             request.profile_revision,
             Sha256Digest::parse(wrapper.executable_sha256.clone()).map_err(route_error)?,
-            wrapper_ref,
+            provider_wrapper_ref,
             Sha256Digest::parse(config_digest).map_err(route_error)?,
-            wrapper.provider_id.clone(),
+            "subrouter".to_owned(),
         )
+        .map_err(route_error)?
+        .bind_execution_provider(wrapper.provider_id.clone())
         .map_err(route_error)?,
     )
+    .map_err(route_error)?
+    .bind_delivery_authority(NativeDeliveryAuthorityRecord {
+        github_installation_id: request.github_installation_id,
+        base_ref: request.base_ref.clone(),
+        base_sha: request.base_sha.clone(),
+        terminal: request.terminal_authority.clone(),
+    })
     .map_err(route_error)?;
     let route = RouteRegistration::new(
         identities.route_ref.clone(),
@@ -690,7 +1025,7 @@ fn native_route(
         opaque_ref("machine", &request.origin_machine),
         provenance,
     )?;
-    Ok((route, vec![terminal, agent, provider]))
+    Ok((route, vec![terminal, agent]))
 }
 
 fn adapter(
@@ -718,7 +1053,11 @@ fn route_error(error: impl std::fmt::Display) -> WorkLedgerError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use crate::work_ledger::{
+        DeliveryAuthorization, NativeStewardDisposition, ProviderAuthorizationOperation,
+        ReconciliationAuthorization,
+    };
     use std::path::PathBuf;
 
     use tempfile::TempDir;
@@ -799,20 +1138,58 @@ mod tests {
             })
         }
 
-        fn launch(&mut self, _request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+        fn authorize(
+            &mut self,
+            fence: &DeliveryFence,
+            _operation: ProviderAuthorizationOperation,
+        ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+            Ok(DeliveryAuthorization::for_test(
+                fence.work_generation,
+                fence.owner_generation,
+            ))
+        }
+
+        fn authorize_reconciliation(
+            &mut self,
+            fence: &DeliveryFence,
+        ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+            Ok(ReconciliationAuthorization::for_test(
+                crate::work_ledger::reconciliation_fence_digest(fence),
+            ))
+        }
+
+        fn launch(
+            &mut self,
+            _request: ProviderLaunchRequest<'_>,
+            _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
             ProviderOutcome::Delivered {
                 receipt: b"provider accepted agent".to_vec(),
             }
         }
 
-        fn reconcile(&mut self, _fence: &DeliveryFence) -> ProviderOutcome {
+        fn reconcile(
+            &mut self,
+            _fence: &DeliveryFence,
+            _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
+            ProviderOutcome::Delivered {
+                receipt: b"provider reconciled agent".to_vec(),
+            }
+        }
+
+        fn reconcile_read_only(
+            &mut self,
+            _fence: &DeliveryFence,
+            _authority: ReconciliationAuthorization,
+        ) -> ProviderOutcome {
             ProviderOutcome::Delivered {
                 receipt: b"provider reconciled agent".to_vec(),
             }
         }
     }
 
-    fn policy(repositories: Vec<String>) -> WorkstreamContinuationConfig {
+    pub(crate) fn policy(repositories: Vec<String>) -> WorkstreamContinuationConfig {
         WorkstreamContinuationConfig {
             origin_machine: "m5".to_owned(),
             repositories,
@@ -825,23 +1202,54 @@ mod tests {
                 max_stdout_bytes: 65_536,
                 max_stderr_bytes: 65_536,
             },
+            terminal_trust: Box::new(crate::workstream_continuation_config::TerminalTrustConfig {
+                cmux_signing_team_id: "7WLXT3NR37".to_owned(),
+            }),
         }
     }
 
-    fn request() -> NativePublicationRequest {
+    pub(crate) fn request() -> NativePublicationRequest {
         let protected_profile_bytes =
             b"shipyard-launch-profile-v1\0{\"schema_version\":1}".to_vec();
         NativePublicationRequest {
             repository: "owner/repo".to_owned(),
             pull_request: 43,
             head_sha: "a".repeat(40),
+            base_ref: "main".into(),
+            base_sha: "b".repeat(40),
+            github_installation_id: 42,
+            repo_policy_revision: 1,
+            terminal_authority:
+                crate::terminal_delivery_authority::TerminalCapabilityRequest::Cmux {
+                    cli_path: "/test/cmux".into(),
+                    socket_path: "/test/cmux.sock".into(),
+                    surface_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+                    workspace_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
+                    native_session_id: "session-43".into(),
+                    provider_kind: "codex".into(),
+                    process: crate::terminal_delivery_authority::LocalProcessIncarnation {
+                        boot_id: "boot".into(),
+                        pid: 42,
+                        start_identity: "start".into(),
+                    },
+                },
             workstream_handle: "GEN-43".to_owned(),
+            plan_sha256: digest(b"GEN-43-plan"),
+            root_revision: 1,
+            issue_revision: 1,
+            projection_revision: 1,
+            material_event_revision: 1,
             context_url: Some("https://linear.example/GEN-43".to_owned()),
             origin_machine: "m5".to_owned(),
             owner_id: "agent-owner-43".to_owned(),
             owner_generation: 1,
             agent_provider: "codex".to_owned(),
             agent_session_id: "session-43".to_owned(),
+            route_account: "account-a".into(),
+            route_model: "model-a".into(),
+            route_wrapper: "subrouter".into(),
+            native_resume_digest: digest(b"subrouter resume session-43"),
+            route_environment_digest: digest(b"subrouter route environment"),
             route_id: "route-43".to_owned(),
             profile_generation: 1,
             profile_revision: 1,
@@ -853,17 +1261,36 @@ mod tests {
         }
     }
 
+    fn seed_repo_policy(state_dir: &std::path::Path, repository: &str) {
+        let ledger = WorkLedger::open(state_dir).expect("ledger");
+        ledger
+            .set_repo_policy(
+                &crate::work_ledger::RepoPolicy {
+                    repo: repository.to_owned(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("repo policy");
+    }
+
     #[test]
     fn dry_run_is_non_mutating_and_apply_replays_exactly() {
         let temp = TempDir::new().expect("temp");
         let request = request();
+        seed_repo_policy(temp.path(), &request.repository);
         let policy = policy(vec![request.repository.clone()]);
         let planned =
             WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, false)
                 .expect("plan");
         assert!(!planned.applied);
         assert!(!planned.replay);
-        assert!(!WorkLedger::path_at(temp.path()).exists());
+        assert!(WorkLedger::path_at(temp.path()).exists());
 
         let applied =
             WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
@@ -884,18 +1311,25 @@ mod tests {
         let ledger = WorkLedger::open_existing(temp.path())
             .expect("open")
             .expect("ledger");
-        let state: (String, String) = ledger
+        let state: (String, u64) = ledger
             .connect_read_only()
             .expect("connection")
             .query_row(
-                "SELECT work.phase, wake.state FROM work_items work
-                 JOIN outbox wake ON wake.work_item_id = work.id
-                 WHERE work.id = ?1",
+                "SELECT work.phase, (SELECT COUNT(*) FROM outbox)
+                   FROM work_items work WHERE work.id = ?1",
                 [&planned.work_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("native state");
-        assert_eq!(state, ("dispatching".to_owned(), "pending".to_owned()));
+        assert_eq!(state, ("managed".to_owned(), 0));
+        ledger
+            .apply_native_steward_disposition(
+                &request.repository,
+                request.pull_request,
+                &request.head_sha,
+                NativeStewardDisposition::Actionable,
+            )
+            .expect("exact actionable observation");
         assert!(
             !ledger
                 .native_wake_consumer_owns(&planned.wake_id)
@@ -924,6 +1358,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn absent_or_drifted_repo_policy_refuses_native_publication() {
+        let absent = TempDir::new().expect("temp");
+        let request = request();
+        let continuation = policy(vec![request.repository.clone()]);
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                absent.path(),
+                &request,
+                &continuation,
+                true
+            )
+            .is_err()
+        );
+        assert!(!WorkLedger::path_at(absent.path()).exists());
+
+        let drifted = TempDir::new().expect("temp");
+        seed_repo_policy(drifted.path(), &request.repository);
+        let ledger = WorkLedger::open_existing(drifted.path())
+            .expect("open")
+            .expect("ledger");
+        WorkLedger::plan_or_apply_native_continuation(
+            drifted.path(),
+            &request,
+            &continuation,
+            true,
+        )
+        .expect("initial publication");
+        let mut changed = ledger
+            .repo_policy(&request.repository)
+            .expect("policy")
+            .expect("present");
+        changed.compatibility_mode = "blocking".to_owned();
+        changed.blocking_rule = "all".to_owned();
+        ledger.set_repo_policy(&changed, 1).expect("revise");
+        assert!(
+            verify_native_policy_binding(
+                drifted.path(),
+                &request.repository,
+                request.pull_request,
+                &request.head_sha
+            )
+            .is_err()
+        );
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                drifted.path(),
+                &request,
+                &continuation,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn configured_named_agent_uses_open_registry_without_lifecycle_changes() {
+        let temp = TempDir::new().expect("temp");
+        let mut request = request();
+        seed_repo_policy(temp.path(), &request.repository);
+        request.agent_provider = "qwen".into();
+        let TerminalCapabilityRequest::Cmux { provider_kind, .. } = &mut request.terminal_authority
+        else {
+            unreachable!()
+        };
+        *provider_kind = "qwen".into();
+        let policy = policy(vec![request.repository.clone()]);
+        WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
+            .expect("named provider publication");
+    }
+
     fn planned_with_apply(mut report: NativePublicationReport) -> NativePublicationReport {
         report.applied = true;
         report
@@ -937,6 +1442,13 @@ mod tests {
                 policy(vec!["owner/repo".to_owned()]),
                 NativePublicationRequest {
                     origin_machine: "m3".to_owned(),
+                    ..request()
+                },
+            ),
+            (
+                policy(vec!["owner/repo".to_owned()]),
+                NativePublicationRequest {
+                    route_wrapper: "codex".to_owned(),
                     ..request()
                 },
             ),
@@ -956,9 +1468,46 @@ mod tests {
     }
 
     #[test]
+    fn cross_provider_terminal_authority_fails_before_storage_creation() {
+        let temp = TempDir::new().expect("temp");
+        let mut request = request();
+        let TerminalCapabilityRequest::Cmux { provider_kind, .. } = &mut request.terminal_authority
+        else {
+            panic!("cmux fixture")
+        };
+        *provider_kind = "claude".to_owned();
+        let policy = policy(vec![request.repository.clone()]);
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
+                .is_err()
+        );
+        assert!(!WorkLedger::path_at(temp.path()).exists());
+    }
+
+    #[test]
+    fn cross_session_terminal_authority_fails_before_storage_creation() {
+        let temp = TempDir::new().expect("temp");
+        let mut request = request();
+        let TerminalCapabilityRequest::Cmux {
+            native_session_id, ..
+        } = &mut request.terminal_authority
+        else {
+            panic!("cmux fixture")
+        };
+        *native_session_id = "different-session".to_owned();
+        let policy = policy(vec![request.repository.clone()]);
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
+                .is_err()
+        );
+        assert!(!WorkLedger::path_at(temp.path()).exists());
+    }
+
+    #[test]
     fn resolver_returns_only_exact_protected_profile_bytes() {
         let temp = TempDir::new().expect("temp");
         let request = request();
+        seed_repo_policy(temp.path(), &request.repository);
         let policy = policy(vec![request.repository.clone()]);
         let report =
             WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
@@ -996,6 +1545,7 @@ mod tests {
     fn changed_profile_cannot_duplicate_one_stable_work_identity() {
         let temp = TempDir::new().expect("temp");
         let request = request();
+        seed_repo_policy(temp.path(), &request.repository);
         let policy = policy(vec![request.repository.clone()]);
         let first =
             WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
@@ -1021,6 +1571,20 @@ mod tests {
         let policy = policy(vec![request.repository.clone()]);
         let identities = PublicationIdentities::new(&request);
         let ledger = WorkLedger::open(temp.path()).expect("ledger");
+        ledger
+            .set_repo_policy(
+                &crate::work_ledger::RepoPolicy {
+                    repo: request.repository.clone(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("repo policy");
 
         // Model a crash after the immutable work item and continuation pair
         // landed, but before lifecycle advancement, route binding, or wake.

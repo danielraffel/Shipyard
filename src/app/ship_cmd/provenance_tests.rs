@@ -173,6 +173,8 @@ esac"#,
         workstream_id: None,
         context_url: None,
         launch_profile: None,
+        after_handoff: "continue".to_owned(),
+        task_graph: None,
     };
     let pr = ResolvedPrContext {
         number: 42,

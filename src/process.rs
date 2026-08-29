@@ -1,7 +1,7 @@
 //! Cross-platform child-process tree supervision.
 
 use std::fmt;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,27 @@ pub(crate) fn run_output_until(
     deadline: Instant,
     label: impl Into<String>,
 ) -> Result<Output, BoundedOutputError> {
+    run_output_with_optional_input_until(command, None, deadline, label)
+}
+
+/// Capture one command with exact bounded stdin under the same descendant-safe
+/// deadline contract as [`run_output_until`].
+pub(crate) fn run_output_with_input_until(
+    command: &mut Command,
+    input: &[u8],
+    deadline: Instant,
+    label: impl Into<String>,
+) -> Result<Output, BoundedOutputError> {
+    run_output_with_optional_input_until(command, Some(input), deadline, label)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_output_with_optional_input_until(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    deadline: Instant,
+    label: impl Into<String>,
+) -> Result<Output, BoundedOutputError> {
     let label = label.into();
     if Instant::now() >= deadline {
         return Err(BoundedOutputError::TimedOut { label });
@@ -75,8 +96,33 @@ pub(crate) fn run_output_until(
         operation: "stderr capture",
         source,
     })?;
+    let mut stdin = input
+        .map(|bytes| {
+            let mut file = tempfile::tempfile()?;
+            file.write_all(bytes)?;
+            file.seek(SeekFrom::Start(0))?;
+            Ok::<_, io::Error>(file)
+        })
+        .transpose()
+        .map_err(|source| BoundedOutputError::Unreadable {
+            label: label.clone(),
+            operation: "stdin capture",
+            source,
+        })?;
     command
-        .stdin(Stdio::null())
+        .stdin(match stdin.as_mut() {
+            Some(file) => {
+                Stdio::from(
+                    file.try_clone()
+                        .map_err(|source| BoundedOutputError::Unreadable {
+                            label: label.clone(),
+                            operation: "stdin clone",
+                            source,
+                        })?,
+                )
+            }
+            None => Stdio::null(),
+        })
         .stdout(Stdio::from(stdout.try_clone().map_err(|source| {
             BoundedOutputError::Unreadable {
                 label: label.clone(),

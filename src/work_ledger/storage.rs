@@ -22,6 +22,8 @@ pub fn absent_status() -> LedgerStatus {
         work_items: 0,
         pending_wakes: 0,
         uncertain_wakes: 0,
+        pending_projection_intents: 0,
+        quarantined_projection_intents: 0,
         imports: 0,
         protected_objects: 0,
         provider_deliveries: 0,
@@ -143,6 +145,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     if version > SCHEMA_VERSION {
         return Err(WorkLedgerError::UnsupportedSchema(version));
     }
+    verify_open_lineage(connection, version)?;
     if version == 1 {
         migrate_v1_to_v2(connection)?;
         version = 2;
@@ -161,10 +164,26 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     if version == 5 {
         migrate_v5_to_v6(connection)?;
+        version = 6;
+    }
+    if version == 6 {
+        migrate_main_v6_to_v8(connection)?;
+        version = 8;
+    }
+    if version == 8 {
+        migrate_v8_to_v9(connection)?;
+        version = 9;
+    }
+    if version == 9 {
+        migrate_v9_to_v10(connection)?;
+        version = 10;
+    }
+    if version == 10 {
+        migrate_v10_to_v11(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
-        return Ok(());
+        return verify_schema_identity(connection);
     }
     if version != 0 {
         return Err(WorkLedgerError::UnsupportedSchema(version));
@@ -670,10 +689,569 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
                 WHERE previous.delivery_id = NEW.delivery_id
              ), 1)
          )
-         BEGIN SELECT RAISE(ABORT, 'provider delivery observation authority mismatch'); END;
-         PRAGMA user_version = 6;",
+         BEGIN SELECT RAISE(ABORT, 'provider delivery observation authority mismatch'); END;",
     )?;
+    install_schema_identity(&transaction)?;
+    install_custody_schema(&transaction)?;
+    install_custody_successor_schema(&transaction)?;
+    install_projection_intent_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn schema_object_exists(
+    connection: &Connection,
+    object_type: &str,
+    name: &str,
+) -> WorkLedgerResult<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2
+         )",
+        [object_type, name],
+        |row| row.get(0),
+    )?)
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> WorkLedgerResult<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        [table, column],
+        |row| row.get(0),
+    )?)
+}
+
+pub(super) fn verify_open_lineage(connection: &Connection, version: i64) -> WorkLedgerResult<()> {
+    if !(0..=SCHEMA_VERSION).contains(&version) {
+        return Err(WorkLedgerError::UnsupportedSchema(version));
+    }
+    if version < 3 {
+        return Ok(());
+    }
+    let donor_sentinel = ["ledger_metadata", "ledger_clock", "route_changes"]
+        .iter()
+        .map(|name| schema_object_exists(connection, "table", name))
+        .collect::<WorkLedgerResult<Vec<_>>>()?
+        .into_iter()
+        .any(|exists| exists);
+    if donor_sentinel {
+        return Err(WorkLedgerError::ForeignSchemaLineage {
+            version,
+            lineage: "route-change donor",
+        });
+    }
+    if version == SCHEMA_VERSION {
+        return verify_schema_identity(connection);
+    }
+    if version == 8 || version == 9 || version == 10 {
+        return verify_schema_identity(connection);
+    }
+    if version == 7 {
+        return Err(WorkLedgerError::Refused(
+            "unmarked schema v7 is not a supported provider-continuation ledger".to_owned(),
+        ));
+    }
+    let required_tables = match version {
+        3 => &["wake_attempts"][..],
+        4 => &["wake_attempts", "wake_claim_epochs"][..],
+        5 => &[
+            "wake_attempts",
+            "wake_claim_epochs",
+            "protected_objects",
+            "activation_epochs",
+            "provider_deliveries",
+            "agent_ownership",
+        ][..],
+        6 => &[
+            "wake_attempts",
+            "wake_claim_epochs",
+            "protected_objects",
+            "activation_epochs",
+            "provider_deliveries",
+            "provider_delivery_observations",
+            "agent_ownership",
+        ][..],
+        _ => {
+            return Err(WorkLedgerError::UnsupportedSchema(version));
+        }
+    };
+    let expected_main_shape = required_tables
+        .iter()
+        .map(|name| schema_object_exists(connection, "table", name))
+        .collect::<WorkLedgerResult<Vec<_>>>()?
+        .into_iter()
+        .all(|exists| exists)
+        && !table_has_column(connection, "outbox", "ledger_incarnation_ref")?
+        && (version < 5
+            || (table_has_column(connection, "outbox", "profile_ref")?
+                && table_has_column(connection, "outbox", "provider_delivery_id")?));
+    if !expected_main_shape || schema_object_exists(connection, "table", "ledger_schema_identity")?
+    {
+        return Err(WorkLedgerError::Refused(format!(
+            "schema v{version} lineage is ambiguous or altered; refusing migration"
+        )));
+    }
+    Ok(())
+}
+
+const SCHEMA_IDENTITY_OBJECTS: &[(&str, &str, &str)] = &[
+    (
+        "table",
+        "ledger_schema_identity",
+        "CREATE TABLE ledger_schema_identity (
+           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+           lineage TEXT NOT NULL CHECK(lineage = 'provider-continuation'),
+           lineage_revision INTEGER NOT NULL CHECK(lineage_revision = 1)
+         )",
+    ),
+    (
+        "trigger",
+        "ledger_schema_identity_immutable",
+        "CREATE TRIGGER ledger_schema_identity_immutable
+         BEFORE UPDATE ON ledger_schema_identity
+         BEGIN SELECT RAISE(ABORT, 'ledger schema identity is immutable'); END",
+    ),
+    (
+        "trigger",
+        "ledger_schema_identity_no_delete",
+        "CREATE TRIGGER ledger_schema_identity_no_delete
+         BEFORE DELETE ON ledger_schema_identity
+         BEGIN SELECT RAISE(ABORT, 'ledger schema identity is immutable'); END",
+    ),
+    (
+        "trigger",
+        "ledger_schema_identity_no_second_insert",
+        "CREATE TRIGGER ledger_schema_identity_no_second_insert
+         BEFORE INSERT ON ledger_schema_identity
+         WHEN EXISTS (SELECT 1 FROM ledger_schema_identity)
+         BEGIN SELECT RAISE(ABORT, 'ledger schema identity is a singleton'); END",
+    ),
+];
+
+fn install_schema_identity(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
+    for object_type in ["table", "trigger"] {
+        for (kind, _, sql) in SCHEMA_IDENTITY_OBJECTS {
+            if *kind == object_type {
+                transaction.execute_batch(&format!("{sql};"))?;
+            }
+        }
+        if object_type == "table" {
+            transaction.execute(
+                "INSERT INTO ledger_schema_identity
+                 (singleton, lineage, lineage_revision)
+                 VALUES (1, 'provider-continuation', 1)",
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_main_v6_to_v8(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 6 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the migration fence".to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 6)?;
+    validate_relational_integrity(&transaction)?;
+    install_schema_identity(&transaction)?;
+    transaction.pragma_update(None, "user_version", 8)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v8_to_v9(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 8 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the custody migration fence".to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 8)?;
+    validate_relational_integrity(&transaction)?;
+    install_custody_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", 9)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v9_to_v10(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 9 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the custody successor migration fence"
+                .to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 9)?;
+    validate_relational_integrity(&transaction)?;
+    install_custody_successor_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", 10)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v10_to_v11(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 10 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the projection intent migration fence"
+                .to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 10)?;
+    validate_relational_integrity(&transaction)?;
+    install_projection_intent_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn install_projection_intent_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE workstream_projection_bindings (
+           work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT,
+           workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
+           plan_sha256 TEXT NOT NULL
+             CHECK(length(plan_sha256) = 64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+           root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
+           issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
+           projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
+           material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
+           repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
+           exact_head TEXT NOT NULL
+             CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           UNIQUE(workstream_handle, repository, exact_head)
+         );
+         CREATE TRIGGER workstream_projection_binding_identity_immutable
+         BEFORE UPDATE OF work_item_id, workstream_handle, plan_sha256, root_revision,
+                          issue_revision, projection_revision, material_event_revision,
+                          repository, created_at
+         ON workstream_projection_bindings
+         BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
+         CREATE TRIGGER workstream_projection_binding_no_delete
+         BEFORE DELETE ON workstream_projection_bindings
+         BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
+         CREATE TABLE projection_intents (
+           intent_id TEXT PRIMARY KEY
+             CHECK(length(intent_id) = 64 AND intent_id NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
+           sequence INTEGER NOT NULL CHECK(sequence > 0),
+           kind TEXT NOT NULL CHECK(kind IN ('handoff', 'waiting', 'actionable', 'new_head',
+                                              'merge', 'configured_closure')),
+           source_revision TEXT NOT NULL
+             CHECK(length(source_revision) = 64 AND source_revision NOT GLOB '*[^0-9a-f]*'),
+           exact_head TEXT
+             CHECK(exact_head IS NULL OR
+                   (length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*')),
+           receipt_snapshot BLOB NOT NULL CHECK(length(receipt_snapshot) BETWEEN 2 AND 1048576),
+           receipt_sha256 TEXT NOT NULL
+             CHECK(length(receipt_sha256) = 64 AND receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+           transition_id TEXT NOT NULL UNIQUE
+             CHECK(length(transition_id) = 64 AND transition_id NOT GLOB '*[^0-9a-f]*'),
+           supersedes_transition_id TEXT
+             CHECK(supersedes_transition_id IS NULL OR
+                   (length(supersedes_transition_id) = 64 AND
+                    supersedes_transition_id NOT GLOB '*[^0-9a-f]*')),
+           state TEXT NOT NULL CHECK(state IN ('pending', 'projected', 'quarantined')),
+           attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+           retry_at_unix_ms INTEGER NOT NULL DEFAULT 0 CHECK(retry_at_unix_ms >= 0),
+           failure_class TEXT,
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           updated_at TEXT NOT NULL CHECK(length(updated_at) >= 20),
+           UNIQUE(workstream_handle, sequence),
+           CHECK(length(receipt_sha256) = 64)
+         );
+         CREATE INDEX projection_intents_drain
+           ON projection_intents(state, retry_at_unix_ms, workstream_handle, sequence);
+         CREATE TRIGGER projection_intent_identity_immutable
+         BEFORE UPDATE OF intent_id, work_item_id, workstream_handle, sequence, kind,
+                          source_revision, exact_head, receipt_snapshot, receipt_sha256,
+                          transition_id, supersedes_transition_id, created_at
+         ON projection_intents
+         BEGIN SELECT RAISE(ABORT, 'projection intent identity is immutable'); END;
+         CREATE TRIGGER projection_intent_no_delete
+         BEFORE DELETE ON projection_intents
+         BEGIN SELECT RAISE(ABORT, 'projection intent cannot be deleted'); END;",
+    )?;
+    Ok(())
+}
+
+fn install_custody_successor_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE custody_successor_rebinds (
+           rebind_id TEXT NOT NULL,
+           message_id TEXT NOT NULL,
+           side TEXT NOT NULL CHECK(side IN ('sender', 'receiver')),
+           rebind_json BLOB NOT NULL,
+           rebind_digest TEXT NOT NULL
+             CHECK(length(rebind_digest) = 64 AND rebind_digest NOT GLOB '*[^0-9a-f]*'),
+           authority_epoch INTEGER NOT NULL CHECK(authority_epoch > 0),
+           state TEXT NOT NULL CHECK(state IN ('prepared', 'committed', 'acknowledged')),
+           receipt_json BLOB,
+           receipt_digest TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           PRIMARY KEY(rebind_id, side),
+           UNIQUE(message_id, side, rebind_digest),
+           UNIQUE(message_id, side, authority_epoch),
+           CHECK((receipt_json IS NULL AND receipt_digest IS NULL) OR
+                 (receipt_json IS NOT NULL AND length(receipt_digest) = 64 AND
+                  receipt_digest NOT GLOB '*[^0-9a-f]*'))
+         );
+         CREATE INDEX custody_successor_message
+           ON custody_successor_rebinds(message_id, side, state, updated_at);
+         CREATE TRIGGER custody_successor_identity_immutable
+         BEFORE UPDATE OF message_id, side, rebind_json, rebind_digest, authority_epoch
+         ON custody_successor_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody successor identity is immutable'); END;
+         CREATE TRIGGER custody_successor_receipt_immutable
+         BEFORE UPDATE OF receipt_json, receipt_digest ON custody_successor_rebinds
+         WHEN OLD.receipt_digest IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'custody successor receipt is immutable'); END;
+         CREATE TRIGGER custody_successor_no_delete
+         BEFORE DELETE ON custody_successor_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody successor rebinds cannot be deleted'); END;
+         CREATE TABLE custody_processed_acknowledgements (
+           receipt_digest TEXT PRIMARY KEY
+             CHECK(length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'),
+           message_id TEXT NOT NULL REFERENCES custody_inbox(message_id) ON DELETE RESTRICT,
+           source_machine_ref TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           UNIQUE(message_id)
+         );
+         CREATE TRIGGER custody_processed_ack_immutable
+         BEFORE UPDATE ON custody_processed_acknowledgements
+         BEGIN SELECT RAISE(ABORT, 'custody processed acknowledgements are immutable'); END;
+         CREATE TRIGGER custody_processed_ack_no_delete
+         BEFORE DELETE ON custody_processed_acknowledgements
+         BEGIN SELECT RAISE(ABORT, 'custody processed acknowledgements cannot be deleted'); END;",
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Keep one atomic, auditable schema installation transaction.
+fn install_custody_schema(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE custody_outbox (
+           message_id TEXT PRIMARY KEY
+             CHECK(length(message_id) = 67 AND substr(message_id, 1, 3) = 'wm_'
+                   AND substr(message_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           wake_id TEXT NOT NULL REFERENCES outbox(wake_id) ON DELETE RESTRICT,
+           identity_json BLOB NOT NULL,
+           identity_digest TEXT NOT NULL
+             CHECK(length(identity_digest) = 64 AND identity_digest NOT GLOB '*[^0-9a-f]*'),
+           state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'custody_accepted',
+                                               'processed', 'cancelled', 'superseded')),
+           active_rebind_epoch INTEGER NOT NULL CHECK(active_rebind_epoch > 0),
+           custody_receipt_digest TEXT,
+           custody_transfer_digest TEXT,
+           processed_receipt_digest TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           UNIQUE(wake_id, message_id)
+         );
+         CREATE TABLE custody_rebinds (
+           message_id TEXT NOT NULL REFERENCES custody_outbox(message_id) ON DELETE RESTRICT,
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           target_machine_ref TEXT NOT NULL,
+           target_incarnation_ref TEXT NOT NULL,
+           target_route_ref TEXT NOT NULL,
+           terminal_adapter TEXT NOT NULL,
+           authority_digest TEXT NOT NULL
+             CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^0-9a-f]*'),
+           created_at TEXT NOT NULL,
+           PRIMARY KEY(message_id, epoch)
+         );
+         CREATE TABLE custody_sender_claims (
+           message_id TEXT NOT NULL REFERENCES custody_outbox(message_id) ON DELETE RESTRICT,
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           owner_ref TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('active', 'released')),
+           acquired_at TEXT NOT NULL,
+           expires_at TEXT NOT NULL,
+           released_at TEXT,
+           PRIMARY KEY(message_id, epoch)
+         );
+         CREATE TABLE custody_inbox (
+           message_id TEXT PRIMARY KEY,
+           identity_json BLOB NOT NULL,
+           identity_digest TEXT NOT NULL,
+           rebind_epoch INTEGER NOT NULL CHECK(rebind_epoch > 0),
+           target_machine_ref TEXT NOT NULL,
+           target_incarnation_ref TEXT NOT NULL,
+           target_route_ref TEXT NOT NULL,
+           terminal_adapter TEXT NOT NULL,
+           authority_digest TEXT NOT NULL,
+           transfer_digest TEXT NOT NULL,
+           transport_auth_digest TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('received', 'processing', 'processed',
+                                               'cancelled', 'superseded')),
+           custody_receipt_digest TEXT NOT NULL,
+           effect_digest TEXT,
+           processed_receipt_digest TEXT,
+           processed_receipt_json BLOB,
+           received_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           processed_at TEXT,
+           CHECK(length(identity_digest) = 64 AND identity_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(length(transfer_digest) = 64 AND transfer_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(length(transport_auth_digest) = 64 AND transport_auth_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(length(custody_receipt_digest) = 64 AND custody_receipt_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(effect_digest IS NULL OR
+                 (length(effect_digest) = 64 AND effect_digest NOT GLOB '*[^0-9a-f]*')),
+           CHECK(processed_receipt_digest IS NULL OR
+                 (length(processed_receipt_digest) = 64 AND
+                  processed_receipt_digest NOT GLOB '*[^0-9a-f]*')),
+           CHECK((state = 'processed' AND effect_digest IS NOT NULL AND
+                  processed_receipt_digest IS NOT NULL AND
+                  processed_receipt_json IS NOT NULL AND processed_at IS NOT NULL) OR
+                 (state != 'processed' AND effect_digest IS NULL AND
+                  processed_receipt_digest IS NULL AND
+                  processed_receipt_json IS NULL AND processed_at IS NULL))
+         );
+         CREATE TABLE custody_inbox_claims (
+           message_id TEXT NOT NULL REFERENCES custody_inbox(message_id) ON DELETE RESTRICT,
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           owner_ref TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('active', 'released')),
+           acquired_at TEXT NOT NULL,
+           expires_at TEXT NOT NULL,
+           released_at TEXT,
+           PRIMARY KEY(message_id, epoch)
+         );
+         CREATE TABLE custody_effects (
+           message_id TEXT PRIMARY KEY REFERENCES custody_inbox(message_id) ON DELETE RESTRICT,
+           effect_digest TEXT NOT NULL,
+           applied_at TEXT NOT NULL
+         );
+         CREATE TABLE custody_controls (
+           control_id TEXT PRIMARY KEY,
+           message_id TEXT NOT NULL,
+           identity_digest TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK(kind IN ('cancelled', 'superseded')),
+           successor_message_id TEXT,
+           expected_rebind_epoch INTEGER NOT NULL CHECK(expected_rebind_epoch > 0),
+           workstream_revision INTEGER NOT NULL CHECK(workstream_revision > 0),
+           authority_digest TEXT NOT NULL,
+           control_digest TEXT NOT NULL UNIQUE,
+           state TEXT NOT NULL CHECK(state IN ('pending', 'acknowledged')),
+           receipt_digest TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE custody_events (
+           event_id TEXT PRIMARY KEY,
+           message_id TEXT NOT NULL,
+           side TEXT NOT NULL CHECK(side IN ('sender', 'receiver')),
+           sequence INTEGER NOT NULL CHECK(sequence > 0),
+           kind TEXT NOT NULL,
+           evidence_digest TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           UNIQUE(message_id, side, sequence)
+         );
+         CREATE INDEX custody_outbox_state ON custody_outbox(state, updated_at, message_id);
+         CREATE INDEX custody_inbox_state ON custody_inbox(state, updated_at, message_id);
+         CREATE TRIGGER custody_outbox_identity_immutable
+         BEFORE UPDATE OF wake_id, identity_json, identity_digest ON custody_outbox
+         BEGIN SELECT RAISE(ABORT, 'custody outbox identity is immutable'); END;
+         CREATE TRIGGER custody_rebind_immutable BEFORE UPDATE ON custody_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody rebinds are immutable'); END;
+         CREATE TRIGGER custody_rebind_no_delete BEFORE DELETE ON custody_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody rebinds cannot be deleted'); END;
+         CREATE TRIGGER custody_inbox_identity_immutable
+         BEFORE UPDATE OF identity_json, identity_digest, rebind_epoch,
+                          target_machine_ref, target_incarnation_ref, target_route_ref,
+                          terminal_adapter, authority_digest, transfer_digest,
+                          transport_auth_digest, custody_receipt_digest ON custody_inbox
+         BEGIN SELECT RAISE(ABORT, 'custody inbox identity is immutable'); END;
+         CREATE TRIGGER custody_inbox_processed_receipt_immutable
+         BEFORE UPDATE OF effect_digest, processed_receipt_digest,
+                          processed_receipt_json, processed_at ON custody_inbox
+         WHEN OLD.processed_receipt_digest IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'custody processed receipt is immutable'); END;
+         CREATE TRIGGER custody_effect_immutable BEFORE UPDATE ON custody_effects
+         BEGIN SELECT RAISE(ABORT, 'custody effects are immutable'); END;
+         CREATE TRIGGER custody_effect_no_delete BEFORE DELETE ON custody_effects
+         BEGIN SELECT RAISE(ABORT, 'custody effects cannot be deleted'); END;
+         CREATE TRIGGER custody_control_identity_immutable
+         BEFORE UPDATE OF message_id, identity_digest, kind, successor_message_id,
+                          expected_rebind_epoch, workstream_revision, authority_digest,
+                          control_digest ON custody_controls
+         BEGIN SELECT RAISE(ABORT, 'custody controls are immutable'); END;
+         CREATE TRIGGER custody_control_no_delete BEFORE DELETE ON custody_controls
+         BEGIN SELECT RAISE(ABORT, 'custody controls cannot be deleted'); END;
+         CREATE TRIGGER custody_event_immutable BEFORE UPDATE ON custody_events
+         BEGIN SELECT RAISE(ABORT, 'custody events are immutable'); END;
+         CREATE TRIGGER custody_event_no_delete BEFORE DELETE ON custody_events
+         BEGIN SELECT RAISE(ABORT, 'custody events cannot be deleted'); END;",
+    )?;
+    Ok(())
+}
+
+fn verify_schema_identity(connection: &Connection) -> WorkLedgerResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, sql FROM sqlite_schema
+         WHERE name = 'ledger_schema_identity'
+            OR name LIKE 'ledger_schema_identity_%'
+         ORDER BY type, name",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = SCHEMA_IDENTITY_OBJECTS
+        .iter()
+        .map(|(kind, name, sql)| ((*kind).to_owned(), (*name).to_owned(), (*sql).to_owned()))
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    if actual != expected {
+        let version = schema_version(connection)?;
+        let donor_v7 = version == 7
+            && schema_object_exists(connection, "table", "ledger_clock")?
+            && schema_object_exists(connection, "table", "route_changes")?
+            && schema_object_exists(connection, "table", "protected_objects")?
+            && table_has_column(connection, "outbox", "ledger_incarnation_ref")?;
+        let reason = if donor_v7 {
+            "schema v7 belongs to the protected-object donor lineage; explicit state reconciliation is required"
+        } else {
+            "work ledger schema identity is missing or altered"
+        };
+        return Err(WorkLedgerError::Refused(reason.to_owned()));
+    }
+    let identity: (String, i64) = connection.query_row(
+        "SELECT lineage, lineage_revision FROM ledger_schema_identity WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if identity != ("provider-continuation".to_owned(), 1) {
+        return Err(WorkLedgerError::Refused(
+            "work ledger schema identity row is missing or altered".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1253,7 +1831,7 @@ pub(super) fn verify_supported_schema(connection: &Connection) -> WorkLedgerResu
     if version != SCHEMA_VERSION {
         return Err(WorkLedgerError::UnsupportedSchema(version));
     }
-    Ok(())
+    verify_schema_identity(connection)
 }
 
 pub(super) fn schema_version(connection: &Connection) -> WorkLedgerResult<i64> {
@@ -1267,6 +1845,7 @@ pub(super) fn verify_integrity(connection: &Connection) -> WorkLedgerResult<Stri
             "integrity check returned {verdict}"
         )));
     }
+    verify_schema_identity(connection)?;
     validate_relational_integrity(connection)?;
     Ok(verdict)
 }
@@ -1284,6 +1863,9 @@ fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()
     }
     if schema_version(connection)? < 5 {
         return Ok(());
+    }
+    if schema_version(connection)? >= 9 {
+        super::durable_custody::validate_persisted_custody(connection)?;
     }
     let invalid_object_names: i64 = connection.query_row(
         "SELECT COUNT(*) FROM protected_objects
@@ -1462,16 +2044,18 @@ pub(super) fn count_where(
     column: &str,
     value: &str,
 ) -> WorkLedgerResult<u64> {
-    if table != "outbox" || column != "state" {
-        return Err(WorkLedgerError::Refused(
-            "unsupported filtered count".to_owned(),
-        ));
-    }
-    Ok(connection.query_row(
-        "SELECT COUNT(*) FROM outbox WHERE state = ?1",
-        [value],
-        |row| row.get(0),
-    )?)
+    let sql = match (table, column) {
+        ("outbox", "state") => "SELECT COUNT(*) FROM outbox WHERE state = ?1",
+        ("projection_intents", "state") => {
+            "SELECT COUNT(*) FROM projection_intents WHERE state = ?1"
+        }
+        _ => {
+            return Err(WorkLedgerError::Refused(
+                "unsupported filtered count".to_owned(),
+            ));
+        }
+    };
+    Ok(connection.query_row(sql, [value], |row| row.get(0))?)
 }
 
 #[cfg(unix)]

@@ -1,9 +1,9 @@
-//! Pure, default-off admission policy for the first Pulp macOS sharding canary.
+//! Pure, default-off admission policy for a repository-scoped macOS sharding canary.
 //!
 //! This module does not discover hosts, transfer artifacts, dispatch shards, or
 //! publish evidence. It only decides whether controller-owned observations are
-//! sufficient to attempt a shadow canary using M3 as builder and M1 as the
-//! secondary worker. Re-evaluation after an offline observation is the recovery
+//! sufficient to attempt a shadow canary using the explicitly configured build
+//! and worker hosts. Re-evaluation after an offline observation is the recovery
 //! mechanism; no partially dispatched state is created here.
 
 use std::collections::BTreeSet;
@@ -15,11 +15,6 @@ use crate::parallel_proof::{
     ShardExecutionMode,
 };
 
-const PULP_REPOSITORY: &str = "generous-corp/pulp";
-const PULP_REPOSITORY_ID: u64 = 1_203_111_607;
-const PULP_MAC_TARGET: &str = "mac";
-const INITIAL_BUILDER: &str = "m3";
-const INITIAL_WORKER: &str = "m1";
 const MINIMUM_SAVINGS_MS: u64 = 120_000;
 const MINIMUM_SAVINGS_PERCENT: u64 = 10;
 const MAX_OVERHEAD_PERCENT: u64 = 15;
@@ -108,10 +103,14 @@ pub struct CanaryTimingEstimate {
 pub struct PulpMacCanaryPolicy {
     /// Explicit opt-in. The default remains false.
     pub enabled: bool,
+    /// Exact immutable repository database identity admitted by this policy.
+    pub repository_id: u64,
     /// Exact canonical repository slug admitted by this policy.
     pub repository: String,
     /// Exact Shipyard target admitted by this policy.
     pub target: String,
+    /// Exact build target triple admitted by this policy.
+    pub target_triple: String,
     /// Host that produced the immutable build artifact.
     pub builder_host_id: String,
     /// Secondary host that receives the artifact over the LAN.
@@ -131,10 +130,12 @@ impl Default for PulpMacCanaryPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
-            repository: PULP_REPOSITORY.to_owned(),
-            target: PULP_MAC_TARGET.to_owned(),
-            builder_host_id: INITIAL_BUILDER.to_owned(),
-            worker_host_id: INITIAL_WORKER.to_owned(),
+            repository_id: 0,
+            repository: String::new(),
+            target: String::new(),
+            target_triple: String::new(),
+            builder_host_id: String::new(),
+            worker_host_id: String::new(),
             assessed_at_ms: 0,
             maximum_observation_age_ms: 60_000,
             minimum_free_bytes: 0,
@@ -149,7 +150,7 @@ impl Default for PulpMacCanaryPolicy {
 pub enum CanaryIneligibleReason {
     /// Repository, target, or target triple is outside the initial canary.
     WrongScope,
-    /// A host pair other than M3 builder and M1 worker was requested.
+    /// The configured builder/worker pair is empty, invalid, or aliases one host.
     InitialHostPairRequired,
     /// One host is absent or ambiguously duplicated.
     HostMissing,
@@ -196,8 +197,18 @@ pub enum PulpMacCanaryDecision {
         manifest_digest: Sha256Digest,
         /// Exact build host selected by the narrow policy.
         builder_host_id: String,
+        /// Exact authenticated builder session admitted by this decision.
+        builder_session_generation: u64,
+        /// Controller time of the admitted builder observation.
+        builder_observed_at_ms: u64,
         /// Exact secondary worker selected by the narrow policy.
         worker_host_id: String,
+        /// Exact authenticated worker session admitted by this decision.
+        worker_session_generation: u64,
+        /// Controller time of the admitted worker observation.
+        worker_observed_at_ms: u64,
+        /// Digest of both complete admitted host observations in role order.
+        host_observations_digest: Sha256Digest,
         /// Number of exhaustive, disjoint shards in the bound plan.
         shard_count: u32,
         /// Fleet-exclusive shards retained from `RUN_SERIAL` declarations.
@@ -235,17 +246,16 @@ pub fn assess_pulp_mac_canary(
 
     let manifest_digest = proof.manifest.digest(proof.inventory, proof.plan)?;
     let mut reasons = BTreeSet::new();
-    if policy.repository != PULP_REPOSITORY
-        || policy.target != PULP_MAC_TARGET
-        || timing.target != PULP_MAC_TARGET
+    if !canary_policy_scope_valid(policy)
         || timing.target != policy.target
-        || proof.manifest.source.repository != PULP_REPOSITORY
-        || proof.manifest.source.repository_id != PULP_REPOSITORY_ID
-        || proof.manifest.build.target_triple != "aarch64-apple-darwin"
+        || !canary_policy_matches_proof(proof, policy)
     {
         reasons.insert(CanaryIneligibleReason::WrongScope);
     }
-    if policy.builder_host_id != INITIAL_BUILDER || policy.worker_host_id != INITIAL_WORKER {
+    if !valid_label(&policy.builder_host_id)
+        || !valid_label(&policy.worker_host_id)
+        || policy.builder_host_id == policy.worker_host_id
+    {
         reasons.insert(CanaryIneligibleReason::InitialHostPairRequired);
     }
     if proof.plan.shards.len() < 2
@@ -298,10 +308,20 @@ pub fn assess_pulp_mac_canary(
         .map(|lock| lock.name.as_str())
         .collect::<BTreeSet<_>>()
         .len();
+    let (Some(builder), Some(worker)) = (builder, worker) else {
+        return Err(ParallelProofError::InvalidField(
+            "eligible canary host observations",
+        ));
+    };
     Ok(PulpMacCanaryDecision::Eligible {
         manifest_digest,
         builder_host_id: policy.builder_host_id.clone(),
+        builder_session_generation: builder.session_generation,
+        builder_observed_at_ms: builder.observed_at_ms,
         worker_host_id: policy.worker_host_id.clone(),
+        worker_session_generation: worker.session_generation,
+        worker_observed_at_ms: worker.observed_at_ms,
+        host_observations_digest: canary_host_observations_digest(builder, worker)?,
         shard_count: u32::try_from(proof.plan.shards.len())
             .map_err(|_| ParallelProofError::InvalidField("canary shard count"))?,
         fleet_exclusive_shards: u32::try_from(fleet_exclusive_shards)
@@ -311,6 +331,39 @@ pub fn assess_pulp_mac_canary(
         predicted_savings_ms: savings,
         predicted_overhead_percent: overhead_percent,
     })
+}
+
+pub(crate) fn canary_policy_matches_proof(
+    proof: ParallelProofContext<'_>,
+    policy: &PulpMacCanaryPolicy,
+) -> bool {
+    proof.manifest.source.repository_id == policy.repository_id
+        && proof.manifest.source.repository == policy.repository
+        && proof.manifest.build.target_triple == policy.target_triple
+}
+
+pub(crate) fn canary_policy_scope_valid(policy: &PulpMacCanaryPolicy) -> bool {
+    policy.repository_id != 0
+        && valid_repository(&policy.repository)
+        && valid_label(&policy.target)
+        && valid_label(&policy.target_triple)
+        && valid_label(&policy.builder_host_id)
+        && valid_label(&policy.worker_host_id)
+        && policy.builder_host_id != policy.worker_host_id
+}
+
+pub(crate) fn canary_host_observations_digest(
+    builder: &CanaryHostObservation,
+    worker: &CanaryHostObservation,
+) -> Result<Sha256Digest, ParallelProofError> {
+    let bytes = serde_json::to_vec(&(builder, worker))?;
+    let domain = b"shipyard.pulp-mac-canary.host-observations.v1";
+    let mut canonical = Vec::with_capacity(16 + domain.len() + bytes.len());
+    canonical.extend_from_slice(&(domain.len() as u64).to_be_bytes());
+    canonical.extend_from_slice(domain);
+    canonical.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    canonical.extend_from_slice(&bytes);
+    Ok(Sha256Digest::of_bytes(&canonical))
 }
 
 fn assess_timing(
@@ -401,7 +454,6 @@ fn assess_host(
         .collect::<BTreeSet<_>>();
     if host.capabilities.len() > MAX_CAPABILITIES
         || !strictly_sorted_unique(&host.capabilities)
-        || !capabilities.contains("macos-arm64")
         || proof.inventory.tests.iter().any(|test| {
             !test
                 .required_capabilities
@@ -411,6 +463,25 @@ fn assess_host(
     {
         reasons.insert(CanaryIneligibleReason::CapabilityMismatch);
     }
+}
+
+pub(crate) fn valid_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'))
+}
+
+fn valid_repository(value: &str) -> bool {
+    value.len() <= 256
+        && value.split_once('/').is_some_and(|(owner, repository)| {
+            !owner.is_empty()
+                && !repository.is_empty()
+                && !repository.contains('/')
+                && valid_label(owner)
+                && valid_label(repository)
+        })
 }
 
 fn strictly_sorted_unique<T: Ord>(values: &[T]) -> bool {
@@ -470,6 +541,13 @@ mod tests {
         ParallelProofManifest, ProofSubject, ResourceLock, ShardPlan, SourceIdentity, TestCase,
         TestInventory, TrustIdentity,
     };
+
+    const PULP_REPOSITORY_ID: u64 = 1_203_111_607;
+    const PULP_REPOSITORY: &str = "generous-corp/pulp";
+    const PULP_MAC_TARGET: &str = "mac";
+    const PULP_TARGET_TRIPLE: &str = "aarch64-apple-darwin";
+    const INITIAL_BUILDER: &str = "m3";
+    const INITIAL_WORKER: &str = "m1";
 
     struct Fixture {
         inventory: TestInventory,
@@ -574,11 +652,16 @@ mod tests {
     fn policy() -> PulpMacCanaryPolicy {
         PulpMacCanaryPolicy {
             enabled: true,
+            repository_id: PULP_REPOSITORY_ID,
+            repository: PULP_REPOSITORY.to_owned(),
+            target: PULP_MAC_TARGET.to_owned(),
+            target_triple: PULP_TARGET_TRIPLE.to_owned(),
+            builder_host_id: INITIAL_BUILDER.to_owned(),
+            worker_host_id: INITIAL_WORKER.to_owned(),
             assessed_at_ms: 10_000,
             maximum_observation_age_ms: 1_000,
             minimum_free_bytes: 100,
             required_cache_generations: vec![cache()],
-            ..PulpMacCanaryPolicy::default()
         }
     }
 
@@ -618,9 +701,16 @@ mod tests {
     #[test]
     fn default_policy_is_disabled_and_never_merge_authoritative() {
         let fixture = fixture();
+        let default_policy = PulpMacCanaryPolicy::default();
+        assert_eq!(default_policy.repository_id, 0);
+        assert!(default_policy.repository.is_empty());
+        assert!(default_policy.target.is_empty());
+        assert!(default_policy.target_triple.is_empty());
+        assert!(default_policy.builder_host_id.is_empty());
+        assert!(default_policy.worker_host_id.is_empty());
         let decision = assess_pulp_mac_canary(
             proof(&fixture),
-            &PulpMacCanaryPolicy::default(),
+            &default_policy,
             &[],
             &CanaryTimingEstimate {
                 manifest_digest: digest("unused-disabled-estimate"),
@@ -633,6 +723,32 @@ mod tests {
         .expect("decision");
         assert_eq!(decision, PulpMacCanaryDecision::Disabled);
         assert!(!decision.satisfies_merge_readiness());
+    }
+
+    #[test]
+    fn explicit_non_pulp_scope_and_hosts_are_eligible() {
+        let mut fixture = fixture();
+        fixture.manifest.source.repository_id = 42;
+        fixture.manifest.source.repository = "example/project".to_owned();
+        let mut configured = policy();
+        configured.repository_id = 42;
+        configured.repository = "example/project".to_owned();
+        configured.target = "release-mac".to_owned();
+        configured.builder_host_id = "builder-a".to_owned();
+        configured.worker_host_id = "worker-b".to_owned();
+        let mut estimate = timing(&fixture, 120_000);
+        estimate.target = configured.target.clone();
+        let decision = assess_pulp_mac_canary(
+            proof(&fixture),
+            &configured,
+            &[
+                host("builder-a", CanaryRoute::SameHost),
+                host("worker-b", CanaryRoute::Lan),
+            ],
+            &estimate,
+        )
+        .expect("decision");
+        assert!(matches!(decision, PulpMacCanaryDecision::Eligible { .. }));
     }
 
     #[test]

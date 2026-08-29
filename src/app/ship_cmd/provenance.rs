@@ -2,10 +2,14 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(not(test))]
+use super::steward_handoff_command;
 use super::{
     CliFailure, LoadedConfig, ResolvedPrContext, ShipStewardHandoff, StewardHandoffArgs,
-    steward_handoff_command, steward_handoff_transfer_report,
+    steward_handoff_transfer_report,
 };
+#[cfg(test)]
+use crate::app::merge_steward_cmd::steward_handoff_command_without_ambient;
 use crate::cloud::GitHubActions;
 use crate::paths::RuntimePaths;
 
@@ -15,6 +19,8 @@ pub(super) struct AppliedStewardHandoff {
     pub(super) context_url: Option<String>,
     pub(super) head: String,
     pub(super) monitoring_transferred: bool,
+    pub(super) agent_disposition: String,
+    pub(super) pause_required: bool,
     pub(super) publication_work_id: Option<String>,
     pub(super) publication_route_ref: Option<String>,
     pub(super) publication_wake_id: Option<String>,
@@ -200,23 +206,28 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
         .unwrap_or_else(|| format!("{repo}#{}", pr.number));
     let context_url = request.context_url.clone().or_else(|| pr.pr_url.clone());
     let mut sink = std::io::sink();
-    steward_handoff_command(
-        &StewardHandoffArgs {
-            repo: Some(repo.to_owned()),
-            pr: pr.number,
-            head: head.to_owned(),
-            workstream_id: workstream_id.clone(),
-            context_url: context_url.clone(),
-            agent_provider: None,
-            agent_session_id: None,
-            agent_parent_session_id: None,
-            agent_surface_id: None,
-            launch_profile: request.launch_profile.clone(),
-            goal_managed: request.launch_profile.is_some(),
-            after_handoff: "continue".to_owned(),
-            transfer_agent_owner: false,
-            apply: true,
-        },
+    let handoff_args = StewardHandoffArgs {
+        repo: Some(repo.to_owned()),
+        pr: pr.number,
+        head: head.to_owned(),
+        workstream_id: workstream_id.clone(),
+        context_url: context_url.clone(),
+        agent_provider: None,
+        agent_session_id: None,
+        agent_parent_session_id: None,
+        agent_surface_id: None,
+        launch_profile: request.launch_profile.clone(),
+        task_graph: request.task_graph.clone(),
+        goal_managed: request.launch_profile.is_some(),
+        after_handoff: request.after_handoff.clone(),
+        transfer_agent_owner: false,
+        apply: true,
+    };
+    #[cfg(not(test))]
+    steward_handoff_command(&handoff_args, cwd, runtime_paths, actions, false, &mut sink)?;
+    #[cfg(test)]
+    steward_handoff_command_without_ambient(
+        &handoff_args,
         cwd,
         runtime_paths,
         actions,
@@ -227,8 +238,12 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
     if !json_mode {
         writeln!(
             stdout,
-            "▸ Durable steward receipt: PR #{} head={} workstream={workstream_id} monitoring_transferred={}",
-            pr.number, head, transfer.wake_consumer_available
+            "▸ Durable steward receipt: PR #{} head={} workstream={workstream_id} monitoring_transferred={} agent_disposition={} pause_required={}",
+            pr.number,
+            head,
+            transfer.wake_consumer_available,
+            transfer.agent_disposition,
+            transfer.pause_required
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
@@ -237,6 +252,8 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
         context_url,
         head: head.to_owned(),
         monitoring_transferred: transfer.wake_consumer_available,
+        agent_disposition: transfer.agent_disposition,
+        pause_required: transfer.pause_required,
         publication_work_id: transfer.publication_work_id,
         publication_route_ref: transfer.publication_route_ref,
         publication_wake_id: transfer.publication_wake_id,

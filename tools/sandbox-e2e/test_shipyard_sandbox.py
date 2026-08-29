@@ -387,6 +387,33 @@ def test_protected_write_is_never_allowlisted_by_filename(tmp_path: Path) -> Non
     assert outcome in offenders
 
 
+def test_transient_directory_entry_does_not_contaminate_unchanged_tree(
+    tmp_path: Path,
+) -> None:
+    protected = tmp_path / "state"
+    protected.mkdir()
+    before = _snapshot_paths(protected)
+
+    transient = protected / "transient"
+    transient.write_text("temporary", encoding="utf-8")
+    transient.unlink()
+
+    assert _find_newer(protected, 0.0, before) == []
+
+
+def test_persistent_directory_entry_is_reported_after_metadata_normalization(
+    tmp_path: Path,
+) -> None:
+    protected = tmp_path / "state"
+    protected.mkdir()
+    before = _snapshot_paths(protected)
+
+    persistent = protected / "persistent"
+    persistent.write_text("outside write", encoding="utf-8")
+
+    assert _find_newer(protected, 0.0, before) == [persistent]
+
+
 @pytest.mark.parametrize("mutation", ["same-length", "append", "replace", "delete"])
 def test_preexisting_protected_file_mutation_is_reported(
     tmp_path: Path, mutation: str

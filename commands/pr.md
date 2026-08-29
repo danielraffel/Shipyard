@@ -9,7 +9,7 @@ Run `shipyard pr` to orchestrate the full push-a-PR flow:
 2. `scripts/version_bump_check.py --mode=apply` — rewrites `Cargo.toml` and `.claude-plugin/plugin.json` for any surface whose code moved. `--no-apply-bumps` switches to report mode so missing bumps hard-fail instead of auto-applying.
 3. `git commit` — single `chore: bump versions` commit using `--only` to pick up exactly the files the bump script touched (pre-staged files the user had in progress for other reasons stay in the index).
 4. Hands off to `shipyard ship` for push + `gh pr create` + cross-platform validate + merge on green.
-5. When the protected base branch has `[merge_steward].auto_handoff = true` (or `--workstream-id`/`--launch-profile` is supplied), writes the exact-head `shipyard/steward-handoff` receipt and managed label immediately after PR creation. With a valid private launch profile, it publishes the wake and waits for the live daemon's fenced provider delivery before reporting monitoring transfer. The PR branch cannot enable this project default for itself.
+5. When the protected base branch has `[merge_steward].auto_handoff = true` (or `--workstream-id`/`--launch-profile` is supplied), writes the exact-head `shipyard/steward-handoff` receipt and managed label immediately after PR creation. With a valid private launch profile, it publishes a zero-wake durable daemon obligation before reporting monitoring transfer. Provider delivery is not part of this boundary. The PR branch cannot enable this project default for itself.
 
 On merge, `.github/workflows/auto-release.yml` detects the `Cargo.toml` package-version move and creates a `v<x.y.z>` tag. The existing tag-triggered `release.yml` then builds + publishes the binaries.
 
@@ -29,6 +29,8 @@ shipyard pr $ARGUMENTS
 - `--workstream-id <id>` — opt into an atomic steward receipt and use this durable work item ID.
 - `--context-url <url>` — receipt link; defaults to the newly-created PR URL.
 - `--launch-profile <private-json>` — bind and publish a protected continuation; requires `--no-apply-bumps` because the profile binds the final exact head. Apply and commit required bumps before generating it. Never put secrets in this file.
+- `--after-handoff <continue|pause>` — disposition after monitoring transfer; defaults to `continue`.
+- `--task-graph <private-json>` — required with `pause`; proves that no independent runnable task remains.
 - `--no-steward-handoff` — explicitly override a project-configured automatic handoff.
 
 ## Bypass trailers (tip commit, never PR body)

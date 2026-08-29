@@ -254,6 +254,7 @@ Shipyard path (the local/controller class may omit it):
 ssh = "m5-lan"
 shipyard_bin = "/Users/you/.local/bin/shipyard"
 github_cli = "/Users/you/.local/bin/ghapp"
+github_token_helper = "/Users/you/.config/shipyard/bin/shipyard-github-app-token"
 shipyard_mode = "shipyard"
 shipyard_global_dir = "/Users/you/Library/Application Support/shipyard"
 shipyard_state_dir = "/Users/you/Library/Application Support/shipyard"
@@ -262,9 +263,13 @@ shipyard_state_dir = "/Users/you/Library/Application Support/shipyard"
 Then review and apply the same immutable release plan:
 
 ```sh
-shipyard runner fleet-update --to v0.100.0 --json
-shipyard runner fleet-update --to v0.100.0 --apply --json
+shipyard runner fleet-update --to vX.Y.Z --host-class m5 --json
+shipyard runner fleet-update --to vX.Y.Z --host-class m5 --apply --json
 ```
+
+Repeat `--host-class` for an intentionally ordered subset or use explicit
+`--all-hosts`. Omission, unknown names, and duplicates fail closed, and apply
+stops before every later host after the first failure.
 
 The command uses a stripped remote environment deliberately, invokes the
 configured absolute binary, bounds each host attempt to ten minutes, and
@@ -283,6 +288,27 @@ environment drift, not as evidence that Homebrew, Tart, or Shipyard is
 uninstalled. Fleet rollout rejects targets older than v0.100.0 before mutation;
 use an older release's documented manual procedure when rollback crosses that
 bootstrap boundary.
+
+Before any host can mutate, fleet rollout resolves the annotated release tag to
+its full tag-object, commit, and tree OIDs; binds the published release ID; and
+downloads the exact `checksums.sha256` and `shipyard-macos-arm64.dmg` assets by
+asset ID. Both downloads must match GitHub's SHA-256 metadata, the manifest must
+contain exactly one matching DMG entry, and `gh attestation verify` must bind
+the DMG to `danielraffel/Shipyard/.github/workflows/release.yml`, the exact tag
+ref, and source commit. A missing DMG attestation makes the release ineligible;
+an operator-provided tag or receipt cannot substitute for this verification.
+
+Each successful JSON host receipt carries that complete immutable authority and
+before/after primary and adjacent `shipyard-workstream-provider` paths,
+versions, and double-observed SHA-256 values. Pre-install source provenance is
+explicitly unverified; post-install source identity is the canonical digest of
+the verified release authority. Paired releases from v0.127.0 onward must match
+exactly, while a legacy rollback must prove the companion absent. The verifier
+closes its mint window by re-reading the tag, release ID, and asset inventory,
+then freezes one authority for the rollout. Every host must return that exact
+authority digest and platform-asset digest; receipts are never reminted from
+mutable GitHub state between hosts. Cross-host installed pair hashes must also
+agree, and any mismatch stops every later host.
 
 Runner-group access is valuable when Shipyard coordinates multiple local
 providers because an App-backed policy verifier can compare selected

@@ -207,9 +207,20 @@ pub(super) fn runner_command<W: Write>(
             json,
             stdout,
         ),
-        RunnerCommand::FleetUpdate { to, apply } => super::fleet_update_cmd::fleet_update_command(
-            &super::fleet_update_cmd::FleetUpdateArgs { to, apply },
+        RunnerCommand::FleetUpdate {
+            to,
+            host_classes,
+            all_hosts,
+            apply,
+        } => super::fleet_update_cmd::fleet_update_command(
+            &super::fleet_update_cmd::FleetUpdateArgs {
+                to,
+                host_classes,
+                all_hosts,
+                apply,
+            },
             mode,
+            cwd,
             runtime_paths,
             json,
             stdout,
@@ -273,6 +284,7 @@ pub(super) fn runner_command<W: Write>(
             launch_profile,
             goal_managed,
             after_handoff,
+            task_graph,
             transfer_agent_owner,
             apply,
         } => super::merge_steward_cmd::steward_handoff_command(
@@ -287,6 +299,7 @@ pub(super) fn runner_command<W: Write>(
                 agent_parent_session_id,
                 agent_surface_id,
                 launch_profile,
+                task_graph,
                 goal_managed,
                 after_handoff,
                 transfer_agent_owner,

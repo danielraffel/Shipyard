@@ -23,6 +23,16 @@ LOADER.exec_module(shipyard_github_app_token)
 
 
 class GitHubAppTokenHelperTests(unittest.TestCase):
+    def test_public_payload_includes_non_secret_installation_identity(self) -> None:
+        public = shipyard_github_app_token.public_token_payload(
+            {
+                "token": "ghs_test",
+                "kind": "github-app-installation",
+                "installation_id": "135929628",
+            }
+        )
+        self.assertEqual(public["installation_id"], "135929628")
+
     def test_base64url_bytes_strips_padding(self) -> None:
         self.assertEqual(shipyard_github_app_token.base64url_bytes(b"ship"), "c2hpcA")
 

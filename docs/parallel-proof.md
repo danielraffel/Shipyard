@@ -16,10 +16,15 @@ records what a future production controller must prove, but it has no queue,
 runner, GitHub, Check Run, or merge-authority integration. Consequently this
 slice alone produces no queue-time improvement.
 
-`src/parallel_proof_canary.rs` adds a second pure, default-off boundary for the
-first production experiment. It will admit only `generous-corp/pulp`'s exact
-numeric repository identity and `mac` target, built on M3 and shared over a
-freshly observed LAN route with M1. Both
+`src/parallel_proof_canary.rs` adds a second pure, default-off boundary for a
+production experiment. The reusable policy has no repository, target, or host
+defaults: enabling it requires an explicit numeric repository ID, canonical
+slug, Shipyard target, build target triple, builder host, and worker host. All
+six values are checked against live proof inputs and retained in measurement
+and cache receipts, so changing only a friendly slug or reusing a correlation
+ID under another target/host pair fails closed before execution. For the Pulp
+example, those values are `1203111607`, `generous-corp/pulp`, `mac`,
+`aarch64-apple-darwin`, M3, and M1. Both
 hosts must declare authenticated persistent, normalized, non-temporary staging
 roots, enough free space,
 the same exact required cache generations, current session generations, and
@@ -29,7 +34,7 @@ progress and can be considered by a later policy after route, cache, and
 disconnect recovery are measured.
 
 The canary accepts controller-owned timing evidence bound to the exact proof
-manifest and independently observed `mac` target only when the predicted
+manifest and explicitly configured target only when the predicted
 wall-clock saving is at least 120 seconds and 10 percent, and transfer plus
 dispatch cost is no more than exactly 15 percent of shard execution time.
 Shared Skia, Dawn, V8, Three.js, FetchContent, and ccache
@@ -162,9 +167,19 @@ matched result explicitly retains the existing full gate as authoritative and
 reports cross-host dispatch as false. It is not an operational canary or a
 speedup measurement.
 
-### Next executable one-host canary
+### Executable canary boundary
 
-The existing supported wiring seam is
+`shipyard parallel-proof-canary --request <absolute-private-json>` now exposes
+a one-shot production CLI seam. It plans without adapter execution or state
+mutation unless `--apply` is supplied. Apply remains default-off and requires
+trusted machine-global policy that pins a native adapter digest, complete
+invocation-authority digest, execution bounds, repository/target, and exact
+builder/worker identities. Shipyard validates strict typed evidence and owns
+immutable no-overwrite receipts; core contains no Pulp commands or personal
+host defaults. A reviewed installed adapter and physical M1/M3/M5 canaries are
+still external acceptance requirements.
+
+The existing changed-surface wiring seam remains
 `src/app/ship_cmd/changed_surface_execution.rs::apply_changed_surface_execution`,
 where trusted machine-global policy can default-off rewrite an exact target's
 stages while preserving the original full execution, feeding

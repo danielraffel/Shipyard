@@ -336,6 +336,9 @@ pub(super) fn cancel_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+mod orphan_reconciliation;
+pub(super) use orphan_reconciliation::reconcile_orphan_command;
+
 pub(super) fn bump_command<W: Write>(
     job_id: &str,
     priority: QueuePriority,
@@ -642,93 +645,4 @@ impl From<QueuePriority> for Priority {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{logs_command, write_log};
-    use crate::log_retention::{TERMINAL_MANIFEST_FILE, TerminalLogManifest};
-    use chrono::Utc;
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::Write;
-
-    #[test]
-    fn write_log_falls_back_to_retained_gzip() {
-        let temp = tempfile::tempdir().expect("temp");
-        let path = temp.path().join("target.log");
-        let output = std::fs::File::create(format!("{}.gz", path.display())).expect("gzip");
-        let mut encoder = GzEncoder::new(output, Compression::fast());
-        encoder.write_all(b"retained evidence\n").expect("write");
-        encoder.finish().expect("finish");
-        let mut stdout = Vec::new();
-        write_log(&mut stdout, path.to_str().expect("path")).expect("read gzip");
-        assert_eq!(stdout, b"retained evidence\n");
-    }
-
-    #[test]
-    fn write_log_includes_rotated_segments_oldest_first() {
-        let temp = tempfile::tempdir().expect("temp");
-        let path = temp.path().join("target.log");
-        std::fs::write(format!("{}.2", path.display()), "oldest\n").expect("oldest");
-        std::fs::write(format!("{}.1", path.display()), "older\n").expect("older");
-        std::fs::write(&path, "active\n").expect("active");
-        let mut stdout = Vec::new();
-        write_log(&mut stdout, path.to_str().expect("path")).expect("read history");
-        assert_eq!(stdout, b"oldest\nolder\nactive\n");
-    }
-
-    #[test]
-    fn trimmed_terminal_job_log_is_readable_by_target() {
-        let temp = tempfile::tempdir().expect("temp");
-        std::fs::write(temp.path().join("queue.json"), r#"{"jobs":[]}"#).expect("queue");
-        let job_dir = temp.path().join("logs/job");
-        std::fs::create_dir_all(&job_dir).expect("job dir");
-        std::fs::write(job_dir.join("macos.log"), "first attempt\n").expect("log");
-        std::fs::write(job_dir.join("macos.log.attempt-1"), "first failover\n").expect("failover");
-        std::fs::write(job_dir.join("macos.log.retry1"), "terminal retry\n").expect("retry");
-        let nested = std::fs::File::create(job_dir.join("macos.log.retry1.attempt-2.gz"))
-            .expect("nested gzip");
-        let mut encoder = GzEncoder::new(nested, Compression::fast());
-        encoder
-            .write_all(b"terminal failover\n")
-            .expect("nested log");
-        encoder.finish().expect("finish nested gzip");
-        let manifest = TerminalLogManifest {
-            schema_version: 1,
-            job_id: "job".to_owned(),
-            terminal_at: Utc::now(),
-            failed: false,
-            reason: "passed".to_owned(),
-        };
-        std::fs::write(
-            job_dir.join(TERMINAL_MANIFEST_FILE),
-            serde_json::to_vec(&manifest).expect("manifest"),
-        )
-        .expect("manifest");
-        let mut stdout = Vec::new();
-        logs_command("job", Some("macos".to_owned()), temp.path(), &mut stdout)
-            .expect("retained log");
-        assert_eq!(
-            stdout,
-            b"first attempt\nfirst failover\nterminal retry\nterminal failover\n"
-        );
-
-        std::fs::remove_file(job_dir.join(TERMINAL_MANIFEST_FILE)).expect("remove manifest");
-        let mut unclassified = Vec::new();
-        logs_command(
-            "job",
-            Some("macos".to_owned()),
-            temp.path(),
-            &mut unclassified,
-        )
-        .expect("unclassified retained log");
-        assert_eq!(unclassified, stdout);
-
-        let error = logs_command(
-            "../job",
-            Some("macos".to_owned()),
-            temp.path(),
-            &mut Vec::new(),
-        )
-        .expect_err("job traversal rejected");
-        assert_eq!(error.code, 2);
-    }
-}
+mod tests;

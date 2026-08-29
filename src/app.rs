@@ -36,8 +36,54 @@ mod init_cmd;
 mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
-pub(crate) use merge_steward_cmd::{LaunchProfileV1, decode_protected_launch_profile};
+pub(crate) use merge_steward_cmd::{
+    ExactStewardTransition, LaunchProfileV1, decode_protected_launch_profile,
+    exact_steward_transition,
+};
+
+#[cfg(unix)]
+pub(crate) fn daemon_steward_repository(
+    mode: crate::identity::RuntimeMode,
+    runtime_paths: &crate::paths::RuntimePaths,
+    cwd: &std::path::Path,
+    repository: &str,
+    base_ref: &str,
+) -> Result<(), String> {
+    let actions = crate::cloud::GitHubActions::from_cwd(mode, cwd).with_repo_override(repository);
+    let args = merge_steward_cmd::StewardCommandArgs {
+        repos: vec![repository.to_owned()],
+        base: base_ref.to_owned(),
+        opt_out_label: "shipyard:no-auto-merge".to_owned(),
+        provenance_blocking_labels: vec!["5·unresolved".to_owned()],
+        managed_label: "shipyard:managed".to_owned(),
+        handoff_context: "Shipyard managed work".to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: true,
+        preempt_capacity: false,
+        max_preemptions_per_head: 1,
+        apply: true,
+        ledger: None,
+    };
+    let mut sink = Vec::new();
+    let code = merge_steward_cmd::steward_command(
+        &args,
+        cwd,
+        mode,
+        runtime_paths,
+        &actions,
+        true,
+        &mut sink,
+    )
+    .map_err(|error| error.message)?;
+    if code == std::process::ExitCode::SUCCESS {
+        Ok(())
+    } else {
+        Err("daemon exact steward cycle was unhealthy".to_owned())
+    }
+}
 mod metrics_cmd;
+mod parallel_proof_canary_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
@@ -52,6 +98,7 @@ mod run_cmd;
 mod runner_cmd;
 mod runner_kill_cmd;
 mod runner_provision_cmd;
+mod sandbox_audit_cmd;
 mod ship_cmd;
 mod ship_state_cmd;
 mod targets_cmd;
@@ -88,12 +135,14 @@ use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
 use self::merge_queue_control_cmd::merge_queue_control_command;
 use self::metrics_cmd::metrics_command;
+use self::parallel_proof_canary_cmd::parallel_proof_canary_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
 use self::pr_cmd::{PrCommandArgs, StewardHandoffPreference, pr_command};
 use self::quarantine_cmd::quarantine_command;
 use self::queue_cmd::{
-    bump_command, cancel_command, evidence_command, logs_command, queue_command, status_command,
+    bump_command, cancel_command, evidence_command, logs_command, queue_command,
+    reconcile_orphan_command, status_command,
 };
 use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
 use self::release_bot_cmd::release_bot_command;
@@ -216,7 +265,11 @@ where
     // volume's cwd was temporarily unavailable.
     let cwd = if matches!(
         &cli.command,
-        Command::Daemon { .. } | Command::WriterDomainExec { .. }
+        Command::Daemon { .. }
+            | Command::WriterDomainExec { .. }
+            | Command::SandboxAuditExec { .. }
+            | Command::ParallelProofCanary { .. }
+            | Command::ParallelProofCanaryWorker { .. }
     ) {
         PathBuf::new()
     } else {
@@ -248,12 +301,46 @@ where
             };
             return Ok(ExitCode::from(code));
         }
+        Command::SandboxAuditExec {
+            work_id,
+            authority_sha,
+            worker_generation,
+            command,
+        } => {
+            return if let Some(generation) = worker_generation {
+                sandbox_audit_cmd::sandbox_audit_worker_command(
+                    &runtime_paths.state_dir,
+                    &work_id,
+                    &authority_sha,
+                    &generation,
+                    &command,
+                )
+            } else {
+                sandbox_audit_cmd::sandbox_audit_exec_command(
+                    &runtime_paths.state_dir,
+                    &work_id,
+                    &authority_sha,
+                    &command,
+                )
+            };
+        }
         Command::ExecutionWorker { job_id, generation } => {
             return execution_worker_command(
                 &job_id,
                 &generation,
                 cli.mode.into(),
                 &runtime_paths.global_dir,
+                &runtime_paths.state_dir,
+            );
+        }
+        Command::ParallelProofCanaryWorker { job_id, generation } => {
+            let config =
+                LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+                    .map_err(|error| CliFailure::new(2, error.to_string()))?;
+            return self::parallel_proof_canary_cmd::parallel_proof_canary_worker_command(
+                &job_id,
+                &generation,
+                &config,
                 &runtime_paths.state_dir,
             );
         }
@@ -313,6 +400,7 @@ where
         | Command::Evidence { .. }
         | Command::Logs { .. }
         | Command::Cancel { .. }
+        | Command::QueueReconcileOrphan { .. }
         | Command::Bump { .. }
         | Command::Queue
         | Command::Cleanup { .. }) => {
@@ -320,6 +408,7 @@ where
                 command,
                 cli.mode.into(),
                 &cwd,
+                &runtime_paths.global_dir,
                 &runtime_paths.state_dir,
                 cli.json,
                 stdout,
@@ -443,8 +532,27 @@ where
                 stdout,
             );
         }
+        Command::ParallelProofCanary {
+            request,
+            apply,
+            status,
+            cancel,
+        } => {
+            let config =
+                LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+                    .map_err(|error| CliFailure::new(2, error.to_string()))?;
+            return parallel_proof_canary_command(
+                request.as_deref(),
+                apply,
+                status.as_deref(),
+                cancel.as_deref(),
+                &config,
+                &runtime_paths.state_dir,
+                stdout,
+            );
+        }
         Command::WorkLedger { command } => {
-            return work_ledger_command(&command, &runtime_paths, cli.json, stdout);
+            return work_ledger_command(&command, &runtime_paths, &cwd, cli.json, stdout);
         }
         Command::Wait { command } => {
             return handle_wait_command(
@@ -516,8 +624,10 @@ fn handle_operational_variant<W: Write>(
             handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
         }
         Command::WriterDomainExec { .. }
+        | Command::SandboxAuditExec { .. }
         | Command::Paths
         | Command::ExecutionWorker { .. }
+        | Command::ParallelProofCanaryWorker { .. }
         | Command::Pin { .. }
         | Command::Dependency { .. }
         | Command::Config { .. }
@@ -533,11 +643,13 @@ fn handle_operational_variant<W: Write>(
         | Command::Evidence { .. }
         | Command::Logs { .. }
         | Command::Cancel { .. }
+        | Command::QueueReconcileOrphan { .. }
         | Command::Bump { .. }
         | Command::Queue
         | Command::QueueObserve { .. }
         | Command::ChangedSurfacePlan { .. }
         | Command::ChangedSurfaceTrialStatus { .. }
+        | Command::ParallelProofCanary { .. }
         | Command::WorkLedger { .. }
         | Command::Cleanup { .. }
         | Command::Targets { .. }
@@ -600,6 +712,7 @@ fn handle_state_command<W: Write>(
     command: Command,
     mode: RuntimeMode,
     cwd: &Path,
+    global_dir: &Path,
     state_dir: &Path,
     json: bool,
     stdout: &mut W,
@@ -616,6 +729,26 @@ fn handle_state_command<W: Write>(
         Command::Cancel { job_id, reason } => {
             cancel_command(&job_id, reason.as_deref(), state_dir, json, stdout)
         }
+        Command::QueueReconcileOrphan {
+            job_id,
+            expected_head,
+            expected_request_sha256,
+            expected_job_sha256,
+            apply,
+            confirm_no_worker_tree,
+        } => reconcile_orphan_command(
+            &job_id,
+            expected_head.as_deref(),
+            expected_request_sha256.as_deref(),
+            expected_job_sha256.as_deref(),
+            apply,
+            confirm_no_worker_tree,
+            mode,
+            global_dir,
+            state_dir,
+            json,
+            stdout,
+        ),
         Command::Bump { job_id, priority } => {
             bump_command(&job_id, priority, state_dir, json, stdout)
         }
@@ -827,6 +960,8 @@ fn handle_pr_variant<W: Write>(
         workstream_id,
         context_url,
         launch_profile,
+        after_handoff,
+        task_graph,
         no_steward_handoff,
     } = command
     else {
@@ -849,6 +984,8 @@ fn handle_pr_variant<W: Write>(
             workstream_id,
             context_url,
             launch_profile,
+            after_handoff,
+            task_graph,
             steward_handoff_preference: if no_steward_handoff {
                 StewardHandoffPreference::Disabled
             } else {

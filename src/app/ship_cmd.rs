@@ -6,6 +6,8 @@ use std::process::ExitCode;
 use serde_json::Value;
 
 use super::daemon_cmd::ensure_execution_daemon;
+#[cfg(not(test))]
+use super::merge_steward_cmd::steward_handoff_command;
 use super::{
     CliFailure, SHIP_EXIT_MERGE_CLIENT_DEFECT, SHIP_EXIT_VALIDATION_STATE_MISSING,
     auto_merge_cmd::{
@@ -13,9 +15,7 @@ use super::{
         supervise_merge_queue,
     },
     cli::{MergeMethod, MergeResult},
-    merge_steward_cmd::{
-        StewardHandoffArgs, steward_handoff_command, steward_handoff_transfer_report,
-    },
+    merge_steward_cmd::{StewardHandoffArgs, steward_handoff_transfer_report},
     wait_cmd::parse_github_repo_slug,
 };
 use crate::auto_rescue::{
@@ -95,6 +95,8 @@ pub(super) struct ShipStewardHandoff {
     pub(super) workstream_id: Option<String>,
     pub(super) context_url: Option<String>,
     pub(super) launch_profile: Option<std::path::PathBuf>,
+    pub(super) after_handoff: String,
+    pub(super) task_graph: Option<std::path::PathBuf>,
 }
 
 mod changed_surface_execution;

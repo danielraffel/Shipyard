@@ -83,6 +83,7 @@ fn prospective_runner_matches_only_queued_subset_labels() {
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     let mut job = StewardJob {
+        id: 1,
         name: "macOS".to_owned(),
         status: "queued".to_owned(),
         conclusion: None,

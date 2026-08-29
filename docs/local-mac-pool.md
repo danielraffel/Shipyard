@@ -175,7 +175,13 @@ use an App-authenticated GitHub wrapper, set `github_cli = "ghapp"` on each
 
 For unattended Shipyard rollout, set `shipyard_bin` to an absolute path on
 every remote host class and make its existing `github_cli` an absolute governed
-helper path. Also declare `shipyard_mode`, `shipyard_global_dir`, and
+wrapper path. Set `github_token_helper` to the distinct absolute
+`shipyard-github-app-token` path; fleet rollout never guesses it from a
+username, host label, `PATH`, or wrapper environment. Declare the wrapper's
+fixed `$HOME/.config/shipyard/bin/shipyard-github-app-token`
+location explicitly; a different helper path fails before any replacement so
+the preserved daemon configuration cannot silently invoke another helper.
+Also declare `shipyard_mode`, `shipyard_global_dir`, and
 `shipyard_state_dir`; rollout fails closed without that exact daemon context.
 Use `shipyard runner fleet-update --to vX.Y.Z` to
 inspect the plan and add `--apply` only for the exact release being deployed.
@@ -191,6 +197,18 @@ installation test: an absolute configured binary that is executable proves the
 tool is present, while a failed relative lookup proves only launch-environment
 drift. Fleet status and rollout therefore use profile paths rather than
 classifying PATH invisibility as absence.
+
+The same frozen release authority binds the `scripts/ghapp` and
+`scripts/shipyard-github-app-token` blobs at the peeled release commit and
+tree. Rollout stages and verifies both, records the existing path/digest/mode,
+then installs the helper before the wrapper as owner-private mode `0700`
+files. The two-file transaction uses same-directory atomic renames, restores
+both old files after a partial error, and keeps a private state-directory
+journal so the next attempt can reconcile an abrupt interruption. It never
+edits GitHub App configuration, key material, or token caches; repository-
+partitioned caching remains behavior of the reviewed helper blob. Post-update
+receipts bind both installed digests and blob OIDs to the same release
+authority used for the CLI pair.
 
 `shipyard runner fleet-status` is the read-only GitHub monitoring surface for
 this pool (it writes only a local observation snapshot). In addition to TartCI

@@ -2,7 +2,7 @@ use super::*;
 use crate::work_ledger::dispatch::{
     DeliveryFence, FreshAgentLaunchProfile, ProviderAdapter, ProviderCapability,
     ProviderLaunchRequest, ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult, WakeEnvelope,
-    WakeProfileResolver,
+    WakeProfileResolver, reconciliation_fence_digest,
 };
 
 #[derive(Clone)]
@@ -82,6 +82,27 @@ impl WakeProfileResolver for Resolver {
     }
 }
 
+struct RepositoryIsolatingResolver {
+    healthy: TestProfile,
+    refused_repository: String,
+    calls: Vec<String>,
+}
+
+impl WakeProfileResolver for RepositoryIsolatingResolver {
+    type Profile = TestProfile;
+
+    fn resolve(&mut self, wake: &WakeEnvelope) -> WorkLedgerResult<Self::Profile> {
+        self.calls.push(wake.repository.clone());
+        if wake.repository == self.refused_repository {
+            Err(WorkLedgerError::Refused(
+                "malformed repository launch profile".to_owned(),
+            ))
+        } else {
+            Ok(self.healthy.clone())
+        }
+    }
+}
+
 struct Adapter {
     capability: Option<ProviderCapability>,
     launch_outcomes: Vec<ProviderOutcome>,
@@ -90,6 +111,9 @@ struct Adapter {
     launch_fences: Vec<DeliveryFence>,
     reconcile_fences: Vec<DeliveryFence>,
     panic_after_claim: bool,
+    panic_during_submit_authorization: bool,
+    authorization_refusal: Option<ProviderOutcome>,
+    authorization_count: usize,
 }
 
 impl Adapter {
@@ -110,6 +134,9 @@ impl Adapter {
             launch_fences: Vec::new(),
             reconcile_fences: Vec::new(),
             panic_after_claim: false,
+            panic_during_submit_authorization: false,
+            authorization_refusal: None,
+            authorization_count: 0,
         }
     }
 }
@@ -121,7 +148,44 @@ impl ProviderAdapter for Adapter {
             .flatten()
     }
 
-    fn launch(&mut self, request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+    fn authorize(
+        &mut self,
+        fence: &DeliveryFence,
+        operation: ProviderAuthorizationOperation,
+    ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+        self.authorization_count += 1;
+        assert!(
+            !(self.panic_during_submit_authorization
+                && operation == ProviderAuthorizationOperation::Submit),
+            "simulated process death after durable preparation"
+        );
+        if let Some(refusal) = self.authorization_refusal.take() {
+            return Err(refusal);
+        }
+        Ok(DeliveryAuthorization::for_test(
+            fence.work_generation,
+            fence.owner_generation,
+        ))
+    }
+
+    fn authorize_reconciliation(
+        &mut self,
+        fence: &DeliveryFence,
+    ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+        self.authorization_count += 1;
+        if let Some(refusal) = self.authorization_refusal.take() {
+            return Err(refusal);
+        }
+        Ok(ReconciliationAuthorization::for_test(
+            reconciliation_fence_digest(fence),
+        ))
+    }
+
+    fn launch(
+        &mut self,
+        request: ProviderLaunchRequest<'_>,
+        _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         self.launch_count += 1;
         self.launch_fences.push(request.fence.clone());
         assert!(
@@ -131,10 +195,54 @@ impl ProviderAdapter for Adapter {
         self.launch_outcomes.remove(0)
     }
 
-    fn reconcile(&mut self, fence: &DeliveryFence) -> ProviderOutcome {
+    fn reconcile(
+        &mut self,
+        fence: &DeliveryFence,
+        _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         self.reconcile_fences.push(fence.clone());
         self.reconcile_outcome.clone()
     }
+
+    fn reconcile_read_only(
+        &mut self,
+        fence: &DeliveryFence,
+        _authority: ReconciliationAuthorization,
+    ) -> ProviderOutcome {
+        self.reconcile_fences.push(fence.clone());
+        self.reconcile_outcome.clone()
+    }
+}
+
+#[test]
+fn authority_refusal_never_marks_launched_or_enters_provider() {
+    let (_temp, ledger, profile, _work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut adapter = Adapter::successful(true);
+    adapter.authorization_refusal = Some(ProviderOutcome::Rejected {
+        evidence: b"delivery-authority-refused:head_mismatch".to_vec(),
+    });
+
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+            .expect("durable authority refusal"),
+        WakeDeliveryResult::Failed
+    );
+    assert_eq!(adapter.authorization_count, 1);
+    assert_eq!(adapter.launch_count, 0);
+    let from_state: String = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT from_state FROM provider_delivery_observations observation
+             JOIN provider_deliveries delivery USING(delivery_id)
+             WHERE delivery.wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("authority refusal observation");
+    assert_eq!(from_state, "prepared");
 }
 
 struct DriftingReconcileAdapter {
@@ -148,11 +256,34 @@ impl ProviderAdapter for DriftingReconcileAdapter {
         self.inner.capability(provider_id)
     }
 
-    fn launch(&mut self, request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
-        self.inner.launch(request)
+    fn authorize(
+        &mut self,
+        fence: &DeliveryFence,
+        operation: ProviderAuthorizationOperation,
+    ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+        self.inner.authorize(fence, operation)
     }
 
-    fn reconcile(&mut self, fence: &DeliveryFence) -> ProviderOutcome {
+    fn authorize_reconciliation(
+        &mut self,
+        fence: &DeliveryFence,
+    ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+        self.inner.authorize_reconciliation(fence)
+    }
+
+    fn launch(
+        &mut self,
+        request: ProviderLaunchRequest<'_>,
+        authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
+        self.inner.launch(request, authority)
+    }
+
+    fn reconcile(
+        &mut self,
+        fence: &DeliveryFence,
+        authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         rusqlite::Connection::open(&self.database_path)
             .expect("concurrent connection")
             .execute(
@@ -160,7 +291,22 @@ impl ProviderAdapter for DriftingReconcileAdapter {
                 [&self.work_item_id],
             )
             .expect("plant concurrent lifecycle change");
-        self.inner.reconcile(fence)
+        self.inner.reconcile(fence, authority)
+    }
+
+    fn reconcile_read_only(
+        &mut self,
+        fence: &DeliveryFence,
+        authority: ReconciliationAuthorization,
+    ) -> ProviderOutcome {
+        rusqlite::Connection::open(&self.database_path)
+            .expect("concurrent connection")
+            .execute(
+                "UPDATE work_items SET work_generation = work_generation + 1 WHERE id = ?1",
+                [&self.work_item_id],
+            )
+            .expect("plant concurrent lifecycle change");
+        self.inner.reconcile_read_only(fence, authority)
     }
 }
 
@@ -487,6 +633,55 @@ fn repository_allowlist_skips_unauthorized_wake_without_mutation_or_starvation()
 }
 
 #[test]
+fn malformed_repository_is_contained_without_starving_healthy_repository() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("ledger");
+    let mut malformed = sample_candidate();
+    malformed.repo = Some("danielraffel/pulp".to_owned());
+    let (_malformed_profile, _malformed_work, malformed_wake) = add_wake(&ledger, malformed);
+
+    let mut healthy = sample_candidate();
+    healthy.work_id = opaque_ref("wi", "healthy shipyard continuation");
+    healthy.repo = Some("generous-corp/shipyard".to_owned());
+    healthy.source_ref = opaque_ref("src", "healthy shipyard continuation");
+    healthy.content_digest = digest(b"healthy shipyard continuation");
+    let (mut healthy_profile, _healthy_work, healthy_wake) =
+        add_wake_labeled(&ledger, healthy, "healthy-repository", false);
+    healthy_profile.repository = "generous-corp/shipyard".to_owned();
+    let policy = WakeConsumerPolicy {
+        activation_enabled: true,
+        dispatch_enabled: true,
+        authorized_repositories: vec![
+            "danielraffel/pulp".to_owned(),
+            "generous-corp/shipyard".to_owned(),
+        ],
+    };
+    let mut resolver = RepositoryIsolatingResolver {
+        healthy: healthy_profile,
+        refused_repository: "danielraffel/pulp".to_owned(),
+        calls: Vec::new(),
+    };
+    let mut adapter = Adapter::successful(true);
+
+    assert_eq!(
+        ledger
+            .consume_one_wake(policy, &mut resolver, &mut adapter)
+            .expect("healthy repository progresses around malformed peer"),
+        WakeDeliveryResult::Delivered
+    );
+    assert_eq!(
+        resolver.calls,
+        vec![
+            "danielraffel/pulp".to_owned(),
+            "generous-corp/shipyard".to_owned(),
+        ]
+    );
+    assert_eq!(outbox_state(&ledger, &malformed_wake), "pending");
+    assert_eq!(outbox_state(&ledger, &healthy_wake), "delivered");
+    assert_eq!(adapter.launch_count, 1);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
     let (temp, ledger, profile, work_id, _wake_id) = setup_wake();
@@ -586,16 +781,16 @@ fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
             .is_err(),
         "a different receipt cannot replay an already returned ownership"
     );
-    let work: (String, u64) = restarted
+    let work: (String, u64, String) = restarted
         .connect_read_only()
         .expect("connection")
         .query_row(
-            "SELECT phase, work_generation FROM work_items WHERE id = ?1",
+            "SELECT phase, work_generation, head_sha FROM work_items WHERE id = ?1",
             [&work_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("returned work");
-    assert_eq!(work, ("returned".to_owned(), 8));
+    assert_eq!(work, ("returned".to_owned(), 8, expected.head_sha.clone()));
 }
 
 #[test]
@@ -623,6 +818,21 @@ fn context_and_return_receipts_refuse_drift_without_partial_transition() {
         &ownership.ownership_id,
         &ownership.receipt_digest,
         &delivery_id,
+    );
+    let mut unchanged_head = expected.clone();
+    unchanged_head.head_sha = context_receipt(&ledger, &wake_id).head_sha;
+    assert!(
+        ledger
+            .return_agent_ownership(
+                &ownership.ownership_id,
+                &delivery_id,
+                7,
+                &unchanged_head,
+                &serde_json::to_vec(&return_receipt(&unchanged_head))
+                    .expect("unchanged-head return"),
+            )
+            .is_err(),
+        "ownership return must advance to a distinct remotely acknowledged head"
     );
     let mut wrong_return = return_receipt(&expected);
     wrong_return.head_sha = "2234567890123456789012345678901234567890".to_owned();
@@ -1084,7 +1294,7 @@ fn retry_ceiling_fails_closed_without_allocating_an_unbounded_attempt() {
 }
 
 #[test]
-fn retry_ceiling_also_applies_when_the_final_attempt_is_reconciled() {
+fn retryable_reconciliation_remains_uncertain_and_never_redispatches() {
     let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
     let mut resolver = Resolver { profile, calls: 0 };
     let mut adapter = Adapter::successful(true);
@@ -1120,10 +1330,19 @@ fn retry_ceiling_also_applies_when_the_final_attempt_is_reconciled() {
     assert_eq!(
         ledger
             .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut adapter)
-            .expect("terminal reconciliation"),
-        WakeDeliveryResult::Failed
+            .expect("non-definitive reconciliation"),
+        WakeDeliveryResult::Uncertain
     );
-    assert_eq!(outbox_state(&ledger, &wake_id), "failed");
+    assert_eq!(outbox_state(&ledger, &wake_id), "uncertain");
+    assert_eq!(adapter.launch_count, 3);
+    assert_eq!(adapter.reconcile_fences.len(), 1);
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+            .expect("uncertain wake is never a submit candidate"),
+        WakeDeliveryResult::Empty
+    );
+    assert_eq!(adapter.launch_count, 3);
 
     let connection = ledger.connect_read_only().expect("connection");
     let work: (String, u64) = connection
@@ -1132,8 +1351,8 @@ fn retry_ceiling_also_applies_when_the_final_attempt_is_reconciled() {
             [&work_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .expect("actionable work");
-    assert_eq!(work, ("actionable".to_owned(), 7));
+        .expect("dispatching work");
+    assert_eq!(work, ("dispatching".to_owned(), 6));
     let attempts: u64 = connection
         .query_row(
             "SELECT count(*) FROM wake_attempts WHERE wake_id = ?1",
@@ -1142,15 +1361,15 @@ fn retry_ceiling_also_applies_when_the_final_attempt_is_reconciled() {
         )
         .expect("bounded attempt count");
     assert_eq!(attempts, 3);
-    let terminal_event: String = connection
+    let terminal_events: u64 = connection
         .query_row(
-            "SELECT kind FROM events
+            "SELECT count(*) FROM events
              WHERE work_item_id = ?1 AND work_generation = 7",
             [&work_id],
             |row| row.get(0),
         )
-        .expect("reconciled retry exhaustion event");
-    assert_eq!(terminal_event, "provider_retry_exhausted");
+        .expect("no false terminal event");
+    assert_eq!(terminal_events, 0);
 }
 
 #[test]
@@ -1209,6 +1428,300 @@ fn restart_reconciles_idempotent_claim_without_duplicate_launch() {
         ledger
             .consume_one_wake(active_policy(), &mut resolver, &mut restarted)
             .expect("duplicate tick"),
+        WakeDeliveryResult::Empty
+    );
+}
+
+#[test]
+fn terminal_stewardship_cancels_prepared_work_before_provider_submit() {
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut interrupted = Adapter::successful(true);
+    interrupted.panic_during_submit_authorization = true;
+    let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ledger.consume_one_wake(active_policy(), &mut resolver, &mut interrupted);
+    }));
+    assert!(death.is_err());
+    assert_eq!(outbox_state(&ledger, &wake_id), "claimed");
+
+    assert!(
+        ledger
+            .transition_with_wake(&work_id, 6, 3, LifecycleState::Terminal, None)
+            .expect("terminal suppression")
+    );
+    assert_eq!(outbox_state(&ledger, &wake_id), "failed");
+    let states: (String, String, String) = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT attempt.state, delivery.state, activation.state
+               FROM wake_attempts attempt
+               JOIN provider_deliveries delivery
+                 ON delivery.wake_id = attempt.wake_id AND delivery.attempt = attempt.attempt
+               JOIN activation_epochs activation
+                 ON activation.activation_id = delivery.activation_id
+              WHERE attempt.wake_id = ?1",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("suppressed provider state");
+    assert_eq!(
+        states,
+        (
+            "failed".to_owned(),
+            "failed".to_owned(),
+            "released".to_owned()
+        )
+    );
+    assert_eq!(interrupted.launch_count, 0);
+}
+
+#[test]
+fn terminal_stewardship_defers_launched_claim_for_reconciliation_only() {
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let mut first_resolver = Resolver {
+        profile: profile.clone(),
+        calls: 0,
+    };
+    let mut interrupted = Adapter::successful(true);
+    interrupted.panic_after_claim = true;
+    let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ledger.consume_one_wake(active_policy(), &mut first_resolver, &mut interrupted);
+    }));
+    assert!(death.is_err());
+    assert_eq!(outbox_state(&ledger, &wake_id), "claimed");
+
+    assert!(
+        !ledger
+            .transition_with_wake(&work_id, 6, 3, LifecycleState::Terminal, None)
+            .expect("defer terminal while provider outcome is unknown")
+    );
+    let phase: String = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT phase FROM work_items WHERE id = ?1",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("phase");
+    assert_eq!(phase, "dispatching");
+
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut restarted = Adapter::successful(true);
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut restarted)
+            .expect("reconcile launched claim"),
+        WakeDeliveryResult::Delivered
+    );
+    assert_eq!(restarted.launch_count, 0);
+    assert_eq!(restarted.reconcile_fences.len(), 1);
+    assert!(
+        ledger
+            .transition_with_wake(&work_id, 6, 3, LifecycleState::Terminal, None)
+            .expect("terminal after reconciliation")
+    );
+}
+
+#[test]
+fn claimed_without_request_is_restart_completed_and_submitted_without_reconcile() {
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let profile_ref = profile.route_profile_ref().expect("profile ref");
+    let claimed_at = Utc::now().to_rfc3339();
+    let original_owner = opaque_ref("consumer", "crashed-before-request-publication");
+    let connection = ledger.connect_read_write().expect("connection");
+    connection
+        .execute(
+            "UPDATE outbox SET state = 'claimed', profile_ref = ?2, updated_at = ?3
+             WHERE wake_id = ?1 AND state = 'pending'",
+            params![wake_id, profile_ref, claimed_at],
+        )
+        .expect("simulate committed claim");
+    connection
+        .execute(
+            "INSERT INTO wake_attempts
+             (wake_id, attempt, state, adapter_id, idempotent, started_at)
+             VALUES (?1, 1, 'claimed', 'test-provider-adapter', 0, ?2)",
+            params![wake_id, claimed_at],
+        )
+        .expect("simulate claimed attempt");
+    connection
+        .execute(
+            "INSERT INTO wake_claim_epochs
+             (wake_id, attempt, epoch, owner_ref, kind, acquired_at)
+             VALUES (?1, 1, 1, ?2, 'claim', ?3)",
+            params![wake_id, original_owner, claimed_at],
+        )
+        .expect("simulate original owner epoch");
+    drop(connection);
+
+    let mut resolver = Resolver {
+        profile: profile.clone(),
+        calls: 0,
+    };
+    let mut recovery = Adapter::successful(false);
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut recovery)
+            .expect("restart completes request then submits"),
+        WakeDeliveryResult::Delivered
+    );
+    assert_eq!(recovery.launch_count, 1);
+    assert!(recovery.reconcile_fences.is_empty());
+    assert_eq!(recovery.launch_fences[0].attempt, 1);
+    assert_eq!(outbox_state(&ledger, &wake_id), "delivered");
+    let prepared_requests: u64 = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT count(*) FROM protected_objects
+             WHERE work_item_id = ?1 AND kind = 'provider_request'",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("restart-completed request");
+    assert_eq!(prepared_requests, 1);
+    let (attempts, owners): (u64, u64) = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT (SELECT count(*) FROM wake_attempts WHERE wake_id = ?1),
+                    (SELECT count(DISTINCT owner_ref) FROM wake_claim_epochs WHERE wake_id = ?1)",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("fresh-owner evidence");
+    assert_eq!(attempts, 1);
+    assert!(owners >= 2);
+}
+
+#[test]
+fn prepared_request_is_restart_completed_without_reconciliation_or_new_attempt() {
+    let (_temp, ledger, profile, _work_id, wake_id) = setup_wake();
+    let mut first_resolver = Resolver {
+        profile: profile.clone(),
+        calls: 0,
+    };
+    let mut interrupted = Adapter::successful(false);
+    interrupted.panic_during_submit_authorization = true;
+    let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ledger.consume_one_wake(active_policy(), &mut first_resolver, &mut interrupted);
+    }));
+    assert!(death.is_err());
+    assert_eq!(outbox_state(&ledger, &wake_id), "claimed");
+    let delivery_state: String = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT state FROM provider_deliveries WHERE wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("prepared delivery");
+    assert_eq!(delivery_state, "prepared");
+
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut recovery = Adapter::successful(false);
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut recovery)
+            .expect("restart launches prepared request"),
+        WakeDeliveryResult::Delivered
+    );
+    assert_eq!(recovery.launch_count, 1);
+    assert!(recovery.reconcile_fences.is_empty());
+    assert_eq!(recovery.launch_fences[0].attempt, 1);
+}
+
+#[test]
+fn exact_not_delivered_reconciliation_permits_one_fresh_owner_submit() {
+    let (_temp, ledger, profile, _work_id, _wake_id) = setup_wake();
+    let mut first_resolver = Resolver {
+        profile: profile.clone(),
+        calls: 0,
+    };
+    let mut interrupted = Adapter::successful(true);
+    interrupted.panic_after_claim = true;
+    let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ledger.consume_one_wake(active_policy(), &mut first_resolver, &mut interrupted);
+    }));
+    assert!(death.is_err());
+
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut recovery = Adapter::successful(true);
+    recovery.reconcile_outcome = ProviderOutcome::NotDelivered {
+        evidence: b"provider proved original idempotency key absent".to_vec(),
+    };
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut recovery)
+            .expect("exact not-delivered reconciliation"),
+        WakeDeliveryResult::Retrying
+    );
+    assert_eq!(recovery.launch_count, 0);
+    assert_eq!(recovery.reconcile_fences.len(), 1);
+    let original_key = recovery.reconcile_fences[0].idempotency_key.clone();
+
+    let mut fresh_owner = Adapter::successful(true);
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut fresh_owner)
+            .expect("fresh owner submits only after definitive proof"),
+        WakeDeliveryResult::Delivered
+    );
+    assert_eq!(fresh_owner.launch_count, 1);
+    assert!(fresh_owner.reconcile_fences.is_empty());
+    assert_eq!(fresh_owner.launch_fences[0].attempt, 2);
+    assert_ne!(fresh_owner.launch_fences[0].idempotency_key, original_key);
+}
+
+#[test]
+fn reconciliation_authorization_failure_never_permits_fresh_submit() {
+    let (_temp, ledger, profile, _work_id, wake_id) = setup_wake();
+    let mut first_resolver = Resolver {
+        profile: profile.clone(),
+        calls: 0,
+    };
+    let mut interrupted = Adapter::successful(true);
+    interrupted.panic_after_claim = true;
+    let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ledger.consume_one_wake(active_policy(), &mut first_resolver, &mut interrupted);
+    }));
+    assert!(death.is_err());
+
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut recovery = Adapter::successful(true);
+    recovery.authorization_refusal = Some(ProviderOutcome::Retryable {
+        evidence: b"temporary authorization failure".to_vec(),
+    });
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut recovery)
+            .expect("recovery authorization failure"),
+        WakeDeliveryResult::Uncertain
+    );
+    assert_eq!(outbox_state(&ledger, &wake_id), "uncertain");
+    assert_eq!(recovery.launch_count, 0);
+    assert!(recovery.reconcile_fences.is_empty());
+
+    let mut second_recovery = Adapter::successful(true);
+    second_recovery.authorization_refusal = Some(ProviderOutcome::Rejected {
+        evidence: b"authorization remains unavailable".to_vec(),
+    });
+    assert_eq!(
+        ledger
+            .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut second_recovery)
+            .expect("uncertain authorization failure"),
+        WakeDeliveryResult::Uncertain
+    );
+    assert_eq!(outbox_state(&ledger, &wake_id), "uncertain");
+    assert_eq!(second_recovery.launch_count, 0);
+    assert!(second_recovery.reconcile_fences.is_empty());
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut second_recovery)
+            .expect("uncertain wake is not a submit candidate"),
         WakeDeliveryResult::Empty
     );
 }
@@ -1617,6 +2130,7 @@ fn route_provider_identity_mismatch_refuses_before_claim_or_launch() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() {
     use std::sync::mpsc;
 
@@ -1634,7 +2148,31 @@ fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() 
             })
         }
 
-        fn launch(&mut self, _request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+        fn authorize(
+            &mut self,
+            fence: &DeliveryFence,
+            _operation: ProviderAuthorizationOperation,
+        ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+            Ok(DeliveryAuthorization::for_test(
+                fence.work_generation,
+                fence.owner_generation,
+            ))
+        }
+
+        fn authorize_reconciliation(
+            &mut self,
+            fence: &DeliveryFence,
+        ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+            Ok(ReconciliationAuthorization::for_test(
+                reconciliation_fence_digest(fence),
+            ))
+        }
+
+        fn launch(
+            &mut self,
+            _request: ProviderLaunchRequest<'_>,
+            _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
             self.entered.send(()).expect("announce provider entry");
             self.release.recv().expect("release provider");
             ProviderOutcome::Delivered {
@@ -1642,7 +2180,19 @@ fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() 
             }
         }
 
-        fn reconcile(&mut self, _fence: &DeliveryFence) -> ProviderOutcome {
+        fn reconcile(
+            &mut self,
+            _fence: &DeliveryFence,
+            _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
+            panic!("a concurrent live owner must not be treated as restart recovery");
+        }
+
+        fn reconcile_read_only(
+            &mut self,
+            _fence: &DeliveryFence,
+            _authority: ReconciliationAuthorization,
+        ) -> ProviderOutcome {
             panic!("a concurrent live owner must not be treated as restart recovery");
         }
     }

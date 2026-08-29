@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+pub use crate::stale_pr_wedge::{StalePrRunWedgeCandidate, plan_stale_pr_run_wedges};
 
 /// One current-head check observed on a pull request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,6 +271,34 @@ pub enum StewardDecision {
     },
 }
 
+/// Classify the producer-provenanced summary emitted by the daemon's exact
+/// shadow observer. This intentionally covers only lifecycle routing: normal
+/// merge mutations still use [`classify_pr`] with the complete PR policy.
+#[must_use]
+pub(crate) fn classify_shadow_summary(
+    exact_head: bool,
+    pending_checks: u64,
+    passed_checks: u64,
+    failed_checks: u64,
+) -> StewardDecision {
+    if !exact_head {
+        return StewardDecision::NeedsUpdate {
+            merge_state: "STALE_HEAD".to_owned(),
+        };
+    }
+    if pending_checks > 0 || (passed_checks == 0 && failed_checks == 0) {
+        return StewardDecision::WaitingRequired {
+            contexts: vec!["producer-provenanced-required-checks".to_owned()],
+        };
+    }
+    if failed_checks > 0 {
+        return StewardDecision::RequiredFailed {
+            contexts: vec!["producer-provenanced-required-failure".to_owned()],
+        };
+    }
+    StewardDecision::ArmMergeQueue
+}
+
 /// Atomic server guarantees required before the steward may merge directly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -528,8 +558,10 @@ pub struct StewardRun {
 }
 
 /// One workflow job used by conservative capacity-preemption policy.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StewardJob {
+    /// Workflow job database ID.
+    pub id: u64,
     /// Job display name.
     pub name: String,
     /// GitHub job status.

@@ -15,17 +15,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::process::{Command, ExitCode};
-use std::thread;
-use std::time::{Duration, Instant};
 
+#[cfg(not(test))]
+use crate::config::LoadedConfig;
 use crate::paths::RuntimePaths;
 use crate::queue::replace_file_with_windows_retry;
+use crate::terminal_delivery_authority::{
+    ProductionTerminalEvidenceAdapter, TerminalCapabilityRequest, TerminalEvidenceAdapter,
+};
 use crate::work_ledger::{
     FreshAgentLaunchProfile, NativePublicationReport, NativePublicationRequest, WorkLedger,
 };
 use crate::workstream_activation_loader::{
     ReadyWorkstreamActivation, WorkstreamActivationLoader, WorkstreamActivationState,
 };
+
+mod disposition;
+use disposition::{AgentDisposition, StoredDispositionProofV1, load_pause_proof};
 
 #[derive(Clone)]
 pub(crate) struct StewardHandoffArgs {
@@ -39,6 +45,7 @@ pub(crate) struct StewardHandoffArgs {
     pub(crate) agent_parent_session_id: Option<String>,
     pub(crate) agent_surface_id: Option<String>,
     pub(crate) launch_profile: Option<std::path::PathBuf>,
+    pub(crate) task_graph: Option<std::path::PathBuf>,
     pub(crate) goal_managed: bool,
     pub(crate) after_handoff: String,
     pub(crate) transfer_agent_owner: bool,
@@ -82,6 +89,8 @@ struct AgentResumeContext {
     surface_provenance: SurfaceProvenance,
     #[serde(default)]
     terminal_provenance: TerminalProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_authority: Option<TerminalCapabilityRequest>,
     goal_managed: bool,
     goal_lifecycle: GoalLifecycle,
     goal_status: GoalStatus,
@@ -232,7 +241,13 @@ struct DurableStewardHandoff {
     goal_status: GoalStatus,
     goal_status_provenance: GoalStatusProvenance,
     phase: HandoffPhase,
-    agent_disposition: String,
+    #[serde(default)]
+    requested_agent_disposition: AgentDisposition,
+    #[serde(default)]
+    agent_disposition: AgentDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disposition_proof: Option<StoredDispositionProofV1>,
+    #[serde(default)]
     pause_required: bool,
     wake_consumer_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,6 +265,8 @@ struct NativePublicationReceiptV1 {
     route_ref: String,
     wake_id: String,
     profile_digest: String,
+    #[serde(default)]
+    repo_policy_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -262,6 +279,8 @@ enum NativePublicationStateV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StewardHandoffTransferReport {
     pub(crate) wake_consumer_available: bool,
+    pub(crate) agent_disposition: String,
+    pub(crate) pause_required: bool,
     pub(crate) publication_work_id: Option<String>,
     pub(crate) publication_route_ref: Option<String>,
     pub(crate) publication_wake_id: Option<String>,
@@ -275,13 +294,57 @@ pub(crate) fn steward_handoff_command<W: Write>(
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    steward_handoff_command_with_resolver(
+        args,
+        cwd,
+        runtime_paths,
+        actions,
+        json_output,
+        stdout,
+        resolve_agent_context,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn steward_handoff_command_without_ambient<W: Write>(
+    args: &StewardHandoffArgs,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
+    json_output: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    steward_handoff_command_with_resolver(
+        args,
+        cwd,
+        runtime_paths,
+        actions,
+        json_output,
+        stdout,
+        |args| resolve_agent_context_with_environment(args, &AgentEnvironment::default()),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn steward_handoff_command_with_resolver<W: Write, F>(
+    args: &StewardHandoffArgs,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
+    json_output: bool,
+    stdout: &mut W,
+    resolve_agent: F,
+) -> Result<ExitCode, CliFailure>
+where
+    F: FnOnce(&StewardHandoffArgs) -> Result<Option<AgentResumeContext>, CliFailure>,
+{
     validate_args(args)?;
     let repo = resolve_repos(args.repo.clone().into_iter().collect(), cwd)?
         .into_iter()
         .next()
         .ok_or_else(|| CliFailure::new(1, "repository was not resolved"))?;
     verify_exact_open_pr(actions, &repo, args.pr, &args.head)?;
-    let agent = resolve_agent_context(args)?;
+    let agent = resolve_agent(args)?;
     let launch_profile = args
         .launch_profile
         .as_deref()
@@ -289,6 +352,21 @@ pub(crate) fn steward_handoff_command<W: Write>(
         .transpose()?
         .map(|profile| prepare_launch_profile_candidate(profile, &repo, &args.head))
         .transpose()?;
+    let requested_disposition = AgentDisposition::parse(&args.after_handoff)?;
+    let disposition_proof = args
+        .task_graph
+        .as_deref()
+        .map(|path| load_pause_proof(path, &args.workstream_id))
+        .transpose()?;
+    if !args.apply
+        && requested_disposition == AgentDisposition::Pause
+        && disposition_proof.is_none()
+    {
+        return Err(CliFailure::new(
+            1,
+            "--after-handoff pause requires --task-graph for a new or dry-run handoff",
+        ));
+    }
     let origin_machine = if args.apply {
         resolve_origin_machine(runtime_paths)?
     } else {
@@ -300,6 +378,8 @@ pub(crate) fn steward_handoff_command<W: Write>(
     validate_launch_profile_route(launch_profile.as_ref(), agent_route.as_ref())?;
 
     let mut wake_consumer_available = false;
+    let mut agent_disposition = AgentDisposition::Continue;
+    let mut pause_required = false;
     if args.apply {
         let directory = handoff_directory(runtime_paths, &repo, args.pr);
         ensure_private_directory(&directory)?;
@@ -308,13 +388,14 @@ pub(crate) fn steward_handoff_command<W: Write>(
         let route_path = agent_route
             .as_ref()
             .map(|route| agent_route_path(runtime_paths, &route.route_id));
-        let mut receipt = prepare_handoff_receipt_with_profile(
+        let mut receipt = prepare_handoff_receipt_with_profile_and_disposition(
             load_handoff(&path)?,
             args,
             &repo,
             &origin_machine,
             agent_route.clone(),
             launch_profile,
+            disposition_proof,
         )?;
         let starting_phase = receipt.phase;
         if let (Some(agent), Some(route), Some(route_path)) =
@@ -351,6 +432,7 @@ pub(crate) fn steward_handoff_command<W: Write>(
             let ready = ready_workstream_activation(runtime_paths)?;
             receipt = publish_managed_handoff(
                 runtime_paths,
+                actions,
                 &path,
                 receipt,
                 &repo,
@@ -360,6 +442,8 @@ pub(crate) fn steward_handoff_command<W: Write>(
             )?;
         }
         wake_consumer_available = receipt.wake_consumer_available;
+        agent_disposition = receipt.agent_disposition;
+        pause_required = receipt.pause_required;
         remove_label(actions, &repo, args.pr, UNMANAGED_LABEL)?;
         debug_assert_eq!(receipt.phase, HandoffPhase::Managed);
     }
@@ -371,6 +455,8 @@ pub(crate) fn steward_handoff_command<W: Write>(
         &origin_machine,
         json_output,
         wake_consumer_available,
+        agent_disposition,
+        pause_required,
         stdout,
     )?;
     Ok(ExitCode::SUCCESS)
@@ -404,10 +490,11 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
             "--context-url must use http:// or https://",
         ));
     }
-    if !matches!(args.after_handoff.as_str(), "continue" | "pause") {
+    let disposition = AgentDisposition::parse(&args.after_handoff)?;
+    if disposition == AgentDisposition::Continue && args.task_graph.is_some() {
         return Err(CliFailure::new(
             1,
-            "--after-handoff must be continue or pause",
+            "--task-graph is accepted only with --after-handoff pause",
         ));
     }
     if args.transfer_agent_owner
@@ -416,12 +503,6 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
         return Err(CliFailure::new(
             1,
             "--transfer-agent-owner requires explicit --agent-provider and --agent-session-id",
-        ));
-    }
-    if args.apply && args.after_handoff == "pause" {
-        return Err(CliFailure::new(
-            1,
-            "--after-handoff pause is unavailable until a scheduler wake consumer is deployed; use continue",
         ));
     }
     Ok(())
@@ -443,26 +524,77 @@ struct AgentEnvironment {
 fn resolve_agent_context(
     args: &StewardHandoffArgs,
 ) -> Result<Option<AgentResumeContext>, CliFailure> {
-    resolve_agent_context_with_environment(
-        args,
-        &AgentEnvironment {
-            codex_session: env::var("CODEX_THREAD_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            claude_session: env::var("CLAUDE_CODE_SESSION_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            surface_id: env::var("CMUX_SURFACE_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            goal_managed: env::var("SHIPYARD_GOAL_MANAGED").as_deref() == Ok("1"),
-            herdr_env: env::var("HERDR_ENV").ok(),
-            herdr_session: env::var("HERDR_SESSION").ok(),
-            herdr_workspace_id: env::var("HERDR_WORKSPACE_ID").ok(),
-            herdr_tab_id: env::var("HERDR_TAB_ID").ok(),
-            herdr_pane_id: env::var("HERDR_PANE_ID").ok(),
-        },
-    )
+    let environment = AgentEnvironment {
+        codex_session: env::var("CODEX_THREAD_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        claude_session: env::var("CLAUDE_CODE_SESSION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        surface_id: env::var("CMUX_SURFACE_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        goal_managed: env::var("SHIPYARD_GOAL_MANAGED").as_deref() == Ok("1"),
+        herdr_env: env::var("HERDR_ENV").ok(),
+        herdr_session: env::var("HERDR_SESSION").ok(),
+        herdr_workspace_id: env::var("HERDR_WORKSPACE_ID").ok(),
+        herdr_tab_id: env::var("HERDR_TAB_ID").ok(),
+        herdr_pane_id: env::var("HERDR_PANE_ID").ok(),
+    };
+    let mut resolved = resolve_agent_context_with_environment(args, &environment)?;
+    if let Some(agent) = resolved.as_mut() {
+        agent.terminal_authority = match &agent.terminal_provenance {
+            TerminalProvenance::Cmux { surface_id } => {
+                let socket_path = env::var("CMUX_SOCKET_PATH")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        CliFailure::new(1, "cmux terminal authority requires CMUX_SOCKET_PATH")
+                    })?;
+                let cli_path = resolve_path_executable("cmux")?;
+                Some(
+                    ProductionTerminalEvidenceAdapter
+                        .capture_cmux(
+                            &cli_path,
+                            &socket_path,
+                            surface_id,
+                            &agent.session_id,
+                            &agent.provider,
+                        )
+                        .map_err(|failure| {
+                            CliFailure::new(
+                                1,
+                                format!("cmux terminal authority refused: {failure:?}"),
+                            )
+                        })?,
+                )
+            }
+            TerminalProvenance::HerdR {
+                session_id,
+                pane_id,
+                ..
+            } => Some(TerminalCapabilityRequest::HerdR {
+                selector: session_id.clone(),
+                terminal_id: Some(pane_id.clone()),
+                native_session_id: agent.session_id.clone(),
+                provider_kind: agent.provider.clone(),
+            }),
+            TerminalProvenance::Absent => None,
+        };
+    }
+    Ok(resolved)
+}
+
+fn resolve_path_executable(name: &str) -> Result<String, CliFailure> {
+    let path = env::var_os("PATH")
+        .into_iter()
+        .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| CliFailure::new(1, format!("{name} executable is unavailable")))?;
+    path.canonicalize()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| CliFailure::new(1, format!("resolve {name} executable: {error}")))
 }
 
 fn resolve_agent_context_with_environment(
@@ -554,6 +686,7 @@ fn resolve_agent_context_with_environment(
         surface_id,
         surface_provenance,
         terminal_provenance,
+        terminal_authority: None,
         goal_managed,
         goal_lifecycle: if goal_managed {
             GoalLifecycle::Managed
@@ -868,12 +1001,57 @@ fn handoff_path(directory: &Path, head: &str) -> std::path::PathBuf {
     directory.join(format!("{}.json", head.to_ascii_lowercase()))
 }
 
+pub(super) fn migrate_legacy_native_policy_authority(
+    state_dir: &Path,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<(), String> {
+    let path = state_dir
+        .join("merge-steward")
+        .join("handoffs")
+        .join(encode_path_segment(&repo.to_ascii_lowercase()))
+        .join(format!("pr-{pr}"))
+        .join(format!("{}.json", head.to_ascii_lowercase()));
+    let mut receipt = load_handoff(&path)
+        .map_err(|error| error.message)?
+        .ok_or_else(|| "legacy native handoff receipt is unavailable".to_owned())?;
+    validate_handoff_receipt_integrity(&receipt, repo, pr, head).map_err(|error| error.message)?;
+    let publication = receipt
+        .native_publication
+        .as_mut()
+        .ok_or_else(|| "legacy native publication receipt is unavailable".to_owned())?;
+    if !receipt.wake_consumer_available
+        || publication.schema_version != 1
+        || publication.state != NativePublicationStateV1::Accepted
+        || publication.repo_policy_revision != 0
+    {
+        return Err("legacy native publication is not accepted migration authority".to_owned());
+    }
+    crate::work_ledger::bind_legacy_native_policy(state_dir, repo, pr, head, &publication.work_id)
+        .map_err(|error| error.to_string())?;
+    let ledger = WorkLedger::open_existing(state_dir)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "native work ledger is unavailable".to_owned())?;
+    let policy = ledger
+        .repo_policy(repo)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "explicit repository policy is unavailable".to_owned())?;
+    publication.schema_version = 2;
+    publication.repo_policy_revision = policy.revision;
+    receipt.schema_version = 4;
+    persist_handoff(&path, receipt, HandoffPhase::Managed).map_err(|error| error.message)?;
+    Ok(())
+}
+
 /// Load and normalize one exact managed handoff into native ledger authority.
 ///
 /// This reader performs no mutation. Publication policy is intentionally
 /// applied later, before the ledger can create storage.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn native_publication_request(
     runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
     repo: &str,
     pr: u64,
     head: &str,
@@ -890,6 +1068,15 @@ pub(crate) fn native_publication_request(
         ));
     }
     let path = handoff_path(&handoff_directory(runtime_paths, repo, pr), head);
+    let trusted_actions = trusted_native_publication_actions(runtime_paths, actions, repo)?;
+    let source_authority = observe_native_source_authority(&trusted_actions, repo, pr, head)?;
+    let ledger = WorkLedger::open_existing(&runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+        .ok_or_else(|| CliFailure::new(1, "explicit repository policy is unavailable"))?;
+    let repo_policy = ledger
+        .repo_policy(repo)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+        .ok_or_else(|| CliFailure::new(1, "explicit repository policy is unavailable"))?;
     let receipt = load_handoff(&path)?
         .ok_or_else(|| CliFailure::new(1, "exact-head durable handoff receipt is unavailable"))?;
     validate_handoff_receipt_integrity(&receipt, repo, pr, head)?;
@@ -950,18 +1137,57 @@ pub(crate) fn native_publication_request(
     let protected_profile_bytes = profile
         .protected_profile_bytes()
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let native_resume_bytes = serde_json::to_vec(&profile.resume_argv)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let route_environment_bytes = serde_json::to_vec(&profile.route_environment)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let route_wrapper = profile
+        .resume_argv
+        .first()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| CliFailure::new(1, "native resume wrapper is missing"))?;
 
     Ok(NativePublicationRequest {
         repository: receipt.repo.to_ascii_lowercase(),
         pull_request: receipt.pr,
         head_sha: receipt.head_sha.to_ascii_lowercase(),
+        base_ref: source_authority.base_ref,
+        base_sha: source_authority.base_sha,
+        github_installation_id: source_authority.installation_id,
+        repo_policy_revision: repo_policy.revision,
+        terminal_authority: private_route
+            .agent
+            .terminal_authority
+            .or_else(test_terminal_authority)
+            .ok_or_else(|| {
+                CliFailure::new(1, "native publication requires live terminal authority")
+            })?,
         workstream_handle: bootstrap.workstream_handle.clone(),
+        plan_sha256: bootstrap.plan_sha256.clone(),
+        root_revision: bootstrap.root_revision,
+        issue_revision: bootstrap.issue_revision,
+        projection_revision: bootstrap.projection_revision,
+        material_event_revision: bootstrap.material_event_revision,
         context_url: bootstrap.context_url.clone(),
         origin_machine: receipt.origin_machine.clone(),
         owner_id: receipt.owner_id.clone(),
         owner_generation: receipt.ownership_generation,
         agent_provider: route.provider.clone(),
         agent_session_id: private_route.agent.session_id,
+        route_account: profile
+            .provider
+            .account
+            .clone()
+            .unwrap_or_else(|| "unselected-account".into()),
+        route_model: profile
+            .provider
+            .model
+            .clone()
+            .unwrap_or_else(|| "unselected-model".into()),
+        route_wrapper,
+        native_resume_digest: hex::encode(Sha256::digest(native_resume_bytes)),
+        route_environment_digest: hex::encode(Sha256::digest(route_environment_bytes)),
         route_id: route.route_id.clone(),
         profile_generation: stored.generation,
         profile_revision: stored.revision,
@@ -970,6 +1196,108 @@ pub(crate) fn native_publication_request(
         protected_profile_bytes,
         success_continuation_digest: bootstrap.success_continuation_digest.clone(),
         failure_continuation_digest: bootstrap.failure_continuation_digest.clone(),
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn trusted_native_publication_actions(
+    _: &RuntimePaths,
+    actions: &GitHubActions,
+    repo: &str,
+) -> Result<GitHubActions, CliFailure> {
+    Ok(actions.clone().with_repo_override(repo))
+}
+
+#[cfg(not(test))]
+fn trusted_native_publication_actions(
+    runtime_paths: &RuntimePaths,
+    _: &GitHubActions,
+    repo: &str,
+) -> Result<GitHubActions, CliFailure> {
+    let config = LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| CliFailure::new(1, format!("resolve native authority cwd: {error}")))?;
+    Ok(GitHubActions::from_loaded_config(cwd, &config).with_repo_override(repo))
+}
+
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn test_terminal_authority() -> Option<TerminalCapabilityRequest> {
+    Some(TerminalCapabilityRequest::Cmux {
+        cli_path: "/test/cmux".into(),
+        socket_path: "/test/cmux.sock".into(),
+        surface_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+        workspace_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
+        native_session_id: "provider-session-7".into(),
+        provider_kind: "codex".into(),
+        process: crate::terminal_delivery_authority::LocalProcessIncarnation {
+            boot_id: "test-boot".into(),
+            pid: 42,
+            start_identity: "test-start".into(),
+        },
+    })
+}
+
+#[cfg(not(test))]
+fn test_terminal_authority() -> Option<TerminalCapabilityRequest> {
+    None
+}
+
+struct NativeSourceAuthority {
+    installation_id: u64,
+    base_ref: String,
+    base_sha: String,
+}
+
+fn observe_native_source_authority(
+    actions: &GitHubActions,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<NativeSourceAuthority, CliFailure> {
+    let installation_id = actions
+        .app_installation_id()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let snapshot = gh_json(
+        actions,
+        &[
+            "pr".into(),
+            "view".into(),
+            pr.to_string(),
+            "--repo".into(),
+            repo.to_owned(),
+            "--json".into(),
+            "state,headRefOid,baseRefName,baseRefOid".into(),
+        ],
+        "observe exact native publication source",
+    )
+    .map_err(|error| CliFailure::new(1, error))?;
+    let pull_request = &snapshot;
+    let observed_head = pull_request.get("headRefOid").and_then(Value::as_str);
+    let base_ref = pull_request
+        .get("baseRefName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let base_sha = pull_request
+        .get("baseRefOid")
+        .and_then(Value::as_str)
+        .filter(|value| is_full_sha(value));
+    if pull_request.get("state").and_then(Value::as_str) != Some("OPEN")
+        || observed_head != Some(head)
+        || base_ref.is_none()
+        || base_sha.is_none()
+    {
+        return Err(CliFailure::new(
+            1,
+            "native publication source head/base authority changed",
+        ));
+    }
+    Ok(NativeSourceAuthority {
+        installation_id,
+        base_ref: base_ref.expect("checked").to_owned(),
+        base_sha: base_sha.expect("checked").to_ascii_lowercase(),
     })
 }
 
@@ -988,6 +1316,8 @@ pub(crate) fn steward_handoff_transfer_report(
     }
     Ok(StewardHandoffTransferReport {
         wake_consumer_available: receipt.wake_consumer_available,
+        agent_disposition: receipt.agent_disposition.as_str().to_owned(),
+        pause_required: receipt.pause_required,
         publication_work_id: receipt
             .native_publication
             .as_ref()
@@ -1247,6 +1577,7 @@ fn prepare_handoff_receipt(
     prepare_handoff_receipt_with_profile(existing, args, repo, origin_machine, agent_route, None)
 }
 
+#[cfg(test)]
 fn prepare_handoff_receipt_with_profile(
     existing: Option<DurableStewardHandoff>,
     args: &StewardHandoffArgs,
@@ -1255,8 +1586,30 @@ fn prepare_handoff_receipt_with_profile(
     agent_route: Option<AgentRouteReference>,
     launch_profile: Option<LaunchProfileCandidateV1>,
 ) -> Result<DurableStewardHandoff, CliFailure> {
+    prepare_handoff_receipt_with_profile_and_disposition(
+        existing,
+        args,
+        repo,
+        origin_machine,
+        agent_route,
+        launch_profile,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_handoff_receipt_with_profile_and_disposition(
+    existing: Option<DurableStewardHandoff>,
+    args: &StewardHandoffArgs,
+    repo: &str,
+    origin_machine: &str,
+    agent_route: Option<AgentRouteReference>,
+    launch_profile: Option<LaunchProfileCandidateV1>,
+    disposition_proof: Option<StoredDispositionProofV1>,
+) -> Result<DurableStewardHandoff, CliFailure> {
     let normalized_repo = repo.to_ascii_lowercase();
     let normalized_head = args.head.to_ascii_lowercase();
+    let requested_disposition = AgentDisposition::parse(&args.after_handoff)?;
     let owner_id = agent_route.as_ref().map_or_else(
         || "fresh-agent-only".to_owned(),
         |route| route.owner_id.clone(),
@@ -1272,11 +1625,23 @@ fn prepare_handoff_receipt_with_profile(
         .map_or(GoalStatusProvenance::NotObserved, |route| {
             route.goal_status_provenance
         });
-    let pause_required = args.after_handoff == "pause"
-        && agent_route.as_ref().is_some_and(|route| route.goal_managed);
     validate_launch_profile_route(launch_profile.as_ref(), agent_route.as_ref())?;
     if let Some(existing) = existing {
         validate_existing_handoff(&existing, args, &normalized_repo, &normalized_head)?;
+        let disposition_proof = match requested_disposition {
+            AgentDisposition::Continue => None,
+            AgentDisposition::Pause => Some(
+                disposition_proof
+                    .or_else(|| existing.disposition_proof.clone())
+                    .filter(|proof| proof.valid_for(&args.workstream_id))
+                    .ok_or_else(|| {
+                        CliFailure::new(
+                            1,
+                            "--after-handoff pause requires a valid durable task-graph proof",
+                        )
+                    })?,
+            ),
+        };
         if args.transfer_agent_owner {
             return transfer_handoff_owner(
                 existing,
@@ -1287,7 +1652,7 @@ fn prepare_handoff_receipt_with_profile(
                 goal_lifecycle,
                 goal_status,
                 goal_status_provenance,
-                pause_required,
+                disposition_proof,
                 launch_profile,
             );
         }
@@ -1322,12 +1687,12 @@ fn prepare_handoff_receipt_with_profile(
                 "same-owner handoff origin machine changed; explicit ownership transfer is required",
             ));
         }
-        if existing.agent_disposition != args.after_handoff
-            || existing.pause_required != pause_required
+        if existing.requested_agent_disposition != requested_disposition
+            || existing.disposition_proof != disposition_proof
         {
             return Err(CliFailure::new(
                 1,
-                "same-owner handoff cannot change agent disposition or pause intent",
+                "same-owner handoff cannot change agent disposition or task-graph proof",
             ));
         }
         return Ok(existing);
@@ -1338,6 +1703,15 @@ fn prepare_handoff_receipt_with_profile(
             "--transfer-agent-owner requires an existing exact-head handoff receipt",
         ));
     }
+    let disposition_proof = match requested_disposition {
+        AgentDisposition::Continue => None,
+        AgentDisposition::Pause => Some(disposition_proof.ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "--after-handoff pause requires --task-graph proving no independent runnable work",
+            )
+        })?),
+    };
     Ok(new_handoff_receipt(
         args,
         normalized_repo,
@@ -1348,7 +1722,8 @@ fn prepare_handoff_receipt_with_profile(
         goal_lifecycle,
         goal_status,
         goal_status_provenance,
-        pause_required,
+        requested_disposition,
+        disposition_proof,
         launch_profile,
     ))
 }
@@ -1407,14 +1782,15 @@ fn new_handoff_receipt(
     goal_lifecycle: GoalLifecycle,
     goal_status: GoalStatus,
     goal_status_provenance: GoalStatusProvenance,
-    pause_required: bool,
+    requested_disposition: AgentDisposition,
+    disposition_proof: Option<StoredDispositionProofV1>,
     launch_profile: Option<LaunchProfileCandidateV1>,
 ) -> DurableStewardHandoff {
     let now = Utc::now().to_rfc3339();
     let launch_profile =
         launch_profile.map(|profile| bind_launch_profile(profile, agent_route.as_ref(), 1, 1));
     DurableStewardHandoff {
-        schema_version: 2,
+        schema_version: 4,
         repo: normalized_repo,
         pr: args.pr,
         head_sha: normalized_head,
@@ -1434,8 +1810,10 @@ fn new_handoff_receipt(
         goal_lifecycle,
         goal_status,
         goal_status_provenance,
-        agent_disposition: args.after_handoff.clone(),
-        pause_required,
+        requested_agent_disposition: requested_disposition,
+        agent_disposition: AgentDisposition::Continue,
+        pause_required: false,
+        disposition_proof,
         wake_consumer_available: false,
         native_publication: None,
         phase: HandoffPhase::Intent,
@@ -1453,6 +1831,7 @@ fn validate_existing_handoff(
     validate_handoff_receipt_integrity(existing, normalized_repo, args.pr, normalized_head)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_handoff_receipt_integrity(
     receipt: &DurableStewardHandoff,
     repo: &str,
@@ -1476,12 +1855,39 @@ fn validate_handoff_receipt_integrity(
                 && receipt.goal_status_provenance == route.goal_status_provenance
         },
     );
-    let pause_consistent = receipt.pause_required
-        == (receipt.agent_disposition == "pause"
-            && receipt
-                .agent_route
-                .as_ref()
-                .is_some_and(|route| route.goal_managed));
+    let disposition_consistent = match receipt.schema_version {
+        2 => {
+            receipt.requested_agent_disposition == AgentDisposition::Continue
+                && receipt.agent_disposition == AgentDisposition::Continue
+                && !receipt.pause_required
+                && receipt.disposition_proof.is_none()
+        }
+        3 | 4 => match receipt.requested_agent_disposition {
+            AgentDisposition::Continue => {
+                receipt.agent_disposition == AgentDisposition::Continue
+                    && !receipt.pause_required
+                    && receipt.disposition_proof.is_none()
+            }
+            AgentDisposition::Pause => {
+                receipt
+                    .disposition_proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.valid_for(&receipt.workstream_id))
+                    && receipt
+                        .agent_route
+                        .as_ref()
+                        .is_some_and(|route| route.goal_managed)
+                    && if receipt.wake_consumer_available {
+                        receipt.agent_disposition == AgentDisposition::Pause
+                            && receipt.pause_required
+                    } else {
+                        receipt.agent_disposition == AgentDisposition::Continue
+                            && !receipt.pause_required
+                    }
+            }
+        },
+        _ => false,
+    };
     let launch_profile_consistent = receipt.launch_profile.as_ref().is_none_or(|stored| {
         stored.generation > 0
             && stored.revision > 0
@@ -1516,7 +1922,10 @@ fn validate_handoff_receipt_integrity(
     ) {
         (false, None, _) => true,
         (available, Some(publication), Some(profile)) => {
-            publication.schema_version == 1
+            ((publication.schema_version == 2 && publication.repo_policy_revision > 0)
+                || (matches!(receipt.schema_version, 2 | 3)
+                    && publication.schema_version == 1
+                    && publication.repo_policy_revision == 0))
                 && publication.profile_digest == profile.profile_digest
                 && valid_publication_identifier(&publication.work_id)
                 && valid_publication_identifier(&publication.route_ref)
@@ -1529,15 +1938,14 @@ fn validate_handoff_receipt_integrity(
         }
         _ => false,
     };
-    if receipt.schema_version != 2
+    if !matches!(receipt.schema_version, 2..=4)
         || !receipt.repo.eq_ignore_ascii_case(repo)
         || receipt.pr != pr
         || !receipt.head_sha.eq_ignore_ascii_case(head)
         || receipt.ownership_generation == 0
         || receipt.revision == 0
-        || !matches!(receipt.agent_disposition.as_str(), "continue" | "pause")
         || !route_consistent
-        || !pause_consistent
+        || !disposition_consistent
         || !launch_profile_consistent
         || !publication_consistent
     {
@@ -1586,7 +1994,7 @@ fn transfer_handoff_owner(
     goal_lifecycle: GoalLifecycle,
     goal_status: GoalStatus,
     goal_status_provenance: GoalStatusProvenance,
-    pause_required: bool,
+    disposition_proof: Option<StoredDispositionProofV1>,
     launch_profile: Option<LaunchProfileCandidateV1>,
 ) -> Result<DurableStewardHandoff, CliFailure> {
     if agent_route.is_none() {
@@ -1597,8 +2005,8 @@ fn transfer_handoff_owner(
     }
     if existing.workstream_id != args.workstream_id
         || existing.context_url != args.context_url
-        || existing.agent_disposition != args.after_handoff
-        || existing.pause_required != pause_required
+        || existing.requested_agent_disposition != AgentDisposition::parse(&args.after_handoff)?
+        || existing.disposition_proof != disposition_proof
     {
         return Err(CliFailure::new(
             1,
@@ -1630,6 +2038,7 @@ fn transfer_handoff_owner(
     existing.goal_lifecycle = goal_lifecycle;
     existing.goal_status = goal_status;
     existing.goal_status_provenance = goal_status_provenance;
+    existing.disposition_proof = disposition_proof;
     let next_generation = existing
         .ownership_generation
         .checked_add(1)
@@ -1689,8 +2098,10 @@ fn ready_workstream_activation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_managed_handoff(
     runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
     path: &Path,
     receipt: DurableStewardHandoff,
     repo: &str,
@@ -1700,31 +2111,33 @@ fn publish_managed_handoff(
 ) -> Result<DurableStewardHandoff, CliFailure> {
     publish_managed_handoff_with_consumer(
         runtime_paths,
+        actions,
         path,
         receipt,
         repo,
         pr,
         head,
         ready,
-        wait_for_native_consumer_ownership,
+        |_paths, _report| Ok(()),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn publish_managed_handoff_with_consumer<F>(
     runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
     path: &Path,
     receipt: DurableStewardHandoff,
     repo: &str,
     pr: u64,
     head: &str,
     ready: &ReadyWorkstreamActivation,
-    await_consumer: F,
+    _await_consumer: F,
 ) -> Result<DurableStewardHandoff, CliFailure>
 where
     F: FnOnce(&RuntimePaths, &NativePublicationReport) -> Result<(), CliFailure>,
 {
-    let request = native_publication_request(runtime_paths, repo, pr, head)?;
+    let request = native_publication_request(runtime_paths, actions, repo, pr, head)?;
     if ready.machine_tag != request.origin_machine {
         return Err(CliFailure::new(
             1,
@@ -1750,14 +2163,20 @@ where
         || report.route_ref != planned.route_ref
         || report.wake_id != planned.wake_id
         || report.profile_digest != planned.profile_digest
+        || report.repo_policy_revision != planned.repo_policy_revision
     {
         return Err(CliFailure::new(
             1,
             "native continuation publication changed after durable intent",
         ));
     }
-    await_consumer(runtime_paths, &report)?;
-    bind_native_publication(path, receipt, &report)
+    // Managed publication remains wake-free. Its canonical ledger record is
+    // nevertheless a durable daemon obligation, so successful exact replay is
+    // the monitoring-transfer boundary; provider delivery is deliberately not
+    // part of the post-handoff disposition decision.
+    crate::work_ledger::verify_native_policy_binding(&runtime_paths.state_dir, repo, pr, head)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    bind_native_publication_accepted(path, receipt, &report)
 }
 
 fn native_publication_receipt(
@@ -1765,12 +2184,13 @@ fn native_publication_receipt(
     state: NativePublicationStateV1,
 ) -> NativePublicationReceiptV1 {
     NativePublicationReceiptV1 {
-        schema_version: 1,
+        schema_version: 2,
         state,
         work_id: report.work_id.clone(),
         route_ref: report.route_ref.clone(),
         wake_id: report.wake_id.clone(),
         profile_digest: report.profile_digest.clone(),
+        repo_policy_revision: report.repo_policy_revision,
     }
 }
 
@@ -1785,6 +2205,22 @@ fn bind_native_publication_pending(
         if receipt.native_publication.as_ref() == Some(&accepted) {
             return Ok(receipt);
         }
+        if receipt
+            .native_publication
+            .as_ref()
+            .is_some_and(|publication| {
+                publication.schema_version == 1
+                    && publication.state == NativePublicationStateV1::Accepted
+                    && publication.work_id == accepted.work_id
+                    && publication.route_ref == accepted.route_ref
+                    && publication.wake_id == accepted.wake_id
+                    && publication.profile_digest == accepted.profile_digest
+            })
+        {
+            receipt.schema_version = 4;
+            receipt.native_publication = Some(accepted);
+            return persist_handoff(path, receipt, HandoffPhase::Managed);
+        }
         return Err(CliFailure::new(
             1,
             "accepted native publication cannot return to pending",
@@ -1792,6 +2228,18 @@ fn bind_native_publication_pending(
     }
     match receipt.native_publication.as_ref() {
         Some(existing) if existing == &pending => Ok(receipt),
+        Some(existing)
+            if existing.schema_version == 1
+                && existing.state == NativePublicationStateV1::Pending
+                && existing.work_id == pending.work_id
+                && existing.route_ref == pending.route_ref
+                && existing.wake_id == pending.wake_id
+                && existing.profile_digest == pending.profile_digest =>
+        {
+            receipt.schema_version = 4;
+            receipt.native_publication = Some(pending);
+            persist_handoff(path, receipt, HandoffPhase::Managed)
+        }
         Some(_) => Err(CliFailure::new(
             1,
             "native publication intent changed for an existing exact-head handoff",
@@ -1803,74 +2251,54 @@ fn bind_native_publication_pending(
     }
 }
 
-fn wait_for_native_consumer_ownership(
-    runtime_paths: &RuntimePaths,
-    report: &NativePublicationReport,
-) -> Result<(), CliFailure> {
-    wait_for_native_consumer_ownership_for(runtime_paths, report, Duration::from_secs(5))
-}
-
-fn wait_for_native_consumer_ownership_for(
-    runtime_paths: &RuntimePaths,
-    report: &NativePublicationReport,
-    timeout: Duration,
-) -> Result<(), CliFailure> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let ledger = WorkLedger::open_existing(&runtime_paths.state_dir)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?
-            .ok_or_else(|| CliFailure::new(1, "native continuation ledger disappeared"))?;
-        if ledger
-            .native_wake_consumer_owns(&report.wake_id)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(CliFailure::new(
-                1,
-                "native continuation daemon did not accept the published wake; monitoring ownership was not transferred",
-            ));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn bind_native_publication(
+fn bind_native_publication_accepted(
     path: &Path,
     mut receipt: DurableStewardHandoff,
     report: &NativePublicationReport,
 ) -> Result<DurableStewardHandoff, CliFailure> {
-    let profile_digest = receipt
-        .launch_profile
-        .as_ref()
-        .map(|profile| profile.profile_digest.as_str())
-        .ok_or_else(|| CliFailure::new(1, "native publication lost its launch profile"))?;
-    if report.profile_digest != profile_digest {
-        return Err(CliFailure::new(
-            1,
-            "native publication receipt does not match the protected launch profile",
-        ));
-    }
     let pending = native_publication_receipt(report, NativePublicationStateV1::Pending);
-    let publication = native_publication_receipt(report, NativePublicationStateV1::Accepted);
+    let accepted = native_publication_receipt(report, NativePublicationStateV1::Accepted);
     if receipt.wake_consumer_available {
-        if receipt.native_publication.as_ref() == Some(&publication) {
+        if receipt.native_publication.as_ref() == Some(&accepted) {
             return Ok(receipt);
         }
         return Err(CliFailure::new(
             1,
-            "native publication receipt changed for an existing exact-head handoff",
+            "accepted monitoring transfer changed its native publication",
         ));
     }
     if receipt.native_publication.as_ref() != Some(&pending) {
         return Err(CliFailure::new(
             1,
-            "native publication acceptance lacks its durable pending intent",
+            "native publication was not durably pending before monitoring transfer",
         ));
     }
+    receipt.native_publication = Some(accepted);
     receipt.wake_consumer_available = true;
-    receipt.native_publication = Some(publication);
+    match receipt.requested_agent_disposition {
+        AgentDisposition::Continue => {
+            receipt.agent_disposition = AgentDisposition::Continue;
+            receipt.pause_required = false;
+        }
+        AgentDisposition::Pause => {
+            if receipt
+                .disposition_proof
+                .as_ref()
+                .is_none_or(|proof| !proof.valid_for(&receipt.workstream_id))
+                || receipt
+                    .agent_route
+                    .as_ref()
+                    .is_none_or(|route| !route.goal_managed)
+            {
+                return Err(CliFailure::new(
+                    1,
+                    "pause disposition lost its managed-goal task-graph authority",
+                ));
+            }
+            receipt.agent_disposition = AgentDisposition::Pause;
+            receipt.pause_required = true;
+        }
+    }
     persist_handoff(path, receipt, HandoffPhase::Managed)
 }
 
@@ -2220,6 +2648,12 @@ fn reconcile_surface_route(
         reconciled.terminal_provenance = TerminalProvenance::Cmux {
             surface_id: surface_id.clone(),
         };
+        // Live cmux evidence is refreshable for the same native session. The
+        // immutable owner identity and generation stay unchanged; publication
+        // later binds the newly observed process/surface tuple atomically.
+        reconciled
+            .terminal_authority
+            .clone_from(&incoming.terminal_authority);
     }
     Ok(reconciled)
 }
@@ -2333,7 +2767,7 @@ fn write_handoff_status(
         command.push("-f".to_owned());
         command.push(format!("target_url={url}"));
     }
-    run_steward_write(actions, &command, "handoff receipt")
+    run_steward_write(actions, &command)
         .map_err(|error| CliFailure::new(1, format!("could not write handoff receipt: {error}")))?;
     Ok(())
 }
@@ -2456,7 +2890,6 @@ pub(super) fn ensure_label(
                 "-f".to_owned(),
                 format!("description={description}"),
             ],
-            "steward label creation",
         )
         .map(|_| ())
         .map_err(|error| CliFailure::new(1, format!("could not create label: {error}"))),
@@ -2483,7 +2916,6 @@ pub(super) fn add_label(
             "-f".to_owned(),
             format!("labels[]={label}"),
         ],
-        "steward label attachment",
     )
     .map(|_| ())
     .map_err(|error| CliFailure::new(1, format!("could not add label {label}: {error}")))
@@ -2504,7 +2936,6 @@ pub(super) fn remove_label(
             "DELETE".to_owned(),
             format!("repos/{repo}/issues/{pr}/labels/{encoded}"),
         ],
-        "steward label removal",
     ) {
         Ok(_) => Ok(()),
         Err(error) if error.to_string().contains("HTTP 404") => Ok(()),
@@ -2518,20 +2949,11 @@ pub(super) fn remove_label(
 pub(super) fn run_steward_write(
     actions: &GitHubActions,
     args: &[String],
-    purpose: &str,
 ) -> Result<String, crate::cloud::GitHubError> {
-    match actions.run_gh(args) {
-        Ok(value) => Ok(value),
-        Err(error) if error.is_integration_permission_denial() => {
-            let _ = crate::writer_domain_lease::write_stderr(format_args!(
-                "shipyard: configured GitHub App cannot write {purpose}; falling back to ambient gh auth for this steward mutation only."
-            ));
-            actions.run_gh_ambient(args)
-        }
-        Err(error) => Err(error),
-    }
+    actions.run_gh(args)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render<W: Write>(
     args: &StewardHandoffArgs,
     repo: &str,
@@ -2539,30 +2961,26 @@ fn render<W: Write>(
     origin_machine: &str,
     json_output: bool,
     wake_consumer_available: bool,
+    agent_disposition: AgentDisposition,
+    pause_required: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    let pause_requested = args.after_handoff == "pause";
-    let effective_disposition = if pause_requested {
-        "unsupported"
-    } else {
-        args.after_handoff.as_str()
-    };
     if json_output {
         let data = render_json_data(
             args,
             repo,
             agent_route,
             origin_machine,
-            effective_disposition,
-            pause_requested,
             wake_consumer_available,
+            agent_disposition,
+            pause_required,
         )?;
         return write_json_envelope(stdout, "runner.steward-handoff", data)
             .map_err(|error| CliFailure::new(1, error.to_string()));
     }
     writeln!(
         stdout,
-        "steward handoff: mode={} repo={} pr=#{} head={} workstream={} label={} requested_disposition={} disposition={} disposition_supported={} pause_supported=false pause_required=false wake_consumer_available={} origin_machine={} repair_route={}",
+        "steward handoff: mode={} repo={} pr=#{} head={} workstream={} label={} requested_disposition={} disposition={} disposition_supported=true pause_supported=true pause_required={} monitoring_transferred={} wake_consumer_available={} origin_machine={} repair_route={}",
         if args.apply { "apply" } else { "dry-run" },
         repo,
         args.pr,
@@ -2570,8 +2988,9 @@ fn render<W: Write>(
         args.workstream_id,
         MANAGED_LABEL,
         args.after_handoff,
-        effective_disposition,
-        !pause_requested,
+        agent_disposition.as_str(),
+        pause_required,
+        wake_consumer_available,
         wake_consumer_available,
         origin_machine,
         if agent_route.is_some() {
@@ -2589,9 +3008,9 @@ fn render_json_data(
     repo: &str,
     agent_route: Option<&AgentRouteReference>,
     origin_machine: &str,
-    effective_disposition: &str,
-    pause_requested: bool,
     wake_consumer_available: bool,
+    agent_disposition: AgentDisposition,
+    pause_required: bool,
 ) -> Result<BTreeMap<String, Value>, CliFailure> {
     let mut data = BTreeMap::from([
         ("apply".to_owned(), Value::from(args.apply)),
@@ -2610,18 +3029,15 @@ fn render_json_data(
         ),
         (
             "agent_disposition".to_owned(),
-            Value::from(effective_disposition),
+            Value::from(agent_disposition.as_str()),
         ),
         (
             "requested_agent_disposition".to_owned(),
             Value::from(args.after_handoff.clone()),
         ),
-        (
-            "agent_disposition_supported".to_owned(),
-            Value::from(!pause_requested),
-        ),
-        ("pause_required".to_owned(), Value::from(false)),
-        ("pause_supported".to_owned(), Value::from(false)),
+        ("agent_disposition_supported".to_owned(), Value::from(true)),
+        ("pause_required".to_owned(), Value::from(pause_required)),
+        ("pause_supported".to_owned(), Value::from(true)),
         (
             "wake_consumer_available".to_owned(),
             Value::from(wake_consumer_available),
@@ -2820,6 +3236,7 @@ fn main() {{
             agent_parent_session_id: None,
             agent_surface_id: None,
             launch_profile: None,
+            task_graph: None,
             goal_managed: false,
             after_handoff: "continue".to_owned(),
             transfer_agent_owner: false,
@@ -2868,9 +3285,10 @@ fn main() {{
         assert!(resolve_agent_context(&managed).is_err());
 
         managed.agent_session_id = Some("019d-test-thread".to_owned());
-        let context = resolve_agent_context(&managed)
-            .expect("valid context")
-            .expect("captured context");
+        let context =
+            resolve_agent_context_with_environment(&managed, &AgentEnvironment::default())
+                .expect("valid context")
+                .expect("captured context");
         assert_eq!(context.provider, "codex");
         assert_eq!(context.resume_transport, "codex_queue");
         assert!(context.goal_managed);
@@ -3043,33 +3461,27 @@ fn main() {{
     }
 
     #[test]
-    fn applied_pause_fails_before_transport_and_dry_run_is_truthful() {
-        let temp = tempfile::tempdir().expect("temp");
-        let paths = RuntimePaths::current_with_overrides(
-            crate::identity::RuntimeMode::Isolated,
-            Some(temp.path().join("global")),
-            Some(temp.path().join("state")),
-        );
+    fn pause_without_a_task_graph_fails_before_transport_and_dry_run_is_truthful() {
         let mut paused = explicit_agent_args("codex", "paused-session");
         paused.goal_managed = true;
         paused.after_handoff = "pause".to_owned();
-        paused.apply = true;
-        let error = steward_handoff_command(
+        let agent = resolve_agent_context_with_environment(&paused, &AgentEnvironment::default())
+            .expect("resolve agent")
+            .expect("agent");
+        let route = agent_route_reference(&agent, "m3");
+        let error = prepare_handoff_receipt_with_profile_and_disposition(
+            None,
             &paused,
-            temp.path(),
-            &paths,
-            &GitHubActions::new(temp.path()),
-            false,
-            &mut Vec::new(),
+            "owner/repo",
+            "m3",
+            Some(route.clone()),
+            None,
+            None,
         )
-        .expect_err("pause cannot apply without a wake consumer");
-        assert!(error.message().contains("wake consumer"));
+        .expect_err("pause cannot be prepared without task-graph authority");
+        assert!(error.message().contains("task-graph"));
 
         paused.apply = false;
-        let agent = resolve_agent_context_with_environment(&paused, &AgentEnvironment::default())
-            .expect("resolve dry-run agent")
-            .expect("dry-run agent");
-        let route = agent_route_reference(&agent, "m3");
         let mut output = Vec::new();
         render(
             &paused,
@@ -3078,14 +3490,16 @@ fn main() {{
             "m3",
             true,
             false,
+            AgentDisposition::Continue,
+            false,
             &mut output,
         )
         .expect("render dry run");
         let value: Value = serde_json::from_slice(&output).expect("dry-run json");
         assert_eq!(value["requested_agent_disposition"], "pause");
-        assert_eq!(value["agent_disposition"], "unsupported");
-        assert_eq!(value["agent_disposition_supported"], false);
-        assert_eq!(value["pause_supported"], false);
+        assert_eq!(value["agent_disposition"], "continue");
+        assert_eq!(value["agent_disposition_supported"], true);
+        assert_eq!(value["pause_supported"], true);
         assert_eq!(value["pause_required"], false);
         assert_eq!(value["wake_consumer_available"], false);
         assert_eq!(value["monitoring_transferred"], false);
@@ -3218,7 +3632,7 @@ fn main() {{
         assert_eq!(receipt.phase, HandoffPhase::Managed);
         assert_eq!(receipt.revision, 4);
         assert_eq!(receipt.head_sha, managed.head);
-        assert_eq!(receipt.agent_disposition, "continue");
+        assert_eq!(receipt.agent_disposition, AgentDisposition::Continue);
         assert!(!receipt.pause_required);
         assert!(!receipt.wake_consumer_available);
         assert_eq!(receipt.goal_lifecycle, GoalLifecycle::Managed);
@@ -3555,11 +3969,7 @@ fn main() {{
         let error =
             prepare_handoff_receipt(Some(receipt), &changed, "owner/repo", "m3", Some(route))
                 .expect_err("disposition cannot change on replay");
-        assert!(
-            error
-                .message()
-                .contains("agent disposition or pause intent")
-        );
+        assert!(error.message().contains("task-graph proof"));
     }
 
     #[test]
@@ -3762,7 +4172,7 @@ fn main() {{
         let (actions, count) = handoff_status_failing_gh(&temp, &args().head);
         let mut handoff_args = explicit_agent_args("codex", "intent-owner-session");
         handoff_args.apply = true;
-        let error = steward_handoff_command(
+        let error = steward_handoff_command_without_ambient(
             &handoff_args,
             temp.path(),
             &paths,
@@ -3803,7 +4213,7 @@ fn main() {{
         handoff_args.apply = true;
         let (actions, log) = handoff_success_gh(&temp, &handoff_args.head, "[]");
 
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             temp.path(),
             &paths,
@@ -3824,7 +4234,7 @@ fn main() {{
         .to_string();
         let (replay_actions, replay_log) =
             handoff_success_gh(&replay_temp, &handoff_args.head, &statuses);
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             replay_temp.path(),
             &paths,
@@ -3903,7 +4313,7 @@ fn main() {{
         }])
         .to_string();
         let (actions, log) = handoff_success_gh(&temp, &handoff_args.head, &statuses);
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             temp.path(),
             &paths,
@@ -3941,7 +4351,7 @@ fn main() {{
         let mut handoff_args = explicit_agent_args("codex", "status-repair-session");
         handoff_args.apply = true;
         let (actions, _) = handoff_success_gh(&temp, &handoff_args.head, "[]");
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             temp.path(),
             &paths,
@@ -3973,7 +4383,7 @@ fn main() {{
         .to_string();
         let (replay_actions, replay_log) =
             handoff_success_gh(&replay_temp, &handoff_args.head, &statuses);
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             replay_temp.path(),
             &paths,
@@ -4020,12 +4430,17 @@ fn main() {{
 
     #[cfg(unix)]
     #[test]
-    fn exact_integration_permission_error_uses_one_ambient_fallback() {
+    fn exact_integration_permission_error_fails_closed_without_ambient_fallback() {
         let temp = tempfile::tempdir().expect("temp");
         let (actions, count) = sequenced_gh(&temp, "Resource not accessible by integration");
-        run_steward_write(&actions, &["api".to_owned(), "test".to_owned()], "test")
-            .expect("ambient fallback");
-        assert_eq!(std::fs::read_to_string(count).expect("count"), "2");
+        let error = run_steward_write(&actions, &["api".to_owned(), "test".to_owned()])
+            .expect_err("configured App denial must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Resource not accessible by integration")
+        );
+        assert_eq!(std::fs::read_to_string(count).expect("count"), "1");
     }
 
     #[cfg(unix)]
@@ -4033,9 +4448,7 @@ fn main() {{
     fn generic_write_failure_does_not_escape_to_ambient_auth() {
         let temp = tempfile::tempdir().expect("temp");
         let (actions, count) = sequenced_gh(&temp, "HTTP 403 generic forbidden");
-        assert!(
-            run_steward_write(&actions, &["api".to_owned(), "test".to_owned()], "test").is_err()
-        );
+        assert!(run_steward_write(&actions, &["api".to_owned(), "test".to_owned()]).is_err());
         assert_eq!(std::fs::read_to_string(count).expect("count"), "1");
     }
 

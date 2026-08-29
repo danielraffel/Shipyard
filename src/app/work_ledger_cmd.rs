@@ -5,12 +5,17 @@ use std::process::ExitCode;
 
 use serde_json::Value;
 
+use crate::cloud::GitHubActions;
+use crate::custody_transport::{
+    MAX_CUSTODY_WIRE_BYTES, handle_incoming_request, incoming_peer_evidence_from_environment,
+    load_custody_transport_policy,
+};
 use crate::daemon_ipc::read_daemon_status;
 use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
 use crate::work_ledger::{
-    AgentReturnExpectation, NativePublicationReport, RepoPolicy, WorkLedger, absent_status,
-    apply_legacy_snapshot, plan_legacy_snapshot, validate_repo_policy,
+    AgentReturnExpectation, CustodyStatus, NativePublicationReport, RepoPolicy, WorkLedger,
+    absent_status, apply_legacy_snapshot, plan_legacy_snapshot, validate_repo_policy,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 
@@ -24,6 +29,7 @@ const MAX_AGENT_RECEIPT_BYTES: u64 = 64 * 1024;
 pub(super) fn work_ledger_command<W: Write>(
     command: &WorkLedgerCommand,
     runtime_paths: &RuntimePaths,
+    cwd: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -53,6 +59,18 @@ pub(super) fn work_ledger_command<W: Write>(
                 writeln!(stdout, "Work items: {}", status.work_items).map_err(failure)?;
                 writeln!(stdout, "Pending wakes: {}", status.pending_wakes).map_err(failure)?;
                 writeln!(stdout, "Uncertain wakes: {}", status.uncertain_wakes).map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Pending projection intents: {}",
+                    status.pending_projection_intents
+                )
+                .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Quarantined projection intents: {}",
+                    status.quarantined_projection_intents
+                )
+                .map_err(failure)?;
                 writeln!(stdout, "Activation: {}", operational.activation_state)
                     .map_err(failure)?;
                 writeln!(stdout, "Dispatch: {}", operational.dispatch_state).map_err(failure)?;
@@ -70,6 +88,89 @@ pub(super) fn work_ledger_command<W: Write>(
                         .map_err(failure)?;
                 }
             }
+        }
+        WorkLedgerCommand::CustodyStatus => {
+            let status = WorkLedger::open_existing(state_dir)
+                .map_err(failure)?
+                .map_or_else(
+                    || Ok(CustodyStatus::default()),
+                    |ledger| ledger.custody_status(),
+                )
+                .map_err(failure)?;
+            if json {
+                write_pretty_json(stdout, &status).map_err(failure)?;
+            } else {
+                writeln!(stdout, "Outgoing pending: {}", status.outgoing_pending)
+                    .map_err(failure)?;
+                writeln!(stdout, "Outgoing claimed: {}", status.outgoing_claimed)
+                    .map_err(failure)?;
+                writeln!(stdout, "Outgoing accepted: {}", status.outgoing_accepted)
+                    .map_err(failure)?;
+                writeln!(stdout, "Outgoing processed: {}", status.outgoing_processed)
+                    .map_err(failure)?;
+                writeln!(stdout, "Outgoing cancelled: {}", status.outgoing_cancelled)
+                    .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Outgoing superseded: {}",
+                    status.outgoing_superseded
+                )
+                .map_err(failure)?;
+                writeln!(stdout, "Incoming received: {}", status.incoming_received)
+                    .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Incoming processing: {}",
+                    status.incoming_processing
+                )
+                .map_err(failure)?;
+                writeln!(stdout, "Incoming processed: {}", status.incoming_processed)
+                    .map_err(failure)?;
+                writeln!(stdout, "Incoming cancelled: {}", status.incoming_cancelled)
+                    .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Incoming superseded: {}",
+                    status.incoming_superseded
+                )
+                .map_err(failure)?;
+                writeln!(stdout, "Pending controls: {}", status.pending_controls)
+                    .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Pending successor rebinds: {}",
+                    status.pending_rebinds
+                )
+                .map_err(failure)?;
+            }
+        }
+        WorkLedgerCommand::CustodyReceive => {
+            let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+            if runtime_paths != &production_paths {
+                return Err(CliFailure::new(
+                    1,
+                    "custody receive is available only against canonical production roots",
+                ));
+            }
+            let policy = load_custody_transport_policy(
+                crate::identity::RuntimeMode::Shipyard,
+                runtime_paths.global_dir.clone(),
+            )
+            .map_err(|error| CliFailure::new(1, error))?
+            .ok_or_else(|| CliFailure::new(1, "custody transport is disabled"))?;
+            let evidence = incoming_peer_evidence_from_environment(&policy)
+                .map_err(|error| CliFailure::new(1, error))?;
+            let mut input = Vec::new();
+            std::io::stdin()
+                .take(MAX_CUSTODY_WIRE_BYTES + 1)
+                .read_to_end(&mut input)
+                .map_err(failure)?;
+            if input.len() as u64 > MAX_CUSTODY_WIRE_BYTES {
+                return Err(CliFailure::new(1, "custody request exceeds the wire limit"));
+            }
+            let response = handle_incoming_request(&policy, state_dir, &evidence, &input);
+            serde_json::to_writer(&mut *stdout, &response).map_err(failure)?;
+            writeln!(stdout).map_err(failure)?;
         }
         WorkLedgerCommand::Import { apply } => {
             let report = if *apply {
@@ -111,7 +212,8 @@ pub(super) fn work_ledger_command<W: Write>(
                     "native publication is available only against canonical production roots",
                 ));
             }
-            let request = native_publication_request(runtime_paths, repo, *pr, head)?;
+            let actions = GitHubActions::new(cwd).with_repo_override(repo);
+            let request = native_publication_request(runtime_paths, &actions, repo, *pr, head)?;
             let mut loader = WorkstreamActivationLoader::production();
             let ready = match loader.revalidate_for_tick() {
                 WorkstreamActivationState::Ready(ready) => ready,
@@ -737,253 +839,4 @@ fn failure(error: impl std::fmt::Display) -> CliFailure {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-    use std::path::PathBuf;
-
-    use super::*;
-    use serde_json::Value;
-    use tempfile::TempDir;
-
-    use crate::workstream_activation_loader::ReadyWorkstreamActivation;
-    use crate::workstream_continuation_config::{
-        ProviderWrapperConfig, WorkstreamContinuationConfig,
-    };
-
-    struct SequenceActivation(VecDeque<Result<ReadyWorkstreamActivation, &'static str>>);
-
-    impl HandshakeActivation for SequenceActivation {
-        fn revalidate(&mut self) -> Result<ReadyWorkstreamActivation, CliFailure> {
-            self.0
-                .pop_front()
-                .expect("activation sequence")
-                .map_err(|code| CliFailure::new(1, code))
-        }
-    }
-
-    fn ready_activation() -> ReadyWorkstreamActivation {
-        ReadyWorkstreamActivation {
-            machine_tag: "m5".to_owned(),
-            config: WorkstreamContinuationConfig {
-                origin_machine: "m5".to_owned(),
-                repositories: vec!["generous-corp/shipyard".to_owned()],
-                provider_wrapper: ProviderWrapperConfig {
-                    executable_path: PathBuf::from("/opt/wrapper"),
-                    executable_sha256: "a".repeat(64),
-                    provider_id: "codex".to_owned(),
-                    adapter_id: "cmux-workstream-v1".to_owned(),
-                    deadline_seconds: 30,
-                    max_stdout_bytes: 1024,
-                    max_stderr_bytes: 1024,
-                },
-            },
-        }
-    }
-
-    #[test]
-    fn status_reports_enabled_configuration_and_redacted_runtime_truth() {
-        let operational = operational_status(
-            WorkstreamActivationState::Ready(ready_activation()),
-            Some(serde_json::json!({
-                "workstream_continuation": {
-                    "state": "idle",
-                    "reason_code": "provider_waiting",
-                    "route_ref": "private-route",
-                    "wake_id": "private-wake"
-                }
-            })),
-        );
-        assert!(operational.activation_enabled);
-        assert!(operational.dispatch_enabled);
-        assert_eq!(operational.activation_state, "enabled");
-        assert_eq!(operational.dispatch_state, "enabled");
-        assert_eq!(operational.continuation_runtime, "idle");
-        assert_eq!(operational.activation_reason_code, None);
-        assert_eq!(
-            operational.runtime_reason_code.as_deref(),
-            Some("provider_waiting")
-        );
-
-        let rendered = work_ledger_status_json(&absent_status(), &operational)
-            .expect("render operational status");
-        assert_eq!(rendered["activation_enabled"], true);
-        assert_eq!(rendered["dispatch_enabled"], true);
-        assert_eq!(rendered["activation_state"], "enabled");
-        assert_eq!(rendered["dispatch_state"], "enabled");
-        assert_eq!(rendered["continuation_runtime"], "idle");
-        assert!(rendered.get("activation_reason_code").is_none());
-        assert_eq!(rendered["runtime_reason_code"], "provider_waiting");
-        let bytes = serde_json::to_vec(&rendered).expect("serialize rendered status");
-        assert!(
-            !bytes
-                .windows(b"private-route".len())
-                .any(|part| part == b"private-route")
-        );
-        assert!(
-            !bytes
-                .windows(b"private-wake".len())
-                .any(|part| part == b"private-wake")
-        );
-    }
-
-    #[test]
-    fn status_distinguishes_disabled_refused_and_stopped_daemon() {
-        let disabled = operational_status(WorkstreamActivationState::Disabled, None);
-        assert!(!disabled.activation_enabled);
-        assert!(!disabled.dispatch_enabled);
-        assert_eq!(disabled.activation_state, "disabled");
-        assert_eq!(disabled.dispatch_state, "disabled");
-        assert_eq!(disabled.continuation_runtime, "daemon_not_running");
-        assert_eq!(disabled.activation_reason_code, None);
-        assert_eq!(disabled.runtime_reason_code, None);
-
-        let old_daemon = operational_status(
-            WorkstreamActivationState::Ready(ready_activation()),
-            Some(serde_json::json!({
-                "pid": 123,
-                "shipyard_version": "0.126.2"
-            })),
-        );
-        assert!(old_daemon.activation_enabled);
-        assert!(old_daemon.dispatch_enabled);
-        assert_eq!(old_daemon.continuation_runtime, "status_unavailable");
-        assert_ne!(old_daemon.continuation_runtime, "daemon_not_running");
-
-        let refused = operational_status(
-            WorkstreamActivationState::Refused(
-                crate::workstream_activation_loader::WorkstreamActivationRefusal::InvalidMachinePolicy,
-            ),
-            Some(serde_json::json!({
-                "workstream_continuation": {
-                    "state": "refused",
-                    "reason_code": "stale_daemon_reason"
-                }
-            })),
-        );
-        assert!(!refused.activation_enabled);
-        assert!(!refused.dispatch_enabled);
-        assert_eq!(refused.activation_state, "refused");
-        assert_eq!(refused.dispatch_state, "refused");
-        assert_eq!(refused.continuation_runtime, "refused");
-        assert_eq!(
-            refused.activation_reason_code.as_deref(),
-            Some("invalid_machine_policy")
-        );
-        assert_eq!(
-            refused.runtime_reason_code.as_deref(),
-            Some("stale_daemon_reason")
-        );
-        let rendered = work_ledger_status_json(&absent_status(), &refused)
-            .expect("render simultaneous refusal status");
-        assert_eq!(rendered["activation_reason_code"], "invalid_machine_policy");
-        assert_eq!(rendered["runtime_reason_code"], "stale_daemon_reason");
-    }
-
-    #[test]
-    fn planted_blocking_input_activation_drift_refuses_before_mutation_authority() {
-        let mut activation = SequenceActivation(VecDeque::from([
-            Ok(ready_activation()),
-            Err("activation_drift"),
-        ]));
-        let mut input_completed = false;
-        let error = read_then_revalidate(&mut activation, || {
-            input_completed = true;
-            Ok(vec![b'{', b'}'])
-        })
-        .expect_err("drift after blocked input");
-        assert!(input_completed);
-        assert_eq!(error.message(), "activation_drift");
-        assert!(activation.0.is_empty());
-    }
-
-    #[test]
-    fn policy_json_always_reports_shadow_activation_and_dispatch() {
-        let temp = TempDir::new().expect("temp");
-        for command in [
-            WorkLedgerPolicyCommand::List,
-            WorkLedgerPolicyCommand::Set {
-                repo: "generous-corp/forge".to_owned(),
-                primary_platform: "macos".to_owned(),
-                compatibility_mode: "independent".to_owned(),
-                compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
-                blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
-                declared_dependency_lanes: Vec::new(),
-                expected_revision: 0,
-                apply: false,
-            },
-        ] {
-            let mut output = Vec::new();
-            policy_command(&command, temp.path(), true, &mut output).expect("policy json");
-            let value: Value = serde_json::from_slice(&output).expect("valid json");
-            assert_eq!(value["mode"], "shadow");
-            assert_eq!(value["activation_enabled"], false);
-            assert_eq!(value["dispatch_enabled"], false);
-        }
-    }
-
-    #[test]
-    fn publication_json_is_stable_and_exposes_no_private_profile() {
-        let report = NativePublicationReport {
-            applied: false,
-            replay: false,
-            work_id: "wi:test".to_owned(),
-            route_ref: "route:test".to_owned(),
-            wake_id: "wake:test".to_owned(),
-            profile_digest: "a".repeat(64),
-        };
-        let mut output = Vec::new();
-        write_publication_report(&mut output, &report, true).expect("publication json");
-        let value: Value = serde_json::from_slice(&output).expect("valid json");
-        assert_eq!(value["applied"], false);
-        assert_eq!(value["replay"], false);
-        assert_eq!(value["work_id"], "wi:test");
-        assert!(value.get("protected_profile_bytes").is_none());
-        assert!(value.get("agent_session_id").is_none());
-    }
-
-    #[test]
-    fn agent_transition_json_omits_protected_object_location() {
-        let ownership = crate::work_ledger::AgentOwnershipReceipt {
-            ownership_id: "ao:test".to_owned(),
-            receipt_object_ref: "secret-object-location".to_owned(),
-            receipt_digest: "a".repeat(64),
-        };
-        let mut output = Vec::new();
-        write_agent_transition(&mut output, true, "context_acknowledged", &ownership, None)
-            .expect("transition JSON");
-        let value: Value = serde_json::from_slice(&output).expect("valid JSON");
-        assert_eq!(value["ownership_id"], "ao:test");
-        assert!(value.get("receipt_object_ref").is_none());
-        assert!(
-            !String::from_utf8(output)
-                .expect("UTF-8")
-                .contains("secret-object-location")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn receipt_reader_requires_private_regular_no_follow_file() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
-
-        let temp = TempDir::new().expect("temp");
-        let receipt = temp.path().join("receipt.json");
-        std::fs::write(&receipt, br#"{"schema_version":1}"#).expect("write");
-        let mut permissions = std::fs::metadata(&receipt).expect("metadata").permissions();
-        permissions.set_mode(0o644);
-        std::fs::set_permissions(&receipt, permissions).expect("public mode");
-        assert!(read_private_file(&receipt).is_err());
-
-        let mut permissions = std::fs::metadata(&receipt).expect("metadata").permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(&receipt, permissions).expect("private mode");
-        assert_eq!(
-            read_private_file(&receipt).expect("private receipt"),
-            br#"{"schema_version":1}"#
-        );
-
-        let link = temp.path().join("receipt-link.json");
-        symlink(&receipt, &link).expect("symlink");
-        assert!(read_private_file(&link).is_err());
-    }
-}
+mod tests;

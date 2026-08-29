@@ -12,6 +12,7 @@ use std::path::{Component, PathBuf};
 use serde::Deserialize;
 
 use crate::config::LoadedConfig;
+use crate::identity::RuntimeMode;
 
 const POLICY_KEY: &str = "workstream_continuation";
 const MAX_DEADLINE_SECONDS: u64 = 300;
@@ -19,6 +20,7 @@ const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_ID_BYTES: usize = 128;
 const MAX_REPOSITORY_COMPONENT_BYTES: usize = 100;
+const LEGACY_CMUX_SIGNING_TEAM_ID: &str = "7WLXT3NR37";
 
 /// A fully enabled, machine-authorized continuation policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,6 +31,17 @@ pub struct WorkstreamContinuationConfig {
     pub repositories: Vec<String>,
     /// Protected provider-wrapper contract.
     pub provider_wrapper: ProviderWrapperConfig,
+    /// Terminal executable trust rooted only in machine-global policy.
+    pub terminal_trust: Box<TerminalTrustConfig>,
+}
+
+/// Verified terminal product identity. The default preserves the previously
+/// deployed cmux identity while allowing non-personal installations to opt in
+/// to their own reviewed signing team without a source change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalTrustConfig {
+    /// Exact Apple signing team accepted for the cmux executable.
+    pub cmux_signing_team_id: String,
 }
 
 impl WorkstreamContinuationConfig {
@@ -60,6 +73,19 @@ pub struct ProviderWrapperConfig {
     pub max_stderr_bytes: u64,
 }
 
+/// Strict route grammar registered independently of physical provider proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegisteredProviderRouteShape {
+    SubrouterV1,
+}
+
+pub(crate) fn registered_provider_route_shape(
+    provider_id: &str,
+) -> Option<RegisteredProviderRouteShape> {
+    matches!(provider_id, "codex" | "claude" | "qwen" | "agy" | "kimi")
+        .then_some(RegisteredProviderRouteShape::SubrouterV1)
+}
+
 /// Refusal returned for malformed, partial, or unauthorized activation policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkstreamContinuationConfigError(String);
@@ -82,6 +108,13 @@ struct RawPolicy {
     origin_machine: Option<String>,
     repositories: Option<Vec<String>>,
     provider_wrapper: Option<RawProviderWrapper>,
+    terminal_trust: Option<RawTerminalTrust>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTerminalTrust {
+    cmux_signing_team_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +158,7 @@ pub fn trusted_workstream_continuation_config(
             if raw.origin_machine.is_some()
                 || raw.repositories.is_some()
                 || raw.provider_wrapper.is_some()
+                || raw.terminal_trust.is_some()
             {
                 return Err(refusal(format!(
                     "{POLICY_KEY} is disabled but contains activation-only fields"
@@ -160,12 +194,59 @@ fn validate_enabled_policy(
         raw.provider_wrapper
             .ok_or_else(|| refusal(format!("{POLICY_KEY}.provider_wrapper is required")))?,
     )?;
+    let terminal_trust = validate_terminal_trust(raw.terminal_trust)?;
 
     Ok(WorkstreamContinuationConfig {
         origin_machine,
         repositories,
         provider_wrapper,
+        terminal_trust: Box::new(terminal_trust),
     })
+}
+
+fn validate_terminal_trust(
+    raw: Option<RawTerminalTrust>,
+) -> Result<TerminalTrustConfig, WorkstreamContinuationConfigError> {
+    let cmux_signing_team_id = raw.map_or_else(
+        || LEGACY_CMUX_SIGNING_TEAM_ID.to_owned(),
+        |trust| trust.cmux_signing_team_id,
+    );
+    if cmux_signing_team_id.len() != 10
+        || !cmux_signing_team_id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(refusal(format!(
+            "{POLICY_KEY}.terminal_trust.cmux_signing_team_id must be a 10-character Apple team identifier"
+        )));
+    }
+    Ok(TerminalTrustConfig {
+        cmux_signing_team_id,
+    })
+}
+
+/// Load only terminal trust from the machine-global product configuration.
+/// Provider requests can repeat this identity for binding, but cannot select it.
+pub(crate) fn load_trusted_terminal_trust_config()
+-> Result<TerminalTrustConfig, WorkstreamContinuationConfigError> {
+    let trusted = LoadedConfig::load_machine_global(RuntimeMode::Shipyard)
+        .map_err(|error| refusal(format!("load trusted terminal policy: {error}")))?;
+    trusted_terminal_trust_config(&trusted)
+}
+
+fn trusted_terminal_trust_config(
+    config: &LoadedConfig,
+) -> Result<TerminalTrustConfig, WorkstreamContinuationConfigError> {
+    let raw = config
+        .get(&format!("{POLICY_KEY}.terminal_trust"))
+        .cloned()
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|error| refusal(format!("decode terminal trust: {error}")))
+        })
+        .transpose()?;
+    validate_terminal_trust(raw)
 }
 
 fn validate_provider_wrapper(
@@ -188,6 +269,11 @@ fn validate_provider_wrapper(
     }
     validate_sha256("provider wrapper executable_sha256", &raw.executable_sha256)?;
     validate_id("provider_id", &raw.provider_id)?;
+    if registered_provider_route_shape(&raw.provider_id).is_none() {
+        return Err(refusal(format!(
+            "{POLICY_KEY}.provider_wrapper.provider_id has no registered route shape"
+        )));
+    }
     validate_id("adapter_id", &raw.adapter_id)?;
     if !(1..=MAX_DEADLINE_SECONDS).contains(&raw.deadline_seconds) {
         return Err(refusal(format!(
@@ -429,12 +515,55 @@ max_stderr_bytes = 16384
         );
         assert_eq!(policy.provider_wrapper.executable_sha256, DIGEST);
         assert_eq!(policy.provider_wrapper.deadline_seconds, 120);
+        assert_eq!(
+            policy.terminal_trust.cmux_signing_team_id,
+            LEGACY_CMUX_SIGNING_TEAM_ID
+        );
         assert!(policy.allows_repository("generous-corp/shipyard"));
         assert!(!policy.allows_repository("attacker/repository"));
 
         let error =
             trusted_workstream_continuation_config(&config, "m3").expect_err("wrong machine");
         assert!(error.to_string().contains("does not match this machine"));
+    }
+
+    #[test]
+    fn terminal_trust_is_machine_global_configurable_and_strict() {
+        let configured = enabled_policy("[\"generous-corp/shipyard\"]")
+            + "\n[workstream_continuation.terminal_trust]\ncmux_signing_team_id = \"ABCDEFGHIJ\"\n";
+        let (_temp, config) = layered_config(Some(&configured), None, None);
+        let policy = trusted_workstream_continuation_config(&config, "m5")
+            .expect("valid policy")
+            .expect("enabled");
+        assert_eq!(policy.terminal_trust.cmux_signing_team_id, "ABCDEFGHIJ");
+
+        for invalid in ["short", "abcdefghij", "ABCDEF!HIJ"] {
+            let body = enabled_policy("[\"generous-corp/shipyard\"]")
+                + &format!(
+                    "\n[workstream_continuation.terminal_trust]\ncmux_signing_team_id = \"{invalid}\"\n"
+                );
+            let (_temp, config) = layered_config(Some(&body), None, None);
+            assert!(trusted_workstream_continuation_config(&config, "m5").is_err());
+        }
+    }
+
+    #[test]
+    fn only_registered_provider_routes_activate() {
+        for provider in ["codex", "claude", "qwen", "agy", "kimi"] {
+            let body = enabled_policy("[\"generous-corp/shipyard\"]").replace(
+                "provider_id = \"codex\"",
+                &format!("provider_id = \"{provider}\""),
+            );
+            let (_temp, config) = layered_config(Some(&body), None, None);
+            assert!(
+                trusted_workstream_continuation_config(&config, "m5").is_ok(),
+                "{provider}"
+            );
+        }
+        let unsupported = enabled_policy("[\"generous-corp/shipyard\"]")
+            .replace("provider_id = \"codex\"", "provider_id = \"unregistered\"");
+        let (_temp, config) = layered_config(Some(&unsupported), None, None);
+        assert!(trusted_workstream_continuation_config(&config, "m5").is_err());
     }
 
     #[test]

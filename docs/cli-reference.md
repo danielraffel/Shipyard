@@ -21,6 +21,8 @@ shipyard run --continue            # don't stop at first failure
 shipyard run command --target linux-vm --artifact 'build/linux-x64/lib/libv8.so' -- bash -lc './build-v8.py --target linux-x64'
 shipyard --json changed-surface-plan --repo OWNER/REPO --pr 123 --target mac  # shadow-only exact-head test plan
 shipyard --json changed-surface-trial-status --repo OWNER/REPO --pr 123 --target mac --head HEAD_SHA  # read-only shadow result verdict
+shipyard --json parallel-proof-canary --request /absolute/private/invocation.json # no-execution/no-mutation plan
+shipyard --json parallel-proof-canary --request /absolute/private/invocation.json --apply # exact machine-global digest-pinned canary
 
 # Ship
 shipyard ship                  # PR → validate → merge on green
@@ -106,6 +108,7 @@ shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable a
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --agent-provider codex --agent-session-id SESSION --launch-profile ./launch-profile.json --apply
+shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --agent-provider codex --agent-session-id SESSION --launch-profile ./launch-profile.json --after-handoff pause --task-graph ./task-graph.json --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/... --launch-profile ./launch-profile.json
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
@@ -120,7 +123,8 @@ shipyard work-ledger policy set --repo generous-corp/forge --primary-platform ma
 # On the protected base branch, make every `shipyard pr` submission durable
 # immediately after PR creation. A PR branch cannot opt itself in.
 # Optional CLI --workstream-id/--context-url values override the fallbacks.
-# --launch-profile atomically publishes a wake when the trusted consumer is enabled.
+# --launch-profile atomically publishes a zero-wake daemon obligation when the trusted consumer is enabled.
+# --after-handoff defaults to continue; pause also requires --task-graph proof.
 # In .shipyard/config.toml:
 # [merge_steward]
 # auto_handoff = true

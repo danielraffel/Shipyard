@@ -233,6 +233,12 @@ class CiMatrixTests(unittest.TestCase):
         self.assertIn('--state-dir "$canary_root/state"', workflow)
         self.assertIn('.tunnel.backend == "inactive"', workflow)
         self.assertIn('SHIPYARD_BINARY_FOR_TEST="$candidate"', workflow)
+        self.assertEqual(workflow.count("sandbox-audit-exec"), 2)
+        self.assertEqual(workflow.count('--authority-sha "$GITHUB_SHA"'), 2)
+        self.assertIn(
+            'sandbox-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}',
+            workflow,
+        )
         self.assertIn('candidate_sha256:$candidate_hash', workflow)
         self.assertIn('sandbox_passed:true', workflow)
         self.assertIn('.real_home == env.HOME', workflow)

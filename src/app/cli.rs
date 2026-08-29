@@ -47,6 +47,22 @@ pub(super) enum Command {
         #[arg(last = true, required = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
+    /// Internal queue-idle admission wrapper for production-home sandbox audits.
+    #[command(name = "sandbox-audit-exec", hide = true)]
+    SandboxAuditExec {
+        /// Stable identity for this exact audit attempt.
+        #[arg(long)]
+        work_id: String,
+        /// Immutable source authority being audited.
+        #[arg(long)]
+        authority_sha: String,
+        /// Internal process-custody generation. Presence selects worker mode.
+        #[arg(long, hide = true)]
+        worker_generation: Option<String>,
+        /// Sandbox audit command and arguments.
+        #[arg(last = true, required = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
     /// Internal daemon-owned queue worker.
     #[command(name = "execution-worker", hide = true)]
     ExecutionWorker {
@@ -54,6 +70,16 @@ pub(super) enum Command {
         #[arg(long)]
         job_id: String,
         /// Unique worker generation used to reject stale PID receipts.
+        #[arg(long)]
+        generation: String,
+    },
+    /// Internal daemon-owned typed parallel-proof canary worker.
+    #[command(name = "parallel-proof-canary-worker", hide = true)]
+    ParallelProofCanaryWorker {
+        /// Exact durable canary job identifier.
+        #[arg(long)]
+        job_id: String,
+        /// Immutable launch generation used for receipt fencing.
         #[arg(long)]
         generation: String,
     },
@@ -152,6 +178,27 @@ pub(super) enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Audit or reconcile one legacy daemon orphan that has no worker receipt.
+    #[command(name = "queue-reconcile-orphan")]
+    QueueReconcileOrphan {
+        /// Exact queue job identifier.
+        job_id: String,
+        /// Expected immutable submitted head (required with --apply).
+        #[arg(long)]
+        expected_head: Option<String>,
+        /// SHA-256 of the exact durable request file (required with --apply).
+        #[arg(long)]
+        expected_request_sha256: Option<String>,
+        /// SHA-256 of the canonical audited queue row (required with --apply).
+        #[arg(long)]
+        expected_job_sha256: Option<String>,
+        /// Apply the exact-CAS terminalization after all live proofs pass.
+        #[arg(long)]
+        apply: bool,
+        /// Explicitly acknowledge the bounded negative process inventory.
+        #[arg(long, requires = "apply")]
+        confirm_no_worker_tree: bool,
+    },
     /// Change the priority of a pending job.
     Bump {
         /// Job identifier.
@@ -218,6 +265,22 @@ pub(super) enum Command {
         /// Exact 40-character lowercase pull-request head SHA.
         #[arg(long = "head")]
         head_sha: String,
+    },
+    /// Plan or apply one default-off, receipt-only parallel-proof canary.
+    #[command(name = "parallel-proof-canary")]
+    ParallelProofCanary {
+        /// Private strict JSON invocation file with exact proof and policy authority.
+        #[arg(long, required_unless_present = "status")]
+        request: Option<PathBuf>,
+        /// Execute the digest-pinned adapter. Omit for no execution or mutation.
+        #[arg(long, requires = "request", conflicts_with_all = ["status", "cancel"])]
+        apply: bool,
+        /// Inspect one durable canary job without launching or polling.
+        #[arg(long, value_name = "JOB_ID", conflicts_with_all = ["request", "apply", "cancel"])]
+        status: Option<String>,
+        /// Request bounded cancellation using the authority in --request.
+        #[arg(long, value_name = "JOB_ID", requires = "request", conflicts_with_all = ["apply", "status"])]
+        cancel: Option<String>,
     },
     /// Clean up old logs, bundles, evidence, and optional ship-state.
     Cleanup {
@@ -392,6 +455,13 @@ pub(super) enum Command {
         /// exact-head steward handoff.
         #[arg(long = "launch-profile", conflicts_with = "no_steward_handoff")]
         launch_profile: Option<PathBuf>,
+        /// Post-handoff owner disposition. Continue is always safe; pause also
+        /// requires a private durable task graph proving no runnable sibling.
+        #[arg(long = "after-handoff", value_parser = ["continue", "pause"], default_value = "continue", conflicts_with = "no_steward_handoff")]
+        after_handoff: String,
+        /// Private `TaskGraphV1` used only to authorize --after-handoff pause.
+        #[arg(long = "task-graph", conflicts_with = "no_steward_handoff")]
+        task_graph: Option<PathBuf>,
         /// Disable a project-configured automatic steward handoff.
         #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
         no_steward_handoff: bool,
@@ -497,6 +567,12 @@ pub(super) enum Command {
 pub(super) enum WorkLedgerCommand {
     /// Show schema, integrity, and redacted lifecycle counts without creating storage.
     Status,
+    /// Show exact durable custody states; no state named "read" is inferred.
+    #[command(name = "custody-status")]
+    CustodyStatus,
+    /// Receive one authenticated custody protocol request from a forced SSH command.
+    #[command(name = "custody-receive", hide = true)]
+    CustodyReceive,
     /// Plan or apply an idempotent legacy-state import. Dry-run is the default.
     Import {
         /// Commit selected redacted projections to the shadow ledger.
@@ -1200,9 +1276,15 @@ pub(super) enum RunnerCommand {
     /// refresh each daemon. Plans only unless `--apply` is supplied.
     #[command(name = "fleet-update")]
     FleetUpdate {
-        /// Exact release tag to install on every host, for example v0.100.0.
+        /// Exact release tag to install, for example v0.127.2.
         #[arg(long = "to")]
         to: String,
+        /// Governed host class to update. Repeat to define fail-stop order.
+        #[arg(long = "host-class")]
+        host_classes: Vec<String>,
+        /// Explicitly select every configured host class in configuration order.
+        #[arg(long, conflicts_with = "host_classes")]
+        all_hosts: bool,
         /// Execute the rollout. Without this flag, emit the exact host plan.
         #[arg(long)]
         apply: bool,
@@ -1304,6 +1386,10 @@ pub(super) enum RunnerCommand {
         /// default; pause only when this PR is its remaining blocker.
         #[arg(long = "after-handoff", value_parser = ["continue", "pause"], default_value = "continue")]
         after_handoff: String,
+        /// Private `TaskGraphV1` proving the handed-off task is the only
+        /// remaining runnable boundary before the original owner may pause.
+        #[arg(long = "task-graph")]
+        task_graph: Option<PathBuf>,
         /// Explicitly transfer an existing exact-head receipt to a replacement
         /// provider session, incrementing its durable ownership generation.
         #[arg(long = "transfer-agent-owner")]
@@ -2172,6 +2258,60 @@ mod tests {
     };
 
     #[test]
+    fn sandbox_audit_exec_requires_explicit_authority_and_child() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "sandbox-audit-exec",
+            "--work-id",
+            "audit-1",
+            "--authority-sha",
+            "a1b2c3",
+            "--",
+            "/usr/bin/true",
+        ])
+        .expect("sandbox audit command");
+        assert!(matches!(
+            cli.command,
+            Command::SandboxAuditExec {
+                work_id,
+                authority_sha,
+                worker_generation,
+                command,
+            } if work_id == "audit-1"
+                && authority_sha == "a1b2c3"
+                && worker_generation.is_none()
+                && command == [std::ffi::OsString::from("/usr/bin/true")]
+        ));
+        assert!(Cli::try_parse_from(["shipyard", "sandbox-audit-exec"]).is_err());
+
+        let worker = Cli::try_parse_from([
+            "shipyard",
+            "sandbox-audit-exec",
+            "--work-id",
+            "audit-1",
+            "--authority-sha",
+            "a1b2c3",
+            "--worker-generation",
+            "generation-1",
+            "--",
+            "/usr/bin/true",
+        ])
+        .expect("sandbox audit worker");
+        assert!(matches!(
+            worker.command,
+            Command::SandboxAuditExec {
+                work_id,
+                authority_sha,
+                worker_generation,
+                command,
+            } if work_id == "audit-1"
+                && authority_sha == "a1b2c3"
+                && worker_generation.as_deref() == Some("generation-1")
+                && command == [std::ffi::OsString::from("/usr/bin/true")]
+        ));
+    }
+
+    #[test]
     fn dependency_pulp_commands_have_an_explicit_operation() {
         let cli = Cli::try_parse_from(["shipyard", "dependency", "pulp", "verify"])
             .expect("dependency verify command");
@@ -2240,6 +2380,41 @@ mod tests {
     }
 
     #[test]
+    fn parallel_proof_canary_defaults_to_plan_and_apply_is_explicit() {
+        let planned = Cli::try_parse_from([
+            "shipyard",
+            "parallel-proof-canary",
+            "--request",
+            "/private/canary.json",
+        ])
+        .expect("parallel-proof canary plan");
+        assert!(matches!(
+            planned.command,
+            Command::ParallelProofCanary { request: Some(request), apply: false, status: None, cancel: None }
+                if request == Path::new("/private/canary.json")
+        ));
+        let applied = Cli::try_parse_from([
+            "shipyard",
+            "parallel-proof-canary",
+            "--request",
+            "/private/canary.json",
+            "--apply",
+        ])
+        .expect("parallel-proof canary apply");
+        assert!(matches!(
+            applied.command,
+            Command::ParallelProofCanary { apply: true, .. }
+        ));
+        assert!(Cli::try_parse_from(["shipyard", "parallel-proof-canary"]).is_err());
+        let status =
+            Cli::try_parse_from(["shipyard", "parallel-proof-canary", "--status", "job-1"])
+                .expect("status without request");
+        assert!(
+            matches!(status.command, Command::ParallelProofCanary { status: Some(job), .. } if job == "job-1")
+        );
+    }
+
+    #[test]
     fn local_linux_lease_defaults_to_trusted_merge_group_context() {
         let cli = Cli::try_parse_from(["shipyard", "runner", "local-linux-lease"])
             .expect("default local Linux lease command");
@@ -2290,6 +2465,36 @@ mod tests {
                 command: WorkLedgerCommand::Import { apply: true }
             }
         ));
+    }
+
+    #[test]
+    fn work_ledger_custody_commands_preserve_exact_peer_binding() {
+        let status = Cli::try_parse_from(["shipyard", "work-ledger", "custody-status"])
+            .expect("custody status");
+        assert!(matches!(
+            status.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::CustodyStatus
+            }
+        ));
+        let receive = Cli::try_parse_from(["shipyard", "work-ledger", "custody-receive"])
+            .expect("custody SSH subsystem receiver");
+        assert!(matches!(
+            receive.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::CustodyReceive
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "work-ledger",
+                "custody-receive",
+                "--peer",
+                "machine_untrusted",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

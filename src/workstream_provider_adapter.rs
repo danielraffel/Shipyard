@@ -6,43 +6,27 @@
 //! release workflows and installer still package only `shipyard`; a production
 //! follow-up must build, sign, install, and digest-pin this second executable.
 
-#[cfg(target_os = "macos")]
-use std::ffi::OsStr;
-#[cfg(target_os = "macos")]
-use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
-#[cfg(target_os = "macos")]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-#[cfg(target_os = "macos")]
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::process::run_output_until;
 use crate::provider_wrapper::{
-    NotAcceptedV1, ProviderAcceptanceV1, ProviderReasoningEffortV1, ProviderWrapperOperationV1,
-    ProviderWrapperOutcomeV1, ProviderWrapperRequestV1, ProviderWrapperResponseV1, UnknownV1,
-    validate_request,
+    NotAcceptedV1, PROVIDER_WRAPPER_SCHEMA_VERSION, ProviderAcceptanceV1, ProviderDeliveryTargetV1,
+    ProviderWrapperOperationV1, ProviderWrapperOutcomeV1, ProviderWrapperRequestV1,
+    ProviderWrapperResponseV1, TerminalEndpointV1, UnknownV1, validate_request,
 };
-use crate::workstream_continuation_config::ProviderWrapperConfig;
+use crate::workstream_continuation_config::{
+    ProviderWrapperConfig, load_trusted_terminal_trust_config,
+};
 
-const SCHEMA_VERSION: u32 = 1;
 const ADAPTER_ID: &str = "cmux-workstream-v1";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
-#[cfg(target_os = "macos")]
-const CMUX_APP: &str = "/Applications/cmux.app";
-const CMUX_CLI: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux";
-const CODEX_WRAPPER: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux-codex-wrapper";
-const CLAUDE_WRAPPER: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux-claude-wrapper";
-#[cfg(target_os = "macos")]
-const CODESIGN: &str = "/usr/bin/codesign";
-#[cfg(target_os = "macos")]
-const MANAFLOW_TEAM_ID: &str = "7WLXT3NR37";
-const COMMAND_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Read one strict request from stdin and emit exactly one strict response.
 pub fn run_stdio() -> Result<(), String> {
@@ -55,8 +39,12 @@ pub fn run_stdio() -> Result<(), String> {
         return Err("request exceeds the bounded input limit".to_owned());
     }
     let request: ProviderWrapperRequestV1 =
-        serde_json::from_slice(&bytes).map_err(|_| "request is not strict v1 JSON".to_owned())?;
-    let response = handle_request(&request, &mut ProductionCmuxRunner);
+        serde_json::from_slice(&bytes).map_err(|_| "request is not strict v2 JSON".to_owned())?;
+    let terminal_trust = load_trusted_terminal_trust_config()
+        .map_err(|_| "trusted terminal policy is unavailable".to_owned())?;
+    let mut terminal = ProductionCmuxTransport::new(terminal_trust.cmux_signing_team_id);
+    let mut provider = ProductionSubrouterLaunchAuthority;
+    let response = handle_request(&request, &mut terminal, &mut provider);
     let canonical =
         serde_json::to_vec(&response).map_err(|_| "response cannot be serialized".to_owned())?;
     let mut stdout = std::io::stdout().lock();
@@ -66,94 +54,88 @@ pub fn run_stdio() -> Result<(), String> {
         .map_err(|_| "response output is unwritable".to_owned())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CommandResult {
-    success: bool,
-    stdout: Vec<u8>,
-}
+/// Verify that this process is the exact companion executable authorized by
+/// the controller before serving an auxiliary read-only protocol.
+#[cfg(unix)]
+pub(crate) fn verify_current_companion_digest(
+    expected_digest: &crate::parallel_proof::Sha256Digest,
+) -> Result<(), String> {
+    const MAX_COMPANION_BYTES: u64 = 128 * 1024 * 1024;
 
-trait CmuxRunner {
-    fn verify(&mut self) -> Result<(), RunnerFailure>;
-    fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RunnerFailure {
-    Unavailable,
-    #[cfg(any(target_os = "macos", test))]
-    Untrusted,
-}
-
-struct ProductionCmuxRunner;
-
-impl CmuxRunner for ProductionCmuxRunner {
-    fn verify(&mut self) -> Result<(), RunnerFailure> {
-        verify_bundled_cmux()
+    let current =
+        std::env::current_exe().map_err(|_| "companion-identity-unavailable".to_owned())?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(current)
+        .map_err(|_| "companion-open-refused".to_owned())?;
+    let before = file
+        .metadata()
+        .map_err(|_| "companion-metadata-refused".to_owned())?;
+    if !before.is_file()
+        || before.uid() != nix::unistd::Uid::effective().as_raw()
+        || before.nlink() != 1
+        || before.len() == 0
+        || before.len() > MAX_COMPANION_BYTES
+        || before.mode() & 0o111 == 0
+        || before.mode() & 0o022 != 0
+    {
+        return Err("companion-metadata-refused".to_owned());
     }
-
-    fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure> {
-        let mut command = Command::new(CMUX_CLI);
-        command.args(args).env_clear();
-        let output = run_output_until(
-            &mut command,
-            Instant::now() + COMMAND_DEADLINE,
-            "cmux workstream provider",
-        )
-        .map_err(|_| RunnerFailure::Unavailable)?;
-        Ok(CommandResult {
-            success: output.status.success(),
-            stdout: output.stdout,
-        })
+    let mut hasher = Sha256::new();
+    let copied = std::io::copy(&mut file, &mut HashWriter(&mut hasher))
+        .map_err(|_| "companion-read-refused".to_owned())?;
+    let after = file
+        .metadata()
+        .map_err(|_| "companion-metadata-refused".to_owned())?;
+    if copied != before.len()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || hex::encode(hasher.finalize()) != expected_digest.as_str()
+    {
+        return Err("companion-digest-refused".to_owned());
     }
-}
-
-#[cfg(target_os = "macos")]
-fn verify_bundled_cmux() -> Result<(), RunnerFailure> {
-    let app = Path::new(CMUX_APP);
-    let cli = Path::new(CMUX_CLI);
-    let app_metadata = fs::metadata(app).map_err(|_| RunnerFailure::Unavailable)?;
-    let cli_metadata = fs::metadata(cli).map_err(|_| RunnerFailure::Unavailable)?;
-    let effective_uid = nix::unistd::Uid::effective().as_raw();
-    for metadata in [&app_metadata, &cli_metadata] {
-        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o022 != 0 {
-            return Err(RunnerFailure::Untrusted);
-        }
-    }
-    if !cli_metadata.is_file() || cli_metadata.permissions().mode() & 0o111 == 0 {
-        return Err(RunnerFailure::Untrusted);
-    }
-    for path in [app, cli] {
-        let requirement = format!(
-            "=anchor apple generic and certificate leaf[subject.OU] = \"{MANAFLOW_TEAM_ID}\""
-        );
-        let output = Command::new(CODESIGN)
-            .args([
-                OsStr::new("--verify"),
-                OsStr::new("--strict"),
-                OsStr::new("-R"),
-            ])
-            .arg(requirement)
-            .arg(path)
-            .output()
-            .map_err(|_| RunnerFailure::Unavailable)?;
-        if !output.status.success() {
-            return Err(RunnerFailure::Untrusted);
-        }
-    }
-    // Darwin cannot execute a previously verified descriptor. The remaining
-    // path race is inside Shipyard's explicit trusted-same-UID boundary, the
-    // same authority that owns cmux.app and Shipyard's machine policy.
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn verify_bundled_cmux() -> Result<(), RunnerFailure> {
-    Err(RunnerFailure::Unavailable)
+#[cfg(not(unix))]
+pub(crate) fn verify_current_companion_digest(
+    _expected_digest: &crate::parallel_proof::Sha256Digest,
+) -> Result<(), String> {
+    Err("companion-digest-verification-unavailable".to_owned())
 }
+
+struct HashWriter<'a>(&'a mut Sha256);
+
+impl Write for HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+mod provider_launch;
+mod terminal_transport;
+
+use provider_launch::{
+    PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE, PrivateLaunch, ProductionSubrouterLaunchAuthority,
+    ProviderLaunchAuthority, delivery_prompt,
+};
+#[cfg(test)]
+use provider_launch::{launch_command, prepare_private_launch, verify_subrouter_executable};
+#[cfg(test)]
+use terminal_transport::verify_cmux_signing_policy;
+use terminal_transport::{ProductionCmuxTransport, RunnerFailure, TerminalTransport};
 
 fn handle_request(
     request: &ProviderWrapperRequestV1,
-    runner: &mut impl CmuxRunner,
+    terminal: &mut impl TerminalTransport,
+    provider: &mut impl ProviderLaunchAuthority,
 ) -> ProviderWrapperResponseV1 {
     if let Err(code) = validate_adapter_request(request) {
         let outcome = match request.operation {
@@ -162,31 +144,23 @@ fn handle_request(
         };
         return response(request, outcome);
     }
-    match runner.verify() {
-        #[cfg(any(target_os = "macos", test))]
-        Err(RunnerFailure::Untrusted) => {
-            let outcome = match request.operation {
-                ProviderWrapperOperationV1::Submit => rejected("cmux-untrusted"),
-                ProviderWrapperOperationV1::Reconcile => uncertain("cmux-untrusted"),
-            };
-            return response(request, outcome);
-        }
-        Err(RunnerFailure::Unavailable) => {
-            let outcome = match request.operation {
-                ProviderWrapperOperationV1::Submit => retryable("cmux-unavailable-before-create"),
-                ProviderWrapperOperationV1::Reconcile => {
-                    uncertain("cmux-unavailable-during-reconcile")
-                }
-            };
-            return response(request, outcome);
-        }
-        Ok(()) => {}
+    if let Some(outcome) = terminal_capability_refusal(request) {
+        return response(request, outcome);
+    }
+    if let Some(outcome) = bind_terminal(request, terminal) {
+        return response(request, outcome);
+    }
+    if let ProviderDeliveryTargetV1::OriginalSession { surface_id } = &request.delivery_target {
+        return response(
+            request,
+            deliver_to_original_session(request, terminal, surface_id),
+        );
     }
     let description = format!(
         "shipyard-workstream-delivery:{}",
         request.delivery_fence.idempotency_key
     );
-    let listed = match list_matching_workspaces(runner, &description) {
+    let listed = match list_matching_workspaces(terminal, &description) {
         Ok(listed) => listed,
         Err(code) => {
             let outcome = match request.operation {
@@ -197,67 +171,221 @@ fn handle_request(
         }
     };
     match listed.as_slice() {
-        [workspace_id] => {
+        [workspace] => {
             return response(
                 request,
-                reconcile_existing_workspace(request, runner, workspace_id, &description),
+                reconcile_existing_workspace(
+                    request,
+                    terminal,
+                    &workspace.workspace_id,
+                    &description,
+                ),
             );
         }
         [] => {}
         _ => return response(request, uncertain("multiple-idempotency-workspaces")),
     }
-    if request.operation == ProviderWrapperOperationV1::Reconcile {
+    if request.operation == ProviderWrapperOperationV1::Reconcile
+        || request.delivery_target == ProviderDeliveryTargetV1::ReconcileOnly
+    {
         return response(request, uncertain("reconcile-visibility-not-yet-proven"));
     }
+    if request.delivery_target != ProviderDeliveryTargetV1::FreshCheckpoint {
+        return response(request, rejected("unsupported-delivery-target"));
+    }
 
-    let args = match create_args(request, &description) {
-        Ok(args) => args,
+    // Terminal transport selection and provider launch authority are separate
+    // trust decisions. Only the typed, validated protected route may cross
+    // this boundary; a missing Subrouter is a refusal, never direct-provider
+    // fallback through the selected terminal.
+    // Exact executable bytes are launch authority, not observation authority.
+    // Reconciliation above must remain able to prove an already accepted
+    // session after the configured Subrouter binary has moved or upgraded.
+    if let Err(code) = provider.verify_route(request) {
+        return response(request, rejected(code));
+    }
+
+    if let Err(code) = require_workspace_create_capability(terminal) {
+        return response(request, retryable(code));
+    }
+    let private_launch = match provider.prepare_launch(request) {
+        Ok(launch) => launch,
         Err(code) => return response(request, rejected(code)),
     };
-    // cmux creates the workspace before it sends `--command` to the surface.
-    // From this invocation onward every failure is an ambiguous acceptance.
-    let created = match runner.run(&args) {
+    let (args, private_launch) = create_args(request, &description, private_launch);
+    // Raw workspace.create executes initial_command during terminal
+    // construction, after cmux has injected its protected workspace/surface
+    // identity. From this invocation onward every failure is ambiguous.
+    let created_result = terminal.run(&args);
+    if !private_launch.wait_until_consumed(PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE) {
+        return response(request, uncertain("cmux-private-launch-not-consumed"));
+    }
+    let created = match created_result {
         Ok(result) if result.success => result,
         Ok(_) | Err(_) => return response(request, uncertain("cmux-create-outcome-unknown")),
     };
     let Ok(created) = parse_created_workspace(&created.stdout) else {
         return response(request, uncertain("cmux-create-response-invalid"));
     };
-    response(
-        request,
-        match session_binding_for_surface(
-            runner,
+    let listed = match list_matching_workspaces(terminal, &description) {
+        Ok(listed) => listed,
+        Err(code) => return response(request, uncertain(code)),
+    };
+    if listed.as_slice()
+        != [WorkspaceMatch {
+            window_id: created.window_id.clone(),
+            workspace_id: created.workspace_id.clone(),
+        }]
+    {
+        return response(request, uncertain("cmux-created-workspace-fence-mismatch"));
+    }
+    let bindings =
+        match session_bindings_for_workspace(terminal, &created.workspace_id, &request.provider_id)
+        {
+            Ok(bindings) => bindings,
+            Err(code) => return response(request, uncertain(code)),
+        };
+    let outcome = match bindings.as_slice() {
+        [binding] if binding.surface_id == created.surface_id => delivered(
+            request,
             &created.workspace_id,
-            &created.surface_id,
-            &request.provider_id,
-        ) {
-            Ok(Some(binding)) => delivered(request, &created.workspace_id, &description, &binding),
-            Ok(None) => uncertain("cmux-session-binding-not-yet-visible"),
-            Err(code) => uncertain(code),
-        },
-    )
+            &description,
+            &binding.binding,
+        ),
+        [] => uncertain("cmux-session-binding-not-yet-visible"),
+        [_] => uncertain("cmux-created-surface-binding-mismatch"),
+        _ => uncertain("multiple-provider-session-bindings"),
+    };
+    response(request, outcome)
+}
+
+fn bind_terminal(
+    request: &ProviderWrapperRequestV1,
+    terminal: &mut impl TerminalTransport,
+) -> Option<ProviderWrapperOutcomeV1> {
+    match terminal.bind(&request.terminal_endpoint) {
+        Err(RunnerFailure::CapabilityUnproven) => {
+            let outcome = match request.operation {
+                ProviderWrapperOperationV1::Submit => rejected("terminal-capability-unproven"),
+                ProviderWrapperOperationV1::Reconcile => uncertain("terminal-capability-unproven"),
+            };
+            Some(outcome)
+        }
+        #[cfg(any(target_os = "macos", test))]
+        Err(RunnerFailure::Untrusted) => {
+            let outcome = match request.operation {
+                ProviderWrapperOperationV1::Submit => rejected("cmux-untrusted"),
+                ProviderWrapperOperationV1::Reconcile => uncertain("cmux-untrusted"),
+            };
+            Some(outcome)
+        }
+        Err(RunnerFailure::Unavailable) => {
+            let outcome = match request.operation {
+                ProviderWrapperOperationV1::Submit => retryable("cmux-unavailable-before-create"),
+                ProviderWrapperOperationV1::Reconcile => {
+                    uncertain("cmux-unavailable-during-reconcile")
+                }
+            };
+            Some(outcome)
+        }
+        Ok(()) => None,
+    }
+}
+
+fn terminal_capability_refusal(
+    request: &ProviderWrapperRequestV1,
+) -> Option<ProviderWrapperOutcomeV1> {
+    matches!(request.terminal_endpoint, TerminalEndpointV1::HerdR { .. }).then(|| {
+        match request.operation {
+            ProviderWrapperOperationV1::Submit => rejected("herdr-capability-unproven"),
+            ProviderWrapperOperationV1::Reconcile => uncertain("herdr-capability-unproven"),
+        }
+    })
 }
 
 fn reconcile_existing_workspace(
     request: &ProviderWrapperRequestV1,
-    runner: &mut impl CmuxRunner,
+    terminal: &mut impl TerminalTransport,
     workspace_id: &str,
     description: &str,
 ) -> ProviderWrapperOutcomeV1 {
-    match session_bindings_for_workspace(runner, workspace_id, &request.provider_id) {
-        Ok(bindings) if bindings.len() == 1 => {
-            delivered(request, workspace_id, description, &bindings[0])
-        }
-        Ok(bindings) if bindings.is_empty() => uncertain("cmux-session-binding-not-yet-visible"),
-        Ok(_) => uncertain("multiple-provider-session-bindings"),
-        Err(code) => uncertain(code),
+    let bindings =
+        match session_bindings_for_workspace(terminal, workspace_id, &request.provider_id) {
+            Ok(bindings) => bindings,
+            Err(code) => return uncertain(code),
+        };
+    match bindings.as_slice() {
+        [binding] => delivered(request, workspace_id, description, &binding.binding),
+        [] => uncertain("cmux-session-binding-not-yet-visible"),
+        _ => uncertain("multiple-provider-session-bindings"),
+    }
+}
+
+fn deliver_to_original_session(
+    request: &ProviderWrapperRequestV1,
+    terminal: &mut impl TerminalTransport,
+    surface_id: &str,
+) -> ProviderWrapperOutcomeV1 {
+    let Some(surface_id) = canonical_uuid(surface_id) else {
+        return rejected("original-surface-id-invalid");
+    };
+    let mut args = cmux_prefix(["surface", "resume", "show"]);
+    args.extend(["--surface".to_owned(), surface_id.clone()]);
+    let evidence = match terminal.run(&args) {
+        Ok(result) if result.success => result,
+        Ok(_) | Err(_) => return retryable("original-session-unavailable-before-send"),
+    };
+    let Ok(evidence) = serde_json::from_slice::<SurfaceResumeEvidence>(&evidence.stdout) else {
+        return retryable("original-session-evidence-invalid");
+    };
+    let Some(mut binding) = evidence.resume_binding else {
+        return retryable("original-session-binding-absent");
+    };
+    let Some(workspace_id) = canonical_uuid(&evidence.workspace_id) else {
+        return retryable("original-workspace-id-invalid");
+    };
+    if canonical_uuid(&evidence.surface_id).as_deref() != Some(surface_id.as_str())
+        || binding.kind != request.provider_id
+        || binding.source != "agent-hook"
+        || binding.checkpoint_id != request.protected_route.native_session_id
+        || !binding.is_local()
+    {
+        return retryable("original-session-binding-changed");
+    }
+    binding.checkpoint_id = match canonical_uuid(&binding.checkpoint_id) {
+        Some(checkpoint) => checkpoint,
+        None => return retryable("original-session-checkpoint-invalid"),
+    };
+    let sent = terminal.run(&[
+        "send".to_owned(),
+        "--surface".to_owned(),
+        surface_id.clone(),
+        delivery_prompt(request),
+    ]);
+    match sent {
+        Ok(result) if result.success => {}
+        Ok(_) => return retryable("original-session-send-refused"),
+        Err(_) => return uncertain("original-session-send-outcome-unknown"),
+    }
+    let entered = terminal.run(&[
+        "send-key".to_owned(),
+        "--surface".to_owned(),
+        surface_id.clone(),
+        "enter".to_owned(),
+    ]);
+    match entered {
+        Ok(result) if result.success => delivered(
+            request,
+            &workspace_id,
+            &format!("in-place:{surface_id}"),
+            &binding,
+        ),
+        Ok(_) | Err(_) => uncertain("original-session-enter-outcome-unknown"),
     }
 }
 
 fn validate_adapter_request(request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
-    if request.adapter_id != ADAPTER_ID
-        || !matches!(request.provider_id.as_str(), "codex" | "claude")
-    {
+    if request.adapter_id != ADAPTER_ID {
         return Err("unsupported-provider-or-adapter");
     }
     let config = ProviderWrapperConfig {
@@ -270,19 +398,14 @@ fn validate_adapter_request(request: &ProviderWrapperRequestV1) -> Result<(), &'
         max_stderr_bytes: 1,
     };
     validate_request(&config, request).map_err(|_| "invalid-provider-request")?;
-    if request.provider_id == "claude"
-        && request.launch_options.reasoning_effort == Some(ProviderReasoningEffortV1::Ultra)
-    {
-        return Err("claude-ultra-effort-unsupported");
-    }
     Ok(())
 }
 
 fn list_matching_workspaces(
-    runner: &mut impl CmuxRunner,
+    terminal: &mut impl TerminalTransport,
     description: &str,
-) -> Result<Vec<String>, &'static str> {
-    let windows_result = runner
+) -> Result<Vec<WorkspaceMatch>, &'static str> {
+    let windows_result = terminal
         .run(&cmux_prefix(["list-windows"]))
         .map_err(|_| "cmux-window-list-unavailable")?;
     if !windows_result.success {
@@ -306,7 +429,7 @@ fn list_matching_workspaces(
     for window_id in window_ids {
         let mut args = cmux_prefix(["workspace", "list"]);
         args.extend(["--window".to_owned(), window_id.clone()]);
-        let result = runner
+        let result = terminal
             .run(&args)
             .map_err(|_| "cmux-workspace-list-unavailable")?;
         if !result.success {
@@ -319,13 +442,22 @@ fn list_matching_workspaces(
         }
         for workspace in listed.workspaces {
             if workspace.description.as_deref() == Some(description) {
-                matches
-                    .push(canonical_uuid(&workspace.id).ok_or("cmux-list-workspace-id-invalid")?);
+                matches.push(WorkspaceMatch {
+                    window_id: window_id.clone(),
+                    workspace_id: canonical_uuid(&workspace.id)
+                        .ok_or("cmux-list-workspace-id-invalid")?,
+                });
             }
         }
     }
     matches.sort();
     Ok(matches)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WorkspaceMatch {
+    window_id: String,
+    workspace_id: String,
 }
 
 #[derive(Deserialize)]
@@ -341,81 +473,106 @@ fn cmux_prefix<const N: usize>(tail: [&str; N]) -> Vec<String> {
         .collect()
 }
 
+#[derive(Deserialize)]
+struct SystemCapabilities {
+    protocol: String,
+    version: u64,
+    methods: Vec<String>,
+    capabilities: Vec<String>,
+}
+
+fn require_workspace_create_capability(
+    terminal: &mut impl TerminalTransport,
+) -> Result<(), &'static str> {
+    let mut args = cmux_prefix(["rpc", "system.capabilities"]);
+    args.push("{}".to_owned());
+    let result = terminal
+        .run(&args)
+        .map_err(|_| "cmux-create-capability-unavailable")?;
+    if !result.success {
+        return Err("cmux-create-capability-refused");
+    }
+    let capabilities: SystemCapabilities = serde_json::from_slice(&result.stdout)
+        .map_err(|_| "cmux-create-capability-response-invalid")?;
+    if capabilities.protocol != "cmux-socket"
+        || capabilities.version != 2
+        || !capabilities
+            .methods
+            .iter()
+            .any(|method| method == "workspace.create")
+        || !capabilities
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace.task_create.v1")
+    {
+        return Err("cmux-create-capability-unproven");
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct WorkspaceCreateParams<'a> {
+    operation_id: String,
+    initial_command: &'a str,
+    cwd: &'a str,
+    title: String,
+    description: &'a str,
+    focus: bool,
+    eager_load_terminal: bool,
+}
+
+fn workspace_create_operation_id(idempotency_key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"shipyard-cmux-workspace-create-operation-id-v1\0");
+    digest.update(idempotency_key.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
 fn create_args(
     request: &ProviderWrapperRequestV1,
     description: &str,
-) -> Result<Vec<String>, &'static str> {
-    let command = launch_command(request)?;
-    let mut args = cmux_prefix(["workspace", "create"]);
-    args.extend([
-        "--name".to_owned(),
-        format!(
+    private_launch: PrivateLaunch,
+) -> (Vec<String>, PrivateLaunch) {
+    let params = WorkspaceCreateParams {
+        operation_id: workspace_create_operation_id(&request.delivery_fence.idempotency_key),
+        initial_command: &private_launch.command,
+        cwd: &request.resume_expectation.worktree_path,
+        title: format!(
             "{} — tracked workstream",
             request.resume_expectation.workstream_handle
         ),
-        "--description".to_owned(),
-        description.to_owned(),
-        "--cwd".to_owned(),
-        request.resume_expectation.worktree_path.clone(),
-        "--focus".to_owned(),
-        "false".to_owned(),
-        "--command".to_owned(),
-        command,
-    ]);
-    Ok(args)
-}
-
-fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static str> {
-    let prompt = format!(
-        "Resume tracked workstream {}. First run `shipyard --json work-ledger context-challenge --wake {}` and reconstruct that exact durable context. Write the matching receipt to a private file, then run `shipyard --json work-ledger acknowledge-context --wake {} --receipt <private-path>`. Complete the remaining work and keep Linear current. Before handoff, run `shipyard --json work-ledger return-challenge --ownership <ownership-id>`, write separate reviewed expectation and receipt files proving a newer checkpoint, evidence, and remote acknowledgement, then run `shipyard --json work-ledger return-ownership --ownership <ownership-id> --expectation <private-path> --receipt <private-path>`. Never put receipt JSON or secrets in argv.",
-        request.resume_expectation.workstream_handle,
-        request.delivery_fence.wake_id,
-        request.delivery_fence.wake_id,
-    );
-    let wrapper = match request.provider_id.as_str() {
-        "codex" => CODEX_WRAPPER,
-        "claude" => CLAUDE_WRAPPER,
-        _ => return Err("unsupported-provider"),
+        description,
+        focus: false,
+        eager_load_terminal: true,
     };
-    let mut words = vec![shell_word(wrapper)?];
-    if let Some(model) = &request.launch_options.model_id {
-        words.push("--model".to_owned());
-        words.push(shell_word(model)?);
-    }
-    if let Some(effort) = request.launch_options.reasoning_effort {
-        let effort = effort_name(effort);
-        if request.provider_id == "codex" {
-            words.push("-c".to_owned());
-            words.push(shell_word(&format!("model_reasoning_effort=\"{effort}\""))?);
-        } else {
-            words.push("--effort".to_owned());
-            words.push(effort.to_owned());
-        }
-    }
-    words.push(shell_word(&prompt)?);
-    Ok(words.join(" "))
-}
-
-fn shell_word(value: &str) -> Result<String, &'static str> {
-    if value.is_empty()
-        || value
-            .chars()
-            .any(|character| character == '\0' || character.is_control())
-    {
-        return Err("launch-value-is-not-shell-safe");
-    }
-    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
-}
-
-const fn effort_name(effort: ProviderReasoningEffortV1) -> &'static str {
-    match effort {
-        ProviderReasoningEffortV1::Low => "low",
-        ProviderReasoningEffortV1::Medium => "medium",
-        ProviderReasoningEffortV1::High => "high",
-        ProviderReasoningEffortV1::Xhigh => "xhigh",
-        ProviderReasoningEffortV1::Max => "max",
-        ProviderReasoningEffortV1::Ultra => "ultra",
-    }
+    let canonical = serde_json::to_string(&params)
+        .expect("workspace create parameters contain only serializable values");
+    let mut args = cmux_prefix(["rpc", "workspace.create"]);
+    args.push(canonical);
+    (args, private_launch)
 }
 
 #[derive(Deserialize)]
@@ -433,11 +590,13 @@ struct ListedWorkspace {
 
 #[derive(Deserialize)]
 struct CreatedWorkspace {
+    window_id: String,
     workspace_id: String,
     surface_id: String,
 }
 
 struct CreatedWorkspaceIds {
+    window_id: String,
     workspace_id: String,
     surface_id: String,
 }
@@ -445,9 +604,10 @@ struct CreatedWorkspaceIds {
 fn parse_created_workspace(bytes: &[u8]) -> Result<CreatedWorkspaceIds, ()> {
     let created: CreatedWorkspace = serde_json::from_slice(bytes).map_err(|_| ())?;
     // cmux adds informational fields (currently `window_id` and `group_id`) to
-    // this response. Acceptance depends only on the two required UUIDs, so
+    // this response. Acceptance depends only on the three required UUIDs, so
     // tolerate additive metadata while validating those identifiers strictly.
     Ok(CreatedWorkspaceIds {
+        window_id: canonical_uuid(&created.window_id).ok_or(())?,
         workspace_id: canonical_uuid(&created.workspace_id).ok_or(())?,
         surface_id: canonical_uuid(&created.surface_id).ok_or(())?,
     })
@@ -471,6 +631,24 @@ struct AgentSessionBinding {
     checkpoint_id: String,
     kind: String,
     source: String,
+    execution_location: Option<String>,
+    remote_pty_session_id: Option<String>,
+    remote_surface_id: Option<String>,
+    remote_workspace_id: Option<String>,
+}
+
+struct SessionBindingMatch {
+    surface_id: String,
+    binding: AgentSessionBinding,
+}
+
+impl AgentSessionBinding {
+    fn is_local(&self) -> bool {
+        self.execution_location.as_deref() == Some("local")
+            && self.remote_pty_session_id.is_none()
+            && self.remote_surface_id.is_none()
+            && self.remote_workspace_id.is_none()
+    }
 }
 
 #[derive(Deserialize)]
@@ -481,13 +659,13 @@ struct SurfaceResumeEvidence {
 }
 
 fn session_bindings_for_workspace(
-    runner: &mut impl CmuxRunner,
+    terminal: &mut impl TerminalTransport,
     workspace_id: &str,
     provider_id: &str,
-) -> Result<Vec<AgentSessionBinding>, &'static str> {
+) -> Result<Vec<SessionBindingMatch>, &'static str> {
     let mut args = cmux_prefix(["surface-health"]);
     args.extend(["--workspace".to_owned(), workspace_id.to_owned()]);
-    let result = runner
+    let result = terminal
         .run(&args)
         .map_err(|_| "cmux-surface-list-unavailable")?;
     if !result.success {
@@ -509,18 +687,21 @@ fn session_bindings_for_workspace(
         return Err("cmux-surface-id-duplicated");
     }
     let mut bindings = Vec::new();
-    for surface_id in surface_ids {
+    for surface_id in &surface_ids {
         if let Some(binding) =
-            session_binding_for_surface(runner, workspace_id, &surface_id, provider_id)?
+            session_binding_for_surface(terminal, workspace_id, surface_id, provider_id)?
         {
-            bindings.push(binding);
+            bindings.push(SessionBindingMatch {
+                surface_id: surface_id.clone(),
+                binding,
+            });
         }
     }
     Ok(bindings)
 }
 
 fn session_binding_for_surface(
-    runner: &mut impl CmuxRunner,
+    terminal: &mut impl TerminalTransport,
     workspace_id: &str,
     surface_id: &str,
     provider_id: &str,
@@ -532,7 +713,7 @@ fn session_binding_for_surface(
         "--surface".to_owned(),
         surface_id.to_owned(),
     ]);
-    let result = runner
+    let result = terminal
         .run(&args)
         .map_err(|_| "cmux-session-evidence-unavailable")?;
     if !result.success {
@@ -548,7 +729,7 @@ fn session_binding_for_surface(
     let Some(mut binding) = evidence.resume_binding else {
         return Ok(None);
     };
-    if binding.kind != provider_id || binding.source != "agent-hook" {
+    if binding.kind != provider_id || binding.source != "agent-hook" || !binding.is_local() {
         return Err("cmux-session-evidence-provider-mismatch");
     }
     binding.checkpoint_id =
@@ -635,7 +816,7 @@ fn response(
     outcome: ProviderWrapperOutcomeV1,
 ) -> ProviderWrapperResponseV1 {
     ProviderWrapperResponseV1 {
-        schema_version: SCHEMA_VERSION,
+        schema_version: PROVIDER_WRAPPER_SCHEMA_VERSION,
         operation: request.operation,
         provider_id: request.provider_id.clone(),
         adapter_id: request.adapter_id.clone(),

@@ -575,6 +575,21 @@ pub(super) fn acquire_run_mutation_guard(
     run: &StewardRun,
     action: &str,
 ) -> Result<MergeQueueMutationGuard, String> {
+    let state = run_mutation_state(observation, run)?;
+    MergeQueueMutationGuard::acquire_in_mode(
+        &control.store,
+        &control.cwd,
+        control.mode,
+        &control.global_dir,
+        &state,
+        action,
+    )
+}
+
+pub(super) fn run_mutation_state(
+    observation: &RepoObservation,
+    run: &StewardRun,
+) -> Result<ShipState, String> {
     let pr_number = run
         .pull_request_number
         .or_else(|| merge_group_pr_number(run))
@@ -589,20 +604,31 @@ pub(super) fn acquire_run_mutation_guard(
         .iter()
         .find(|pr| pr.fact.number == pr_number)
         .map_or(run.head_branch.as_str(), |pr| pr.fact.head_branch.as_str());
-    let state = ShipState::new(
+    Ok(ShipState::new(
         pr_number,
         &observation.repo,
         branch,
         &observation.base,
         &run.head_sha,
         "runner-steward",
-    );
-    MergeQueueMutationGuard::acquire_in_mode(
+    ))
+}
+
+pub(super) fn acquire_run_mutation_guard_with_correlation(
+    control: &MutationControl,
+    observation: &RepoObservation,
+    run: &StewardRun,
+    action: &str,
+    correlation_id: &str,
+) -> Result<MergeQueueMutationGuard, String> {
+    let state = run_mutation_state(observation, run)?;
+    MergeQueueMutationGuard::acquire_in_mode_with_correlation(
         &control.store,
         &control.cwd,
         control.mode,
         &control.global_dir,
         &state,
         action,
+        correlation_id,
     )
 }

@@ -62,7 +62,7 @@ impl std::fmt::Display for FailureClass {
     }
 }
 
-const INFRA_MARKERS: [&str; 12] = [
+const INFRA_MARKERS: [&str; 13] = [
     "Connection refused",
     "ssh: connect",
     "Network is unreachable",
@@ -75,6 +75,7 @@ const INFRA_MARKERS: [&str; 12] = [
     "Connection closed by remote host",
     "Connection timed out",
     "ssh_exchange_identification",
+    crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_CLASSIFICATION,
 ];
 
 /// Classify a non-successful target outcome.
@@ -198,6 +199,21 @@ mod tests {
             classify_failure("", "assertion failed", 1, false, false),
             FailureClass::Test
         );
+    }
+
+    #[test]
+    fn writer_domain_overlap_is_retryable_infra_not_test() {
+        let failure_class = classify_failure(
+            "",
+            "sandbox_writer_domain_overlap: exclusive sandbox audit could not acquire lock",
+            75,
+            false,
+            false,
+        );
+
+        assert_eq!(failure_class, FailureClass::Infra);
+        assert_ne!(failure_class, FailureClass::Test);
+        assert!(is_retryable(failure_class));
     }
 
     #[test]

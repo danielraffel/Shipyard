@@ -38,6 +38,7 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
             shipyard_global_dir: None,
             shipyard_state_dir: None,
             github_cli: None,
+            github_token_helper: None,
             tart_home: None,
             labels: Vec::new(),
         },
@@ -52,16 +53,20 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
             shipyard_global_dir: None,
             shipyard_state_dir: None,
             github_cli: None,
+            github_token_helper: None,
             tart_home: None,
             labels: Vec::new(),
         },
     ];
 
-    let timeout = std::time::Duration::from_secs(2);
+    // The contract is one shared deadline, not a two-second scheduler-latency
+    // budget. Leave enough slack for healthy probes in the fully parallel test
+    // suite while the 30-second fixture still proves bounded cancellation.
+    let timeout = std::time::Duration::from_secs(10);
     let started = std::time::Instant::now();
     let probes = probe_hosts_concurrently_with_timeout(&classes, timeout);
 
-    assert!(started.elapsed() < timeout + std::time::Duration::from_secs(2));
+    assert!(started.elapsed() < timeout + std::time::Duration::from_secs(5));
     assert_eq!(probes.len(), 2);
     assert!(!probes[0].capacity.readable());
     assert_eq!(probes[0].capacity.free(), 0);
@@ -241,6 +246,7 @@ fn remote_tartci_command_sets_tart_home_and_quotes_binary() {
         shipyard_global_dir: None,
         shipyard_state_dir: None,
         github_cli: Some("ghapp".to_owned()),
+        github_token_helper: None,
         tart_home: Some("/Users/ci user/VMs".to_owned()),
         labels: Vec::new(),
     };
@@ -263,6 +269,7 @@ fn remote_tartci_command_leaves_github_cli_unset_by_default() {
         shipyard_global_dir: None,
         shipyard_state_dir: None,
         github_cli: None,
+        github_token_helper: None,
         tart_home: None,
         labels: Vec::new(),
     };

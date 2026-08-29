@@ -1113,9 +1113,12 @@ mod tests {
             last_event_at: None,
             registered_repos: Vec::new(),
             configured_repos: Vec::new(),
+            capabilities: Vec::new(),
             rate_limit: None,
             workstream_continuation:
                 crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
+            actionable_wake_producer:
+                crate::actionable_wake_producer::ActionableWakeProducerStatus::default(),
             last_error: None,
         }
     }

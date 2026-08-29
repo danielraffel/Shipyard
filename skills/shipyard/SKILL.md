@@ -26,11 +26,13 @@ judgment. A handoff with only a success trigger is invalid: terminal failure,
 head drift, cancellation, timeout, and ambiguous process loss each need an
 explicit disposition or wake owner.
 
-Until the receipt reports `wake_consumer_available=true`, the originating
-agent retains the last monitoring obligation and must not park solely in
-reliance on Shipyard. A launch profile plus an enabled trusted machine-global
-consumer publishes the wake before reporting transfer; a basic receipt records
-only the safe route and does not transfer monitoring.
+Until the receipt reports `monitoring_transferred=true`, the originating agent
+retains the last monitoring obligation. Durable publication creates a
+zero-wake daemon obligation; it does not launch a provider process. Stop
+monitor-only children after transfer, but continue independent runnable work by
+default. Park only when the exact machine-readable tuple is
+`monitoring_transferred=true`, `agent_disposition=pause`, and
+`pause_required=true`, backed by `--after-handoff pause --task-graph`.
 
 Shipyard records terminal provenance using explicit terminal contracts. A
 HerdR handoff requires `HERDR_ENV=1` plus workspace, tab, and pane identity;
@@ -54,8 +56,7 @@ stored argv directly. It validates the prompt-free native grammar, projects
 typed model/reasoning options into the pinned provider adapter, and reports
 transfer only after durable publication. See `docs/launch-profile.md`.
 
-After an acknowledged handoff whose receipt proves the wake consumer is
-available:
+After an acknowledged handoff whose receipt proves monitoring is transferred:
 
 - Shipyard owns process lifetime, monitoring, bounded deterministic retries,
   transition-only logs, terminal receipts, and recovery after its own restart.
@@ -71,6 +72,9 @@ available:
 - A provider timeout with an uncertain dispatch outcome is recorded and is not
   blindly repeated. Session death, quota exhaustion, host reboot, and
   offline/rejoin must not erase an acknowledged obligation.
+
+See `docs/post-handoff-disposition.md` for the task-graph schema, crash windows,
+and Pulp/Forge Modular/Forge Sequencer/Vellum workflow rules.
 
 This contract applies to bounded jobs as well as PRs: CMake/CTest proofs,
 artifact builds, release publication, notarization, benchmark matrices, cache
@@ -127,12 +131,52 @@ not participate at all; drain them and prove exact-binary fleet convergence
 before trusting the audit.
 
 On macOS, advisory-lock contention can briefly appear before `lsof` reports its
-holder. The guardian may observe only that exact no-holder/contended state for a
-bounded stable-idle window while continuously fencing the production PID/start
-identity, binary hash, configuration, and active-worker set. Any reported holder,
-identity drift, new worker, persistent contention, or deadline remains a hard
-failure. Sandbox failure artifacts must stay inside the explicit canary or
-runner temp root; never glob protected system temp trees.
+holder, and a corrected daemon can briefly be the sole reported holder while it
+finishes one mutation-scoped write. The guardian may observe only those exact
+no-holder or production-PID-only contended states for a bounded stable-idle
+window while continuously fencing the production PID/start identity, binary
+hash, configuration, and active-worker set. Stable idle selects the corrected
+preserve path. Only uninterrupted exact production-PID ownership through the
+bound plus exact IPC-reported running-daemon version `0.108.1` selects the legacy
+quiesce/restore path, and the current installed artifact must independently
+report that same exact version before a destructive stop so restoration is
+possible. The post-observation peer, disk-version, identity, and final-holder
+proofs share one aggregate deadline so guardian readiness remains within the
+workflow receipt budget. Known-corrected, unknown, or running/disk-mismatched versions fail closed under
+persistent contention and are never stopped on duration alone. Any
+foreign/additional or missing holder sample, identity drift, new worker,
+changing or ambiguous ownership, or deadline that does not prove one of those
+two states remains a hard failure. Production stop/control must run from stable
+`/` with explicit production state
+authority, never from a repository checkout that can be unavailable.
+Restore retries must adopt an already-live
+exact matching production daemon before spawning, but only after bounded
+same-connection macOS `LOCAL_PEERPID`-fenced IPC status response and original
+stdio identity proof, with repository, version, and active-worker probes all
+bound to the explicit production state root rather than candidate or HOME
+defaults, so a
+post-spawn verification error cannot launch a duplicate or accept a
+hung/misdirected process. Retain a live/uncertain restore child across cleanup
+retries, but clear a child only after its exit is authoritative so the next
+retry can replace it. Retain the machine-wide canary lease from any production
+stop request across partial quiesce or restore failure and in the final failure
+receipt; release it only after exact
+production identity is verified, so another canary cannot overlap an uncertain
+detached restore child. Before adopting a different exact production daemon, terminate and
+authoritatively reap Shipyard's own retained restore child so it cannot later
+acquire the lifetime lock and replace the verified owner. A restored v0.108.1
+daemon must report that exact version over same-peer IPC and additionally prove
+stable PID-only kernel contention on its lifetime lock before the guardian
+releases the host lease, with repository/worker authority and exact process
+identity revalidated after the lock proof. IPC readiness or an open descriptor
+alone is not enough. After any stop request, never adopt the original PID/start
+generation as restored while it remains alive; wait boundedly for it to exit,
+then spawn or adopt only a different exact generation. If the corrected daemon
+was never stopped and the canary fails before its mutation-fence audit, recover
+by proving the exact unchanged production identity and stable idle state without
+misreporting the mutation fence as passed, then release the lease. Sandbox failure
+artifacts must stay inside the explicit canary or runner temp root; never glob
+protected system temp trees.
 
 After cleanup, treat a single daemon IPC status miss as an observation rather
 than proof of death: use a bounded status window that continuously rechecks the
@@ -257,9 +301,11 @@ both authorization boundaries. The legacy scalar remains compatible only by
 itself; replace it atomically when migrating because mixed scalar/scoped policy
 is ambiguous and fails closed.
 
-The first one-host build-once bridge is also library-only and machine-global
-default-off. It accepts only Pulp's exact numeric repository identity, `mac`
-target, Apple Silicon build contract, and M3. Bind one successful configure and
+The one-host build-once bridge remains machine-global default-off. The
+`parallel-proof-canary` command exposes a one-shot plan/apply seam; apply also
+requires a trusted digest-pinned native adapter and complete reviewed
+invocation-authority digest. Core contains no Pulp commands or personal host
+defaults. Bind one successful configure and
 one successful build receipt to the exact source, toolchain, canonical CTest
 inventory, proof manifest, and compact artifact content/layout/size identity.
 Consumption must remain in the same authenticated M3 session, verify that
@@ -354,10 +400,35 @@ not resume until the incident owner has restored the intended queue order.
 Queue writes are serialized process-wide and recorded in machine-global
 `merge_queue/mutations.jsonl`.
 
-For release rollout, configure absolute `shipyard_bin` and `github_cli` paths plus explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir` on every remote
-`[host_class.<name>]`. Review `shipyard runner fleet-update --to vX.Y.Z` and
-then use the same command with `--apply`; do not assemble per-host SSH/install
-pipelines. Fleet rollout requires a self-contained machine-global command auth
+For release rollout, configure absolute `shipyard_bin` and `github_cli` paths
+plus explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir`
+on every remote `[host_class.<name>]`. Review `shipyard runner fleet-update
+--to vX.Y.Z --host-class <class>` and then use the same command with `--apply`;
+do not assemble per-host SSH/install pipelines. Repeat `--host-class` only for
+a reviewed ordered subset, or use explicit `--all-hosts`. Missing, unknown, and
+duplicate selection fails closed; apply stops before later hosts after the
+first failure.
+
+Before any host can mutate, Shipyard resolves the exact annotated tag object,
+commit, tree, release ID, checksum-manifest asset, and macOS DMG asset. It
+downloads both assets by ID, verifies their GitHub SHA-256 values and exact
+manifest entry, and requires DMG `gh attestation verify` proof from
+`danielraffel/Shipyard/.github/workflows/release.yml` at the exact tag ref and
+source commit. A tag string or locally asserted receipt is never source
+authority. A missing DMG attestation keeps the release ineligible. Shipyard
+closes the authority-mint window by re-reading the tag, release ID, and asset
+inventory, then freezes that exact authority for the rollout. Each host must
+return the frozen authority and platform-asset digests; Shipyard never remints
+authority between hosts, and any receipt or cross-host pair-hash mismatch stops
+every later host.
+
+A successful typed host receipt includes the full authority plus before/after
+primary and `shipyard-workstream-provider` path, version, and double-observed
+SHA-256, CLI/daemon identity, configured runtime paths, and repository
+preservation. Pre-install provenance is explicitly unverified; only the
+post-install pair is bound to the verified authority digest. Releases from
+v0.127.0 require both pair members; older rollback tags at or above v0.100.0
+must prove the companion absent. Fleet rollout requires a self-contained machine-global command auth
 helper because inherited secrets are deliberately stripped. The updater stages
 the entire exact-tag installer before execution (including when the old remote
 binary predates fleet-update), refreshes daemons only after
@@ -770,6 +841,20 @@ as though no destination exists.
 The proof does not select a host or dispatch a shard. A roaming/offline worker
 is additive only and must be excluded or reassigned without blocking the
 minimum completion set.
+The `parallel_proof_canary_receipt` schema records exact proof/artifact,
+exact admitted host observations/session generations, route, transfer/resume/
+object-reuse bytes, exact cache-generation use, worker-minutes, wall-time evidence,
+and a separately validated same-proof control-receipt digest. It requires zero model calls,
+reports the measured speed/overhead gate, and never authorizes a merge. A
+receipt digest alone is not durable publication. Use the default-off
+`parallel_proof_canary_driver` to run the control strictly before distributed
+work, recheck exact authenticated M3/M1 session and storage fences, bind actual
+transport/resume counters and prefix digests, force avoided-cache-byte claims
+and model calls to zero, and publish exact bytes through its crash-durable
+immutable evidence store. Retain the complete fence observations, and durably
+record distributed-started before mutation plus terminal failure on every
+post-start error; never retry an unreconciled correlation. No production host adapter exists yet: do not use
+ad-hoc SSH/rsync or treat policy enablement as authority to mutate hosts.
 Follow [`docs/artifact-transport.md`](../../docs/artifact-transport.md) before
 integrating it with a scheduler.
 
@@ -1913,6 +1998,23 @@ controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an
 explicit operator fallback when fleet status says the local Macs are
 offline/unhealthy, or when the workflow intentionally asks for hosted coverage.
 
+For the default-off Pulp M3/M1 performance canary, cache readiness requires an
+immutable content manifest produced by the read-only no-follow tree observer.
+Observe every required M3 generation before probing M1, preserve exact policy
+generation and freshness fences, record `model_calls=0`, and publish only
+crash-durable no-overwrite paired receipts. M1 observation must use the strict
+digest-pinned companion protocol over `StrictSshRemoteM1CacheTransport`:
+explicit pinned identity and known-host authority only, with cleared ambient
+SSH configuration. Probe direct LAN first; an independently pinned Tailnet
+target may carry diagnostic cache observation only after a transport-class
+failure and can never close the LAN/session gate. Bind the exact host receipt,
+session generation, route, capabilities, persistent staging reserve, verified
+terminal instance, companion executable, immutable manifest, request/response
+digests and bytes, route RTTs, fallback class, and exchange RTT. Never reroute
+after the request crosses the companion boundary. This can close only the exact
+remote M1 gates it proves; M3 and execution authority remain separate. See
+`docs/pulp-mac-cache-readiness.md`.
+
 For Vellum's repository-scoped disposable lanes, treat an `offline + busy`
 runner as an ownership mismatch until TartCI proves otherwise. Run the bounded
 two-snapshot check, correlate the exact VM/lease/supervisor and in-progress job,
@@ -1978,6 +2080,13 @@ exact SDK bytes it consumes and matching extracted `sdk-provenance.json` source
 and distribution eligibility to the lock.
 
 ## Cutover Discipline
+
+For native continuation delivery, require fresh exact PR head/base SHA and the
+numeric repository-scoped GitHub App installation identity. Treat cmux labels
+as provenance only: delivery authority is a unique local process/surface plus
+the exact live native checkpoint, rechecked immediately before provider I/O.
+HerdR remains typed-refused until it exposes equivalent independent evidence.
+Never replace a refused Subrouter route with direct provider execution.
 
 Release/cutover is a human decision, not an implementation side effect. Before
 asking for go/no-go, ensure:

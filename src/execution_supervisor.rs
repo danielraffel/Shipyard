@@ -18,8 +18,8 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{Duration, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use wait_timeout::ChildExt;
 
+use crate::daemon_worker_capacity::{DaemonWorkerCapacity, DaemonWorkerClaim};
 use crate::execution_termination::{TerminationAction, TerminationPhase, TerminationStore};
 use crate::host_pool::{HostPoolLeaseError, HostPoolLeaseStore, default_lease_path};
 use crate::identity::RuntimeMode;
@@ -33,6 +33,9 @@ use crate::queue_request::{
 };
 use crate::queue_scheduler::{AlreadyMergedCancellation, AlreadyMergedObserver};
 use crate::ship::persist_terminal_outcome;
+use crate::worker_process_custody::{
+    ProcessLiveness, terminate_child_tree as terminate_owned_child_tree,
+};
 
 const MAX_WORKERS: usize = 1;
 const MAX_METADATA_CONTROLLERS: usize = 4;
@@ -40,20 +43,6 @@ const MAX_METADATA_CONTROLLERS: usize = 4;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkerObservation {
     Alive(WorkerReceipt),
-    Dead,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProcessLiveness {
-    #[cfg_attr(
-        windows,
-        expect(
-            dead_code,
-            reason = "Windows ownership probing is unsupported and therefore never proves a process alive"
-        )
-    )]
-    Alive,
     Dead,
     Unknown,
 }
@@ -194,7 +183,11 @@ impl ExecutionSupervisor {
     /// Reconcile worker ownership and admit safe pending jobs.
     pub fn tick(&mut self) -> Result<(), SupervisorError> {
         crate::writer_domain_lease::ensure_protected_dir_all(&self.worker_dir())?;
-        self.observe_merged_ship_jobs()?;
+        // Local custody recovery must never wait behind repository-wide git
+        // provenance scans or provider observation.  A cancellation already
+        // present at tick entry is handled before any potentially expensive
+        // merged-job observation; newly observed merges are consumed on the
+        // next bounded tick.
         self.reconcile_terminal_outcomes()?;
         self.reconcile_finalized_termination_transactions()?;
         self.terminate_cancelled_workers()?;
@@ -207,8 +200,14 @@ impl ExecutionSupervisor {
         self.reap_owned_children()?;
         self.recover_queue_absent()?;
         self.sweep_terminal_receipts()?;
+        // Keep merge observation ahead of admission so already-merged pending
+        // work is never launched, but behind custody repair so a slow git or
+        // provider probe cannot starve an existing cancellation.
+        self.observe_merged_ship_jobs()?;
+        self.terminate_cancelled_workers()?;
         let unknown_worker = self.reconcile_running()?;
         if !unknown_worker {
+            self.heartbeat_running_worker_capacity()?;
             self.admit_pending()?;
         }
         Ok(())
@@ -268,7 +267,7 @@ impl ExecutionSupervisor {
         for job in queue
             .get_all()?
             .into_iter()
-            .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
+            .filter(requires_merged_ship_observation)
         {
             let Ok(Some(envelope)) = request_store.load(&job.id) else {
                 continue;
@@ -688,6 +687,7 @@ impl ExecutionSupervisor {
 
         let pending = queue.get_pending()?;
         let mut selected = Vec::new();
+        let mut selected_capacity = Vec::new();
         let mut selected_native_count = 0usize;
         let mut selected_metadata_count = 0usize;
         let mut cancellations = Vec::new();
@@ -762,6 +762,17 @@ impl ExecutionSupervisor {
             if !admissible(&envelope, &occupied) {
                 continue;
             }
+            if !metadata_controller {
+                let authority = envelope
+                    .provenance
+                    .as_ref()
+                    .map_or("", |provenance| provenance.head_sha.as_str());
+                let claim = DaemonWorkerClaim::queue(&job.id, authority);
+                if !DaemonWorkerCapacity::new(&self.state_dir).claim_or_heartbeat(&claim)? {
+                    continue;
+                }
+                selected_capacity.push(claim);
+            }
             if metadata_controller {
                 selected_metadata_count += 1;
             } else {
@@ -784,8 +795,20 @@ impl ExecutionSupervisor {
         let started = if running_resources.errors.is_empty() {
             queue.start_pending_jobs_for_drain(&lock, &selected)?
         } else {
+            for claim in &selected_capacity {
+                DaemonWorkerCapacity::new(&self.state_dir).release(claim)?;
+            }
             Vec::new()
         };
+        let started_ids = started
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for claim in &selected_capacity {
+            if !started_ids.contains(claim.work_id()) {
+                DaemonWorkerCapacity::new(&self.state_dir).release(claim)?;
+            }
+        }
         for job in started {
             if let Err(error) = self.spawn_worker(&job) {
                 queue.requeue_deferred_running_jobs_for_drain(
@@ -796,6 +819,7 @@ impl ExecutionSupervisor {
                         defer_until: Some(Utc::now() + Duration::seconds(5)),
                     }],
                 )?;
+                DaemonWorkerCapacity::new(&self.state_dir).release_queue_work(&job.id)?;
             }
         }
         Ok(())
@@ -872,7 +896,7 @@ impl ExecutionSupervisor {
                 self.children.insert(job.id.clone(), child);
                 return Ok(());
             }
-            if terminate_child_tree(&mut child)? {
+            if terminate_owned_child_tree(&mut child)? {
                 remove_if_present(&receipt_path)?;
                 return Err(error);
             }
@@ -935,6 +959,39 @@ impl ExecutionSupervisor {
 
     fn release_host_pool_leases(&self, job_id: &str) -> Result<(), SupervisorError> {
         HostPoolLeaseStore::new(default_lease_path(&self.state_dir)).release_for_job(job_id)?;
+        DaemonWorkerCapacity::new(&self.state_dir).release_queue_work(job_id)?;
+        Ok(())
+    }
+
+    fn heartbeat_running_worker_capacity(&self) -> Result<(), SupervisorError> {
+        let request_store = QueueRequestStore::new(&self.state_dir)?;
+        let mut queue = Queue::new(&self.state_dir)?;
+        let capacity = DaemonWorkerCapacity::new(&self.state_dir);
+        let running = queue.get_running()?;
+        capacity
+            .release_inactive_queue_claims(&running.iter().map(|job| job.id.clone()).collect())?;
+        for job in running {
+            let probe = DaemonWorkerClaim::queue(&job.id, "");
+            if capacity.heartbeat_existing(&probe)? {
+                continue;
+            }
+            let authority = match request_store.load(&job.id) {
+                Ok(Some(envelope)) if envelope.is_metadata_authority_controller() => continue,
+                Ok(Some(envelope)) => envelope
+                    .provenance
+                    .as_ref()
+                    .map_or("unknown-running-request", |provenance| {
+                        provenance.head_sha.as_str()
+                    })
+                    .to_owned(),
+                Ok(None) | Err(_) => "unknown-running-request".to_owned(),
+            };
+            if !capacity.claim_or_heartbeat(&DaemonWorkerClaim::queue(&job.id, &authority))? {
+                return Err(SupervisorError::Outcome(
+                    "native worker capacity is owned by another daemon runtime".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -972,17 +1029,16 @@ impl ExecutionSupervisor {
         let mut child = self.children.remove(job_id);
         let mut transaction = if let Some(transaction) = store.load(job_id)? {
             let mut transaction = transaction;
-            let Some(receipt) = self.read_exact_receipt(job_id)? else {
-                if let Some(child) = child {
-                    self.children.insert(job_id.to_owned(), child);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "durable termination transaction lost its exact worker receipt",
-                )
-                .into());
-            };
-            if !transaction.matches_receipt(&receipt) {
+            // Once `begin` has durably recorded the frozen process-tree
+            // snapshot, that transaction is the recovery authority. The
+            // separately published worker receipt may disappear in a crash
+            // after the transaction commit; requiring it here would strand a
+            // tree that we can still prove dead from the durable snapshot.
+            // A receipt that is present remains a generation CAS fence: never
+            // apply an old transaction to a replacement worker generation.
+            if let Some(receipt) = self.read_exact_receipt(job_id)?
+                && !transaction.matches_receipt(&receipt)
+            {
                 if let Some(child) = child {
                     self.children.insert(job_id.to_owned(), child);
                 }
@@ -1108,6 +1164,11 @@ fn running_resource_claims(
     Ok(RunningResourceClaims { claims, errors })
 }
 
+fn requires_merged_ship_observation(job: &Job) -> bool {
+    matches!(job.status, JobStatus::Pending | JobStatus::Running)
+        && job.cancel_requested_at.is_none()
+}
+
 fn request_error_is_job_local(error: &QueueRequestError) -> bool {
     matches!(
         error,
@@ -1117,186 +1178,9 @@ fn request_error_is_job_local(error: &QueueRequestError) -> bool {
     )
 }
 
-fn signal_process_tree(pid: u32) -> io::Result<Vec<u32>> {
-    #[cfg(unix)]
-    {
-        // Stop the exact owner before snapshotting its descendants so it
-        // cannot launch more work while cancellation walks the tree.
-        let stopped = Command::new("/bin/kill")
-            .args(["-STOP", "--", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !stopped.success() {
-            return Err(io::Error::other("worker root could not be stopped"));
-        }
-        // Snapshot exact descendants after stopping the owner. Dispatchers
-        // may create their own process groups, so signalling only `-pid` can
-        // leave governed build/ctest grandchildren consuming capacity.
-        let descendants = descendant_processes(pid)?;
-        for descendant in descendants.iter().rev() {
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", "--", &descendant.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        let status = Command::new("/bin/kill")
-            .args(["-KILL", "--", &format!("-{pid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if !status?.success() {
-            return Err(io::Error::other("worker process group could not be killed"));
-        }
-        Ok(descendants)
-    }
-    #[cfg(windows)]
-    {
-        let status = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other("worker process tree could not be killed"));
-        }
-        Ok(Vec::new())
-    }
-}
-
 #[cfg(all(test, unix))]
 fn terminate_process_group(pid: u32) -> bool {
-    signal_process_tree(pid).is_ok()
-}
-
-fn terminate_child_tree(child: &mut Child) -> io::Result<bool> {
-    if child.try_wait()?.is_some() {
-        #[cfg(unix)]
-        return verify_exited_worker_group_dead(child.id());
-        #[cfg(windows)]
-        return Ok(false);
-    }
-    #[cfg_attr(
-        windows,
-        expect(
-            unused_variables,
-            reason = "Windows taskkill confirms the tree without exposing descendant PIDs"
-        )
-    )]
-    let Ok(descendants) = signal_process_tree(child.id()) else {
-        return Ok(false);
-    };
-    if child.wait_timeout(StdDuration::from_secs(5))?.is_some() {
-        #[cfg(unix)]
-        return Ok(descendants
-            .iter()
-            .all(|pid| process_id_liveness(*pid) == ProcessLiveness::Dead));
-        #[cfg(windows)]
-        return Ok(true);
-    }
-    // Platform fallback: never block the daemon on an unbounded wait. On
-    // Windows this directly terminates the root if taskkill was unavailable;
-    // on Unix it is a final exact-process escalation after the tree signal.
-    let _ = child.kill();
-    let root_dead = child.wait_timeout(StdDuration::from_secs(1))?.is_some();
-    #[cfg(unix)]
-    return Ok(root_dead
-        && descendants
-            .iter()
-            .all(|pid| process_id_liveness(*pid) == ProcessLiveness::Dead));
-    #[cfg(windows)]
-    Ok(root_dead)
-}
-
-#[cfg(unix)]
-fn verify_exited_worker_group_dead(process_group: u32) -> io::Result<bool> {
-    // Daemon workers are created as process-group leaders. If the root raced
-    // cancellation and has already exited, kill and inspect that retained
-    // execution boundary before releasing its claim.
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", "--", &format!("-{process_group}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let deadline = Instant::now() + StdDuration::from_secs(1);
-    loop {
-        let output = Command::new("/bin/ps")
-            .args(["-axo", "pgid=,stat="])
-            .output()?;
-        if !output.status.success() {
-            return Ok(false);
-        }
-        let live = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-            let mut fields = line.split_whitespace();
-            fields.next().and_then(|value| value.parse::<u32>().ok()) == Some(process_group)
-                && !fields.next().is_some_and(|state| state.starts_with('Z'))
-        });
-        if !live {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        thread::sleep(StdDuration::from_millis(10));
-    }
-}
-
-#[cfg(unix)]
-fn descendant_processes(root: u32) -> io::Result<Vec<u32>> {
-    let output = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid="])
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other("process-tree observation failed"));
-    }
-    let relations = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse::<u32>().ok()?;
-            let parent = fields.next()?.parse::<u32>().ok()?;
-            Some((pid, parent))
-        })
-        .collect::<Vec<_>>();
-    let mut descendants = Vec::new();
-    let mut parents = vec![root];
-    while let Some(parent) = parents.pop() {
-        for &(pid, observed_parent) in &relations {
-            if observed_parent == parent && !descendants.contains(&pid) {
-                descendants.push(pid);
-                parents.push(pid);
-            }
-        }
-    }
-    Ok(descendants)
-}
-
-#[cfg(unix)]
-fn process_id_liveness(pid: u32) -> ProcessLiveness {
-    let Ok(output) = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
-    else {
-        return ProcessLiveness::Unknown;
-    };
-    if output.status.success() {
-        let state = String::from_utf8_lossy(&output.stdout);
-        if state.trim_start().starts_with('Z') || state.trim().is_empty() {
-            ProcessLiveness::Dead
-        } else {
-            ProcessLiveness::Alive
-        }
-    } else if output.stderr.is_empty() {
-        ProcessLiveness::Dead
-    } else {
-        ProcessLiveness::Unknown
-    }
+    crate::worker_process_custody::terminate_detached_worker_tree(pid).is_ok()
 }
 
 #[cfg_attr(
@@ -2275,6 +2159,7 @@ mod tests {
     #[cfg(unix)]
     #[derive(Clone, Copy, Debug)]
     enum TerminationCrashBoundary {
+        FrozenBeforeTreeDeath,
         TreeDeadBeforeLeaseRelease,
         LeaseReleasedBeforeMarker,
         MarkerBeforeQueueFinalization,
@@ -2284,11 +2169,25 @@ mod tests {
     #[test]
     fn gen42_issue_437_cancel_restart_completes_every_durable_crash_boundary() {
         for boundary in [
+            TerminationCrashBoundary::FrozenBeforeTreeDeath,
             TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
             TerminationCrashBoundary::LeaseReleasedBeforeMarker,
             TerminationCrashBoundary::MarkerBeforeQueueFinalization,
         ] {
-            assert_termination_crash_recovers(TerminationAction::Cancel, boundary);
+            assert_termination_crash_recovers(TerminationAction::Cancel, boundary, true);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_cancel_restart_completes_every_durable_crash_boundary() {
+        for boundary in [
+            TerminationCrashBoundary::FrozenBeforeTreeDeath,
+            TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
+            TerminationCrashBoundary::LeaseReleasedBeforeMarker,
+            TerminationCrashBoundary::MarkerBeforeQueueFinalization,
+        ] {
+            assert_termination_crash_recovers(TerminationAction::Cancel, boundary, false);
         }
     }
 
@@ -2296,12 +2195,99 @@ mod tests {
     #[test]
     fn gen42_issue_437_defer_restart_completes_every_durable_crash_boundary() {
         for boundary in [
+            TerminationCrashBoundary::FrozenBeforeTreeDeath,
             TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
             TerminationCrashBoundary::LeaseReleasedBeforeMarker,
             TerminationCrashBoundary::MarkerBeforeQueueFinalization,
         ] {
-            assert_termination_crash_recovers(TerminationAction::Defer, boundary);
+            assert_termination_crash_recovers(TerminationAction::Defer, boundary, true);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_defer_restart_completes_every_durable_crash_boundary() {
+        for boundary in [
+            TerminationCrashBoundary::FrozenBeforeTreeDeath,
+            TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
+            TerminationCrashBoundary::LeaseReleasedBeforeMarker,
+            TerminationCrashBoundary::MarkerBeforeQueueFinalization,
+        ] {
+            assert_termination_crash_recovers(TerminationAction::Defer, boundary, false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_recovery_still_refuses_a_present_replacement_generation() {
+        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let job_id = "replacement-generation";
+        queued_ship_job(temp.path(), job_id, "exact-head");
+        let mut supervisor = ExecutionSupervisor::new(
+            fake_worker_tree(temp.path()),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor.tick().expect("start exact worker");
+        wait_for_live_descendant(&temp.path().join("descendant.pid"));
+        Queue::new(temp.path())
+            .expect("queue")
+            .request_cancel(job_id, Some("operator cancel".to_owned()))
+            .expect("request cancel")
+            .expect("running job");
+        let WorkerObservation::Alive(exact_receipt) = supervisor
+            .observe_cancellation_receipt(job_id)
+            .expect("observe exact worker")
+        else {
+            panic!("expected live exact worker receipt");
+        };
+        TerminationStore::new(temp.path())
+            .begin(&exact_receipt, TerminationAction::Cancel)
+            .expect("freeze exact tree");
+        let replacement = WorkerReceipt {
+            job_id: job_id.to_owned(),
+            generation: "replacement-generation".to_owned(),
+            pid: std::process::id(),
+            started_at: Utc::now(),
+        };
+        write_json_atomic(&supervisor.receipt_path(job_id), &replacement)
+            .expect("publish replacement receipt");
+
+        let error = supervisor
+            .complete_worker_termination(job_id, TerminationAction::Cancel)
+            .expect_err("replacement generation must fail closed");
+        assert!(error.to_string().contains("receipt generation changed"));
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get(job_id)
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            serde_json::from_slice::<WorkerReceipt>(
+                &fs::read(supervisor.receipt_path(job_id)).expect("replacement retained")
+            )
+            .expect("receipt json"),
+            replacement
+        );
+
+        // Restore the exact receipt solely to finish the frozen test worker;
+        // production recovery must never erase or adopt the replacement.
+        write_json_atomic(&supervisor.receipt_path(job_id), &exact_receipt)
+            .expect("restore exact receipt for cleanup");
+        let transaction = supervisor
+            .complete_worker_termination(job_id, TerminationAction::Cancel)
+            .expect("finish exact transaction")
+            .expect("tree-death proof");
+        assert_eq!(transaction.phase, TerminationPhase::LeasesReleased);
+        supervisor
+            .cleanup_termination_transaction(&transaction)
+            .expect("cleanup transaction");
     }
 
     #[cfg(unix)]
@@ -2477,6 +2463,7 @@ mod tests {
     fn assert_termination_crash_recovers(
         action: TerminationAction,
         boundary: TerminationCrashBoundary,
+        retain_receipt: bool,
     ) {
         let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2540,12 +2527,14 @@ mod tests {
         };
         let store = TerminationStore::new(temp.path());
         let mut transaction = store.begin(&receipt, action).expect("freeze tree");
-        let mut child = original.children.remove(job_id).expect("owned child");
-        assert!(
-            store
-                .prove_tree_dead(&mut transaction, Some(&mut child))
-                .expect("prove tree dead")
-        );
+        if !matches!(boundary, TerminationCrashBoundary::FrozenBeforeTreeDeath) {
+            let mut child = original.children.remove(job_id).expect("owned child");
+            assert!(
+                store
+                    .prove_tree_dead(&mut transaction, Some(&mut child))
+                    .expect("prove tree dead")
+            );
+        }
         if matches!(
             boundary,
             TerminationCrashBoundary::LeaseReleasedBeforeMarker
@@ -2564,10 +2553,18 @@ mod tests {
                 .mark_leases_released(&mut transaction)
                 .expect("released marker");
         }
+        if !retain_receipt {
+            remove_if_present(&original.receipt_path(job_id)).expect("remove exact receipt");
+            queued_job(temp.path(), "replacement");
+        }
         drop(original);
 
         let mut restarted = ExecutionSupervisor::new(
-            PathBuf::from("/does/not/exist"),
+            if retain_receipt {
+                PathBuf::from("/does/not/exist")
+            } else {
+                fake_worker(temp.path())
+            },
             RuntimeMode::Isolated,
             temp.path().into(),
             temp.path().into(),
@@ -2596,6 +2593,32 @@ mod tests {
             }
             TerminationAction::Defer => assert_eq!(job.status, JobStatus::Pending),
         }
+        if !retain_receipt {
+            assert_eq!(
+                queue
+                    .get("replacement")
+                    .expect("read replacement")
+                    .expect("replacement job")
+                    .status,
+                JobStatus::Running
+            );
+            assert!(restarted.children.contains_key("replacement"));
+            restarted.tick().expect("idempotent second tick");
+            assert_eq!(
+                queue
+                    .get("replacement")
+                    .expect("read replacement")
+                    .expect("replacement job")
+                    .status,
+                JobStatus::Running
+            );
+            let mut replacement = restarted
+                .children
+                .remove("replacement")
+                .expect("replacement worker");
+            terminate_process_group(replacement.id());
+            let _ = replacement.wait();
+        }
     }
 
     #[test]
@@ -2610,6 +2633,35 @@ mod tests {
             let cancellations = merged_cancellations(temp.path(), JobStatus::Pending, observed);
             assert_eq!(!cancellations.is_empty(), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn exact_merged_cancellation_proof_stops_repeated_remote_observation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pending = queued_ship_job(temp.path(), "proven-merged", "exact-head");
+        assert!(requires_merged_ship_observation(&pending));
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, std::slice::from_ref(&pending.id))
+            .expect("start");
+        drop(lock);
+        let proven = queue
+            .request_cancel_with_proof(
+                &pending.id,
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(CancellationProof {
+                    cause: CancellationCause::AlreadyMerged,
+                    repository: "owner/repo".to_owned(),
+                    pull_request: 438,
+                    head_sha: "exact-head".to_owned(),
+                }),
+            )
+            .expect("request cancellation")
+            .expect("running job");
+
+        assert!(!requires_merged_ship_observation(&proven));
     }
 
     #[cfg(unix)]

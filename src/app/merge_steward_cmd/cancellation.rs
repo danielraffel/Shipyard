@@ -27,6 +27,32 @@ pub(super) fn apply_repo_plan(
     remaining_preemptions: usize,
     mutation_control: Option<&MutationControl>,
 ) -> (RepoReport, bool, usize) {
+    let wedge_reconcile_error = if args.apply && args.coalesce {
+        super::stale_pr_wedge::reconcile_receipts(
+            actions,
+            &observation.repo,
+            ledger_path,
+            ledger,
+            mutation_control.expect("apply mode requires mutation control"),
+        )
+        .err()
+    } else {
+        None
+    };
+    let wedge_observation = if args.coalesce {
+        super::stale_pr_wedge::observe_candidates(actions, observation)
+    } else {
+        Ok(Vec::new())
+    };
+    let wedge_observation_error = wedge_observation.as_ref().err().cloned();
+    let observed_wedge_candidates = wedge_observation.unwrap_or_default();
+    let reserved_wedge_run_ids = super::stale_pr_wedge::reserved_run_ids(
+        &observation.repo,
+        &observed_wedge_candidates,
+        ledger,
+    );
+    let wedge_candidates =
+        super::stale_pr_wedge::dedupe_candidates(observed_wedge_candidates, ledger);
     let terminal_handoff_reconcile_error = if args.apply {
         let current_heads = observation
             .prs
@@ -72,7 +98,9 @@ pub(super) fn apply_repo_plan(
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
         || pr_mutation_failed
         || recovery_witness_error.is_some()
-        || terminal_handoff_reconcile_error.is_some();
+        || terminal_handoff_reconcile_error.is_some()
+        || wedge_reconcile_error.is_some()
+        || wedge_observation_error.is_some();
     let mut planned_cancellations = Vec::new();
     if args.coalesce {
         let current_heads = current_pull_request_heads(&observation.prs);
@@ -89,6 +117,8 @@ pub(super) fn apply_repo_plan(
             &observation.merge_group_heads,
             &opted_out,
         ));
+        planned_cancellations
+            .retain(|cancellation| !reserved_wedge_run_ids.contains(&cancellation.run_id));
     }
     planned_cancellations.extend(plan_repo_capacity_preemptions(
         args,
@@ -107,6 +137,24 @@ pub(super) fn apply_repo_plan(
         })
         .count();
     let mut cancellations = Vec::new();
+    if args.apply
+        && let Some(candidate) = wedge_candidates.first()
+    {
+        let report = super::stale_pr_wedge::apply_candidate(
+            actions,
+            observation,
+            candidate,
+            &args.opt_out_label,
+            &args.managed_label,
+            &args.handoff_context,
+            &args.provenance_blocking_labels,
+            ledger_path,
+            ledger,
+            mutation_control.expect("apply mode requires mutation control"),
+        );
+        unhealthy |= report.error.is_some();
+        cancellations.push(report);
+    }
     for cancellation in planned_cancellations {
         let (mutation, error) = if args.apply {
             apply_run_cancellation(
@@ -152,6 +200,12 @@ pub(super) fn apply_repo_plan(
                 .collect(),
             prs: reports,
             cancellations,
+            stale_pr_run_wedge: super::stale_pr_wedge::repo_status(
+                Some(observation),
+                wedge_candidates,
+                ledger,
+                &observation.repo,
+            ),
             errors: observation
                 .preemption_error
                 .iter()
@@ -159,6 +213,8 @@ pub(super) fn apply_repo_plan(
                 .cloned()
                 .chain(recovery_witness_error)
                 .chain(terminal_handoff_reconcile_error)
+                .chain(wedge_reconcile_error)
+                .chain(wedge_observation_error)
                 .collect(),
         },
         unhealthy,

@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 11;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -49,41 +49,81 @@ macro_rules! candidate_params {
     };
 }
 
+mod actionable_scheduler;
+mod canary_wake;
+#[allow(dead_code)] // Live cmux/HerdR proof remains default-off until upstream contracts ship.
+mod delivery_authority;
 #[allow(dead_code)] // Some ownership lifecycle operations remain future-facing.
 mod delivery_ownership;
 #[allow(dead_code)] // Some generic adapter surfaces are exercised only by native dispatch.
 mod dispatch;
+#[allow(dead_code)] // Enabled with the cross-machine daemon transport canary.
+mod durable_custody;
 mod importer;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use delivery_authority::verify_delivery_authority_at;
+pub(crate) use delivery_authority::{
+    DeliveryAuthorityExpectation, DeliveryAuthorityProbe, DeliveryAuthorityRefusal,
+    DeliveryAuthorization, GitHubAuthorityObservation, ProcessIncarnation,
+    ReconciliationAuthorization, TerminalAuthorityObservation, TerminalMutationEndpoint,
+    verify_delivery_authority, verify_delivery_or_fresh_authority, verify_reconciliation_authority,
+};
 #[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
 pub(crate) use delivery_ownership::{
     AgentContextChallenge, AgentContextReceipt, AgentOwnershipReceipt, AgentReturnChallenge,
     AgentReturnExpectation, AgentReturnReceipt,
 };
+#[cfg(test)]
+pub(crate) use dispatch::reconciliation_fence_digest;
 pub(crate) use dispatch::{
     DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
-    FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
-    ProviderOutcome, StoredProviderRequest, WakeConsumerPolicy, WakeDeliveryResult,
+    FreshAgentResumeExpectation, ProviderAdapter, ProviderAuthorizationOperation,
+    ProviderCapability, ProviderLaunchRequest, ProviderOutcome, StoredProviderRequest,
+    WakeConsumerPolicy, WakeDeliveryResult,
 };
 #[cfg(test)]
 pub(crate) use dispatch::{WakeEnvelope, WakeProfileResolver};
+#[allow(unused_imports)] // Consumed by the cross-machine transport adapter follow-up.
+pub(crate) use durable_custody::{
+    AuthenticatedCustodyControl, AuthenticatedCustodyControlReceipt, AuthenticatedCustodyReceipt,
+    AuthenticatedCustodySuccessorRebind, AuthenticatedCustodySuccessorReceipt,
+    AuthenticatedCustodyTransfer, AuthenticatedProcessedReceipt, CustodyControl,
+    CustodyControlReceipt, CustodyEnvelope, CustodyKind, CustodyReceipt, CustodyRelation,
+    CustodyStatus, CustodySuccessorRebind, CustodySuccessorReceipt, CustodyTransfer,
+    CustodyTransportAuthenticator, InboxAuthority, InboxClaim, ProcessedReceipt, SenderClaim,
+    authenticate_custody_control, authenticate_custody_control_receipt,
+    authenticate_custody_receipt, authenticate_custody_successor_rebind,
+    authenticate_custody_successor_receipt, authenticate_custody_transfer,
+    authenticate_processed_receipt,
+};
 mod lifecycle;
 mod native_publication;
+#[cfg(test)]
+pub(crate) use native_publication::tests::{
+    policy as native_publication_test_policy, request as native_publication_test_request,
+};
 mod observation;
 mod persistence;
 mod policy;
+mod projection_intents;
+pub(crate) use projection_intents::PendingProjectionIntent;
 #[allow(dead_code)] // Platform-specific helpers are not used on every target.
 mod protected_objects;
 mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.
 mod route;
 mod storage;
+pub(crate) use actionable_scheduler::{NativeStewardApplyReport, NativeStewardDisposition};
 use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};
+pub(crate) use lifecycle::deterministic_wake_id;
 pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};
 #[allow(unused_imports)] // Consumed by the CLI/runtime integration follow-up.
 pub(crate) use native_publication::{
     ExactProtectedProfileResolver, NativePublicationReport, NativePublicationRequest,
+    bind_legacy_native_policy, verify_native_policy_binding,
 };
 pub use observation::ShadowPrTarget;
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
@@ -98,7 +138,7 @@ pub use storage::absent_status;
 use storage::{
     configure_durable, count, count_where, create_database_file_no_follow, migrate,
     protect_database_file, protect_ledger_directory, schema_version, synchronous_name,
-    validate_protected_storage, verify_integrity, verify_supported_schema,
+    validate_protected_storage, verify_integrity, verify_open_lineage, verify_supported_schema,
 };
 
 /// Error returned by a fail-closed work-ledger operation.
@@ -117,6 +157,13 @@ pub enum WorkLedgerError {
     },
     /// The database was written by a newer, unsupported implementation.
     UnsupportedSchema(i64),
+    /// A numerically overlapping schema belongs to an incompatible ledger lineage.
+    ForeignSchemaLineage {
+        /// Ambiguous `SQLite` schema number.
+        version: i64,
+        /// Redacted lineage family.
+        lineage: &'static str,
+    },
     /// An invariant or generation fence refused a mutation.
     Refused(String),
 }
@@ -135,6 +182,10 @@ impl Display for WorkLedgerError {
                     "unsupported work ledger schema version {version}"
                 )
             }
+            Self::ForeignSchemaLineage { version, lineage } => write!(
+                formatter,
+                "work ledger schema version {version} belongs to incompatible {lineage} lineage"
+            ),
             Self::Refused(reason) => write!(formatter, "work ledger refused mutation: {reason}"),
         }
     }
@@ -231,6 +282,10 @@ pub struct LedgerStatus {
     pub pending_wakes: u64,
     /// Ambiguous outbox count, which requires reconciliation rather than retry.
     pub uncertain_wakes: u64,
+    /// Authenticated transition projections waiting for the optional drainer.
+    pub pending_projection_intents: u64,
+    /// Projection intents isolated after a local digest or identity contradiction.
+    pub quarantined_projection_intents: u64,
     /// Imported source count.
     pub imports: u64,
     /// Immutable protected-object metadata rows.

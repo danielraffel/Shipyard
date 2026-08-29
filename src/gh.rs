@@ -709,6 +709,7 @@ fn helper_failure_is_transient(stderr: &str) -> bool {
 struct TokenResolution {
     token: String,
     kind: Option<String>,
+    installation_id: Option<u64>,
     expires_at: Option<DateTime<Utc>>,
     valid_until: Option<DateTime<Utc>>,
 }
@@ -737,6 +738,7 @@ fn env_token(token_env: &str) -> Result<TokenResolution, GhPrepareError> {
     Ok(TokenResolution {
         token,
         kind: None,
+        installation_id: None,
         expires_at: None,
         valid_until: None,
     })
@@ -761,6 +763,7 @@ fn parse_helper_stdout(
     Ok(TokenResolution {
         token: trimmed.to_owned(),
         kind: inferred_token_kind(trimmed),
+        installation_id: None,
         expires_at: None,
         valid_until: cache_ttl_seconds.map(|ttl| now + chrono::Duration::seconds(ttl_seconds(ttl))),
     })
@@ -795,6 +798,21 @@ fn parse_json_helper_stdout(
         Some(Value::Null) | None => None,
         Some(_) => return Err(GhPrepareError::HelperStdoutMalformed),
     };
+    let installation_id = match value.get("installation_id") {
+        Some(Value::String(value)) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(GhPrepareError::HelperStdoutMalformed)
+            .map(Some)?,
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or(GhPrepareError::HelperStdoutMalformed)
+            .map(Some)?,
+        Some(Value::Null) | None => None,
+        Some(_) => return Err(GhPrepareError::HelperStdoutMalformed),
+    };
     let valid_until = expires_at.map_or_else(
         || cache_ttl_seconds.map(|ttl| now + chrono::Duration::seconds(ttl_seconds(ttl))),
         |expires_at| {
@@ -804,6 +822,7 @@ fn parse_json_helper_stdout(
     let token = TokenResolution {
         token,
         kind,
+        installation_id,
         expires_at,
         valid_until,
     };
@@ -814,6 +833,26 @@ fn parse_json_helper_stdout(
         return Err(GhPrepareError::TokenExpired);
     }
     Ok(token)
+}
+
+impl GhClient {
+    pub(crate) fn app_installation_id(&self, cwd: &Path) -> Result<u64, GhPrepareError> {
+        // Installation access tokens are opaque and GitHub exposes no
+        // token-authenticated endpoint that returns their installation ID.
+        // The machine-global command helper is therefore the trusted mint
+        // boundary: it resolves the repository installation with an App JWT,
+        // mints that installation's token, and returns both in one response.
+        // Callers separately use the token to re-read the exact repository/PR.
+        let token = self
+            .resolve_token_with_timeout(cwd, Some(Duration::from_secs(15)))?
+            .ok_or(GhPrepareError::HelperStdoutMalformed)?;
+        if token.kind.as_deref() != Some("github-app-installation") {
+            return Err(GhPrepareError::HelperStdoutMalformed);
+        }
+        token
+            .installation_id
+            .ok_or(GhPrepareError::HelperStdoutMalformed)
+    }
 }
 
 fn inferred_token_kind(token: &str) -> Option<String> {

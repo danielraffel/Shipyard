@@ -5,13 +5,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -131,6 +132,16 @@ pub struct QueueRequestStore {
     path: PathBuf,
 }
 
+/// Exclusive per-request mutation fence shared by submission, recovery, and
+/// receiptless orphan reconciliation.
+pub(crate) struct QueueRequestMutationGuard(File);
+
+impl Drop for QueueRequestMutationGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 impl QueueRequestStore {
     /// Open a request store rooted at `<state_dir>/queue/requests`.
     pub fn new(state_dir: impl Into<PathBuf>) -> io::Result<Self> {
@@ -151,6 +162,27 @@ impl QueueRequestStore {
         self.path.join(format!("{job_id}.json"))
     }
 
+    /// Exclude every cooperative writer for one exact immutable request.
+    pub(crate) fn acquire_mutation_lock(
+        &self,
+        job_id: &str,
+    ) -> QueueRequestResult<QueueRequestMutationGuard> {
+        validate_job_id(job_id)?;
+        let lock_dir = self.path.join(".locks");
+        crate::writer_domain_lease::ensure_protected_dir_all(&lock_dir)?;
+        let lock_path = lock_dir.join(format!("{job_id}.lock"));
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        drop(writer_domain);
+        FileExt::lock_exclusive(&file)?;
+        Ok(QueueRequestMutationGuard(file))
+    }
+
     /// Save one request envelope atomically.
     pub fn save(&self, envelope: &QueuedExecutionEnvelope) -> QueueRequestResult<()> {
         if envelope.schema_version != QUEUED_EXECUTION_SCHEMA_VERSION {
@@ -158,6 +190,7 @@ impl QueueRequestStore {
                 version: envelope.schema_version,
             });
         }
+        let _mutation = self.acquire_mutation_lock(&envelope.job_id)?;
         write_json_atomic(&self.path_for(&envelope.job_id), envelope)
     }
 
@@ -169,6 +202,7 @@ impl QueueRequestStore {
                 version: envelope.schema_version,
             });
         }
+        let _mutation = self.acquire_mutation_lock(&envelope.job_id)?;
         write_json_atomic_durable(&self.path_for(&envelope.job_id), envelope)
     }
 
@@ -181,6 +215,7 @@ impl QueueRequestStore {
 
     /// Delete one request envelope, if present.
     pub fn delete(&self, job_id: &str) -> QueueRequestResult<bool> {
+        let _mutation = self.acquire_mutation_lock(job_id)?;
         delete_if_present(&self.path_for(job_id))
     }
 
@@ -2054,7 +2089,6 @@ fn validate_current_envelope(envelope: &QueuedExecutionEnvelope) -> QueueRequest
     Ok(())
 }
 
-#[cfg(any(unix, test))]
 fn validate_job_id(job_id: &str) -> QueueRequestResult<()> {
     if job_id.is_empty()
         || job_id.len() > 255
@@ -2147,6 +2181,8 @@ fn sweep_absent_older_than(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
 
     use serde_json::{Value, json};
@@ -2452,6 +2488,32 @@ mod tests {
         assert_eq!(loaded.kind, QueuedExecutionKind::Run);
         assert!(matches!(loaded.request, QueuedExecutionRequest::Run(_)));
         assert_eq!(loaded.to_run_request().expect("restore run"), run_request());
+    }
+
+    #[test]
+    fn request_mutation_lock_excludes_concurrent_store_writer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-locked", temp.path(), &run_request());
+        let guard = store
+            .acquire_mutation_lock(&envelope.job_id)
+            .expect("exclusive request lock");
+        let writer = store.clone();
+        let submitted = envelope.clone();
+        let (sent, received) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let result = writer.save(&submitted);
+            sent.send(result).expect("send result");
+        });
+
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer unblocked")
+            .expect("save");
+        thread.join().expect("writer thread");
     }
 
     #[test]
