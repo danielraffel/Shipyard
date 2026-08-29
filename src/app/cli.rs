@@ -162,6 +162,27 @@ pub(super) enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Audit or reconcile one legacy daemon orphan that has no worker receipt.
+    #[command(name = "queue-reconcile-orphan")]
+    QueueReconcileOrphan {
+        /// Exact queue job identifier.
+        job_id: String,
+        /// Expected immutable submitted head (required with --apply).
+        #[arg(long)]
+        expected_head: Option<String>,
+        /// SHA-256 of the exact durable request file (required with --apply).
+        #[arg(long)]
+        expected_request_sha256: Option<String>,
+        /// SHA-256 of the canonical audited queue row (required with --apply).
+        #[arg(long)]
+        expected_job_sha256: Option<String>,
+        /// Apply the exact-CAS terminalization after all live proofs pass.
+        #[arg(long)]
+        apply: bool,
+        /// Explicitly acknowledge the bounded negative process inventory.
+        #[arg(long, requires = "apply")]
+        confirm_no_worker_tree: bool,
+    },
     /// Change the priority of a pending job.
     Bump {
         /// Job identifier.

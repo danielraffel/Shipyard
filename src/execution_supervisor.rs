@@ -194,7 +194,11 @@ impl ExecutionSupervisor {
     /// Reconcile worker ownership and admit safe pending jobs.
     pub fn tick(&mut self) -> Result<(), SupervisorError> {
         crate::writer_domain_lease::ensure_protected_dir_all(&self.worker_dir())?;
-        self.observe_merged_ship_jobs()?;
+        // Local custody recovery must never wait behind repository-wide git
+        // provenance scans or provider observation.  A cancellation already
+        // present at tick entry is handled before any potentially expensive
+        // merged-job observation; newly observed merges are consumed on the
+        // next bounded tick.
         self.reconcile_terminal_outcomes()?;
         self.reconcile_finalized_termination_transactions()?;
         self.terminate_cancelled_workers()?;
@@ -207,6 +211,11 @@ impl ExecutionSupervisor {
         self.reap_owned_children()?;
         self.recover_queue_absent()?;
         self.sweep_terminal_receipts()?;
+        // Keep merge observation ahead of admission so already-merged pending
+        // work is never launched, but behind custody repair so a slow git or
+        // provider probe cannot starve an existing cancellation.
+        self.observe_merged_ship_jobs()?;
+        self.terminate_cancelled_workers()?;
         let unknown_worker = self.reconcile_running()?;
         if !unknown_worker {
             self.admit_pending()?;
@@ -1109,11 +1118,7 @@ fn running_resource_claims(
 
 fn requires_merged_ship_observation(job: &Job) -> bool {
     matches!(job.status, JobStatus::Pending | JobStatus::Running)
-        && !(job.cancel_requested_at.is_some()
-            && job
-                .cancellation_proof
-                .as_ref()
-                .is_some_and(|proof| proof.cause == CancellationCause::AlreadyMerged))
+        && job.cancel_requested_at.is_none()
 }
 
 fn request_error_is_job_local(error: &QueueRequestError) -> bool {

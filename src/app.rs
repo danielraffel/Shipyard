@@ -140,7 +140,8 @@ use self::pin_cmd::pin_command;
 use self::pr_cmd::{PrCommandArgs, StewardHandoffPreference, pr_command};
 use self::quarantine_cmd::quarantine_command;
 use self::queue_cmd::{
-    bump_command, cancel_command, evidence_command, logs_command, queue_command, status_command,
+    bump_command, cancel_command, evidence_command, logs_command, queue_command,
+    reconcile_orphan_command, status_command,
 };
 use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
 use self::release_bot_cmd::release_bot_command;
@@ -374,6 +375,7 @@ where
         | Command::Evidence { .. }
         | Command::Logs { .. }
         | Command::Cancel { .. }
+        | Command::QueueReconcileOrphan { .. }
         | Command::Bump { .. }
         | Command::Queue
         | Command::Cleanup { .. }) => {
@@ -381,6 +383,7 @@ where
                 command,
                 cli.mode.into(),
                 &cwd,
+                &runtime_paths.global_dir,
                 &runtime_paths.state_dir,
                 cli.json,
                 stdout,
@@ -614,6 +617,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Evidence { .. }
         | Command::Logs { .. }
         | Command::Cancel { .. }
+        | Command::QueueReconcileOrphan { .. }
         | Command::Bump { .. }
         | Command::Queue
         | Command::QueueObserve { .. }
@@ -682,6 +686,7 @@ fn handle_state_command<W: Write>(
     command: Command,
     mode: RuntimeMode,
     cwd: &Path,
+    global_dir: &Path,
     state_dir: &Path,
     json: bool,
     stdout: &mut W,
@@ -698,6 +703,26 @@ fn handle_state_command<W: Write>(
         Command::Cancel { job_id, reason } => {
             cancel_command(&job_id, reason.as_deref(), state_dir, json, stdout)
         }
+        Command::QueueReconcileOrphan {
+            job_id,
+            expected_head,
+            expected_request_sha256,
+            expected_job_sha256,
+            apply,
+            confirm_no_worker_tree,
+        } => reconcile_orphan_command(
+            &job_id,
+            expected_head.as_deref(),
+            expected_request_sha256.as_deref(),
+            expected_job_sha256.as_deref(),
+            apply,
+            confirm_no_worker_tree,
+            mode,
+            global_dir,
+            state_dir,
+            json,
+            stdout,
+        ),
         Command::Bump { job_id, priority } => {
             bump_command(&job_id, priority, state_dir, json, stdout)
         }

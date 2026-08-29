@@ -472,10 +472,28 @@ impl Job {
         if self.status != JobStatus::Running {
             return Err(JobTransitionError::InvalidCancel(self.status));
         }
+        if self
+            .cancellation_proof
+            .as_ref()
+            .zip(proof.as_ref())
+            .is_some_and(|(existing, replacement)| existing != replacement)
+        {
+            return Err(JobTransitionError::ConflictingCancellationProof);
+        }
         let mut next = self.clone();
-        next.cancellation_reason = reason;
-        next.cancellation_proof = proof;
-        next.cancel_requested_at = Some(Utc::now());
+        let proof_upgrade = self.cancellation_proof.is_none() && proof.is_some();
+        next.cancellation_reason = if proof_upgrade {
+            reason.or_else(|| self.cancellation_reason.clone())
+        } else {
+            self.cancellation_reason.clone().or(reason)
+        };
+        // Repeated controller/operator requests are idempotent with respect
+        // to the original cancellation boundary.  In particular, a later
+        // untyped manual request must not erase an authenticated
+        // already-merged proof or make a long-stale orphan appear freshly
+        // cancelled on every invocation.
+        next.cancellation_proof = proof.or_else(|| self.cancellation_proof.clone());
+        next.cancel_requested_at = self.cancel_requested_at.or_else(|| Some(Utc::now()));
         Ok(next)
     }
 
@@ -622,6 +640,8 @@ pub enum JobTransitionError {
     InvalidComplete(JobStatus),
     /// Cannot cancel from this status.
     InvalidCancel(JobStatus),
+    /// A later controller tried to replace authenticated cancellation authority.
+    ConflictingCancellationProof,
     /// Cannot defer from this status.
     InvalidDefer(JobStatus),
 }
@@ -635,6 +655,12 @@ impl std::fmt::Display for JobTransitionError {
             }
             Self::InvalidCancel(status) => {
                 write!(formatter, "cannot cancel job in state {status:?}")
+            }
+            Self::ConflictingCancellationProof => {
+                write!(
+                    formatter,
+                    "cancellation proof contradicts existing authority"
+                )
             }
             Self::InvalidDefer(status) => write!(formatter, "cannot defer job in state {status:?}"),
         }
@@ -687,7 +713,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        Job, JobStatus, JobTransitionError, Priority, TargetResult, TargetStatus, ValidationMode,
+        CancellationCause, CancellationProof, Job, JobStatus, JobTransitionError, Priority,
+        TargetResult, TargetStatus, ValidationMode,
     };
 
     fn job() -> Job {
@@ -894,6 +921,47 @@ mod tests {
         assert_eq!(cancelled.status, JobStatus::Cancelled);
         assert!(cancelled.completed_at.is_some());
         assert!(cancelled.cancel_requested_at.is_some());
+    }
+
+    #[test]
+    fn repeated_running_cancel_preserves_first_request_and_authenticated_proof() {
+        let running = job().start().expect("start");
+        let proof = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 42,
+            head_sha: running.sha.clone(),
+        };
+        let first = running
+            .request_cancel_with_reason_and_proof(
+                Some("authenticated merge observation".to_owned()),
+                Some(proof.clone()),
+            )
+            .expect("first request");
+        let first_requested_at = first.cancel_requested_at;
+        let repeated = first
+            .request_cancel_with_reason(Some("operator retry".to_owned()))
+            .expect("repeated request");
+
+        assert_eq!(repeated.cancel_requested_at, first_requested_at);
+        assert_eq!(repeated.cancellation_proof, Some(proof));
+        assert_eq!(
+            repeated.cancellation_reason.as_deref(),
+            Some("authenticated merge observation")
+        );
+
+        let contradictory = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 43,
+            head_sha: running.sha,
+        };
+        assert_eq!(
+            repeated
+                .request_cancel_with_reason_and_proof(None, Some(contradictory))
+                .expect_err("contradictory authority must refuse"),
+            JobTransitionError::ConflictingCancellationProof
+        );
     }
 
     #[test]

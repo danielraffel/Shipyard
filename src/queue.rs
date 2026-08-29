@@ -700,6 +700,52 @@ impl Queue {
         })
     }
 
+    /// Exact-CAS terminalization for a separately audited receiptless orphan.
+    ///
+    /// This is intentionally narrower than ordinary cancellation: callers
+    /// must first prove daemon/process absence and authenticated disposition,
+    /// then supply the unchanged running snapshot observed under that audit.
+    /// No other queue row is trimmed, reordered, or otherwise mutated.
+    pub(crate) fn finalize_audited_receiptless_cancel(
+        &mut self,
+        expected_jobs: &[Job],
+        expected: &Job,
+        reason: String,
+        proof: CancellationProof,
+    ) -> QueueResult<Option<Job>> {
+        self.with_jobs_locked_strict(|jobs| {
+            if jobs.as_slice() != expected_jobs {
+                return Err(QueueError::StateConflict(
+                    "queue changed after receiptless orphan audit".to_owned(),
+                ));
+            }
+            let Some(job) = jobs.iter_mut().find(|job| job.id == expected.id) else {
+                return Ok(None);
+            };
+            if *job != *expected {
+                return Err(QueueError::StateConflict(format!(
+                    "receiptless orphan {} changed after audit",
+                    expected.id
+                )));
+            }
+            if job.status != JobStatus::Running || job.cancel_requested_at.is_none() {
+                return Err(QueueError::StateConflict(format!(
+                    "receiptless orphan {} is not a cancel-requested running job",
+                    expected.id
+                )));
+            }
+            let cancelled = job
+                .cancel_with_reason_and_proof(Some(reason), Some(proof))
+                .map_err(|error| QueueError::StateConflict(error.to_string()))?;
+            *job = cancelled.clone();
+            crate::log_retention::invalidate_conflicting_terminal_manifest(
+                &self.state_dir,
+                &cancelled,
+            )?;
+            Ok(Some(cancelled))
+        })
+    }
+
     /// Reclassify the exact completed snapshot produced by an authoritative
     /// worker when its required post-validation phase fails. The full snapshot
     /// comparison prevents a stale worker from rewriting a newer disposition.
@@ -1272,7 +1318,10 @@ mod tests {
     use serde_json::Value;
     use tempfile::TempDir;
 
-    use crate::job::{Job, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
+    use crate::job::{
+        CancellationCause, CancellationProof, Job, JobStatus, Priority, TargetResult, TargetStatus,
+        ValidationMode,
+    };
     use crate::queue_request::{QueueRequestStore, QueuedExecutionEnvelope, run_workload_scope};
     use crate::ship::RunExecutionRequest;
 
@@ -1413,6 +1462,57 @@ mod tests {
             preserved.cancellation_reason.as_deref(),
             Some("operator cancel")
         );
+    }
+
+    #[test]
+    fn audited_receiptless_cancel_is_exact_cas_and_preserves_other_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let running = queue
+            .enqueue(job("main", "merged-head", &["mac"]))
+            .expect("enqueue")
+            .start()
+            .expect("start")
+            .request_cancel_with_reason(Some("operator request".to_owned()))
+            .expect("request cancel");
+        queue.update(&running).expect("running");
+        let pending = queue
+            .enqueue(job("other", "pending-head", &["mac"]))
+            .expect("pending");
+        let pending_before = queue.get(&pending.id).expect("read").expect("pending");
+        let exact_queue = queue.get_all().expect("exact queue");
+        let proof = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 42,
+            head_sha: running.sha.clone(),
+        };
+
+        let cancelled = queue
+            .finalize_audited_receiptless_cancel(
+                &exact_queue,
+                &running,
+                super::ALREADY_MERGED_CANCEL_REASON.to_owned(),
+                proof.clone(),
+            )
+            .expect("finalize")
+            .expect("job");
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+        assert_eq!(cancelled.cancellation_proof, Some(proof));
+        assert_eq!(
+            queue.get(&pending.id).expect("read").expect("pending"),
+            pending_before
+        );
+
+        assert!(matches!(
+            queue.finalize_audited_receiptless_cancel(
+                &exact_queue,
+                &running,
+                super::ALREADY_MERGED_CANCEL_REASON.to_owned(),
+                cancelled.cancellation_proof.clone().expect("proof"),
+            ),
+            Err(super::QueueError::StateConflict(_))
+        ));
     }
 
     #[test]
