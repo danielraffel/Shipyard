@@ -71,8 +71,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release --locked --bin shipyard
+      - name: Build release binaries
+        run: cargo build --release --locked --bin shipyard --bin shipyard-workstream-provider
 
       - name: Package artifact
         shell: bash
@@ -81,6 +81,7 @@ jobs:
           ${{ matrix.python }} scripts/package_release.py \
             --skip-build \
             --binary "${{ matrix.binary }}" \
+            --companion-binary "${{ matrix.companion_binary }}" \
             --target "${{ matrix.package_target }}" \
             --tag ci-smoke \
             --dist-dir artifacts/package \

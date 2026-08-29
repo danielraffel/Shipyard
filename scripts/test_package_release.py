@@ -159,12 +159,20 @@ class PackageReleaseTests(unittest.TestCase):
             fake_binary = root / "shipyard"
             fake_binary.write_text("#!/bin/sh\necho 'shipyard 0.1.0'\n", encoding="utf-8")
             fake_binary.chmod(fake_binary.stat().st_mode | stat.S_IXUSR)
+            fake_companion = root / "shipyard-workstream-provider"
+            fake_companion.write_text(
+                "#!/bin/sh\necho 'shipyard-workstream-provider 0.1.0'\n",
+                encoding="utf-8",
+            )
+            fake_companion.chmod(fake_companion.stat().st_mode | stat.S_IXUSR)
 
             args = package_release.parse_args(
                 [
                     "--skip-build",
                     "--binary",
                     str(fake_binary),
+                    "--companion-binary",
+                    str(fake_companion),
                     "--target",
                     "linux-x64",
                     "--tag",
@@ -177,9 +185,101 @@ class PackageReleaseTests(unittest.TestCase):
                 artifacts = package_release.package(args)
 
             artifact = root / "dist" / "v-test" / "shipyard-linux-x64"
-            self.assertEqual(artifacts, [artifact])
+            companion = (
+                root
+                / "dist"
+                / "v-test"
+                / "shipyard-workstream-provider-linux-x64"
+            )
+            self.assertEqual(artifacts, [artifact, companion])
             self.assertTrue(artifact.exists())
-            self.assertTrue((root / "dist" / "v-test" / "checksums.sha256").exists())
+            self.assertTrue(companion.exists())
+            checksums = root / "dist" / "v-test" / "checksums.sha256"
+            self.assertEqual(len(checksums.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_packaging_refuses_a_missing_companion_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake_binary = root / "shipyard"
+            fake_binary.write_text("#!/bin/sh\necho 'shipyard 0.1.0'\n", encoding="utf-8")
+            fake_binary.chmod(0o755)
+            args = package_release.parse_args(
+                [
+                    "--skip-build",
+                    "--binary",
+                    str(fake_binary),
+                    "--companion-binary",
+                    str(root / "missing-provider"),
+                    "--target",
+                    "linux-x64",
+                ]
+            )
+
+            with self.assertRaisesRegex(SystemExit, "companion binary"):
+                package_release.package(args)
+
+    def test_signed_dmg_stages_and_signs_both_binaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary = root / "shipyard"
+            companion = root / "shipyard-workstream-provider"
+            for path, name in (
+                (binary, "shipyard"),
+                (companion, "shipyard-workstream-provider"),
+            ):
+                path.write_text(f"#!/bin/sh\necho '{name} 0.127.0'\n", encoding="utf-8")
+                path.chmod(0o755)
+            args = package_release.parse_args(
+                [
+                    "--skip-build",
+                    "--binary",
+                    str(binary),
+                    "--companion-binary",
+                    str(companion),
+                    "--target",
+                    "macos-arm64",
+                    "--tag",
+                    "v0.127.0",
+                    "--dist-dir",
+                    str(root / "dist"),
+                    "--dmg",
+                    "--sign-macos",
+                ]
+            )
+            staged_names: set[str] = set()
+
+            def fake_create_dmg(stage: Path, output: Path, **_kwargs: object) -> None:
+                staged_names.update(path.name for path in stage.iterdir())
+                output.write_text("dmg", encoding="utf-8")
+
+            with mock.patch.object(package_release, "require_commands"), \
+                    mock.patch.object(package_release, "require_signing_env"), \
+                    mock.patch.object(package_release, "prepared_signing_keychain"), \
+                    mock.patch.object(package_release, "verify_signing_probe"), \
+                    mock.patch.object(package_release, "sign_binary") as sign_binary, \
+                    mock.patch.object(package_release, "sign_dmg"), \
+                    mock.patch.object(
+                        package_release, "create_dmg", side_effect=fake_create_dmg
+                    ), mock.patch.object(
+                        package_release,
+                        "smoke_dmg",
+                        return_value="shipyard 0.127.0\nshipyard-workstream-provider 0.127.0",
+                    ) as smoke_dmg, redirect_stdout(StringIO()):
+                artifacts = package_release.package(args)
+
+            self.assertEqual(
+                staged_names,
+                {"shipyard", "shipyard-workstream-provider"},
+            )
+            self.assertEqual(
+                {call.args[0].name for call in sign_binary.call_args_list},
+                {"shipyard", "shipyard-workstream-provider"},
+            )
+            smoke_dmg.assert_called_once_with(
+                artifacts[0],
+                ("shipyard", "shipyard-workstream-provider"),
+                ci_mode=False,
+            )
 
     def test_ci_mode_softens_dmg_mount_failure(self) -> None:
         def fake_run(args: list[str], **_kwargs: object) -> str:
@@ -191,7 +291,7 @@ class PackageReleaseTests(unittest.TestCase):
                 mock.patch.object(package_release, "run", side_effect=fake_run):
             result = package_release.smoke_dmg(
                 Path("fake.dmg"),
-                "shipyard",
+                ("shipyard", "shipyard-workstream-provider"),
                 ci_mode=True,
             )
 
@@ -208,7 +308,7 @@ class PackageReleaseTests(unittest.TestCase):
             with self.assertRaises(package_release.CommandFailed):
                 package_release.smoke_dmg(
                     Path("fake.dmg"),
-                    "shipyard",
+                    ("shipyard", "shipyard-workstream-provider"),
                     ci_mode=False,
                 )
 

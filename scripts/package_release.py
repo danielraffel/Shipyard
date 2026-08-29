@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import os
 import platform
+import re
 import secrets
 import shlex
 import shutil
@@ -21,6 +22,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DIST_DIR = ROOT / "dist" / "release"
 BIN_NAME = "shipyard"
+COMPANION_BIN_NAME = "shipyard-workstream-provider"
+SEMVER_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
 NOTARY_WAIT_TIMEOUT = "45m"
 SENSITIVE_FLAGS = {"--password", "-p", "-P", "-k"}
 SENSITIVE_ENV_NAMES = (
@@ -138,12 +145,14 @@ def artifact_filename(prefix: str, target: ReleaseTarget) -> str:
     return f"{prefix}-{target.name}{target.exe_suffix}"
 
 
-def default_binary_path(target: ReleaseTarget, cargo_target: str | None) -> Path:
+def default_binary_path(
+    target: ReleaseTarget, cargo_target: str | None, binary_name: str = BIN_NAME
+) -> Path:
     release_dir = ROOT / "target"
     if cargo_target:
         release_dir = release_dir / cargo_target
     release_dir = release_dir / "release"
-    return release_dir / f"{BIN_NAME}{target.exe_suffix}"
+    return release_dir / f"{binary_name}{target.exe_suffix}"
 
 
 def require_commands(names: list[str]) -> None:
@@ -241,17 +250,64 @@ def verify_signing_probe() -> None:
 
 
 def build_release(cargo_target: str | None) -> None:
-    args = ["cargo", "build", "--release", "--locked", "--bin", BIN_NAME]
+    args = [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--bin",
+        BIN_NAME,
+        "--bin",
+        COMPANION_BIN_NAME,
+    ]
     if cargo_target:
         args.extend(["--target", cargo_target])
     run(args)
 
 
-def smoke_binary(binary: Path) -> str:
+def smoke_binary(binary: Path, expected_name: str = BIN_NAME) -> str:
     output = run([str(binary), "--version"], capture=True)
-    if BIN_NAME not in output:
-        raise SystemExit(f"Version smoke failed for {binary}: {output!r}")
+    parse_binary_version(output, expected_name, source=str(binary))
     return output
+
+
+def parse_binary_version(output: str, expected_name: str, *, source: str) -> str:
+    fields = output.split()
+    if len(fields) != 2 or fields[0] != expected_name:
+        raise SystemExit(f"Version smoke failed for {source}: {output!r}")
+    version = fields[1].removeprefix("v")
+    if not SEMVER_RE.fullmatch(version):
+        raise SystemExit(f"Invalid semantic version from {source}: {output!r}")
+    return version
+
+
+def require_matching_pair_versions(
+    primary_output: str, companion_output: str
+) -> None:
+    primary_version = parse_binary_version(
+        primary_output, BIN_NAME, source=BIN_NAME
+    )
+    companion_version = parse_binary_version(
+        companion_output, COMPANION_BIN_NAME, source=COMPANION_BIN_NAME
+    )
+    if primary_version != companion_version:
+        raise SystemExit(
+            "Release binary version mismatch: "
+            f"{BIN_NAME}={primary_version} "
+            f"{COMPANION_BIN_NAME}={companion_version}"
+        )
+
+
+def smoke_binary_pair(
+    primary: Path,
+    companion: Path,
+    primary_name: str = BIN_NAME,
+    companion_name: str = COMPANION_BIN_NAME,
+) -> str:
+    primary_output = smoke_binary(primary, primary_name)
+    companion_output = smoke_binary(companion, companion_name)
+    require_matching_pair_versions(primary_output, companion_output)
+    return f"{primary_output}\n{companion_output}"
 
 
 def sign_binary(path: Path) -> None:
@@ -504,7 +560,7 @@ def notarize_and_staple(path: Path) -> None:
     run(["xcrun", "stapler", "validate", str(path)])
 
 
-def smoke_dmg(path: Path, binary_name: str, *, ci_mode: bool) -> str:
+def smoke_dmg(path: Path, binary_names: tuple[str, ...], *, ci_mode: bool) -> str:
     require_commands(["hdiutil"])
     with tempfile.TemporaryDirectory(prefix="shipyard-dmg-") as temp:
         mount = Path(temp) / "mnt"
@@ -526,7 +582,12 @@ def smoke_dmg(path: Path, binary_name: str, *, ci_mode: bool) -> str:
                 return f"DMG mount skipped in CI mode: {error}"
             raise
         try:
-            return smoke_binary(mount / binary_name)
+            if len(binary_names) != 2:
+                raise SystemExit("DMG smoke requires the Shipyard binary pair")
+            return smoke_binary_pair(
+                mount / binary_names[0],
+                mount / binary_names[1],
+            )
         finally:
             subprocess.run(
                 ["hdiutil", "detach", str(mount)],
@@ -580,9 +641,14 @@ def package(args: argparse.Namespace) -> list[Path]:
         build_release(args.cargo_target)
 
     binary = args.binary or default_binary_path(target, args.cargo_target)
+    companion_binary = args.companion_binary or default_binary_path(
+        target, args.cargo_target, COMPANION_BIN_NAME
+    )
     if not binary.exists():
         raise SystemExit(f"Built binary not found: {binary}")
-    smoke = smoke_binary(binary)
+    if not companion_binary.exists():
+        raise SystemExit(f"Built companion binary not found: {companion_binary}")
+    smoke = smoke_binary_pair(binary, companion_binary)
 
     tag = args.tag or "dev"
     output_dir = args.dist_dir / tag
@@ -596,12 +662,15 @@ def package(args: argparse.Namespace) -> list[Path]:
             stage = Path(temp) / "stage"
             stage.mkdir()
             staged_binary = stage / args.artifact_prefix
+            staged_companion = stage / args.companion_artifact_prefix
             shutil.copy2(binary, staged_binary)
+            shutil.copy2(companion_binary, staged_companion)
             dmg = output_dir / f"{artifact_base}.dmg"
             if args.sign_macos:
                 with prepared_signing_keychain():
                     verify_signing_probe()
                     sign_binary(staged_binary)
+                    sign_binary(staged_companion)
                     create_dmg(stage, dmg, volume_name="Shipyard")
                     sign_dmg(dmg)
             else:
@@ -609,7 +678,11 @@ def package(args: argparse.Namespace) -> list[Path]:
             if args.notarize:
                 notarize_and_staple(dmg)
             if not args.no_smoke:
-                smoke = smoke_dmg(dmg, args.artifact_prefix, ci_mode=args.ci_mode)
+                smoke = smoke_dmg(
+                    dmg,
+                    (args.artifact_prefix, args.companion_artifact_prefix),
+                    ci_mode=args.ci_mode,
+                )
             artifacts.append(dmg)
     else:
         artifact = output_dir / artifact_base
@@ -619,8 +692,22 @@ def package(args: argparse.Namespace) -> list[Path]:
                 verify_signing_probe()
                 sign_binary(artifact)
         if not args.no_smoke:
-            smoke = smoke_binary(artifact)
+            primary_smoke = smoke_binary(artifact)
         artifacts.append(artifact)
+        companion_artifact = output_dir / artifact_filename(
+            args.companion_artifact_prefix, target
+        )
+        shutil.copy2(companion_binary, companion_artifact)
+        if args.sign_macos:
+            with prepared_signing_keychain():
+                sign_binary(companion_artifact)
+        if not args.no_smoke:
+            companion_smoke = smoke_binary(
+                companion_artifact, COMPANION_BIN_NAME
+            )
+            require_matching_pair_versions(primary_smoke, companion_smoke)
+            smoke = f"{primary_smoke}\n{companion_smoke}"
+        artifacts.append(companion_artifact)
 
     for artifact in artifacts:
         write_checksums(output_dir, artifact)
@@ -638,10 +725,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--target", choices=sorted(TARGETS), help="Release target; defaults to host")
     parser.add_argument("--cargo-target", help="Optional Rust target triple for cross builds")
     parser.add_argument("--binary", type=Path, help="Use an already-built binary")
+    parser.add_argument(
+        "--companion-binary", type=Path, help="Use an already-built provider binary"
+    )
     parser.add_argument("--skip-build", action="store_true", help="Do not run cargo build")
     parser.add_argument("--tag", help="Release tag label for output layout")
     parser.add_argument("--dist-dir", type=Path, default=DEFAULT_DIST_DIR)
     parser.add_argument("--artifact-prefix", default=BIN_NAME)
+    parser.add_argument("--companion-artifact-prefix", default=COMPANION_BIN_NAME)
     parser.add_argument("--dmg", action="store_true", help="Package macOS target as a DMG")
     parser.add_argument("--sign-macos", action="store_true", help="Developer-ID sign macOS artifact")
     parser.add_argument("--notarize", action="store_true", help="Notarize and staple the macOS DMG")
