@@ -51,6 +51,7 @@ impl WorkLedger {
             ledger_incarnation_ref,
             clock,
         };
+        ledger.reconcile_protected_object_storage()?;
         Ok(ledger)
     }
 
@@ -76,6 +77,8 @@ impl WorkLedger {
             ledger_incarnation_ref,
             clock,
         };
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&dir)?;
+        ledger.reconcile_protected_object_storage()?;
         Ok(Some(ledger))
     }
 
@@ -93,6 +96,12 @@ impl WorkLedger {
 
     /// Return redacted operational status.
     pub fn status(&self) -> WorkLedgerResult<LedgerStatus> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        self.reconcile_and_verify_protected_object_storage()?;
         let connection = self.connect_read_only()?;
         verify_supported_schema(&connection)?;
         let integrity = verify_integrity(&connection)?;
@@ -115,6 +124,7 @@ impl WorkLedger {
             pending_wakes: count_where(&connection, "outbox", "state", "pending")?,
             uncertain_wakes: count_where(&connection, "outbox", "state", "uncertain")?,
             imports: count(&connection, "imports")?,
+            protected_objects: count(&connection, "protected_objects")?,
             activation_enabled: false,
             dispatch_enabled: false,
         })

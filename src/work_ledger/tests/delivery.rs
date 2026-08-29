@@ -887,7 +887,7 @@ fn v2_pending_outbox_migrates_to_v4_without_losing_wake() {
     drop(ledger);
     let migrated = WorkLedger::open(temp.path()).expect("migrate v2");
     let connection = migrated.connect_read_only().expect("connection");
-    assert_eq!(schema_version(&connection).expect("version"), 6);
+    assert_eq!(schema_version(&connection).expect("version"), 7);
     let row: (String, u64, Option<String>, String) = connection
         .query_row(
             "SELECT state, claim_attempt, claim_id, ledger_incarnation_ref
@@ -917,7 +917,7 @@ fn full_v1_pending_outbox_migrates_to_v4_with_terminal_receipt_constraints() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate full v1 ledger");
     let connection = migrated.connect_read_only().expect("connection");
-    assert_eq!(schema_version(&connection).expect("version"), 6);
+    assert_eq!(schema_version(&connection).expect("version"), 7);
     let row: (String, u64, Option<String>, String) = connection
         .query_row(
             "SELECT state, claim_attempt, claim_id, ledger_incarnation_ref

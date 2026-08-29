@@ -26,6 +26,7 @@ pub fn absent_status() -> LedgerStatus {
         pending_wakes: 0,
         uncertain_wakes: 0,
         imports: 0,
+        protected_objects: 0,
         activation_enabled: false,
         dispatch_enabled: false,
     }
@@ -145,8 +146,11 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     if version == SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 6 {
+        return migrate_v6_to_v7(connection);
+    }
     if version == 5 {
-        return migrate_v5_to_v6(connection);
+        return migrate_v5_to_current(connection);
     }
     if version == 4 {
         return migrate_v4_to_current(connection);
@@ -352,6 +356,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     upgrade_v3_incarnation(&transaction, &ledger_incarnation_ref)?;
     upgrade_v4_clock(&transaction)?;
     upgrade_v5_route_changes(&transaction)?;
+    upgrade_v6_protected_objects(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -369,6 +374,7 @@ fn migrate_v2_to_v4(
     upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
     upgrade_v4_clock(&transaction)?;
     upgrade_v5_route_changes(&transaction)?;
+    upgrade_v6_protected_objects(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -494,6 +500,7 @@ fn migrate_v1_to_v4(
     upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
     upgrade_v4_clock(&transaction)?;
     upgrade_v5_route_changes(&transaction)?;
+    upgrade_v6_protected_objects(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -507,6 +514,7 @@ fn migrate_v3_to_v4(
     upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
     upgrade_v4_clock(&transaction)?;
     upgrade_v5_route_changes(&transaction)?;
+    upgrade_v6_protected_objects(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -607,14 +615,24 @@ fn migrate_v4_to_current(connection: &mut Connection) -> WorkLedgerResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     upgrade_v4_clock(&transaction)?;
     upgrade_v5_route_changes(&transaction)?;
+    upgrade_v6_protected_objects(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
 
-fn migrate_v5_to_v6(connection: &mut Connection) -> WorkLedgerResult<()> {
+fn migrate_v5_to_current(connection: &mut Connection) -> WorkLedgerResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     upgrade_v5_route_changes(&transaction)?;
+    upgrade_v6_protected_objects(&transaction)?;
+    verify_migration_foreign_keys(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v6_to_v7(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    upgrade_v6_protected_objects(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -650,6 +668,7 @@ pub(super) const CLOCK_TIMESTAMP_TABLES: &[(&str, &[(&str, bool)])] = &[
     ),
     ("imports", &[("imported_at", false)]),
     ("repo_policies", &[("updated_at", false)]),
+    ("protected_objects", &[("created_at", false)]),
     (
         "route_changes",
         &[
@@ -781,7 +800,9 @@ fn upgrade_v4_clock(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult
          );",
     )?;
     for (name, sql) in expected_clock_triggers() {
-        if name.starts_with("ledger_clock_route_changes_") {
+        if name.starts_with("ledger_clock_route_changes_")
+            || name.starts_with("ledger_clock_protected_objects_")
+        {
             continue;
         }
         transaction.execute_batch(&format!("{sql};"))?;
@@ -897,7 +918,116 @@ fn upgrade_v5_route_changes(transaction: &rusqlite::Transaction<'_>) -> WorkLedg
             transaction.execute_batch(&format!("{sql};"))?;
         }
     }
+    transaction.pragma_update(None, "user_version", 6)?;
+    Ok(())
+}
+
+const PROTECTED_OBJECT_SCHEMA_OBJECTS: &[(&str, &str, &str)] = &[
+    (
+        "index",
+        "protected_objects_work_kind",
+        "CREATE INDEX protected_objects_work_kind
+           ON protected_objects(work_item_id, kind, created_at)",
+    ),
+    (
+        "table",
+        "protected_objects",
+        "CREATE TABLE protected_objects (
+           object_ref TEXT PRIMARY KEY
+             CHECK(length(object_ref) = 67 AND substr(object_ref, 1, 3) = 'po_'
+                   AND substr(object_ref, 4) NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           kind TEXT NOT NULL CHECK(kind IN ('launch_profile', 'provider_request',
+                                             'provider_receipt', 'agent_receipt')),
+           profile_ref TEXT,
+           storage_name TEXT NOT NULL UNIQUE
+             CHECK(length(storage_name) = 76
+                   AND substr(storage_name, 1, 7) = 'object-'
+                   AND substr(storage_name, 8, 64) NOT GLOB '*[^0-9a-f]*'
+                   AND substr(storage_name, 72, 5) = '.blob'),
+           content_digest TEXT NOT NULL
+             CHECK(length(content_digest) = 64
+                   AND content_digest NOT GLOB '*[^0-9a-f]*'),
+           byte_length INTEGER NOT NULL CHECK(byte_length >= 0 AND byte_length <= 1048576),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           CHECK((kind = 'launch_profile' AND profile_ref IS NOT NULL
+                  AND length(profile_ref) = 78
+                  AND substr(profile_ref, 1, 14) = 'opaque:sha256:'
+                  AND substr(profile_ref, 15) NOT GLOB '*[^0-9a-f]*')
+                 OR (kind != 'launch_profile' AND profile_ref IS NULL)),
+           UNIQUE(work_item_id, profile_ref)
+         )",
+    ),
+    (
+        "trigger",
+        "protected_object_capacity",
+        "CREATE TRIGGER protected_object_capacity
+         BEFORE INSERT ON protected_objects
+         WHEN (SELECT COUNT(*) FROM protected_objects) >= 4096
+           OR (SELECT COALESCE(SUM(byte_length), 0) FROM protected_objects)
+                + NEW.byte_length > 16777216
+         BEGIN SELECT RAISE(ABORT, 'protected object store capacity exceeded'); END",
+    ),
+    (
+        "trigger",
+        "protected_object_immutable",
+        "CREATE TRIGGER protected_object_immutable
+         BEFORE UPDATE ON protected_objects
+         BEGIN SELECT RAISE(ABORT, 'protected object metadata is immutable'); END",
+    ),
+    (
+        "trigger",
+        "protected_object_no_delete",
+        "CREATE TRIGGER protected_object_no_delete
+         BEFORE DELETE ON protected_objects
+         BEGIN SELECT RAISE(ABORT, 'protected objects cannot be deleted'); END",
+    ),
+];
+
+fn upgrade_v6_protected_objects(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
+    for object_type in ["table", "index", "trigger"] {
+        for (kind, _, sql) in PROTECTED_OBJECT_SCHEMA_OBJECTS {
+            if *kind == object_type {
+                transaction.execute_batch(&format!("{sql};"))?;
+            }
+        }
+    }
+    for (name, sql) in expected_clock_triggers() {
+        if name.starts_with("ledger_clock_protected_objects_") {
+            transaction.execute_batch(&format!("{sql};"))?;
+        }
+    }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn verify_protected_object_schema(connection: &Connection) -> WorkLedgerResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, sql FROM sqlite_schema
+         WHERE name IN ('protected_objects', 'protected_objects_work_kind',
+                        'protected_object_capacity', 'protected_object_immutable',
+                        'protected_object_no_delete')
+         ORDER BY type, name",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = PROTECTED_OBJECT_SCHEMA_OBJECTS
+        .iter()
+        .map(|(kind, name, sql)| ((*kind).to_owned(), (*name).to_owned(), (*sql).to_owned()))
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    if actual != expected {
+        return Err(WorkLedgerError::Refused(
+            "protected object schema is incomplete or altered".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1008,7 +1138,8 @@ pub(super) fn verify_supported_schema(connection: &Connection) -> WorkLedgerResu
     if version != SCHEMA_VERSION {
         return Err(WorkLedgerError::UnsupportedSchema(version));
     }
-    verify_clock_schema(connection)
+    verify_clock_schema(connection)?;
+    verify_protected_object_schema(connection)
 }
 
 pub(super) fn schema_version(connection: &Connection) -> WorkLedgerResult<i64> {
@@ -1042,6 +1173,7 @@ pub(super) fn count(connection: &Connection, table: &str) -> WorkLedgerResult<u6
     let sql = match table {
         "work_items" => "SELECT COUNT(*) FROM work_items",
         "imports" => "SELECT COUNT(*) FROM imports",
+        "protected_objects" => "SELECT COUNT(*) FROM protected_objects",
         _ => {
             return Err(WorkLedgerError::Refused(
                 "unsupported count table".to_owned(),

@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -56,6 +56,8 @@ mod lifecycle;
 mod observation;
 mod persistence;
 mod policy;
+#[allow(dead_code)] // Consumed by native provider publication after the shadow schema lands.
+mod protected_objects;
 mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.
 mod route;
@@ -69,6 +71,8 @@ pub use observation::ShadowPrTarget;
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
 pub use policy::RepoPolicy;
 pub(crate) use policy::validate_repo_policy;
+#[cfg(test)]
+pub(crate) use protected_objects::ProtectedObjectKind;
 #[cfg(test)]
 use registry::{RouteRegistration, load_validated_route, validated_route_exists};
 use route::{AdapterBindingRecord, RouteProvenanceRecord};
@@ -212,6 +216,8 @@ pub struct LedgerStatus {
     pub uncertain_wakes: u64,
     /// Imported source count.
     pub imports: u64,
+    /// Immutable protected object count.
+    pub protected_objects: u64,
     /// Activation is deliberately unavailable in this phase.
     pub activation_enabled: bool,
     /// Dispatch is deliberately unavailable in this phase.

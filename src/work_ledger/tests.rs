@@ -157,4 +157,5 @@ mod delivery;
 mod importer;
 mod lifecycle;
 mod persistence;
+mod protected_objects;
 mod route_change;

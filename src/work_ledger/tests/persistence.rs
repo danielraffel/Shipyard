@@ -126,6 +126,7 @@ pub(super) fn strip_v5_clock_schema(ledger: &WorkLedger) {
 }
 
 pub(super) fn strip_v6_route_change_schema(ledger: &WorkLedger) {
+    strip_v7_protected_object_schema(ledger);
     let connection = ledger.connect_read_write().expect("v6 connection");
     if schema_version(&connection).expect("schema version") != 6 {
         return;
@@ -147,6 +148,125 @@ pub(super) fn strip_v6_route_change_schema(ledger: &WorkLedger) {
         .expect("strip v6 route changes");
 }
 
+pub(super) fn strip_v7_protected_object_schema(ledger: &WorkLedger) {
+    let connection = ledger.connect_read_write().expect("v7 connection");
+    if schema_version(&connection).expect("schema version") != 7 {
+        return;
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type='trigger' AND name LIKE 'ledger_clock_protected_objects_%'",
+        )
+        .expect("protected object clock triggers");
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("names");
+    drop(statement);
+    for name in names {
+        connection
+            .execute_batch(&format!("DROP TRIGGER \"{name}\";"))
+            .expect("drop protected object clock trigger");
+    }
+    connection
+        .execute_batch(
+            "DROP TRIGGER protected_object_capacity;
+             DROP TRIGGER protected_object_immutable;
+             DROP TRIGGER protected_object_no_delete;
+             DROP TABLE protected_objects;
+             PRAGMA user_version=6;",
+        )
+        .expect("strip v7 protected objects");
+}
+
+#[test]
+fn v6_to_v7_protected_object_migration_installs_closed_storage_and_clock_inventory() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("ledger");
+    strip_v7_protected_object_schema(&ledger);
+    drop(ledger);
+
+    let migrated = WorkLedger::open(temp.path()).expect("migrate v6");
+    let connection = migrated.connect_read_only().expect("connection");
+    assert_eq!(schema_version(&connection).expect("version"), 7);
+    let table: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='table' AND name='protected_objects'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("table");
+    assert_eq!(table, 1);
+    let triggers: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='trigger'
+               AND name LIKE 'ledger_clock_protected_objects_%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("clock triggers");
+    assert_eq!(triggers, 2);
+}
+
+#[test]
+fn failed_v6_to_v7_protected_object_creation_rolls_back_without_clock_triggers() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("ledger");
+    strip_v7_protected_object_schema(&ledger);
+    let connection = ledger.connect_read_write().expect("connection");
+    connection
+        .execute_batch("CREATE TABLE protected_objects(collision TEXT);")
+        .expect("collision");
+    drop(connection);
+    drop(ledger);
+
+    assert!(WorkLedger::open(temp.path()).is_err());
+    let connection = Connection::open(WorkLedger::path_at(temp.path())).expect("inspect");
+    assert_eq!(schema_version(&connection).expect("version"), 6);
+    let triggers: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='trigger'
+               AND name LIKE 'ledger_clock_protected_objects_%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("clock triggers");
+    assert_eq!(triggers, 0);
+}
+
+#[test]
+fn missing_protected_object_invariant_trigger_fails_schema_closed() {
+    for trigger in [
+        "protected_object_capacity",
+        "protected_object_immutable",
+        "protected_object_no_delete",
+    ] {
+        let temp = TempDir::new().expect("temp");
+        let ledger = WorkLedger::open(temp.path()).expect("ledger");
+        let connection = ledger.connect_read_write().expect("connection");
+        connection
+            .execute_batch(&format!("DROP TRIGGER \"{trigger}\";"))
+            .expect("drop invariant trigger");
+        drop(connection);
+
+        assert!(matches!(
+            ledger.status(),
+            Err(WorkLedgerError::Refused(reason))
+                if reason.contains("protected object schema is incomplete or altered")
+        ));
+        assert!(matches!(
+            WorkLedger::open_existing(temp.path()),
+            Err(WorkLedgerError::Refused(reason))
+                if reason.contains("protected object schema is incomplete or altered")
+        ));
+    }
+}
+
 #[test]
 fn v5_to_v6_route_change_migration_is_exclusive_and_installs_clock_inventory() {
     let temp = TempDir::new().expect("temp");
@@ -155,7 +275,7 @@ fn v5_to_v6_route_change_migration_is_exclusive_and_installs_clock_inventory() {
     drop(ledger);
     let migrated = WorkLedger::open(temp.path()).expect("migrate v5");
     let c = migrated.connect_read_only().expect("connection");
-    assert_eq!(schema_version(&c).expect("version"), 6);
+    assert_eq!(schema_version(&c).expect("version"), 7);
     let table: i64 = c
         .query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='route_changes'",
@@ -241,7 +361,7 @@ fn fresh_v5_clock_has_exact_timestamp_writer_trigger_inventory() {
     expected.sort();
     actual.sort();
     assert_eq!(actual, expected);
-    assert_eq!(schema_version(&connection).expect("schema version"), 6);
+    assert_eq!(schema_version(&connection).expect("schema version"), 7);
     assert!(
         super::clock::load_durable_floor(&connection)
             .expect("clock floor")
@@ -291,7 +411,7 @@ fn v4_to_v5_migration_derives_exact_floor_and_is_idempotent() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate v4");
     let connection = migrated.connect_read_only().expect("v5 connection");
-    assert_eq!(schema_version(&connection).expect("schema version"), 6);
+    assert_eq!(schema_version(&connection).expect("schema version"), 7);
     assert_eq!(
         super::clock::load_durable_floor(&connection)
             .expect("clock floor")
@@ -655,7 +775,7 @@ fn v1_registry_migrates_transactionally_and_accepts_exact_agent_binding() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate exact v1 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 6);
+    assert_eq!(schema_version(&connection).expect("schema version"), 7);
     let preserved: Vec<(String, String, String)> = {
         let mut statement = connection
             .prepare(
