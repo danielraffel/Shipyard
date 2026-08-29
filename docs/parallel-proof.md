@@ -16,10 +16,15 @@ records what a future production controller must prove, but it has no queue,
 runner, GitHub, Check Run, or merge-authority integration. Consequently this
 slice alone produces no queue-time improvement.
 
-`src/parallel_proof_canary.rs` adds a second pure, default-off boundary for the
-first production experiment. It will admit only `generous-corp/pulp`'s exact
-numeric repository identity and `mac` target, built on M3 and shared over a
-freshly observed LAN route with M1. Both
+`src/parallel_proof_canary.rs` adds a second pure, default-off boundary for a
+production experiment. The reusable policy has no repository, target, or host
+defaults: enabling it requires an explicit numeric repository ID, canonical
+slug, Shipyard target, build target triple, builder host, and worker host. All
+six values are checked against live proof inputs and retained in measurement
+and cache receipts, so changing only a friendly slug or reusing a correlation
+ID under another target/host pair fails closed before execution. For the Pulp
+example, those values are `1203111607`, `generous-corp/pulp`, `mac`,
+`aarch64-apple-darwin`, M3, and M1. Both
 hosts must declare authenticated persistent, normalized, non-temporary staging
 roots, enough free space,
 the same exact required cache generations, current session generations, and
@@ -29,7 +34,7 @@ progress and can be considered by a later policy after route, cache, and
 disconnect recovery are measured.
 
 The canary accepts controller-owned timing evidence bound to the exact proof
-manifest and independently observed `mac` target only when the predicted
+manifest and explicitly configured target only when the predicted
 wall-clock saving is at least 120 seconds and 10 percent, and transfer plus
 dispatch cost is no more than exactly 15 percent of shard execution time.
 Shared Skia, Dawn, V8, Three.js, FetchContent, and ccache

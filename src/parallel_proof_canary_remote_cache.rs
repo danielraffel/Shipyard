@@ -1,4 +1,7 @@
-//! Authenticated companion protocol for read-only M1 cache observation.
+//! Authenticated companion protocol for read-only remote cache observation.
+//!
+//! Historical `M1` type names remain for API stability; live builder and
+//! worker host identities are explicit constructor inputs and receipt data.
 //!
 //! The production carrier tries an explicit pinned direct-LAN target first and
 //! may use an independently pinned Tailscale target only after a classified
@@ -29,7 +32,7 @@ pub const REMOTE_M1_CACHE_PROTOCOL_SCHEMA: u32 = 1;
 const MAX_COMPANION_MESSAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_COMPANION_STDERR_BYTES: u64 = 64 * 1024;
 
-/// Authenticated facts established before invoking the M1 companion.
+/// Authenticated facts established before invoking the remote companion.
 ///
 /// Construction validates shape only. Implementations of
 /// [`RemoteM1CacheTransport`] own the trust boundary and must populate these
@@ -39,13 +42,13 @@ const MAX_COMPANION_STDERR_BYTES: u64 = 64 * 1024;
 pub struct RemoteM1CacheAuthority {
     /// Stable controller host initiating the observation.
     pub source_host_id: String,
-    /// Stable worker host; only `m1` is supported.
+    /// Stable configured worker host.
     pub host_id: String,
     /// Digest of the exact read-only host receipt used by the controller.
     pub host_observation_sha256: Sha256Digest,
     /// Nonzero reconnect-fenced host session generation.
     pub host_session_generation: u64,
-    /// Exact pinned route used from M3 to M1; Tailnet is diagnostic-only.
+    /// Exact pinned route used from builder to worker; Tailnet is diagnostic-only.
     pub route: CanaryRoute,
     /// Exact SSH destination selected for this route.
     pub destination: String,
@@ -79,18 +82,15 @@ impl RemoteM1CacheAuthority {
         let required_free = self
             .artifact_bytes_total
             .checked_add(self.minimum_reserve_bytes);
-        if self.source_host_id != "m3"
-            || self.host_id != "m1"
+        if !valid_host_id(&self.source_host_id)
+            || !valid_host_id(&self.host_id)
+            || self.source_host_id == self.host_id
             || self.host_session_generation == 0
             || !matches!(self.route, CanaryRoute::Lan | CanaryRoute::Tailnet)
             || !safe_destination(&self.destination)
             || self.capabilities.is_empty()
             || self.capabilities.len() > MAX_CAPABILITIES
             || !strictly_sorted_unique(&self.capabilities)
-            || !self
-                .capabilities
-                .iter()
-                .any(|capability| capability == "macos-arm64")
             || self.staging_class != CanaryStagingClass::Persistent
             || !safe_persistent_macos_path(&self.staging_root)
             || self.artifact_bytes_total == 0
@@ -638,9 +638,11 @@ impl RemoteM1CacheTransport for StrictSshRemoteM1CacheTransport {
     }
 }
 
-/// Production-shape M1 observer over a caller-owned authenticated transport.
+/// Production-shape remote observer over a caller-owned authenticated transport.
 pub struct AuthenticatedRemoteM1CacheObserver<T> {
     transport: T,
+    source_host_id: String,
+    worker_host_id: String,
     timeout: Duration,
     maximum_authority_age_ms: u64,
 }
@@ -649,36 +651,50 @@ impl<T: RemoteM1CacheTransport> AuthenticatedRemoteM1CacheObserver<T> {
     /// Construct a bounded observer. No transport call occurs here.
     pub fn new(
         transport: T,
+        source_host_id: impl Into<String>,
+        worker_host_id: impl Into<String>,
         timeout: Duration,
         maximum_authority_age_ms: u64,
     ) -> Result<Self, CacheObserverError> {
-        if timeout.is_zero() || timeout > Duration::from_secs(30) || maximum_authority_age_ms == 0 {
+        let source_host_id = source_host_id.into();
+        let worker_host_id = worker_host_id.into();
+        if !valid_host_id(&source_host_id)
+            || !valid_host_id(&worker_host_id)
+            || source_host_id == worker_host_id
+            || timeout.is_zero()
+            || timeout > Duration::from_secs(30)
+            || maximum_authority_age_ms == 0
+        {
             return Err(CacheObserverError::Invalid(
                 "remote M1 cache observer bounds".to_owned(),
             ));
         }
         Ok(Self {
             transport,
+            source_host_id,
+            worker_host_id,
             timeout,
             maximum_authority_age_ms,
         })
     }
 
-    /// Authenticate and observe one exact immutable M1 cache generation.
+    /// Authenticate and observe one exact immutable worker cache generation.
     pub fn observe(
         &mut self,
         spec: &CacheGenerationProbeSpec,
     ) -> Result<CacheGenerationObservationReceipt, CacheObserverError> {
-        if spec.host_id() != "m1" {
+        if spec.host_id() != self.worker_host_id {
             return Err(CacheObserverError::Invalid(
-                "remote cache observer only supports m1".to_owned(),
+                "remote cache observer worker binding".to_owned(),
             ));
         }
         let deadline = Instant::now() + self.timeout;
         let authority = self.transport.authenticate_m1(deadline)?;
         authority.validate()?;
         let now = controller_now_ms()?;
-        if authority.host_observation_sha256 != *spec.host_observation_sha256()
+        if authority.source_host_id != self.source_host_id
+            || authority.host_id != self.worker_host_id
+            || authority.host_observation_sha256 != *spec.host_observation_sha256()
             || authority.observed_at_ms > now
             || now.saturating_sub(authority.observed_at_ms) > self.maximum_authority_age_ms
         {
@@ -708,7 +724,7 @@ impl<T: RemoteM1CacheTransport> AuthenticatedRemoteM1CacheObserver<T> {
         }
         let receipt = CacheGenerationObservationReceipt {
             schema_version: crate::parallel_proof_canary_cache::CACHE_GENERATION_OBSERVATION_SCHEMA,
-            host_id: "m1".to_owned(),
+            host_id: self.worker_host_id.clone(),
             observed_at_ms: controller_observed_at_ms,
             probe_elapsed_ms: response.probe_elapsed_ms,
             host_observation_sha256: authority.host_observation_sha256.clone(),
@@ -729,20 +745,34 @@ impl<T: RemoteM1CacheTransport> AuthenticatedRemoteM1CacheObserver<T> {
     }
 }
 
-/// Exact role router used by the existing M3-before-M1 paired cache driver.
+/// Exact role router used by the builder-before-worker paired cache driver.
 pub struct PairedAuthenticatedCacheObserver<T> {
     local: LocalCacheGenerationObserver,
     remote: AuthenticatedRemoteM1CacheObserver<T>,
+    builder_host_id: String,
+    worker_host_id: String,
 }
 
 impl<T: RemoteM1CacheTransport> PairedAuthenticatedCacheObserver<T> {
-    /// Pair the production M3 local observer with one authenticated M1 adapter.
-    #[must_use]
-    pub fn new(remote: AuthenticatedRemoteM1CacheObserver<T>) -> Self {
-        Self {
-            local: LocalCacheGenerationObserver,
-            remote,
+    /// Pair one explicit local builder with one authenticated remote worker.
+    pub fn new(
+        builder_host_id: impl Into<String>,
+        worker_host_id: impl Into<String>,
+        remote: AuthenticatedRemoteM1CacheObserver<T>,
+    ) -> Result<Self, CacheObserverError> {
+        let builder_host_id = builder_host_id.into();
+        let worker_host_id = worker_host_id.into();
+        if builder_host_id == worker_host_id || remote.worker_host_id != worker_host_id {
+            return Err(CacheObserverError::Invalid(
+                "paired cache observer host binding".to_owned(),
+            ));
         }
+        Ok(Self {
+            local: LocalCacheGenerationObserver::new(builder_host_id.clone())?,
+            remote,
+            builder_host_id,
+            worker_host_id,
+        })
     }
 }
 
@@ -751,12 +781,14 @@ impl<T: RemoteM1CacheTransport> CacheGenerationObserver for PairedAuthenticatedC
         &mut self,
         spec: &CacheGenerationProbeSpec,
     ) -> Result<CacheGenerationObservationReceipt, CacheObserverError> {
-        match spec.host_id() {
-            "m3" => self.local.observe(spec),
-            "m1" => self.remote.observe(spec),
-            _ => Err(CacheObserverError::Invalid(
-                "paired cache observer only supports m3 then m1".to_owned(),
-            )),
+        if spec.host_id() == self.builder_host_id {
+            self.local.observe(spec)
+        } else if spec.host_id() == self.worker_host_id {
+            self.remote.observe(spec)
+        } else {
+            Err(CacheObserverError::Invalid(
+                "paired cache observer host binding".to_owned(),
+            ))
         }
     }
 
@@ -799,7 +831,7 @@ impl RemoteM1CacheRequest {
     ) -> Result<Self, CacheObserverError> {
         let request = Self {
             schema_version: REMOTE_M1_CACHE_PROTOCOL_SCHEMA,
-            host_id: "m1".to_owned(),
+            host_id: authority.host_id.clone(),
             authority_sha256: authority.digest()?,
             host_observation_sha256: authority.host_observation_sha256.clone(),
             terminal_instance_sha256: authority.terminal_instance_sha256.clone(),
@@ -816,7 +848,7 @@ impl RemoteM1CacheRequest {
     fn validate(&self) -> Result<(), CacheObserverError> {
         self.expected_manifest.validate()?;
         if self.schema_version != REMOTE_M1_CACHE_PROTOCOL_SCHEMA
-            || self.host_id != "m1"
+            || !valid_host_id(&self.host_id)
             || self.model_calls != 0
             || !safe_persistent_macos_path(&self.cache_root)
             || self.expected_manifest.digest()? != self.expected_manifest_sha256
@@ -1027,6 +1059,14 @@ fn domain_digest<T: Serialize>(
 
 fn strictly_sorted_unique<T: Ord>(values: &[T]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn valid_host_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'))
 }
 
 fn safe_persistent_macos_path(value: &str) -> bool {
@@ -1331,9 +1371,14 @@ mod tests {
             tamper_stats: false,
             remote_clock_ms: None,
         };
-        let mut observer =
-            AuthenticatedRemoteM1CacheObserver::new(transport, Duration::from_secs(1), 60_000)
-                .unwrap();
+        let mut observer = AuthenticatedRemoteM1CacheObserver::new(
+            transport,
+            "m3",
+            "m1",
+            Duration::from_secs(1),
+            60_000,
+        )
+        .unwrap();
         let receipt = observer.observe(&spec).unwrap();
         assert_eq!(receipt.host_id, "m1");
         assert_eq!(receipt.manifest, manifest);
@@ -1355,6 +1400,39 @@ mod tests {
     }
 
     #[test]
+    fn remote_observer_uses_explicit_non_pulp_host_pair() {
+        let root = cache_tree();
+        let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+        let host_digest = digest("worker-b-observation");
+        let spec =
+            CacheGenerationProbeSpec::new("worker-b", host_digest.clone(), root.path(), manifest)
+                .unwrap();
+        let mut observed_authority = authority(host_digest);
+        observed_authority.source_host_id = "builder-a".to_owned();
+        observed_authority.host_id = "worker-b".to_owned();
+        let transport = FakeTransport {
+            authorities: VecDeque::from([observed_authority]),
+            calls: Vec::new(),
+            tamper_stats: false,
+            remote_clock_ms: None,
+        };
+        let mut observer = AuthenticatedRemoteM1CacheObserver::new(
+            transport,
+            "builder-a",
+            "worker-b",
+            Duration::from_secs(1),
+            60_000,
+        )
+        .unwrap();
+        let receipt = observer.observe(&spec).unwrap();
+        assert_eq!(receipt.host_id, "worker-b");
+        assert_eq!(
+            receipt.remote_authority.unwrap().authority.source_host_id,
+            "builder-a"
+        );
+    }
+
+    #[test]
     fn remote_wall_clock_is_authenticated_but_never_used_for_controller_freshness() {
         let root = cache_tree();
         let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
@@ -1370,9 +1448,14 @@ mod tests {
             tamper_stats: false,
             remote_clock_ms: Some(remote_clock_ms),
         };
-        let mut observer =
-            AuthenticatedRemoteM1CacheObserver::new(transport, Duration::from_secs(1), 60_000)
-                .unwrap();
+        let mut observer = AuthenticatedRemoteM1CacheObserver::new(
+            transport,
+            "m3",
+            "m1",
+            Duration::from_secs(1),
+            60_000,
+        )
+        .unwrap();
         let receipt = observer.observe(&spec).unwrap();
         assert!(receipt.observed_at_ms >= authority_time);
         assert_ne!(receipt.observed_at_ms, remote_clock_ms);
@@ -1423,9 +1506,14 @@ mod tests {
             tamper_stats: false,
             remote_clock_ms: None,
         };
-        let mut observer =
-            AuthenticatedRemoteM1CacheObserver::new(detached, Duration::from_secs(1), 60_000)
-                .unwrap();
+        let mut observer = AuthenticatedRemoteM1CacheObserver::new(
+            detached,
+            "m3",
+            "m1",
+            Duration::from_secs(1),
+            60_000,
+        )
+        .unwrap();
         assert!(observer.observe(&spec).is_err());
         assert_eq!(observer.transport.calls, ["authenticate"]);
 
@@ -1435,9 +1523,14 @@ mod tests {
             tamper_stats: true,
             remote_clock_ms: None,
         };
-        let mut observer =
-            AuthenticatedRemoteM1CacheObserver::new(tampered, Duration::from_secs(1), 60_000)
-                .unwrap();
+        let mut observer = AuthenticatedRemoteM1CacheObserver::new(
+            tampered,
+            "m3",
+            "m1",
+            Duration::from_secs(1),
+            60_000,
+        )
+        .unwrap();
         assert!(observer.observe(&spec).is_err());
         assert_eq!(observer.transport.calls, ["authenticate", "invoke"]);
     }
@@ -1458,9 +1551,14 @@ mod tests {
             tamper_stats: false,
             remote_clock_ms: None,
         };
-        let mut observer =
-            AuthenticatedRemoteM1CacheObserver::new(transport, Duration::from_secs(1), 60_000)
-                .unwrap();
+        let mut observer = AuthenticatedRemoteM1CacheObserver::new(
+            transport,
+            "m3",
+            "m1",
+            Duration::from_secs(1),
+            60_000,
+        )
+        .unwrap();
         assert!(observer.observe(&spec).is_err());
         assert_eq!(observer.transport.calls, ["authenticate"]);
     }
@@ -1492,6 +1590,12 @@ mod tests {
         };
         let policy = PulpMacCanaryPolicy {
             enabled: true,
+            repository_id: 1_203_111_607,
+            repository: "generous-corp/pulp".to_owned(),
+            target: "mac".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            builder_host_id: "m3".to_owned(),
+            worker_host_id: "m1".to_owned(),
             assessed_at_ms: controller_now_ms().unwrap(),
             required_cache_generations: vec![expected.generation.clone()],
             ..PulpMacCanaryPolicy::default()
@@ -1503,11 +1607,13 @@ mod tests {
                 tamper_stats: false,
                 remote_clock_ms: None,
             },
+            "m3",
+            "m1",
             Duration::from_secs(1),
             60_000,
         )
         .unwrap();
-        let mut observer = PairedAuthenticatedCacheObserver::new(remote);
+        let mut observer = PairedAuthenticatedCacheObserver::new("m3", "m1", remote).unwrap();
         let store_parent = persistent_temp();
         let store = PulpMacCacheEvidenceStore::open(store_parent.path().join("evidence")).unwrap();
         assert!(drive_pulp_mac_cache_probe(&request, &policy, &mut observer, &store).is_err());
@@ -1540,9 +1646,14 @@ mod tests {
             runner,
         )
         .unwrap();
-        let mut observer =
-            AuthenticatedRemoteM1CacheObserver::new(transport, Duration::from_secs(1), 60_000)
-                .unwrap();
+        let mut observer = AuthenticatedRemoteM1CacheObserver::new(
+            transport,
+            "m3",
+            "m1",
+            Duration::from_secs(1),
+            60_000,
+        )
+        .unwrap();
         let receipt = observer.observe(&spec).unwrap();
         let remote = receipt.remote_authority.unwrap();
         assert_eq!(remote.authority.route, CanaryRoute::Lan);

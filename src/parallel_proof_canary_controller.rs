@@ -1237,6 +1237,39 @@ mod tests {
         RemoteM1CacheAuthority, test_remote_authority_receipt,
     };
 
+    fn pulp_policy() -> PulpMacCanaryPolicy {
+        PulpMacCanaryPolicy {
+            repository_id: 1_203_111_607,
+            repository: "generous-corp/pulp".to_owned(),
+            target: "mac".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            builder_host_id: "m3".to_owned(),
+            worker_host_id: "m1".to_owned(),
+            ..PulpMacCanaryPolicy::default()
+        }
+    }
+
+    fn cache_evidence(
+        assessed_at_ms: u64,
+        builder: Vec<CacheGenerationObservationReceipt>,
+        worker: Vec<CacheGenerationObservationReceipt>,
+    ) -> PulpMacCacheProbeEvidence {
+        PulpMacCacheProbeEvidence {
+            schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,
+            correlation_id: "controller-cache-proof".to_owned(),
+            repository_id: 1_203_111_607,
+            repository: "generous-corp/pulp".to_owned(),
+            target: "mac".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            builder_host_id: "m3".to_owned(),
+            worker_host_id: "m1".to_owned(),
+            assessed_at_ms,
+            builder,
+            worker,
+            model_calls: 0,
+        }
+    }
+
     #[derive(Default)]
     struct FakeRunner {
         outputs: VecDeque<Result<ReadOnlyProbeOutput, CanaryObserverError>>,
@@ -1503,7 +1536,7 @@ mod tests {
             enabled: true,
             assessed_at_ms: controller_now_ms().unwrap(),
             minimum_free_bytes: 1024,
-            ..PulpMacCanaryPolicy::default()
+            ..pulp_policy()
         };
         let readiness =
             classify_pulp_mac_dry_run_readiness(&policy, 4096, &[m3_receipt, m1_receipt]).unwrap();
@@ -1564,20 +1597,17 @@ mod tests {
         };
         let m3_digest = m3_receipt.digest().unwrap();
         let m1_digest = m1_receipt.digest().unwrap();
-        let cache_evidence = PulpMacCacheProbeEvidence {
-            schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,
-            correlation_id: "controller-cache-proof".to_owned(),
+        let cache_evidence = cache_evidence(
             assessed_at_ms,
-            builder: vec![cache_receipt("m3", m3_digest)],
-            worker: vec![cache_receipt("m1", m1_digest)],
-            model_calls: 0,
-        };
+            vec![cache_receipt("m3", m3_digest)],
+            vec![cache_receipt("m1", m1_digest)],
+        );
         let policy = PulpMacCanaryPolicy {
             enabled: true,
             assessed_at_ms,
             minimum_free_bytes: 1024,
             required_cache_generations: vec![manifest.generation],
-            ..PulpMacCanaryPolicy::default()
+            ..pulp_policy()
         };
         let host_receipts = [m3_receipt, m1_receipt];
         let readiness = classify_pulp_mac_dry_run_readiness_with_cache(
@@ -1641,7 +1671,7 @@ mod tests {
         let policy = PulpMacCanaryPolicy {
             assessed_at_ms: receipt.observed_at_ms,
             maximum_observation_age_ms: 1,
-            ..PulpMacCanaryPolicy::default()
+            ..pulp_policy()
         };
         receipt.observed_at_ms = receipt.observed_at_ms.saturating_add(1);
         let readiness = classify_pulp_mac_dry_run_readiness(&policy, 1024, &[receipt]).unwrap();
@@ -1676,12 +1706,9 @@ mod tests {
         let receipt = observer
             .observe(&local_spec(staging), Duration::from_secs(1))
             .unwrap();
-        let readiness = classify_pulp_mac_dry_run_readiness(
-            &PulpMacCanaryPolicy::default(),
-            1024,
-            &[receipt.clone(), receipt],
-        )
-        .unwrap();
+        let readiness =
+            classify_pulp_mac_dry_run_readiness(&pulp_policy(), 1024, &[receipt.clone(), receipt])
+                .unwrap();
         assert!(readiness.gaps().iter().any(|gap| matches!(
             gap,
             PhysicalCanaryReadinessGap::HostObservationMissing { host_id }

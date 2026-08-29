@@ -1,5 +1,5 @@
 //! Controller-owned execution and immutable publication for the default-off
-//! Pulp macOS shadow canary.
+//! repository-scoped macOS shadow canary.
 //!
 //! There is deliberately no production host adapter in this module. Enabling
 //! policy without explicitly supplying an authenticated adapter cannot touch a
@@ -103,12 +103,12 @@ pub trait PulpMacCanaryExecutor {
     /// Read the controller's current UTC epoch milliseconds.
     fn controller_now_ms(&mut self) -> Result<u64, ParallelProofError>;
 
-    /// Capture controller-authenticated M3/M1 observations without mutation.
+    /// Capture controller-authenticated builder/worker observations without mutation.
     fn authenticated_host_observations(
         &mut self,
     ) -> Result<Vec<CanaryHostObservation>, ParallelProofError>;
 
-    /// Execute the single-host M3 control and return its authenticated receipt.
+    /// Execute the single-host builder control and return its authenticated receipt.
     /// The adapter, not this driver, owns execution and timing authentication.
     fn run_single_host_control(
         &mut self,
@@ -496,7 +496,10 @@ pub fn drive_pulp_mac_canary<E: PulpMacCanaryExecutor>(
     validate_correlation_id(&correlation_id)?;
     let manifest_digest = proof.manifest.digest(proof.inventory, proof.plan)?;
     match store.load(&correlation_id) {
-        Ok(evidence) if evidence.receipt.manifest_digest == manifest_digest => {
+        Ok(evidence)
+            if evidence.receipt.manifest_digest == manifest_digest
+                && evidence.receipt.validate_against(proof, policy).is_ok() =>
+        {
             return Ok(PulpMacCanaryDriverOutcome::Recorded {
                 evidence: Box::new(evidence),
                 write_outcome: StoreWriteOutcome::AlreadyPresent,
@@ -522,7 +525,7 @@ pub fn drive_pulp_mac_canary<E: PulpMacCanaryExecutor>(
 
     // The control must fully finish before any transfer or shard execution.
     let control_receipt = executor.run_single_host_control(proof, builder)?;
-    control_receipt.validate(proof, builder)?;
+    control_receipt.validate(proof, &assessed_policy, builder)?;
 
     let pre_execution_hosts = executor.authenticated_host_observations()?;
     let pre_execution_now_ms = executor.controller_now_ms()?;
@@ -535,7 +538,7 @@ pub fn drive_pulp_mac_canary<E: PulpMacCanaryExecutor>(
         pre_execution_now_ms,
         StorageFence::BeforeTransfer,
     )?;
-    let control_receipt_sha256 = control_receipt.digest(proof, builder)?;
+    let control_receipt_sha256 = control_receipt.digest(proof, &assessed_policy, builder)?;
     let claim_outcome = store.record_attempt(&PulpMacCanaryAttemptRecord {
         schema_version: DRIVER_SCHEMA_VERSION,
         correlation_id: correlation_id.clone(),
@@ -651,8 +654,9 @@ fn finish_started_canary<E: PulpMacCanaryExecutor>(
         caches,
         model_calls: 0,
     };
-    let receipt =
-        PulpMacCanaryMeasurementReceipt::capture(proof, decision, builder, worker, builder, input)?;
+    let receipt = PulpMacCanaryMeasurementReceipt::capture(
+        proof, policy, decision, builder, worker, builder, input,
+    )?;
     let evidence = PulpMacCanaryEvidence::new(
         receipt,
         interruption,
@@ -1024,8 +1028,10 @@ mod tests {
     fn policy(enabled: bool) -> PulpMacCanaryPolicy {
         PulpMacCanaryPolicy {
             enabled,
+            repository_id: 1_203_111_607,
             repository: "generous-corp/pulp".to_owned(),
             target: "mac".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
             builder_host_id: "m3".to_owned(),
             worker_host_id: "m1".to_owned(),
             assessed_at_ms: 10_000,
@@ -1117,7 +1123,8 @@ mod tests {
             host: &CanaryHostObservation,
         ) -> Result<SingleHostControlReceipt, ParallelProofError> {
             self.calls.push("control");
-            let mut receipt = SingleHostControlReceipt::capture(proof, host, 800_000, 790_000, 0)?;
+            let mut receipt =
+                SingleHostControlReceipt::capture(proof, &policy(true), host, 800_000, 790_000, 0)?;
             if self.corrupt_control {
                 receipt.artifact_sha256 = digest("wrong-artifact");
             }
@@ -1287,6 +1294,22 @@ mod tests {
             Err(ParallelProofError::ImmutableConflict(_))
         ));
         assert!(wrong_proof_replay.calls.is_empty());
+
+        let mut wrong_scope = policy(true);
+        wrong_scope.target = "release-mac".to_owned();
+        let mut wrong_scope_replay = FakeExecutor::normal();
+        assert!(matches!(
+            drive_pulp_mac_canary(
+                fixture.proof(),
+                &wrong_scope,
+                &timing(&fixture),
+                "same-key",
+                &mut wrong_scope_replay,
+                &evidence_store,
+            ),
+            Err(ParallelProofError::ImmutableConflict(_))
+        ));
+        assert!(wrong_scope_replay.calls.is_empty());
 
         let conflict_directory = tempfile::tempdir().unwrap();
         let conflict_store = store(&conflict_directory);

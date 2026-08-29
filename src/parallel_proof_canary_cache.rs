@@ -1,4 +1,4 @@
-//! Default-off cache-generation observation for the Pulp macOS canary.
+//! Default-off cache-generation observation for a repository-scoped macOS canary.
 //!
 //! The production observer in this module only reads a local cache tree. It
 //! creates a canonical immutable manifest by hashing the complete tree through
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::artifact_transport::{LayoutEntry, verified_immutable_tree_inventory};
 use crate::parallel_proof::{Sha256Digest, StoreWriteOutcome};
 use crate::parallel_proof_canary::{
-    CanaryCacheGeneration, CanaryRoute, INITIAL_BUILDER, INITIAL_WORKER, PulpMacCanaryPolicy,
+    CanaryCacheGeneration, CanaryRoute, PulpMacCanaryPolicy, canary_policy_scope_valid,
 };
 use crate::parallel_proof_canary_remote_cache::RemoteM1CacheAuthorityReceipt;
 
@@ -29,7 +29,7 @@ pub const CACHE_GENERATION_MANIFEST_SCHEMA: u32 = 1;
 /// Current host cache-observation schema.
 pub const CACHE_GENERATION_OBSERVATION_SCHEMA: u32 = 2;
 /// Current paired M3/M1 evidence schema.
-pub const PULP_MAC_CACHE_EVIDENCE_SCHEMA: u32 = 2;
+pub const PULP_MAC_CACHE_EVIDENCE_SCHEMA: u32 = 3;
 
 const MAX_CACHE_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
@@ -233,8 +233,7 @@ pub struct CacheGenerationObservationReceipt {
     pub manifest: CacheGenerationManifest,
     /// Digest of the complete manifest.
     pub manifest_sha256: Sha256Digest,
-    /// Authenticated companion/transport authority. Required for M1 and
-    /// forbidden for the local M3 observer.
+    /// Authenticated companion/transport authority for a remote observation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_authority: Option<RemoteM1CacheAuthorityReceipt>,
     /// Routine observation uses no model.
@@ -255,8 +254,8 @@ impl CacheGenerationObservationReceipt {
             || self.model_calls != 0
             || match self.remote_authority.as_ref() {
                 Some(authority) => {
-                    self.host_id != INITIAL_WORKER
-                        || authority.validate().is_err()
+                    authority.validate().is_err()
+                        || authority.authority.host_id != self.host_id
                         || authority.authority.host_observation_sha256
                             != self.host_observation_sha256
                         || authority.authority.observed_at_ms > self.observed_at_ms
@@ -270,7 +269,7 @@ impl CacheGenerationObservationReceipt {
                             Ok(true)
                         )
                 }
-                None => self.host_id == INITIAL_WORKER,
+                None => false,
             }
         {
             return Err(CacheObserverError::Invalid(
@@ -369,17 +368,32 @@ pub trait CacheGenerationObserver {
 
 /// Production local observer. Remote observation requires a separately owned
 /// authenticated companion/transport adapter and is intentionally absent.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalCacheGenerationObserver;
+#[derive(Clone, Debug)]
+pub struct LocalCacheGenerationObserver {
+    host_id: String,
+}
+
+impl LocalCacheGenerationObserver {
+    /// Bind local filesystem evidence to one explicitly configured host id.
+    pub fn new(host_id: impl Into<String>) -> Result<Self, CacheObserverError> {
+        let host_id = host_id.into();
+        if !valid_label(&host_id) {
+            return Err(CacheObserverError::Invalid(
+                "local cache observer host id".to_owned(),
+            ));
+        }
+        Ok(Self { host_id })
+    }
+}
 
 impl CacheGenerationObserver for LocalCacheGenerationObserver {
     fn observe(
         &mut self,
         spec: &CacheGenerationProbeSpec,
     ) -> Result<CacheGenerationObservationReceipt, CacheObserverError> {
-        if spec.host_id != INITIAL_BUILDER {
+        if spec.host_id != self.host_id {
             return Err(CacheObserverError::Invalid(
-                "local cache observer may only attest the controller host m3".to_owned(),
+                "local cache observer host binding".to_owned(),
             ));
         }
         let started = Instant::now();
@@ -424,7 +438,7 @@ impl CacheGenerationObserver for LocalCacheGenerationObserver {
     }
 }
 
-/// Default-off request for sequential M3-then-M1 cache observation.
+/// Default-off request for sequential builder-then-worker cache observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PulpMacCacheProbeRequest {
     /// Explicit opt-in. False performs no observation or write.
@@ -448,6 +462,18 @@ pub struct PulpMacCacheProbeEvidence {
     pub schema_version: u32,
     /// Stable no-overwrite evidence identity.
     pub correlation_id: String,
+    /// Immutable repository database identity bound by policy.
+    pub repository_id: u64,
+    /// Canonical repository slug bound by policy.
+    pub repository: String,
+    /// Exact Shipyard target bound by policy.
+    pub target: String,
+    /// Exact build target triple bound by policy.
+    pub target_triple: String,
+    /// Exact local builder host bound by policy.
+    pub builder_host_id: String,
+    /// Exact remote worker host bound by policy.
+    pub worker_host_id: String,
     /// Controller policy time used for freshness.
     pub assessed_at_ms: u64,
     /// Builder receipts, always completed before worker observation begins.
@@ -466,8 +492,13 @@ impl PulpMacCacheProbeEvidence {
             || self.assessed_at_ms == 0
             || self.assessed_at_ms > policy.assessed_at_ms
             || policy.maximum_observation_age_ms == 0
-            || policy.builder_host_id != INITIAL_BUILDER
-            || policy.worker_host_id != INITIAL_WORKER
+            || !canary_policy_scope_valid(policy)
+            || self.repository_id != policy.repository_id
+            || self.repository != policy.repository
+            || self.target != policy.target
+            || self.target_triple != policy.target_triple
+            || self.builder_host_id != policy.builder_host_id
+            || self.worker_host_id != policy.worker_host_id
             || self.model_calls != 0
         {
             return Err(CacheObserverError::Invalid(
@@ -476,16 +507,18 @@ impl PulpMacCacheProbeEvidence {
         }
         validate_role_receipts(
             &self.builder,
-            INITIAL_BUILDER,
+            &policy.builder_host_id,
             &policy.required_cache_generations,
             Some((policy.assessed_at_ms, policy.maximum_observation_age_ms)),
+            false,
         )?;
         validate_receipts_precede_assessment(&self.builder, self.assessed_at_ms)?;
         validate_role_receipts(
             &self.worker,
-            INITIAL_WORKER,
+            &policy.worker_host_id,
             &policy.required_cache_generations,
             Some((policy.assessed_at_ms, policy.maximum_observation_age_ms)),
+            true,
         )?;
         validate_receipts_precede_assessment(&self.worker, self.assessed_at_ms)?;
         Ok(())
@@ -706,7 +739,7 @@ impl PulpMacCacheEvidenceStore {
     }
 }
 
-/// Observe every required cache on M3 first, then M1, and durably publish the
+/// Observe every required cache on the configured builder first, then the worker, and durably publish the
 /// complete evidence. The explicit disabled path performs no observer call.
 pub fn drive_pulp_mac_cache_probe<O: CacheGenerationObserver>(
     request: &PulpMacCacheProbeRequest,
@@ -722,8 +755,8 @@ pub fn drive_pulp_mac_cache_probe<O: CacheGenerationObserver>(
     let replay_policy = policy_at(policy, replay_assessed_at_ms)?;
     match store.load(&request.correlation_id, &replay_policy) {
         Ok(evidence) => {
-            if validate_receipt_bindings(&request.builder, &evidence.builder).is_err()
-                || validate_receipt_bindings(&request.worker, &evidence.worker).is_err()
+            if validate_receipt_bindings(&request.builder, &evidence.builder, false).is_err()
+                || validate_receipt_bindings(&request.worker, &evidence.worker, true).is_err()
             {
                 return Err(CacheObserverError::ImmutableConflict(
                     request.correlation_id.clone(),
@@ -742,14 +775,15 @@ pub fn drive_pulp_mac_cache_probe<O: CacheGenerationObserver>(
         .iter()
         .map(|spec| observer.observe(spec))
         .collect::<Result<Vec<_>, _>>()?;
-    validate_receipt_bindings(&request.builder, &builder)?;
-    // M1 is never probed before every exact M3 generation has been proven.
+    validate_receipt_bindings(&request.builder, &builder, false)?;
+    // The worker is never probed before every exact builder generation is proven.
     let builder_assessed_at_ms = observer.controller_now_ms()?;
     validate_role_receipts(
         &builder,
-        INITIAL_BUILDER,
+        &policy.builder_host_id,
         &policy.required_cache_generations,
         Some((builder_assessed_at_ms, policy.maximum_observation_age_ms)),
+        false,
     )?;
     validate_receipts_precede_assessment(&builder, builder_assessed_at_ms)?;
     let worker = request
@@ -757,12 +791,18 @@ pub fn drive_pulp_mac_cache_probe<O: CacheGenerationObserver>(
         .iter()
         .map(|spec| observer.observe(spec))
         .collect::<Result<Vec<_>, _>>()?;
-    validate_receipt_bindings(&request.worker, &worker)?;
+    validate_receipt_bindings(&request.worker, &worker, true)?;
     let assessed_at_ms = observer.controller_now_ms()?;
     let observation_policy = policy_at(policy, assessed_at_ms)?;
     let evidence = PulpMacCacheProbeEvidence {
         schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,
         correlation_id: request.correlation_id.clone(),
+        repository_id: policy.repository_id,
+        repository: policy.repository.clone(),
+        target: policy.target.clone(),
+        target_triple: policy.target_triple.clone(),
+        builder_host_id: policy.builder_host_id.clone(),
+        worker_host_id: policy.worker_host_id.clone(),
         assessed_at_ms,
         builder,
         worker,
@@ -844,8 +884,7 @@ fn validate_request(
 ) -> Result<(), CacheObserverError> {
     if !valid_correlation_id(&request.correlation_id)
         || policy.maximum_observation_age_ms == 0
-        || policy.builder_host_id != INITIAL_BUILDER
-        || policy.worker_host_id != INITIAL_WORKER
+        || !canary_policy_scope_valid(policy)
     {
         return Err(CacheObserverError::Invalid(
             "Pulp macOS cache probe request".to_owned(),
@@ -853,12 +892,12 @@ fn validate_request(
     }
     validate_specs(
         &request.builder,
-        INITIAL_BUILDER,
+        &policy.builder_host_id,
         &policy.required_cache_generations,
     )?;
     validate_specs(
         &request.worker,
-        INITIAL_WORKER,
+        &policy.worker_host_id,
         &policy.required_cache_generations,
     )
 }
@@ -902,6 +941,7 @@ fn validate_specs(
 fn validate_receipt_bindings(
     specs: &[CacheGenerationProbeSpec],
     receipts: &[CacheGenerationObservationReceipt],
+    require_remote: bool,
 ) -> Result<(), CacheObserverError> {
     if specs.len() != receipts.len()
         || specs.iter().zip(receipts).any(|(spec, receipt)| {
@@ -909,8 +949,7 @@ fn validate_receipt_bindings(
                 || receipt.host_observation_sha256 != spec.host_observation_sha256
                 || receipt.manifest != spec.expected_manifest
                 || receipt.cache_root != spec.root.to_str().unwrap_or_default()
-                || (spec.host_id == INITIAL_WORKER && receipt.remote_authority.is_none())
-                || (spec.host_id == INITIAL_BUILDER && receipt.remote_authority.is_some())
+                || require_remote != receipt.remote_authority.is_some()
         })
     {
         return Err(CacheObserverError::Invalid(
@@ -954,6 +993,7 @@ fn validate_role_receipts(
     host_id: &str,
     required: &[CanaryCacheGeneration],
     freshness: Option<(u64, u64)>,
+    require_remote: bool,
 ) -> Result<(), CacheObserverError> {
     let generations = receipts
         .iter()
@@ -970,9 +1010,7 @@ fn validate_role_receipts(
                     "cache observation host or freshness fence".to_owned(),
                 ));
             }
-            if (host_id == INITIAL_WORKER && receipt.remote_authority.is_none())
-                || (host_id == INITIAL_BUILDER && receipt.remote_authority.is_some())
-            {
+            if require_remote != receipt.remote_authority.is_some() {
                 return Err(CacheObserverError::Invalid(
                     "cache observation transport authority".to_owned(),
                 ));
@@ -1288,6 +1326,12 @@ mod tests {
     fn policy(manifest: &CacheGenerationManifest) -> PulpMacCanaryPolicy {
         PulpMacCanaryPolicy {
             enabled: true,
+            repository_id: 1_203_111_607,
+            repository: "generous-corp/pulp".to_owned(),
+            target: "mac".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            builder_host_id: "m3".to_owned(),
+            worker_host_id: "m1".to_owned(),
             assessed_at_ms: 1_000,
             maximum_observation_age_ms: 100,
             required_cache_generations: vec![manifest.generation.clone()],
@@ -1426,19 +1470,20 @@ mod tests {
         let spec =
             CacheGenerationProbeSpec::new("m3", host_digest("m3"), root.path(), manifest.clone())
                 .unwrap();
-        let observed = LocalCacheGenerationObserver.observe(&spec).unwrap();
-        assert_eq!(observed.manifest, manifest);
-        assert_eq!(observed.model_calls, 0);
-        observed.validate().unwrap();
+        let mut observer = LocalCacheGenerationObserver::new("m3").unwrap();
+        let receipt = observer.observe(&spec).unwrap();
+        assert_eq!(receipt.manifest, manifest);
+        assert_eq!(receipt.model_calls, 0);
+        receipt.validate().unwrap();
 
         let worker_spec =
             CacheGenerationProbeSpec::new("m1", host_digest("m1"), root.path(), manifest.clone())
                 .unwrap();
-        assert!(LocalCacheGenerationObserver.observe(&worker_spec).is_err());
+        assert!(observer.observe(&worker_spec).is_err());
 
         fs::write(root.path().join("index.bin"), b"drifted").unwrap();
         assert!(matches!(
-            LocalCacheGenerationObserver.observe(&spec),
+            observer.observe(&spec),
             Err(CacheObserverError::GenerationMismatch { .. })
         ));
     }
@@ -1550,6 +1595,12 @@ mod tests {
         let second = produce_cache_generation_manifest(root.path(), "second", "v1").unwrap();
         let policy = PulpMacCanaryPolicy {
             enabled: true,
+            repository_id: 1_203_111_607,
+            repository: "generous-corp/pulp".to_owned(),
+            target: "mac".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            builder_host_id: "m3".to_owned(),
+            worker_host_id: "m1".to_owned(),
             assessed_at_ms: 1_000,
             maximum_observation_age_ms: 100,
             required_cache_generations: vec![first.generation.clone(), second.generation.clone()],
@@ -1558,6 +1609,12 @@ mod tests {
         let evidence = PulpMacCacheProbeEvidence {
             schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,
             correlation_id: "multi-generation-authority".to_owned(),
+            repository_id: policy.repository_id,
+            repository: policy.repository.clone(),
+            target: policy.target.clone(),
+            target_triple: policy.target_triple.clone(),
+            builder_host_id: policy.builder_host_id.clone(),
+            worker_host_id: policy.worker_host_id.clone(),
             assessed_at_ms: 1_000,
             builder: vec![
                 receipt("m3", root.path(), first.clone(), 990),
@@ -1582,6 +1639,12 @@ mod tests {
         let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
         let policy = PulpMacCanaryPolicy {
             enabled: true,
+            repository_id: 1_203_111_607,
+            repository: "generous-corp/pulp".to_owned(),
+            target: "mac".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            builder_host_id: "m3".to_owned(),
+            worker_host_id: "m1".to_owned(),
             assessed_at_ms: 1_000,
             maximum_observation_age_ms: 100,
             required_cache_generations: vec![manifest.generation.clone()],
@@ -1601,6 +1664,12 @@ mod tests {
         let evidence = PulpMacCacheProbeEvidence {
             schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,
             correlation_id: "tailnet-measurement-only".to_owned(),
+            repository_id: policy.repository_id,
+            repository: policy.repository.clone(),
+            target: policy.target.clone(),
+            target_triple: policy.target_triple.clone(),
+            builder_host_id: policy.builder_host_id.clone(),
+            worker_host_id: policy.worker_host_id.clone(),
             assessed_at_ms: 1_000,
             builder: vec![receipt("m3", root.path(), manifest, 990)],
             worker: vec![worker],
@@ -1709,6 +1778,12 @@ mod tests {
         let mut evidence = PulpMacCacheProbeEvidence {
             schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,
             correlation_id: "stale".to_owned(),
+            repository_id: policy.repository_id,
+            repository: policy.repository.clone(),
+            target: policy.target.clone(),
+            target_triple: policy.target_triple.clone(),
+            builder_host_id: policy.builder_host_id.clone(),
+            worker_host_id: policy.worker_host_id.clone(),
             assessed_at_ms: 1_000,
             builder: vec![receipt("m3", root.path(), manifest.clone(), 899)],
             worker: vec![receipt("m1", root.path(), manifest, 995)],

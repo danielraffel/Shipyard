@@ -1,4 +1,4 @@
-//! Compact, immutable measurements for the default-off Pulp macOS canary.
+//! Compact, immutable measurements for a default-off repository-scoped canary.
 //!
 //! This module records evidence; it does not discover hosts, transfer bytes,
 //! dispatch work, persist records, or satisfy merge readiness. Callers must
@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::parallel_proof::{ParallelProofContext, ParallelProofError, Sha256Digest};
 use crate::parallel_proof_canary::{
-    CanaryCacheGeneration, CanaryHostObservation, CanaryRoute, INITIAL_BUILDER, PULP_MAC_TARGET,
-    PULP_REPOSITORY, PULP_REPOSITORY_ID, PulpMacCanaryDecision, canary_host_observations_digest,
-    is_pulp_mac_canary_scope,
+    CanaryCacheGeneration, CanaryHostObservation, CanaryRoute, PulpMacCanaryDecision,
+    PulpMacCanaryPolicy, canary_host_observations_digest, canary_policy_matches_proof,
+    canary_policy_scope_valid,
 };
 
 /// Current immutable measurement-receipt schema.
-pub const PULP_MAC_CANARY_MEASUREMENT_SCHEMA: u32 = 2;
+pub const PULP_MAC_CANARY_MEASUREMENT_SCHEMA: u32 = 3;
 const MINIMUM_SAVINGS_MS: u64 = 120_000;
 const MINIMUM_SAVINGS_PERCENT: u64 = 10;
 const MAX_OVERHEAD_PERCENT: u64 = 15;
@@ -69,6 +69,10 @@ pub struct SingleHostControlReceipt {
     pub repository_id: u64,
     /// Exact canonical source repository.
     pub repository: String,
+    /// Exact Shipyard target measured by this control.
+    pub target: String,
+    /// Exact build target triple measured by this control.
+    pub target_triple: String,
     /// Exact source head.
     pub head_sha: String,
     /// Exact source tree.
@@ -92,17 +96,19 @@ pub struct SingleHostControlReceipt {
 }
 
 impl SingleHostControlReceipt {
-    /// Capture one pure control receipt from an authenticated M3 observation.
+    /// Capture one pure control receipt from the authenticated configured builder.
     pub fn capture(
         proof: ParallelProofContext<'_>,
+        policy: &PulpMacCanaryPolicy,
         host: &CanaryHostObservation,
         submit_to_receipt_ms: u64,
         worker_active_ms: u64,
         model_calls: u64,
     ) -> Result<Self, ParallelProofError> {
         let proof = ParallelProofContext::new(proof.manifest, proof.inventory, proof.plan)?;
-        if !is_pulp_mac_canary_scope(proof)
-            || host.host_id != INITIAL_BUILDER
+        if !canary_policy_scope_valid(policy)
+            || !canary_policy_matches_proof(proof, policy)
+            || host.host_id != policy.builder_host_id
             || host.route != CanaryRoute::SameHost
             || !host.online
             || host.session_generation == 0
@@ -117,6 +123,8 @@ impl SingleHostControlReceipt {
             manifest_digest: proof.manifest.digest(proof.inventory, proof.plan)?,
             repository_id: proof.manifest.source.repository_id,
             repository: proof.manifest.source.repository.clone(),
+            target: policy.target.clone(),
+            target_triple: proof.manifest.build.target_triple.clone(),
             head_sha: proof.manifest.source.head_sha.clone(),
             tree_sha: proof.manifest.source.tree_sha.clone(),
             artifact_sha256: proof.manifest.artifact.payload_sha256.clone(),
@@ -128,7 +136,7 @@ impl SingleHostControlReceipt {
             worker_active_ms,
             model_calls,
         };
-        receipt.validate(proof, host)?;
+        receipt.validate(proof, policy, host)?;
         Ok(receipt)
     }
 
@@ -136,6 +144,7 @@ impl SingleHostControlReceipt {
     pub fn validate(
         &self,
         proof: ParallelProofContext<'_>,
+        policy: &PulpMacCanaryPolicy,
         host: &CanaryHostObservation,
     ) -> Result<(), ParallelProofError> {
         let proof = ParallelProofContext::new(proof.manifest, proof.inventory, proof.plan)?;
@@ -144,14 +153,17 @@ impl SingleHostControlReceipt {
                 self.schema_version,
             ));
         }
-        if !is_pulp_mac_canary_scope(proof)
-            || self.repository_id != PULP_REPOSITORY_ID
-            || self.repository != PULP_REPOSITORY
+        if !canary_policy_scope_valid(policy)
+            || !canary_policy_matches_proof(proof, policy)
+            || self.repository_id != policy.repository_id
+            || self.repository != policy.repository
+            || self.target != policy.target
+            || self.target_triple != policy.target_triple
             || self.manifest_digest != proof.manifest.digest(proof.inventory, proof.plan)?
             || self.head_sha != proof.manifest.source.head_sha
             || self.tree_sha != proof.manifest.source.tree_sha
             || self.artifact_sha256 != proof.manifest.artifact.payload_sha256
-            || self.host_id != INITIAL_BUILDER
+            || self.host_id != policy.builder_host_id
             || self.host_id != host.host_id
             || self.host_session_generation != host.session_generation
             || self.host_observed_at_ms != host.observed_at_ms
@@ -176,9 +188,10 @@ impl SingleHostControlReceipt {
     pub fn digest(
         &self,
         proof: ParallelProofContext<'_>,
+        policy: &PulpMacCanaryPolicy,
         host: &CanaryHostObservation,
     ) -> Result<Sha256Digest, ParallelProofError> {
-        self.validate(proof, host)?;
+        self.validate(proof, policy, host)?;
         canonical_digest("shipyard.pulp-mac-canary.single-host-control.v1", self)
     }
 }
@@ -236,6 +249,8 @@ pub struct PulpMacCanaryMeasurementReceipt {
     pub repository: String,
     /// Exact Shipyard target admitted by the narrow canary policy.
     pub target: String,
+    /// Exact build target triple admitted by the canary policy.
+    pub target_triple: String,
     /// Exact proposal head executed by the canary.
     pub head_sha: String,
     /// Exact proposal tree executed by the canary.
@@ -300,6 +315,7 @@ impl PulpMacCanaryMeasurementReceipt {
     /// Create an exact-proof receipt from an already eligible shadow decision.
     pub fn capture(
         proof: ParallelProofContext<'_>,
+        policy: &PulpMacCanaryPolicy,
         decision: &PulpMacCanaryDecision,
         builder: &CanaryHostObservation,
         worker: &CanaryHostObservation,
@@ -308,55 +324,21 @@ impl PulpMacCanaryMeasurementReceipt {
     ) -> Result<Self, ParallelProofError> {
         let proof = ParallelProofContext::new(proof.manifest, proof.inventory, proof.plan)?;
         let manifest_digest = proof.manifest.digest(proof.inventory, proof.plan)?;
-        let PulpMacCanaryDecision::Eligible {
-            manifest_digest: admitted_manifest,
-            builder_host_id,
-            builder_session_generation,
-            builder_observed_at_ms,
-            worker_host_id,
-            worker_session_generation,
-            worker_observed_at_ms,
-            host_observations_digest,
-            ..
-        } = decision
-        else {
-            return Err(ParallelProofError::InvalidField(
-                "canary measurement admission",
-            ));
-        };
-        if admitted_manifest != &manifest_digest {
+        let host_observations_digest =
+            validate_measurement_admission(decision, &manifest_digest, builder, worker)?;
+        if !canary_policy_scope_valid(policy) || !canary_policy_matches_proof(proof, policy) {
             return Err(ParallelProofError::BindingMismatch(
-                "canary measurement manifest",
+                "parallel-proof canary scope",
             ));
         }
-        if !is_pulp_mac_canary_scope(proof) {
-            return Err(ParallelProofError::BindingMismatch(
-                "Pulp macOS canary scope",
-            ));
-        }
-        if builder.host_id != *builder_host_id
-            || builder.session_generation != *builder_session_generation
-            || builder.observed_at_ms != *builder_observed_at_ms
-            || worker.host_id != *worker_host_id
-            || worker.session_generation != *worker_session_generation
-            || worker.observed_at_ms != *worker_observed_at_ms
-            || canary_host_observations_digest(builder, worker)? != *host_observations_digest
-            || builder.host_id == worker.host_id
-            || builder.route != CanaryRoute::SameHost
-            || worker.route != CanaryRoute::Lan
-            || !builder.online
-            || !worker.online
-            || builder.session_generation == 0
-            || worker.session_generation == 0
-        {
-            return Err(ParallelProofError::BindingMismatch(
-                "canary measurement hosts",
-            ));
-        }
-        input.single_host_control.validate(proof, control_host)?;
+        input
+            .single_host_control
+            .validate(proof, policy, control_host)?;
         let single_host_control_ms = input.single_host_control.submit_to_receipt_ms;
         let single_host_control_receipt_digest =
-            input.single_host_control.digest(proof, control_host)?;
+            input
+                .single_host_control
+                .digest(proof, policy, control_host)?;
         validate_input(
             &input,
             proof.manifest.artifact.size_bytes,
@@ -371,7 +353,8 @@ impl PulpMacCanaryMeasurementReceipt {
             manifest_digest,
             repository_id: proof.manifest.source.repository_id,
             repository: proof.manifest.source.repository.clone(),
-            target: PULP_MAC_TARGET.to_owned(),
+            target: policy.target.clone(),
+            target_triple: policy.target_triple.clone(),
             head_sha: proof.manifest.source.head_sha.clone(),
             tree_sha: proof.manifest.source.tree_sha.clone(),
             artifact_sha256: proof.manifest.artifact.payload_sha256.clone(),
@@ -382,7 +365,7 @@ impl PulpMacCanaryMeasurementReceipt {
             worker_host_id: worker.host_id.clone(),
             worker_session_generation: worker.session_generation,
             worker_observed_at_ms: worker.observed_at_ms,
-            host_observations_digest: host_observations_digest.clone(),
+            host_observations_digest,
             route: worker.route,
             delivery_mode: input.delivery_mode,
             artifact_bytes_total: input.artifact_bytes_total,
@@ -403,6 +386,7 @@ impl PulpMacCanaryMeasurementReceipt {
             model_calls: input.model_calls,
         };
         receipt.validate()?;
+        receipt.validate_against(proof, policy)?;
         Ok(receipt)
     }
 
@@ -434,9 +418,10 @@ impl PulpMacCanaryMeasurementReceipt {
         )?;
         validate_cache_measurements(&self.caches, None)?;
         self.claimed_cache_bytes_avoided()?;
-        if self.repository_id != PULP_REPOSITORY_ID
-            || self.repository != PULP_REPOSITORY
-            || self.target != PULP_MAC_TARGET
+        if self.repository_id == 0
+            || !valid_repository(&self.repository)
+            || !valid_label(&self.target)
+            || !valid_label(&self.target_triple)
             || !valid_git_sha(&self.head_sha)
             || !valid_git_sha(&self.tree_sha)
             || self.head_sha.len() != self.tree_sha.len()
@@ -452,6 +437,35 @@ impl PulpMacCanaryMeasurementReceipt {
         {
             return Err(ParallelProofError::InvalidField(
                 "canary measurement identity",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate this receipt against the exact proof and configured scope.
+    pub fn validate_against(
+        &self,
+        proof: ParallelProofContext<'_>,
+        policy: &PulpMacCanaryPolicy,
+    ) -> Result<(), ParallelProofError> {
+        self.validate()?;
+        let proof = ParallelProofContext::new(proof.manifest, proof.inventory, proof.plan)?;
+        if !canary_policy_scope_valid(policy)
+            || !canary_policy_matches_proof(proof, policy)
+            || self.repository_id != policy.repository_id
+            || self.repository != policy.repository
+            || self.target != policy.target
+            || self.target_triple != policy.target_triple
+            || self.builder_host_id != policy.builder_host_id
+            || self.worker_host_id != policy.worker_host_id
+            || self.manifest_digest != proof.manifest.digest(proof.inventory, proof.plan)?
+            || self.head_sha != proof.manifest.source.head_sha
+            || self.tree_sha != proof.manifest.source.tree_sha
+            || self.artifact_sha256 != proof.manifest.artifact.payload_sha256
+            || self.artifact_layout_sha256 != proof.manifest.artifact.layout_sha256
+        {
+            return Err(ParallelProofError::BindingMismatch(
+                "canary measurement policy",
             ));
         }
         Ok(())
@@ -512,6 +526,55 @@ impl PulpMacCanaryMeasurementReceipt {
     pub const fn satisfies_merge_readiness(&self) -> bool {
         false
     }
+}
+
+fn validate_measurement_admission(
+    decision: &PulpMacCanaryDecision,
+    manifest_digest: &Sha256Digest,
+    builder: &CanaryHostObservation,
+    worker: &CanaryHostObservation,
+) -> Result<Sha256Digest, ParallelProofError> {
+    let PulpMacCanaryDecision::Eligible {
+        manifest_digest: admitted_manifest,
+        builder_host_id,
+        builder_session_generation,
+        builder_observed_at_ms,
+        worker_host_id,
+        worker_session_generation,
+        worker_observed_at_ms,
+        host_observations_digest,
+        ..
+    } = decision
+    else {
+        return Err(ParallelProofError::InvalidField(
+            "canary measurement admission",
+        ));
+    };
+    if admitted_manifest != manifest_digest {
+        return Err(ParallelProofError::BindingMismatch(
+            "canary measurement manifest",
+        ));
+    }
+    if builder.host_id != *builder_host_id
+        || builder.session_generation != *builder_session_generation
+        || builder.observed_at_ms != *builder_observed_at_ms
+        || worker.host_id != *worker_host_id
+        || worker.session_generation != *worker_session_generation
+        || worker.observed_at_ms != *worker_observed_at_ms
+        || canary_host_observations_digest(builder, worker)? != *host_observations_digest
+        || builder.host_id == worker.host_id
+        || builder.route != CanaryRoute::SameHost
+        || worker.route != CanaryRoute::Lan
+        || !builder.online
+        || !worker.online
+        || builder.session_generation == 0
+        || worker.session_generation == 0
+    {
+        return Err(ParallelProofError::BindingMismatch(
+            "canary measurement hosts",
+        ));
+    }
+    Ok(host_observations_digest.clone())
 }
 
 fn canary_host_observation_digest(
@@ -598,6 +661,13 @@ fn valid_label(value: &str) -> bool {
         && value.len() <= 512
         && value.trim() == value
         && !value.chars().any(char::is_control)
+}
+
+fn valid_repository(value: &str) -> bool {
+    value.len() <= 256
+        && value.split_once('/').is_some_and(|(owner, repository)| {
+            valid_label(owner) && valid_label(repository) && !repository.contains('/')
+        })
 }
 
 fn validate_delivery(
@@ -806,6 +876,19 @@ mod tests {
             .expect("proof")
     }
 
+    fn policy() -> PulpMacCanaryPolicy {
+        PulpMacCanaryPolicy {
+            enabled: true,
+            repository_id: 1_203_111_607,
+            repository: "generous-corp/pulp".to_owned(),
+            target: "mac".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            builder_host_id: "m3".to_owned(),
+            worker_host_id: "m1".to_owned(),
+            ..PulpMacCanaryPolicy::default()
+        }
+    }
+
     fn cache() -> CanaryCacheGeneration {
         CanaryCacheGeneration {
             name: "skia".to_owned(),
@@ -853,7 +936,7 @@ mod tests {
         }
     }
 
-    fn input(fixture: &Fixture) -> CanaryMeasurementInput {
+    fn input_for(fixture: &Fixture, policy: &PulpMacCanaryPolicy) -> CanaryMeasurementInput {
         CanaryMeasurementInput {
             correlation_id: "pulp-pr-1-attempt-1".to_owned(),
             delivery_mode: ArtifactDeliveryMode::VerifiedPrefixResume,
@@ -870,7 +953,8 @@ mod tests {
             submit_to_receipt_ms: 700_000,
             single_host_control: SingleHostControlReceipt::capture(
                 proof(fixture),
-                &host("m3", CanaryRoute::SameHost, 3),
+                policy,
+                &host(&policy.builder_host_id, CanaryRoute::SameHost, 3),
                 1_000_000,
                 900_000,
                 0,
@@ -885,12 +969,25 @@ mod tests {
         }
     }
 
+    fn input(fixture: &Fixture) -> CanaryMeasurementInput {
+        input_for(fixture, &policy())
+    }
+
     fn receipt(
         fixture: &Fixture,
         input: CanaryMeasurementInput,
     ) -> Result<PulpMacCanaryMeasurementReceipt, ParallelProofError> {
+        receipt_for(fixture, &policy(), input)
+    }
+
+    fn receipt_for(
+        fixture: &Fixture,
+        policy: &PulpMacCanaryPolicy,
+        input: CanaryMeasurementInput,
+    ) -> Result<PulpMacCanaryMeasurementReceipt, ParallelProofError> {
         PulpMacCanaryMeasurementReceipt::capture(
             proof(fixture),
+            policy,
             &decision(fixture),
             &host("m3", CanaryRoute::SameHost, 4),
             &host("m1", CanaryRoute::Lan, 7),
@@ -950,6 +1047,7 @@ mod tests {
         assert!(matches!(
             PulpMacCanaryMeasurementReceipt::capture(
                 proof(&fixture),
+                &policy(),
                 &wrong_decision,
                 &host("m3", CanaryRoute::SameHost, 4),
                 &host("m1", CanaryRoute::Lan, 7),
@@ -964,6 +1062,7 @@ mod tests {
         assert!(matches!(
             PulpMacCanaryMeasurementReceipt::capture(
                 proof(&fixture),
+                &policy(),
                 &decision(&fixture),
                 &host("m3", CanaryRoute::SameHost, 4),
                 &host("m1", CanaryRoute::Tailnet, 7),
@@ -980,6 +1079,7 @@ mod tests {
         assert!(matches!(
             PulpMacCanaryMeasurementReceipt::capture(
                 proof(&fixture),
+                &policy(),
                 &decision(&fixture),
                 &host("m3", CanaryRoute::SameHost, 4),
                 &reconnected,
@@ -993,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_eligible_decision_cannot_escape_fixed_pulp_scope() {
+    fn receipt_refuses_a_manifest_outside_the_configured_scope() {
         let mut fixture = fixture();
         let measurement = input(&fixture);
         fixture.manifest.source.repository_id = 99;
@@ -1001,9 +1101,65 @@ mod tests {
         assert!(matches!(
             receipt(&fixture, measurement),
             Err(ParallelProofError::BindingMismatch(
-                "Pulp macOS canary scope"
+                "parallel-proof canary scope"
             ))
         ));
+    }
+
+    #[test]
+    fn matching_non_pulp_scope_is_receipt_bound() {
+        let mut fixture = fixture();
+        fixture.manifest.source.repository_id = 42;
+        fixture.manifest.source.repository = "example/project".to_owned();
+        let configured = PulpMacCanaryPolicy {
+            repository_id: 42,
+            repository: "example/project".to_owned(),
+            target: "release-mac".to_owned(),
+            builder_host_id: "builder-a".to_owned(),
+            worker_host_id: "worker-b".to_owned(),
+            ..policy()
+        };
+        let builder = host("builder-a", CanaryRoute::SameHost, 4);
+        let worker = host("worker-b", CanaryRoute::Lan, 7);
+        let control = host("builder-a", CanaryRoute::SameHost, 3);
+        let mut admitted = decision(&fixture);
+        if let PulpMacCanaryDecision::Eligible {
+            builder_host_id,
+            worker_host_id,
+            host_observations_digest,
+            ..
+        } = &mut admitted
+        {
+            *builder_host_id = builder.host_id.clone();
+            *worker_host_id = worker.host_id.clone();
+            *host_observations_digest =
+                canary_host_observations_digest(&builder, &worker).expect("host digest");
+        }
+        let mut measurement = input_for(&fixture, &configured);
+        measurement.single_host_control = SingleHostControlReceipt::capture(
+            proof(&fixture),
+            &configured,
+            &control,
+            1_000_000,
+            900_000,
+            0,
+        )
+        .expect("control");
+        let receipt = PulpMacCanaryMeasurementReceipt::capture(
+            proof(&fixture),
+            &configured,
+            &admitted,
+            &builder,
+            &worker,
+            &control,
+            measurement,
+        )
+        .expect("generic receipt");
+        assert_eq!(receipt.repository_id, 42);
+        assert_eq!(receipt.repository, "example/project");
+        assert_eq!(receipt.target, "release-mac");
+        assert_eq!(receipt.builder_host_id, "builder-a");
+        assert_eq!(receipt.worker_host_id, "worker-b");
     }
 
     #[test]

@@ -131,8 +131,9 @@ not part of the minimum completion set.
 ## Measurements, logs, and retention
 
 `parallel_proof_canary_receipt` defines the compact, shadow-only measurement
-record for the first Pulp macOS canary. It binds the complete proof-manifest
-digest, repository/head/tree, encoded artifact and layout digests, exact builder
+record. It binds the complete proof-manifest digest, numeric repository ID and
+slug, Shipyard target and build target triple, repository head/tree, encoded
+artifact and layout digests, exact builder
 and worker observations plus session generations, authenticated LAN route, full/resumed/object-
 reuse byte accounting, and exact cache generations. The legacy untrusted
 avoided-byte field is canonically zero; it is never accepted as measurement. Setup/
@@ -144,7 +145,7 @@ and 15-percent transport-overhead ceiling without becoming merge authority.
 The speed gate consumes only controller timing and transport byte counters.
 
 `parallel_proof_canary_driver` is the default-off controller execution seam. It
-first authenticates the exact M3/M1 observations, completes the M3 control,
+first authenticates the exact configured builder/worker observations, completes the builder control,
 rechecks both session fences and the storage reserve, then permits transfer and
 distributed shadow execution. It rechecks the fences and reserve again before
 publishing schema-v1 driver evidence. The exact pre-execution and final host
@@ -158,10 +159,11 @@ claims are not representable at the adapter boundary. `model_calls` is supplied
 by neither policy nor adapter and is always zero.
 
 The execution driver has no production shell, daemon, or fleet adapter. The
-separate cache-observation path has a production-callable strict-SSH M3-to-M1
-carrier, but it is read-only, requires protected controller authority, rejects
+separate cache-observation path has a production-callable strict-SSH
+builder-to-worker carrier whose host identities are explicit constructor inputs,
+but it is read-only, requires protected controller authority, rejects
 ambient SSH state, and cannot execute transfer/shard work. Therefore setting
-`policy.enabled=true` alone still cannot mutate M3, M1, a cache, or a staging
+`policy.enabled=true` alone still cannot mutate a host, cache, or staging
 root.
 
 Successful driver evidence is published through
@@ -176,7 +178,7 @@ a successful compact receipt.
 
 There is intentionally no physical mutation command yet. Before adding one,
 the controller adapter must supply all of the following from authenticated
-APIs, not operator-entered JSON: exact M3/M1 host and nonzero session
+APIs, not operator-entered JSON: exact configured host identities and nonzero session
 generations; current online/LAN route observations; canonical persistent staging
 roots; filesystem free-byte observations that retain the configured reserve;
 exact cache generation digests; monotonic phase timings; transport byte
