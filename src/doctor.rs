@@ -125,6 +125,16 @@ pub fn collect_report(
     cwd: &Path,
     state_dir: &Path,
 ) -> DoctorReport {
+    collect_report_with_github_auth(probe, mode, cwd, state_dir, &github_auth_summary(mode, cwd))
+}
+
+fn collect_report_with_github_auth(
+    probe: &impl CommandProbe,
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    github_auth: &Result<GhAuthSummary, GhAuthCheckError>,
+) -> DoctorReport {
     let mut checks = BTreeMap::new();
 
     let mut core = BTreeMap::new();
@@ -152,13 +162,12 @@ pub fn collect_report(
 
     let mut cloud = BTreeMap::new();
     cloud.insert("gh".to_owned(), check_command(probe, "gh", &["--version"]));
-    let github_auth = github_auth_summary(mode, cwd);
     let ambient_gh_auth = probe_ambient_gh_cli_auth(probe);
     cloud.insert(
         "github-auth".to_owned(),
-        github_auth_entry_result(&github_auth, &ambient_gh_auth),
+        github_auth_entry_result(github_auth, &ambient_gh_auth),
     );
-    if let Ok(summary) = &github_auth
+    if let Ok(summary) = github_auth
         && let Some(entry) = check_gh_workflow_scope_for_auth(probe, summary)
     {
         cloud.insert("gh-scope".to_owned(), entry);
@@ -1213,7 +1222,7 @@ mod tests {
         ReleaseBotSecretState, ambient_gh_cli_auth_from, check_daemon_version_drift_with,
         check_gh_workflow_scope_for_auth, check_gh_workflow_scope_with,
         check_macos_gatekeeper_health_with, check_release_bot_token_with,
-        check_shipyard_path_shadows_with, check_tag_drift_with, collect_report,
+        check_shipyard_path_shadows_with, check_tag_drift_with, collect_report_with_github_auth,
         configured_token_scope_entry, github_auth_entry, github_auth_entry_result,
         is_runner_target, nsc_entry, parse_github_repo_slug, release_chain_result_entry,
         runner_check,
@@ -1234,17 +1243,23 @@ mod tests {
     }
 
     fn report_with(values: &[(&str, &str)]) -> DoctorReport {
+        let temp = tempfile::tempdir().expect("tempdir");
         let probe = FakeProbe {
             values: values
                 .iter()
                 .map(|(command, version)| ((*command).to_owned(), (*version).to_owned()))
                 .collect(),
         };
-        collect_report(
+        collect_report_with_github_auth(
             &probe,
-            RuntimeMode::Shipyard,
-            Path::new("."),
-            Path::new("."),
+            RuntimeMode::Isolated,
+            temp.path(),
+            temp.path(),
+            &Ok(GhAuthSummary {
+                source: GhAuthSourceSummary::GhCli,
+                token_kind: None,
+                expires_at: None,
+            }),
         )
     }
 
