@@ -17,7 +17,14 @@ fn test_schema_object_exists(connection: &Connection, object_type: &str, name: &
 fn strip_schema_identity(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TRIGGER IF EXISTS custody_event_no_delete;
+            "DROP TRIGGER IF EXISTS custody_processed_ack_no_delete;
+             DROP TRIGGER IF EXISTS custody_processed_ack_immutable;
+             DROP TABLE IF EXISTS custody_processed_acknowledgements;
+             DROP TRIGGER IF EXISTS custody_successor_no_delete;
+             DROP TRIGGER IF EXISTS custody_successor_receipt_immutable;
+             DROP TRIGGER IF EXISTS custody_successor_identity_immutable;
+             DROP TABLE IF EXISTS custody_successor_rebinds;
+             DROP TRIGGER IF EXISTS custody_event_no_delete;
              DROP TRIGGER IF EXISTS custody_event_immutable;
              DROP TRIGGER IF EXISTS custody_control_no_delete;
              DROP TRIGGER IF EXISTS custody_control_identity_immutable;

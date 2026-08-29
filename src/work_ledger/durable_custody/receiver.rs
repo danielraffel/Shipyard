@@ -2,13 +2,96 @@ use super::{
     AuthenticatedCustodyControl, AuthenticatedCustodyTransfer, CustodyControlReceipt,
     CustodyEnvelope, CustodyReceipt, DateTime, InboxAuthority, InboxClaim, OptionalExtension,
     ProcessedReceipt, Transaction, TransactionBehavior, Utc, WorkLedger, WorkLedgerError,
-    WorkLedgerResult, control_kind_str, control_receipt, digest, load_control, params,
-    positive_u64, processed_receipt, receipt_from_transfer, record_custody_event,
-    release_expired_claims, release_inbox_claim, sqlite_i64, validate_control, validate_digest,
-    validate_lease, validate_opaque_ref, validate_transfer, verify_inbox_claim,
+    WorkLedgerResult, active_inbox_binding, control_kind_str, control_receipt, digest,
+    load_control, params, positive_u64, processed_receipt, receipt_from_transfer,
+    record_custody_event, release_expired_claims, release_inbox_claim, validate_control,
+    validate_digest, validate_lease, validate_opaque_ref, validate_transfer, verify_inbox_claim,
 };
 
 impl WorkLedger {
+    pub(crate) fn processed_custody_receipts(
+        &self,
+        limit: usize,
+    ) -> WorkLedgerResult<Vec<(ProcessedReceipt, String)>> {
+        let connection = self.custody_read_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT inbox.processed_receipt_json, inbox.identity_json
+               FROM custody_inbox inbox
+               LEFT JOIN custody_processed_acknowledgements ack
+                 ON ack.message_id = inbox.message_id
+              WHERE inbox.state = 'processed' AND ack.message_id IS NULL
+              ORDER BY inbox.updated_at, inbox.message_id LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.map(|row| {
+            let (receipt_json, identity_json) = row?;
+            let receipt: ProcessedReceipt =
+                serde_json::from_slice(&receipt_json).map_err(|_| {
+                    WorkLedgerError::Refused("stored processed receipt is invalid".to_owned())
+                })?;
+            super::validate_processed_receipt(&receipt)?;
+            let envelope: CustodyEnvelope =
+                serde_json::from_slice(&identity_json).map_err(|_| {
+                    WorkLedgerError::Refused("stored custody envelope is invalid".to_owned())
+                })?;
+            envelope.validate()?;
+            Ok((receipt, envelope.source_machine_ref))
+        })
+        .collect()
+    }
+
+    pub(crate) fn acknowledge_processed_delivery(
+        &self,
+        receipt: &ProcessedReceipt,
+        source_machine_ref: &str,
+    ) -> WorkLedgerResult<()> {
+        super::validate_processed_receipt(receipt)?;
+        validate_opaque_ref(
+            "custody processed source machine",
+            source_machine_ref,
+            "machine",
+        )?;
+        let (_writer_domain, mut connection) = self.custody_write_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (stored_receipt, identity_json): (Vec<u8>, Vec<u8>) = tx.query_row(
+            "SELECT processed_receipt_json, identity_json FROM custody_inbox
+              WHERE message_id = ?1 AND state = 'processed'",
+            [&receipt.message_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let envelope: CustodyEnvelope = serde_json::from_slice(&identity_json).map_err(|_| {
+            WorkLedgerError::Refused("stored custody envelope is invalid".to_owned())
+        })?;
+        if stored_receipt
+            != serde_json::to_vec(receipt).map_err(|_| {
+                WorkLedgerError::Refused(
+                    "processed custody receipt cannot be serialized".to_owned(),
+                )
+            })?
+            || envelope.source_machine_ref != source_machine_ref
+        {
+            return Err(WorkLedgerError::Refused(
+                "processed acknowledgement contradicts retained custody".to_owned(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO custody_processed_acknowledgements
+             (receipt_digest, message_id, source_machine_ref, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(receipt_digest) DO NOTHING",
+            params![
+                receipt.receipt_digest,
+                receipt.message_id,
+                source_machine_ref,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn accept_custody(
         &self,
         authenticated: &AuthenticatedCustodyTransfer,
@@ -44,6 +127,17 @@ impl WorkLedger {
             if identity != transfer.envelope.identity_digest {
                 return Err(WorkLedgerError::Refused(
                     "custody message ID collision".to_owned(),
+                ));
+            }
+            let successor: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM custody_successor_rebinds
+                  WHERE message_id = ?1 AND side = 'receiver' AND state = 'committed'",
+                [&transfer.envelope.message_id],
+                |row| row.get(0),
+            )?;
+            if successor != 0 {
+                return Err(WorkLedgerError::Refused(
+                    "old-incarnation custody delivery arrived after successor commit".to_owned(),
                 ));
             }
             return receipt_from_transfer(transfer, Some(&transfer_receipt));
@@ -163,31 +257,13 @@ impl WorkLedger {
         validate_digest("custody effect", effect_digest)?;
         let (_writer_domain, mut connection) = self.custody_write_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (
-            identity_json,
-            target_machine,
-            target_incarnation,
-            rebind_epoch,
-            transfer_digest,
-            expected_authority,
-            state,
-        ): (Vec<u8>, String, String, i64, String, String, String) = tx.query_row(
-            "SELECT identity_json, target_machine_ref, target_incarnation_ref, rebind_epoch,
-                    transfer_digest, authority_digest, state
+        let (identity_json, target_machine, state): (Vec<u8>, String, String) = tx.query_row(
+            "SELECT identity_json, target_machine_ref, state
                FROM custody_inbox WHERE message_id = ?1",
             [&claim.message_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let active = active_inbox_binding(&tx, &claim.message_id)?;
         let envelope: CustodyEnvelope = serde_json::from_slice(&identity_json).map_err(|_| {
             WorkLedgerError::Refused("stored custody envelope is invalid".to_owned())
         })?;
@@ -219,10 +295,10 @@ impl WorkLedger {
                 || receipt.workstream_revision != envelope.workstream_revision
                 || receipt.effect_digest != stored_effect
                 || receipt.target_machine_ref != target_machine
-                || receipt.target_incarnation_ref != target_incarnation
-                || receipt.rebind_epoch != positive_u64("inbox rebind epoch", rebind_epoch)?
-                || receipt.transfer_digest != transfer_digest
-                || receipt.authority_digest != expected_authority
+                || receipt.target_incarnation_ref != active.incarnation
+                || receipt.rebind_epoch != active.epoch
+                || receipt.transfer_digest != active.transfer_digest
+                || receipt.authority_digest != active.authority_digest
             {
                 return Err(WorkLedgerError::Refused(
                     "stored processed receipt does not match custody state".to_owned(),
@@ -248,8 +324,8 @@ impl WorkLedger {
         }
         if state != "processing"
             || authority.workstream_revision != envelope.workstream_revision
-            || authority.target_incarnation_ref != target_incarnation
-            || authority.authority_digest != expected_authority
+            || authority.target_incarnation_ref != active.incarnation
+            || authority.authority_digest != active.authority_digest
         {
             return Err(WorkLedgerError::Refused(
                 "live inbox authority no longer matches the message".to_owned(),
@@ -260,10 +336,10 @@ impl WorkLedger {
             &envelope,
             effect_digest,
             &target_machine,
-            &target_incarnation,
-            positive_u64("inbox rebind epoch", rebind_epoch)?,
-            &transfer_digest,
-            &expected_authority,
+            &active.incarnation,
+            active.epoch,
+            &active.transfer_digest,
+            &active.authority_digest,
             claim,
         )?;
         let receipt_json = serde_json::to_vec(&receipt).map_err(|_| {
@@ -309,20 +385,21 @@ impl WorkLedger {
         let control = &authenticated.control;
         let (_writer_domain, mut connection) = self.custody_write_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (identity_json, identity_digest, epoch, state): (Vec<u8>, String, i64, String) = tx
-            .query_row(
-                "SELECT identity_json, identity_digest, rebind_epoch, state
+        let (identity_json, identity_digest, state): (Vec<u8>, String, String) = tx.query_row(
+            "SELECT identity_json, identity_digest, state
                    FROM custody_inbox WHERE message_id = ?1",
-                [&control.message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
+            [&control.message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let active = active_inbox_binding(&tx, &control.message_id)?;
         let envelope: CustodyEnvelope = serde_json::from_slice(&identity_json).map_err(|_| {
             WorkLedgerError::Refused("stored custody envelope is invalid".to_owned())
         })?;
         if authenticated.authenticated_source_machine_ref != envelope.source_machine_ref
             || identity_digest != control.identity_digest
-            || epoch != sqlite_i64("control rebind epoch", control.expected_rebind_epoch)?
+            || active.epoch != control.expected_rebind_epoch
             || envelope.workstream_revision != control.workstream_revision
+            || active.authority_digest != control.authority_digest
         {
             return Err(WorkLedgerError::Refused(
                 "custody control does not match the received authority".to_owned(),

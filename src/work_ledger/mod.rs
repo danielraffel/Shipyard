@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -86,11 +86,15 @@ pub(crate) use dispatch::{WakeEnvelope, WakeProfileResolver};
 #[allow(unused_imports)] // Consumed by the cross-machine transport adapter follow-up.
 pub(crate) use durable_custody::{
     AuthenticatedCustodyControl, AuthenticatedCustodyControlReceipt, AuthenticatedCustodyReceipt,
+    AuthenticatedCustodySuccessorRebind, AuthenticatedCustodySuccessorReceipt,
     AuthenticatedCustodyTransfer, AuthenticatedProcessedReceipt, CustodyControl,
     CustodyControlReceipt, CustodyEnvelope, CustodyKind, CustodyReceipt, CustodyRelation,
-    CustodyTransfer, CustodyTransportAuthenticator, InboxAuthority, InboxClaim, ProcessedReceipt,
-    SenderClaim, authenticate_custody_control, authenticate_custody_control_receipt,
-    authenticate_custody_receipt, authenticate_custody_transfer, authenticate_processed_receipt,
+    CustodyStatus, CustodySuccessorRebind, CustodySuccessorReceipt, CustodyTransfer,
+    CustodyTransportAuthenticator, InboxAuthority, InboxClaim, ProcessedReceipt, SenderClaim,
+    authenticate_custody_control, authenticate_custody_control_receipt,
+    authenticate_custody_receipt, authenticate_custody_successor_rebind,
+    authenticate_custody_successor_receipt, authenticate_custody_transfer,
+    authenticate_processed_receipt,
 };
 mod lifecycle;
 mod native_publication;

@@ -8,6 +8,25 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Redacted durable custody lifecycle counts. "Read" is intentionally absent:
+/// only storage and consumer-claim transitions are observable.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct CustodyStatus {
+    pub(crate) outgoing_pending: u64,
+    pub(crate) outgoing_claimed: u64,
+    pub(crate) outgoing_accepted: u64,
+    pub(crate) outgoing_processed: u64,
+    pub(crate) outgoing_cancelled: u64,
+    pub(crate) outgoing_superseded: u64,
+    pub(crate) incoming_received: u64,
+    pub(crate) incoming_processing: u64,
+    pub(crate) incoming_processed: u64,
+    pub(crate) incoming_cancelled: u64,
+    pub(crate) incoming_superseded: u64,
+    pub(crate) pending_controls: u64,
+    pub(crate) pending_rebinds: u64,
+}
+
 use super::{
     WorkLedgerError, WorkLedgerResult, digest, opaque_ref, validate_control, validate_digest,
     validate_opaque_ref, validate_token, validate_transfer,
@@ -94,6 +113,89 @@ pub(crate) struct CustodyReceipt {
     pub(crate) target_incarnation_ref: String,
     pub(crate) transfer_digest: String,
     pub(crate) receipt_digest: String,
+}
+
+/// Authenticated successor-incarnation migration for custody already committed
+/// by the destination but not yet processed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CustodySuccessorRebind {
+    pub(crate) rebind_id: String,
+    pub(crate) message_id: String,
+    pub(crate) identity_digest: String,
+    pub(crate) workstream_revision: u64,
+    pub(crate) source_machine_ref: String,
+    pub(crate) target_machine_ref: String,
+    pub(crate) old_target_incarnation_ref: String,
+    pub(crate) new_target_incarnation_ref: String,
+    pub(crate) old_authority_epoch: u64,
+    pub(crate) new_authority_epoch: u64,
+    pub(crate) old_transfer_digest: String,
+    pub(crate) old_custody_receipt_digest: String,
+    pub(crate) new_target_route_ref: String,
+    pub(crate) terminal_adapter: String,
+    pub(crate) new_authority_digest: String,
+    pub(crate) successor_proof_digest: String,
+    pub(crate) rebind_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CustodySuccessorReceipt {
+    pub(crate) rebind_id: String,
+    pub(crate) message_id: String,
+    pub(crate) identity_digest: String,
+    pub(crate) workstream_revision: u64,
+    pub(crate) target_machine_ref: String,
+    pub(crate) new_target_incarnation_ref: String,
+    pub(crate) new_authority_epoch: u64,
+    pub(crate) rebind_digest: String,
+    pub(crate) successor_proof_digest: String,
+    pub(crate) receipt_digest: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AuthenticatedCustodySuccessorRebind {
+    pub(super) rebind: CustodySuccessorRebind,
+    pub(super) authenticated_source_machine_ref: String,
+    pub(super) transport_auth_digest: String,
+}
+
+pub(crate) fn authenticate_custody_successor_rebind<A: CustodyTransportAuthenticator>(
+    authenticator: &mut A,
+    source_machine_ref: &str,
+    rebind: CustodySuccessorRebind,
+) -> WorkLedgerResult<AuthenticatedCustodySuccessorRebind> {
+    super::validate_successor_rebind(&rebind)?;
+    let witness = authenticator.authenticate(source_machine_ref, &rebind.rebind_digest)?;
+    validate_digest("custody successor transport witness", &witness)?;
+    Ok(AuthenticatedCustodySuccessorRebind {
+        rebind,
+        authenticated_source_machine_ref: source_machine_ref.to_owned(),
+        transport_auth_digest: witness,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AuthenticatedCustodySuccessorReceipt {
+    pub(super) receipt: CustodySuccessorReceipt,
+    pub(super) authenticated_peer_machine_ref: String,
+    pub(super) transport_auth_digest: String,
+}
+
+pub(crate) fn authenticate_custody_successor_receipt<A: CustodyTransportAuthenticator>(
+    authenticator: &mut A,
+    peer_machine_ref: &str,
+    receipt: CustodySuccessorReceipt,
+) -> WorkLedgerResult<AuthenticatedCustodySuccessorReceipt> {
+    super::validate_successor_receipt(&receipt)?;
+    let witness = authenticator.authenticate(peer_machine_ref, &receipt.receipt_digest)?;
+    validate_digest("custody successor receipt transport witness", &witness)?;
+    Ok(AuthenticatedCustodySuccessorReceipt {
+        receipt,
+        authenticated_peer_machine_ref: peer_machine_ref.to_owned(),
+        transport_auth_digest: witness,
+    })
 }
 
 #[derive(Clone, Debug)]

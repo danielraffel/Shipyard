@@ -18,14 +18,17 @@ mod common;
 use common::{
     control_kind_str, control_receipt, load_control, positive_u64, processed_receipt,
     receipt_from_transfer, record_custody_event, relation_prior_state, release_expired_claims,
-    release_inbox_claim, release_sender_claim, sqlite_i64, transfer_digest, transfer_from_tx,
-    validate_control, validate_control_receipt, validate_lease,
+    release_inbox_claim, release_sender_claim, sqlite_i64, successor_receipt, transfer_digest,
+    transfer_from_tx, validate_control, validate_control_receipt, validate_lease,
     validate_persisted_processed_receipts, validate_processed_receipt, validate_receipt,
-    validate_target, validate_transfer, verify_inbox_claim, verify_sender_claim,
+    validate_successor_rebind, validate_successor_receipt, validate_target, validate_transfer,
+    verify_inbox_claim, verify_sender_claim,
 };
 
 pub(super) fn validate_persisted_custody(connection: &Connection) -> WorkLedgerResult<()> {
     validate_persisted_processed_receipts(connection)
 }
+mod rebind;
 mod receiver;
+use rebind::active_inbox_binding;
 mod sender;

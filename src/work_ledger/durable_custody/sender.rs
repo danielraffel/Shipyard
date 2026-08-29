@@ -10,6 +10,85 @@ use super::{
 };
 
 impl WorkLedger {
+    pub(crate) fn custody_status(&self) -> WorkLedgerResult<super::CustodyStatus> {
+        let connection = self.custody_read_connection()?;
+        let count = |table: &str, state: &str| -> WorkLedgerResult<u64> {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE state = ?1");
+            let value: i64 = connection.query_row(&sql, [state], |row| row.get(0))?;
+            u64::try_from(value).map_err(|_| {
+                WorkLedgerError::Refused("custody status count is out of range".to_owned())
+            })
+        };
+        let pending_controls: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM custody_controls WHERE state = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        let pending_rebinds: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM custody_successor_rebinds
+              WHERE side = 'sender' AND state = 'prepared'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(super::CustodyStatus {
+            outgoing_pending: count("custody_outbox", "pending")?,
+            outgoing_claimed: count("custody_outbox", "claimed")?,
+            outgoing_accepted: count("custody_outbox", "custody_accepted")?,
+            outgoing_processed: count("custody_outbox", "processed")?,
+            outgoing_cancelled: count("custody_outbox", "cancelled")?,
+            outgoing_superseded: count("custody_outbox", "superseded")?,
+            incoming_received: count("custody_inbox", "received")?,
+            incoming_processing: count("custody_inbox", "processing")?,
+            incoming_processed: count("custody_inbox", "processed")?,
+            incoming_cancelled: count("custody_inbox", "cancelled")?,
+            incoming_superseded: count("custody_inbox", "superseded")?,
+            pending_controls: u64::try_from(pending_controls).map_err(|_| {
+                WorkLedgerError::Refused("custody status count is out of range".to_owned())
+            })?,
+            pending_rebinds: u64::try_from(pending_rebinds).map_err(|_| {
+                WorkLedgerError::Refused("custody status count is out of range".to_owned())
+            })?,
+        })
+    }
+
+    pub(crate) fn custody_send_candidates(&self, limit: usize) -> WorkLedgerResult<Vec<String>> {
+        let connection = self.custody_read_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT message_id FROM custody_outbox
+              WHERE state IN ('pending', 'claimed') ORDER BY updated_at, message_id LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn pending_custody_controls(
+        &self,
+        limit: usize,
+    ) -> WorkLedgerResult<Vec<(CustodyControl, String)>> {
+        let connection = self.custody_read_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT control.control_id, rebind.target_machine_ref
+               FROM custody_controls control
+               JOIN custody_outbox message ON message.message_id = control.message_id
+               JOIN custody_rebinds rebind ON rebind.message_id = message.message_id
+                                      AND rebind.epoch = message.active_rebind_epoch
+              WHERE control.state = 'pending'
+              ORDER BY control.updated_at, control.control_id LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let identities = rows.collect::<Result<Vec<_>, _>>()?;
+        identities
+            .into_iter()
+            .map(|(control_id, machine)| {
+                load_control(&connection, &control_id).map(|control| (control, machine))
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_lines)] // Staging validates source, replay, target, and event atomically.
     pub(crate) fn stage_cross_machine_custody(
         &self,
@@ -441,6 +520,7 @@ impl WorkLedger {
         positive_u64("next custody rebind epoch", next)
     }
 
+    #[allow(clippy::too_many_lines)] // One append-only control staging transaction.
     pub(crate) fn prepare_remote_custody_control(
         &self,
         message_id: &str,
@@ -469,6 +549,28 @@ impl WorkLedger {
         if state != "custody_accepted" {
             return Err(WorkLedgerError::Refused(
                 "remote custody control requires accepted but unprocessed custody".to_owned(),
+            ));
+        }
+        let pending_successor: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM custody_successor_rebinds
+              WHERE message_id = ?1 AND side = 'sender' AND state = 'prepared'",
+            [message_id],
+            |row| row.get(0),
+        )?;
+        if pending_successor != 0 {
+            return Err(WorkLedgerError::Refused(
+                "remote custody control conflicts with a prepared successor".to_owned(),
+            ));
+        }
+        let active_authority: String = tx.query_row(
+            "SELECT authority_digest FROM custody_rebinds
+              WHERE message_id = ?1 AND epoch = ?2",
+            params![message_id, epoch],
+            |row| row.get(0),
+        )?;
+        if authority_digest != active_authority {
+            return Err(WorkLedgerError::Refused(
+                "remote custody control authority is stale".to_owned(),
             ));
         }
         let envelope: CustodyEnvelope = serde_json::from_slice(&identity_json).map_err(|_| {

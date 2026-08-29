@@ -170,6 +170,10 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     if version == 8 {
         migrate_v8_to_v9(connection)?;
+        version = 9;
+    }
+    if version == 9 {
+        migrate_v9_to_v10(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
@@ -683,6 +687,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     )?;
     install_schema_identity(&transaction)?;
     install_custody_schema(&transaction)?;
+    install_custody_successor_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -732,7 +737,7 @@ pub(super) fn verify_open_lineage(connection: &Connection, version: i64) -> Work
     if version == SCHEMA_VERSION {
         return verify_schema_identity(connection);
     }
-    if version == 8 {
+    if version == 8 || version == 9 {
         return verify_schema_identity(connection);
     }
     if version == 7 {
@@ -863,10 +868,83 @@ fn migrate_v8_to_v9(connection: &mut Connection) -> WorkLedgerResult<()> {
     verify_open_lineage(&transaction, 8)?;
     validate_relational_integrity(&transaction)?;
     install_custody_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", 9)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v9_to_v10(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 9 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the custody successor migration fence"
+                .to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 9)?;
+    validate_relational_integrity(&transaction)?;
+    install_custody_successor_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     verify_schema_identity(&transaction)?;
     validate_relational_integrity(&transaction)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn install_custody_successor_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE custody_successor_rebinds (
+           rebind_id TEXT NOT NULL,
+           message_id TEXT NOT NULL,
+           side TEXT NOT NULL CHECK(side IN ('sender', 'receiver')),
+           rebind_json BLOB NOT NULL,
+           rebind_digest TEXT NOT NULL
+             CHECK(length(rebind_digest) = 64 AND rebind_digest NOT GLOB '*[^0-9a-f]*'),
+           authority_epoch INTEGER NOT NULL CHECK(authority_epoch > 0),
+           state TEXT NOT NULL CHECK(state IN ('prepared', 'committed', 'acknowledged')),
+           receipt_json BLOB,
+           receipt_digest TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           PRIMARY KEY(rebind_id, side),
+           UNIQUE(message_id, side, rebind_digest),
+           UNIQUE(message_id, side, authority_epoch),
+           CHECK((receipt_json IS NULL AND receipt_digest IS NULL) OR
+                 (receipt_json IS NOT NULL AND length(receipt_digest) = 64 AND
+                  receipt_digest NOT GLOB '*[^0-9a-f]*'))
+         );
+         CREATE INDEX custody_successor_message
+           ON custody_successor_rebinds(message_id, side, state, updated_at);
+         CREATE TRIGGER custody_successor_identity_immutable
+         BEFORE UPDATE OF message_id, side, rebind_json, rebind_digest, authority_epoch
+         ON custody_successor_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody successor identity is immutable'); END;
+         CREATE TRIGGER custody_successor_receipt_immutable
+         BEFORE UPDATE OF receipt_json, receipt_digest ON custody_successor_rebinds
+         WHEN OLD.receipt_digest IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'custody successor receipt is immutable'); END;
+         CREATE TRIGGER custody_successor_no_delete
+         BEFORE DELETE ON custody_successor_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody successor rebinds cannot be deleted'); END;
+         CREATE TABLE custody_processed_acknowledgements (
+           receipt_digest TEXT PRIMARY KEY
+             CHECK(length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'),
+           message_id TEXT NOT NULL REFERENCES custody_inbox(message_id) ON DELETE RESTRICT,
+           source_machine_ref TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           UNIQUE(message_id)
+         );
+         CREATE TRIGGER custody_processed_ack_immutable
+         BEFORE UPDATE ON custody_processed_acknowledgements
+         BEGIN SELECT RAISE(ABORT, 'custody processed acknowledgements are immutable'); END;
+         CREATE TRIGGER custody_processed_ack_no_delete
+         BEFORE DELETE ON custody_processed_acknowledgements
+         BEGIN SELECT RAISE(ABORT, 'custody processed acknowledgements cannot be deleted'); END;",
+    )?;
     Ok(())
 }
 

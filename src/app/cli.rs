@@ -530,6 +530,12 @@ pub(super) enum Command {
 pub(super) enum WorkLedgerCommand {
     /// Show schema, integrity, and redacted lifecycle counts without creating storage.
     Status,
+    /// Show exact durable custody states; no state named "read" is inferred.
+    #[command(name = "custody-status")]
+    CustodyStatus,
+    /// Receive one authenticated custody protocol request from a forced SSH command.
+    #[command(name = "custody-receive", hide = true)]
+    CustodyReceive,
     /// Plan or apply an idempotent legacy-state import. Dry-run is the default.
     Import {
         /// Commit selected redacted projections to the shadow ledger.
@@ -2368,6 +2374,36 @@ mod tests {
                 command: WorkLedgerCommand::Import { apply: true }
             }
         ));
+    }
+
+    #[test]
+    fn work_ledger_custody_commands_preserve_exact_peer_binding() {
+        let status = Cli::try_parse_from(["shipyard", "work-ledger", "custody-status"])
+            .expect("custody status");
+        assert!(matches!(
+            status.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::CustodyStatus
+            }
+        ));
+        let receive = Cli::try_parse_from(["shipyard", "work-ledger", "custody-receive"])
+            .expect("custody SSH subsystem receiver");
+        assert!(matches!(
+            receive.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::CustodyReceive
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "work-ledger",
+                "custody-receive",
+                "--peer",
+                "machine_untrusted",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

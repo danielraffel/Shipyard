@@ -6,12 +6,16 @@ use std::process::ExitCode;
 use serde_json::Value;
 
 use crate::cloud::GitHubActions;
+use crate::custody_transport::{
+    MAX_CUSTODY_WIRE_BYTES, handle_incoming_request, incoming_peer_evidence_from_environment,
+    load_custody_transport_policy,
+};
 use crate::daemon_ipc::read_daemon_status;
 use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
 use crate::work_ledger::{
-    AgentReturnExpectation, NativePublicationReport, RepoPolicy, WorkLedger, absent_status,
-    apply_legacy_snapshot, plan_legacy_snapshot, validate_repo_policy,
+    AgentReturnExpectation, CustodyStatus, NativePublicationReport, RepoPolicy, WorkLedger,
+    absent_status, apply_legacy_snapshot, plan_legacy_snapshot, validate_repo_policy,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 
@@ -72,6 +76,89 @@ pub(super) fn work_ledger_command<W: Write>(
                         .map_err(failure)?;
                 }
             }
+        }
+        WorkLedgerCommand::CustodyStatus => {
+            let status = WorkLedger::open_existing(state_dir)
+                .map_err(failure)?
+                .map_or_else(
+                    || Ok(CustodyStatus::default()),
+                    |ledger| ledger.custody_status(),
+                )
+                .map_err(failure)?;
+            if json {
+                write_pretty_json(stdout, &status).map_err(failure)?;
+            } else {
+                writeln!(stdout, "Outgoing pending: {}", status.outgoing_pending)
+                    .map_err(failure)?;
+                writeln!(stdout, "Outgoing claimed: {}", status.outgoing_claimed)
+                    .map_err(failure)?;
+                writeln!(stdout, "Outgoing accepted: {}", status.outgoing_accepted)
+                    .map_err(failure)?;
+                writeln!(stdout, "Outgoing processed: {}", status.outgoing_processed)
+                    .map_err(failure)?;
+                writeln!(stdout, "Outgoing cancelled: {}", status.outgoing_cancelled)
+                    .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Outgoing superseded: {}",
+                    status.outgoing_superseded
+                )
+                .map_err(failure)?;
+                writeln!(stdout, "Incoming received: {}", status.incoming_received)
+                    .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Incoming processing: {}",
+                    status.incoming_processing
+                )
+                .map_err(failure)?;
+                writeln!(stdout, "Incoming processed: {}", status.incoming_processed)
+                    .map_err(failure)?;
+                writeln!(stdout, "Incoming cancelled: {}", status.incoming_cancelled)
+                    .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Incoming superseded: {}",
+                    status.incoming_superseded
+                )
+                .map_err(failure)?;
+                writeln!(stdout, "Pending controls: {}", status.pending_controls)
+                    .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Pending successor rebinds: {}",
+                    status.pending_rebinds
+                )
+                .map_err(failure)?;
+            }
+        }
+        WorkLedgerCommand::CustodyReceive => {
+            let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+            if runtime_paths != &production_paths {
+                return Err(CliFailure::new(
+                    1,
+                    "custody receive is available only against canonical production roots",
+                ));
+            }
+            let policy = load_custody_transport_policy(
+                crate::identity::RuntimeMode::Shipyard,
+                runtime_paths.global_dir.clone(),
+            )
+            .map_err(|error| CliFailure::new(1, error))?
+            .ok_or_else(|| CliFailure::new(1, "custody transport is disabled"))?;
+            let evidence = incoming_peer_evidence_from_environment(&policy)
+                .map_err(|error| CliFailure::new(1, error))?;
+            let mut input = Vec::new();
+            std::io::stdin()
+                .take(MAX_CUSTODY_WIRE_BYTES + 1)
+                .read_to_end(&mut input)
+                .map_err(failure)?;
+            if input.len() as u64 > MAX_CUSTODY_WIRE_BYTES {
+                return Err(CliFailure::new(1, "custody request exceeds the wire limit"));
+            }
+            let response = handle_incoming_request(&policy, state_dir, &evidence, &input);
+            serde_json::to_writer(&mut *stdout, &response).map_err(failure)?;
+            writeln!(stdout).map_err(failure)?;
         }
         WorkLedgerCommand::Import { apply } => {
             let report = if *apply {

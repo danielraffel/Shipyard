@@ -29,6 +29,8 @@ use chrono::Utc;
 
 use crate::actionable_wake_producer::{ActionableWakeProducer, ActionableWakeProducerStatus};
 use crate::config::LoadedConfig;
+#[cfg(unix)]
+use crate::custody_transport::CustodyTransportRuntime;
 use crate::daemon_ipc::read_daemon_status;
 #[cfg(unix)]
 use crate::daemon_ipc::{IpcServer, IpcState, github_auth_degraded_message};
@@ -203,6 +205,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let registration_error = Arc::new(Mutex::new(None::<String>));
     let execution_error = Arc::new(Mutex::new(None::<String>));
     let transition_projection_error = Arc::new(Mutex::new(None::<String>));
+    let custody_transport_error = Arc::new(Mutex::new(None::<String>));
     let continuation_status = Arc::new(Mutex::new(ContinuationRuntimeStatus::default()));
     let actionable_producer_status = Arc::new(Mutex::new(ActionableWakeProducerStatus::default()));
     let ship_dir = config.state_dir.join("ship");
@@ -243,6 +246,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         Arc::clone(&registration_error),
         Arc::clone(&execution_error),
         Arc::clone(&transition_projection_error),
+        Arc::clone(&custody_transport_error),
         Arc::clone(&continuation_status),
         Arc::clone(&actionable_producer_status),
         Arc::clone(&last_event_at),
@@ -287,6 +291,11 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         config.global_dir.clone(),
         config.state_dir.clone(),
     );
+    let mut custody_transport_runtime = CustodyTransportRuntime::for_daemon(
+        config.mode,
+        config.global_dir.clone(),
+        config.state_dir.clone(),
+    );
     if let Ok(mut published) = transition_projection_error.lock() {
         *published = transition_projection_runtime.diagnostic_error();
     }
@@ -312,6 +321,9 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut pending_steward_targets = native_steward_inventory(&config.state_dir);
     let (steward_tx, steward_rx) = mpsc::channel::<DaemonStewardResult>();
     let mut steward_in_flight = false;
+    if let Ok(mut published) = custody_transport_error.lock() {
+        *published = custody_transport_runtime.diagnostic_error();
+    }
     if let Ok(mut published) = actionable_producer_status.lock() {
         *published = actionable_producer.status();
     }
@@ -438,6 +450,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         }
         continuation_runtime.tick();
         transition_projection_runtime.tick();
+        custody_transport_runtime.tick();
+        if let Ok(mut published) = custody_transport_error.lock() {
+            *published = custody_transport_runtime.diagnostic_error();
+        }
         if let Ok(mut published) = transition_projection_error.lock() {
             *published = transition_projection_runtime.diagnostic_error();
         }
@@ -576,6 +592,7 @@ fn daemon_status_provider(
     registration_error: Arc<Mutex<Option<String>>>,
     execution_error: Arc<Mutex<Option<String>>>,
     transition_projection_error: Arc<Mutex<Option<String>>>,
+    custody_transport_error: Arc<Mutex<Option<String>>>,
     continuation_status: Arc<Mutex<ContinuationRuntimeStatus>>,
     actionable_producer_status: Arc<Mutex<ActionableWakeProducerStatus>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
@@ -613,6 +630,12 @@ fn daemon_status_provider(
                 .or_else(|| execution_error.lock().ok().and_then(|guard| guard.clone()))
                 .or_else(|| {
                     transition_projection_error
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                })
+                .or_else(|| {
+                    custody_transport_error
                         .lock()
                         .ok()
                         .and_then(|guard| guard.clone())
@@ -2132,6 +2155,7 @@ mod tests {
         let provider = daemon_status_provider(
             Arc::clone(&registration),
             vec!["owner/repo".to_owned(), "owner/pending".to_owned()],
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
