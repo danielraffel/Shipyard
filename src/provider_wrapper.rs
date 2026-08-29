@@ -991,6 +991,14 @@ mod tests {
         hex::encode(Sha256::digest(value.as_bytes()))
     }
 
+    fn native_absolute_test_path(leaf: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\Shipyard\{leaf}")
+        } else {
+            format!("/tmp/shipyard/{leaf}")
+        }
+    }
+
     fn request(operation: ProviderWrapperOperationV1) -> ProviderWrapperRequestV1 {
         let mut fence = ProviderDeliveryFenceV1 {
             wake_id: "wake-1".into(),
@@ -1023,7 +1031,7 @@ mod tests {
                 checkpoint_generation: 4,
                 checkpoint_digest: digest("checkpoint"),
                 repository: "generous-corp/shipyard".into(),
-                worktree_path: "/tmp/worktree".into(),
+                worktree_path: native_absolute_test_path("worktree"),
                 head_sha: "a".repeat(40),
                 expected_resume_context_digest: digest("resume"),
                 success_continuation_digest: digest("success"),

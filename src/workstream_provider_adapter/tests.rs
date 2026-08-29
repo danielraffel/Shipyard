@@ -18,6 +18,14 @@ const OTHER_WINDOW_UUID: &str = "923E4567-E89B-12D3-A456-426614174000";
 const SURFACE_UUID: &str = "223E4567-E89B-12D3-A456-426614174000";
 const SESSION_UUID: &str = "323E4567-E89B-12D3-A456-426614174000";
 
+fn native_absolute_test_path(leaf: &str) -> String {
+    if cfg!(windows) {
+        format!(r"C:\Shipyard\{leaf}")
+    } else {
+        format!("/tmp/shipyard/{leaf}")
+    }
+}
+
 #[derive(Default)]
 struct FakeRunner {
     verification: Option<Result<(), RunnerFailure>>,
@@ -159,7 +167,7 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
             checkpoint_generation: 1,
             checkpoint_digest: "3".repeat(64),
             repository: "generous-corp/shipyard".to_owned(),
-            worktree_path: "/tmp/shipyard-gen43".to_owned(),
+            worktree_path: native_absolute_test_path("shipyard-gen43"),
             head_sha: "4".repeat(40),
             expected_resume_context_digest: "5".repeat(64),
             success_continuation_digest: "6".repeat(64),
@@ -388,7 +396,8 @@ fn same_title_with_wrong_description_does_not_replay() {
 #[test]
 fn structured_launch_quotes_cwd_and_excludes_raw_context() {
     let mut request = request("codex", ProviderWrapperOperationV1::Submit);
-    request.resume_expectation.worktree_path = "/tmp/work tree'quoted".to_owned();
+    let quoted_worktree = native_absolute_test_path("work tree'quoted");
+    request.resume_expectation.worktree_path = quoted_worktree.clone();
     request.resume_expectation.context_url =
         Some("https://linear.app/generous/private-secret'raw".to_owned());
     let mut runner = FakeRunner {
@@ -405,7 +414,7 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
     let create = &runner.calls[2];
     assert_eq!(create[..3], ["--json", "--id-format", "uuids"]);
     let cwd_index = create.iter().position(|arg| arg == "--cwd").unwrap();
-    assert_eq!(create[cwd_index + 1], "/tmp/work tree'quoted");
+    assert_eq!(create[cwd_index + 1], quoted_worktree);
     let command_index = create.iter().position(|arg| arg == "--command").unwrap();
     let command = &create[command_index + 1];
     assert!(!command.contains("private-secret"));
@@ -546,6 +555,17 @@ fn untrusted_cmux_and_unsupported_provider_refuse_before_any_command() {
         ProviderWrapperOutcomeV1::Rejected { .. }
     ));
     assert!(runner.calls.is_empty());
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn production_cmux_adapter_refuses_before_running_any_cmux_command() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let response = handle_request(&request, &mut ProductionCmuxRunner);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Retryable { .. }
+    ));
 }
 
 #[test]
@@ -741,6 +761,7 @@ impl ProviderAdapter for LedgerCmuxAdapter {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
     let temp = tempfile::tempdir().expect("temp");
@@ -750,7 +771,7 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
         origin_machine: "m5".to_owned(),
         repositories: vec!["generous-corp/shipyard".to_owned()],
         provider_wrapper: ProviderWrapperConfig {
-            executable_path: PathBuf::from("/opt/shipyard/cmux-provider"),
+            executable_path: PathBuf::from(native_absolute_test_path("cmux-provider")),
             executable_sha256: "8".repeat(64),
             provider_id: "codex".to_owned(),
             adapter_id: ADAPTER_ID.to_owned(),
