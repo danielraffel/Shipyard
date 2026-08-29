@@ -10,7 +10,9 @@
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::path::PathBuf;
+use std::path::{Component, Path};
 
 use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::identity::RuntimeMode;
@@ -326,20 +328,14 @@ fn has_dot_component(path: &Path) -> bool {
 }
 
 fn has_symlink_ancestor(path: &Path) -> bool {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        // A Windows drive prefix such as `C:` is not an absolute path until
-        // the following root component has been appended. Probing that
-        // drive-relative prefix can fail even though the complete path and
-        // every real ancestor are safe.
-        if !current.is_absolute() {
-            continue;
-        }
-        match fs::symlink_metadata(&current) {
+    // Walk complete paths rather than rebuilding Windows drive or verbatim
+    // prefixes component by component. Missing descendants are expected for
+    // first-run roots, but every existing parent still has to be inspected.
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
             Ok(metadata) if metadata.file_type().is_symlink() => return true,
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return true,
         }
     }
@@ -682,6 +678,7 @@ max_stderr_bytes = 65536
         std::os::unix::fs::symlink(&real, &linked).expect("root symlink");
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&real, &linked).expect("root symlink");
+        assert!(has_symlink_ancestor(&linked.join("missing")));
         let mut paths = fixture.paths.clone();
         paths.global_dir = linked;
         let mut loader = WorkstreamActivationLoader::inspection(RuntimeMode::Shipyard, paths);
