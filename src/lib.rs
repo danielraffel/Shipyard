@@ -1,4 +1,17 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        unused_imports,
+        unused_variables,
+        clippy::large_enum_variant,
+        clippy::unnecessary_wraps,
+        clippy::unused_self,
+        clippy::unused_unit,
+        reason = "Unix controller capabilities compile as explicit fail-closed stubs on Windows"
+    )
+)]
 
 //! Core library for Shipyard.
 

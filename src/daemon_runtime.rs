@@ -27,6 +27,7 @@ use serde_json::Value;
 #[cfg(unix)]
 use chrono::Utc;
 
+#[cfg(unix)]
 use crate::actionable_wake_producer::{ActionableWakeProducer, ActionableWakeProducerStatus};
 use crate::config::LoadedConfig;
 #[cfg(unix)]
@@ -2237,6 +2238,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn canary_capability_recovers_after_a_later_clean_tick() {
         let mut capabilities =

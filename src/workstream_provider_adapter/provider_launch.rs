@@ -180,6 +180,7 @@ pub(super) fn delivery_prompt(request: &ProviderWrapperRequestV1) -> String {
     )
 }
 
+#[cfg(unix)]
 pub(super) fn prepare_private_launch(
     request: &ProviderWrapperRequestV1,
     snapshot_executable: bool,
@@ -240,6 +241,14 @@ pub(super) fn prepare_private_launch(
         route_path,
         executable_path,
     })
+}
+
+#[cfg(not(unix))]
+pub(super) fn prepare_private_launch(
+    _: &ProviderWrapperRequestV1,
+    _: bool,
+) -> Result<PrivateLaunch, &'static str> {
+    Err("private-launch-unavailable")
 }
 
 #[cfg(unix)]

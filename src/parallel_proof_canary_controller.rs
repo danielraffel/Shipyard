@@ -127,7 +127,7 @@ impl StrictSshCanaryTarget {
         validate_executable(&self.ssh_program)?;
         validate_private_identity_authority(&self.identity_file)?;
         let authority = KnownHostsAuthority::open(&self.known_hosts_file)?;
-        let known_hosts_sha256 = authority.digest.clone();
+        let known_hosts_sha256 = authority.digest().clone();
         let mut command = Command::new(&self.ssh_program);
         command
             .env_clear()

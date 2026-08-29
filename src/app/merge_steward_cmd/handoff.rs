@@ -4463,6 +4463,6 @@ fn main() {{
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "handoff/launch_profile_tests.rs"]
 mod launch_profile_tests;

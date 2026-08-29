@@ -371,6 +371,11 @@ impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
         &mut self,
         request: &CanarySupervisedLaunch,
     ) -> Result<CanaryProcessTreeIdentity, String> {
+        if !cfg!(unix) {
+            return Err(
+                "canary worker custody requires Unix process birth and group identity".to_owned(),
+            );
+        }
         request.validate()?;
         let ApprovedCanaryOperation::ParallelProofDistributedShadow {
             worker_executable_sha256,
@@ -504,7 +509,6 @@ impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
     }
 }
 
-#[cfg(unix)]
 fn capture_worker_start_identity(
     child: &mut Child,
     probe: impl FnOnce(u32) -> Result<Option<Sha256Digest>, String>,
@@ -579,6 +583,11 @@ fn os_process_start_identity(pid: u32) -> Result<Option<Sha256Digest>, String> {
     crate::worker_process_custody::process_start_identity(pid)
         .map(|identity| identity.map(|bytes| Sha256Digest::of_bytes(&bytes)))
         .map_err(|_| "canary worker OS start identity is unavailable".to_owned())
+}
+
+#[cfg(not(unix))]
+fn os_process_start_identity(_pid: u32) -> Result<Option<Sha256Digest>, String> {
+    Err("canary worker OS start identity is unavailable on this platform".to_owned())
 }
 
 #[cfg(unix)]
