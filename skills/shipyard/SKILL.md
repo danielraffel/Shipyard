@@ -354,10 +354,35 @@ not resume until the incident owner has restored the intended queue order.
 Queue writes are serialized process-wide and recorded in machine-global
 `merge_queue/mutations.jsonl`.
 
-For release rollout, configure absolute `shipyard_bin` and `github_cli` paths plus explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir` on every remote
-`[host_class.<name>]`. Review `shipyard runner fleet-update --to vX.Y.Z` and
-then use the same command with `--apply`; do not assemble per-host SSH/install
-pipelines. Fleet rollout requires a self-contained machine-global command auth
+For release rollout, configure absolute `shipyard_bin` and `github_cli` paths
+plus explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir`
+on every remote `[host_class.<name>]`. Review `shipyard runner fleet-update
+--to vX.Y.Z --host-class <class>` and then use the same command with `--apply`;
+do not assemble per-host SSH/install pipelines. Repeat `--host-class` only for
+a reviewed ordered subset, or use explicit `--all-hosts`. Missing, unknown, and
+duplicate selection fails closed; apply stops before later hosts after the
+first failure.
+
+Before any host can mutate, Shipyard resolves the exact annotated tag object,
+commit, tree, release ID, checksum-manifest asset, and macOS DMG asset. It
+downloads both assets by ID, verifies their GitHub SHA-256 values and exact
+manifest entry, and requires DMG `gh attestation verify` proof from
+`danielraffel/Shipyard/.github/workflows/release.yml` at the exact tag ref and
+source commit. A tag string or locally asserted receipt is never source
+authority. A missing DMG attestation keeps the release ineligible. Shipyard
+closes the authority-mint window by re-reading the tag, release ID, and asset
+inventory, then freezes that exact authority for the rollout. Each host must
+return the frozen authority and platform-asset digests; Shipyard never remints
+authority between hosts, and any receipt or cross-host pair-hash mismatch stops
+every later host.
+
+A successful typed host receipt includes the full authority plus before/after
+primary and `shipyard-workstream-provider` path, version, and double-observed
+SHA-256, CLI/daemon identity, configured runtime paths, and repository
+preservation. Pre-install provenance is explicitly unverified; only the
+post-install pair is bound to the verified authority digest. Releases from
+v0.127.0 require both pair members; older rollback tags at or above v0.100.0
+must prove the companion absent. Fleet rollout requires a self-contained machine-global command auth
 helper because inherited secrets are deliberately stripped. The updater stages
 the entire exact-tag installer before execution (including when the old remote
 binary predates fleet-update), refreshes daemons only after

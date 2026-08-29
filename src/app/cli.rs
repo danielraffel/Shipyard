@@ -1200,9 +1200,15 @@ pub(super) enum RunnerCommand {
     /// refresh each daemon. Plans only unless `--apply` is supplied.
     #[command(name = "fleet-update")]
     FleetUpdate {
-        /// Exact release tag to install on every host, for example v0.100.0.
+        /// Exact release tag to install, for example v0.127.2.
         #[arg(long = "to")]
         to: String,
+        /// Governed host class to update. Repeat to define fail-stop order.
+        #[arg(long = "host-class")]
+        host_classes: Vec<String>,
+        /// Explicitly select every configured host class in configuration order.
+        #[arg(long, conflicts_with = "host_classes")]
+        all_hosts: bool,
         /// Execute the rollout. Without this flag, emit the exact host plan.
         #[arg(long)]
         apply: bool,
