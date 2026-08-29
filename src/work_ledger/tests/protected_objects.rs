@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::work_ledger::route::OpaqueRef;
 use crate::work_ledger::{ProtectedObjectKind, digest};
 
@@ -13,24 +14,27 @@ fn ledger_with_work() -> (TempDir, WorkLedger, String) {
 
 #[cfg(not(unix))]
 #[test]
-fn unsupported_platform_allows_absent_storage_but_refuses_an_observed_directory() {
-    let (temp, ledger, _work_id) = ledger_with_work();
+fn unsupported_production_platform_uses_test_only_storage_backend() {
+    use crate::work_ledger::protected_objects::PRODUCTION_PROTECTED_OBJECT_STORAGE_SUPPORTED;
+
+    assert!(!PRODUCTION_PROTECTED_OBJECT_STORAGE_SUPPORTED);
+    let (temp, ledger, work_id) = ledger_with_work();
     assert_eq!(
         ledger.status().expect("absent storage").protected_objects,
         0
     );
-
-    fs::create_dir(temp.path().join("work-ledger/protected-objects"))
-        .expect("protected object directory fixture");
-    let error = ledger
-        .status()
-        .expect_err("observed storage must fail closed");
-    assert!(
-        error
-            .to_string()
-            .contains("require no-follow file descriptors"),
-        "unexpected refusal: {error}"
-    );
+    let bytes = b"test-only protected object";
+    ledger
+        .put_protected_object(
+            &work_id,
+            ProtectedObjectKind::ProviderRequest,
+            None,
+            &digest(bytes),
+            bytes,
+        )
+        .expect("test-only backend");
+    assert_eq!(ledger.status().expect("test status").protected_objects, 1);
+    assert!(temp.path().join("work-ledger/protected-objects").is_dir());
 }
 
 #[cfg(unix)]

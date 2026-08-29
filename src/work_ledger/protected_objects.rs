@@ -1,6 +1,7 @@
 //! Immutable protected objects referenced by the canonical work ledger.
 
 use std::collections::BTreeMap;
+#[cfg(any(unix, test))]
 use std::io::{Read, Write};
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -15,6 +16,20 @@ const PROTECTED_OBJECT_DIRECTORY: &str = "protected-objects";
 const MAX_PROTECTED_OBJECT_BYTES: usize = 1_048_576;
 const MAX_PROTECTED_OBJECT_ROWS: usize = 4_096;
 const MAX_PROTECTED_OBJECT_TOTAL_BYTES: u64 = 16 * 1_048_576;
+
+#[cfg(test)]
+pub(super) const PRODUCTION_PROTECTED_OBJECT_STORAGE_SUPPORTED: bool = cfg!(unix);
+
+#[cfg(any(unix, all(not(unix), not(test))))]
+type ProtectedObjectDirectory = std::fs::File;
+
+/// Path-backed protected-object storage exists only in unit-test builds on
+/// platforms where the production no-follow descriptor contract is absent.
+/// Release binaries on those platforms keep refusing protected storage.
+#[cfg(all(not(unix), test))]
+struct ProtectedObjectDirectory {
+    path: std::path::PathBuf,
+}
 
 /// Closed object families accepted by the protected store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,7 +412,7 @@ fn protected_object_record(
 fn try_open_object_directory(
     parent: &std::path::Path,
     create: bool,
-) -> WorkLedgerResult<Option<std::fs::File>> {
+) -> WorkLedgerResult<Option<ProtectedObjectDirectory>> {
     use rustix::fs::{Mode, OFlags, fchmod, mkdirat, open, openat};
     use std::os::unix::fs::PermissionsExt;
 
@@ -443,12 +458,12 @@ fn try_open_object_directory(
 fn open_object_directory(
     parent: &std::path::Path,
     create: bool,
-) -> WorkLedgerResult<std::fs::File> {
+) -> WorkLedgerResult<ProtectedObjectDirectory> {
     try_open_object_directory(parent, create)?
         .ok_or_else(|| WorkLedgerError::Refused("protected object directory is missing".to_owned()))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(test)))]
 fn try_open_object_directory(
     parent: &std::path::Path,
     create: bool,
@@ -467,10 +482,42 @@ fn try_open_object_directory(
     }
 }
 
+#[cfg(all(not(unix), test))]
+fn try_open_object_directory(
+    parent: &std::path::Path,
+    create: bool,
+) -> WorkLedgerResult<Option<ProtectedObjectDirectory>> {
+    let path = parent.join(PROTECTED_OBJECT_DIRECTORY);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&path)?;
+            std::fs::symlink_metadata(&path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(WorkLedgerError::Refused(
+            "test protected object directory is not a plain directory".to_owned(),
+        ));
+    }
+    Ok(Some(ProtectedObjectDirectory { path }))
+}
+
+#[cfg(all(not(unix), test))]
+fn open_object_directory(
+    parent: &std::path::Path,
+    create: bool,
+) -> WorkLedgerResult<ProtectedObjectDirectory> {
+    try_open_object_directory(parent, create)?
+        .ok_or_else(|| WorkLedgerError::Refused("protected object directory is missing".to_owned()))
+}
+
 #[cfg(unix)]
 fn verify_directory_binding(
     parent: &std::path::Path,
-    directory: &std::fs::File,
+    directory: &ProtectedObjectDirectory,
 ) -> WorkLedgerResult<()> {
     use rustix::fs::{Mode, OFlags, open, openat};
     use std::os::unix::fs::MetadataExt;
@@ -535,7 +582,7 @@ fn read_object_file(
 
 #[cfg(unix)]
 fn read_object_from_directory(
-    directory: &std::fs::File,
+    directory: &ProtectedObjectDirectory,
     name: &str,
     record: &ProtectedObjectRecord,
 ) -> WorkLedgerResult<Vec<u8>> {
@@ -641,7 +688,7 @@ fn scan_object_directory(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(test)))]
 fn scan_object_directory(
     _parent: &std::path::Path,
     expected: &mut BTreeMap<String, ProtectedObjectRecord>,
@@ -655,6 +702,169 @@ fn scan_object_directory(
     }
 }
 
+#[cfg(all(not(unix), test))]
+fn validate_test_object_file(
+    path: &std::path::Path,
+    record: &ProtectedObjectRecord,
+) -> WorkLedgerResult<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() != record.byte_length
+        || metadata.len() > MAX_PROTECTED_OBJECT_BYTES as u64
+    {
+        return Err(WorkLedgerError::Refused(
+            "test protected object file metadata is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), test))]
+fn read_object_file(
+    parent: &std::path::Path,
+    name: &str,
+    record: &ProtectedObjectRecord,
+) -> WorkLedgerResult<Vec<u8>> {
+    let directory = open_object_directory(parent, false)?;
+    read_object_from_directory(&directory, name, record)
+}
+
+#[cfg(all(not(unix), test))]
+fn read_object_from_directory(
+    directory: &ProtectedObjectDirectory,
+    name: &str,
+    record: &ProtectedObjectRecord,
+) -> WorkLedgerResult<Vec<u8>> {
+    let path = directory.path.join(name);
+    validate_test_object_file(&path, record)?;
+    let mut file = std::fs::File::open(&path)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_PROTECTED_OBJECT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != record.byte_length || digest(&bytes) != record.content_digest {
+        return Err(WorkLedgerError::Refused(
+            "protected object bytes do not match registered metadata".to_owned(),
+        ));
+    }
+    validate_test_object_file(&path, record)?;
+    Ok(bytes)
+}
+
+#[cfg(all(not(unix), test))]
+fn reconcile_pending_objects(directory: &ProtectedObjectDirectory) -> WorkLedgerResult<()> {
+    for entry in std::fs::read_dir(&directory.path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(WorkLedgerError::Refused(
+                "pending protected object name is not UTF-8".to_owned(),
+            ));
+        };
+        if !name.starts_with(".pending-") {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_PROTECTED_OBJECT_BYTES as u64
+        {
+            return Err(WorkLedgerError::Refused(
+                "pending protected object is unsafe to reconcile".to_owned(),
+            ));
+        }
+        std::fs::remove_file(entry.path())?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), test))]
+fn scan_object_directory(
+    parent: &std::path::Path,
+    expected: &mut BTreeMap<String, ProtectedObjectRecord>,
+) -> WorkLedgerResult<()> {
+    let Some(directory) = try_open_object_directory(parent, false)? else {
+        return Ok(());
+    };
+    let mut names = std::fs::read_dir(&directory.path)?
+        .map(|entry| {
+            entry?.file_name().into_string().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "protected object filename is not UTF-8",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if names.len() > MAX_PROTECTED_OBJECT_ROWS {
+        return Err(WorkLedgerError::Refused(
+            "protected object directory exceeds its entry bound".to_owned(),
+        ));
+    }
+    names.sort();
+    for name in names {
+        let Some(record) = expected.remove(&name) else {
+            return Err(WorkLedgerError::Refused(
+                "protected object directory contains an unregistered entry".to_owned(),
+            ));
+        };
+        read_object_from_directory(&directory, &name, &record)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), test))]
+fn verify_directory_binding(
+    parent: &std::path::Path,
+    directory: &ProtectedObjectDirectory,
+) -> WorkLedgerResult<()> {
+    let rebound = parent.join(PROTECTED_OBJECT_DIRECTORY);
+    let metadata = std::fs::symlink_metadata(&rebound)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || std::fs::canonicalize(rebound)? != std::fs::canonicalize(&directory.path)?
+    {
+        return Err(WorkLedgerError::Refused(
+            "protected object directory binding changed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), test))]
+fn write_object_to_directory(
+    directory: &ProtectedObjectDirectory,
+    name: &str,
+    record: &ProtectedObjectRecord,
+    bytes: &[u8],
+) -> WorkLedgerResult<()> {
+    let path = directory.path.join(name);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            validate_test_object_file(&path, record)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let observed = read_object_from_directory(directory, name, record)?;
+            if observed == bytes {
+                Ok(())
+            } else {
+                Err(WorkLedgerError::Refused(
+                    "protected object filename collides with different bytes".to_owned(),
+                ))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(all(
     unix,
     any(
@@ -665,7 +875,7 @@ fn scan_object_directory(
     )
 ))]
 fn write_object_to_directory(
-    directory: &std::fs::File,
+    directory: &ProtectedObjectDirectory,
     name: &str,
     record: &ProtectedObjectRecord,
     bytes: &[u8],
@@ -754,7 +964,7 @@ fn write_object_to_directory(
     ))
 ))]
 fn write_object_to_directory(
-    _directory: &std::fs::File,
+    _directory: &ProtectedObjectDirectory,
     _name: &str,
     _record: &ProtectedObjectRecord,
     _bytes: &[u8],
@@ -764,7 +974,7 @@ fn write_object_to_directory(
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(test)))]
 fn read_object_file(
     _parent: &std::path::Path,
     _name: &str,
@@ -775,7 +985,7 @@ fn read_object_file(
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(test)))]
 fn open_object_directory(
     _parent: &std::path::Path,
     _create: bool,
@@ -785,9 +995,9 @@ fn open_object_directory(
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(test)))]
 fn read_object_from_directory(
-    _directory: &std::fs::File,
+    _directory: &ProtectedObjectDirectory,
     _name: &str,
     _record: &ProtectedObjectRecord,
 ) -> WorkLedgerResult<Vec<u8>> {
@@ -796,26 +1006,26 @@ fn read_object_from_directory(
     ))
 }
 
-#[cfg(not(unix))]
-fn reconcile_pending_objects(_directory: &std::fs::File) -> WorkLedgerResult<()> {
+#[cfg(all(not(unix), not(test)))]
+fn reconcile_pending_objects(_directory: &ProtectedObjectDirectory) -> WorkLedgerResult<()> {
     Err(WorkLedgerError::Refused(
         "protected objects require no-follow file descriptors on this platform".to_owned(),
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(test)))]
 fn verify_directory_binding(
     _parent: &std::path::Path,
-    _directory: &std::fs::File,
+    _directory: &ProtectedObjectDirectory,
 ) -> WorkLedgerResult<()> {
     Err(WorkLedgerError::Refused(
         "protected objects require no-follow file descriptors on this platform".to_owned(),
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(test)))]
 fn write_object_to_directory(
-    _directory: &std::fs::File,
+    _directory: &ProtectedObjectDirectory,
     _name: &str,
     _record: &ProtectedObjectRecord,
     _bytes: &[u8],
