@@ -4,7 +4,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::daemon_worker_capacity::DaemonWorkerCapacity;
+use crate::daemon_worker_capacity::{DaemonWorkerCapacity, ExclusiveSandboxAdmission};
 use crate::parallel_proof::Sha256Digest;
 use crate::writer_domain_lease::{
     WRITER_DOMAIN_OVERLAP_CLASSIFICATION, WRITER_DOMAIN_OVERLAP_EXIT_CODE,
@@ -19,7 +19,7 @@ pub(super) fn sandbox_audit_exec_command(
     command: &[OsString],
 ) -> Result<ExitCode, CliFailure> {
     let capacity = DaemonWorkerCapacity::new(state_dir);
-    let Some(_exclusive_sandbox) = capacity
+    let admission = capacity
         .claim_exclusive_sandbox_if_queue_idle(state_dir, work_id, authority_sha)
         .map_err(|error| {
             CliFailure::new(
@@ -28,14 +28,18 @@ pub(super) fn sandbox_audit_exec_command(
                     "{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: could not prove exclusive sandbox admission: {error}"
                 ),
             )
-        })?
-    else {
-        return Err(CliFailure::new(
-            WRITER_DOMAIN_OVERLAP_EXIT_CODE,
-            format!(
-                "{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: exclusive sandbox admission requires an idle production queue and free shared worker capacity"
-            ),
-        ));
+        })?;
+    let _exclusive_sandbox = match admission {
+        ExclusiveSandboxAdmission::Acquired(lease) => lease,
+        ExclusiveSandboxAdmission::Refused(refusal) => {
+            return Err(CliFailure::new(
+                WRITER_DOMAIN_OVERLAP_EXIT_CODE,
+                format!(
+                    "{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: exclusive sandbox admission refused: {}",
+                    refusal.classification()
+                ),
+            ));
+        }
     };
     let (program, args) = command
         .split_first()
@@ -227,7 +231,9 @@ fn capture_process_start_identity(_pid: u32) -> Result<Sha256Digest, String> {
 mod tests {
     use std::os::unix::process::CommandExt as _;
 
-    use crate::daemon_worker_capacity::{DaemonWorkerCapacity, DaemonWorkerClaim};
+    use crate::daemon_worker_capacity::{
+        DaemonWorkerCapacity, DaemonWorkerClaim, ExclusiveSandboxAdmission,
+    };
     use crate::job::{Job, Priority, ValidationMode};
     use crate::queue::Queue;
 
@@ -239,8 +245,10 @@ mod tests {
         let capacity = DaemonWorkerCapacity::new(temp.path());
         let exclusive = capacity
             .claim_exclusive_sandbox_if_queue_idle(temp.path(), "audit-1", "a1b2c3")
-            .expect("admission")
-            .expect("exclusive capacity");
+            .expect("admission");
+        let ExclusiveSandboxAdmission::Acquired(exclusive) = exclusive else {
+            panic!("exclusive capacity refused");
+        };
         let mut command = Command::new("/bin/sleep");
         command.arg("30").process_group(0);
         let mut worker = command.spawn().expect("worker");
@@ -283,6 +291,7 @@ mod tests {
 
         assert_eq!(error.code, WRITER_DOMAIN_OVERLAP_EXIT_CODE);
         assert!(error.message.contains(WRITER_DOMAIN_OVERLAP_CLASSIFICATION));
+        assert!(error.message.contains("sandbox_queue_not_idle"));
         assert!(!invoked.exists(), "refused audit must not start its child");
     }
 }
