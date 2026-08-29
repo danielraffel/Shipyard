@@ -754,6 +754,33 @@ fn validate_build_tree_root(root: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Produce a stable, fully verified inventory of one immutable directory tree.
+///
+/// The tree is opened through no-follow directory handles, every regular file
+/// is hashed, and the complete inventory is observed a second time before it is
+/// returned. Links, special files, hard links, concurrent mutation, and
+/// unsupported controller platforms fail closed. The operation is read-only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedImmutableTreeInventory {
+    /// Portable mode of the pinned root directory.
+    pub root_mode: u32,
+    /// Complete sorted inventory below the root.
+    pub entries: Vec<LayoutEntry>,
+}
+
+pub fn verified_immutable_tree_inventory(
+    root: &Path,
+) -> Result<VerifiedImmutableTreeInventory, Error> {
+    validate_build_tree_root(root)?;
+    let observed = observe_build_tree(root)?;
+    let inventory = VerifiedImmutableTreeInventory {
+        root_mode: observed.root_mode,
+        entries: observed.entries.clone(),
+    };
+    validate_observed_build_tree(root, &observed, &inventory.entries)?;
+    Ok(inventory)
+}
+
 fn validate_observed_build_tree(
     root_path: &Path,
     observed: &ObservedBuildTree,

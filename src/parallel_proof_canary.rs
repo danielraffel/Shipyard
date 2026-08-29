@@ -15,11 +15,11 @@ use crate::parallel_proof::{
     ShardExecutionMode,
 };
 
-const PULP_REPOSITORY: &str = "generous-corp/pulp";
-const PULP_REPOSITORY_ID: u64 = 1_203_111_607;
-const PULP_MAC_TARGET: &str = "mac";
-const INITIAL_BUILDER: &str = "m3";
-const INITIAL_WORKER: &str = "m1";
+pub(crate) const PULP_REPOSITORY: &str = "generous-corp/pulp";
+pub(crate) const PULP_REPOSITORY_ID: u64 = 1_203_111_607;
+pub(crate) const PULP_MAC_TARGET: &str = "mac";
+pub(crate) const INITIAL_BUILDER: &str = "m3";
+pub(crate) const INITIAL_WORKER: &str = "m1";
 const MINIMUM_SAVINGS_MS: u64 = 120_000;
 const MINIMUM_SAVINGS_PERCENT: u64 = 10;
 const MAX_OVERHEAD_PERCENT: u64 = 15;
@@ -196,8 +196,18 @@ pub enum PulpMacCanaryDecision {
         manifest_digest: Sha256Digest,
         /// Exact build host selected by the narrow policy.
         builder_host_id: String,
+        /// Exact authenticated builder session admitted by this decision.
+        builder_session_generation: u64,
+        /// Controller time of the admitted builder observation.
+        builder_observed_at_ms: u64,
         /// Exact secondary worker selected by the narrow policy.
         worker_host_id: String,
+        /// Exact authenticated worker session admitted by this decision.
+        worker_session_generation: u64,
+        /// Controller time of the admitted worker observation.
+        worker_observed_at_ms: u64,
+        /// Digest of both complete admitted host observations in role order.
+        host_observations_digest: Sha256Digest,
         /// Number of exhaustive, disjoint shards in the bound plan.
         shard_count: u32,
         /// Fleet-exclusive shards retained from `RUN_SERIAL` declarations.
@@ -298,10 +308,20 @@ pub fn assess_pulp_mac_canary(
         .map(|lock| lock.name.as_str())
         .collect::<BTreeSet<_>>()
         .len();
+    let (Some(builder), Some(worker)) = (builder, worker) else {
+        return Err(ParallelProofError::InvalidField(
+            "eligible canary host observations",
+        ));
+    };
     Ok(PulpMacCanaryDecision::Eligible {
         manifest_digest,
         builder_host_id: policy.builder_host_id.clone(),
+        builder_session_generation: builder.session_generation,
+        builder_observed_at_ms: builder.observed_at_ms,
         worker_host_id: policy.worker_host_id.clone(),
+        worker_session_generation: worker.session_generation,
+        worker_observed_at_ms: worker.observed_at_ms,
+        host_observations_digest: canary_host_observations_digest(builder, worker)?,
         shard_count: u32::try_from(proof.plan.shards.len())
             .map_err(|_| ParallelProofError::InvalidField("canary shard count"))?,
         fleet_exclusive_shards: u32::try_from(fleet_exclusive_shards)
@@ -311,6 +331,26 @@ pub fn assess_pulp_mac_canary(
         predicted_savings_ms: savings,
         predicted_overhead_percent: overhead_percent,
     })
+}
+
+pub(crate) fn is_pulp_mac_canary_scope(proof: ParallelProofContext<'_>) -> bool {
+    proof.manifest.source.repository_id == PULP_REPOSITORY_ID
+        && proof.manifest.source.repository == PULP_REPOSITORY
+        && proof.manifest.build.target_triple == "aarch64-apple-darwin"
+}
+
+pub(crate) fn canary_host_observations_digest(
+    builder: &CanaryHostObservation,
+    worker: &CanaryHostObservation,
+) -> Result<Sha256Digest, ParallelProofError> {
+    let bytes = serde_json::to_vec(&(builder, worker))?;
+    let domain = b"shipyard.pulp-mac-canary.host-observations.v1";
+    let mut canonical = Vec::with_capacity(16 + domain.len() + bytes.len());
+    canonical.extend_from_slice(&(domain.len() as u64).to_be_bytes());
+    canonical.extend_from_slice(domain);
+    canonical.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    canonical.extend_from_slice(&bytes);
+    Ok(Sha256Digest::of_bytes(&canonical))
 }
 
 fn assess_timing(

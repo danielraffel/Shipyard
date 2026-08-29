@@ -128,14 +128,72 @@ Before any scheduler or shard integration is enabled:
 M5 must never be a required shard while roaming. Its availability is additive,
 not part of the minimum completion set.
 
-## Logs and retention
+## Measurements, logs, and retention
 
-Future integration must write bounded structured records containing artifact
-and manifest digests, source head/tree, producer fence, source/destination host,
-LAN or tailnet route, cache hits/misses by generation, bytes total/reused/sent,
-verified resume offset, setup/transfer/verification duration, free-space
-observation, outcome, and reassignment reason. Never log credentials or raw
-rsync environment.
+`parallel_proof_canary_receipt` defines the compact, shadow-only measurement
+record for the first Pulp macOS canary. It binds the complete proof-manifest
+digest, repository/head/tree, encoded artifact and layout digests, exact builder
+and worker observations plus session generations, authenticated LAN route, full/resumed/object-
+reuse byte accounting, and exact cache generations. The legacy untrusted
+avoided-byte field is canonically zero; it is never accepted as measurement. Setup/
+transfer/verification/dispatch/shard/worker timings, submit-to-receipt wall
+clock, and the digest of a separately validated same-proof single-host control
+receipt. Routine canaries require
+`model_calls=0`. The receipt reports the 120-second-and-10-percent speed floor
+and 15-percent transport-overhead ceiling without becoming merge authority.
+The speed gate consumes only controller timing and transport byte counters.
+
+`parallel_proof_canary_driver` is the default-off controller execution seam. It
+first authenticates the exact M3/M1 observations, completes the M3 control,
+rechecks both session fences and the storage reserve, then permits transfer and
+distributed shadow execution. It rechecks the fences and reserve again before
+publishing schema-v1 driver evidence. The exact pre-execution and final host
+observations are retained alongside recomputable digests. Before any transfer
+or shard work the store publishes an immutable `distributed_started` record;
+post-start failures publish a separate immutable failure record, and an
+unreconciled started/failed correlation is never retried automatically. Resume evidence includes partial and
+verified-prefix digests plus pre-interruption, retained-prefix, and suffix-byte
+counters. Exact cache generations and use are recorded, while avoided-byte
+claims are not representable at the adapter boundary. `model_calls` is supplied
+by neither policy nor adapter and is always zero.
+
+The execution driver has no production shell, daemon, or fleet adapter. The
+separate cache-observation path has a production-callable strict-SSH M3-to-M1
+carrier, but it is read-only, requires protected controller authority, rejects
+ambient SSH state, and cannot execute transfer/shard work. Therefore setting
+`policy.enabled=true` alone still cannot mutate M3, M1, a cache, or a staging
+root.
+
+Successful driver evidence is published through
+`PulpMacCanaryEvidenceStore`, a controller-owned crash-durable no-overwrite
+store. Byte-identical replay is idempotent and a conflicting correlation id is
+refused. Never
+log credentials, private paths, or raw rsync environment. Failed and reassigned
+attempts still need bounded transition records; they must not be rewritten into
+a successful compact receipt.
+
+### Physical canary prerequisites and command boundary
+
+There is intentionally no physical mutation command yet. Before adding one,
+the controller adapter must supply all of the following from authenticated
+APIs, not operator-entered JSON: exact M3/M1 host and nonzero session
+generations; current online/LAN route observations; canonical persistent staging
+roots; filesystem free-byte observations that retain the configured reserve;
+exact cache generation digests; monotonic phase timings; transport byte
+counters; authenticated partial/prefix digests; and compact execution receipts.
+
+The non-mutating proof commands for this slice are:
+
+```sh
+cargo test --locked --lib parallel_proof_canary_driver
+cargo test --locked --lib parallel_proof_canary_receipt
+cargo clippy --locked --all-targets --all-features -- -D warnings
+```
+
+A future physical invocation must remain an explicit default-off command shaped
+like `shipyard canary pulp-mac measure --policy <controller-policy> --dry-run`
+before any `--execute` mode is reviewed. Do not substitute ad-hoc `ssh`, `rsync`,
+claimed avoided bytes, or model-generated monitoring for that missing adapter.
 
 Rotate transfer logs with Shipyard's bounded log-retention primitives. Keep the
 terminal receipt and compact metrics longer than verbose transport logs; retain

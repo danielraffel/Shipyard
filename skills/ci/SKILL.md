@@ -46,7 +46,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Shadow-plan changed-surface tests for an exact PR head | `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n> --target <name>` (base-owned literal tests only; full suite remains authoritative; identity mismatch hard-fails, ambiguity falls back full) |
 | Authorize an exact metadata-only PR without a native worker | Configure trusted machine-global `[metadata_authority]` plus one repository entry containing a narrow path allowlist and exact required hosted checks. `shipyard pr` emits an immutable exact base/head/tree/path/check/policy receipt and queues zero native targets only when every observation agrees; unknown paths, stale/pending checks, SHA drift, or policy ambiguity preserve full validation or refuse execution. Project config cannot activate or widen this tier. |
 | Read one exact shadow-comparison result | `shipyard --json changed-surface-trial-status --repo <owner/repo> --pr <n> --target <name> --head <sha>` (read-only; exit 3 collecting, 0 ready, 1 rejected; validates exact receipt identity plus conservative timing/savings and never promotes policy or merge readiness) |
-| Assess the first Pulp macOS sharding canary | Library-only and default-off: the pure `parallel_proof_canary` contract accepts only Pulp's exact numeric repository identity and slug plus an independently observed `mac` target, M3 build + fresh M1 LAN eligibility, authenticated persistent normalized staging roots, exact host-local cache generations, preserved CTest topology, manifest-bound timing evidence, material predicted savings, and an exact non-rounded transfer-overhead ceiling. It cannot dispatch work or authorize a merge; M5 remains optional and excluded until roaming recovery is separately proven. |
+| Assess the first Pulp macOS sharding canary | Library-only and default-off: the pure `parallel_proof_canary` contract accepts only Pulp's exact numeric repository identity and slug plus an independently observed `mac` target, M3 build + fresh M1 LAN eligibility, authenticated persistent normalized staging roots, exact host-local cache generations, preserved CTest topology, manifest-bound timing evidence, material predicted savings, and an exact non-rounded transfer-overhead ceiling. The controller-owned `parallel_proof_canary_driver` completes the proof-bound same-host control before distributed work, rechecks and retains exact fresh session/storage fences, binds actual transfer and interrupted-resume counters, forces avoided-byte claims and model calls to zero, records distributed-started before mutation, and no-overwrite publishes success or post-start failure evidence. Its cache observer has a read-only strict-SSH M3-to-M1 carrier, but the execution driver has no production host adapter, so policy enablement alone cannot dispatch or mutate. Neither surface authorizes a merge; M5 remains optional and excluded until roaming recovery is separately proven. |
 | Produce a canonical shadow CTest inventory | Library-only: translate bounded CTest JSON-v1 with an independent exhaustive count/sorted-ID digest, exact configuration, bounded controller-owned capabilities, and explicit host/fleet scope for every resource lock. Filtered, ambiguous, disabled, non-executable, `REQUIRED_FILES`-dependent, or unsupported graphs fail closed. This does not invoke CTest, dispatch work, or authorize a merge. |
 | Assess one-host Pulp M3 build-once consumption | Library-only and default-off: bind exactly one successful configure/build receipt to the exact source, toolchain, canonical CTest inventory, proof manifest, and compact artifact content address; require same-session M3 consumption with zero configure/build invocations and exact sorted executed-set reconciliation. The existing full gate remains authoritative, and this cannot run commands, dispatch cross-host work, publish a check, or authorize a merge. |
 | Show run logs | `shipyard logs <job_id> --json` |
@@ -1681,6 +1681,20 @@ Reconcile resume records even when the authoritative terminal-handoff update is
 a no-op so legacy ledgers backfill on restart. Publish or roll back both maps as
 one crash-consistent ledger image, and keep `dispatch_enabled=false` until the
 outbox, acknowledgment, and physical canary gates are separately complete.
+
+**Pulp macOS cache readiness is exact and default-off.** Generate cache
+identities from the complete read-only no-follow tree inventory; a directory
+name or `claimed_bytes_avoided` is not evidence. Probe all required M3
+generations before M1, require exact policy inventory and freshness on both,
+and persist paired zero-model evidence without overwrite. Remote M1 proof must
+cross the protected digest-pinned companion transport and bind exact
+host/session/route/capability/staging/reserve/terminal/manifest authority plus
+carrier-origin byte, digest, and monotonic timing counters. Use only the
+explicit pinned strict-SSH carrier: LAN first, independently pinned Tailnet
+only after a transport failure, and never ambient SSH/config. Tailnet cache
+measurements cannot close the LAN/session gate. The proof supplies no authority
+beyond its exact receipt and never authorizes cache mutation or canary execution. See
+`docs/pulp-mac-cache-readiness.md`.
 
 **Detached daemon temp roots must not depend on the launching shell.** A daemon
 started from launchd or a minimal SSH environment may inherit no `TMPDIR`.

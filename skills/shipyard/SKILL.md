@@ -835,6 +835,20 @@ as though no destination exists.
 The proof does not select a host or dispatch a shard. A roaming/offline worker
 is additive only and must be excluded or reassigned without blocking the
 minimum completion set.
+The `parallel_proof_canary_receipt` schema records exact proof/artifact,
+exact admitted host observations/session generations, route, transfer/resume/
+object-reuse bytes, exact cache-generation use, worker-minutes, wall-time evidence,
+and a separately validated same-proof control-receipt digest. It requires zero model calls,
+reports the measured speed/overhead gate, and never authorizes a merge. A
+receipt digest alone is not durable publication. Use the default-off
+`parallel_proof_canary_driver` to run the control strictly before distributed
+work, recheck exact authenticated M3/M1 session and storage fences, bind actual
+transport/resume counters and prefix digests, force avoided-cache-byte claims
+and model calls to zero, and publish exact bytes through its crash-durable
+immutable evidence store. Retain the complete fence observations, and durably
+record distributed-started before mutation plus terminal failure on every
+post-start error; never retry an unreconciled correlation. No production host adapter exists yet: do not use
+ad-hoc SSH/rsync or treat policy enablement as authority to mutate hosts.
 Follow [`docs/artifact-transport.md`](../../docs/artifact-transport.md) before
 integrating it with a scheduler.
 
@@ -1977,6 +1991,23 @@ full local fleet should leave jobs queued on the self-hosted VM labels until a
 controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an
 explicit operator fallback when fleet status says the local Macs are
 offline/unhealthy, or when the workflow intentionally asks for hosted coverage.
+
+For the default-off Pulp M3/M1 performance canary, cache readiness requires an
+immutable content manifest produced by the read-only no-follow tree observer.
+Observe every required M3 generation before probing M1, preserve exact policy
+generation and freshness fences, record `model_calls=0`, and publish only
+crash-durable no-overwrite paired receipts. M1 observation must use the strict
+digest-pinned companion protocol over `StrictSshRemoteM1CacheTransport`:
+explicit pinned identity and known-host authority only, with cleared ambient
+SSH configuration. Probe direct LAN first; an independently pinned Tailnet
+target may carry diagnostic cache observation only after a transport-class
+failure and can never close the LAN/session gate. Bind the exact host receipt,
+session generation, route, capabilities, persistent staging reserve, verified
+terminal instance, companion executable, immutable manifest, request/response
+digests and bytes, route RTTs, fallback class, and exchange RTT. Never reroute
+after the request crosses the companion boundary. This can close only the exact
+remote M1 gates it proves; M3 and execution authority remain separate. See
+`docs/pulp-mac-cache-readiness.md`.
 
 For Vellum's repository-scoped disposable lanes, treat an `offline + busy`
 runner as an ownership mismatch until TartCI proves otherwise. Run the bounded

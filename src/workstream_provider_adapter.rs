@@ -10,9 +10,13 @@
 use std::ffi::OsStr;
 #[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -64,6 +68,71 @@ pub fn run_stdio() -> Result<(), String> {
         .write_all(&canonical)
         .and_then(|()| stdout.write_all(b"\n"))
         .map_err(|_| "response output is unwritable".to_owned())
+}
+
+/// Verify that this process is the exact companion executable authorized by
+/// the controller before serving an auxiliary read-only protocol.
+#[cfg(unix)]
+pub(crate) fn verify_current_companion_digest(
+    expected_digest: &crate::parallel_proof::Sha256Digest,
+) -> Result<(), String> {
+    const MAX_COMPANION_BYTES: u64 = 128 * 1024 * 1024;
+
+    let current =
+        std::env::current_exe().map_err(|_| "companion-identity-unavailable".to_owned())?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(current)
+        .map_err(|_| "companion-open-refused".to_owned())?;
+    let before = file
+        .metadata()
+        .map_err(|_| "companion-metadata-refused".to_owned())?;
+    if !before.is_file()
+        || before.uid() != nix::unistd::Uid::effective().as_raw()
+        || before.nlink() != 1
+        || before.len() == 0
+        || before.len() > MAX_COMPANION_BYTES
+        || before.mode() & 0o111 == 0
+        || before.mode() & 0o022 != 0
+    {
+        return Err("companion-metadata-refused".to_owned());
+    }
+    let mut hasher = Sha256::new();
+    let copied = std::io::copy(&mut file, &mut HashWriter(&mut hasher))
+        .map_err(|_| "companion-read-refused".to_owned())?;
+    let after = file
+        .metadata()
+        .map_err(|_| "companion-metadata-refused".to_owned())?;
+    if copied != before.len()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || hex::encode(hasher.finalize()) != expected_digest.as_str()
+    {
+        return Err("companion-digest-refused".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn verify_current_companion_digest(
+    _expected_digest: &crate::parallel_proof::Sha256Digest,
+) -> Result<(), String> {
+    Err("companion-digest-verification-unavailable".to_owned())
+}
+
+struct HashWriter<'a>(&'a mut Sha256);
+
+impl Write for HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

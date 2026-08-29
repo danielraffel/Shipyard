@@ -1,16 +1,32 @@
 //! Protected stdio entrypoint for Shipyard's cmux workstream provider.
 
 fn main() -> std::process::ExitCode {
-    if std::env::args_os().len() == 2
-        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version"))
-    {
-        println!("shipyard-workstream-provider {}", env!("CARGO_PKG_VERSION"));
-        return std::process::ExitCode::SUCCESS;
-    }
-    match shipyard::workstream_provider_adapter::run_stdio() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("shipyard-workstream-provider: {error}");
+    let mut arguments = std::env::args_os();
+    let _program = arguments.next();
+    match (arguments.next(), arguments.next()) {
+        (Some(flag), None) if flag == "--version" => {
+            println!("shipyard-workstream-provider {}", env!("CARGO_PKG_VERSION"));
+            std::process::ExitCode::SUCCESS
+        }
+        (Some(flag), None) if flag == "--observe-m1-cache" => {
+            match shipyard::parallel_proof_canary_remote_cache::run_remote_m1_cache_observer_stdio()
+            {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("shipyard-workstream-provider: {error}");
+                    std::process::ExitCode::from(2)
+                }
+            }
+        }
+        (None, None) => match shipyard::workstream_provider_adapter::run_stdio() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("shipyard-workstream-provider: {error}");
+                std::process::ExitCode::from(2)
+            }
+        },
+        _ => {
+            eprintln!("shipyard-workstream-provider: unsupported arguments");
             std::process::ExitCode::from(2)
         }
     }
