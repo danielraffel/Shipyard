@@ -56,6 +56,9 @@ pub(super) enum Command {
         /// Immutable source authority being audited.
         #[arg(long)]
         authority_sha: String,
+        /// Internal process-custody generation. Presence selects worker mode.
+        #[arg(long, hide = true)]
+        worker_generation: Option<String>,
         /// Sandbox audit command and arguments.
         #[arg(last = true, required = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
@@ -2272,12 +2275,40 @@ mod tests {
             Command::SandboxAuditExec {
                 work_id,
                 authority_sha,
+                worker_generation,
                 command,
             } if work_id == "audit-1"
                 && authority_sha == "a1b2c3"
+                && worker_generation.is_none()
                 && command == [std::ffi::OsString::from("/usr/bin/true")]
         ));
         assert!(Cli::try_parse_from(["shipyard", "sandbox-audit-exec"]).is_err());
+
+        let worker = Cli::try_parse_from([
+            "shipyard",
+            "sandbox-audit-exec",
+            "--work-id",
+            "audit-1",
+            "--authority-sha",
+            "a1b2c3",
+            "--worker-generation",
+            "generation-1",
+            "--",
+            "/usr/bin/true",
+        ])
+        .expect("sandbox audit worker");
+        assert!(matches!(
+            worker.command,
+            Command::SandboxAuditExec {
+                work_id,
+                authority_sha,
+                worker_generation,
+                command,
+            } if work_id == "audit-1"
+                && authority_sha == "a1b2c3"
+                && worker_generation.as_deref() == Some("generation-1")
+                && command == [std::ffi::OsString::from("/usr/bin/true")]
+        ));
     }
 
     #[test]

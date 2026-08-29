@@ -94,12 +94,55 @@ pub(crate) fn terminate_child_tree(child: &mut Child) -> io::Result<bool> {
 /// Terminate a detached daemon-owned worker tree by exact root identity.
 #[cfg(unix)]
 pub(crate) fn terminate_detached_worker_tree(pid: u32) -> io::Result<bool> {
-    let descendants = signal_process_tree(pid)?;
-    let group_dead = verify_exited_worker_group_dead(pid)?;
+    let descendants = match signal_process_tree(pid) {
+        Ok(descendants) => descendants,
+        Err(_error) if process_id_liveness(pid) == ProcessLiveness::Dead => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let group_dead = terminate_process_group(pid)?;
     Ok(group_dead
         && descendants
             .iter()
             .all(|descendant| process_id_liveness(*descendant) == ProcessLiveness::Dead))
+}
+
+/// Terminate a daemon-owned process group even when its original leader has
+/// already exited. Callers must authenticate the group identity before using
+/// this primitive; a live leader with a mismatched birth identity is not safe
+/// to signal.
+#[cfg(unix)]
+pub(crate) fn terminate_process_group(process_group: u32) -> io::Result<bool> {
+    let status = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{process_group}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() && process_group_liveness(process_group)? == ProcessLiveness::Alive {
+        return Err(io::Error::other("worker process group could not be killed"));
+    }
+    wait_for_process_group_death(process_group)
+}
+
+/// Observe whether a process group still has any non-zombie members.
+#[cfg(unix)]
+pub(crate) fn process_group_liveness(process_group: u32) -> io::Result<ProcessLiveness> {
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pgid=,stat="])
+        .output()?;
+    if !output.status.success() {
+        return Ok(ProcessLiveness::Unknown);
+    }
+    let live = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next().and_then(|value| value.parse::<u32>().ok()) == Some(process_group)
+            && !fields.next().is_some_and(|state| state.starts_with('Z'))
+    });
+    Ok(if live {
+        ProcessLiveness::Alive
+    } else {
+        ProcessLiveness::Dead
+    })
 }
 
 fn signal_process_tree(pid: u32) -> io::Result<Vec<u32>> {
@@ -151,26 +194,14 @@ fn signal_process_tree(pid: u32) -> io::Result<Vec<u32>> {
 
 #[cfg(unix)]
 fn verify_exited_worker_group_dead(process_group: u32) -> io::Result<bool> {
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", "--", &format!("-{process_group}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    terminate_process_group(process_group)
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_death(process_group: u32) -> io::Result<bool> {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        let output = Command::new("/bin/ps")
-            .args(["-axo", "pgid=,stat="])
-            .output()?;
-        if !output.status.success() {
-            return Ok(false);
-        }
-        let live = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-            let mut fields = line.split_whitespace();
-            fields.next().and_then(|value| value.parse::<u32>().ok()) == Some(process_group)
-                && !fields.next().is_some_and(|state| state.starts_with('Z'))
-        });
-        if !live {
+        if process_group_liveness(process_group)? == ProcessLiveness::Dead {
             return Ok(true);
         }
         if Instant::now() >= deadline {

@@ -304,14 +304,25 @@ where
         Command::SandboxAuditExec {
             work_id,
             authority_sha,
+            worker_generation,
             command,
         } => {
-            return sandbox_audit_cmd::sandbox_audit_exec_command(
-                &runtime_paths.state_dir,
-                &work_id,
-                &authority_sha,
-                &command,
-            );
+            return if let Some(generation) = worker_generation {
+                sandbox_audit_cmd::sandbox_audit_worker_command(
+                    &runtime_paths.state_dir,
+                    &work_id,
+                    &authority_sha,
+                    &generation,
+                    &command,
+                )
+            } else {
+                sandbox_audit_cmd::sandbox_audit_exec_command(
+                    &runtime_paths.state_dir,
+                    &work_id,
+                    &authority_sha,
+                    &command,
+                )
+            };
         }
         Command::ExecutionWorker { job_id, generation } => {
             return execution_worker_command(
