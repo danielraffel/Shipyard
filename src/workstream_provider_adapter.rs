@@ -326,12 +326,60 @@ fn reconcile_existing_workspace(
     workspace_id: &str,
     description: &str,
 ) -> ProviderWrapperOutcomeV1 {
-    match session_bindings_for_workspace(runner, workspace_id, &request.provider_id) {
-        Ok(bindings) if bindings.len() == 1 => {
-            delivered(request, workspace_id, description, &bindings[0])
+    let state = match session_bindings_for_workspace(runner, workspace_id, &request.provider_id) {
+        Ok(state) => state,
+        Err(code) => return uncertain(code),
+    };
+    match state.bindings.as_slice() {
+        [binding] => delivered(request, workspace_id, description, binding),
+        [] if request.operation == ProviderWrapperOperationV1::Reconcile
+            && state.surface_ids.len() == 1 =>
+        {
+            recover_existing_surface(request, runner, workspace_id, &state.surface_ids[0])
         }
-        Ok(bindings) if bindings.is_empty() => uncertain("cmux-session-binding-not-yet-visible"),
-        Ok(_) => uncertain("multiple-provider-session-bindings"),
+        [] => uncertain("cmux-session-binding-not-yet-visible"),
+        _ => uncertain("multiple-provider-session-bindings"),
+    }
+}
+
+fn recover_existing_surface(
+    request: &ProviderWrapperRequestV1,
+    runner: &mut impl CmuxRunner,
+    workspace_id: &str,
+    surface_id: &str,
+) -> ProviderWrapperOutcomeV1 {
+    let private_launch = match prepare_private_launch(request) {
+        Ok(launch) => launch,
+        Err(code) => return uncertain(code),
+    };
+    let mut args = cmux_prefix(["respawn-pane"]);
+    args.extend([
+        "--workspace".to_owned(),
+        workspace_id.to_owned(),
+        "--surface".to_owned(),
+        surface_id.to_owned(),
+        "--command".to_owned(),
+        private_launch.command.clone(),
+    ]);
+    let result = runner.run(&args);
+    if !private_launch.wait_until_consumed(PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE) {
+        return uncertain("cmux-private-relaunch-not-consumed");
+    }
+    match result {
+        Ok(result) if result.success => {}
+        Ok(_) | Err(_) => return uncertain("cmux-respawn-outcome-unknown"),
+    }
+    match session_binding_for_surface(runner, workspace_id, surface_id, &request.provider_id) {
+        Ok(Some(binding)) => delivered(
+            request,
+            workspace_id,
+            &format!(
+                "shipyard-workstream-delivery:{}",
+                request.delivery_fence.idempotency_key
+            ),
+            &binding,
+        ),
+        Ok(None) => uncertain("cmux-session-binding-not-yet-visible-after-respawn"),
         Err(code) => uncertain(code),
     }
 }
@@ -620,11 +668,16 @@ struct SurfaceResumeEvidence {
     resume_binding: Option<AgentSessionBinding>,
 }
 
+struct WorkspaceSessionState {
+    surface_ids: Vec<String>,
+    bindings: Vec<AgentSessionBinding>,
+}
+
 fn session_bindings_for_workspace(
     runner: &mut impl CmuxRunner,
     workspace_id: &str,
     provider_id: &str,
-) -> Result<Vec<AgentSessionBinding>, &'static str> {
+) -> Result<WorkspaceSessionState, &'static str> {
     let mut args = cmux_prefix(["surface-health"]);
     args.extend(["--workspace".to_owned(), workspace_id.to_owned()]);
     let result = runner
@@ -649,14 +702,17 @@ fn session_bindings_for_workspace(
         return Err("cmux-surface-id-duplicated");
     }
     let mut bindings = Vec::new();
-    for surface_id in surface_ids {
+    for surface_id in &surface_ids {
         if let Some(binding) =
-            session_binding_for_surface(runner, workspace_id, &surface_id, provider_id)?
+            session_binding_for_surface(runner, workspace_id, surface_id, provider_id)?
         {
             bindings.push(binding);
         }
     }
-    Ok(bindings)
+    Ok(WorkspaceSessionState {
+        surface_ids,
+        bindings,
+    })
 }
 
 fn session_binding_for_surface(

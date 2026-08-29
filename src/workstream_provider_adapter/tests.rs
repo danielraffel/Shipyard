@@ -293,6 +293,8 @@ fn workspace_created_before_agent_hook_session_is_not_accepted() {
             list(serde_json::json!([workspace(&description(&request))])),
             surface_health(&[SURFACE_UUID]),
             session_evidence(None),
+            successful_json(serde_json::json!({"ok": true})),
+            session_evidence(None),
         ]),
         ..FakeRunner::default()
     };
@@ -303,7 +305,8 @@ fn workspace_created_before_agent_hook_session_is_not_accepted() {
         response.outcome,
         ProviderWrapperOutcomeV1::Uncertain { .. }
     ));
-    assert_eq!(runner.calls.len(), 4);
+    assert_eq!(runner.calls.len(), 6);
+    assert_eq!(runner.calls[4][3], "respawn-pane");
     assert!(runner.calls.iter().all(|call| {
         call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
     }));
@@ -421,6 +424,39 @@ fn delayed_workspace_visibility_keeps_one_fence_and_never_creates_again() {
         })
         .count();
     assert_eq!(create_count, 1);
+}
+
+#[test]
+fn reconciliation_respawns_one_stranded_surface_with_the_exact_private_route() {
+    let mut request = request("qwen", ProviderWrapperOperationV1::Reconcile);
+    request.protected_route.argv[1] = "qwen".into();
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(None),
+            successful_json(serde_json::json!({"ok": true})),
+            session_evidence(Some("qwen")),
+        ]),
+        ..FakeRunner::default()
+    };
+    let response = handle_request(&request, &mut runner);
+    assert_delivered(&response, "qwen");
+    let respawn = &runner.calls[4];
+    assert_eq!(respawn[3], "respawn-pane");
+    assert_eq!(
+        respawn[respawn.iter().position(|arg| arg == "--workspace").unwrap() + 1],
+        UUID.to_ascii_lowercase()
+    );
+    assert_eq!(
+        respawn[respawn.iter().position(|arg| arg == "--surface").unwrap() + 1],
+        SURFACE_UUID.to_ascii_lowercase()
+    );
+    let command = &respawn[respawn.iter().position(|arg| arg == "--command").unwrap() + 1];
+    assert!(!command.contains("account-a"));
+    assert!(!command.contains("native-session-a"));
+    assert!(runner.private_launches[0].contains("exec '/opt/subrouter' 'qwen' 'resume'"));
 }
 
 #[test]
