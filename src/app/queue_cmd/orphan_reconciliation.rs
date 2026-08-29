@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -407,8 +407,7 @@ pub(super) fn write_orphan_reconciliation(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     temp.persist(path)
         .map_err(|error| CliFailure::new(1, error.error.to_string()))?;
-    File::open(parent)
-        .and_then(|file| file.sync_all())
+    crate::log_retention::sync_parent_directory(path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     Ok(())
 }
