@@ -7,6 +7,8 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
+use crate::terminal_delivery_authority::TerminalMutationEndpoint;
+
 use super::digest;
 
 const MAX_GITHUB_OBSERVATION_AGE: Duration = Duration::seconds(30);
@@ -147,6 +149,42 @@ pub(crate) struct DeliveryAuthorization {
     target_owner_generation: u64,
 }
 
+/// Non-cloneable, read-only authority for inspecting one original provider
+/// idempotency fence. It cannot authorize launch, prompt delivery, or terminal
+/// mutation. The provider boundary must consume it exactly once.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ReconciliationAuthorization {
+    github_receipt_digest: String,
+    terminal_endpoint: TerminalMutationEndpoint,
+    fence_digest: String,
+}
+
+impl ReconciliationAuthorization {
+    pub(crate) fn receipt_digest(&self) -> &str {
+        &self.github_receipt_digest
+    }
+
+    pub(crate) fn terminal_endpoint(&self) -> &TerminalMutationEndpoint {
+        &self.terminal_endpoint
+    }
+
+    pub(crate) fn fence_digest(&self) -> &str {
+        &self.fence_digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(fence_digest: String) -> Self {
+        Self {
+            github_receipt_digest: "0".repeat(64),
+            terminal_endpoint: TerminalMutationEndpoint::Cmux {
+                executable_path: "/test/cmux".to_owned(),
+                socket_path: "/test/cmux.sock".to_owned(),
+            },
+            fence_digest,
+        }
+    }
+}
+
 impl DeliveryAuthorization {
     pub(crate) fn receipt_digest(&self) -> &str {
         &self.github_receipt_digest
@@ -182,6 +220,31 @@ pub(crate) fn verify_delivery_authority<P: DeliveryAuthorityProbe>(
     verify_delivery_authority_inner(probe, expected, None)
 }
 
+/// Mint read-only reconciliation authority without requiring the original
+/// terminal occupant to remain alive. Fresh GitHub App/head/base evidence is
+/// still mandatory, and the witness is bound to both the authenticated
+/// terminal endpoint and immutable provider-delivery fence.
+pub(crate) fn verify_reconciliation_authority<P: DeliveryAuthorityProbe>(
+    probe: &mut P,
+    expected: &DeliveryAuthorityExpectation,
+    terminal_endpoint: TerminalMutationEndpoint,
+    fence_digest: String,
+) -> Result<ReconciliationAuthorization, DeliveryAuthorityRefusal> {
+    let github_receipt_digest = verify_github_authority(probe, expected, None)?;
+    if fence_digest.len() != 64
+        || !fence_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(DeliveryAuthorityRefusal::TerminalAuthorityUnavailable);
+    }
+    Ok(ReconciliationAuthorization {
+        github_receipt_digest,
+        terminal_endpoint,
+        fence_digest,
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn verify_delivery_authority_at<P: DeliveryAuthorityProbe>(
     probe: &mut P,
@@ -196,6 +259,28 @@ fn verify_delivery_authority_inner<P: DeliveryAuthorityProbe>(
     expected: &DeliveryAuthorityExpectation,
     fixed_now: Option<DateTime<Utc>>,
 ) -> Result<DeliveryAuthorization, DeliveryAuthorityRefusal> {
+    let github_receipt_digest = verify_github_authority(probe, expected, fixed_now)?;
+
+    let terminal = probe.verify_terminal_once(expected)?;
+    verify_terminal_authority(expected, &terminal, fixed_now)?;
+
+    Ok(DeliveryAuthorization {
+        github_receipt_digest,
+        terminal_instance: terminal.actual_terminal_instance,
+        process: terminal.process,
+        native_session_id: terminal.native_session_id,
+        source_work_generation: terminal.source_work_generation,
+        source_owner_generation: terminal.source_owner_generation,
+        target_work_generation: terminal.target_work_generation,
+        target_owner_generation: terminal.target_owner_generation,
+    })
+}
+
+fn verify_github_authority<P: DeliveryAuthorityProbe>(
+    probe: &mut P,
+    expected: &DeliveryAuthorityExpectation,
+    fixed_now: Option<DateTime<Utc>>,
+) -> Result<String, DeliveryAuthorityRefusal> {
     if expected.base_ref.is_empty() {
         return Err(DeliveryAuthorityRefusal::BaseRefMissing);
     }
@@ -240,7 +325,14 @@ fn verify_delivery_authority_inner<P: DeliveryAuthorityProbe>(
     })
     .expect("fixed GitHub authority receipt is serializable");
 
-    let terminal = probe.verify_terminal_once(expected)?;
+    Ok(digest(&receipt))
+}
+
+fn verify_terminal_authority(
+    expected: &DeliveryAuthorityExpectation,
+    terminal: &TerminalAuthorityObservation,
+    fixed_now: Option<DateTime<Utc>>,
+) -> Result<(), DeliveryAuthorityRefusal> {
     if terminal.requested_terminal_instance != expected.requested_terminal_instance {
         return Err(DeliveryAuthorityRefusal::TerminalInstanceMismatch);
     }
@@ -281,16 +373,7 @@ fn verify_delivery_authority_inner<P: DeliveryAuthorityProbe>(
         return Err(DeliveryAuthorityRefusal::GenerationMismatch);
     }
 
-    Ok(DeliveryAuthorization {
-        github_receipt_digest: digest(&receipt),
-        terminal_instance: terminal.actual_terminal_instance,
-        process: terminal.process,
-        native_session_id: terminal.native_session_id,
-        source_work_generation: terminal.source_work_generation,
-        source_owner_generation: terminal.source_owner_generation,
-        target_work_generation: terminal.target_work_generation,
-        target_owner_generation: terminal.target_owner_generation,
-    })
+    Ok(())
 }
 
 #[cfg(test)]

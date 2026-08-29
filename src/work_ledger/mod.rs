@@ -62,13 +62,16 @@ pub(crate) use delivery_authority::verify_delivery_authority_at;
 pub(crate) use delivery_authority::{
     DeliveryAuthorityExpectation, DeliveryAuthorityProbe, DeliveryAuthorityRefusal,
     DeliveryAuthorization, GitHubAuthorityObservation, ProcessIncarnation,
-    TerminalAuthorityObservation, verify_delivery_authority,
+    ReconciliationAuthorization, TerminalAuthorityObservation, verify_delivery_authority,
+    verify_reconciliation_authority,
 };
 #[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
 pub(crate) use delivery_ownership::{
     AgentContextChallenge, AgentContextReceipt, AgentOwnershipReceipt, AgentReturnChallenge,
     AgentReturnExpectation, AgentReturnReceipt,
 };
+#[cfg(test)]
+pub(crate) use dispatch::reconciliation_fence_digest;
 pub(crate) use dispatch::{
     DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
     FreshAgentResumeExpectation, ProviderAdapter, ProviderAuthorizationOperation,

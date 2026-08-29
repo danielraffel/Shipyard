@@ -781,7 +781,9 @@ fn route_error(error: impl std::fmt::Display) -> WorkLedgerError {
 
 #[cfg(test)]
 mod tests {
-    use crate::work_ledger::{DeliveryAuthorization, ProviderAuthorizationOperation};
+    use crate::work_ledger::{
+        DeliveryAuthorization, ProviderAuthorizationOperation, ReconciliationAuthorization,
+    };
     use std::path::PathBuf;
 
     use tempfile::TempDir;
@@ -873,6 +875,15 @@ mod tests {
             ))
         }
 
+        fn authorize_reconciliation(
+            &mut self,
+            fence: &DeliveryFence,
+        ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+            Ok(ReconciliationAuthorization::for_test(
+                crate::work_ledger::reconciliation_fence_digest(fence),
+            ))
+        }
+
         fn launch(
             &mut self,
             _request: ProviderLaunchRequest<'_>,
@@ -887,6 +898,16 @@ mod tests {
             &mut self,
             _fence: &DeliveryFence,
             _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
+            ProviderOutcome::Delivered {
+                receipt: b"provider reconciled agent".to_vec(),
+            }
+        }
+
+        fn reconcile_read_only(
+            &mut self,
+            _fence: &DeliveryFence,
+            _authority: ReconciliationAuthorization,
         ) -> ProviderOutcome {
             ProviderOutcome::Delivered {
                 receipt: b"provider reconciled agent".to_vec(),

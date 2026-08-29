@@ -21,12 +21,12 @@ use super::lifecycle::record_event;
 use super::registry::validated_route_matches_launch;
 use super::route::{OpaqueRef, RouteProvenanceRecord};
 use super::{
-    DeliveryAuthorization, LifecycleState, OptionalExtension, ProtectedObjectKind, Transaction,
-    TransactionBehavior, Utc, WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable,
-    create_database_file_no_follow, digest, opaque_ref, params, validate_digest, validate_token,
-    verify_integrity, verify_supported_schema,
+    DeliveryAuthorization, LifecycleState, OptionalExtension, ProtectedObjectKind,
+    ReconciliationAuthorization, Transaction, TransactionBehavior, Utc, WorkLedger,
+    WorkLedgerError, WorkLedgerResult, configure_durable, create_database_file_no_follow, digest,
+    opaque_ref, params, validate_digest, validate_token, verify_integrity, verify_supported_schema,
 };
-use crate::terminal_delivery_authority::TerminalCapabilityRequest;
+use crate::terminal_delivery_authority::{TerminalCapabilityRequest, TerminalMutationEndpoint};
 
 /// A wake may consume at most this many provider delivery attempts. A
 /// retryable outcome on the final attempt is terminal so a permanently
@@ -36,6 +36,12 @@ const MAX_PROVIDER_DELIVERY_ATTEMPTS: u64 = 3;
 pub(crate) struct CurrentDeliveryAuthorityRequest {
     pub(crate) expected: super::DeliveryAuthorityExpectation,
     pub(crate) terminal: TerminalCapabilityRequest,
+}
+
+pub(crate) struct CurrentReconciliationAuthorityRequest {
+    pub(crate) expected: super::DeliveryAuthorityExpectation,
+    pub(crate) terminal_endpoint: TerminalMutationEndpoint,
+    pub(crate) fence_digest: String,
 }
 
 /// Includes the initial uncertain submit observation. Once this durable budget
@@ -212,6 +218,10 @@ pub(crate) trait ProviderAdapter {
         fence: &DeliveryFence,
         operation: ProviderAuthorizationOperation,
     ) -> Result<DeliveryAuthorization, ProviderOutcome>;
+    fn authorize_reconciliation(
+        &mut self,
+        fence: &DeliveryFence,
+    ) -> Result<ReconciliationAuthorization, ProviderOutcome>;
     fn launch(
         &mut self,
         request: ProviderLaunchRequest<'_>,
@@ -222,6 +232,37 @@ pub(crate) trait ProviderAdapter {
         fence: &DeliveryFence,
         authority: DeliveryAuthorization,
     ) -> ProviderOutcome;
+    fn reconcile_read_only(
+        &mut self,
+        fence: &DeliveryFence,
+        authority: ReconciliationAuthorization,
+    ) -> ProviderOutcome;
+}
+
+pub(crate) fn reconciliation_fence_digest(fence: &DeliveryFence) -> String {
+    digest(
+        format!(
+            "shipyard-provider-reconciliation-fence-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            fence.wake_id,
+            fence.work_item_id,
+            fence.work_generation,
+            fence.owner_generation,
+            fence.route_ref,
+            fence.payload_digest,
+            fence.attempt,
+            fence.consumer_epoch,
+            fence.consumer_owner_ref,
+            fence.activation_id,
+            fence.delivery_id,
+            fence.request_object_ref,
+            fence.profile_ref,
+            fence.adapter_id,
+            fence.provider_id,
+            fence.idempotency_key,
+            "read-only",
+        )
+        .as_bytes(),
+    )
 }
 
 /// Stable scheduler envelope; it contains no raw prompt, argv, or credential.
@@ -667,6 +708,29 @@ impl WorkLedger {
         })
     }
 
+    /// Re-read the same protected delivery fence used for submit authority,
+    /// but return only the immutable terminal service endpoint needed for a
+    /// read-only idempotency lookup. The original process/session remains
+    /// provenance and is deliberately not required to be alive.
+    pub(crate) fn current_reconciliation_authority_request(
+        &self,
+        fence: &DeliveryFence,
+    ) -> WorkLedgerResult<CurrentReconciliationAuthorityRequest> {
+        let request = self.current_delivery_authority_request(fence)?;
+        let terminal_endpoint = request.terminal.mutation_endpoint().ok_or_else(|| {
+            WorkLedgerError::Refused(
+                super::DeliveryAuthorityRefusal::TerminalAuthorityUnavailable
+                    .code()
+                    .to_owned(),
+            )
+        })?;
+        Ok(CurrentReconciliationAuthorityRequest {
+            expected: request.expected,
+            terminal_endpoint,
+            fence_digest: reconciliation_fence_digest(fence),
+        })
+    }
+
     /// Re-read the exact claim and classify why its stored route cannot yet
     /// authorize live delivery. This is intentionally a read-only transaction:
     /// static route metadata is never promoted to runtime authority.
@@ -981,7 +1045,7 @@ impl WorkLedger {
             .parent()
             .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
-        let authority = match adapter.authorize(fence, ProviderAuthorizationOperation::Reconcile) {
+        let authority = match adapter.authorize_reconciliation(fence) {
             Ok(authority) => authority,
             Err(outcome) => return Ok(reconciliation_authorization_failure(outcome)),
         };
@@ -995,7 +1059,7 @@ impl WorkLedger {
         // Keep the single-writer lease through provider I/O so no sibling can
         // supersede the exact claim after its one-shot witness is accepted.
         Ok(reconcile_outcome_without_redispatch(
-            adapter.reconcile(fence, authority),
+            adapter.reconcile_read_only(fence, authority),
         ))
     }
 

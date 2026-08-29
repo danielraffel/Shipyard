@@ -2,6 +2,35 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Exact machine-local endpoint on which a terminal adapter may perform a
+/// bounded operation. This deliberately excludes requested workspace, tab,
+/// surface, and session labels: those identify occupants, not the authenticated
+/// terminal service endpoint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "adapter", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum TerminalMutationEndpoint {
+    Cmux {
+        executable_path: String,
+        socket_path: String,
+    },
+}
+
+impl TerminalCapabilityRequest {
+    pub(crate) fn mutation_endpoint(&self) -> Option<TerminalMutationEndpoint> {
+        match self {
+            Self::Cmux {
+                cli_path,
+                socket_path,
+                ..
+            } => Some(TerminalMutationEndpoint::Cmux {
+                executable_path: cli_path.clone(),
+                socket_path: socket_path.clone(),
+            }),
+            Self::HerdR { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LocalProcessIncarnation {

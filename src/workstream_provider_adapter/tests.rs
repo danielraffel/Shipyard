@@ -9,7 +9,8 @@ use crate::provider_wrapper::{
 use crate::work_ledger::{
     DeliveryAuthorization, DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
     FreshAgentResumeExpectation, ProviderAdapter, ProviderAuthorizationOperation,
-    ProviderCapability, ProviderLaunchRequest, ProviderOutcome, WakeEnvelope, WakeProfileResolver,
+    ProviderCapability, ProviderLaunchRequest, ProviderOutcome, ReconciliationAuthorization,
+    WakeEnvelope, WakeProfileResolver,
 };
 #[cfg(unix)]
 use crate::work_ledger::{
@@ -743,6 +744,15 @@ impl ProviderAdapter for LedgerCmuxAdapter {
         ))
     }
 
+    fn authorize_reconciliation(
+        &mut self,
+        fence: &DeliveryFence,
+    ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+        Ok(ReconciliationAuthorization::for_test(
+            crate::work_ledger::reconciliation_fence_digest(fence),
+        ))
+    }
+
     fn launch(
         &mut self,
         launch: ProviderLaunchRequest<'_>,
@@ -775,6 +785,24 @@ impl ProviderAdapter for LedgerCmuxAdapter {
         &mut self,
         fence: &DeliveryFence,
         _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
+        self.reconcile_fence = Some(fence.clone());
+        let request = Self::wrapper_request(fence, ProviderWrapperOperationV1::Reconcile);
+        self.wrapper_keys
+            .push(request.delivery_fence.idempotency_key.clone());
+        let mut runner = FakeRunner {
+            verification: Some(Err(RunnerFailure::Unavailable)),
+            ..FakeRunner::default()
+        };
+        let response = handle_request(&request, &mut runner);
+        assert!(runner.calls.is_empty());
+        Self::map(response)
+    }
+
+    fn reconcile_read_only(
+        &mut self,
+        fence: &DeliveryFence,
+        _authority: ReconciliationAuthorization,
     ) -> ProviderOutcome {
         self.reconcile_fence = Some(fence.clone());
         let request = Self::wrapper_request(fence, ProviderWrapperOperationV1::Reconcile);

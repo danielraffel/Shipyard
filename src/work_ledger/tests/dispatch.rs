@@ -2,7 +2,7 @@ use super::*;
 use crate::work_ledger::dispatch::{
     DeliveryFence, FreshAgentLaunchProfile, ProviderAdapter, ProviderCapability,
     ProviderLaunchRequest, ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult, WakeEnvelope,
-    WakeProfileResolver,
+    WakeProfileResolver, reconciliation_fence_digest,
 };
 
 #[derive(Clone)]
@@ -168,6 +168,19 @@ impl ProviderAdapter for Adapter {
         ))
     }
 
+    fn authorize_reconciliation(
+        &mut self,
+        fence: &DeliveryFence,
+    ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+        self.authorization_count += 1;
+        if let Some(refusal) = self.authorization_refusal.take() {
+            return Err(refusal);
+        }
+        Ok(ReconciliationAuthorization::for_test(
+            reconciliation_fence_digest(fence),
+        ))
+    }
+
     fn launch(
         &mut self,
         request: ProviderLaunchRequest<'_>,
@@ -186,6 +199,15 @@ impl ProviderAdapter for Adapter {
         &mut self,
         fence: &DeliveryFence,
         _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
+        self.reconcile_fences.push(fence.clone());
+        self.reconcile_outcome.clone()
+    }
+
+    fn reconcile_read_only(
+        &mut self,
+        fence: &DeliveryFence,
+        _authority: ReconciliationAuthorization,
     ) -> ProviderOutcome {
         self.reconcile_fences.push(fence.clone());
         self.reconcile_outcome.clone()
@@ -242,6 +264,13 @@ impl ProviderAdapter for DriftingReconcileAdapter {
         self.inner.authorize(fence, operation)
     }
 
+    fn authorize_reconciliation(
+        &mut self,
+        fence: &DeliveryFence,
+    ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+        self.inner.authorize_reconciliation(fence)
+    }
+
     fn launch(
         &mut self,
         request: ProviderLaunchRequest<'_>,
@@ -263,6 +292,21 @@ impl ProviderAdapter for DriftingReconcileAdapter {
             )
             .expect("plant concurrent lifecycle change");
         self.inner.reconcile(fence, authority)
+    }
+
+    fn reconcile_read_only(
+        &mut self,
+        fence: &DeliveryFence,
+        authority: ReconciliationAuthorization,
+    ) -> ProviderOutcome {
+        rusqlite::Connection::open(&self.database_path)
+            .expect("concurrent connection")
+            .execute(
+                "UPDATE work_items SET work_generation = work_generation + 1 WHERE id = ?1",
+                [&self.work_item_id],
+            )
+            .expect("plant concurrent lifecycle change");
+        self.inner.reconcile_read_only(fence, authority)
     }
 }
 
@@ -1994,6 +2038,7 @@ fn route_provider_identity_mismatch_refuses_before_claim_or_launch() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() {
     use std::sync::mpsc;
 
@@ -2022,6 +2067,15 @@ fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() 
             ))
         }
 
+        fn authorize_reconciliation(
+            &mut self,
+            fence: &DeliveryFence,
+        ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+            Ok(ReconciliationAuthorization::for_test(
+                reconciliation_fence_digest(fence),
+            ))
+        }
+
         fn launch(
             &mut self,
             _request: ProviderLaunchRequest<'_>,
@@ -2038,6 +2092,14 @@ fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() 
             &mut self,
             _fence: &DeliveryFence,
             _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
+            panic!("a concurrent live owner must not be treated as restart recovery");
+        }
+
+        fn reconcile_read_only(
+            &mut self,
+            _fence: &DeliveryFence,
+            _authority: ReconciliationAuthorization,
         ) -> ProviderOutcome {
             panic!("a concurrent live owner must not be treated as restart recovery");
         }

@@ -89,6 +89,27 @@ fn exact_current_route_produces_one_shot_authority() {
 }
 
 #[test]
+fn dead_original_occupant_does_not_block_read_only_reconciliation_authority() {
+    let now = Utc::now();
+    let mut probe = probe(now);
+    probe.terminal = Err(DeliveryAuthorityRefusal::NoTerminalMatch);
+    let endpoint = TerminalMutationEndpoint::Cmux {
+        executable_path: "/Applications/cmux.app/Contents/MacOS/cmux".to_owned(),
+        socket_path: "/tmp/cmux.sock".to_owned(),
+    };
+    let authority = verify_reconciliation_authority(
+        &mut probe,
+        &expectation(),
+        endpoint.clone(),
+        "f".repeat(64),
+    )
+    .expect("fresh App/head evidence authorizes only the exact read-only lookup");
+    assert_eq!(probe.terminal_calls, 0);
+    assert_eq!(authority.terminal_endpoint(), &endpoint);
+    assert_eq!(authority.fence_digest(), "f".repeat(64));
+}
+
+#[test]
 fn head_or_base_drift_refuses_before_terminal_io() {
     let now = Utc::now();
     for drift in ["head", "base"] {

@@ -26,8 +26,9 @@ use crate::work_ledger::{
     DeliveryAuthorization, DeliveryFence, ExactProtectedProfileResolver, FreshAgentLaunchProfile,
     GitHubAuthorityObservation, ProcessIncarnation, ProviderAdapter,
     ProviderAuthorizationOperation, ProviderCapability, ProviderLaunchRequest, ProviderOutcome,
-    StoredProviderRequest, TerminalAuthorityObservation, WakeConsumerPolicy, WakeDeliveryResult,
-    WorkLedger, verify_delivery_authority,
+    ReconciliationAuthorization, StoredProviderRequest, TerminalAuthorityObservation,
+    WakeConsumerPolicy, WakeDeliveryResult, WorkLedger, verify_delivery_authority,
+    verify_reconciliation_authority,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 use crate::workstream_continuation_config::WorkstreamContinuationConfig;
@@ -289,11 +290,53 @@ impl ProviderAdapter for WorkLedgerProviderAdapter<'_> {
         let mut probe = ProductionDeliveryAuthorityProbe {
             github: GitHubActions::from_loaded_config(cwd, &trusted_config)
                 .with_repo_override(&request.expected.repository),
-            terminal: request.terminal,
+            terminal: Some(request.terminal),
             terminal_adapter: ProductionTerminalEvidenceAdapter,
         };
         verify_delivery_authority(&mut probe, &request.expected)
             .map_err(|refusal| authority_refusal(wrapper_operation, refusal))
+    }
+
+    fn authorize_reconciliation(
+        &mut self,
+        fence: &DeliveryFence,
+    ) -> Result<ReconciliationAuthorization, ProviderOutcome> {
+        let operation = ProviderWrapperOperationV1::Reconcile;
+        let request = self
+            .ledger
+            .current_reconciliation_authority_request(fence)
+            .map_err(|error| {
+                authority_refusal(operation, map_authority_request_error(&error.to_string()))
+            })?;
+        let cwd = std::env::current_dir().map_err(|_| {
+            authority_refusal(
+                operation,
+                DeliveryAuthorityRefusal::GitHubAppAuthorityUnavailable,
+            )
+        })?;
+        let trusted_config =
+            LoadedConfig::load_machine_global(RuntimeMode::Shipyard).map_err(|_| {
+                authority_refusal(
+                    operation,
+                    DeliveryAuthorityRefusal::GitHubAppAuthorityUnavailable,
+                )
+            })?;
+        let mut probe = ProductionDeliveryAuthorityProbe {
+            github: GitHubActions::from_loaded_config(cwd, &trusted_config)
+                .with_repo_override(&request.expected.repository),
+            // Reconciliation must never acquire authority from the dead
+            // occupant. If the verifier regresses and asks for it, the probe
+            // fails closed rather than consulting requested labels.
+            terminal: None,
+            terminal_adapter: ProductionTerminalEvidenceAdapter,
+        };
+        verify_reconciliation_authority(
+            &mut probe,
+            &request.expected,
+            request.terminal_endpoint,
+            request.fence_digest,
+        )
+        .map_err(|refusal| authority_refusal(operation, refusal))
     }
 
     fn launch(
@@ -306,16 +349,35 @@ impl ProviderAdapter for WorkLedgerProviderAdapter<'_> {
 
     fn reconcile(
         &mut self,
-        fence: &DeliveryFence,
-        authority: DeliveryAuthorization,
+        _fence: &DeliveryFence,
+        _authority: DeliveryAuthorization,
     ) -> ProviderOutcome {
-        self.run(fence, ProviderWrapperOperationV1::Reconcile, authority)
+        ProviderOutcome::Uncertain {
+            evidence: b"legacy reconciliation authority refused".to_vec(),
+        }
+    }
+
+    fn reconcile_read_only(
+        &mut self,
+        fence: &DeliveryFence,
+        authority: ReconciliationAuthorization,
+    ) -> ProviderOutcome {
+        let Ok(current) = self.ledger.current_reconciliation_authority_request(fence) else {
+            return preflight_refusal(ProviderWrapperOperationV1::Reconcile);
+        };
+        if current.fence_digest != authority.fence_digest()
+            || &current.terminal_endpoint != authority.terminal_endpoint()
+            || authority.receipt_digest().len() != 64
+        {
+            return preflight_refusal(ProviderWrapperOperationV1::Reconcile);
+        }
+        self.run_reconciliation(fence, authority)
     }
 }
 
 struct ProductionDeliveryAuthorityProbe {
     github: GitHubActions,
-    terminal: crate::terminal_delivery_authority::TerminalCapabilityRequest,
+    terminal: Option<crate::terminal_delivery_authority::TerminalCapabilityRequest>,
     terminal_adapter: ProductionTerminalEvidenceAdapter,
 }
 
@@ -378,7 +440,11 @@ impl DeliveryAuthorityProbe for ProductionDeliveryAuthorityProbe {
     ) -> Result<TerminalAuthorityObservation, DeliveryAuthorityRefusal> {
         let observed = self
             .terminal_adapter
-            .verify_once(&self.terminal)
+            .verify_once(
+                self.terminal
+                    .as_ref()
+                    .ok_or(DeliveryAuthorityRefusal::TerminalAuthorityUnavailable)?,
+            )
             .map_err(map_terminal_refusal)?;
         Ok(TerminalAuthorityObservation {
             requested_terminal_instance: expected.requested_terminal_instance.clone(),
@@ -463,6 +529,43 @@ impl WorkLedgerProviderAdapter<'_> {
                 ProviderWrapperOperationV1::Reconcile => ProviderOutcome::NotDelivered {
                     evidence: response_receipt.canonical_bytes,
                 },
+            },
+            Ok(ProviderWrapperRunResult::Uncertain {
+                response_receipt, ..
+            }) => ProviderOutcome::Uncertain {
+                evidence: response_receipt.map_or_else(
+                    || b"provider-wrapper-uncertain-without-receipt".to_vec(),
+                    |receipt| receipt.canonical_bytes,
+                ),
+            },
+            Err(_) => preflight_refusal(operation),
+        }
+    }
+
+    fn run_reconciliation(
+        &self,
+        fence: &DeliveryFence,
+        _authority: ReconciliationAuthorization,
+    ) -> ProviderOutcome {
+        let operation = ProviderWrapperOperationV1::Reconcile;
+        let Ok(request) = self.wrapper_request(fence, operation) else {
+            return preflight_refusal(operation);
+        };
+        match run_provider_wrapper(&self.config.provider_wrapper, &self.environment, &request) {
+            Ok(ProviderWrapperRunResult::Delivered {
+                response_receipt, ..
+            }) => ProviderOutcome::Delivered {
+                receipt: response_receipt.canonical_bytes,
+            },
+            Ok(ProviderWrapperRunResult::Rejected {
+                response_receipt, ..
+            }) => ProviderOutcome::NotDelivered {
+                evidence: response_receipt.canonical_bytes,
+            },
+            Ok(ProviderWrapperRunResult::Retryable {
+                response_receipt, ..
+            }) => ProviderOutcome::Uncertain {
+                evidence: response_receipt.canonical_bytes,
             },
             Ok(ProviderWrapperRunResult::Uncertain {
                 response_receipt, ..
