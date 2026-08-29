@@ -177,7 +177,7 @@ fn native_profile() -> LaunchProfileV1 {
     )]);
     profile.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
     profile.launch_argv = vec![
-        "subrouter".into(),
+        "/opt/subrouter".into(),
         "codex".into(),
         "--model".into(),
         "model-tier-a".into(),
@@ -185,7 +185,7 @@ fn native_profile() -> LaunchProfileV1 {
         "model_reasoning_effort=\"medium\"".into(),
     ];
     profile.resume_argv = vec![
-        "subrouter".into(),
+        "/opt/subrouter".into(),
         "codex".into(),
         "resume".into(),
         "--model".into(),
@@ -385,7 +385,7 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
             .profile
             .resume_argv,
         vec![
-            "subrouter",
+            "/opt/subrouter",
             "codex",
             "resume",
             "--model",

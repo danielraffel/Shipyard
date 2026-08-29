@@ -287,15 +287,17 @@ fn validate_native_argv(
     argv: &[String],
     resume: bool,
 ) -> Result<(), CliFailure> {
-    let executable = argv
-        .first()
-        .map(String::as_str)
-        .map(Path::new)
+    let executable_path = argv.first().map(String::as_str).map(Path::new);
+    let executable = executable_path
         .and_then(|path| path.file_name())
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     let provider = profile.provider.provider.as_str();
-    if executable != "subrouter" || argv.get(1).map(String::as_str) != Some(provider) {
+    if !executable_path.is_some_and(|path| {
+        path.is_absolute() && path.components().collect::<std::path::PathBuf>() == path
+    }) || executable != "subrouter"
+        || argv.get(1).map(String::as_str) != Some(provider)
+    {
         return Err(CliFailure::new(
             1,
             "native fresh-agent argv requires an exact Subrouter provider wrapper",
@@ -763,7 +765,7 @@ mod tests {
             BTreeMap::from([("SUBROUTER_CODEX_ACCOUNT_ID".into(), "account-a".into())]);
         codex.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
         codex.launch_argv = vec![
-            "subrouter".into(),
+            "/opt/subrouter".into(),
             "codex".into(),
             "--model".into(),
             "model-x".into(),
@@ -771,7 +773,7 @@ mod tests {
             "model_reasoning_effort=\"medium\"".into(),
         ];
         codex.resume_argv = vec![
-            "subrouter".into(),
+            "/opt/subrouter".into(),
             "codex".into(),
             "resume".into(),
             "--model".into(),
@@ -790,7 +792,7 @@ mod tests {
             BTreeMap::from([("SUBROUTER_CLAUDE_ACCOUNT_ID".into(), "account-a".into())]);
         claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::High);
         claude.launch_argv = vec![
-            "subrouter".into(),
+            "/opt/subrouter".into(),
             "claude".into(),
             "--model".into(),
             "model-x".into(),
@@ -798,7 +800,7 @@ mod tests {
             "high".into(),
         ];
         claude.resume_argv = vec![
-            "subrouter".into(),
+            "/opt/subrouter".into(),
             "claude".into(),
             "--model".into(),
             "model-x".into(),
@@ -825,13 +827,13 @@ mod tests {
         qwen.route_environment =
             BTreeMap::from([("SUBROUTER_QWEN_ACCOUNT_ID".into(), "account-a".into())]);
         qwen.launch_argv = vec![
-            "subrouter".into(),
+            "/opt/subrouter".into(),
             "qwen".into(),
             "--model".into(),
             "model-x".into(),
         ];
         qwen.resume_argv = vec![
-            "subrouter".into(),
+            "/opt/subrouter".into(),
             "qwen".into(),
             "resume".into(),
             "--model".into(),
@@ -862,13 +864,13 @@ mod tests {
         qwen.route_environment =
             BTreeMap::from([("SUBROUTER_QWEN_ACCOUNT_ID".into(), "account-a".into())]);
         qwen.launch_argv = vec![
-            "subrouter".into(),
+            "/opt/subrouter".into(),
             "qwen".into(),
             "--model".into(),
             "model-x".into(),
         ];
         qwen.resume_argv = vec![
-            "subrouter".into(),
+            "/opt/subrouter".into(),
             "qwen".into(),
             "resume".into(),
             "--model".into(),

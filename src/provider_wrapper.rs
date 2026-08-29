@@ -14,7 +14,7 @@ use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -524,10 +524,13 @@ fn validate_protected_route(
     for value in &route.argv {
         validate_value(value)?;
     }
-    let executable = Path::new(&route.argv[0])
-        .file_name()
-        .and_then(|value| value.to_str());
-    if executable != Some("subrouter") || route.argv[1] != request.provider_id {
+    let executable_path = Path::new(&route.argv[0]);
+    let executable = executable_path.file_name().and_then(|value| value.to_str());
+    if !executable_path.is_absolute()
+        || executable_path.components().collect::<PathBuf>() != executable_path
+        || executable != Some("subrouter")
+        || route.argv[1] != request.provider_id
+    {
         return Err(refusal(
             "protected provider route is not the exact Subrouter provider",
         ));

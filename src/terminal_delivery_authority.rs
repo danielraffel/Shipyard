@@ -71,17 +71,70 @@ pub(crate) fn observe_provider_on_cmux_surface(
         native_session_id,
         provider_kind,
     )?;
-    for pid in candidate_agent_pids(provider_kind)? {
-        let target = match resolve_pid(cli_path, socket_path, pid) {
-            Ok(target) => target,
-            Err(TerminalCapabilityRefusal::NoMatch) => continue,
-            Err(_) => return Err(TerminalCapabilityRefusal::Unobservable),
-        };
-        if target.surface_id == surface_id && process_has_argument(pid, native_session_id)? {
+    for pid in cmux_surface_process_pids(cli_path, socket_path, surface_id)? {
+        if process_has_argument(pid, native_session_id)? {
             return Ok(ProviderProcessPresence::Present);
         }
     }
     Ok(ProviderProcessPresence::Absent)
+}
+
+#[cfg(target_os = "macos")]
+fn cmux_surface_process_pids(
+    cli_path: &str,
+    socket_path: &str,
+    surface_id: &str,
+) -> Result<Vec<u32>, TerminalCapabilityRefusal> {
+    let value = cmux_json(
+        cli_path,
+        socket_path,
+        &[
+            "--json",
+            "--id-format",
+            "uuids",
+            "top",
+            "--all",
+            "--processes",
+        ],
+    )?;
+    let groups = value
+        .pointer("/memory_diagnostic/children/groups")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(TerminalCapabilityRefusal::InvalidResponse)?;
+    let mut pids = Vec::new();
+    for group in groups {
+        let attributions = group
+            .get("attributions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(TerminalCapabilityRefusal::InvalidResponse)?;
+        for attribution in attributions {
+            if attribution
+                .get("surface_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(surface_id)
+            {
+                continue;
+            }
+            let attributed = attribution
+                .get("pids")
+                .and_then(serde_json::Value::as_array)
+                .ok_or(TerminalCapabilityRefusal::InvalidResponse)?;
+            for pid in attributed {
+                let pid = pid
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .filter(|pid| *pid != 0)
+                    .ok_or(TerminalCapabilityRefusal::InvalidResponse)?;
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    if pids.len() > 256 {
+        return Err(TerminalCapabilityRefusal::Unobservable);
+    }
+    Ok(pids)
 }
 
 #[cfg(target_os = "macos")]
