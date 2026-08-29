@@ -3,11 +3,11 @@
 use super::lifecycle::record_event;
 use super::{
     Connection, DATABASE_NAME, Duration, ImportCandidate, ImportReport, LedgerStatus,
-    LifecycleState, OpenFlags, OptionalExtension, Path, PathBuf, SCHEMA_VERSION,
-    TransactionBehavior, Utc, WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable,
-    count, count_where, create_database_file_no_follow, fs, import_report, importer, migrate,
-    opaque_path_ref, params, protect_database_file, protect_ledger_directory, schema_version,
-    synchronous_name, validate_candidate, validate_protected_storage, verify_integrity,
+    LifecycleState, OpenFlags, OptionalExtension, Path, PathBuf, TransactionBehavior, Utc,
+    WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable, count, count_where,
+    create_database_file_no_follow, fs, import_report, importer, migrate, opaque_path_ref, params,
+    protect_database_file, protect_ledger_directory, schema_version, synchronous_name,
+    validate_candidate, validate_protected_storage, verify_integrity, verify_open_lineage,
     verify_supported_schema,
 };
 
@@ -22,7 +22,8 @@ impl WorkLedger {
     pub fn open(state_dir: &Path) -> WorkLedgerResult<Self> {
         let dir = state_dir.join("work-ledger");
         reject_symlink_if_present(state_dir, &dir, "ledger directory")?;
-        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&dir)?;
+        let _writer_domain =
+            crate::writer_domain_lease::acquire_exclusive_for_protected_path(&dir)?;
         crate::writer_domain_lease::ensure_protected_dir_all(&dir)?;
         let ledger = Self {
             path: dir.join(DATABASE_NAME),
@@ -31,11 +32,7 @@ impl WorkLedger {
         let existing = ledger.path.exists();
         if existing {
             validate_protected_storage(&dir, &ledger.path)?;
-            let connection = ledger.connect_read_only()?;
-            let version = schema_version(&connection)?;
-            if !(0..=SCHEMA_VERSION).contains(&version) {
-                return Err(WorkLedgerError::UnsupportedSchema(version));
-            }
+            ledger.verify_existing_schema_snapshot(false)?;
         } else {
             protect_ledger_directory(&dir)?;
             create_database_file_no_follow(&ledger.path)?;
@@ -62,11 +59,10 @@ impl WorkLedger {
         validate_ledger_path(state_dir, &path, true)?;
         validate_protected_storage(&dir, &path)?;
         let ledger = Self { path };
-        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&dir)?;
+        let _writer_domain =
+            crate::writer_domain_lease::acquire_exclusive_for_protected_path(&dir)?;
+        ledger.verify_existing_schema_snapshot(true)?;
         ledger.reconcile_protected_object_storage()?;
-        let connection = ledger.connect_read_only()?;
-        verify_supported_schema(&connection)?;
-        verify_integrity(&connection)?;
         Ok(Some(ledger))
     }
 
@@ -297,6 +293,32 @@ impl WorkLedger {
         )?;
         Ok(connection)
     }
+
+    fn verify_existing_schema_snapshot(&self, require_current: bool) -> WorkLedgerResult<()> {
+        let snapshot = tempfile::Builder::new()
+            .prefix("shipyard-ledger-lineage-")
+            .tempdir()?;
+        let snapshot_database = snapshot.path().join(DATABASE_NAME);
+        fs::copy(&self.path, &snapshot_database)?;
+        let source_wal = sqlite_sidecar_path(&self.path, "-wal");
+        if source_wal.exists() {
+            fs::copy(source_wal, sqlite_sidecar_path(&snapshot_database, "-wal"))?;
+        }
+        let connection = Connection::open(snapshot_database)?;
+        let version = schema_version(&connection)?;
+        verify_open_lineage(&connection, version)?;
+        if require_current {
+            verify_supported_schema(&connection)?;
+            verify_integrity(&connection)?;
+        }
+        Ok(())
+    }
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 fn sqlite_path_with_pinned_final_component(path: &Path) -> WorkLedgerResult<PathBuf> {

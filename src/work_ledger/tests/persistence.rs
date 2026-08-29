@@ -2,7 +2,36 @@ use super::*;
 #[cfg(unix)]
 use crate::work_ledger::route::OpaqueRef;
 
+fn test_schema_object_exists(connection: &Connection, object_type: &str, name: &str) -> bool {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2
+             )",
+            [object_type, name],
+            |row| row.get(0),
+        )
+        .expect("schema object query")
+}
+
+fn strip_schema_identity(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP TRIGGER ledger_schema_identity_no_second_insert;
+             DROP TRIGGER ledger_schema_identity_immutable;
+             DROP TRIGGER ledger_schema_identity_no_delete;
+             DROP TABLE ledger_schema_identity;",
+        )
+        .expect("strip schema identity");
+    assert!(!test_schema_object_exists(
+        connection,
+        "table",
+        "ledger_schema_identity"
+    ));
+}
+
 fn install_exact_v4_schema(connection: &Connection) {
+    strip_schema_identity(connection);
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
@@ -268,7 +297,10 @@ fn v1_registry_migrates_transactionally_and_accepts_exact_agent_binding() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate exact v1 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 6);
+    assert_eq!(
+        schema_version(&connection).expect("schema version"),
+        SCHEMA_VERSION
+    );
     let preserved: Vec<(String, String, String)> = {
         let mut statement = connection
             .prepare(
@@ -353,7 +385,10 @@ fn v2_outbox_migrates_through_durable_attempts_and_claim_epochs() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate v2 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 6);
+    assert_eq!(
+        schema_version(&connection).expect("schema version"),
+        SCHEMA_VERSION
+    );
     let attempt_table: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'wake_attempts'",
@@ -386,7 +421,10 @@ fn v3_attempts_migrate_to_claim_epochs_without_rewriting_attempts() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate v3 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 6);
+    assert_eq!(
+        schema_version(&connection).expect("schema version"),
+        SCHEMA_VERSION
+    );
     let claim_table: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_schema
@@ -403,6 +441,7 @@ fn v5_migrates_to_append_only_provider_delivery_observations() {
     let temp = TempDir::new().expect("temp");
     let ledger = WorkLedger::open(temp.path()).expect("create current ledger");
     let connection = ledger.connect_read_write().expect("connection");
+    strip_schema_identity(&connection);
     connection
         .execute_batch(
             "DROP TRIGGER provider_delivery_observation_insert_fence;
@@ -418,7 +457,10 @@ fn v5_migrates_to_append_only_provider_delivery_observations() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate v5 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 6);
+    assert_eq!(
+        schema_version(&connection).expect("schema version"),
+        SCHEMA_VERSION
+    );
     let observation_table: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_schema
@@ -428,6 +470,538 @@ fn v5_migrates_to_append_only_provider_delivery_observations() {
         )
         .expect("observation table");
     assert_eq!(observation_table, 1);
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn released_main_v6_live_and_uncertain_state_migrates_once_without_redispatch() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("current ledger");
+    let candidate = sample_candidate();
+    let work_id = candidate.work_id.clone();
+    ledger.import(&[candidate]).expect("work fixture");
+    let request_bytes = b"preserved uncertain provider request";
+    let request = ledger
+        .put_protected_object(
+            &work_id,
+            ProtectedObjectKind::ProviderRequest,
+            None,
+            &digest(request_bytes),
+            request_bytes,
+        )
+        .expect("provider request");
+    let wake_id = opaque_ref("wake", "released-main-v6 uncertain wake");
+    let activation_id = opaque_ref("ae", "released-main-v6 active activation");
+    let delivery_id = opaque_ref("pd", "released-main-v6 uncertain delivery");
+    let idempotency_key = opaque_ref("key", "released-main-v6 dispatch identity");
+    let timestamp = "2026-08-28T12:00:00Z";
+    let connection = ledger.connect_read_write().expect("connection");
+    configure_durable(&connection).expect("durable connection");
+    connection
+        .execute(
+            "INSERT INTO outbox
+             (wake_id, work_item_id, work_generation, owner_generation, state,
+              route_ref, payload_digest, created_at, updated_at)
+             VALUES (?1, ?2, 1, 3, 'uncertain', ?3, ?4, ?5, ?5)",
+            params![
+                wake_id,
+                work_id,
+                opaque_ref("route", "released-main-v6 route"),
+                digest(b"preserved uncertain payload"),
+                timestamp,
+            ],
+        )
+        .expect("uncertain wake");
+    connection
+        .execute(
+            "INSERT INTO wake_attempts
+             (wake_id, attempt, state, adapter_id, idempotent, outcome_digest,
+              started_at, finished_at)
+             VALUES (?1, 1, 'uncertain', 'subrouter', 1, ?2, ?3, ?3)",
+            params![wake_id, digest(b"uncertain outcome"), timestamp],
+        )
+        .expect("uncertain attempt");
+    connection
+        .execute(
+            "INSERT INTO activation_epochs
+             (activation_id, work_item_id, work_generation, owner_generation,
+              epoch, owner_ref, state, acquired_at)
+             VALUES (?1, ?2, 1, 3, 1, ?3, 'active', ?4)",
+            params![
+                activation_id,
+                work_id,
+                opaque_ref("owner", "released-main-v6 owner"),
+                timestamp,
+            ],
+        )
+        .expect("active activation");
+    connection
+        .execute(
+            "INSERT INTO provider_deliveries
+             (delivery_id, wake_id, attempt, activation_id, provider_id,
+              adapter_id, idempotency_key, request_object_ref, state,
+              created_at, updated_at)
+             VALUES (?1, ?2, 1, ?3, 'codex', 'subrouter', ?4, ?5,
+                     'uncertain', ?6, ?6)",
+            params![
+                delivery_id,
+                wake_id,
+                activation_id,
+                idempotency_key,
+                request.object_ref,
+                timestamp,
+            ],
+        )
+        .expect("uncertain delivery");
+    let snapshot = |connection: &Connection| {
+        connection
+            .query_row(
+                "SELECT wake.state, attempt.state, delivery.state,
+                        delivery.idempotency_key, request.content_digest,
+                        activation.state,
+                        (SELECT COUNT(*) FROM wake_attempts WHERE wake_id = wake.wake_id)
+                   FROM outbox wake
+                   JOIN wake_attempts attempt ON attempt.wake_id = wake.wake_id
+                   JOIN provider_deliveries delivery
+                     ON delivery.wake_id = wake.wake_id AND delivery.attempt = attempt.attempt
+                   JOIN protected_objects request
+                     ON request.object_ref = delivery.request_object_ref
+                   JOIN activation_epochs activation
+                     ON activation.activation_id = delivery.activation_id
+                  WHERE wake.wake_id = ?1",
+                [&wake_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .expect("state snapshot")
+    };
+    let before = snapshot(&connection);
+    strip_schema_identity(&connection);
+    connection
+        .pragma_update(None, "user_version", 6)
+        .expect("released main v6 fixture");
+    drop(connection);
+    drop(ledger);
+
+    let migrated = WorkLedger::open(temp.path()).expect("migrate released main v6");
+    let connection = migrated.connect_read_only().expect("inspect migration");
+    assert_eq!(
+        schema_version(&connection).expect("schema version"),
+        SCHEMA_VERSION
+    );
+    assert_eq!(snapshot(&connection), before);
+    drop(connection);
+    drop(migrated);
+
+    let reopened = WorkLedger::open(temp.path()).expect("idempotent reopen");
+    let connection = reopened.connect_read_only().expect("inspect reopen");
+    assert_eq!(snapshot(&connection), before);
+}
+
+fn install_a425_donor_lineage_fixture(connection: &Connection, version: i64) {
+    connection
+        .execute_batch(
+            "CREATE TABLE ledger_metadata (
+               singleton INTEGER PRIMARY KEY,
+               ledger_incarnation_ref TEXT NOT NULL
+             );
+             CREATE TABLE ledger_clock (
+               singleton INTEGER PRIMARY KEY,
+               observed_floor TEXT,
+               writer_revision INTEGER NOT NULL,
+               floor_revision INTEGER NOT NULL
+             );
+             CREATE TABLE work_items (
+               id TEXT PRIMARY KEY,
+               work_generation INTEGER NOT NULL,
+               owner_generation INTEGER NOT NULL
+             );
+             CREATE TABLE outbox (
+               wake_id TEXT PRIMARY KEY,
+               work_item_id TEXT NOT NULL,
+               ledger_incarnation_ref TEXT NOT NULL,
+               state TEXT NOT NULL,
+               delivery_start_digest TEXT,
+               receipt_digest TEXT
+             );
+             CREATE TABLE route_changes (
+               change_id TEXT PRIMARY KEY,
+               work_item_id TEXT NOT NULL,
+               state TEXT NOT NULL,
+               start_integrity TEXT,
+               receipt_digest TEXT
+             );
+             INSERT INTO ledger_metadata VALUES (1, 'ledger_fixture');
+             INSERT INTO ledger_clock VALUES (1, '2026-08-28T12:00:00+00:00', 4, 4);
+             INSERT INTO work_items VALUES ('work_fixture', 4, 3);
+             INSERT INTO outbox VALUES (
+               'wake_fixture', 'work_fixture', 'ledger_fixture', 'uncertain',
+               'delivery_start_fixture', 'receipt_fixture'
+             );
+             INSERT INTO route_changes VALUES (
+               'change_fixture', 'work_fixture', 'uncertain',
+               'start_fixture', 'route_receipt_fixture'
+             );",
+        )
+        .expect("a425 donor lineage fixture");
+    if version == 7 {
+        connection
+            .execute_batch(
+                "CREATE TABLE protected_objects (
+                   object_ref TEXT PRIMARY KEY,
+                   work_item_id TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   profile_ref TEXT,
+                   storage_name TEXT NOT NULL,
+                   content_digest TEXT NOT NULL,
+                   byte_length INTEGER NOT NULL,
+                   created_at TEXT NOT NULL
+                 );
+                 INSERT INTO protected_objects VALUES (
+                   'po_fixture', 'work_fixture', 'provider_request', NULL,
+                   'object-fixture.blob', 'digest_fixture', 7,
+                   '2026-08-28T12:00:00Z'
+                 );",
+            )
+            .expect("a425 protected-object fixture");
+    }
+    connection
+        .pragma_update(None, "user_version", version)
+        .expect("donor schema version");
+}
+
+#[test]
+fn donor_v6_and_v7_refuse_without_rewriting_uncertain_state() {
+    for version in [6_i64, 7] {
+        let mut connection = Connection::open_in_memory().expect("connection");
+        install_a425_donor_lineage_fixture(&connection, version);
+        let before: (String, String, String, String) = connection
+            .query_row(
+                "SELECT wake.state, wake.delivery_start_digest,
+                        wake.receipt_digest, change.receipt_digest
+                   FROM outbox wake JOIN route_changes change
+                  WHERE wake.wake_id = 'wake_fixture'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("donor snapshot");
+        let error = migrate(&mut connection).expect_err("donor lineage must refuse");
+        assert!(
+            matches!(error, WorkLedgerError::ForeignSchemaLineage {
+                version: refused_version,
+                lineage: "route-change donor"
+            } if refused_version == version),
+            "unexpected donor refusal: {error}"
+        );
+        assert_eq!(schema_version(&connection).expect("version"), version);
+        let after: (String, String, String, String) = connection
+            .query_row(
+                "SELECT wake.state, wake.delivery_start_digest,
+                        wake.receipt_digest, change.receipt_digest
+                   FROM outbox wake JOIN route_changes change
+                  WHERE wake.wake_id = 'wake_fixture'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("preserved donor snapshot");
+        assert_eq!(after, before);
+        assert!(!test_schema_object_exists(
+            &connection,
+            "table",
+            "ledger_schema_identity"
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn donor_open_refuses_before_wal_or_sidecar_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().expect("temp");
+    let ledger_dir = temp.path().join("work-ledger");
+    fs::create_dir(&ledger_dir).expect("ledger dir");
+    fs::set_permissions(&ledger_dir, fs::Permissions::from_mode(0o700)).expect("ledger dir mode");
+    let database = WorkLedger::path_at(temp.path());
+    let connection = Connection::open(&database).expect("donor database");
+    install_a425_donor_lineage_fixture(&connection, 7);
+    assert_eq!(
+        connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .expect("journal mode"),
+        "delete"
+    );
+    drop(connection);
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).expect("database mode");
+    let before = fs::read(&database).expect("database bytes");
+
+    let error = WorkLedger::open(temp.path()).expect_err("donor open must refuse");
+    assert!(
+        matches!(
+            error,
+            WorkLedgerError::ForeignSchemaLineage {
+                version: 7,
+                lineage: "route-change donor"
+            }
+        ),
+        "unexpected WAL donor refusal: {error}"
+    );
+    assert_eq!(fs::read(&database).expect("preserved database"), before);
+    assert!(!database.with_extension("sqlite3-wal").exists());
+    assert!(!database.with_extension("sqlite3-shm").exists());
+    let connection = Connection::open_with_flags(
+        &database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("read-only donor database");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .expect("preserved journal mode"),
+        "delete"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn wal_mode_donor_with_absent_sidecars_refuses_without_recreating_them() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().expect("temp");
+    let ledger_dir = temp.path().join("work-ledger");
+    fs::create_dir(&ledger_dir).expect("ledger dir");
+    fs::set_permissions(&ledger_dir, fs::Permissions::from_mode(0o700)).expect("ledger dir mode");
+    let database = WorkLedger::path_at(temp.path());
+    let connection = Connection::open(&database).expect("donor database");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row
+                .get::<_, String>(0))
+            .expect("enable WAL"),
+        "wal"
+    );
+    install_a425_donor_lineage_fixture(&connection, 7);
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint donor fixture");
+    drop(connection);
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).expect("database mode");
+    let wal = database.with_extension("sqlite3-wal");
+    let shm = database.with_extension("sqlite3-shm");
+    assert!(!wal.exists(), "closed checkpointed fixture must lack WAL");
+    assert!(!shm.exists(), "closed checkpointed fixture must lack SHM");
+    let before = fs::read(&database).expect("database bytes");
+
+    let error = WorkLedger::open(temp.path()).expect_err("WAL donor open must refuse");
+    assert!(
+        matches!(
+            error,
+            WorkLedgerError::ForeignSchemaLineage {
+                version: 7,
+                lineage: "route-change donor"
+            }
+        ),
+        "unexpected committed-WAL donor refusal: {error}"
+    );
+    assert_eq!(fs::read(&database).expect("preserved database"), before);
+    assert!(!wal.exists(), "preflight must not create WAL");
+    assert!(!shm.exists(), "preflight must not create SHM");
+}
+
+#[cfg(unix)]
+#[test]
+fn donor_committed_only_in_wal_is_detected_without_source_sidecar_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().expect("temp");
+    let ledger_dir = temp.path().join("work-ledger");
+    fs::create_dir(&ledger_dir).expect("ledger dir");
+    fs::set_permissions(&ledger_dir, fs::Permissions::from_mode(0o700)).expect("ledger dir mode");
+    let database = WorkLedger::path_at(temp.path());
+    let connection = Connection::open(&database).expect("donor database");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row
+                .get::<_, String>(0))
+            .expect("enable WAL"),
+        "wal"
+    );
+    connection
+        .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+        .expect("disable auto-checkpoint");
+    install_a425_donor_lineage_fixture(&connection, 7);
+    let wal = database.with_extension("sqlite3-wal");
+    let shm = database.with_extension("sqlite3-shm");
+    for path in [&database, &wal, &shm] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("protected mode");
+    }
+    let before_database = fs::read(&database).expect("database bytes");
+    let before_wal = fs::read(&wal).expect("WAL bytes");
+    let before_shm = fs::read(&shm).expect("SHM bytes");
+    let before_mtimes = [&database, &wal, &shm].map(|path| {
+        fs::metadata(path)
+            .expect("source metadata")
+            .modified()
+            .expect("source mtime")
+    });
+
+    let error = WorkLedger::open(temp.path()).expect_err("WAL donor open must refuse");
+    assert!(
+        matches!(
+            error,
+            WorkLedgerError::ForeignSchemaLineage {
+                version: 7,
+                lineage: "route-change donor"
+            }
+        ),
+        "unexpected committed-WAL donor refusal: {error}"
+    );
+    assert_eq!(
+        fs::read(&database).expect("preserved database"),
+        before_database
+    );
+    assert_eq!(fs::read(&wal).expect("preserved WAL"), before_wal);
+    assert_eq!(fs::read(&shm).expect("preserved SHM"), before_shm);
+    assert_eq!(
+        [&database, &wal, &shm].map(|path| {
+            fs::metadata(path)
+                .expect("preserved metadata")
+                .modified()
+                .expect("preserved mtime")
+        }),
+        before_mtimes
+    );
+    drop(connection);
+}
+
+#[cfg(unix)]
+#[test]
+fn current_wal_snapshot_validation_does_not_touch_source_bytes_or_mtimes() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("current ledger");
+    let connection = ledger.connect_read_write().expect("live WAL connection");
+    connection
+        .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+        .expect("disable auto-checkpoint");
+    connection
+        .execute(
+            "INSERT INTO repo_policies
+             (repo, primary_platform, compatibility_mode, compatibility_lanes_json,
+              blocking_rule, declared_dependency_lanes_json, revision, updated_at)
+             VALUES ('danielraffel/pulp', 'macos', 'independent', '[\"linux\",\"windows\"]',
+                     'declared_dependency_or_shared_integrity', '[]', 1,
+                     '2026-08-28T12:00:00Z')",
+            [],
+        )
+        .expect("committed current WAL row");
+    let database = ledger.path().to_path_buf();
+    let wal = database.with_extension("sqlite3-wal");
+    let shm = database.with_extension("sqlite3-shm");
+    let before = [&database, &wal, &shm].map(|path| {
+        (
+            fs::read(path).expect("source bytes"),
+            fs::metadata(path)
+                .expect("source metadata")
+                .modified()
+                .expect("source mtime"),
+        )
+    });
+
+    WorkLedger::open_existing(temp.path())
+        .expect("snapshot validation")
+        .expect("existing ledger");
+    let after = [&database, &wal, &shm].map(|path| {
+        (
+            fs::read(path).expect("preserved source bytes"),
+            fs::metadata(path)
+                .expect("preserved source metadata")
+                .modified()
+                .expect("preserved source mtime"),
+        )
+    });
+    assert_eq!(after, before);
+    drop(connection);
+}
+
+#[test]
+fn divergent_unmarked_v3_refuses_without_guessing_a_lineage() {
+    let mut connection = Connection::open_in_memory().expect("connection");
+    connection
+        .execute_batch(
+            "CREATE TABLE work_items (id TEXT PRIMARY KEY);
+             CREATE TABLE outbox (
+               wake_id TEXT PRIMARY KEY,
+               work_item_id TEXT NOT NULL,
+               ledger_incarnation_ref TEXT NOT NULL,
+               state TEXT NOT NULL,
+               delivery_start_digest TEXT
+             );
+             INSERT INTO work_items VALUES ('work_fixture');
+             INSERT INTO outbox VALUES (
+               'wake_fixture', 'work_fixture', 'ledger_fixture', 'uncertain',
+               'delivery_start_fixture'
+             );
+             PRAGMA user_version = 3;",
+        )
+        .expect("divergent v3 fixture");
+    let error = migrate(&mut connection).expect_err("unmarked v3 must refuse");
+    assert!(matches!(error, WorkLedgerError::Refused(ref reason)
+        if reason.contains("ambiguous or altered")));
+    assert_eq!(schema_version(&connection).expect("version"), 3);
+    assert_eq!(
+        connection
+            .query_row("SELECT state FROM outbox", [], |row| row
+                .get::<_, String>(0))
+            .expect("preserved state"),
+        "uncertain"
+    );
+}
+
+#[test]
+fn failed_v6_identity_install_rolls_back_version_and_rows() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("current ledger");
+    ledger
+        .import(&[sample_candidate()])
+        .expect("preserved work fixture");
+    let connection = ledger.connect_read_write().expect("connection");
+    strip_schema_identity(&connection);
+    connection
+        .execute_batch(
+            "CREATE TRIGGER ledger_schema_identity_immutable
+             BEFORE UPDATE ON work_items
+             BEGIN SELECT RAISE(ABORT, 'migration collision'); END;
+             PRAGMA user_version = 6;",
+        )
+        .expect("migration collision fixture");
+    drop(connection);
+    drop(ledger);
+
+    assert!(WorkLedger::open(temp.path()).is_err());
+    let connection = Connection::open(WorkLedger::path_at(temp.path())).expect("inspect rollback");
+    assert_eq!(schema_version(&connection).expect("version"), 6);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM work_items", [], |row| row
+                .get::<_, i64>(0))
+            .expect("preserved work rows"),
+        1
+    );
+    assert!(!test_schema_object_exists(
+        &connection,
+        "table",
+        "ledger_schema_identity"
+    ));
 }
 
 #[test]
@@ -488,7 +1062,10 @@ fn v4_acknowledged_delivery_migrates_losslessly_to_split_v5_schema() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate exact v4 ledger");
     let connection = migrated.connect_read_only().expect("inspect v5");
-    assert_eq!(schema_version(&connection).expect("schema version"), 6);
+    assert_eq!(
+        schema_version(&connection).expect("schema version"),
+        SCHEMA_VERSION
+    );
     let outbox: (String, Option<String>, String) = connection
         .query_row(
             "SELECT state, provider_delivery_id, transport_receipt_digest

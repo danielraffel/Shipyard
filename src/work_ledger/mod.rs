@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -98,7 +98,7 @@ pub use storage::absent_status;
 use storage::{
     configure_durable, count, count_where, create_database_file_no_follow, migrate,
     protect_database_file, protect_ledger_directory, schema_version, synchronous_name,
-    validate_protected_storage, verify_integrity, verify_supported_schema,
+    validate_protected_storage, verify_integrity, verify_open_lineage, verify_supported_schema,
 };
 
 /// Error returned by a fail-closed work-ledger operation.
@@ -117,6 +117,13 @@ pub enum WorkLedgerError {
     },
     /// The database was written by a newer, unsupported implementation.
     UnsupportedSchema(i64),
+    /// A numerically overlapping schema belongs to an incompatible ledger lineage.
+    ForeignSchemaLineage {
+        /// Ambiguous `SQLite` schema number.
+        version: i64,
+        /// Redacted lineage family.
+        lineage: &'static str,
+    },
     /// An invariant or generation fence refused a mutation.
     Refused(String),
 }
@@ -135,6 +142,10 @@ impl Display for WorkLedgerError {
                     "unsupported work ledger schema version {version}"
                 )
             }
+            Self::ForeignSchemaLineage { version, lineage } => write!(
+                formatter,
+                "work ledger schema version {version} belongs to incompatible {lineage} lineage"
+            ),
             Self::Refused(reason) => write!(formatter, "work ledger refused mutation: {reason}"),
         }
     }

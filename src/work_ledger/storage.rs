@@ -143,6 +143,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     if version > SCHEMA_VERSION {
         return Err(WorkLedgerError::UnsupportedSchema(version));
     }
+    verify_open_lineage(connection, version)?;
     if version == 1 {
         migrate_v1_to_v2(connection)?;
         version = 2;
@@ -161,10 +162,14 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     if version == 5 {
         migrate_v5_to_v6(connection)?;
+        version = 6;
+    }
+    if version == 6 {
+        migrate_main_v6_to_v8(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
-        return Ok(());
+        return verify_schema_identity(connection);
     }
     if version != 0 {
         return Err(WorkLedgerError::UnsupportedSchema(version));
@@ -670,10 +675,221 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
                 WHERE previous.delivery_id = NEW.delivery_id
              ), 1)
          )
-         BEGIN SELECT RAISE(ABORT, 'provider delivery observation authority mismatch'); END;
-         PRAGMA user_version = 6;",
+         BEGIN SELECT RAISE(ABORT, 'provider delivery observation authority mismatch'); END;",
     )?;
+    install_schema_identity(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn schema_object_exists(
+    connection: &Connection,
+    object_type: &str,
+    name: &str,
+) -> WorkLedgerResult<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2
+         )",
+        [object_type, name],
+        |row| row.get(0),
+    )?)
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> WorkLedgerResult<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        [table, column],
+        |row| row.get(0),
+    )?)
+}
+
+pub(super) fn verify_open_lineage(connection: &Connection, version: i64) -> WorkLedgerResult<()> {
+    if !(0..=SCHEMA_VERSION).contains(&version) {
+        return Err(WorkLedgerError::UnsupportedSchema(version));
+    }
+    if version < 3 {
+        return Ok(());
+    }
+    let donor_sentinel = ["ledger_metadata", "ledger_clock", "route_changes"]
+        .iter()
+        .map(|name| schema_object_exists(connection, "table", name))
+        .collect::<WorkLedgerResult<Vec<_>>>()?
+        .into_iter()
+        .any(|exists| exists);
+    if donor_sentinel {
+        return Err(WorkLedgerError::ForeignSchemaLineage {
+            version,
+            lineage: "route-change donor",
+        });
+    }
+    if version == SCHEMA_VERSION {
+        return verify_schema_identity(connection);
+    }
+    if version == 7 {
+        return Err(WorkLedgerError::Refused(
+            "unmarked schema v7 is not a supported provider-continuation ledger".to_owned(),
+        ));
+    }
+    let required_tables = match version {
+        3 => &["wake_attempts"][..],
+        4 => &["wake_attempts", "wake_claim_epochs"][..],
+        5 => &[
+            "wake_attempts",
+            "wake_claim_epochs",
+            "protected_objects",
+            "activation_epochs",
+            "provider_deliveries",
+            "agent_ownership",
+        ][..],
+        6 => &[
+            "wake_attempts",
+            "wake_claim_epochs",
+            "protected_objects",
+            "activation_epochs",
+            "provider_deliveries",
+            "provider_delivery_observations",
+            "agent_ownership",
+        ][..],
+        _ => {
+            return Err(WorkLedgerError::UnsupportedSchema(version));
+        }
+    };
+    let expected_main_shape = required_tables
+        .iter()
+        .map(|name| schema_object_exists(connection, "table", name))
+        .collect::<WorkLedgerResult<Vec<_>>>()?
+        .into_iter()
+        .all(|exists| exists)
+        && !table_has_column(connection, "outbox", "ledger_incarnation_ref")?
+        && (version < 5
+            || (table_has_column(connection, "outbox", "profile_ref")?
+                && table_has_column(connection, "outbox", "provider_delivery_id")?));
+    if !expected_main_shape || schema_object_exists(connection, "table", "ledger_schema_identity")?
+    {
+        return Err(WorkLedgerError::Refused(format!(
+            "schema v{version} lineage is ambiguous or altered; refusing migration"
+        )));
+    }
+    Ok(())
+}
+
+const SCHEMA_IDENTITY_OBJECTS: &[(&str, &str, &str)] = &[
+    (
+        "table",
+        "ledger_schema_identity",
+        "CREATE TABLE ledger_schema_identity (
+           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+           lineage TEXT NOT NULL CHECK(lineage = 'provider-continuation'),
+           lineage_revision INTEGER NOT NULL CHECK(lineage_revision = 1)
+         )",
+    ),
+    (
+        "trigger",
+        "ledger_schema_identity_immutable",
+        "CREATE TRIGGER ledger_schema_identity_immutable
+         BEFORE UPDATE ON ledger_schema_identity
+         BEGIN SELECT RAISE(ABORT, 'ledger schema identity is immutable'); END",
+    ),
+    (
+        "trigger",
+        "ledger_schema_identity_no_delete",
+        "CREATE TRIGGER ledger_schema_identity_no_delete
+         BEFORE DELETE ON ledger_schema_identity
+         BEGIN SELECT RAISE(ABORT, 'ledger schema identity is immutable'); END",
+    ),
+    (
+        "trigger",
+        "ledger_schema_identity_no_second_insert",
+        "CREATE TRIGGER ledger_schema_identity_no_second_insert
+         BEFORE INSERT ON ledger_schema_identity
+         WHEN EXISTS (SELECT 1 FROM ledger_schema_identity)
+         BEGIN SELECT RAISE(ABORT, 'ledger schema identity is a singleton'); END",
+    ),
+];
+
+fn install_schema_identity(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
+    for object_type in ["table", "trigger"] {
+        for (kind, _, sql) in SCHEMA_IDENTITY_OBJECTS {
+            if *kind == object_type {
+                transaction.execute_batch(&format!("{sql};"))?;
+            }
+        }
+        if object_type == "table" {
+            transaction.execute(
+                "INSERT INTO ledger_schema_identity
+                 (singleton, lineage, lineage_revision)
+                 VALUES (1, 'provider-continuation', 1)",
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_main_v6_to_v8(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 6 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the migration fence".to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 6)?;
+    validate_relational_integrity(&transaction)?;
+    install_schema_identity(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn verify_schema_identity(connection: &Connection) -> WorkLedgerResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, sql FROM sqlite_schema
+         WHERE name = 'ledger_schema_identity'
+            OR name LIKE 'ledger_schema_identity_%'
+         ORDER BY type, name",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = SCHEMA_IDENTITY_OBJECTS
+        .iter()
+        .map(|(kind, name, sql)| ((*kind).to_owned(), (*name).to_owned(), (*sql).to_owned()))
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    if actual != expected {
+        let version = schema_version(connection)?;
+        let donor_v7 = version == 7
+            && schema_object_exists(connection, "table", "ledger_clock")?
+            && schema_object_exists(connection, "table", "route_changes")?
+            && schema_object_exists(connection, "table", "protected_objects")?
+            && table_has_column(connection, "outbox", "ledger_incarnation_ref")?;
+        let reason = if donor_v7 {
+            "schema v7 belongs to the protected-object donor lineage; explicit state reconciliation is required"
+        } else {
+            "work ledger schema identity is missing or altered"
+        };
+        return Err(WorkLedgerError::Refused(reason.to_owned()));
+    }
+    let identity: (String, i64) = connection.query_row(
+        "SELECT lineage, lineage_revision FROM ledger_schema_identity WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if identity != ("provider-continuation".to_owned(), 1) {
+        return Err(WorkLedgerError::Refused(
+            "work ledger schema identity row is missing or altered".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1253,7 +1469,7 @@ pub(super) fn verify_supported_schema(connection: &Connection) -> WorkLedgerResu
     if version != SCHEMA_VERSION {
         return Err(WorkLedgerError::UnsupportedSchema(version));
     }
-    Ok(())
+    verify_schema_identity(connection)
 }
 
 pub(super) fn schema_version(connection: &Connection) -> WorkLedgerResult<i64> {
@@ -1267,6 +1483,7 @@ pub(super) fn verify_integrity(connection: &Connection) -> WorkLedgerResult<Stri
             "integrity check returned {verdict}"
         )));
     }
+    verify_schema_identity(connection)?;
     validate_relational_integrity(connection)?;
     Ok(verdict)
 }
