@@ -99,7 +99,40 @@ fn sample_registered_route(work_id: &str) -> (RouteRegistration, Vec<AdapterBind
 }
 
 fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, AdapterBindingRecord) {
+    #[derive(serde::Serialize)]
+    struct FileBinding<'a> {
+        path: &'a str,
+        sha256: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct WrapperBinding<'a> {
+        companion_path: &'a str,
+        companion_sha256: &'a str,
+        subrouter_path: &'a str,
+        subrouter_sha256: &'a str,
+    }
     let opaque = |label: &str| OpaqueRef::derive("test", label.as_bytes());
+    let account_digest = digest(b"account");
+    let headers_digest = digest(b"headers");
+    let subrouter_digest = digest(b"subrouter executable");
+    let companion_digest = digest(b"binary");
+    let account = serde_json::to_vec(&FileBinding {
+        path: "/Users/test/.config/pulp/secrets/subrouter-account",
+        sha256: &account_digest,
+    })
+    .expect("account binding");
+    let headers = serde_json::to_vec(&FileBinding {
+        path: "/Users/test/.config/pulp/secrets/subrouter-headers",
+        sha256: &headers_digest,
+    })
+    .expect("headers binding");
+    let wrapper = serde_json::to_vec(&WrapperBinding {
+        companion_path: "/usr/bin/false",
+        companion_sha256: &companion_digest,
+        subrouter_path: "/Users/test/.local/bin/subrouter",
+        subrouter_sha256: &subrouter_digest,
+    })
+    .expect("wrapper binding");
     let agent_adapter = adapter_binding(AdapterAxis::Agent, "codex", "codex");
     let provenance = RouteProvenanceRecord::new(
         TerminalRouteRecord::new(TerminalRoute::Cmux {
@@ -112,11 +145,17 @@ fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, Adap
             AgentRoute::Codex {
                 session: NativeSessionRoute {
                     native_session_ref: opaque("session"),
-                    native_resume_ref: opaque("resume"),
-                    account_ref: opaque("account"),
-                    model_ref: opaque("model"),
-                    wrapper_ref: opaque("wrapper"),
-                    session_headers_ref: opaque("headers"),
+                    native_resume_ref: OpaqueRef::derive(
+                        "native-resume-id",
+                        b"cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                    ),
+                    account_ref: OpaqueRef::derive("subrouter-account-file", &account),
+                    model_ref: OpaqueRef::derive("subrouter-model-id", b"gpt-5.6-sol"),
+                    wrapper_ref: OpaqueRef::derive("subrouter-wrapper", &wrapper),
+                    session_headers_ref: OpaqueRef::derive(
+                        "subrouter-session-headers-file",
+                        &headers,
+                    ),
                     session_headers_sha256: Sha256Digest::of_bytes(b"headers"),
                 },
             },
@@ -131,7 +170,7 @@ fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, Adap
             3,
             1,
             Sha256Digest::of_bytes(b"binary"),
-            opaque("wrapper"),
+            OpaqueRef::derive("subrouter-wrapper", &wrapper),
             Sha256Digest::of_bytes(b"config"),
             "subrouter".to_owned(),
         )

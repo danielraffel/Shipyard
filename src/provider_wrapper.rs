@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{
@@ -143,8 +143,65 @@ pub(crate) struct ProviderWrapperRequestV1 {
     pub(crate) provider_id: String,
     pub(crate) adapter_id: String,
     pub(crate) delivery_fence: ProviderDeliveryFenceV1,
+    pub(crate) subrouter_routing: SubrouterRoutingV1,
     pub(crate) resume_expectation: FreshResumeExpectationV1,
     pub(crate) launch_options: ProviderLaunchOptionsV1,
+}
+
+/// Canonical file-backed secret material. Only the path and reviewed digest
+/// are persisted; plaintext is resolved by the companion immediately before
+/// launch through the unattended-secret permission contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderSecretFileV1 {
+    pub(crate) path: String,
+    pub(crate) sha256: String,
+}
+
+/// Exact terminal runtime passed independently from provider routing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ProviderTerminalRouteV1 {
+    Cmux {
+        workspace_ref: String,
+        pane_ref: String,
+        surface_ref: String,
+    },
+    HerdR {
+        session_ref: String,
+        workspace_ref: String,
+        tab_ref: String,
+        pane_ref: String,
+    },
+}
+
+/// Authenticated Subrouter route and generation material required by the
+/// digest-pinned companion. Opaque identities stay separate from live files.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SubrouterRoutingV1 {
+    pub(crate) terminal: ProviderTerminalRouteV1,
+    pub(crate) native_session_ref: String,
+    pub(crate) native_resume_ref: String,
+    pub(crate) native_resume_id: String,
+    pub(crate) server_ref: String,
+    pub(crate) provider_route_ref: String,
+    pub(crate) account_ref: String,
+    pub(crate) account_file: ProviderSecretFileV1,
+    pub(crate) model_ref: String,
+    pub(crate) wrapper_ref: String,
+    pub(crate) companion_sha256: String,
+    pub(crate) subrouter_executable_path: String,
+    pub(crate) subrouter_executable_sha256: String,
+    pub(crate) agent_executable_path: String,
+    pub(crate) agent_executable_sha256: String,
+    pub(crate) session_headers_ref: String,
+    pub(crate) session_headers_file: ProviderSecretFileV1,
+    pub(crate) routing_generation: u64,
+    pub(crate) launch_generation: u64,
+    pub(crate) launch_revision: u64,
+    pub(crate) agent_adapter_generation: u64,
+    pub(crate) agent_adapter_revision: u64,
 }
 
 /// Narrow user intent that the digest-pinned provider adapter translates into
@@ -277,7 +334,11 @@ impl ProviderWrapperEnvironment {
         for (name, value) in entries {
             if !matches!(
                 name.as_str(),
-                "HOME" | "TMPDIR" | "SYSTEMROOT" | "USERPROFILE"
+                "HOME"
+                    | "TMPDIR"
+                    | "SYSTEMROOT"
+                    | "USERPROFILE"
+                    | "SHIPYARD_PROVIDER_COMPANION_PATH"
             ) {
                 return Err(refusal("wrapper environment key is not allowlisted"));
             }
@@ -412,6 +473,7 @@ pub(crate) fn validate_request(
             "provider wrapper idempotency key does not bind the exact delivery fence",
         ));
     }
+    validate_subrouter_routing(&request.subrouter_routing)?;
     let resume = &request.resume_expectation;
     for value in [
         &resume.workstream_handle,
@@ -473,6 +535,96 @@ pub(crate) fn validate_request(
         ));
     }
     validate_launch_options(&request.launch_options)?;
+    Ok(())
+}
+
+fn validate_subrouter_routing(routing: &SubrouterRoutingV1) -> Result<(), ProviderWrapperRefusal> {
+    for value in [
+        &routing.native_session_ref,
+        &routing.native_resume_ref,
+        &routing.native_resume_id,
+        &routing.server_ref,
+        &routing.provider_route_ref,
+        &routing.account_ref,
+        &routing.model_ref,
+        &routing.wrapper_ref,
+        &routing.session_headers_ref,
+    ] {
+        validate_token(value)?;
+    }
+    for secret in [&routing.account_file, &routing.session_headers_file] {
+        validate_digest(&secret.sha256)?;
+        let path = Path::new(&secret.path);
+        if secret.path.is_empty()
+            || secret.path.len() > 4096
+            || !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            || path.components().collect::<PathBuf>() != path
+        {
+            return Err(refusal(
+                "Subrouter secret reference must be a normalized absolute path",
+            ));
+        }
+    }
+    for digest in [
+        &routing.companion_sha256,
+        &routing.subrouter_executable_sha256,
+        &routing.agent_executable_sha256,
+    ] {
+        validate_digest(digest)?;
+    }
+    let subrouter_path = Path::new(&routing.subrouter_executable_path);
+    if routing.subrouter_executable_path.is_empty()
+        || routing.subrouter_executable_path.len() > 4096
+        || !subrouter_path.is_absolute()
+        || subrouter_path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || subrouter_path.components().collect::<PathBuf>() != subrouter_path
+    {
+        return Err(refusal(
+            "Subrouter executable reference must be a normalized absolute path",
+        ));
+    }
+    let agent_path = Path::new(&routing.agent_executable_path);
+    if routing.agent_executable_path.is_empty()
+        || routing.agent_executable_path.len() > 4096
+        || !agent_path.is_absolute()
+        || agent_path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || agent_path.components().collect::<PathBuf>() != agent_path
+    {
+        return Err(refusal(
+            "agent executable reference must be a normalized absolute path",
+        ));
+    }
+    if routing.routing_generation == 0
+        || routing.launch_generation == 0
+        || routing.launch_revision == 0
+        || routing.agent_adapter_generation == 0
+        || routing.agent_adapter_revision == 0
+    {
+        return Err(refusal("Subrouter route generations must be nonzero"));
+    }
+    let terminal_refs: &[&String] = match &routing.terminal {
+        ProviderTerminalRouteV1::Cmux {
+            workspace_ref,
+            pane_ref,
+            surface_ref,
+        } => &[workspace_ref, pane_ref, surface_ref],
+        ProviderTerminalRouteV1::HerdR {
+            session_ref,
+            workspace_ref,
+            tab_ref,
+            pane_ref,
+        } => &[session_ref, workspace_ref, tab_ref, pane_ref],
+    };
+    for value in terminal_refs {
+        validate_token(value)?;
+    }
     Ok(())
 }
 
@@ -1099,6 +1251,44 @@ mod tests {
             provider_id: "codex".into(),
             adapter_id: "codex-wrapper-v1".into(),
             delivery_fence: fence,
+            subrouter_routing: SubrouterRoutingV1 {
+                terminal: ProviderTerminalRouteV1::Cmux {
+                    workspace_ref: "workspace-1".into(),
+                    pane_ref: "pane-1".into(),
+                    surface_ref: "surface-1".into(),
+                },
+                native_session_ref:
+                    "opaque:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+                native_resume_ref:
+                    "opaque:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_owned(),
+                native_resume_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into(),
+                server_ref: "server-1".into(),
+                provider_route_ref: "provider-route-1".into(),
+                account_ref: "account-1".into(),
+                account_file: ProviderSecretFileV1 {
+                    path: "/Users/test/.config/pulp/secrets/subrouter-account".into(),
+                    sha256: digest("account"),
+                },
+                model_ref: "model-1".into(),
+                wrapper_ref: "wrapper-1".into(),
+                companion_sha256: digest("companion"),
+                subrouter_executable_path: "/Users/test/.local/bin/subrouter".into(),
+                subrouter_executable_sha256: digest("subrouter"),
+                agent_executable_path: "/Users/test/.local/bin/codex".into(),
+                agent_executable_sha256: digest("codex"),
+                session_headers_ref: "headers-1".into(),
+                session_headers_file: ProviderSecretFileV1 {
+                    path: "/Users/test/.config/pulp/secrets/subrouter-headers".into(),
+                    sha256: digest("headers"),
+                },
+                routing_generation: 4,
+                launch_generation: 3,
+                launch_revision: 2,
+                agent_adapter_generation: 5,
+                agent_adapter_revision: 6,
+            },
             resume_expectation: FreshResumeExpectationV1 {
                 workstream_handle: "GEN-43".into(),
                 context_url: Some("https://linear.app/example/issue/GEN-43".into()),

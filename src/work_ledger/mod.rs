@@ -62,6 +62,7 @@ mod policy;
 mod protected_objects;
 #[allow(dead_code)] // Activated by the later default-off continuation consumer.
 mod provider_publication;
+pub(crate) use provider_publication::NativeProviderTickResult;
 mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.
 mod route;

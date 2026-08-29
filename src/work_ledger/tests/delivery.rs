@@ -1,12 +1,14 @@
 use super::*;
 use chrono::{Duration as ChronoDuration, TimeZone};
+use std::collections::VecDeque;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use crate::provider_wrapper::{
     FreshResumeExpectationV1, ProtectedProviderResponseV1, ProviderAcceptanceV1,
-    ProviderLaunchOptionsV1, ProviderWrapperConfig, ProviderWrapperOperationV1,
-    ProviderWrapperOutcomeV1, ProviderWrapperResponseV1,
+    ProviderLaunchOptionsV1, ProviderSecretFileV1, ProviderTerminalRouteV1, ProviderWrapperConfig,
+    ProviderWrapperOperationV1, ProviderWrapperOutcomeV1, ProviderWrapperResponseV1,
+    ProviderWrapperRunResult, SubrouterRoutingV1,
 };
 use crate::work_ledger::delivery_ownership::{AgentContextReceipt, AgentReturnReceipt};
 
@@ -166,6 +168,82 @@ fn provider_config(claim: &DeliveryClaim) -> ProviderWrapperConfig {
     }
 }
 
+fn provider_launch_options() -> ProviderLaunchOptionsV1 {
+    ProviderLaunchOptionsV1 {
+        model_id: Some("gpt-5.6-sol".to_owned()),
+        reasoning_effort: None,
+    }
+}
+
+fn subrouter_routing(claim: &DeliveryClaim) -> SubrouterRoutingV1 {
+    let terminal = match &claim.route.terminal {
+        TerminalRoute::Cmux {
+            workspace_ref,
+            pane_ref,
+            surface_ref,
+        } => ProviderTerminalRouteV1::Cmux {
+            workspace_ref: workspace_ref.as_str().to_owned(),
+            pane_ref: pane_ref.as_str().to_owned(),
+            surface_ref: surface_ref.as_str().to_owned(),
+        },
+        TerminalRoute::HerdR {
+            session_ref,
+            workspace_ref,
+            tab_ref,
+            pane_ref,
+        } => ProviderTerminalRouteV1::HerdR {
+            session_ref: session_ref.as_str().to_owned(),
+            workspace_ref: workspace_ref.as_str().to_owned(),
+            tab_ref: tab_ref.as_str().to_owned(),
+            pane_ref: pane_ref.as_str().to_owned(),
+        },
+        TerminalRoute::Registered { .. } => panic!("test route must be native"),
+    };
+    let ProviderRoute::Subrouter {
+        server_ref,
+        route_ref,
+    } = &claim.route.provider
+    else {
+        panic!("test route must use Subrouter");
+    };
+    SubrouterRoutingV1 {
+        terminal,
+        native_session_ref: claim.route.native_session_ref.clone(),
+        native_resume_ref: claim.route.native_resume_ref.clone(),
+        native_resume_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_owned(),
+        server_ref: server_ref.as_str().to_owned(),
+        provider_route_ref: route_ref.as_str().to_owned(),
+        account_ref: claim.route.account_ref.clone(),
+        account_file: ProviderSecretFileV1 {
+            path: "/Users/test/.config/pulp/secrets/subrouter-account".to_owned(),
+            sha256: digest(b"account"),
+        },
+        model_ref: claim.route.model_ref.clone(),
+        wrapper_ref: claim.route.wrapper_ref.clone(),
+        companion_sha256: claim.route.executable_sha256.clone(),
+        subrouter_executable_path: "/Users/test/.local/bin/subrouter".to_owned(),
+        subrouter_executable_sha256: digest(b"subrouter executable"),
+        agent_executable_path: "/Users/test/.local/bin/codex".to_owned(),
+        agent_executable_sha256: claim
+            .route
+            .agent
+            .adapter
+            .implementation_sha256
+            .as_str()
+            .to_owned(),
+        session_headers_ref: claim.route.session_headers_ref.clone(),
+        session_headers_file: ProviderSecretFileV1 {
+            path: "/Users/test/.config/pulp/secrets/subrouter-headers".to_owned(),
+            sha256: claim.route.session_headers_sha256.clone(),
+        },
+        routing_generation: claim.route.route_revision,
+        launch_generation: claim.route.launch_generation,
+        launch_revision: claim.route.launch_revision,
+        agent_adapter_generation: claim.route.agent.adapter.generation,
+        agent_adapter_revision: claim.route.agent.adapter.revision,
+    }
+}
+
 fn resume_expectation(claim: &DeliveryClaim) -> FreshResumeExpectationV1 {
     FreshResumeExpectationV1 {
         workstream_handle: "GEN-14".to_owned(),
@@ -225,6 +303,83 @@ fn provider_response(
     }
 }
 
+struct ScriptedNativeRunner {
+    outcomes: VecDeque<ProviderWrapperOutcomeV1>,
+    operations: Vec<ProviderWrapperOperationV1>,
+}
+
+impl super::super::provider_publication::NativeWrapperRunner for ScriptedNativeRunner {
+    fn run(
+        &mut self,
+        _config: &ProviderWrapperConfig,
+        _environment: &crate::provider_wrapper::ProviderWrapperEnvironment,
+        request: &crate::provider_wrapper::ProviderWrapperRequestV1,
+    ) -> Result<ProviderWrapperRunResult, String> {
+        self.operations.push(request.operation);
+        let outcome = self
+            .outcomes
+            .pop_front()
+            .ok_or_else(|| "unexpected wrapper call".to_owned())?;
+        let response = ProviderWrapperResponseV1 {
+            schema_version: 1,
+            operation: request.operation,
+            provider_id: request.provider_id.clone(),
+            adapter_id: request.adapter_id.clone(),
+            idempotency_key: request.delivery_fence.idempotency_key.clone(),
+            outcome: outcome.clone(),
+        };
+        let canonical_bytes = serde_json::to_vec(&response).expect("response bytes");
+        let response_receipt = ProtectedProviderResponseV1 {
+            response_digest: digest(&canonical_bytes),
+            canonical_bytes,
+        };
+        Ok(match outcome {
+            ProviderWrapperOutcomeV1::Delivered {
+                provider_session_ref,
+                receipt_digest,
+                ..
+            } => ProviderWrapperRunResult::Delivered {
+                provider_session_ref,
+                provider_receipt_digest: receipt_digest,
+                response_receipt,
+            },
+            ProviderWrapperOutcomeV1::Retryable { error_digest, .. } => {
+                ProviderWrapperRunResult::Retryable {
+                    error_digest,
+                    response_receipt,
+                }
+            }
+            ProviderWrapperOutcomeV1::Rejected { error_digest, .. } => {
+                ProviderWrapperRunResult::Rejected {
+                    error_digest,
+                    response_receipt,
+                }
+            }
+            ProviderWrapperOutcomeV1::Uncertain {
+                evidence_digest, ..
+            } => ProviderWrapperRunResult::Uncertain {
+                evidence_digest,
+                response_receipt: Some(response_receipt),
+            },
+        })
+    }
+}
+
+fn delivered_outcome() -> ProviderWrapperOutcomeV1 {
+    ProviderWrapperOutcomeV1::Delivered {
+        acceptance: ProviderAcceptanceV1::ProviderSessionAccepted,
+        provider_session_ref: "session:codex:accepted-1".to_owned(),
+        receipt_digest: digest(b"provider accepted"),
+    }
+}
+
+fn retryable_outcome() -> ProviderWrapperOutcomeV1 {
+    ProviderWrapperOutcomeV1::Retryable {
+        launch_state: crate::provider_wrapper::NotAcceptedV1::NotAccepted,
+        error_digest: digest(b"definitively not accepted"),
+    }
+}
+
 fn publish_context_request(
     ledger: &WorkLedger,
     claim: &DeliveryClaim,
@@ -234,9 +389,10 @@ fn publish_context_request(
             claim,
             ProviderWrapperOperationV1::Submit,
             &provider_config(claim),
+            subrouter_routing(claim),
             head_authority(claim),
             resume_expectation(claim),
-            ProviderLaunchOptionsV1::default(),
+            provider_launch_options(),
         )
         .expect("protected context request")
 }
@@ -278,9 +434,10 @@ fn provider_request_is_crash_replay_safe_and_preserves_route_axes() {
             &claim,
             ProviderWrapperOperationV1::Submit,
             &config,
+            subrouter_routing(&claim),
             head_authority(&claim),
             resume_expectation(&claim),
-            ProviderLaunchOptionsV1::default(),
+            provider_launch_options(),
         )
         .expect("publish request");
 
@@ -290,9 +447,10 @@ fn provider_request_is_crash_replay_safe_and_preserves_route_axes() {
             &claim,
             ProviderWrapperOperationV1::Submit,
             &config,
+            subrouter_routing(&claim),
             head_authority(&claim),
             resume_expectation(&claim),
-            ProviderLaunchOptionsV1::default(),
+            provider_launch_options(),
         )
         .expect("replay request");
 
@@ -338,9 +496,10 @@ fn provider_request_refuses_stale_claim_and_direct_fallback() {
                 &stale,
                 ProviderWrapperOperationV1::Submit,
                 &provider_config(&claim),
+                subrouter_routing(&claim),
                 head_authority(&claim),
                 resume_expectation(&claim),
-                ProviderLaunchOptionsV1::default(),
+                provider_launch_options(),
             )
             .is_err()
     );
@@ -353,9 +512,10 @@ fn provider_request_refuses_stale_claim_and_direct_fallback() {
                 &claim,
                 ProviderWrapperOperationV1::Submit,
                 &provider_config(&claim),
+                subrouter_routing(&claim),
                 stale_authority,
                 resume_expectation(&claim),
-                ProviderLaunchOptionsV1::default(),
+                provider_launch_options(),
             )
             .is_err()
     );
@@ -368,9 +528,58 @@ fn provider_request_refuses_stale_claim_and_direct_fallback() {
                 &claim,
                 ProviderWrapperOperationV1::Submit,
                 &direct,
+                subrouter_routing(&claim),
                 head_authority(&claim),
                 resume_expectation(&claim),
-                ProviderLaunchOptionsV1::default(),
+                provider_launch_options(),
+            )
+            .is_err()
+    );
+
+    let mut wrong_resume = subrouter_routing(&claim);
+    wrong_resume.native_resume_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd".to_owned();
+    assert!(
+        ledger
+            .publish_native_provider_request(
+                &claim,
+                ProviderWrapperOperationV1::Submit,
+                &provider_config(&claim),
+                wrong_resume,
+                head_authority(&claim),
+                resume_expectation(&claim),
+                provider_launch_options(),
+            )
+            .is_err()
+    );
+
+    let mut wrong_account = subrouter_routing(&claim);
+    wrong_account.account_file.sha256 = digest(b"different account");
+    assert!(
+        ledger
+            .publish_native_provider_request(
+                &claim,
+                ProviderWrapperOperationV1::Submit,
+                &provider_config(&claim),
+                wrong_account,
+                head_authority(&claim),
+                resume_expectation(&claim),
+                provider_launch_options(),
+            )
+            .is_err()
+    );
+
+    let mut wrong_model = provider_launch_options();
+    wrong_model.model_id = Some("gpt-5.5".to_owned());
+    assert!(
+        ledger
+            .publish_native_provider_request(
+                &claim,
+                ProviderWrapperOperationV1::Submit,
+                &provider_config(&claim),
+                subrouter_routing(&claim),
+                head_authority(&claim),
+                resume_expectation(&claim),
+                wrong_model,
             )
             .is_err()
     );
@@ -392,9 +601,10 @@ fn provider_receipt_is_exact_and_replay_safe_before_acknowledgment() {
             &claim,
             ProviderWrapperOperationV1::Submit,
             &provider_config(&claim),
+            subrouter_routing(&claim),
             head_authority(&claim),
             resume_expectation(&claim),
-            ProviderLaunchOptionsV1::default(),
+            provider_launch_options(),
         )
         .expect("request");
     let started = start_at(&ledger, &claim, at(1)).expect("start");
@@ -448,6 +658,148 @@ fn provider_receipt_is_exact_and_replay_safe_before_acknowledgment() {
             .publish_native_provider_receipt(&started, &cross_delivery, &response)
             .is_err()
     );
+}
+
+#[test]
+fn native_provider_ingress_delivers_only_the_exact_protected_request() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    publish_context_request(&ledger, &claim);
+    let mut runner = ScriptedNativeRunner {
+        outcomes: VecDeque::from([delivered_outcome()]),
+        operations: Vec::new(),
+    };
+    let result = ledger
+        .native_provider_tick_with(
+            &provider_config(&claim),
+            &crate::provider_wrapper::ProviderWrapperEnvironment::default(),
+            &["danielraffel/shipyard".to_owned()],
+            &mut runner,
+        )
+        .expect("native delivery");
+    assert_eq!(
+        result,
+        super::super::provider_publication::NativeProviderTickResult::Progressed
+    );
+    assert_eq!(runner.operations, [ProviderWrapperOperationV1::Submit]);
+    let state: (String, String) = ledger
+        .connect_read_only()
+        .expect("ledger")
+        .query_row(
+            "SELECT o.state, w.phase FROM outbox o
+             JOIN work_items w ON w.id = o.work_item_id WHERE o.wake_id = ?1",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("state");
+    assert_eq!(
+        state,
+        ("acknowledged".to_owned(), "agent_owned_repair".to_owned())
+    );
+}
+
+#[test]
+fn native_provider_ingress_leaves_unauthorized_repository_untouched() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    publish_context_request(&ledger, &claim);
+    let mut runner = ScriptedNativeRunner {
+        outcomes: VecDeque::new(),
+        operations: Vec::new(),
+    };
+    let result = ledger
+        .native_provider_tick_with(
+            &provider_config(&claim),
+            &crate::provider_wrapper::ProviderWrapperEnvironment::default(),
+            &["danielraffel/other".to_owned()],
+            &mut runner,
+        )
+        .expect("unauthorized repository is inert");
+    assert_eq!(
+        result,
+        super::super::provider_publication::NativeProviderTickResult::NoWork
+    );
+    assert!(runner.operations.is_empty());
+    let state: String = ledger
+        .connect_read_only()
+        .expect("ledger")
+        .query_row(
+            "SELECT state FROM outbox WHERE wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("state");
+    assert_eq!(state, "claimed");
+}
+
+#[test]
+fn recovered_started_delivery_reconciles_without_redispatch() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    publish_context_request(&ledger, &claim);
+    start_at(&ledger, &claim, at(1)).expect("durable start boundary");
+    let mut recovered = ScriptedNativeRunner {
+        outcomes: VecDeque::new(),
+        operations: Vec::new(),
+    };
+    ledger
+        .native_provider_tick_with(
+            &provider_config(&claim),
+            &crate::provider_wrapper::ProviderWrapperEnvironment::default(),
+            &["danielraffel/shipyard".to_owned()],
+            &mut recovered,
+        )
+        .expect("recover started delivery");
+    assert!(recovered.operations.is_empty());
+
+    let mut reconcile = ScriptedNativeRunner {
+        outcomes: VecDeque::from([retryable_outcome()]),
+        operations: Vec::new(),
+    };
+    ledger
+        .native_provider_tick_with(
+            &provider_config(&claim),
+            &crate::provider_wrapper::ProviderWrapperEnvironment::default(),
+            &["danielraffel/shipyard".to_owned()],
+            &mut reconcile,
+        )
+        .expect("reconcile uncertain delivery");
+    assert_eq!(
+        reconcile.operations,
+        [ProviderWrapperOperationV1::Reconcile]
+    );
+    let state: (String, String) = ledger
+        .connect_read_only()
+        .expect("ledger")
+        .query_row(
+            "SELECT o.state, w.phase FROM outbox o
+             JOIN work_items w ON w.id = o.work_item_id WHERE o.wake_id = ?1",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("state");
+    assert_eq!(state, ("failed".to_owned(), "actionable".to_owned()));
 }
 
 #[test]

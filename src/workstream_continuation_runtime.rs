@@ -5,11 +5,14 @@
 //! executor boundary contains routine deterministic work only; it has no model
 //! or terminal UI dependency.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::identity::RuntimeMode;
+use crate::provider_wrapper::ProviderWrapperEnvironment;
+use crate::work_ledger::WorkLedger;
 use crate::workstream_activation_loader::{
     ReadyWorkstreamActivation, WorkstreamActivationLoader, WorkstreamActivationState,
 };
@@ -61,17 +64,50 @@ type WorkerResult = (
 
 const CONTINUATION_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-struct DefaultContinuationExecutor;
+struct DefaultContinuationExecutor {
+    state_dir: PathBuf,
+}
 
 impl ContinuationExecutor for DefaultContinuationExecutor {
     fn consume_one(
         &mut self,
-        _activation: &ReadyWorkstreamActivation,
+        activation: &ReadyWorkstreamActivation,
     ) -> Result<ContinuationTickResult, &'static str> {
-        // Activation is now safely daemon-owned. Delivery remains inert until
-        // the private publication ingress supplies an exact protected request;
-        // never manufacture authority or fall back to a direct provider.
-        Ok(ContinuationTickResult::NoWork)
+        let Some(ledger) =
+            WorkLedger::open_existing(&self.state_dir).map_err(|_| "ledger_open_refused")?
+        else {
+            return Ok(ContinuationTickResult::NoWork);
+        };
+        let mut environment_entries = ["HOME", "TMPDIR", "SYSTEMROOT", "USERPROFILE"]
+            .into_iter()
+            .filter_map(|key| std::env::var_os(key).map(|value| (key.to_owned(), value)))
+            .collect::<Vec<_>>();
+        environment_entries.push((
+            "SHIPYARD_PROVIDER_COMPANION_PATH".to_owned(),
+            activation
+                .config
+                .provider_wrapper
+                .executable_path
+                .as_os_str()
+                .to_owned(),
+        ));
+        let environment = ProviderWrapperEnvironment::new(environment_entries)
+            .map_err(|_| "provider_environment_refused")?;
+        match ledger
+            .native_provider_tick(
+                &activation.config.provider_wrapper,
+                &environment,
+                &activation.config.repositories,
+            )
+            .map_err(|_| "native_provider_delivery_refused")?
+        {
+            crate::work_ledger::NativeProviderTickResult::NoWork => {
+                Ok(ContinuationTickResult::NoWork)
+            }
+            crate::work_ledger::NativeProviderTickResult::Progressed => {
+                Ok(ContinuationTickResult::Consumed)
+            }
+        }
     }
 }
 
@@ -84,11 +120,11 @@ pub(crate) struct WorkstreamContinuationRuntime {
 }
 
 impl WorkstreamContinuationRuntime {
-    pub(crate) fn new(mode: RuntimeMode) -> Self {
+    pub(crate) fn new(mode: RuntimeMode, state_dir: PathBuf) -> Self {
         if mode != RuntimeMode::Shipyard {
             return Self {
                 activation: Box::new(DisabledActivation),
-                executor: Some(Box::new(DefaultContinuationExecutor)),
+                executor: Some(Box::new(DefaultContinuationExecutor { state_dir })),
                 worker: None,
                 state: ContinuationRuntimeState::Disabled,
                 next_activation_at: Instant::now(),
@@ -96,7 +132,7 @@ impl WorkstreamContinuationRuntime {
         }
         Self {
             activation: Box::new(WorkstreamActivationLoader::production()),
-            executor: Some(Box::new(DefaultContinuationExecutor)),
+            executor: Some(Box::new(DefaultContinuationExecutor { state_dir })),
             worker: None,
             state: ContinuationRuntimeState::Disabled,
             next_activation_at: Instant::now(),
@@ -231,7 +267,9 @@ mod tests {
 
     #[test]
     fn isolated_runtime_is_permanently_default_off() {
-        let mut runtime = WorkstreamContinuationRuntime::new(RuntimeMode::Isolated);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut runtime =
+            WorkstreamContinuationRuntime::new(RuntimeMode::Isolated, temp.path().to_path_buf());
         runtime.tick();
         assert_eq!(runtime.state(), &ContinuationRuntimeState::Disabled);
         assert!(runtime.worker.is_none());

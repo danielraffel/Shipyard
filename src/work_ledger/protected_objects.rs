@@ -55,7 +55,7 @@ impl WorkLedger {
         &self,
         work_item_id: &str,
         kind: ProtectedObjectKind,
-    ) -> WorkLedgerResult<Vec<Vec<u8>>> {
+    ) -> WorkLedgerResult<Vec<(ProtectedObjectRecord, Vec<u8>)>> {
         let connection = self.connect_read_only()?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
@@ -94,14 +94,15 @@ impl WorkLedger {
             .parent()
             .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
         let directory = open_object_directory(parent, false)?;
-        let bytes = rows
+        let objects = rows
             .into_iter()
             .map(|(storage_name, record)| {
-                read_object_from_directory(&directory, &storage_name, &record)
+                let bytes = read_object_from_directory(&directory, &storage_name, &record)?;
+                Ok((record, bytes))
             })
             .collect::<WorkLedgerResult<Vec<_>>>()?;
         verify_directory_binding(parent, &directory)?;
-        Ok(bytes)
+        Ok(objects)
     }
 
     /// Persist an immutable object while applying an exact ledger fence in the

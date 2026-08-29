@@ -184,6 +184,8 @@ pub mod workflow_cancellation;
 pub(crate) mod workstream_activation_loader;
 pub mod workstream_continuation_config;
 pub(crate) mod workstream_continuation_runtime;
+/// Digest-pinnable Subrouter companion for fresh workstream recovery.
+pub mod workstream_provider_adapter;
 /// Host-global production-writer coordination for sandbox E2E isolation.
 mod writer_domain_lease;
 
