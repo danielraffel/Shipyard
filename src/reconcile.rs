@@ -985,10 +985,12 @@ fn run_capture(
 mod tests {
     use chrono::{Duration, TimeZone};
 
+    #[cfg(unix)]
+    use super::run_capture;
     use super::{
         CommandCapture, ReconcileFetchError, ReconcileTransition, ReconcileWindow,
         fetch_provenanced_page, parse_provenanced_page, reconcile_active_ship_states_with,
-        reconcile_ship_state, run_capture,
+        reconcile_ship_state,
     };
     use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
 

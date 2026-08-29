@@ -8,9 +8,12 @@ use crate::provider_wrapper::{
 };
 use crate::work_ledger::{
     DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
-    FreshAgentResumeExpectation, NativePublicationRequest, ProviderAdapter, ProviderCapability,
-    ProviderLaunchRequest, ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult, WakeEnvelope,
-    WakeProfileResolver, WorkLedger,
+    FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
+    ProviderOutcome, WakeEnvelope, WakeProfileResolver,
+};
+#[cfg(unix)]
+use crate::work_ledger::{
+    NativePublicationRequest, WakeConsumerPolicy, WakeDeliveryResult, WorkLedger,
 };
 
 const UUID: &str = "123E4567-E89B-12D3-A456-426614174000";

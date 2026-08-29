@@ -10,21 +10,27 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
+#[cfg(unix)]
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
 use crate::process::ProcessTree;
 use crate::workstream_continuation_config::ProviderWrapperConfig;
 
+#[cfg(unix)]
 mod execution_sentinel;
-#[cfg(not(unix))]
-use execution_sentinel::SentinelCleanup;
+#[cfg(unix)]
 use execution_sentinel::terminate_sentinel_processes;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -303,11 +309,17 @@ pub(crate) enum ProviderExecutableIdentityBoundary {
 #[must_use]
 pub(crate) const fn provider_executable_identity_boundary() -> ProviderExecutableIdentityBoundary {
     #[cfg(target_os = "linux")]
-    return ProviderExecutableIdentityBoundary::KernelSealedSnapshot;
+    {
+        ProviderExecutableIdentityBoundary::KernelSealedSnapshot
+    }
     #[cfg(target_os = "macos")]
-    return ProviderExecutableIdentityBoundary::TrustedSameUidPrivateSnapshot;
+    {
+        ProviderExecutableIdentityBoundary::TrustedSameUidPrivateSnapshot
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return ProviderExecutableIdentityBoundary::Unsupported;
+    {
+        ProviderExecutableIdentityBoundary::Unsupported
+    }
 }
 
 /// Execute one request through the immutable configured wrapper.
@@ -324,25 +336,23 @@ pub(crate) fn run_provider_wrapper(
         .lock()
         .map_err(|_| refusal("provider wrapper test execution lock is poisoned"))?;
     validate_request(config, request)?;
-    if !provider_wrapper_execution_supported() {
-        return Ok(uncertain("platform-cannot-prove-exact-wrapper-execution"));
-    }
-    let request_bytes = serde_json::to_vec(request)
-        .map_err(|_| refusal("provider wrapper request cannot be serialized"))?;
-    if request_bytes.len() > MAX_REQUEST_BYTES {
-        return Err(refusal(
-            "provider wrapper request exceeds the bounded input limit",
-        ));
-    }
-
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (environment, request_bytes);
-        return Ok(uncertain("platform-cannot-prove-exact-wrapper-execution"));
+        let _ = environment;
+        Ok(uncertain("platform-cannot-prove-exact-wrapper-execution"))
     }
 
-    #[cfg(unix)]
-    run_provider_wrapper_unix(config, environment, request, &request_bytes)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let request_bytes = serde_json::to_vec(request)
+            .map_err(|_| refusal("provider wrapper request cannot be serialized"))?;
+        if request_bytes.len() > MAX_REQUEST_BYTES {
+            return Err(refusal(
+                "provider wrapper request exceeds the bounded input limit",
+            ));
+        }
+        run_provider_wrapper_unix(config, environment, request, &request_bytes)
+    }
 }
 
 pub(crate) fn validate_request(
@@ -716,17 +726,11 @@ fn run_provider_wrapper_unix(
     }
     let tree_cleanup_deadline = Instant::now() + TEARDOWN_BUDGET;
     process.terminate_until(tree_cleanup_deadline);
-    #[cfg(unix)]
     let sentinel_cleanup = terminate_sentinel_processes(
         &sentinel_path,
         Instant::now() + SENTINEL_TEARDOWN_BUDGET,
         POLL_INTERVAL,
     );
-    #[cfg(not(unix))]
-    let sentinel_cleanup = SentinelCleanup {
-        proven: true,
-        residual_detected: false,
-    };
     if capture_exceeds(&stdout, config.max_stdout_bytes)
         || capture_exceeds(&stderr, config.max_stderr_bytes)
     {
@@ -879,8 +883,10 @@ fn prepare_platform_executable(
     Ok(None)
 }
 
+#[cfg(unix)]
 struct HashWriter<'a>(&'a mut Sha256);
 
+#[cfg(unix)]
 impl Write for HashWriter<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.0.update(buffer);
@@ -892,11 +898,13 @@ impl Write for HashWriter<'_> {
     }
 }
 
+#[cfg(unix)]
 fn capture_exceeds(file: &File, limit: u64) -> bool {
     file.metadata()
         .map_or(true, |metadata| metadata.len() > limit)
 }
 
+#[cfg(unix)]
 fn read_capture(file: &mut File, limit: u64) -> Option<Vec<u8>> {
     file.seek(SeekFrom::Start(0)).ok()?;
     let mut bytes = Vec::new();
@@ -982,6 +990,7 @@ fn refusal(message: impl Into<String>) -> ProviderWrapperRefusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
 
     #[cfg(unix)]
