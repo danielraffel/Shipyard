@@ -365,9 +365,10 @@ fn dry_run_is_ineligible_and_never_synthesizes_missing_proofs() {
 
 #[test]
 fn exact_cache_evidence_closes_only_the_cache_gap() {
+    let current = std::env::current_dir().unwrap().canonicalize().unwrap();
     let cache_root = tempfile::Builder::new()
         .prefix(".shipyard-controller-cache-")
-        .tempdir_in(std::env::current_dir().unwrap())
+        .tempdir_in(current)
         .unwrap();
     fs::write(cache_root.path().join("object.bin"), b"cache-object").unwrap();
     let manifest = produce_cache_generation_manifest(cache_root.path(), "skia", "m124").unwrap();
