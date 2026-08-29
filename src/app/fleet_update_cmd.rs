@@ -696,7 +696,7 @@ fn remote_update_command(
 
 fn exact_asset_curl_shim(asset_name: &str) -> String {
     format!(
-        "#!/bin/bash\nset -euo pipefail\ncase \"$*\" in\n  *\"/releases/tags/\"*) /usr/bin/printf '{{\"assets\":[{{\"name\":\"{asset_name}\",\"url\":\"file://%s\"}}]}}\\n200\\n' \"$SHIPYARD_FLEET_ASSET_PATH\" ;;\n  *) exec /usr/bin/curl \"$@\" ;;\nesac"
+        "#!/bin/bash\nset -euo pipefail\ncase \"$*\" in\n  *\"/releases/tags/\"*) /usr/bin/printf '{{\"assets\":[{{\"name\":\"{asset_name}\",\"url\":\"file://%s\",\"browser_download_url\":\"file://%s\"}}]}}\\n200\\n' \"$SHIPYARD_FLEET_ASSET_PATH\" \"$SHIPYARD_FLEET_ASSET_PATH\" ;;\n  *) exec /usr/bin/curl \"$@\" ;;\nesac"
     )
 }
 
@@ -1167,6 +1167,37 @@ mod tests {
         assert!(command.contains("--global-dir '/tmp/governed config'"));
         assert!(command.contains("--state-dir '/tmp/governed state'"));
         assert!(command.ends_with("--refresh-daemon --unattended-fleet"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_asset_shim_serves_authenticated_and_unauthenticated_installer_urls() {
+        let temp = tempfile::tempdir().expect("temp");
+        let shim = temp.path().join("curl-shim");
+        std::fs::write(&shim, exact_asset_curl_shim("shipyard-macos-arm64")).expect("shim");
+        let asset = temp.path().join("verified-asset");
+        let output = Command::new("/bin/bash")
+            .arg(&shim)
+            .arg("https://api.github.com/repos/example/shipyard/releases/tags/v1.2.3")
+            .env("SHIPYARD_FLEET_ASSET_PATH", &asset)
+            .output()
+            .expect("run shim");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 response");
+        let payload: Value =
+            serde_json::from_str(stdout.lines().next().expect("release response JSON line"))
+                .expect("release response JSON");
+        let expected = format!("file://{}", asset.display());
+        assert_eq!(
+            payload.pointer("/assets/0/url").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            payload
+                .pointer("/assets/0/browser_download_url")
+                .and_then(Value::as_str),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
