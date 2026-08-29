@@ -794,7 +794,6 @@ fn write_recovery_status(
                 context.observation.repo, pr.fact.number
             ),
         ],
-        "recovery status",
     )
     .map(|_| ())
     .map_err(|error| format!("could not write recovery status: {error}"))

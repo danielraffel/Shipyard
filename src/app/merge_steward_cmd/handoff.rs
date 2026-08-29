@@ -2767,7 +2767,7 @@ fn write_handoff_status(
         command.push("-f".to_owned());
         command.push(format!("target_url={url}"));
     }
-    run_steward_write(actions, &command, "handoff receipt")
+    run_steward_write(actions, &command)
         .map_err(|error| CliFailure::new(1, format!("could not write handoff receipt: {error}")))?;
     Ok(())
 }
@@ -2890,7 +2890,6 @@ pub(super) fn ensure_label(
                 "-f".to_owned(),
                 format!("description={description}"),
             ],
-            "steward label creation",
         )
         .map(|_| ())
         .map_err(|error| CliFailure::new(1, format!("could not create label: {error}"))),
@@ -2917,7 +2916,6 @@ pub(super) fn add_label(
             "-f".to_owned(),
             format!("labels[]={label}"),
         ],
-        "steward label attachment",
     )
     .map(|_| ())
     .map_err(|error| CliFailure::new(1, format!("could not add label {label}: {error}")))
@@ -2938,7 +2936,6 @@ pub(super) fn remove_label(
             "DELETE".to_owned(),
             format!("repos/{repo}/issues/{pr}/labels/{encoded}"),
         ],
-        "steward label removal",
     ) {
         Ok(_) => Ok(()),
         Err(error) if error.to_string().contains("HTTP 404") => Ok(()),
@@ -2952,18 +2949,8 @@ pub(super) fn remove_label(
 pub(super) fn run_steward_write(
     actions: &GitHubActions,
     args: &[String],
-    purpose: &str,
 ) -> Result<String, crate::cloud::GitHubError> {
-    match actions.run_gh(args) {
-        Ok(value) => Ok(value),
-        Err(error) if error.is_integration_permission_denial() => {
-            let _ = crate::writer_domain_lease::write_stderr(format_args!(
-                "shipyard: configured GitHub App cannot write {purpose}; falling back to ambient gh auth for this steward mutation only."
-            ));
-            actions.run_gh_ambient(args)
-        }
-        Err(error) => Err(error),
-    }
+    actions.run_gh(args)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4443,12 +4430,17 @@ fn main() {{
 
     #[cfg(unix)]
     #[test]
-    fn exact_integration_permission_error_uses_one_ambient_fallback() {
+    fn exact_integration_permission_error_fails_closed_without_ambient_fallback() {
         let temp = tempfile::tempdir().expect("temp");
         let (actions, count) = sequenced_gh(&temp, "Resource not accessible by integration");
-        run_steward_write(&actions, &["api".to_owned(), "test".to_owned()], "test")
-            .expect("ambient fallback");
-        assert_eq!(std::fs::read_to_string(count).expect("count"), "2");
+        let error = run_steward_write(&actions, &["api".to_owned(), "test".to_owned()])
+            .expect_err("configured App denial must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Resource not accessible by integration")
+        );
+        assert_eq!(std::fs::read_to_string(count).expect("count"), "1");
     }
 
     #[cfg(unix)]
@@ -4456,9 +4448,7 @@ fn main() {{
     fn generic_write_failure_does_not_escape_to_ambient_auth() {
         let temp = tempfile::tempdir().expect("temp");
         let (actions, count) = sequenced_gh(&temp, "HTTP 403 generic forbidden");
-        assert!(
-            run_steward_write(&actions, &["api".to_owned(), "test".to_owned()], "test").is_err()
-        );
+        assert!(run_steward_write(&actions, &["api".to_owned(), "test".to_owned()]).is_err());
         assert_eq!(std::fs::read_to_string(count).expect("count"), "1");
     }
 
