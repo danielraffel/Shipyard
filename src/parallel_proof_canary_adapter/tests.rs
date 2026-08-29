@@ -282,6 +282,9 @@ fn pinned_runner_rejects_symlink_digest_timeout_and_output_limit() {
         "#include <stdio.h>\nint main(void) { fputs(\"12345\", stdout); return 0; }",
     );
     let mut loud_config = config(loud_path, loud_digest);
+    // This assertion is about the output bound, not scheduler latency. Keep
+    // enough wall-clock slack for a heavily parallel full-suite run.
+    loud_config.deadline_seconds = 30;
     loud_config.max_stdout_bytes = 4;
     let mut loud = DigestPinnedCanaryProtocolRunner::new(loud_config);
     let loud_result = loud.invoke(b"{}");

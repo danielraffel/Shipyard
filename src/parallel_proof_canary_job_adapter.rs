@@ -1164,7 +1164,10 @@ fn main() {{
     let mut command = std::process::Command::new("/bin/sleep");
     command.arg("30").process_group(0);
     let child = command.spawn().unwrap();
-    std::fs::write({descendant_pid_path_literal}, child.id().to_string()).unwrap();
+    let pid_path = std::path::PathBuf::from({descendant_pid_path_literal});
+    let staged_pid_path = pid_path.with_extension("pid.staged");
+    std::fs::write(&staged_pid_path, child.id().to_string()).unwrap();
+    std::fs::rename(staged_pid_path, pid_path).unwrap();
     std::thread::sleep(std::time::Duration::from_secs(30));
 }}"#,
         );
