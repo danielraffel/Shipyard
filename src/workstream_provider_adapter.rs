@@ -17,9 +17,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-#[cfg(target_os = "macos")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -414,7 +412,7 @@ fn create_args(
     request: &ProviderWrapperRequestV1,
     description: &str,
 ) -> Result<Vec<String>, &'static str> {
-    let command = launch_command(request)?;
+    let command = prepare_private_launch(request)?;
     let mut args = cmux_prefix(["workspace", "create"]);
     args.extend([
         "--name".to_owned(),
@@ -441,23 +439,67 @@ fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static
         request.delivery_fence.wake_id,
         request.delivery_fence.wake_id,
     );
-    let mut words = Vec::new();
-    if !request.protected_route.environment.is_empty() {
-        words.push("'/usr/bin/env'".to_owned());
-        for (name, value) in &request.protected_route.environment {
-            words.push(shell_word(&format!("{name}={value}"))?);
-        }
-    }
-    words.extend(
-        request
-            .protected_route
-            .argv
-            .iter()
-            .map(|value| shell_word(value))
-            .collect::<Result<Vec<_>, _>>()?,
+    let mut lines = request
+        .protected_route
+        .environment
+        .iter()
+        .map(|(name, value)| {
+            shell_word(&format!("{name}={value}")).map(|word| format!("export {word}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut invocation = request
+        .protected_route
+        .argv
+        .iter()
+        .map(|value| shell_word(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    invocation.push(shell_word(&prompt)?);
+    lines.push(format!("exec {}", invocation.join(" ")));
+    Ok(lines.join("\n"))
+}
+
+fn prepare_private_launch(request: &ProviderWrapperRequestV1) -> Result<String, &'static str> {
+    let body = launch_command(request)?;
+    let directory = tempfile::Builder::new()
+        .prefix(".shipyard-workstream-route-")
+        .tempdir()
+        .map_err(|_| "private-launch-directory-unavailable")?;
+    let directory_path = directory.path().to_path_buf();
+    let route_path = directory_path.join("launch.sh");
+    let mut route = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&route_path)
+        .map_err(|_| "private-launch-file-unavailable")?;
+    let directory_word = shell_word(
+        directory_path
+            .to_str()
+            .ok_or("private-launch-path-invalid")?,
+    )?;
+    let prologue = format!(
+        "#!/bin/sh\nset -eu\nroute_dir={directory_word}\nrm -f -- \"$0\"\nrmdir -- \"$route_dir\"\n"
     );
-    words.push(shell_word(&prompt)?);
-    Ok(words.join(" "))
+    route
+        .write_all(prologue.as_bytes())
+        .and_then(|()| route.write_all(body.as_bytes()))
+        .and_then(|()| route.write_all(b"\n"))
+        .and_then(|()| route.sync_all())
+        .map_err(|_| "private-launch-file-unwritable")?;
+    drop(route);
+    sync_directory(&directory_path)?;
+    let directory_path = directory.keep();
+    let route_path = directory_path.join("launch.sh");
+    Ok(format!(
+        "'/bin/sh' {}",
+        shell_word(route_path.to_str().ok_or("private-launch-path-invalid")?)?
+    ))
+}
+
+fn sync_directory(path: &Path) -> Result<(), &'static str> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "private-launch-directory-unwritable")
 }
 
 fn shell_word(value: &str) -> Result<String, &'static str> {

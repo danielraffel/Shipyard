@@ -1,6 +1,8 @@
 #![allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 
 use std::collections::VecDeque;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 
 use super::*;
 use crate::provider_wrapper::{
@@ -36,6 +38,13 @@ struct FakeRunner {
     bound_endpoints: Vec<CmuxEndpointV1>,
     results: VecDeque<Result<CommandResult, RunnerFailure>>,
     calls: Vec<Vec<String>>,
+    private_launches: Vec<String>,
+}
+
+fn private_launch_path(command: &str) -> Option<PathBuf> {
+    Some(PathBuf::from(
+        command.strip_prefix("'/bin/sh' '")?.strip_suffix('\'')?,
+    ))
 }
 
 impl CmuxRunner for FakeRunner {
@@ -46,6 +55,14 @@ impl CmuxRunner for FakeRunner {
 
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure> {
         self.calls.push(args.to_vec());
+        if let Some(index) = args.iter().position(|argument| argument == "--command")
+            && let Some(path) = private_launch_path(&args[index + 1])
+        {
+            self.private_launches
+                .push(std::fs::read_to_string(&path).unwrap());
+            std::fs::remove_file(&path).unwrap();
+            std::fs::remove_dir(path.parent().unwrap()).unwrap();
+        }
         self.results
             .pop_front()
             .expect("test runner must provide one result per call")
@@ -452,28 +469,49 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
     assert_eq!(create[cwd_index + 1], quoted_worktree);
     let command_index = create.iter().position(|arg| arg == "--command").unwrap();
     let command = &create[command_index + 1];
+    let launch = &runner.private_launches[0];
     assert!(!command.contains("private-secret"));
     assert!(!command.contains("context_url"));
-    assert!(command.contains("GEN-43"));
-    assert!(command.contains("wake:gen43:1"));
+    assert!(!command.contains("GEN-43"));
+    assert!(!command.contains("account-a"));
+    assert!(!command.contains("agent@example.test"));
+    assert!(launch.contains("GEN-43"));
+    assert!(launch.contains("wake:gen43:1"));
     for command_name in [
         "context-challenge",
         "acknowledge-context",
         "return-challenge",
         "return-ownership",
     ] {
-        assert!(command.contains(command_name));
+        assert!(launch.contains(command_name));
     }
-    assert!(command.contains("Never put receipt JSON or secrets in argv"));
+    assert!(launch.contains("Never put receipt JSON or secrets in argv"));
 }
 
 #[test]
 fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     let codex = request("codex", ProviderWrapperOperationV1::Submit);
-    let codex_command = launch_command(&codex).unwrap();
-    assert!(codex_command.starts_with("'/usr/bin/env' 'SUBROUTER_CODEX_ACCOUNT_ID=account-a' 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test' '/opt/subrouter' 'codex' 'resume'"));
-    assert!(codex_command.contains("'native-session-a'"));
-    assert!(!codex_command.contains("cmux-codex-wrapper"));
+    let codex_body = launch_command(&codex).unwrap();
+    assert!(codex_body.starts_with("export 'SUBROUTER_CODEX_ACCOUNT_ID=account-a'\nexport 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test'\nexec '/opt/subrouter' 'codex' 'resume'"));
+    assert!(codex_body.contains("'native-session-a'"));
+    assert!(!codex_body.contains("cmux-codex-wrapper"));
+    let codex_command = prepare_private_launch(&codex).unwrap();
+    assert!(!codex_command.contains("account-a"));
+    assert!(!codex_command.contains("agent@example.test"));
+    assert!(!codex_command.contains("native-session-a"));
+    let launch_path = private_launch_path(&codex_command).unwrap();
+    let metadata = std::fs::metadata(&launch_path).unwrap();
+    #[cfg(unix)]
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::read_to_string(&launch_path)
+            .unwrap()
+            .lines()
+            .last(),
+        codex_body.lines().last()
+    );
+    std::fs::remove_file(&launch_path).unwrap();
+    std::fs::remove_dir(launch_path.parent().unwrap()).unwrap();
     let public_response = serde_json::to_string(&response(&codex, rejected("test"))).unwrap();
     for private in [
         "account-a",
@@ -497,9 +535,52 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
         "--resume".into(),
         "native-session-a".into(),
     ];
-    let claude_command = launch_command(&claude).unwrap();
-    assert!(claude_command.contains("'/opt/subrouter' 'claude' '--model' 'fable'"));
-    assert!(!claude_command.contains("cmux-claude-wrapper"));
+    let claude_body = launch_command(&claude).unwrap();
+    assert!(claude_body.contains("exec '/opt/subrouter' 'claude' '--model' 'fable'"));
+    assert!(!claude_body.contains("cmux-claude-wrapper"));
+}
+
+#[cfg(unix)]
+#[test]
+fn private_launch_capsule_sets_route_environment_and_deletes_itself() {
+    let scope = tempfile::tempdir().unwrap();
+    let subrouter = scope.path().join("subrouter");
+    let output = scope.path().join("observed.txt");
+    std::fs::write(
+        &subrouter,
+        "#!/bin/sh\nprintf '%s\\n' \"$SUBROUTER_QWEN_ACCOUNT_ID\" \"$@\" > \"$SUBROUTER_TEST_OUTPUT\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&subrouter, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut request = request("qwen", ProviderWrapperOperationV1::Submit);
+    request.protected_route.argv[0] = subrouter.to_string_lossy().into_owned();
+    request.protected_route.environment = std::collections::BTreeMap::from([
+        (
+            "SUBROUTER_QWEN_ACCOUNT_ID".to_owned(),
+            "account-a".to_owned(),
+        ),
+        (
+            "SUBROUTER_TEST_OUTPUT".to_owned(),
+            output.to_string_lossy().into_owned(),
+        ),
+    ]);
+    let command = prepare_private_launch(&request).unwrap();
+    let launch_path = private_launch_path(&command).unwrap();
+    let launch_directory = launch_path.parent().unwrap().to_path_buf();
+    assert!(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!launch_path.exists());
+    assert!(!launch_directory.exists());
+    let observed = std::fs::read_to_string(output).unwrap();
+    assert!(observed.starts_with("account-a\nqwen\nresume\n"));
+    assert!(observed.contains("native-session-a"));
+    assert!(observed.contains("Resume tracked workstream GEN-43"));
 }
 
 #[test]
