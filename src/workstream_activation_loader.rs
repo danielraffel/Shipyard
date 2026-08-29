@@ -329,6 +329,13 @@ fn has_symlink_ancestor(path: &Path) -> bool {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // A Windows drive prefix such as `C:` is not an absolute path until
+        // the following root component has been appended. Probing that
+        // drive-relative prefix can fail even though the complete path and
+        // every real ancestor are safe.
+        if !current.is_absolute() {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => return true,
             Ok(_) => {}
