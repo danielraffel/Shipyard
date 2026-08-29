@@ -178,8 +178,8 @@ fn live_create_shape_accepts_additive_metadata_and_requires_uuid_ids() {
     .unwrap();
 
     let parsed = parse_created_workspace(&bytes).expect("live cmux create shape");
-    assert_eq!(parsed.workspace_id, UUID.to_ascii_lowercase());
-    assert_eq!(parsed.surface_id, SURFACE_UUID.to_ascii_lowercase());
+    assert_eq!(parsed.workspace, UUID.to_ascii_lowercase());
+    assert_eq!(parsed.surface, SURFACE_UUID.to_ascii_lowercase());
 
     let invalid = serde_json::to_vec(&serde_json::json!({
         "workspace_id": "workspace:1",

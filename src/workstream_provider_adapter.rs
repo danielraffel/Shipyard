@@ -194,6 +194,18 @@ fn handle_request(
         return response(request, rejected("unsupported-delivery-target"));
     }
 
+    response(
+        request,
+        create_fresh_workspace(request, terminal, provider, &description),
+    )
+}
+
+fn create_fresh_workspace(
+    request: &ProviderWrapperRequestV1,
+    terminal: &mut impl TerminalTransport,
+    provider: &mut impl ProviderLaunchAuthority,
+    description: &str,
+) -> ProviderWrapperOutcomeV1 {
     // Terminal transport selection and provider launch authority are separate
     // trust decisions. Only the typed, validated protected route may cross
     // this boundary; a missing Subrouter is a refusal, never direct-provider
@@ -202,61 +214,56 @@ fn handle_request(
     // Reconciliation above must remain able to prove an already accepted
     // session after the configured Subrouter binary has moved or upgraded.
     if let Err(code) = provider.verify_route(request) {
-        return response(request, rejected(code));
+        return rejected(code);
     }
 
     if let Err(code) = require_workspace_create_capability(terminal) {
-        return response(request, retryable(code));
+        return retryable(code);
     }
     let private_launch = match provider.prepare_launch(request) {
         Ok(launch) => launch,
-        Err(code) => return response(request, rejected(code)),
+        Err(code) => return rejected(code),
     };
-    let (args, private_launch) = create_args(request, &description, private_launch);
+    let (args, private_launch) = create_args(request, description, private_launch);
     // Raw workspace.create executes initial_command during terminal
     // construction, after cmux has injected its protected workspace/surface
     // identity. From this invocation onward every failure is ambiguous.
     let created_result = terminal.run(&args);
     if !private_launch.wait_until_consumed(PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE) {
-        return response(request, uncertain("cmux-private-launch-not-consumed"));
+        return uncertain("cmux-private-launch-not-consumed");
     }
     let created = match created_result {
         Ok(result) if result.success => result,
-        Ok(_) | Err(_) => return response(request, uncertain("cmux-create-outcome-unknown")),
+        Ok(_) | Err(_) => return uncertain("cmux-create-outcome-unknown"),
     };
     let Ok(created) = parse_created_workspace(&created.stdout) else {
-        return response(request, uncertain("cmux-create-response-invalid"));
+        return uncertain("cmux-create-response-invalid");
     };
-    let listed = match list_matching_workspaces(terminal, &description) {
+    let listed = match list_matching_workspaces(terminal, description) {
         Ok(listed) => listed,
-        Err(code) => return response(request, uncertain(code)),
+        Err(code) => return uncertain(code),
     };
     if listed.as_slice()
         != [WorkspaceMatch {
-            window_id: created.window_id.clone(),
-            workspace_id: created.workspace_id.clone(),
+            window_id: created.window.clone(),
+            workspace_id: created.workspace.clone(),
         }]
     {
-        return response(request, uncertain("cmux-created-workspace-fence-mismatch"));
+        return uncertain("cmux-created-workspace-fence-mismatch");
     }
     let bindings =
-        match session_bindings_for_workspace(terminal, &created.workspace_id, &request.provider_id)
-        {
+        match session_bindings_for_workspace(terminal, &created.workspace, &request.provider_id) {
             Ok(bindings) => bindings,
-            Err(code) => return response(request, uncertain(code)),
+            Err(code) => return uncertain(code),
         };
-    let outcome = match bindings.as_slice() {
-        [binding] if binding.surface_id == created.surface_id => delivered(
-            request,
-            &created.workspace_id,
-            &description,
-            &binding.binding,
-        ),
+    match bindings.as_slice() {
+        [binding] if binding.surface_id == created.surface => {
+            delivered(request, &created.workspace, description, &binding.binding)
+        }
         [] => uncertain("cmux-session-binding-not-yet-visible"),
         [_] => uncertain("cmux-created-surface-binding-mismatch"),
         _ => uncertain("multiple-provider-session-bindings"),
-    };
-    response(request, outcome)
+    }
 }
 
 fn bind_terminal(
@@ -590,15 +597,18 @@ struct ListedWorkspace {
 
 #[derive(Deserialize)]
 struct CreatedWorkspace {
-    window_id: String,
-    workspace_id: String,
-    surface_id: String,
+    #[serde(rename = "window_id")]
+    window: String,
+    #[serde(rename = "workspace_id")]
+    workspace: String,
+    #[serde(rename = "surface_id")]
+    surface: String,
 }
 
 struct CreatedWorkspaceIds {
-    window_id: String,
-    workspace_id: String,
-    surface_id: String,
+    window: String,
+    workspace: String,
+    surface: String,
 }
 
 fn parse_created_workspace(bytes: &[u8]) -> Result<CreatedWorkspaceIds, ()> {
@@ -607,9 +617,9 @@ fn parse_created_workspace(bytes: &[u8]) -> Result<CreatedWorkspaceIds, ()> {
     // this response. Acceptance depends only on the three required UUIDs, so
     // tolerate additive metadata while validating those identifiers strictly.
     Ok(CreatedWorkspaceIds {
-        window_id: canonical_uuid(&created.window_id).ok_or(())?,
-        workspace_id: canonical_uuid(&created.workspace_id).ok_or(())?,
-        surface_id: canonical_uuid(&created.surface_id).ok_or(())?,
+        window: canonical_uuid(&created.window).ok_or(())?,
+        workspace: canonical_uuid(&created.workspace).ok_or(())?,
+        surface: canonical_uuid(&created.surface).ok_or(())?,
     })
 }
 
