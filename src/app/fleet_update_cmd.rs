@@ -8,12 +8,14 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+mod auth_support;
 mod evidence;
 mod release_authority;
 
 #[cfg(test)]
 use evidence::{
-    BinaryEvidence, BinaryPairEvidence, SourceIdentityBasis, execute_plan_with_timeout,
+    AuthSupportEvidence, BinaryEvidence, BinaryPairEvidence, SourceIdentityBasis,
+    SupportFileEvidence, execute_plan_with_timeout,
 };
 use evidence::{HostUpdateEvidence, PlanExecutionError, execute_plan, validate_evidence};
 use release_authority::{
@@ -96,6 +98,8 @@ struct HostUpdatePlan {
     ssh: Option<String>,
     binary: PathBuf,
     companion_binary: PathBuf,
+    auth_helper: PathBuf,
+    auth_wrapper: PathBuf,
     target: String,
     source_identity: String,
     release_authority: ReleaseAuthority,
@@ -475,32 +479,83 @@ fn host_update_plan_with_authority(
             ),
         ));
     }
-    let command = if class.ssh.is_some() {
-        let helper = class.github_cli.as_deref().ok_or_else(|| {
+    let auth_wrapper = class.github_cli.as_deref().map(PathBuf::from).ok_or_else(|| {
+        CliFailure::new(
+            2,
+            format!(
+                "host_class.{}.github_cli must name the absolute governed wrapper for fleet rollout",
+                class.class
+            ),
+        )
+    })?;
+    let auth_helper = class
+        .github_token_helper
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
             CliFailure::new(
                 2,
                 format!(
-                    "host_class.{}.github_cli must name the absolute governed auth helper for bootstrap rollout",
+                    "host_class.{}.github_token_helper must name the absolute owner-private helper path for fleet rollout",
                     class.class
                 ),
             )
         })?;
-        let helper = PathBuf::from(helper);
-        if !helper.to_string_lossy().starts_with('/') {
-            return Err(CliFailure::new(
-                2,
-                format!(
-                    "host_class.{}.github_cli must be absolute for bootstrap rollout",
-                    class.class
-                ),
-            ));
-        }
+    if !auth_wrapper.is_absolute() || !auth_helper.is_absolute() || auth_wrapper == auth_helper {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "host_class.{} auth helper and wrapper paths must be distinct absolute paths",
+                class.class
+            ),
+        ));
+    }
+    if !is_lexically_normal_absolute(&auth_wrapper) || !is_lexically_normal_absolute(&auth_helper) {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "host_class.{} auth helper and wrapper paths must not contain dot or parent components",
+                class.class
+            ),
+        ));
+    }
+    let auth_journal = state_dir.join("fleet-auth-support.transaction");
+    let auth_lock = state_dir.join("fleet-auth-support.lock");
+    let managed_targets = [
+        auth_helper.clone(),
+        auth_wrapper.clone(),
+        binary.clone(),
+        companion_binary.clone(),
+    ];
+    let mut transaction_paths = Vec::with_capacity(managed_targets.len() * 3);
+    for target in managed_targets {
+        transaction_paths.push(target.clone());
+        transaction_paths.extend(transaction_marker_paths(&target));
+    }
+    let mut unique_paths = std::collections::HashSet::new();
+    if transaction_paths
+        .iter()
+        .any(|path| !unique_paths.insert(path.clone()))
+        || transaction_paths
+            .iter()
+            .any(|path| path == &auth_journal || path.starts_with(&auth_lock))
+    {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "host_class.{} auth helper and wrapper paths must not overlap managed binaries or transaction state",
+                class.class
+            ),
+        ));
+    }
+    let command = if class.ssh.is_some() {
         remote_update_command(
             &binary,
             &companion_binary,
             target,
             release_authority,
-            &helper,
+            &auth_wrapper,
+            &auth_helper,
             runtime_mode.as_str(),
             &global_dir,
             &state_dir,
@@ -513,6 +568,8 @@ fn host_update_plan_with_authority(
         ssh: class.ssh.clone(),
         binary,
         companion_binary,
+        auth_helper,
+        auth_wrapper,
         target: target.to_owned(),
         source_identity: release_authority.identity_sha256.clone(),
         release_authority: release_authority.clone(),
@@ -526,6 +583,27 @@ fn host_update_plan_with_authority(
         plan.command = local_update_command(&plan);
     }
     Ok(plan)
+}
+
+fn is_lexically_normal_absolute(path: &Path) -> bool {
+    path.to_str().is_some_and(|raw| {
+        raw.starts_with('/')
+            && raw.len() > 1
+            && !raw.chars().any(char::is_control)
+            && raw
+                .split('/')
+                .skip(1)
+                .all(|component| !matches!(component, "" | "." | ".."))
+    })
+}
+
+fn transaction_marker_paths(path: &Path) -> [PathBuf; 2] {
+    let marker = |suffix: &str| {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    };
+    [marker(".shipyard-rollback"), marker(".shipyard-was-absent")]
 }
 
 #[cfg(test)]
@@ -549,6 +627,16 @@ fn test_release_authority(tag: &str) -> ReleaseAuthority {
             blob_oid: "9".repeat(40),
             sha256: "a".repeat(64),
         },
+        auth_helper: release_authority::SourceFileAuthority {
+            path: "scripts/shipyard-github-app-token".to_owned(),
+            blob_oid: "b".repeat(40),
+            sha256: "c".repeat(64),
+        },
+        auth_wrapper: release_authority::SourceFileAuthority {
+            path: "scripts/ghapp".to_owned(),
+            blob_oid: "d".repeat(40),
+            sha256: "e".repeat(64),
+        },
         checksum_manifest: ReleaseAssetAuthority {
             id: 10,
             name: "checksums.sha256".to_owned(),
@@ -571,6 +659,7 @@ fn remote_update_command(
     companion_binary: &Path,
     target: &str,
     authority: &ReleaseAuthority,
+    auth_wrapper: &Path,
     auth_helper: &Path,
     mode: &str,
     global_dir: &Path,
@@ -579,12 +668,34 @@ fn remote_update_command(
     let install_dir = binary.parent().unwrap_or_else(|| Path::new("/"));
     let version = target.strip_prefix('v').unwrap_or(target);
     let installer_url = format!(
-        "https://raw.githubusercontent.com/danielraffel/Shipyard/{}/install.sh",
-        authority.commit_oid
+        "https://raw.githubusercontent.com/{}/{}/{}",
+        authority.repository, authority.commit_oid, authority.installer.path
     );
     let release_asset_url = format!(
-        "https://api.github.com/repos/danielraffel/Shipyard/releases/assets/{}",
-        authority.platform_asset.id
+        "https://api.github.com/repos/{}/releases/assets/{}",
+        authority.repository, authority.platform_asset.id
+    );
+    let (auth_helper_url, auth_wrapper_url) = auth_support::source_urls(authority);
+    let before_auth = auth_support::probe(auth_helper, auth_wrapper, "before");
+    let after_auth = auth_support::probe(auth_helper, auth_wrapper, "after");
+    let auth_contract = auth_support::wrapper_helper_contract_probe(auth_helper);
+    let binary_install_command = format!(
+        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR={} SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null",
+        shlex_quote(version),
+        shlex_quote(&install_dir.display().to_string())
+    );
+    let auth_transaction = auth_support::install_transaction(
+        auth_helper,
+        auth_wrapper,
+        binary,
+        companion_binary,
+        tag_requires_companion(target),
+        "\"$auth_helper_source\"",
+        "\"$auth_wrapper_source\"",
+        &binary_install_command,
+        state_dir,
+        authority,
+        false,
     );
     let before_pair = remote_pair_probe(binary, companion_binary, "before", None, false);
     let after_pair = remote_pair_probe(
@@ -596,57 +707,55 @@ fn remote_update_command(
     );
     let exact_asset_curl_shim = exact_asset_curl_shim(&authority.platform_asset.name);
     let script = format!(
-        "set -euo pipefail\n\
-         {}\n\
+        "set -euo pipefail\n{}\n{}\n{}\n\
          before_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
          token=\"$({} auth token)\"\n\
-         installer=\"$(/usr/bin/mktemp)\"\n\
-         staging_dir=\"$(/usr/bin/mktemp -d)\"\n\
+         installer=\"$(/usr/bin/mktemp)\"; staging_dir=\"$(/usr/bin/mktemp -d)\"\n\
          trap '/bin/rm -f \"$installer\"; /bin/rm -rf \"$staging_dir\"' EXIT\n\
          /usr/bin/curl -fsSL --output \"$installer\" {}\n\
-         installer_sha256=\"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\"\n\
-         test \"$installer_sha256\" = {}\n\
+         test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}\n\
          release_asset=\"$staging_dir/release-asset\"\n\
          /usr/bin/printf 'Authorization: Bearer %s\\n' \"$token\" | /usr/bin/curl -fsSL -H @- -H 'Accept: application/octet-stream' --output \"$release_asset\" {}\n\
-         release_asset_sha256=\"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\"\n\
-         test \"$release_asset_sha256\" = {}\n\
-         curl_shim=\"$staging_dir/curl-exact-asset\"\n\
-         /usr/bin/printf '%s\\n' {} > \"$curl_shim\"\n\
-         /bin/chmod 700 \"$curl_shim\"\n\
+         release_asset_sha256=\"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\"; test \"$release_asset_sha256\" = {}\n\
+         auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"\n\
+         /usr/bin/printf 'Authorization: Bearer %s\\n' \"$token\" | /usr/bin/curl -fsSL -H @- --output \"$auth_helper_source\" {}\n\
+         /usr/bin/printf 'Authorization: Bearer %s\\n' \"$token\" | /usr/bin/curl -fsSL -H @- --output \"$auth_wrapper_source\" {}\n\
+         test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}\n\
+         test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}\n\
+         curl_shim=\"$staging_dir/curl-exact-asset\"; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"\n\
          SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$staging_dir\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null\n\
-         staged_binary=\"$staging_dir/shipyard\"\n\
-         staged_version=\"$(\"$staged_binary\" --version)\"\n\
-         test \"$staged_version\" = {}\n\
+         staged_binary=\"$staging_dir/shipyard\"; test \"$(\"$staged_binary\" --version)\" = {}\n\
          \"$staged_binary\" --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
-         SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR={} SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null\n\
-         unset token\n\
-         {}\n\
+         {}\nunset token\n{}\n{}\n\
          {} --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
          refresh_receipt=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon refresh | /usr/bin/tr -d '\\n')\"\n\
          after_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
-         printf '%s%s\\n' {} \"$before_primary_sha256\"\n\
-         printf '%s%s\\n' {} \"$before_primary_version\"\n\
-         printf '%s%s\\n' {} \"$before_companion_sha256\"\n\
-         printf '%s%s\\n' {} \"$before_companion_version\"\n\
-         printf '%s%s\\n' {} \"$after_primary_sha256\"\n\
-         printf '%s%s\\n' {} \"$after_primary_version\"\n\
-         printf '%s%s\\n' {} \"$after_companion_sha256\"\n\
-         printf '%s%s\\n' {} \"$after_companion_version\"\n\
-         printf '%s%s\\n' {} \"$before_status\"\n\
-         printf '%s%s\\n' {} \"$refresh_receipt\"\n\
-         printf '%s%s\\n' {} \"$after_status\"\n\
-         printf '%s%s\\n' {} {}\n\
-         printf '%s%s\\n' {} \"$release_asset_sha256\"",
+         printf '%s%s\\n' {} \"$before_primary_sha256\"; printf '%s%s\\n' {} \"$before_primary_version\"\n\
+         printf '%s%s\\n' {} \"$before_companion_sha256\"; printf '%s%s\\n' {} \"$before_companion_version\"\n\
+         printf '%s%s\\n' {} \"$after_primary_sha256\"; printf '%s%s\\n' {} \"$after_primary_version\"\n\
+         printf '%s%s\\n' {} \"$after_companion_sha256\"; printf '%s%s\\n' {} \"$after_companion_version\"\n\
+         printf '%s%s\\n' {} \"$before_auth_helper_sha256\"; printf '%s%s\\n' {} \"$before_auth_helper_mode\"\n\
+         printf '%s%s\\n' {} \"$before_auth_wrapper_sha256\"; printf '%s%s\\n' {} \"$before_auth_wrapper_mode\"\n\
+         printf '%s%s\\n' {} \"$after_auth_helper_sha256\"; printf '%s%s\\n' {} \"$after_auth_helper_mode\"\n\
+         printf '%s%s\\n' {} \"$after_auth_wrapper_sha256\"; printf '%s%s\\n' {} \"$after_auth_wrapper_mode\"\n\
+         printf '%s%s\\n' {} \"$before_status\"; printf '%s%s\\n' {} \"$refresh_receipt\"; printf '%s%s\\n' {} \"$after_status\"\n\
+         printf '%s%s\\n' {} {}; printf '%s%s\\n' {} \"$release_asset_sha256\"",
         before_pair,
+        before_auth,
+        auth_contract,
         shlex_quote(&binary.display().to_string()),
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
         shlex_quote(&state_dir.display().to_string()),
-        shlex_quote(&auth_helper.display().to_string()),
+        shlex_quote(&auth_wrapper.display().to_string()),
         shlex_quote(&installer_url),
         shlex_quote(&authority.installer.sha256),
         shlex_quote(&release_asset_url),
         shlex_quote(&authority.platform_asset.sha256),
+        shlex_quote(&auth_helper_url),
+        shlex_quote(&auth_wrapper_url),
+        shlex_quote(&authority.auth_helper.sha256),
+        shlex_quote(&authority.auth_wrapper.sha256),
         shlex_quote(&exact_asset_curl_shim),
         shlex_quote(version),
         shlex_quote(&format!("shipyard {version}")),
@@ -654,9 +763,9 @@ fn remote_update_command(
         shlex_quote(&global_dir.display().to_string()),
         shlex_quote(&state_dir.display().to_string()),
         shlex_quote(target),
-        shlex_quote(version),
-        shlex_quote(&install_dir.display().to_string()),
+        auth_transaction,
         after_pair,
+        after_auth,
         shlex_quote(&binary.display().to_string()),
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
@@ -678,6 +787,14 @@ fn remote_update_command(
         shlex_quote(REMOTE_AFTER_PRIMARY_VERSION_PREFIX),
         shlex_quote(REMOTE_AFTER_COMPANION_SHA256_PREFIX),
         shlex_quote(REMOTE_AFTER_COMPANION_VERSION_PREFIX),
+        shlex_quote(auth_support::BEFORE_HELPER_SHA_PREFIX),
+        shlex_quote(auth_support::BEFORE_HELPER_MODE_PREFIX),
+        shlex_quote(auth_support::BEFORE_WRAPPER_SHA_PREFIX),
+        shlex_quote(auth_support::BEFORE_WRAPPER_MODE_PREFIX),
+        shlex_quote(auth_support::AFTER_HELPER_SHA_PREFIX),
+        shlex_quote(auth_support::AFTER_HELPER_MODE_PREFIX),
+        shlex_quote(auth_support::AFTER_WRAPPER_SHA_PREFIX),
+        shlex_quote(auth_support::AFTER_WRAPPER_MODE_PREFIX),
         shlex_quote(REMOTE_BEFORE_STATUS_PREFIX),
         shlex_quote(REMOTE_REFRESH_PREFIX),
         shlex_quote(REMOTE_AFTER_STATUS_PREFIX),
@@ -773,21 +890,20 @@ fn remote_pair_probe(
 
 fn local_update_command(plan: &HostUpdatePlan) -> String {
     let installer_url = format!(
-        "https://raw.githubusercontent.com/danielraffel/Shipyard/{}/install.sh",
-        plan.release_authority.commit_oid
+        "https://raw.githubusercontent.com/{}/{}/{}",
+        plan.release_authority.repository,
+        plan.release_authority.commit_oid,
+        plan.release_authority.installer.path
     );
     let release_asset_url = format!(
-        "https://api.github.com/repos/danielraffel/Shipyard/releases/assets/{}",
-        plan.release_authority.platform_asset.id
+        "https://api.github.com/repos/{}/releases/assets/{}",
+        plan.release_authority.repository, plan.release_authority.platform_asset.id
     );
+    let (auth_helper_url, auth_wrapper_url) = auth_support::source_urls(&plan.release_authority);
+    let auth_contract = auth_support::wrapper_helper_contract_probe(&plan.auth_helper);
     let curl_shim = exact_asset_curl_shim(&plan.release_authority.platform_asset.name);
-    format!(
-        "set -euo pipefail; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; /usr/bin/curl -fsSL --output \"$installer\" {}; installer_sha256=\"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\"; test \"$installer_sha256\" = {}; /usr/bin/curl -fsSL -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; release_asset_sha256=\"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\"; test \"$release_asset_sha256\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" /usr/bin/env -i HOME={} PATH={} SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" {} --mode {} --global-dir {} --state-dir {} --json update --to {} --install-script-url \"file://$installer\" --curl-bin \"$curl_shim\" --refresh-daemon --unattended-fleet",
-        shlex_quote(&installer_url),
-        shlex_quote(&plan.release_authority.installer.sha256),
-        shlex_quote(&release_asset_url),
-        shlex_quote(&plan.release_authority.platform_asset.sha256),
-        shlex_quote(&curl_shim),
+    let binary_install_command = format!(
+        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" /usr/bin/env -i HOME={} PATH={} SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" {} --mode {} --global-dir {} --state-dir {} --json update --to {} --install-script-url \"file://$installer\" --curl-bin \"$curl_shim\" --refresh-daemon --unattended-fleet",
         shlex_quote(&home_dir().display().to_string()),
         shlex_quote(&unattended_tool_path().to_string_lossy()),
         shlex_quote(&plan.binary.display().to_string()),
@@ -795,6 +911,33 @@ fn local_update_command(plan: &HostUpdatePlan) -> String {
         shlex_quote(&plan.global_dir.display().to_string()),
         shlex_quote(&plan.state_dir.display().to_string()),
         shlex_quote(&plan.target),
+    );
+    let auth_transaction = auth_support::install_transaction(
+        &plan.auth_helper,
+        &plan.auth_wrapper,
+        &plan.binary,
+        &plan.companion_binary,
+        plan.companion_required,
+        "\"$auth_helper_source\"",
+        "\"$auth_wrapper_source\"",
+        &binary_install_command,
+        &plan.state_dir,
+        &plan.release_authority,
+        false,
+    );
+    format!(
+        "set -euo pipefail; {}; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; /usr/bin/curl -fsSL --output \"$installer\" {}; test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; test \"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL --output \"$auth_helper_source\" {}; /usr/bin/curl -fsSL --output \"$auth_wrapper_source\" {}; test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; {}",
+        auth_contract,
+        shlex_quote(&installer_url),
+        shlex_quote(&plan.release_authority.installer.sha256),
+        shlex_quote(&release_asset_url),
+        shlex_quote(&plan.release_authority.platform_asset.sha256),
+        shlex_quote(&auth_helper_url),
+        shlex_quote(&auth_wrapper_url),
+        shlex_quote(&plan.release_authority.auth_helper.sha256),
+        shlex_quote(&plan.release_authority.auth_wrapper.sha256),
+        shlex_quote(&curl_shim),
+        auth_transaction,
     )
 }
 
@@ -827,6 +970,8 @@ fn render_plan<W: Write>(
                             "ssh": plan.ssh,
                             "binary": plan.binary,
                             "companion_binary": plan.companion_binary,
+                            "auth_helper": plan.auth_helper,
+                            "auth_wrapper": plan.auth_wrapper,
                             "source_identity": plan.source_identity,
                             "release_authority": plan.release_authority,
                             "companion_required": plan.companion_required,
@@ -860,6 +1005,7 @@ fn render_plan<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Human and JSON receipts intentionally share one field-complete boundary.
 fn render_host_result<W: Write>(
     stdout: &mut W,
     json: bool,
@@ -884,6 +1030,14 @@ fn render_host_result<W: Write>(
             Value::from(plan.companion_binary.display().to_string()),
         );
         data.insert(
+            "auth_helper".to_owned(),
+            Value::from(plan.auth_helper.display().to_string()),
+        );
+        data.insert(
+            "auth_wrapper".to_owned(),
+            Value::from(plan.auth_wrapper.display().to_string()),
+        );
+        data.insert(
             "source_identity".to_owned(),
             Value::from(plan.source_identity.clone()),
         );
@@ -906,6 +1060,16 @@ fn render_host_result<W: Write>(
         );
         if let Some(evidence) = evidence {
             insert_binary_pair_evidence(&mut data, evidence)?;
+            data.insert(
+                "auth_support_before".to_owned(),
+                serde_json::to_value(&evidence.auth_support_before)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
+            );
+            data.insert(
+                "auth_support_after".to_owned(),
+                serde_json::to_value(&evidence.auth_support_after)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
+            );
             data.insert(
                 "executable_sha256".to_owned(),
                 Value::from(evidence.executable_sha256.clone()),
@@ -1014,6 +1178,9 @@ mod tests {
             shipyard_global_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
             shipyard_state_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
             github_cli: Some("/Users/ci/.local/bin/ghapp".to_owned()),
+            github_token_helper: Some(
+                "/Users/ci/.config/shipyard/bin/shipyard-github-app-token".to_owned(),
+            ),
             tart_home: Some("/Users/ci/VMs".to_owned()),
             labels: Vec::new(),
         }
@@ -1038,6 +1205,9 @@ mod tests {
         )));
         assert!(plan.command.contains("/Users/ci/.local/bin/shipyard"));
         assert!(plan.command.contains("/Users/ci/.local/bin/ghapp"));
+        assert!(plan.command.contains(
+            "test /Users/ci/.config/shipyard/bin/shipyard-github-app-token = \"$HOME/.config/shipyard/bin/shipyard-github-app-token\""
+        ));
         assert!(
             plan.command
                 .contains(&format!("Shipyard/{}/install.sh", "2".repeat(40)))
@@ -1166,7 +1336,8 @@ mod tests {
         assert!(command.contains("--mode isolated"));
         assert!(command.contains("--global-dir '/tmp/governed config'"));
         assert!(command.contains("--state-dir '/tmp/governed state'"));
-        assert!(command.ends_with("--refresh-daemon --unattended-fleet"));
+        assert!(command.contains("--refresh-daemon --unattended-fleet"));
+        assert!(command.contains("fleet-auth-support.transaction"));
     }
 
     #[cfg(unix)]
@@ -1223,6 +1394,53 @@ mod tests {
     }
 
     #[test]
+    fn auth_support_paths_reject_dot_and_parent_components() {
+        let mut class = host(Some("m5"), Some("/Users/ci/.local/bin/shipyard"));
+        class.github_token_helper =
+            Some("/Users/ci/.config/shipyard/bin/../shipyard-github-app-token".to_owned());
+        let error = host_update_plan(&class, "v0.127.0")
+            .expect_err("parent component must fail before command construction");
+        assert!(
+            error
+                .message
+                .contains("must not contain dot or parent components")
+        );
+
+        class.github_token_helper =
+            Some("/Users/ci/.config/shipyard/./bin/shipyard-github-app-token".to_owned());
+        let error = host_update_plan(&class, "v0.127.0")
+            .expect_err("dot component must fail before command construction");
+        assert!(
+            error
+                .message
+                .contains("must not contain dot or parent components")
+        );
+    }
+
+    #[test]
+    fn auth_support_paths_reject_managed_binary_and_transaction_collisions() {
+        let mut class = host(Some("m5"), Some("/Users/ci/.local/bin/shipyard"));
+        class.github_token_helper = Some("/Users/ci/.local/bin/shipyard".to_owned());
+        let error = host_update_plan(&class, "v0.127.0")
+            .expect_err("primary binary collision must fail before rollout");
+        assert!(error.message.contains("must not overlap managed binaries"));
+
+        class.github_token_helper =
+            Some("/Users/ci/.local/bin/shipyard-workstream-provider".to_owned());
+        let error = host_update_plan(&class, "v0.127.0")
+            .expect_err("companion binary collision must fail before rollout");
+        assert!(error.message.contains("must not overlap managed binaries"));
+
+        class.github_token_helper = Some(
+            "/Users/ci/Library/Application Support/shipyard/fleet-auth-support.transaction"
+                .to_owned(),
+        );
+        let error = host_update_plan(&class, "v0.127.0")
+            .expect_err("journal collision must fail before rollout");
+        assert!(error.message.contains("or transaction state"));
+    }
+
+    #[test]
     fn remote_bootstrap_requires_absolute_governed_auth_helper() {
         let mut config = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
         config.github_cli = Some("ghapp".to_owned());
@@ -1230,7 +1448,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("github_cli must be absolute for bootstrap rollout")
+                .contains("auth helper and wrapper paths must be distinct absolute paths")
         );
     }
 
@@ -1377,11 +1595,36 @@ mod tests {
             cli_version: format!("shipyard {version}"),
             before_pair: pair(version, false),
             after_pair: pair(version, true),
+            auth_support_before: auth_support(false),
+            auth_support_after: auth_support(true),
             daemon_version: version.to_owned(),
             daemon_pid: 42,
             configured_repos_before: Some(vec!["owner/repo".to_owned()]),
             configured_repos_after: vec!["owner/repo".to_owned()],
             configured_repos_preserved: Some(true),
+        }
+    }
+
+    fn auth_support(verified: bool) -> AuthSupportEvidence {
+        let file = |path: &str, digest: char, blob: char| SupportFileEvidence {
+            path: PathBuf::from(path),
+            sha256: Some(digest.to_string().repeat(64)),
+            mode: Some(if verified { 0o700 } else { 0o755 }),
+            source_blob_oid: verified.then(|| blob.to_string().repeat(40)),
+            source_identity: verified.then(|| "8".repeat(64)),
+            source_identity_basis: if verified {
+                SourceIdentityBasis::VerifiedReleaseAuthority
+            } else {
+                SourceIdentityBasis::UnverifiedPreinstall
+            },
+        };
+        AuthSupportEvidence {
+            helper: file(
+                "/Users/ci/.config/shipyard/bin/shipyard-github-app-token",
+                'c',
+                'b',
+            ),
+            wrapper: file("/Users/ci/.local/bin/ghapp", 'e', 'd'),
         }
     }
 

@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::auth_support;
 use super::{
     COMPANION_BINARY_NAME, HOST_UPDATE_TIMEOUT, HostUpdatePlan,
     REMOTE_AFTER_COMPANION_SHA256_PREFIX, REMOTE_AFTER_COMPANION_VERSION_PREFIX,
@@ -26,6 +27,8 @@ pub(super) struct HostUpdateEvidence {
     pub(super) release_asset_sha256: String,
     pub(super) before_pair: BinaryPairEvidence,
     pub(super) after_pair: BinaryPairEvidence,
+    pub(super) auth_support_before: AuthSupportEvidence,
+    pub(super) auth_support_after: AuthSupportEvidence,
     pub(super) executable_sha256: String,
     pub(super) cli_version: String,
     pub(super) daemon_version: String,
@@ -33,6 +36,22 @@ pub(super) struct HostUpdateEvidence {
     pub(super) configured_repos_before: Option<Vec<String>>,
     pub(super) configured_repos_after: Vec<String>,
     pub(super) configured_repos_preserved: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct AuthSupportEvidence {
+    pub(super) helper: SupportFileEvidence,
+    pub(super) wrapper: SupportFileEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct SupportFileEvidence {
+    pub(super) path: PathBuf,
+    pub(super) sha256: Option<String>,
+    pub(super) mode: Option<u32>,
+    pub(super) source_blob_oid: Option<String>,
+    pub(super) source_identity: Option<String>,
+    pub(super) source_identity_basis: SourceIdentityBasis,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -74,13 +93,14 @@ pub(super) fn execute_plan_with_timeout(
     timeout: Duration,
 ) -> Result<HostUpdateEvidence, PlanExecutionError> {
     let deadline = Instant::now() + timeout;
-    let (before_status, before_pair) = if plan.ssh.is_none() {
+    let (before_status, before_pair, before_auth) = if plan.ssh.is_none() {
         let status = run_local_daemon_status(plan, deadline)?;
         let pair = collect_local_pair(plan, deadline, false)?;
         validate_binary_pair(plan, &pair, None).map_err(PlanExecutionError::Failed)?;
-        (Some(status), Some(pair))
+        let auth = collect_local_auth_support(plan, false)?;
+        (Some(status), Some(pair), Some(auth))
     } else {
-        (None, None)
+        (None, None, None)
     };
     let mut command = if let Some(host) = &plan.ssh {
         let mut command = Command::new(ssh_binary());
@@ -121,6 +141,7 @@ pub(super) fn execute_plan_with_timeout(
             plan,
             &before_status.expect("local status was collected before update"),
             before_pair.expect("local pair was collected before update"),
+            before_auth.expect("local auth support was collected before update"),
             &output.stdout,
             deadline,
         )
@@ -172,10 +193,12 @@ fn collect_local_evidence(
     plan: &HostUpdatePlan,
     before_status: &Value,
     before_pair: BinaryPairEvidence,
+    before_auth: AuthSupportEvidence,
     update_stdout: &[u8],
     host_deadline: Instant,
 ) -> Result<HostUpdateEvidence, PlanExecutionError> {
     let after_pair = collect_local_pair(plan, host_deadline, true)?;
+    let after_auth = collect_local_auth_support(plan, true)?;
     let after_status = run_local_daemon_status(plan, host_deadline)?;
     let daemon_pid = serde_json::Deserializer::from_slice(update_stdout)
         .into_iter::<Value>()
@@ -195,12 +218,91 @@ fn collect_local_evidence(
     evidence_from_values(
         before_pair,
         after_pair,
+        before_auth,
+        after_auth,
         daemon_pid,
         before_status,
         &after_status,
         plan.release_authority.identity_sha256.clone(),
         plan.release_authority.platform_asset.sha256.clone(),
     )
+}
+
+fn collect_local_auth_support(
+    plan: &HostUpdatePlan,
+    verified: bool,
+) -> Result<AuthSupportEvidence, PlanExecutionError> {
+    Ok(AuthSupportEvidence {
+        helper: collect_local_support_file(
+            &plan.auth_helper,
+            verified.then_some(plan.release_authority.auth_helper.blob_oid.as_str()),
+            verified,
+            plan,
+        )?,
+        wrapper: collect_local_support_file(
+            &plan.auth_wrapper,
+            verified.then_some(plan.release_authority.auth_wrapper.blob_oid.as_str()),
+            verified,
+            plan,
+        )?,
+    })
+}
+
+fn collect_local_support_file(
+    path: &Path,
+    blob_oid: Option<&str>,
+    verified: bool,
+    plan: &HostUpdatePlan,
+) -> Result<SupportFileEvidence, PlanExecutionError> {
+    if !path_present_no_follow(path)? {
+        return Ok(SupportFileEvidence {
+            path: path.to_owned(),
+            sha256: None,
+            mode: None,
+            source_blob_oid: None,
+            source_identity: None,
+            source_identity_basis: SourceIdentityBasis::UnverifiedPreinstall,
+        });
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to inspect support file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(PlanExecutionError::Failed(format!(
+            "support file {} was not a no-follow regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    let mode = Some(file_mode(&metadata));
+    #[cfg(not(unix))]
+    let mode = None;
+    Ok(SupportFileEvidence {
+        path: path.to_owned(),
+        sha256: Some(sha256_file(path).map_err(|error| {
+            PlanExecutionError::Failed(format!(
+                "failed to hash support file {}: {error}",
+                path.display()
+            ))
+        })?),
+        mode,
+        source_blob_oid: blob_oid.map(str::to_owned),
+        source_identity: verified.then(|| plan.source_identity.clone()),
+        source_identity_basis: if verified {
+            SourceIdentityBasis::VerifiedReleaseAuthority
+        } else {
+            SourceIdentityBasis::UnverifiedPreinstall
+        },
+    })
+}
+
+#[cfg(unix)]
+fn file_mode(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o777
 }
 
 fn collect_local_pair(
@@ -292,6 +394,8 @@ pub(super) fn parse_remote_evidence(
     let before_pair = remote_pair_from_markers(plan, text, false)?;
     validate_binary_pair(plan, &before_pair, None).map_err(PlanExecutionError::Failed)?;
     let after_pair = remote_pair_from_markers(plan, text, true)?;
+    let before_auth = remote_auth_support_from_markers(plan, text, false)?;
+    let after_auth = remote_auth_support_from_markers(plan, text, true)?;
     let before_status = parse_json_text(
         &unique_marker(text, REMOTE_BEFORE_STATUS_PREFIX)?,
         "remote pre-update daemon status",
@@ -324,6 +428,8 @@ pub(super) fn parse_remote_evidence(
     let evidence = evidence_from_values(
         before_pair,
         after_pair,
+        before_auth,
+        after_auth,
         daemon_pid,
         &before_status,
         &after_status,
@@ -336,6 +442,87 @@ pub(super) fn parse_remote_evidence(
         ));
     }
     Ok(evidence)
+}
+
+fn remote_auth_support_from_markers(
+    plan: &HostUpdatePlan,
+    text: &str,
+    after: bool,
+) -> Result<AuthSupportEvidence, PlanExecutionError> {
+    let (helper_sha, helper_mode, wrapper_sha, wrapper_mode) = if after {
+        (
+            auth_support::AFTER_HELPER_SHA_PREFIX,
+            auth_support::AFTER_HELPER_MODE_PREFIX,
+            auth_support::AFTER_WRAPPER_SHA_PREFIX,
+            auth_support::AFTER_WRAPPER_MODE_PREFIX,
+        )
+    } else {
+        (
+            auth_support::BEFORE_HELPER_SHA_PREFIX,
+            auth_support::BEFORE_HELPER_MODE_PREFIX,
+            auth_support::BEFORE_WRAPPER_SHA_PREFIX,
+            auth_support::BEFORE_WRAPPER_MODE_PREFIX,
+        )
+    };
+    Ok(AuthSupportEvidence {
+        helper: support_file_from_markers(
+            &plan.auth_helper,
+            &unique_marker(text, helper_sha)?,
+            &unique_marker(text, helper_mode)?,
+            after.then_some(plan.release_authority.auth_helper.blob_oid.as_str()),
+            after,
+            plan,
+        )?,
+        wrapper: support_file_from_markers(
+            &plan.auth_wrapper,
+            &unique_marker(text, wrapper_sha)?,
+            &unique_marker(text, wrapper_mode)?,
+            after.then_some(plan.release_authority.auth_wrapper.blob_oid.as_str()),
+            after,
+            plan,
+        )?,
+    })
+}
+
+fn support_file_from_markers(
+    path: &Path,
+    sha256: &str,
+    mode: &str,
+    blob_oid: Option<&str>,
+    verified: bool,
+    plan: &HostUpdatePlan,
+) -> Result<SupportFileEvidence, PlanExecutionError> {
+    let (sha256, mode) = match (sha256, mode) {
+        ("absent", "absent") => (None, None),
+        ("absent", _) | (_, "absent") => {
+            return Err(PlanExecutionError::Failed(
+                "auth support presence markers disagreed".to_owned(),
+            ));
+        }
+        (sha256, mode) => {
+            if !valid_sha256(sha256) {
+                return Err(PlanExecutionError::Failed(
+                    "auth support SHA-256 marker was invalid".to_owned(),
+                ));
+            }
+            let parsed = u32::from_str_radix(mode, 8).map_err(|_| {
+                PlanExecutionError::Failed("auth support mode marker was invalid".to_owned())
+            })?;
+            (Some(sha256.to_owned()), Some(parsed))
+        }
+    };
+    Ok(SupportFileEvidence {
+        path: path.to_owned(),
+        sha256,
+        mode,
+        source_blob_oid: blob_oid.map(str::to_owned),
+        source_identity: verified.then(|| plan.source_identity.clone()),
+        source_identity_basis: if verified {
+            SourceIdentityBasis::VerifiedReleaseAuthority
+        } else {
+            SourceIdentityBasis::UnverifiedPreinstall
+        },
+    })
 }
 
 fn remote_pair_from_markers(
@@ -515,9 +702,12 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+#[allow(clippy::too_many_arguments)] // One typed join of paired binary, support, daemon, and authority observations.
 fn evidence_from_values(
     before_pair: BinaryPairEvidence,
     after_pair: BinaryPairEvidence,
+    auth_support_before: AuthSupportEvidence,
+    auth_support_after: AuthSupportEvidence,
     daemon_pid: u32,
     before_status: &Value,
     after_status: &Value,
@@ -565,6 +755,8 @@ fn evidence_from_values(
         cli_version: format!("shipyard {}", after_pair.primary.semantic_version),
         before_pair,
         after_pair,
+        auth_support_before,
+        auth_support_after,
         daemon_version,
         daemon_pid,
         configured_repos_before,
@@ -667,6 +859,8 @@ pub(super) fn validate_evidence(
     }
     validate_binary_pair(plan, &evidence.before_pair, None)?;
     validate_binary_pair(plan, &evidence.after_pair, Some(&plan.target))?;
+    validate_auth_support(plan, &evidence.auth_support_before, false)?;
+    validate_auth_support(plan, &evidence.auth_support_after, true)?;
     let version = plan.target.trim_start_matches('v');
     let expected_cli = format!("shipyard {version}");
     if evidence.cli_version != expected_cli
@@ -684,6 +878,51 @@ pub(super) fn validate_evidence(
     }
     if evidence.configured_repos_preserved == Some(false) {
         return Err("configured repositories changed across daemon refresh".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_auth_support(
+    plan: &HostUpdatePlan,
+    support: &AuthSupportEvidence,
+    after: bool,
+) -> Result<(), String> {
+    for (observed, path, authority) in [
+        (
+            &support.helper,
+            &plan.auth_helper,
+            &plan.release_authority.auth_helper,
+        ),
+        (
+            &support.wrapper,
+            &plan.auth_wrapper,
+            &plan.release_authority.auth_wrapper,
+        ),
+    ] {
+        if observed.path != *path {
+            return Err("auth support evidence used an unexpected path".to_owned());
+        }
+        if after {
+            if observed.sha256.as_deref() != Some(authority.sha256.as_str())
+                || observed.mode != Some(0o700)
+                || observed.source_blob_oid.as_deref() != Some(authority.blob_oid.as_str())
+                || observed.source_identity.as_deref() != Some(plan.source_identity.as_str())
+                || observed.source_identity_basis != SourceIdentityBasis::VerifiedReleaseAuthority
+            {
+                return Err(
+                    "post-install auth support was mixed, tampered, unsafe, or not release-bound"
+                        .to_owned(),
+                );
+            }
+        } else if observed.source_blob_oid.is_some()
+            || observed.source_identity.is_some()
+            || observed.source_identity_basis != SourceIdentityBasis::UnverifiedPreinstall
+            || observed.sha256.is_some() != observed.mode.is_some()
+        {
+            return Err(
+                "pre-install auth support provenance was not explicitly unverified".to_owned(),
+            );
+        }
     }
     Ok(())
 }
@@ -719,6 +958,9 @@ mod tests {
             shipyard_global_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
             shipyard_state_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
             github_cli: Some("/Users/ci/.local/bin/ghapp".to_owned()),
+            github_token_helper: Some(
+                "/Users/ci/.config/shipyard/bin/shipyard-github-app-token".to_owned(),
+            ),
             tart_home: Some("/Users/ci/VMs".to_owned()),
             labels: Vec::new(),
         }
@@ -756,11 +998,36 @@ mod tests {
             cli_version: format!("shipyard {version}"),
             before_pair: pair(version, false),
             after_pair: pair(version, true),
+            auth_support_before: auth_support(false),
+            auth_support_after: auth_support(true),
             daemon_version: version.to_owned(),
             daemon_pid: 42,
             configured_repos_before: Some(vec!["owner/repo".to_owned()]),
             configured_repos_after: vec!["owner/repo".to_owned()],
             configured_repos_preserved: Some(true),
+        }
+    }
+
+    fn auth_support(verified: bool) -> AuthSupportEvidence {
+        let file = |path: &str, digest: char, blob: char| SupportFileEvidence {
+            path: PathBuf::from(path),
+            sha256: Some(digest.to_string().repeat(64)),
+            mode: Some(if verified { 0o700 } else { 0o755 }),
+            source_blob_oid: verified.then(|| blob.to_string().repeat(40)),
+            source_identity: verified.then(verified_source_identity),
+            source_identity_basis: if verified {
+                SourceIdentityBasis::VerifiedReleaseAuthority
+            } else {
+                SourceIdentityBasis::UnverifiedPreinstall
+            },
+        };
+        AuthSupportEvidence {
+            helper: file(
+                "/Users/ci/.config/shipyard/bin/shipyard-github-app-token",
+                'c',
+                'b',
+            ),
+            wrapper: file("/Users/ci/.local/bin/ghapp", 'e', 'd'),
         }
     }
 
@@ -785,10 +1052,22 @@ mod tests {
             "shipyard_version": "0.127.0"
         });
         let stdout = format!(
-            "{REMOTE_BEFORE_PRIMARY_SHA256_PREFIX}{}\n{REMOTE_BEFORE_PRIMARY_VERSION_PREFIX}shipyard 0.126.2\n{REMOTE_BEFORE_COMPANION_SHA256_PREFIX}absent\n{REMOTE_BEFORE_COMPANION_VERSION_PREFIX}absent\n{REMOTE_AFTER_PRIMARY_SHA256_PREFIX}{}\n{REMOTE_AFTER_PRIMARY_VERSION_PREFIX}shipyard 0.127.0\n{REMOTE_AFTER_COMPANION_SHA256_PREFIX}{}\n{REMOTE_AFTER_COMPANION_VERSION_PREFIX}shipyard-workstream-provider 0.127.0\n{REMOTE_BEFORE_STATUS_PREFIX}{before}\n{REMOTE_REFRESH_PREFIX}{refresh}\n{REMOTE_AFTER_STATUS_PREFIX}{after}\n{REMOTE_AUTHORITY_ID_PREFIX}{}\n{REMOTE_RELEASE_ASSET_SHA256_PREFIX}{}\n",
+            "{REMOTE_BEFORE_PRIMARY_SHA256_PREFIX}{}\n{REMOTE_BEFORE_PRIMARY_VERSION_PREFIX}shipyard 0.126.2\n{REMOTE_BEFORE_COMPANION_SHA256_PREFIX}absent\n{REMOTE_BEFORE_COMPANION_VERSION_PREFIX}absent\n{REMOTE_AFTER_PRIMARY_SHA256_PREFIX}{}\n{REMOTE_AFTER_PRIMARY_VERSION_PREFIX}shipyard 0.127.0\n{REMOTE_AFTER_COMPANION_SHA256_PREFIX}{}\n{REMOTE_AFTER_COMPANION_VERSION_PREFIX}shipyard-workstream-provider 0.127.0\n{}{}\n{}755\n{}{}\n{}755\n{}{}\n{}700\n{}{}\n{}700\n{REMOTE_BEFORE_STATUS_PREFIX}{before}\n{REMOTE_REFRESH_PREFIX}{refresh}\n{REMOTE_AFTER_STATUS_PREFIX}{after}\n{REMOTE_AUTHORITY_ID_PREFIX}{}\n{REMOTE_RELEASE_ASSET_SHA256_PREFIX}{}\n",
             "a".repeat(64),
             "b".repeat(64),
             "c".repeat(64),
+            auth_support::BEFORE_HELPER_SHA_PREFIX,
+            "f".repeat(64),
+            auth_support::BEFORE_HELPER_MODE_PREFIX,
+            auth_support::BEFORE_WRAPPER_SHA_PREFIX,
+            "a".repeat(64),
+            auth_support::BEFORE_WRAPPER_MODE_PREFIX,
+            auth_support::AFTER_HELPER_SHA_PREFIX,
+            "c".repeat(64),
+            auth_support::AFTER_HELPER_MODE_PREFIX,
+            auth_support::AFTER_WRAPPER_SHA_PREFIX,
+            "e".repeat(64),
+            auth_support::AFTER_WRAPPER_MODE_PREFIX,
             "8".repeat(64),
             "6".repeat(64),
         );
@@ -818,6 +1097,22 @@ mod tests {
         assert!(validate_evidence(&plan, &observed).is_err());
         assert!(!valid_sha256(&"A".repeat(64)));
         assert!(!valid_sha256("short"));
+    }
+
+    #[test]
+    fn auth_support_evidence_rejects_tamper_and_mixed_release_source() {
+        let plan = super::super::host_update_plan(&host(None), "v0.127.0").expect("plan");
+        let mut observed = evidence("0.127.0");
+        observed.auth_support_after.helper.sha256 = Some("f".repeat(64));
+        assert!(validate_evidence(&plan, &observed).is_err());
+
+        observed.auth_support_after = auth_support(true);
+        observed.auth_support_after.wrapper.source_blob_oid = Some("b".repeat(40));
+        assert!(validate_evidence(&plan, &observed).is_err());
+
+        observed.auth_support_after = auth_support(true);
+        observed.auth_support_after.wrapper.mode = Some(0o755);
+        assert!(validate_evidence(&plan, &observed).is_err());
     }
 
     #[test]
@@ -904,6 +1199,8 @@ mod tests {
         let observed = evidence_from_values(
             pair.clone(),
             pair,
+            auth_support(false),
+            auth_support(true),
             9,
             &before,
             &after,

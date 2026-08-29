@@ -12,10 +12,12 @@ use sha2::{Digest, Sha256};
 use crate::config::LoadedConfig;
 use crate::gh::{GhClient, GhSupervision};
 
-const REPOSITORY: &str = "danielraffel/Shipyard";
-const SIGNER_WORKFLOW: &str = "danielraffel/Shipyard/.github/workflows/release.yml";
+const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
 const PLATFORM_ASSET: &str = "shipyard-macos-arm64.dmg";
 const CHECKSUM_ASSET: &str = "checksums.sha256";
+const INSTALLER_PATH: &str = "install.sh";
+const AUTH_HELPER_PATH: &str = "scripts/shipyard-github-app-token";
+const AUTH_WRAPPER_PATH: &str = "scripts/ghapp";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -28,6 +30,8 @@ pub(super) struct ReleaseAuthority {
     pub(super) tree_oid: String,
     pub(super) release_id: u64,
     pub(super) installer: InstallerAuthority,
+    pub(super) auth_helper: SourceFileAuthority,
+    pub(super) auth_wrapper: SourceFileAuthority,
     pub(super) checksum_manifest: ReleaseAssetAuthority,
     pub(super) platform_asset: ReleaseAssetAuthority,
     pub(super) identity_sha256: String,
@@ -35,6 +39,13 @@ pub(super) struct ReleaseAuthority {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct InstallerAuthority {
+    pub(super) path: String,
+    pub(super) blob_oid: String,
+    pub(super) sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct SourceFileAuthority {
     pub(super) path: String,
     pub(super) blob_oid: String,
     pub(super) sha256: String,
@@ -63,9 +74,10 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
     }
 
     fn command(&self) -> Result<Command, String> {
+        let repository = release_repository()?;
         GhClient::from_loaded_config(self.config)
             .map_err(|error| format!("failed to load governed GitHub auth: {error}"))?
-            .with_repo_override(REPOSITORY)
+            .with_repo_override(&repository)
             .map_err(|error| format!("failed to bind governed GitHub auth: {error}"))?
             .prepare_privileged_command_with_auth_timeout(
                 self.cwd,
@@ -88,7 +100,11 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
     }
 
     fn download_asset(&self, asset: &ObservedAsset) -> Result<Vec<u8>, String> {
-        let endpoint = format!("repos/{REPOSITORY}/releases/assets/{}", asset.id);
+        let endpoint = format!(
+            "repos/{}/releases/assets/{}",
+            release_repository()?,
+            asset.id
+        );
         let mut command = self.command()?;
         command
             .args(["api", &endpoint, "-H", "Accept: application/octet-stream"])
@@ -114,6 +130,8 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
         asset: &ObservedAsset,
         bytes: &[u8],
     ) -> Result<String, String> {
+        let repository = release_repository()?;
+        let signer_workflow = format!("{repository}/{RELEASE_WORKFLOW}");
         let temp = tempfile::tempdir()
             .map_err(|error| format!("could not create attestation staging directory: {error}"))?;
         let path = temp.path().join(&asset.name);
@@ -125,9 +143,9 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
             .arg(&path)
             .args([
                 "--repo",
-                REPOSITORY,
+                &repository,
                 "--signer-workflow",
-                SIGNER_WORKFLOW,
+                &signer_workflow,
                 "--source-digest",
                 commit_oid,
                 "--source-ref",
@@ -149,28 +167,35 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
         verified_statement_identity(&output.stdout, asset, commit_oid, tag)
     }
 
-    fn installer_authority(&self, commit_oid: &str) -> Result<InstallerAuthority, String> {
-        let installer = self.api_json(&format!(
-            "repos/{REPOSITORY}/contents/install.sh?ref={commit_oid}"
+    fn source_file_authority(
+        &self,
+        commit_oid: &str,
+        expected_path: &str,
+    ) -> Result<SourceFileAuthority, String> {
+        let source = self.api_json(&format!(
+            "repos/{}/contents/{expected_path}?ref={commit_oid}",
+            release_repository()?
         ))?;
-        if string(&installer, "/type", "installer object type")? != "file"
-            || string(&installer, "/path", "installer path")? != "install.sh"
-            || string(&installer, "/encoding", "installer encoding")? != "base64"
+        if string(&source, "/type", "source object type")? != "file"
+            || string(&source, "/path", "source path")? != expected_path
+            || string(&source, "/encoding", "source encoding")? != "base64"
         {
-            return Err("release commit did not contain one regular install.sh file".to_owned());
+            return Err(format!(
+                "release commit did not contain one regular {expected_path} file"
+            ));
         }
-        let blob_oid = string(&installer, "/sha", "installer blob SHA")?;
-        validate_oid(blob_oid, "installer blob")?;
+        let blob_oid = string(&source, "/sha", "source blob SHA")?;
+        validate_oid(blob_oid, "source blob")?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(
-                string(&installer, "/content", "installer content")?
+                string(&source, "/content", "source content")?
                     .bytes()
                     .filter(|byte| !byte.is_ascii_whitespace())
                     .collect::<Vec<_>>(),
             )
-            .map_err(|error| format!("GitHub installer content was invalid base64: {error}"))?;
-        Ok(InstallerAuthority {
-            path: "install.sh".to_owned(),
+            .map_err(|error| format!("GitHub source content was invalid base64: {error}"))?;
+        Ok(SourceFileAuthority {
+            path: expected_path.to_owned(),
             blob_oid: blob_oid.to_owned(),
             sha256: sha256(&bytes),
         })
@@ -184,13 +209,14 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
         checksum: &ObservedAsset,
         platform: &ObservedAsset,
     ) -> Result<(), String> {
-        let final_tag = self.api_json(&format!("repos/{REPOSITORY}/git/ref/tags/{tag}"))?;
+        let repository = release_repository()?;
+        let final_tag = self.api_json(&format!("repos/{repository}/git/ref/tags/{tag}"))?;
         if string(&final_tag, "/object/sha", "final tag object SHA")? != tag_object_oid {
             return Err(
                 "release tag changed while immutable authority was being minted".to_owned(),
             );
         }
-        let final_release = self.api_json(&format!("repos/{REPOSITORY}/releases/tags/{tag}"))?;
+        let final_release = self.api_json(&format!("repos/{repository}/releases/tags/{tag}"))?;
         if final_release.get("id").and_then(Value::as_u64) != Some(release_id)
             || final_release.get("draft").and_then(Value::as_bool) != Some(false)
         {
@@ -212,7 +238,8 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
 
 impl ReleaseAuthorityVerifier for GitHubReleaseAuthorityVerifier<'_> {
     fn verify(&self, tag: &str) -> Result<ReleaseAuthority, String> {
-        let tag_ref = self.api_json(&format!("repos/{REPOSITORY}/git/ref/tags/{tag}"))?;
+        let repository = release_repository()?;
+        let tag_ref = self.api_json(&format!("repos/{repository}/git/ref/tags/{tag}"))?;
         let tag_object_oid = string(&tag_ref, "/object/sha", "tag object SHA")?;
         validate_oid(tag_object_oid, "tag object")?;
         if string(&tag_ref, "/object/type", "tag object type")? != "tag" {
@@ -221,7 +248,7 @@ impl ReleaseAuthorityVerifier for GitHubReleaseAuthorityVerifier<'_> {
                     .to_owned(),
             );
         }
-        let tag_object = self.api_json(&format!("repos/{REPOSITORY}/git/tags/{tag_object_oid}"))?;
+        let tag_object = self.api_json(&format!("repos/{repository}/git/tags/{tag_object_oid}"))?;
         if string(&tag_object, "/tag", "annotated tag name")? != tag
             || string(&tag_object, "/object/type", "annotated tag target type")? != "commit"
         {
@@ -231,15 +258,22 @@ impl ReleaseAuthorityVerifier for GitHubReleaseAuthorityVerifier<'_> {
         }
         let commit_oid = string(&tag_object, "/object/sha", "release commit SHA")?;
         validate_oid(commit_oid, "release commit")?;
-        let commit = self.api_json(&format!("repos/{REPOSITORY}/git/commits/{commit_oid}"))?;
+        let commit = self.api_json(&format!("repos/{repository}/git/commits/{commit_oid}"))?;
         if string(&commit, "/sha", "commit SHA")? != commit_oid {
             return Err("GitHub commit response drifted from the annotated tag target".to_owned());
         }
         let tree_oid = string(&commit, "/tree/sha", "release tree SHA")?;
         validate_oid(tree_oid, "release tree")?;
-        let installer_authority = self.installer_authority(commit_oid)?;
+        let installer_source = self.source_file_authority(commit_oid, INSTALLER_PATH)?;
+        let installer_authority = InstallerAuthority {
+            path: installer_source.path,
+            blob_oid: installer_source.blob_oid,
+            sha256: installer_source.sha256,
+        };
+        let auth_helper = self.source_file_authority(commit_oid, AUTH_HELPER_PATH)?;
+        let auth_wrapper = self.source_file_authority(commit_oid, AUTH_WRAPPER_PATH)?;
 
-        let release = self.api_json(&format!("repos/{REPOSITORY}/releases/tags/{tag}"))?;
+        let release = self.api_json(&format!("repos/{repository}/releases/tags/{tag}"))?;
         if string(&release, "/tag_name", "release tag")? != tag
             || release.get("draft").and_then(Value::as_bool) != Some(false)
             || release.get("prerelease").and_then(Value::as_bool) != Some(false)
@@ -264,13 +298,15 @@ impl ReleaseAuthorityVerifier for GitHubReleaseAuthorityVerifier<'_> {
             self.verify_attestation(tag, commit_oid, platform, &platform_bytes)?;
 
         let mut authority = ReleaseAuthority {
-            repository: REPOSITORY.to_owned(),
+            repository,
             tag: tag.to_owned(),
             tag_object_oid: tag_object_oid.to_owned(),
             commit_oid: commit_oid.to_owned(),
             tree_oid: tree_oid.to_owned(),
             release_id,
             installer: installer_authority,
+            auth_helper,
+            auth_wrapper,
             checksum_manifest: checksum.with_attestation(None),
             platform_asset: platform.with_attestation(Some(platform_attestation)),
             identity_sha256: String::new(),
@@ -393,7 +429,7 @@ fn verified_statement_identity(
     let records: Vec<Value> = serde_json::from_slice(bytes)
         .map_err(|error| format!("attestation verifier returned invalid JSON: {error}"))?;
     let expected_ref = format!("refs/tags/{tag}");
-    let expected_repository = format!("https://github.com/{REPOSITORY}");
+    let expected_repository = format!("https://github.com/{}", release_repository()?);
     let expected_dependency = format!("git+{expected_repository}@{expected_ref}");
     let mut identities = Vec::new();
     for record in records {
@@ -520,6 +556,30 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn release_repository() -> Result<String, String> {
+    let url = env!("CARGO_PKG_REPOSITORY").trim_end_matches(['/', '\\']);
+    let slug = url
+        .strip_prefix("https://github.com/")
+        .and_then(|value| value.strip_suffix(".git").or(Some(value)))
+        .ok_or_else(|| "package repository must be an HTTPS GitHub repository".to_owned())?;
+    let mut parts = slug.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty()
+        || name.is_empty()
+        || parts.next().is_some()
+        || !owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("package repository did not contain one safe owner/name slug".to_owned());
+    }
+    Ok(format!("{owner}/{name}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +593,7 @@ mod tests {
     }
 
     fn verified_output(asset: &ObservedAsset, commit: &str, tag: &str) -> Vec<u8> {
+        let repository = release_repository().expect("package repository");
         let statement = serde_json::json!({
             "_type": "https://in-toto.io/Statement/v1",
             "subject": [{"name": asset.name, "digest": {"sha256": asset.sha256}}],
@@ -540,7 +601,7 @@ mod tests {
             "predicate": {
                 "buildDefinition": {
                     "resolvedDependencies": [{
-                        "uri": format!("git+https://github.com/{REPOSITORY}@refs/tags/{tag}"),
+                        "uri": format!("git+https://github.com/{repository}@refs/tags/{tag}"),
                         "digest": {"gitCommit": commit}
                     }]
                 }

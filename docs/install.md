@@ -254,6 +254,7 @@ Shipyard path (the local/controller class may omit it):
 ssh = "m5-lan"
 shipyard_bin = "/Users/you/.local/bin/shipyard"
 github_cli = "/Users/you/.local/bin/ghapp"
+github_token_helper = "/Users/you/.config/shipyard/bin/shipyard-github-app-token"
 shipyard_mode = "shipyard"
 shipyard_global_dir = "/Users/you/Library/Application Support/shipyard"
 shipyard_state_dir = "/Users/you/Library/Application Support/shipyard"

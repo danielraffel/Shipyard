@@ -38,6 +38,7 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
             shipyard_global_dir: None,
             shipyard_state_dir: None,
             github_cli: None,
+            github_token_helper: None,
             tart_home: None,
             labels: Vec::new(),
         },
@@ -52,6 +53,7 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
             shipyard_global_dir: None,
             shipyard_state_dir: None,
             github_cli: None,
+            github_token_helper: None,
             tart_home: None,
             labels: Vec::new(),
         },
@@ -241,6 +243,7 @@ fn remote_tartci_command_sets_tart_home_and_quotes_binary() {
         shipyard_global_dir: None,
         shipyard_state_dir: None,
         github_cli: Some("ghapp".to_owned()),
+        github_token_helper: None,
         tart_home: Some("/Users/ci user/VMs".to_owned()),
         labels: Vec::new(),
     };
@@ -263,6 +266,7 @@ fn remote_tartci_command_leaves_github_cli_unset_by_default() {
         shipyard_global_dir: None,
         shipyard_state_dir: None,
         github_cli: None,
+        github_token_helper: None,
         tart_home: None,
         labels: Vec::new(),
     };

@@ -281,6 +281,14 @@ but `token_command[0]` must remain the host's configured `ghapp` wrapper path:
    by the unattended account. The wrapper invokes the paired helper with an
    absolute trusted Python interpreter and exports the minted token directly to
    native `gh`, keeping token material out of process argv.
+   Governed `runner fleet-update` performs this sequence automatically when
+   each host class declares absolute `github_cli` and `github_token_helper`
+   paths. The helper path must explicitly equal the frozen wrapper contract,
+   `$HOME/.config/shipyard/bin/shipyard-github-app-token`; fleet rollout checks
+   that before mutation. Its frozen release authority includes both exact source blobs; its
+   private recovery journal rolls back an interrupted helper-first install on
+   the next attempt. It preserves the existing auth configuration and never
+   emits a token or private-key value in plan or result evidence.
 3. Remove the fixed installation id and old single cache file from the wrapper.
    Configure `token_command = ["/absolute/path/to/ghapp", "token", "--repo",
    "{repo_slug}"]`. Do not replace

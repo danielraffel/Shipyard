@@ -70,6 +70,10 @@ pub struct HostClassConfig {
     /// default; set this to an App-authenticated wrapper such as `ghapp` when
     /// the ambient user token is unavailable or intentionally not used.
     pub github_cli: Option<String>,
+    /// Absolute owner-private GitHub App token-helper path used by governed
+    /// fleet rollout. This is separate from `github_cli` because the wrapper
+    /// and helper commonly live in different directories.
+    pub github_token_helper: Option<String>,
     /// Optional Tart store to expose as `TART_HOME` while reading this host.
     /// Use an absolute path; shell expansion is intentionally not performed.
     pub tart_home: Option<String>,
@@ -83,7 +87,7 @@ pub struct HostClassConfig {
 ///
 /// # Errors
 /// Returns a human-readable message when a class entry is malformed (not a
-/// table, non-string `ssh`/`tart_bin`/`tartci_bin`/Shipyard runtime fields/`github_cli`/`tart_home`,
+/// table, non-string `ssh`/`tart_bin`/`tartci_bin`/Shipyard runtime fields/`github_cli`/`github_token_helper`/`tart_home`,
 /// non-integer/negative `cap`, or a `labels` that is not an array of strings).
 #[allow(clippy::too_many_lines)] // Keep each host-class field's fail-closed diagnostic adjacent.
 pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> {
@@ -171,6 +175,7 @@ pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> 
             Some(TomlValue::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
             Some(_) => return Err(format!("host_class.{class}.github_cli must be a string")),
         };
+        let github_token_helper = parse_runtime_dir("github_token_helper")?;
         let tart_home = match table.get("tart_home") {
             Some(TomlValue::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
             None | Some(TomlValue::String(_)) => None,
@@ -199,6 +204,7 @@ pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> 
             shipyard_global_dir,
             shipyard_state_dir,
             github_cli,
+            github_token_helper,
             tart_home,
             labels,
         });
@@ -636,6 +642,7 @@ mod tests {
         assert_eq!(classes[0].tart_bin, "tart");
         assert_eq!(classes[0].tartci_bin, "tartci");
         assert_eq!(classes[0].github_cli, None);
+        assert_eq!(classes[0].github_token_helper, None);
         assert_eq!(classes[1].class, "studio");
         assert_eq!(classes[1].cap, 4);
         assert_eq!(classes[1].ssh.as_deref(), Some("studio-ci.local"));
@@ -692,6 +699,24 @@ mod tests {
         let cfg = table("[host_class.studio]\ngithub_cli = \"ghapp\"\n");
         let classes = parse_host_classes(&cfg).expect("parse");
         assert_eq!(classes[0].github_cli.as_deref(), Some("ghapp"));
+    }
+
+    #[test]
+    fn parse_host_classes_reads_only_explicit_absolute_token_helper() {
+        let cfg = table(
+            "[host_class.studio]\ngithub_token_helper = \"/Users/ci/.config/shipyard/bin/shipyard-github-app-token\"\n",
+        );
+        let classes = parse_host_classes(&cfg).expect("parse");
+        assert_eq!(
+            classes[0].github_token_helper.as_deref(),
+            Some("/Users/ci/.config/shipyard/bin/shipyard-github-app-token")
+        );
+        assert!(
+            parse_host_classes(&table(
+                "[host_class.studio]\ngithub_token_helper = \"relative/helper\"\n"
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -914,6 +939,7 @@ mod tests {
             shipyard_global_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
             shipyard_state_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
             github_cli: None,
+            github_token_helper: None,
             tart_home: Some("/Users/ci user/VMs".to_owned()),
             labels: Vec::new(),
         };
