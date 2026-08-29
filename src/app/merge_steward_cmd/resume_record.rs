@@ -119,6 +119,10 @@ pub(super) fn reconcile_resume_records(ledger: &mut StewardLedger) -> Result<boo
     {
         if record.phase != ResumeRecordPhase::Resolved {
             record.phase = ResumeRecordPhase::Resolved;
+            record.terminal_adapter = None;
+            record.updated_at.clone_from(&now);
+            changed = true;
+        } else if record.terminal_adapter.take().is_some() {
             record.updated_at.clone_from(&now);
             changed = true;
         }
@@ -193,15 +197,10 @@ fn route(handoff: &TerminalHandoff) -> Result<ResumeRouteV1, CliFailure> {
             provider_adapter,
         });
     };
-    let terminal_adapter = match handoff.owner_terminal_provenance {
-        Some(super::TerminalProvenanceKind::Cmux) => Some(TerminalAdapterV1::Cmux {
-            route_id: route_id.to_owned(),
-        }),
-        Some(super::TerminalProvenanceKind::HerdR) => Some(TerminalAdapterV1::HerdR {
-            route_id: route_id.to_owned(),
-        }),
-        Some(super::TerminalProvenanceKind::Absent) | None => None,
-    };
+    // Runtime labels are provenance, not live instance authority. The verifier
+    // can produce typed binding evidence, but no route-change CAS persists that
+    // evidence yet. Keep TerminalAdapter publication inert until that gate lands.
+    let terminal_adapter = None;
     let agent_adapter = match (
         handoff.owner_provider.as_deref(),
         handoff.resume_transport.as_deref(),

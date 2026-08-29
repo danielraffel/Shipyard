@@ -1097,6 +1097,7 @@ mod queue_priority_recovery;
 mod render;
 mod resume_record;
 mod terminal_handoff;
+mod terminal_target_verifier;
 
 use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,

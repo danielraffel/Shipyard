@@ -3,7 +3,7 @@ use crate::app::merge_steward_cmd::TerminalProvenanceKind;
 use crate::app::merge_steward_cmd::handoff::ProviderRouteReferenceV1;
 use crate::app::merge_steward_cmd::ledger::load_ledger;
 use crate::app::merge_steward_cmd::resume_record::{
-    AgentAdapterV1, ProviderAdapterV1, ResumeRecordPhase, TerminalAdapterV1,
+    AgentAdapterV1, ProviderAdapterV1, ResumeRecordPhase,
 };
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -233,10 +233,7 @@ fn legacy_absent_provenance_enriches_to_cmux_without_weakening_route_fences() {
         Some(TerminalProvenanceKind::Cmux)
     );
     let resume = ledger.resume_records.values().next().expect("resume");
-    assert!(matches!(
-        resume.terminal_adapter,
-        Some(TerminalAdapterV1::Cmux { ref route_id }) if route_id == "cmux-route"
-    ));
+    assert_eq!(resume.terminal_adapter, None);
     assert!(!resume.dispatch_enabled);
 
     let mut drifted = owner("different-route");
@@ -807,10 +804,7 @@ fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
         .values()
         .next()
         .expect("HerdR resume");
-    assert!(matches!(
-        resume.terminal_adapter,
-        Some(TerminalAdapterV1::HerdR { ref route_id }) if route_id == "herdr-route"
-    ));
+    assert_eq!(resume.terminal_adapter, None);
     assert!(matches!(
         resume.agent_adapter,
         Some(AgentAdapterV1::Native {

@@ -55,10 +55,7 @@ fn terminal_and_agent_adapters_are_orthogonal() {
         Some("surface-7"),
     ))
     .expect("record");
-    assert!(matches!(
-        record.terminal_adapter,
-        Some(TerminalAdapterV1::Cmux { ref route_id }) if route_id == "route-exact"
-    ));
+    assert_eq!(record.terminal_adapter, None);
     assert!(matches!(
         record.agent_adapter,
         Some(AgentAdapterV1::Native {
@@ -75,12 +72,7 @@ fn herdr_terminal_does_not_replace_native_agent_transport() {
     let mut terminal = handoff(Some("codex"), Some("codex_queue"), None);
     terminal.owner_terminal_provenance = Some(TerminalProvenanceKind::HerdR);
     let record = record_for(&terminal).expect("HerdR record");
-    assert!(matches!(
-        record.terminal_adapter,
-        Some(TerminalAdapterV1::HerdR {
-            ref route_id,
-        }) if route_id == "route-exact"
-    ));
+    assert_eq!(record.terminal_adapter, None);
     assert!(matches!(
         record.agent_adapter,
         Some(AgentAdapterV1::Native {
@@ -150,24 +142,19 @@ fn fresh_checkpoint_preserves_launch_profile_provider_route() {
 }
 
 #[test]
-fn cmux_terminal_route_can_exist_without_native_agent_transport() {
+fn unverified_cmux_route_without_native_transport_is_unroutable() {
     let record = record_for(&handoff(
         Some("future-provider"),
         Some("unsupported-native-route"),
         Some("surface-7"),
     ))
     .expect("record");
-    assert!(matches!(
-        record.terminal_adapter,
-        Some(TerminalAdapterV1::Cmux {
-            ref route_id,
-        }) if route_id == "route-exact"
-    ));
+    assert_eq!(record.terminal_adapter, None);
     assert_eq!(record.agent_adapter, None);
     assert_eq!(record.provider_adapter, None);
     assert_eq!(
         record.routing_disposition,
-        ResumeRoutingDisposition::OriginalOwner
+        ResumeRoutingDisposition::UnroutablePrivateRoute
     );
     assert!(!record.dispatch_enabled);
 }
@@ -214,6 +201,14 @@ fn reconciliation_is_idempotent_and_resolves_removed_authority() {
     assert!(!reconcile_resume_records(&mut ledger).expect("replay"));
     assert_eq!(ledger.resume_records, first);
 
+    ledger
+        .resume_records
+        .values_mut()
+        .next()
+        .expect("legacy record")
+        .terminal_adapter = Some(TerminalAdapterV1::Cmux {
+        route_id: "legacy-unverified".to_owned(),
+    });
     ledger.terminal_handoffs.clear();
     assert!(reconcile_resume_records(&mut ledger).expect("resolve"));
     assert!(
@@ -222,4 +217,11 @@ fn reconciliation_is_idempotent_and_resolves_removed_authority() {
             .values()
             .all(|record| record.phase == ResumeRecordPhase::Resolved)
     );
+    assert!(
+        ledger
+            .resume_records
+            .values()
+            .all(|record| record.terminal_adapter.is_none())
+    );
+    assert!(!reconcile_resume_records(&mut ledger).expect("resolved replay"));
 }

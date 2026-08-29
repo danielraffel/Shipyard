@@ -1957,6 +1957,12 @@ is the current default terminal; HerdR is an optional terminal adapter, while
 Subrouter is provider-routing provenance carried by the exact launch/resume
 profile. Preserve both dimensions concurrently. Never infer one from the other
 or silently translate a missing Subrouter route into direct `codex`. During the
+inert phase, cmux/HerdR labels are locators only: exact local process identity
+plus adapter-specific live proof is required before a terminal can be bound.
+Unbound and demoted states publish no terminal adapter, and demotion retains its
+last verified instance as a tombstone. See
+`docs/terminal-target-verification.md`.
+During the
 inert projection phase, reconcile legacy terminal handoffs even on a no-op
 transition, atomically publish/roll back terminal and resume maps together, and
 verify that every record keeps dispatch disabled. Activation additionally

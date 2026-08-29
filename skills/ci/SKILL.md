@@ -1670,6 +1670,11 @@ Keep terminal runtime (`cmux` or optional HerdR) separate from agent/provider
 transport (native Codex/Claude plus any launch-profile router such as
 Subrouter). A terminal adapter must not replace or imply the provider route,
 and missing Subrouter provenance must never fall back to direct `codex`.
+Treat terminal labels as locators only. A terminal remains
+`leader_live_unbound` until the exact local boot/PID/start tuple is independently
+re-observed and the cmux or HerdR adapter proves one live target as specified in
+`docs/terminal-target-verification.md`. Do not publish a `TerminalAdapter` for
+unbound or demoted state; demotion retains the prior instance tombstone.
 Reconcile resume records even when the authoritative terminal-handoff update is
 a no-op so legacy ledgers backfill on restart. Publish or roll back both maps as
 one crash-consistent ledger image, and keep `dispatch_enabled=false` until the
