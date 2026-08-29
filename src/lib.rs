@@ -168,6 +168,8 @@ pub mod stacked_pr;
 /// pipeline; diagnostic subcommands deliberately skip this.
 pub mod supervised;
 mod terminal_delivery_authority;
+/// Optional local outbox and adapter contract for external transition projection.
+pub mod transition_projection;
 /// Working-tree drift detection shared by future `shipyard run` wiring.
 pub mod tree_drift;
 /// Tunnel readiness, Tailscale probe decoding, and supervisor retry policy.
