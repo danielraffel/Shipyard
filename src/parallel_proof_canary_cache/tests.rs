@@ -191,15 +191,41 @@ fn local_observer_requires_the_exact_immutable_manifest() {
     assert_eq!(receipt.model_calls, 0);
     receipt.validate().unwrap();
 
-    let worker_spec =
-        CacheGenerationProbeSpec::new("m1", host_digest("m1"), root.path(), manifest.clone())
-            .unwrap();
-    assert!(observer.observe(&worker_spec).is_err());
-
     fs::write(root.path().join("index.bin"), b"drifted").unwrap();
     assert!(matches!(
         observer.observe(&spec),
         Err(CacheObserverError::GenerationMismatch { .. })
+    ));
+}
+
+#[test]
+fn local_observer_refuses_a_different_host_before_platform_packing() {
+    let root = cache_tree();
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
+    let spec =
+        CacheGenerationProbeSpec::new("m1", host_digest("m1"), root.path(), manifest).unwrap();
+    let mut observer = LocalCacheGenerationObserver::new("m3").unwrap();
+
+    assert!(matches!(
+        observer.observe(&spec),
+        Err(CacheObserverError::Invalid(message))
+            if message == "local cache observer host binding"
+    ));
+}
+
+#[cfg(not(unix))]
+#[test]
+fn local_observer_refuses_matching_host_without_no_follow_directory_handles() {
+    let root = cache_tree();
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
+    let spec =
+        CacheGenerationProbeSpec::new("m3", host_digest("m3"), root.path(), manifest).unwrap();
+    let mut observer = LocalCacheGenerationObserver::new("m3").unwrap();
+
+    assert!(matches!(
+        observer.observe(&spec),
+        Err(CacheObserverError::Artifact(message))
+            if message.contains("requires no-follow directory handles")
     ));
 }
 

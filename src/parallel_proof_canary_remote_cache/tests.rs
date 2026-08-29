@@ -10,9 +10,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 use super::*;
-#[cfg(unix)]
 use crate::parallel_proof_canary::PulpMacCanaryPolicy;
-#[cfg(unix)]
 use crate::parallel_proof_canary_cache::{
     PulpMacCacheEvidenceStore, PulpMacCacheProbeRequest, drive_pulp_mac_cache_probe,
 };
@@ -450,7 +448,6 @@ fn non_lan_or_insufficient_reserve_authority_is_refused_before_invocation() {
     assert_eq!(observer.transport.calls, ["authenticate"]);
 }
 
-#[cfg(unix)]
 #[test]
 fn paired_driver_never_reaches_m1_after_failed_local_m3_proof() {
     let m3_root = cache_tree();
@@ -504,7 +501,18 @@ fn paired_driver_never_reaches_m1_after_failed_local_m3_proof() {
     let mut observer = PairedAuthenticatedCacheObserver::new("m3", "m1", remote).unwrap();
     let store_parent = persistent_temp();
     let store = PulpMacCacheEvidenceStore::open(store_parent.path().join("evidence")).unwrap();
-    assert!(drive_pulp_mac_cache_probe(&request, &policy, &mut observer, &store).is_err());
+    let error = drive_pulp_mac_cache_probe(&request, &policy, &mut observer, &store).unwrap_err();
+    #[cfg(unix)]
+    assert!(matches!(
+        error,
+        CacheObserverError::GenerationMismatch { .. }
+    ));
+    #[cfg(not(unix))]
+    assert!(matches!(
+        error,
+        CacheObserverError::Artifact(message)
+            if message.contains("requires no-follow directory handles")
+    ));
     assert!(observer.remote.transport.calls.is_empty());
 }
 
