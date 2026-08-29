@@ -252,7 +252,7 @@ pub(super) fn validate_launch_profile(profile: &LaunchProfileV1) -> Result<(), C
     validate_argv("launch", &profile.launch_argv)?;
     validate_argv("resume", &profile.resume_argv)?;
     if let Some(digest) = profile.subrouter_executable_sha256.as_deref() {
-        validate_sha256("Subrouter executable digest", digest)?;
+        validate_lower_sha256("Subrouter executable digest", digest)?;
     }
     validate_route_environment(profile)?;
     validate_metadata("provider ID", &profile.provider.provider)?;
@@ -950,6 +950,9 @@ mod tests {
         assert!(validate_launch_profile(&invalid).is_err());
         invalid = profile();
         invalid.worktree.path = "relative/path".into();
+        assert!(validate_launch_profile(&invalid).is_err());
+        invalid = profile();
+        invalid.subrouter_executable_sha256 = Some("A".repeat(64));
         assert!(validate_launch_profile(&invalid).is_err());
     }
 

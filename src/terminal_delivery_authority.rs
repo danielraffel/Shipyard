@@ -74,7 +74,7 @@ pub(crate) fn observe_provider_on_cmux_surface(
     for pid in cmux_surface_process_pids(cli_path, socket_path, surface_id)? {
         match process_matches_provider_session(pid, provider_kind, native_session_id) {
             Ok(true) => return Ok(ProviderProcessPresence::Present),
-            Ok(false) | Err(TerminalCapabilityRefusal::Unobservable) => {}
+            Ok(false) | Err(TerminalCapabilityRefusal::NoMatch) => {}
             Err(error) => return Err(error),
         }
     }
@@ -155,7 +155,10 @@ fn process_matches_provider_session(
         "terminal provider argv",
     )
     .map_err(|_| TerminalCapabilityRefusal::Unobservable)?;
-    if !output.status.success() || output.stdout.len() > 64 * 1024 {
+    if !output.status.success() {
+        return Err(TerminalCapabilityRefusal::NoMatch);
+    }
+    if output.stdout.len() > 64 * 1024 {
         return Err(TerminalCapabilityRefusal::Unobservable);
     }
     let command = std::str::from_utf8(&output.stdout)
