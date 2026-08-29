@@ -62,8 +62,8 @@ pub(crate) use delivery_authority::verify_delivery_authority_at;
 pub(crate) use delivery_authority::{
     DeliveryAuthorityExpectation, DeliveryAuthorityProbe, DeliveryAuthorityRefusal,
     DeliveryAuthorization, GitHubAuthorityObservation, ProcessIncarnation,
-    ReconciliationAuthorization, TerminalAuthorityObservation, verify_delivery_authority,
-    verify_reconciliation_authority,
+    ReconciliationAuthorization, TerminalAuthorityObservation, TerminalMutationEndpoint,
+    verify_delivery_authority, verify_reconciliation_authority,
 };
 #[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
 pub(crate) use delivery_ownership::{

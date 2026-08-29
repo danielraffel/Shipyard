@@ -157,7 +157,7 @@ fn capture_cmux(
         provider_kind,
     )?;
     let mut matches = Vec::new();
-    for pid in candidate_agent_pids()? {
+    for pid in candidate_agent_pids(provider_kind)? {
         let Ok(process) = observe_process(pid) else {
             continue;
         };
@@ -541,7 +541,7 @@ fn cmux_json_with_timeout(
 }
 
 #[cfg(target_os = "macos")]
-fn candidate_agent_pids() -> Result<Vec<u32>, TerminalCapabilityRefusal> {
+fn candidate_agent_pids(provider_kind: &str) -> Result<Vec<u32>, TerminalCapabilityRefusal> {
     use std::process::Command;
     let output = Command::new("/bin/ps")
         .args(["-axo", "pid=,uid=,comm="])
@@ -560,7 +560,7 @@ fn candidate_agent_pids() -> Result<Vec<u32>, TerminalCapabilityRefusal> {
             let process_uid = fields.next()?.parse::<u32>().ok()?;
             let command = fields.next()?;
             let name = command.rsplit('/').next()?;
-            (process_uid == uid && matches!(name, "codex" | "claude")).then_some(pid)
+            (process_uid == uid && name == provider_kind).then_some(pid)
         })
         .collect::<Vec<_>>();
     pids.sort_unstable();
@@ -644,7 +644,11 @@ fn validate_cmux_inputs(
         || socket_metadata.permissions().mode() & 0o022 != 0
         || !is_uuid(surface_id)
         || native_session_id.trim().is_empty()
-        || !matches!(provider_kind, "codex" | "claude")
+        || provider_kind.is_empty()
+        || provider_kind.len() > 128
+        || !provider_kind.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
     {
         return Err(TerminalCapabilityRefusal::Unobservable);
     }

@@ -14,7 +14,7 @@ use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -45,7 +45,39 @@ const SENTINEL_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 const SENTINEL_TEARDOWN_BUDGET: Duration = TEARDOWN_BUDGET;
 const EXECUTION_SENTINEL_FD_ENV: &str = "SHIPYARD_PROVIDER_SENTINEL_FD";
 #[cfg(test)]
-static PROVIDER_EXECUTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 4;
+#[cfg(test)]
+static PROVIDER_EXECUTION_TEST_PERMITS: std::sync::Mutex<usize> =
+    std::sync::Mutex::new(PROVIDER_EXECUTION_TEST_CONCURRENCY);
+#[cfg(test)]
+static PROVIDER_EXECUTION_TEST_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+#[cfg(test)]
+struct ProviderExecutionTestPermit;
+
+#[cfg(test)]
+impl Drop for ProviderExecutionTestPermit {
+    fn drop(&mut self) {
+        if let Ok(mut available) = PROVIDER_EXECUTION_TEST_PERMITS.lock() {
+            *available += 1;
+            PROVIDER_EXECUTION_TEST_READY.notify_one();
+        }
+    }
+}
+
+#[cfg(test)]
+fn provider_execution_test_permit() -> Result<ProviderExecutionTestPermit, ProviderWrapperRefusal> {
+    let mut available = PROVIDER_EXECUTION_TEST_PERMITS
+        .lock()
+        .map_err(|_| refusal("provider wrapper test execution permits are poisoned"))?;
+    while *available == 0 {
+        available = PROVIDER_EXECUTION_TEST_READY
+            .wait(available)
+            .map_err(|_| refusal("provider wrapper test execution permits are poisoned"))?;
+    }
+    *available -= 1;
+    Ok(ProviderExecutionTestPermit)
+}
 
 /// Exact operation requested from the protected wrapper.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -135,8 +167,38 @@ pub(crate) struct ProviderWrapperRequestV1 {
     pub(crate) provider_id: String,
     pub(crate) adapter_id: String,
     pub(crate) delivery_fence: ProviderDeliveryFenceV1,
+    /// Exact terminal endpoint accepted by the one-shot delivery authority.
+    pub(crate) cmux_endpoint: CmuxEndpointV1,
+    /// Exact private Subrouter route decoded from the protected launch profile.
+    pub(crate) protected_route: ProtectedProviderRouteV1,
     pub(crate) resume_expectation: FreshResumeExpectationV1,
     pub(crate) launch_options: ProviderLaunchOptionsV1,
+}
+
+/// The exact cmux process/socket pair authorized for this delivery.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CmuxEndpointV1 {
+    pub(crate) executable_path: String,
+    pub(crate) socket_path: String,
+}
+
+/// Prompt-free provider route retained only inside protected execution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProtectedProviderRouteV1 {
+    /// Exact Subrouter resume argv. The adapter appends only Shipyard's prompt.
+    pub(crate) argv: Vec<String>,
+    /// Digest of the exact Subrouter executable accepted by the profile.
+    pub(crate) executable_sha256: String,
+    /// Exact private routing headers/environment from the protected profile.
+    pub(crate) environment: BTreeMap<String, String>,
+    /// Selected Subrouter account, retained only inside the protected request.
+    pub(crate) account_id: Option<String>,
+    /// Native provider session that the exact resume argv must select.
+    pub(crate) native_session_id: String,
+    /// Digest of the protected profile from which this route was decoded.
+    pub(crate) profile_digest: String,
 }
 
 /// Narrow user intent that the digest-pinned provider adapter translates into
@@ -328,13 +390,11 @@ pub(crate) fn run_provider_wrapper(
     environment: &ProviderWrapperEnvironment,
     request: &ProviderWrapperRequestV1,
 ) -> Result<ProviderWrapperRunResult, ProviderWrapperRefusal> {
-    // The subprocess fixtures share a deliberately tight deadline and invoke
-    // host-wide process observation. Serialize only tests so unrelated test
-    // threads cannot manufacture scheduler/lsof starvation failures.
+    // The subprocess fixtures invoke host-wide process observation. Bound
+    // their test-only concurrency without serializing unrelated private
+    // sentinels or making a multi-call test wait behind the whole suite.
     #[cfg(test)]
-    let _test_execution = PROVIDER_EXECUTION_TEST_LOCK
-        .lock()
-        .map_err(|_| refusal("provider wrapper test execution lock is poisoned"))?;
+    let _test_execution = provider_execution_test_permit()?;
     validate_request(config, request)?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -452,8 +512,243 @@ pub(crate) fn validate_request(
             "fresh-resume head must be an exact lowercase 40-hex commit",
         ));
     }
+    validate_cmux_endpoint(&request.cmux_endpoint)?;
+    validate_protected_route(request)?;
     validate_launch_options(&request.launch_options)?;
     Ok(())
+}
+
+fn validate_cmux_endpoint(endpoint: &CmuxEndpointV1) -> Result<(), ProviderWrapperRefusal> {
+    for value in [&endpoint.executable_path, &endpoint.socket_path] {
+        validate_value(value)?;
+        let path = Path::new(value);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(refusal(
+                "cmux endpoint must contain normalized absolute paths",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_protected_route(
+    request: &ProviderWrapperRequestV1,
+) -> Result<(), ProviderWrapperRefusal> {
+    const MAX_ROUTE_ITEMS: usize = 64;
+    const MAX_ROUTE_BYTES: usize = 16 * 1024;
+    const MAX_ROUTE_ENVIRONMENT: usize = 16;
+
+    let route = &request.protected_route;
+    validate_digest(&route.executable_sha256)?;
+    validate_digest(&route.profile_digest)?;
+    if route.profile_digest != request.delivery_fence.payload_digest
+        || route.argv.len() < 3
+        || route.argv.len() > MAX_ROUTE_ITEMS
+        || route.argv.iter().map(String::len).sum::<usize>() > MAX_ROUTE_BYTES
+    {
+        return Err(refusal(
+            "protected provider route does not bind the exact profile",
+        ));
+    }
+    for value in &route.argv {
+        validate_value(value)?;
+    }
+    let executable_path = Path::new(&route.argv[0]);
+    let executable = executable_path.file_name().and_then(|value| value.to_str());
+    if !executable_path.is_absolute()
+        || executable_path.components().collect::<PathBuf>() != executable_path
+        || executable != Some("subrouter")
+        || route.argv[1] != request.provider_id
+    {
+        return Err(refusal(
+            "protected provider route is not the exact Subrouter provider",
+        ));
+    }
+    if route.argv[2..]
+        .iter()
+        .any(|value| value.chars().any(char::is_whitespace))
+    {
+        return Err(refusal("protected provider route must remain prompt-free"));
+    }
+    validate_value(&route.native_session_id)?;
+    if !exact_provider_route(
+        &route.argv[2..],
+        request.launch_options.model_id.as_deref(),
+        request
+            .launch_options
+            .reasoning_effort
+            .map(provider_reasoning_effort_name),
+        Some(&route.native_session_id),
+    ) {
+        return Err(refusal(
+            "protected provider route does not bind session or provider selection",
+        ));
+    }
+    validate_protected_route_environment(request, MAX_ROUTE_ENVIRONMENT)
+}
+
+pub(crate) fn exact_provider_route(
+    tail: &[String],
+    expected_model: Option<&str>,
+    expected_reasoning: Option<&str>,
+    expected_session: Option<&str>,
+) -> bool {
+    let mut models = Vec::new();
+    let mut reasoning = Vec::new();
+    let mut sessions = Vec::new();
+    let mut resume_markers = 0;
+    let mut index = 0;
+    while index < tail.len() {
+        let value = tail[index].as_str();
+        match value {
+            "resume" => resume_markers += 1,
+            "--resume" => {
+                resume_markers += 1;
+                index += 1;
+                let Some(session) = tail.get(index).map(String::as_str) else {
+                    return false;
+                };
+                sessions.push(session);
+            }
+            "--model" => {
+                index += 1;
+                let Some(model) = tail.get(index).map(String::as_str) else {
+                    return false;
+                };
+                models.push(model);
+            }
+            "--effort" | "--reasoning-effort" => {
+                index += 1;
+                let Some(effort) = tail.get(index).map(String::as_str) else {
+                    return false;
+                };
+                reasoning.push(effort);
+            }
+            "-c" => {
+                index += 1;
+                let Some(setting) = tail.get(index).map(String::as_str) else {
+                    return false;
+                };
+                let Some(effort) = setting.strip_prefix("model_reasoning_effort=") else {
+                    return false;
+                };
+                reasoning.push(effort.trim_matches('"'));
+            }
+            _ => {
+                if let Some(model) = value.strip_prefix("--model=") {
+                    models.push(model);
+                } else if let Some(effort) = value
+                    .strip_prefix("--effort=")
+                    .or_else(|| value.strip_prefix("--reasoning-effort="))
+                {
+                    reasoning.push(effort);
+                } else if expected_session == Some(value) {
+                    sessions.push(value);
+                } else {
+                    return false;
+                }
+            }
+        }
+        index += 1;
+    }
+    if models
+        .iter()
+        .chain(&reasoning)
+        .any(|value| value.is_empty())
+    {
+        return false;
+    }
+    let session_matches = match expected_session {
+        Some(expected) => sessions == [expected] && resume_markers == 1,
+        None => sessions.is_empty() && resume_markers == 0,
+    };
+    session_matches
+        && selections_match(&models, expected_model)
+        && selections_match(&reasoning, expected_reasoning)
+}
+
+fn selections_match(observed: &[&str], expected: Option<&str>) -> bool {
+    match expected {
+        Some(expected) => observed == [expected],
+        None => observed.is_empty(),
+    }
+}
+
+fn validate_protected_route_environment(
+    request: &ProviderWrapperRequestV1,
+    max_environment: usize,
+) -> Result<(), ProviderWrapperRefusal> {
+    let route = &request.protected_route;
+    if route.environment.len() > max_environment {
+        return Err(refusal("protected provider route environment is too large"));
+    }
+    for (name, value) in &route.environment {
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || !name.starts_with("SUBROUTER_")
+        {
+            return Err(refusal(
+                "protected provider route environment key is invalid",
+            ));
+        }
+        validate_value(value)?;
+    }
+    let expected_account_key = subrouter_account_environment_key(&request.provider_id);
+    let account_entries = route
+        .environment
+        .iter()
+        .filter(|(name, _)| name.ends_with("_ACCOUNT_ID"))
+        .collect::<Vec<_>>();
+    match route.account_id.as_deref() {
+        Some(account)
+            if account_entries.len() == 1
+                && account_entries[0].0 == &expected_account_key
+                && account_entries[0].1 == account =>
+        {
+            validate_value(account)?;
+        }
+        None if account_entries.is_empty() => {}
+        _ => {
+            return Err(refusal(
+                "protected provider route account selection is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) const fn provider_reasoning_effort_name(
+    value: ProviderReasoningEffortV1,
+) -> &'static str {
+    match value {
+        ProviderReasoningEffortV1::Low => "low",
+        ProviderReasoningEffortV1::Medium => "medium",
+        ProviderReasoningEffortV1::High => "high",
+        ProviderReasoningEffortV1::Xhigh => "xhigh",
+        ProviderReasoningEffortV1::Max => "max",
+        ProviderReasoningEffortV1::Ultra => "ultra",
+    }
+}
+
+pub(crate) fn subrouter_account_environment_key(provider_id: &str) -> String {
+    format!(
+        "SUBROUTER_{}_ACCOUNT_ID",
+        provider_id
+            .chars()
+            .map(|character| if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    )
 }
 
 fn validate_launch_options(
@@ -672,17 +967,21 @@ fn run_provider_wrapper_unix(
         .write(true)
         .open(&sentinel_path)
         .map_err(|_| refusal("provider wrapper execution sentinel cannot be created"))?;
-    #[cfg(unix)]
-    let sentinel_fd = {
-        use std::os::fd::AsRawFd;
-        rustix::io::fcntl_setfd(&sentinel, rustix::io::FdFlags::empty())
-            .map_err(|_| refusal("provider wrapper execution sentinel cannot be inherited"))?;
-        sentinel.as_raw_fd()
-    };
-    let mut command = Command::new(&prepared.path);
+    drop(sentinel);
+    // Keep the parent descriptor table untouched. Clearing CLOEXEC in this
+    // multi-threaded process allowed an unrelated concurrent child to inherit
+    // another invocation's sentinel and be mistaken for its descendant. The
+    // fixed system shell opens only this invocation's private sentinel in the
+    // child immediately before replacing itself with the verified snapshot.
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "exec 9<>\"$1\" || exit 126\nshift\nexec \"$@\"",
+        "shipyard-provider-sentinel",
+    ]);
+    command.arg(&sentinel_path).arg(&prepared.path);
     command.env_clear().envs(environment.0.iter());
-    #[cfg(unix)]
-    command.env(EXECUTION_SENTINEL_FD_ENV, sentinel_fd.to_string());
+    command.env(EXECUTION_SENTINEL_FD_ENV, "9");
     command
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout.try_clone().map_err(|_| {
@@ -696,9 +995,6 @@ fn run_provider_wrapper_unix(
     let Ok(mut process) = ProcessTree::spawn(&mut command) else {
         return Ok(uncertain("verified-wrapper-launch-outcome-unknown"));
     };
-    #[cfg(unix)]
-    rustix::io::fcntl_setfd(&sentinel, rustix::io::FdFlags::CLOEXEC)
-        .map_err(|_| refusal("provider wrapper execution sentinel cannot be isolated"))?;
     let mut status = None;
     let mut uncertain_reason = None;
     loop {
@@ -1027,6 +1323,27 @@ mod tests {
             operation,
             provider_id: "codex".into(),
             adapter_id: "codex-wrapper-v1".into(),
+            cmux_endpoint: CmuxEndpointV1 {
+                executable_path: native_absolute_test_path("cmux"),
+                socket_path: native_absolute_test_path("cmux.sock"),
+            },
+            protected_route: ProtectedProviderRouteV1 {
+                argv: vec![
+                    "/opt/subrouter".into(),
+                    "codex".into(),
+                    "resume".into(),
+                    "--model".into(),
+                    "gpt-5.6-sol".into(),
+                    "-c".into(),
+                    "model_reasoning_effort=\"medium\"".into(),
+                    "session-1".into(),
+                ],
+                executable_sha256: "9".repeat(64),
+                environment: BTreeMap::new(),
+                account_id: None,
+                native_session_id: "session-1".into(),
+                profile_digest: fence.payload_digest.clone(),
+            },
             delivery_fence: fence,
             resume_expectation: FreshResumeExpectationV1 {
                 workstream_handle: "GEN-43".into(),
@@ -1257,7 +1574,10 @@ mod tests {
             executable_sha256,
             provider_id: "codex".into(),
             adapter_id: "codex-wrapper-v1".into(),
-            deadline_seconds: 2,
+            // Success fixtures may share a macOS host with expensive Pulp
+            // compilation. Timeout-specific tests replace this value with a
+            // shorter bound and retain a deliberately slower child.
+            deadline_seconds: 15,
             max_stdout_bytes: 4096,
             max_stderr_bytes: 4096,
         }
@@ -1428,7 +1748,12 @@ mod tests {
             response_bytes,
         );
         let (_wrapper_dir, path, sha) = wrapper_c(&body);
-        let config = config(&path, sha);
+        let mut config = config(&path, sha);
+        // This two-invocation fixture runs inside the fully parallel library
+        // suite, where process startup can exceed the tiny default test budget.
+        // Keep its private wrapper/state while allowing both exact invocations
+        // the same production-scale launch budget.
+        config.deadline_seconds = 15;
         assert!(matches!(
             run_provider_wrapper(&config, &ProviderWrapperEnvironment::default(), &submit).unwrap(),
             ProviderWrapperRunResult::Uncertain { .. }
@@ -1633,5 +1958,48 @@ mod tests {
                 .is_err()
         );
         assert!(ProviderWrapperEnvironment::new([("HOME".into(), OsString::from("/tmp"))]).is_ok());
+    }
+
+    #[test]
+    fn provider_selections_are_symmetric_with_protected_metadata() {
+        let selected = vec![
+            "resume".to_owned(),
+            "--model".to_owned(),
+            "model-a".to_owned(),
+            "--effort=high".to_owned(),
+            "session-a".to_owned(),
+        ];
+        assert!(exact_provider_route(
+            &selected,
+            Some("model-a"),
+            Some("high"),
+            Some("session-a")
+        ));
+        assert!(!exact_provider_route(
+            &selected,
+            None,
+            Some("high"),
+            Some("session-a")
+        ));
+        assert!(!exact_provider_route(
+            &selected,
+            Some("model-a"),
+            None,
+            Some("session-a")
+        ));
+        let duplicated = [selected.clone(), vec!["--model".into(), "model-b".into()]].concat();
+        assert!(!exact_provider_route(
+            &duplicated,
+            Some("model-a"),
+            Some("high"),
+            Some("session-a")
+        ));
+        let unsafe_flag = [selected, vec!["--dangerously-bypass-approvals".into()]].concat();
+        assert!(!exact_provider_route(
+            &unsafe_flag,
+            Some("model-a"),
+            Some("high"),
+            Some("session-a")
+        ));
     }
 }

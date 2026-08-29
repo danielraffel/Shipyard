@@ -122,6 +122,11 @@ fn profile(resume_flag: &str) -> LaunchProfileV1 {
             resume_flag.into(),
             "provider-session-7".into(),
         ],
+        subrouter_executable_sha256: Some("9".repeat(64)),
+        route_environment: std::collections::BTreeMap::from([(
+            "SUBROUTER_OPAQUE_PROVIDER_ACCOUNT_ID".into(),
+            "subscription-a".into(),
+        )]),
         provider: ProviderMetadataV1 {
             provider: "opaque-provider".into(),
             account: Some("subscription-a".into()),
@@ -167,9 +172,13 @@ fn profile(resume_flag: &str) -> LaunchProfileV1 {
 fn native_profile() -> LaunchProfileV1 {
     let mut profile = profile("-r");
     profile.provider.provider = "codex".into();
+    profile.route_environment = std::collections::BTreeMap::from([(
+        "SUBROUTER_CODEX_ACCOUNT_ID".into(),
+        "subscription-a".into(),
+    )]);
     profile.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
     profile.launch_argv = vec![
-        "subrouter".into(),
+        "/opt/subrouter".into(),
         "codex".into(),
         "--model".into(),
         "model-tier-a".into(),
@@ -177,7 +186,7 @@ fn native_profile() -> LaunchProfileV1 {
         "model_reasoning_effort=\"medium\"".into(),
     ];
     profile.resume_argv = vec![
-        "subrouter".into(),
+        "/opt/subrouter".into(),
         "codex".into(),
         "resume".into(),
         "--model".into(),
@@ -396,7 +405,7 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
             .profile
             .resume_argv,
         vec![
-            "subrouter",
+            "/opt/subrouter",
             "codex",
             "resume",
             "--model",
@@ -405,6 +414,13 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
             "model_reasoning_effort=\"medium\"",
             "provider-session-7"
         ]
+    );
+    assert_eq!(
+        stored.profile.route_environment,
+        std::collections::BTreeMap::from([(
+            "SUBROUTER_CODEX_ACCOUNT_ID".to_owned(),
+            "subscription-a".to_owned(),
+        )])
     );
     assert!(!restarted.wake_consumer_available);
     let paths = RuntimePaths::current_with_overrides(
@@ -1089,6 +1105,7 @@ fn public_receipt_render_never_projects_private_profile_fields() {
         "worktrees",
         "subscription-a",
         "model-tier-a",
+        "SUBROUTER_OPAQUE_PROVIDER_ACCOUNT_ID",
     ] {
         assert!(
             !rendered.contains(private),

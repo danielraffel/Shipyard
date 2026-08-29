@@ -66,11 +66,10 @@ fn probe(now: DateTime<Utc>) -> Probe {
                 start_identity: "start-a".to_owned(),
             },
             native_session_id: "codex-session-a".to_owned(),
-            source_work_generation: 6,
-            source_owner_generation: 2,
-            target_work_generation: 6,
-            target_owner_generation: 2,
-            transactionally_rebound: false,
+            mutation_endpoint: TerminalMutationEndpoint::Cmux {
+                executable_path: "/test/cmux-a".to_owned(),
+                socket_path: "/test/cmux-a.sock".to_owned(),
+            },
             observed_at: now,
         }),
         terminal_calls: 0,
@@ -80,10 +79,10 @@ fn probe(now: DateTime<Utc>) -> Probe {
 #[test]
 fn exact_current_route_produces_one_shot_authority() {
     let now = Utc::now();
-    let mut probe = probe(now);
+    let mut first_probe = probe(now);
     let authority =
-        verify_delivery_authority_at(&mut probe, &expectation(), now).expect("authority");
-    assert_eq!(probe.terminal_calls, 1);
+        verify_delivery_authority_at(&mut first_probe, &expectation(), now).expect("authority");
+    assert_eq!(first_probe.terminal_calls, 1);
     assert_eq!(authority.terminal_instance(), "cmux:surface-a");
     assert_eq!(authority.receipt_digest().len(), 64);
 }
@@ -110,6 +109,26 @@ fn dead_original_occupant_does_not_block_read_only_reconciliation_authority() {
 }
 
 #[test]
+fn authorization_cannot_be_reused_with_altered_ledger_generations() {
+    let now = Utc::now();
+    let mut second_probe = probe(now);
+    let authority =
+        verify_delivery_authority_at(&mut second_probe, &expectation(), now).expect("authority");
+    assert_eq!(
+        authority.into_mutation_endpoint_for(7, 2),
+        Err(DeliveryAuthorityRefusal::GenerationMismatch)
+    );
+
+    let mut second_probe = probe(now);
+    let authority =
+        verify_delivery_authority_at(&mut second_probe, &expectation(), now).expect("authority");
+    assert_eq!(
+        authority.into_mutation_endpoint_for(6, 3),
+        Err(DeliveryAuthorityRefusal::GenerationMismatch)
+    );
+}
+
+#[test]
 fn head_or_base_drift_refuses_before_terminal_io() {
     let now = Utc::now();
     for drift in ["head", "base"] {
@@ -131,7 +150,7 @@ fn head_or_base_drift_refuses_before_terminal_io() {
 }
 
 #[test]
-fn moved_terminal_requires_verified_rebind_and_exact_generations() {
+fn moved_terminal_requires_separate_reconciliation_authority() {
     let now = Utc::now();
     let mut first_probe = probe(now);
     let terminal = first_probe.terminal.as_mut().expect("terminal");
@@ -140,25 +159,13 @@ fn moved_terminal_requires_verified_rebind_and_exact_generations() {
         verify_delivery_authority_at(&mut first_probe, &expectation(), now),
         Err(DeliveryAuthorityRefusal::TerminalInstanceMismatch)
     );
-
-    let mut rebound_probe = probe(now);
-    let terminal = rebound_probe.terminal.as_mut().expect("terminal");
-    terminal.actual_terminal_instance = "cmux:surface-b".to_owned();
-    terminal.transactionally_rebound = true;
-    terminal.target_owner_generation += 1;
-    assert_eq!(
-        verify_delivery_authority_at(&mut rebound_probe, &expectation(), now),
-        Err(DeliveryAuthorityRefusal::GenerationMismatch)
-    );
 }
 
 #[test]
-fn claimed_rebind_never_waives_process_incarnation() {
+fn exact_terminal_match_never_waives_process_incarnation() {
     let now = Utc::now();
     let mut hostile = probe(now);
     let terminal = hostile.terminal.as_mut().expect("terminal");
-    terminal.actual_terminal_instance = "cmux:surface-b".to_owned();
-    terminal.transactionally_rebound = true;
     terminal.process.start_identity = "different-process".to_owned();
     assert_eq!(
         verify_delivery_authority_at(&mut hostile, &expectation(), now),

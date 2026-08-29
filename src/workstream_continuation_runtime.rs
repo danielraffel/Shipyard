@@ -14,7 +14,7 @@ use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
 use crate::provider_wrapper::{
-    FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderLaunchOptionsV1,
+    CmuxEndpointV1, FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderLaunchOptionsV1,
     ProviderWrapperEnvironment, ProviderWrapperOperationV1, ProviderWrapperRequestV1,
     ProviderWrapperRunResult, provider_wrapper_execution_supported, run_provider_wrapper,
 };
@@ -27,8 +27,8 @@ use crate::work_ledger::{
     GitHubAuthorityObservation, ProcessIncarnation, ProviderAdapter,
     ProviderAuthorizationOperation, ProviderCapability, ProviderLaunchRequest, ProviderOutcome,
     ReconciliationAuthorization, StoredProviderRequest, TerminalAuthorityObservation,
-    WakeConsumerPolicy, WakeDeliveryResult, WorkLedger, verify_delivery_authority,
-    verify_reconciliation_authority,
+    TerminalMutationEndpoint, WakeConsumerPolicy, WakeDeliveryResult, WorkLedger,
+    verify_delivery_authority, verify_reconciliation_authority,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 use crate::workstream_continuation_config::WorkstreamContinuationConfig;
@@ -438,14 +438,27 @@ impl DeliveryAuthorityProbe for ProductionDeliveryAuthorityProbe {
         &mut self,
         expected: &DeliveryAuthorityExpectation,
     ) -> Result<TerminalAuthorityObservation, DeliveryAuthorityRefusal> {
+        let terminal_request = self
+            .terminal
+            .as_ref()
+            .ok_or(DeliveryAuthorityRefusal::TerminalAuthorityUnavailable)?;
         let observed = self
             .terminal_adapter
-            .verify_once(
-                self.terminal
-                    .as_ref()
-                    .ok_or(DeliveryAuthorityRefusal::TerminalAuthorityUnavailable)?,
-            )
+            .verify_once(terminal_request)
             .map_err(map_terminal_refusal)?;
+        let mutation_endpoint = match terminal_request {
+            crate::terminal_delivery_authority::TerminalCapabilityRequest::Cmux {
+                cli_path,
+                socket_path,
+                ..
+            } => TerminalMutationEndpoint::Cmux {
+                executable_path: cli_path.clone(),
+                socket_path: socket_path.clone(),
+            },
+            crate::terminal_delivery_authority::TerminalCapabilityRequest::HerdR { .. } => {
+                return Err(DeliveryAuthorityRefusal::TerminalAuthorityUnavailable);
+            }
+        };
         Ok(TerminalAuthorityObservation {
             requested_terminal_instance: expected.requested_terminal_instance.clone(),
             actual_terminal_instance: observed.terminal_instance,
@@ -455,11 +468,7 @@ impl DeliveryAuthorityProbe for ProductionDeliveryAuthorityProbe {
                 start_identity: observed.process.start_identity,
             },
             native_session_id: observed.native_session_id,
-            source_work_generation: expected.source_work_generation,
-            source_owner_generation: expected.source_owner_generation,
-            target_work_generation: expected.target_work_generation,
-            target_owner_generation: expected.target_owner_generation,
-            transactionally_rebound: false,
+            mutation_endpoint,
             observed_at: Utc::now(),
         })
     }
@@ -504,9 +513,14 @@ impl WorkLedgerProviderAdapter<'_> {
         &self,
         fence: &DeliveryFence,
         operation: ProviderWrapperOperationV1,
-        _authority: DeliveryAuthorization,
+        authority: DeliveryAuthorization,
     ) -> ProviderOutcome {
-        let Ok(request) = self.wrapper_request(fence, operation) else {
+        let Ok(mutation_endpoint) =
+            authority.into_mutation_endpoint_for(fence.work_generation, fence.owner_generation)
+        else {
+            return preflight_refusal(operation);
+        };
+        let Ok(request) = self.wrapper_request(fence, operation, &mutation_endpoint) else {
             return preflight_refusal(operation);
         };
         match run_provider_wrapper(&self.config.provider_wrapper, &self.environment, &request) {
@@ -545,10 +559,11 @@ impl WorkLedgerProviderAdapter<'_> {
     fn run_reconciliation(
         &self,
         fence: &DeliveryFence,
-        _authority: ReconciliationAuthorization,
+        authority: ReconciliationAuthorization,
     ) -> ProviderOutcome {
         let operation = ProviderWrapperOperationV1::Reconcile;
-        let Ok(request) = self.wrapper_request(fence, operation) else {
+        let Ok(request) = self.wrapper_request(fence, operation, authority.terminal_endpoint())
+        else {
             return preflight_refusal(operation);
         };
         match run_provider_wrapper(&self.config.provider_wrapper, &self.environment, &request) {
@@ -583,6 +598,7 @@ impl WorkLedgerProviderAdapter<'_> {
         &self,
         fence: &DeliveryFence,
         operation: ProviderWrapperOperationV1,
+        mutation_endpoint: &TerminalMutationEndpoint,
     ) -> Result<ProviderWrapperRequestV1, ()> {
         let (record, bytes) = self
             .ledger
@@ -608,6 +624,9 @@ impl WorkLedgerProviderAdapter<'_> {
         let profile: LaunchProfileV1 = resolver
             .resolve_exact(&fence.work_item_id, &fence.payload_digest)
             .map_err(|_| ())?;
+        profile
+            .validate_native_fresh_agent_grammar()
+            .map_err(|_| ())?;
         if profile.provider_id() != fence.provider_id
             || profile.provider_launch_options() != stored.launch_options
         {
@@ -626,12 +645,23 @@ impl WorkLedgerProviderAdapter<'_> {
             idempotency_key: String::new(),
         };
         delivery_fence.bind_idempotency_key();
+        let cmux_endpoint = match mutation_endpoint {
+            TerminalMutationEndpoint::Cmux {
+                executable_path,
+                socket_path,
+            } => CmuxEndpointV1 {
+                executable_path: executable_path.clone(),
+                socket_path: socket_path.clone(),
+            },
+        };
         Ok(ProviderWrapperRequestV1 {
             schema_version: 1,
             operation,
             provider_id: stored.provider_id,
             adapter_id: stored.adapter_id,
             delivery_fence,
+            cmux_endpoint,
+            protected_route: profile.protected_resume_route(fence.payload_digest.clone()),
             resume_expectation: FreshResumeExpectationV1 {
                 workstream_handle: stored.resume.workstream_handle,
                 context_url: stored.resume.context_url,
