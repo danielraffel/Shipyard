@@ -1,9 +1,12 @@
+#[cfg(unix)]
 use std::process::{Child, Command};
 
 use super::*;
+#[cfg(unix)]
+use crate::parallel_proof_canary_job::launch_canary_job;
 use crate::parallel_proof_canary_job::{
     ApprovedCanaryOperation, CanaryCancellationPolicy, CanaryJobOwner, CanaryLogPolicy,
-    CanarySuccessPredicate, CanaryWakePredicate, launch_canary_job,
+    CanarySuccessPredicate, CanaryWakePredicate,
 };
 
 fn digest(value: &str) -> Sha256Digest {
@@ -177,6 +180,33 @@ fn capability_is_exact_and_default_off() {
     assert!(daemon_supports_canary_jobs(&serde_json::json!({
         "capabilities": [DAEMON_CANARY_JOB_CAPABILITY]
     })));
+}
+
+#[cfg(windows)]
+#[test]
+fn production_supervisor_refuses_launch_without_unix_process_custody() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = std::env::current_exe().unwrap();
+    let binary_sha256 = executable_digest(&binary).unwrap();
+    let job = job(binary_sha256.clone());
+    let request = CanarySupervisedLaunch {
+        job: job.clone(),
+        job_sha256: job.digest().unwrap(),
+        launch_nonce_sha256: digest("windows-refusal"),
+        claimed_at_ms: 2,
+    };
+    let mut supervisor = ShipyardCanaryProcessSupervisor::new(
+        binary,
+        RuntimeMode::Isolated,
+        temp.path().join("global"),
+        temp.path().join("state"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        supervisor.launch_typed_worker(&request),
+        Err("canary worker custody requires Unix process birth and group identity".to_owned())
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(unix)]
 #[test]
 fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     let codex = request("codex", ProviderWrapperOperationV1::Submit);
@@ -61,6 +62,20 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
         launch_command(&claude, Path::new(&claude.protected_route.argv[0]), false).unwrap();
     assert!(claude_body.contains("exec '/opt/subrouter' 'claude' '--model' 'fable'"));
     assert!(!claude_body.contains("cmux-claude-wrapper"));
+}
+
+#[cfg(windows)]
+#[test]
+fn production_subrouter_launch_refuses_without_unix_custody() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    assert_eq!(
+        verify_subrouter_executable(&request),
+        Err("subrouter-executable-verification-unavailable")
+    );
+    assert_eq!(
+        prepare_private_launch(&request, true).map(|_| ()),
+        Err("private-launch-unavailable")
+    );
 }
 
 #[test]

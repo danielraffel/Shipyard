@@ -1,13 +1,16 @@
 #[cfg(unix)]
 use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
 use super::HashWriter;
 use crate::provider_wrapper::{ProviderDeliveryTargetV1, ProviderWrapperRequestV1};
 
@@ -249,6 +252,28 @@ pub(super) fn prepare_private_launch(
     _: bool,
 ) -> Result<PrivateLaunch, &'static str> {
     Err("private-launch-unavailable")
+}
+
+#[cfg(all(test, not(unix)))]
+pub(super) fn prepare_test_launch(
+    request: &ProviderWrapperRequestV1,
+) -> Result<PrivateLaunch, &'static str> {
+    // FakeRunner reads and consumes this capsule without spawning a shell. It
+    // keeps platform-neutral adapter tests separate from the production
+    // Windows path, whose refusal is covered by a dedicated regression.
+    let directory = tempfile::Builder::new()
+        .prefix(".shipyard-workstream-route-test-")
+        .tempdir()
+        .map_err(|_| "private-launch-directory-unavailable")?;
+    let directory_path = directory.keep();
+    let route_path = directory_path.join("launch.sh");
+    let body = launch_command(request, Path::new(&request.protected_route.argv[0]), false)?;
+    std::fs::write(&route_path, body).map_err(|_| "private-launch-file-unwritable")?;
+    Ok(PrivateLaunch {
+        command: format!("'/bin/sh' '{}'", route_path.display()),
+        route_path,
+        executable_path: directory_path.join("subrouter"),
+    })
 }
 
 #[cfg(unix)]

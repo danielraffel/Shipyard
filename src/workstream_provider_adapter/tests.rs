@@ -3,7 +3,9 @@
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use super::terminal_transport::CommandResult;
 use super::*;
@@ -11,6 +13,7 @@ use crate::provider_wrapper::{
     CmuxEndpointV1, FreshResumeExpectationV1, ProtectedProviderRouteV1, ProviderDeliveryFenceV1,
     ProviderLaunchOptionsV1, ProviderReasoningEffortV1, TerminalEndpointV1,
 };
+#[cfg(unix)]
 use crate::work_ledger::{
     DeliveryAuthorization, DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
     FreshAgentResumeExpectation, ProviderAdapter, ProviderAuthorizationOperation,
@@ -107,7 +110,14 @@ impl ProviderLaunchAuthority for FakeProviderLaunchAuthority {
         request: &ProviderWrapperRequestV1,
     ) -> Result<PrivateLaunch, &'static str> {
         self.prepare_calls += 1;
-        prepare_private_launch(request, false)
+        #[cfg(unix)]
+        {
+            prepare_private_launch(request, false)
+        }
+        #[cfg(not(unix))]
+        {
+            provider_launch::prepare_test_launch(request)
+        }
     }
 }
 

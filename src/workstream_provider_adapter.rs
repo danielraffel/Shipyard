@@ -122,12 +122,14 @@ impl Write for HashWriter<'_> {
 mod provider_launch;
 mod terminal_transport;
 
+#[cfg(all(test, unix))]
+use provider_launch::launch_command;
 use provider_launch::{
     PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE, PrivateLaunch, ProductionSubrouterLaunchAuthority,
     ProviderLaunchAuthority, delivery_prompt,
 };
 #[cfg(test)]
-use provider_launch::{launch_command, prepare_private_launch, verify_subrouter_executable};
+use provider_launch::{prepare_private_launch, verify_subrouter_executable};
 #[cfg(test)]
 use terminal_transport::verify_cmux_signing_policy;
 use terminal_transport::{ProductionCmuxTransport, RunnerFailure, TerminalTransport};
