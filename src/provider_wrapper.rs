@@ -1946,7 +1946,10 @@ mod tests {
             "pid_t child = fork(); if (child == 0) { sleep(30); return 0; } const char *home = getenv(\"HOME\"); char path[4096]; snprintf(path, sizeof(path), \"%s/child.pid\", home); FILE *file = fopen(path, \"w\"); fprintf(file, \"%d\", child); fclose(file); waitpid(child, 0, 0); return 0;",
         );
         let mut timeout_config = config(&path, sha);
-        timeout_config.deadline_seconds = 5;
+        // The full macOS suite runs thousands of process fixtures in parallel.
+        // Keep this below the child's 30-second sleep while allowing the
+        // wrapper enough scheduler time to publish its descendant receipt.
+        timeout_config.deadline_seconds = 15;
         let environment = ProviderWrapperEnvironment::new([(
             "HOME".into(),
             directory.path().as_os_str().to_owned(),
@@ -1988,7 +1991,7 @@ mod tests {
             "pid_t child = fork(); if (child == 0) { setsid(); const char *home = getenv(\"HOME\"); char path[4096]; snprintf(path, sizeof(path), \"%s/detached.pid\", home); FILE *file = fopen(path, \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; } waitpid(child, 0, 0); return 0;",
         );
         let mut timeout_config = config(&path, sha);
-        timeout_config.deadline_seconds = 5;
+        timeout_config.deadline_seconds = 15;
         let environment = ProviderWrapperEnvironment::new([(
             "HOME".into(),
             directory.path().as_os_str().to_owned(),
