@@ -819,8 +819,7 @@ impl ExecutionSupervisor {
                         defer_until: Some(Utc::now() + Duration::seconds(5)),
                     }],
                 )?;
-                DaemonWorkerCapacity::new(&self.state_dir)
-                    .release(&DaemonWorkerClaim::queue(&job.id, ""))?;
+                DaemonWorkerCapacity::new(&self.state_dir).release_queue_work(&job.id)?;
             }
         }
         Ok(())
@@ -960,8 +959,7 @@ impl ExecutionSupervisor {
 
     fn release_host_pool_leases(&self, job_id: &str) -> Result<(), SupervisorError> {
         HostPoolLeaseStore::new(default_lease_path(&self.state_dir)).release_for_job(job_id)?;
-        DaemonWorkerCapacity::new(&self.state_dir)
-            .release(&DaemonWorkerClaim::queue(job_id, ""))?;
+        DaemonWorkerCapacity::new(&self.state_dir).release_queue_work(job_id)?;
         Ok(())
     }
 

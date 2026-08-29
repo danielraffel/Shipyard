@@ -153,8 +153,20 @@ impl DaemonWorkerCapacity {
     }
 
     pub(crate) fn release(&self, claim: &DaemonWorkerClaim) -> Result<bool, HostPoolLeaseError> {
+        let logical_job_id = claim.lease_job_id();
+        let exact = self.leases.leases()?.into_iter().find(|lease| {
+            lease.pool_name == POOL
+                && lease.member_id == MEMBER
+                && lease.job_id.as_deref() == Some(logical_job_id.as_str())
+                && lease.branch == claim.kind_label()
+                && lease.sha == claim.authority_sha
+        });
+        exact.map_or(Ok(false), |lease| self.leases.release(&lease.lease_id))
+    }
+
+    pub(crate) fn release_queue_work(&self, work_id: &str) -> Result<bool, HostPoolLeaseError> {
         self.leases
-            .release_for_job(&claim.lease_job_id())
+            .release_for_job(&DaemonWorkerClaim::queue(work_id, "").lease_job_id())
             .map(|removed| removed != 0)
     }
 
@@ -226,7 +238,7 @@ impl ExclusiveSandboxLease {
                 if !heartbeat_running.load(Ordering::Acquire) {
                     break;
                 }
-                if heartbeat_capacity.heartbeat_existing(&heartbeat_claim).ok() != Some(true) {
+                if heartbeat_capacity.claim_or_heartbeat(&heartbeat_claim).ok() != Some(true) {
                     break;
                 }
             }
@@ -348,5 +360,18 @@ mod tests {
                 .claim_or_heartbeat(&DaemonWorkerClaim::queue("queued", "sha"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn expired_guard_authority_cannot_release_a_replacement_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let capacity = DaemonWorkerCapacity::with_stale_seconds(temp.path(), 1);
+        let old = DaemonWorkerClaim::exclusive_sandbox("audit", "authority-old");
+        assert!(capacity.claim_or_heartbeat(&old).unwrap());
+        std::thread::sleep(Duration::from_millis(1_100));
+        let replacement = DaemonWorkerClaim::exclusive_sandbox("audit", "authority-new");
+        assert!(capacity.claim_or_heartbeat(&replacement).unwrap());
+        assert!(!capacity.release(&old).unwrap());
+        assert!(capacity.heartbeat_existing(&replacement).unwrap());
     }
 }
