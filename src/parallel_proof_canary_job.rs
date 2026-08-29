@@ -256,6 +256,8 @@ pub struct CanaryProcessTreeIdentity {
     pub tree_id: String,
     /// Adapter-authenticated process birth token.
     pub birth_token: String,
+    /// Digest of the OS process start identity captured after spawn.
+    pub os_start_identity_sha256: Sha256Digest,
     /// Nonce derived from the immutable prepared receipt and supplied at launch.
     pub launch_nonce_sha256: Sha256Digest,
     /// Exact executable digest observed at launch.
@@ -2194,6 +2196,7 @@ mod tests {
             pid: 42,
             tree_id: "pgrp:42".to_owned(),
             birth_token: "birth-1".to_owned(),
+            os_start_identity_sha256: Sha256Digest::of_bytes(b"test-start"),
             launch_nonce_sha256: nonce,
             executable_sha256: worker_executable_sha256.clone(),
             launched_at_ms: 1_100,

@@ -229,6 +229,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 Some(format!("parallel_proof_canary_job config: {error}")),
             ),
         };
+    let mut canary_diagnostic = canary_job_init_error.clone();
     let canary_capabilities = Arc::new(Mutex::new(
         canary_job_runtime.as_ref().map_or_else(Vec::new, |_| {
             vec![crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY.to_owned()]
@@ -332,20 +333,16 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             .tick()
             .err()
             .map(|error| format!("execution_supervisor: {error}"));
-        let canary_error = canary_job_runtime.as_mut().and_then(|runtime| {
-            runtime
-                .tick(u64::try_from(Utc::now().timestamp_millis()).unwrap_or(u64::MAX))
-                .err()
-                .map(|error| format!("parallel_proof_canary_job: {error}"))
-        });
-        if canary_error.is_some()
-            && let Ok(mut capabilities) = canary_capabilities.lock()
-        {
-            capabilities.clear();
+        if let Some(runtime) = canary_job_runtime.as_mut() {
+            let result =
+                runtime.tick(u64::try_from(Utc::now().timestamp_millis()).unwrap_or(u64::MAX));
+            if let Ok(mut capabilities) = canary_capabilities.lock() {
+                update_canary_runtime_health(result, &mut capabilities, &mut canary_diagnostic);
+            }
         }
         if let Ok(mut last_error) = execution_error.lock() {
             *last_error = supervisor_error
-                .or(canary_error)
+                .or_else(|| canary_diagnostic.clone())
                 .or_else(|| canary_job_init_error.clone());
         }
         drain_webhook_events(
@@ -503,6 +500,29 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         .stop()
         .map_err(|error| DaemonRunError::Protocol(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn update_canary_runtime_health(
+    result: Result<crate::parallel_proof_canary_job_adapter::DaemonCanaryTickReport, String>,
+    capabilities: &mut Vec<String>,
+    diagnostic: &mut Option<String>,
+) {
+    match result {
+        Ok(report) if report.ran => {
+            *diagnostic = report
+                .warning
+                .map(|warning| format!("parallel_proof_canary_job warning: {warning}"));
+            *capabilities = vec![
+                crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY.to_owned(),
+            ];
+        }
+        Ok(_) => {}
+        Err(error) => {
+            *diagnostic = Some(format!("parallel_proof_canary_job: {error}"));
+            capabilities.clear();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1981,7 +2001,7 @@ mod tests {
         daemon_tunnel_config, handle_webhook_request, load_or_create_webhook_secret,
         parse_tunnel_enabled, pid_alive, prepare_daemon_temp_dir,
         process_looks_like_shipyard_daemon, reconcile_healed_event, run_blocking, ship_state_map,
-        should_start_reconcile, start_tunnel_runtime, stop_running,
+        should_start_reconcile, start_tunnel_runtime, stop_running, update_canary_runtime_health,
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{read_daemon_ship_state_list, read_daemon_status};
@@ -2180,6 +2200,55 @@ mod tests {
 
         assert_eq!(status.registered_repos, vec!["owner/repo"]);
         assert_eq!(status.configured_repos, vec!["owner/repo", "owner/pending"]);
+    }
+
+    #[test]
+    fn canary_capability_recovers_after_a_later_clean_tick() {
+        let mut capabilities =
+            vec![crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY.to_owned()];
+        let mut diagnostic = None;
+        update_canary_runtime_health(
+            Err("transient store failure".to_owned()),
+            &mut capabilities,
+            &mut diagnostic,
+        );
+        assert!(capabilities.is_empty());
+        assert!(
+            diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("transient store failure")
+        );
+
+        update_canary_runtime_health(
+            Ok(
+                crate::parallel_proof_canary_job_adapter::DaemonCanaryTickReport {
+                    ran: true,
+                    processed_jobs: 1,
+                    warning: Some("one corrupt record was isolated".to_owned()),
+                },
+            ),
+            &mut capabilities,
+            &mut diagnostic,
+        );
+        assert_eq!(
+            capabilities,
+            vec![crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY]
+        );
+        assert!(diagnostic.as_deref().unwrap().contains("corrupt record"));
+
+        update_canary_runtime_health(
+            Ok(
+                crate::parallel_proof_canary_job_adapter::DaemonCanaryTickReport {
+                    ran: true,
+                    processed_jobs: 0,
+                    warning: None,
+                },
+            ),
+            &mut capabilities,
+            &mut diagnostic,
+        );
+        assert!(diagnostic.is_none());
     }
 
     #[cfg(unix)]

@@ -28,6 +28,7 @@ pub const DAEMON_CANARY_JOB_CAPABILITY: &str = "parallel_proof_canary_job_v1";
 const MAX_WORKER_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SUPERVISOR_RECORD_BYTES: usize = 64 * 1024;
 const MAX_DAEMON_CANARY_TICK_INTERVAL_MS: u64 = 1_000;
+const MAX_DAEMON_CANARY_JOBS_PER_TICK: usize = 1;
 
 pub(crate) fn executable_digest(path: &Path) -> Result<Sha256Digest, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
@@ -352,12 +353,14 @@ impl ShipyardCanaryProcessSupervisor {
                     exited_at_ms: completion.completed_at_ms,
                     artifact: completion.artifact,
                 }),
+                WorkerLiveness::IdentityMismatch => Ok(CanaryProcessObservation::IdentityMismatch),
                 WorkerLiveness::Unknown => Err("canary worker liveness is unknown".to_owned()),
             };
         }
         match worker_process_liveness(&receipt) {
             WorkerLiveness::Alive => Ok(CanaryProcessObservation::Alive(process.clone())),
             WorkerLiveness::Dead => Ok(CanaryProcessObservation::Missing),
+            WorkerLiveness::IdentityMismatch => Ok(CanaryProcessObservation::IdentityMismatch),
             WorkerLiveness::Unknown => Err("canary worker liveness is unknown".to_owned()),
         }
     }
@@ -423,10 +426,24 @@ impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
         }
         let mut child = command.spawn().map_err(|error| error.to_string())?;
         let pid = child.id();
+        let os_start_identity_sha256 = match os_process_start_identity(pid) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                let _ = terminate_process_group(pid, Duration::from_secs(1));
+                let _ = child.wait();
+                return Err("canary worker exited before start identity was captured".to_owned());
+            }
+            Err(error) => {
+                let _ = terminate_process_group(pid, Duration::from_secs(1));
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let process = CanaryProcessTreeIdentity {
             pid,
             tree_id: format!("pgrp-{pid}"),
             birth_token: request.launch_nonce_sha256.as_str().to_owned(),
+            os_start_identity_sha256,
             launch_nonce_sha256: request.launch_nonce_sha256.clone(),
             executable_sha256: self.binary_sha256.clone(),
             launched_at_ms: request.claimed_at_ms,
@@ -476,6 +493,17 @@ impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
         if receipt.process != *process {
             return Ok(CanaryCancellationObservation::Missing);
         }
+        match worker_process_liveness(&receipt) {
+            WorkerLiveness::Alive => {}
+            WorkerLiveness::Dead | WorkerLiveness::IdentityMismatch => {
+                return Ok(CanaryCancellationObservation::Missing);
+            }
+            WorkerLiveness::Unknown => {
+                return Err(
+                    "canary worker identity cannot be revalidated for cancellation".to_owned(),
+                );
+            }
+        }
         if terminate_process_group(process.pid, Duration::from_millis(grace_ms))? {
             if let Some(mut child) = self.children.remove(&job.job_id) {
                 let _ = child.wait();
@@ -491,12 +519,19 @@ impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
 enum WorkerLiveness {
     Alive,
     Dead,
+    IdentityMismatch,
     Unknown,
 }
 
 fn worker_process_liveness(receipt: &CanarySupervisorReceipt) -> WorkerLiveness {
     #[cfg(unix)]
     {
+        match os_process_start_identity(receipt.process.pid) {
+            Ok(Some(identity)) if identity == receipt.process.os_start_identity_sha256 => {}
+            Ok(Some(_)) => return WorkerLiveness::IdentityMismatch,
+            Ok(None) => return WorkerLiveness::Dead,
+            Err(_) => return WorkerLiveness::Unknown,
+        }
         let output = Command::new("/bin/ps")
             .args([
                 "-ww",
@@ -530,6 +565,23 @@ fn worker_process_liveness(receipt: &CanarySupervisorReceipt) -> WorkerLiveness 
 }
 
 #[cfg(unix)]
+fn os_process_start_identity(pid: u32) -> Result<Option<Sha256Digest>, String> {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| error.to_string())?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if output.status.success() && !value.is_empty() {
+        Ok(Some(Sha256Digest::of_bytes(value.as_bytes())))
+    } else if !output.status.success() && output.stderr.is_empty() {
+        Ok(None)
+    } else {
+        Err("canary worker OS start identity is unavailable".to_owned())
+    }
+}
+
+#[cfg(unix)]
 fn terminate_process_group(pid: u32, grace: Duration) -> Result<bool, String> {
     let _ = grace;
     crate::execution_supervisor::terminate_detached_worker_tree(pid)
@@ -558,6 +610,8 @@ pub(crate) fn verify_worker_authority(
                 && receipt.generation == generation
                 && receipt.process.pid == std::process::id()
                 && receipt.process.birth_token == generation
+                && os_process_start_identity(std::process::id())?
+                    == Some(receipt.process.os_start_identity_sha256.clone())
             {
                 return Ok(receipt.process);
             }
@@ -591,6 +645,14 @@ pub(crate) struct DaemonCanaryJobRuntime {
     store: crate::parallel_proof_canary_job::CanaryJobStore,
     backend: DaemonCanaryJobBackend<ShipyardCanaryProcessSupervisor>,
     next_tick_at_ms: u64,
+    next_job_after: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DaemonCanaryTickReport {
+    pub(crate) ran: bool,
+    pub(crate) processed_jobs: usize,
+    pub(crate) warning: Option<String>,
 }
 
 impl DaemonCanaryJobRuntime {
@@ -622,12 +684,13 @@ impl DaemonCanaryJobRuntime {
             store,
             backend: DaemonCanaryJobBackend::new(supervisor),
             next_tick_at_ms: 0,
+            next_job_after: None,
         }))
     }
 
-    pub(crate) fn tick(&mut self, now_ms: u64) -> Result<(), String> {
+    pub(crate) fn tick(&mut self, now_ms: u64) -> Result<DaemonCanaryTickReport, String> {
         if now_ms < self.next_tick_at_ms {
-            return Ok(());
+            return Ok(DaemonCanaryTickReport::default());
         }
         self.next_tick_at_ms = now_ms.saturating_add(MAX_DAEMON_CANARY_TICK_INTERVAL_MS);
         let mut first_error = None;
@@ -639,7 +702,14 @@ impl DaemonCanaryJobRuntime {
         for error in scan_errors {
             first_error.get_or_insert(error);
         }
-        for job_id in pending_job_ids {
+        let selected_job_ids = bounded_job_batch(
+            &pending_job_ids,
+            self.next_job_after.as_deref(),
+            MAX_DAEMON_CANARY_JOBS_PER_TICK,
+        );
+        let processed_jobs = selected_job_ids.len();
+        for job_id in selected_job_ids {
+            self.next_job_after = Some(job_id.clone());
             let snapshot = match self.store.load(&job_id) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
@@ -698,8 +768,24 @@ impl DaemonCanaryJobRuntime {
             }
         }
         self.next_tick_at_ms = now_ms.saturating_add(next_interval_ms);
-        first_error.map_or(Ok(()), Err)
+        Ok(DaemonCanaryTickReport {
+            ran: true,
+            processed_jobs,
+            warning: first_error,
+        })
     }
+}
+
+fn bounded_job_batch(job_ids: &[String], after: Option<&str>, limit: usize) -> Vec<String> {
+    if job_ids.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let start = after.map_or(0, |cursor| {
+        job_ids.partition_point(|job_id| job_id.as_str() <= cursor) % job_ids.len()
+    });
+    (0..job_ids.len().min(limit))
+        .map(|offset| job_ids[(start + offset) % job_ids.len()].clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -792,6 +878,7 @@ mod tests {
                 pid,
                 tree_id: format!("pgrp-{pid}"),
                 birth_token: format!("test-{pid}"),
+                os_start_identity_sha256: digest("test-start"),
                 launch_nonce_sha256: request.launch_nonce_sha256.clone(),
                 executable_sha256: self.executable_sha256.clone(),
                 launched_at_ms: request.claimed_at_ms,
@@ -881,6 +968,64 @@ mod tests {
         assert!(daemon_supports_canary_jobs(&serde_json::json!({
             "capabilities": [DAEMON_CANARY_JOB_CAPABILITY]
         })));
+    }
+
+    #[test]
+    fn bounded_batches_rotate_fairly_across_backlog() {
+        let jobs = (0..5)
+            .map(|index| format!("job-{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(bounded_job_batch(&jobs, None, 1), vec!["job-0"]);
+        assert_eq!(bounded_job_batch(&jobs, Some("job-0"), 1), vec!["job-1"]);
+        assert_eq!(bounded_job_batch(&jobs, Some("job-4"), 1), vec!["job-0"]);
+        assert!(bounded_job_batch(&jobs, None, 0).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_refuses_mismatched_os_start_identity_without_signalling() {
+        let _guard = crate::test_support::PROCESS_TREE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let binary = PathBuf::from("/bin/sleep");
+        let binary_sha256 = executable_digest(&binary).unwrap();
+        let job = job(binary_sha256.clone());
+        let nonce = digest("pid-reuse-negative-control");
+        let mut child = Command::new(&binary).arg("30").spawn().unwrap();
+        let pid = child.id();
+        let process = CanaryProcessTreeIdentity {
+            pid,
+            tree_id: format!("pgrp-{pid}"),
+            birth_token: nonce.as_str().to_owned(),
+            os_start_identity_sha256: digest("different-process-start"),
+            launch_nonce_sha256: nonce.clone(),
+            executable_sha256: binary_sha256,
+            launched_at_ms: 2,
+        };
+        let mut supervisor = ShipyardCanaryProcessSupervisor::new(
+            binary,
+            RuntimeMode::Isolated,
+            temp.path().join("global"),
+            temp.path().join("state"),
+        )
+        .unwrap();
+        supervisor
+            .store
+            .put_receipt(&CanarySupervisorReceipt {
+                job_id: job.job_id.clone(),
+                generation: nonce.as_str().to_owned(),
+                process: process.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            supervisor.cancel_typed_worker(&job, &process, 100).unwrap(),
+            CanaryCancellationObservation::Missing
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]
