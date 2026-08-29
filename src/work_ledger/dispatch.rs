@@ -177,10 +177,24 @@ pub(crate) enum ProviderAuthorizationOperation {
 /// Typed provider outcome. Digests refer to protected receipts or diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderOutcome {
-    Delivered { receipt: Vec<u8> },
-    Retryable { evidence: Vec<u8> },
-    Uncertain { evidence: Vec<u8> },
-    Rejected { evidence: Vec<u8> },
+    Delivered {
+        receipt: Vec<u8>,
+    },
+    /// Definitive reconciliation proof that the fenced idempotency key did
+    /// not create a provider-side agent. This is the only reconciliation
+    /// outcome allowed to make a fresh submit attempt eligible.
+    NotDelivered {
+        evidence: Vec<u8>,
+    },
+    Retryable {
+        evidence: Vec<u8>,
+    },
+    Uncertain {
+        evidence: Vec<u8>,
+    },
+    Rejected {
+        evidence: Vec<u8>,
+    },
 }
 
 /// Machine-local adapter. `reconcile` inspects an already-claimed idempotency key;
@@ -241,13 +255,21 @@ fn classify_provider_outcome(
         ProviderOutcome::Delivered { receipt } => {
             ("delivered", WakeDeliveryResult::Delivered, receipt, None)
         }
+        ProviderOutcome::NotDelivered { evidence } if attempt >= MAX_PROVIDER_DELIVERY_ATTEMPTS => {
+            (
+                "failed",
+                WakeDeliveryResult::Failed,
+                evidence,
+                Some("provider_not_delivered_retry_exhausted"),
+            )
+        }
         ProviderOutcome::Retryable { evidence } if attempt >= MAX_PROVIDER_DELIVERY_ATTEMPTS => (
             "failed",
             WakeDeliveryResult::Failed,
             evidence,
             Some("provider_retry_exhausted"),
         ),
-        ProviderOutcome::Retryable { evidence } => {
+        ProviderOutcome::NotDelivered { evidence } | ProviderOutcome::Retryable { evidence } => {
             ("retry", WakeDeliveryResult::Retrying, evidence, None)
         }
         ProviderOutcome::Uncertain { evidence } => {
@@ -260,6 +282,28 @@ fn classify_provider_outcome(
             Some(rejection_event),
         ),
     }
+}
+
+/// Reconciliation is evidence collection, never a second submit path. A
+/// retryable transport answer does not prove that the original idempotency key
+/// was not accepted, so it remains uncertain. Only exact not-delivered proof
+/// may make a fresh submit attempt eligible.
+fn reconcile_outcome_without_redispatch(outcome: ProviderOutcome) -> ProviderOutcome {
+    match outcome {
+        ProviderOutcome::Retryable { evidence } => ProviderOutcome::Uncertain { evidence },
+        other => other,
+    }
+}
+
+fn reconciliation_authorization_failure(outcome: ProviderOutcome) -> ProviderOutcome {
+    let evidence = match outcome {
+        ProviderOutcome::Delivered { receipt } => receipt,
+        ProviderOutcome::NotDelivered { evidence }
+        | ProviderOutcome::Retryable { evidence }
+        | ProviderOutcome::Uncertain { evidence }
+        | ProviderOutcome::Rejected { evidence } => evidence,
+    };
+    ProviderOutcome::Uncertain { evidence }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -493,10 +537,39 @@ impl WorkLedger {
     {
         validate_consumer_policy(&policy)?;
         let consumer = acquire_consumer_lease(&self.path)?;
-        let Some(wake) = self.next_wake(&policy)? else {
+        let wakes = self.next_wakes(&policy)?;
+        if wakes.is_empty() {
             return Ok(WakeDeliveryResult::Empty);
-        };
-        let profile = resolver.resolve(&wake)?;
+        }
+        let mut first_repository_error = None;
+        for wake in wakes {
+            match self.consume_selected_wake(&wake, resolver, adapter, &consumer) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    // All external adapter outcomes are typed and finalized in
+                    // `consume_selected_wake`; an error return therefore means
+                    // this repository refused before provider I/O. Preserve its
+                    // state for repair without starving another repository.
+                    first_repository_error.get_or_insert(error);
+                }
+            }
+        }
+        Err(first_repository_error.expect("nonempty wake selection has an error"))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn consume_selected_wake<R, A>(
+        &self,
+        wake: &WakeEnvelope,
+        resolver: &mut R,
+        adapter: &mut A,
+        consumer: &ConsumerLease,
+    ) -> WorkLedgerResult<WakeDeliveryResult>
+    where
+        R: WakeProfileResolver,
+        A: ProviderAdapter,
+    {
+        let profile = resolver.resolve(wake)?;
         let profile_digest = profile.profile_digest()?;
         if profile_digest != wake.payload_digest {
             return Err(WorkLedgerError::Refused(
@@ -506,32 +579,32 @@ impl WorkLedger {
         let profile_ref = profile.route_profile_ref()?;
         if !profile.permits_fresh_agent() {
             return self.fail_without_launch(
-                &wake,
+                wake,
                 profile.provider_id(),
                 profile.provider_id(),
                 &profile_ref,
-                &consumer,
+                consumer,
                 b"fresh-agent recovery is not authorized by the launch profile",
             );
         }
         let Some(capability) = adapter.capability(profile.provider_id()) else {
             return self.fail_without_launch(
-                &wake,
+                wake,
                 profile.provider_id(),
                 profile.provider_id(),
                 &profile_ref,
-                &consumer,
+                consumer,
                 b"provider adapter capability is unavailable",
             );
         };
         validate_token("provider adapter ID", &capability.adapter_id)?;
         if !capability.fresh_agent_launch {
             return self.fail_without_launch(
-                &wake,
+                wake,
                 &capability.adapter_id,
                 profile.provider_id(),
                 &profile_ref,
-                &consumer,
+                consumer,
                 b"provider adapter lacks fresh-agent capability",
             );
         }
@@ -561,14 +634,15 @@ impl WorkLedger {
             &profile_bytes,
         )?;
 
-        let (claim_fence, recovered_claim, claim_idempotent) = self.claim_wake(
-            &wake,
-            &capability,
-            &profile_ref,
-            profile.provider_id(),
-            &consumer,
-        )?;
-        let fence = self.prepare_delivery(
+        let (claim_fence, _recovered_claim, claim_idempotent, legacy_unwitnessed) = self
+            .claim_wake(
+                wake,
+                &capability,
+                &profile_ref,
+                profile.provider_id(),
+                consumer,
+            )?;
+        let (fence, delivery_was_launched) = self.prepare_delivery(
             claim_fence,
             &capability,
             profile.provider_id(),
@@ -576,14 +650,26 @@ impl WorkLedger {
             resume,
             &profile_object.object_ref,
         )?;
-        let outcome = if recovered_claim {
+        let outcome = if legacy_unwitnessed {
+            ProviderOutcome::Uncertain {
+                evidence: format!(
+                    "legacy claimed wake lacks durable pre-launch witness\n{}",
+                    fence.wake_id
+                )
+                .into_bytes(),
+            }
+        } else if delivery_was_launched {
             if claim_idempotent {
-                let authority =
-                    match adapter.authorize(&fence, ProviderAuthorizationOperation::Reconcile) {
-                        Ok(authority) => authority,
-                        Err(outcome) => return self.finalize_wake(&fence, outcome),
-                    };
-                adapter.reconcile(&fence, authority)
+                let authority = match adapter
+                    .authorize(&fence, ProviderAuthorizationOperation::Reconcile)
+                {
+                    Ok(authority) => authority,
+                    Err(outcome) => {
+                        return self
+                            .finalize_wake(&fence, reconciliation_authorization_failure(outcome));
+                    }
+                };
+                reconcile_outcome_without_redispatch(adapter.reconcile(&fence, authority))
             } else {
                 ProviderOutcome::Uncertain {
                     evidence: format!(
@@ -675,9 +761,14 @@ impl WorkLedger {
         }
         let authority = match adapter.authorize(&fence, ProviderAuthorizationOperation::Reconcile) {
             Ok(authority) => authority,
-            Err(outcome) => return self.finalize_uncertain_wake(&fence, outcome),
+            Err(outcome) => {
+                return self.finalize_uncertain_wake(
+                    &fence,
+                    reconciliation_authorization_failure(outcome),
+                );
+            }
         };
-        let outcome = adapter.reconcile(&fence, authority);
+        let outcome = reconcile_outcome_without_redispatch(adapter.reconcile(&fence, authority));
         self.finalize_uncertain_wake(&fence, outcome)
     }
 
@@ -728,6 +819,42 @@ impl WorkLedger {
     ) -> WorkLedgerResult<bool> {
         validate_consumer_policy(policy)?;
         self.next_wake(policy).map(|wake| wake.is_some())
+    }
+
+    /// Whether an exact uncertain delivery exists for this repository
+    /// allowlist, including one whose automatic reconciliation budget is
+    /// exhausted. This is status evidence only; it never authorizes I/O.
+    pub(crate) fn has_authorized_unresolved_uncertain_wake(
+        &self,
+        policy: &WakeConsumerPolicy,
+    ) -> WorkLedgerResult<bool> {
+        validate_consumer_policy(policy)?;
+        let connection = self.connect_read_only()?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let placeholders = std::iter::repeat_n("?", policy.authorized_repositories.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM outbox wake
+                   JOIN work_items work ON work.id = wake.work_item_id
+                   JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+                  WHERE wake.state = 'uncertain' AND delivery.state = 'uncertain'
+                    AND work.phase = 'dispatching'
+                    AND work.work_generation = wake.work_generation
+                    AND work.owner_generation = wake.owner_generation
+                    AND lower(work.repo) IN ({placeholders})
+             )"
+        );
+        connection
+            .query_row(
+                &sql,
+                params_from_iter(policy.authorized_repositories.iter()),
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     fn uncertain_fence(&self, wake_id: &str) -> WorkLedgerResult<(DeliveryFence, String)> {
@@ -897,6 +1024,18 @@ impl WorkLedger {
     }
 
     fn next_wake(&self, policy: &WakeConsumerPolicy) -> WorkLedgerResult<Option<WakeEnvelope>> {
+        self.next_wakes(policy).map(|mut wakes| {
+            if wakes.is_empty() {
+                None
+            } else {
+                Some(wakes.remove(0))
+            }
+        })
+    }
+
+    /// Select the oldest claimed-or-pending wake for each authorized
+    /// repository so one malformed item cannot starve healthy repositories.
+    fn next_wakes(&self, policy: &WakeConsumerPolicy) -> WorkLedgerResult<Vec<WakeEnvelope>> {
         let connection = self.connect_read_only()?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
@@ -912,27 +1051,33 @@ impl WorkLedger {
              WHERE wake.state IN ('claimed', 'pending')
                AND lower(work.repo) IN ({placeholders})
              ORDER BY CASE wake.state WHEN 'claimed' THEN 0 ELSE 1 END,
-                      wake.created_at, wake.wake_id LIMIT 1"
+                      wake.created_at, wake.wake_id"
         );
-        connection
-            .query_row(
-                &sql,
-                params_from_iter(policy.authorized_repositories.iter()),
-                |row| {
-                    Ok(WakeEnvelope {
-                        wake_id: row.get(0)?,
-                        work_item_id: row.get(1)?,
-                        work_generation: row.get(2)?,
-                        owner_generation: row.get(3)?,
-                        route_ref: row.get(4)?,
-                        payload_digest: row.get(5)?,
-                        state: row.get(6)?,
-                        repository: row.get(7)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter(policy.authorized_repositories.iter()),
+            |row| {
+                Ok(WakeEnvelope {
+                    wake_id: row.get(0)?,
+                    work_item_id: row.get(1)?,
+                    work_generation: row.get(2)?,
+                    owner_generation: row.get(3)?,
+                    route_ref: row.get(4)?,
+                    payload_digest: row.get(5)?,
+                    state: row.get(6)?,
+                    repository: row.get(7)?,
+                })
+            },
+        )?;
+        let mut repositories = BTreeSet::new();
+        let mut wakes = Vec::new();
+        for row in rows {
+            let wake = row?;
+            if repositories.insert(wake.repository.clone()) {
+                wakes.push(wake);
+            }
+        }
+        Ok(wakes)
     }
 
     fn fail_without_launch(
@@ -950,13 +1095,14 @@ impl WorkLedger {
             fresh_agent_launch: false,
             idempotent_launch: false,
         };
-        let (fence, _, _) =
+        let (fence, _, _, _) =
             self.claim_wake(wake, &capability, profile_ref, provider_kind, consumer)?;
         self.finalize_without_delivery(&fence, evidence)
     }
 
-    /// Return `(fence, recovered_claim, claim_idempotent)`. `recovered_claim`
-    /// is true when the selected wake was already claimed before this tick.
+    /// Return the fence plus restart witnesses. `legacy_unwitnessed` means a
+    /// migrated claimed wake had no durable attempt proving whether provider
+    /// I/O began; it must remain uncertain even if a request can be rebuilt.
     fn claim_wake(
         &self,
         wake: &WakeEnvelope,
@@ -964,7 +1110,7 @@ impl WorkLedger {
         profile_ref: &str,
         provider_kind: &str,
         consumer: &ConsumerLease,
-    ) -> WorkLedgerResult<(DeliveryFence, bool, bool)> {
+    ) -> WorkLedgerResult<(DeliveryFence, bool, bool, bool)> {
         let parent = self
             .path
             .parent()
@@ -987,7 +1133,7 @@ impl WorkLedger {
                 "wake launch profile binding changed before claim".to_owned(),
             ));
         }
-        let (attempt, claim_idempotent, consumer_epoch) = claim_attempt(
+        let (attempt, claim_idempotent, consumer_epoch, legacy_unwitnessed) = claim_attempt(
             &transaction,
             wake,
             capability,
@@ -1016,6 +1162,7 @@ impl WorkLedger {
             },
             recovered_claim,
             claim_idempotent,
+            legacy_unwitnessed,
         ))
     }
 
@@ -1032,7 +1179,7 @@ impl WorkLedger {
         launch_options: FreshAgentProviderLaunchOptions,
         resume: StoredResumeExpectation,
         profile_object_ref: &str,
-    ) -> WorkLedgerResult<DeliveryFence> {
+    ) -> WorkLedgerResult<(DeliveryFence, bool)> {
         let activation_id = opaque_ref(
             "ae",
             &format!(
@@ -1180,6 +1327,9 @@ impl WorkLedger {
                 },
             )
             .optional()?;
+        let delivery_was_launched = existing_delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.7 == "launched");
         match existing_delivery {
             None => {
                 transaction.execute(
@@ -1231,7 +1381,7 @@ impl WorkLedger {
         fence.adapter_id.clone_from(&capability.adapter_id);
         provider_id.clone_into(&mut fence.provider_id);
         fence.idempotency_key = idempotency_key;
-        Ok(fence)
+        Ok((fence, delivery_was_launched))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1635,7 +1785,7 @@ fn claim_attempt(
     capability: &ProviderCapability,
     recovered_claim: bool,
     consumer_owner_ref: &str,
-) -> WorkLedgerResult<(u64, bool, u64)> {
+) -> WorkLedgerResult<(u64, bool, u64, bool)> {
     let existing: Option<(u64, String, bool)> = transaction
         .query_row(
             "SELECT attempt, adapter_id, idempotent FROM wake_attempts
@@ -1661,7 +1811,7 @@ fn claim_attempt(
             consumer_owner_ref,
             "recovery",
         )?;
-        return Ok((attempt, idempotent, epoch));
+        return Ok((attempt, idempotent, epoch, false));
     }
 
     let attempt: u64 = transaction.query_row(
@@ -1703,7 +1853,7 @@ fn claim_attempt(
         consumer_owner_ref,
         "claim",
     )?;
-    Ok((attempt, claim_idempotent, epoch))
+    Ok((attempt, claim_idempotent, epoch, recovered_claim))
 }
 
 fn record_claim_epoch(

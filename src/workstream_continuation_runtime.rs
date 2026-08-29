@@ -30,7 +30,7 @@ pub enum ContinuationRuntimeState {
     Disabled,
     Refused,
     ProviderUnavailable,
-    Idle,
+    Ready,
     InFlight,
     Delivered,
     Retrying,
@@ -105,6 +105,12 @@ pub(crate) trait ContinuationExecutor: Send {
         config: &WorkstreamContinuationConfig,
     ) -> Result<bool, ContinuationTickError>;
 
+    fn has_unresolved_uncertain(
+        &self,
+        state_dir: &Path,
+        config: &WorkstreamContinuationConfig,
+    ) -> Result<bool, ContinuationTickError>;
+
     fn execute(
         &mut self,
         state_dir: &Path,
@@ -143,6 +149,19 @@ impl ContinuationExecutor for WorkLedgerContinuationExecutor {
         };
         ledger
             .has_authorized_pending_wake(&consumer_policy(config))
+            .map_err(|_| ContinuationTickError("ledger_status_refused"))
+    }
+
+    fn has_unresolved_uncertain(
+        &self,
+        state_dir: &Path,
+        config: &WorkstreamContinuationConfig,
+    ) -> Result<bool, ContinuationTickError> {
+        let Some(ledger) = open_ledger(state_dir)? else {
+            return Ok(false);
+        };
+        ledger
+            .has_authorized_unresolved_uncertain_wake(&consumer_policy(config))
             .map_err(|_| ContinuationTickError("ledger_status_refused"))
     }
 
@@ -283,8 +302,13 @@ impl WorkLedgerProviderAdapter<'_> {
             },
             Ok(ProviderWrapperRunResult::Rejected {
                 response_receipt, ..
-            }) => ProviderOutcome::Rejected {
-                evidence: response_receipt.canonical_bytes,
+            }) => match operation {
+                ProviderWrapperOperationV1::Submit => ProviderOutcome::Rejected {
+                    evidence: response_receipt.canonical_bytes,
+                },
+                ProviderWrapperOperationV1::Reconcile => ProviderOutcome::NotDelivered {
+                    evidence: response_receipt.canonical_bytes,
+                },
             },
             Ok(ProviderWrapperRunResult::Uncertain {
                 response_receipt, ..
@@ -498,10 +522,23 @@ impl WorkstreamContinuationRuntime {
             Ok(Some(wake_id)) => ContinuationAction::ReconcileUncertain(wake_id),
             Ok(None) => match executor.has_pending(&self.state_dir, &config) {
                 Ok(true) => ContinuationAction::ConsumePending,
-                Ok(false) => {
-                    self.set_status(ContinuationRuntimeState::Idle, None);
-                    return;
-                }
+                Ok(false) => match executor.has_unresolved_uncertain(&self.state_dir, &config) {
+                    Ok(true) => {
+                        self.set_status(
+                            ContinuationRuntimeState::Uncertain,
+                            Some("reconciliation_budget_exhausted"),
+                        );
+                        return;
+                    }
+                    Ok(false) => {
+                        self.set_status(ContinuationRuntimeState::Ready, None);
+                        return;
+                    }
+                    Err(error) => {
+                        self.set_status(ContinuationRuntimeState::Error, Some(error.0));
+                        return;
+                    }
+                },
                 Err(error) => {
                     self.set_status(ContinuationRuntimeState::Error, Some(error.0));
                     return;
@@ -566,7 +603,7 @@ impl WorkstreamContinuationRuntime {
         self.executor = Some(message.executor);
         match message.result {
             Ok(ContinuationTickResult::Empty) => {
-                self.set_status(ContinuationRuntimeState::Idle, None);
+                self.set_status(ContinuationRuntimeState::Ready, None);
             }
             Ok(ContinuationTickResult::Delivered) => {
                 self.set_status(ContinuationRuntimeState::Delivered, None);
@@ -637,6 +674,7 @@ mod tests {
         executions: Arc<AtomicUsize>,
         uncertain: Option<String>,
         pending: bool,
+        unresolved_uncertain: bool,
         block: Option<Arc<AtomicBool>>,
         observed: Arc<Mutex<Vec<ContinuationAction>>>,
         result: ContinuationTickResult,
@@ -659,6 +697,15 @@ mod tests {
         ) -> Result<bool, ContinuationTickError> {
             self.selections.fetch_add(1, Ordering::SeqCst);
             Ok(self.pending)
+        }
+
+        fn has_unresolved_uncertain(
+            &self,
+            _state_dir: &Path,
+            _config: &WorkstreamContinuationConfig,
+        ) -> Result<bool, ContinuationTickError> {
+            self.selections.fetch_add(1, Ordering::SeqCst);
+            Ok(self.unresolved_uncertain)
         }
 
         fn execute(
@@ -724,6 +771,7 @@ mod tests {
                 executions: Arc::clone(&executions),
                 uncertain,
                 pending,
+                unresolved_uncertain: false,
                 block,
                 observed: Arc::clone(&observed),
                 result: ContinuationTickResult::Delivered,
@@ -764,6 +812,48 @@ mod tests {
         );
         runtime.tick();
         assert_eq!(runtime.status().state, ContinuationRuntimeState::Disabled);
+    }
+
+    #[test]
+    fn enabled_empty_controller_reports_ready_not_disabled_or_in_flight() {
+        let (mut runtime, selections, executions, _) = runtime(vec![ready()], None, None);
+        runtime.tick();
+        assert_eq!(runtime.status().state, ContinuationRuntimeState::Ready);
+        assert_eq!(runtime.status().reason_code, None);
+        assert_eq!(selections.load(Ordering::SeqCst), 3);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            serde_json::to_value(runtime.status()).expect("status JSON")["state"],
+            "ready"
+        );
+    }
+
+    #[test]
+    fn exhausted_uncertainty_is_truthful_and_does_not_execute() {
+        let selections = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut runtime = WorkstreamContinuationRuntime::new(
+            PathBuf::from("/unused"),
+            Box::new(SequenceActivation(Mutex::new(vec![ready()].into()))),
+            Box::new(RecordingExecutor {
+                selections: Arc::clone(&selections),
+                executions: Arc::clone(&executions),
+                uncertain: None,
+                pending: false,
+                unresolved_uncertain: true,
+                block: None,
+                observed: Arc::new(Mutex::new(Vec::new())),
+                result: ContinuationTickResult::Delivered,
+            }),
+        );
+        runtime.tick();
+        assert_eq!(runtime.status().state, ContinuationRuntimeState::Uncertain);
+        assert_eq!(
+            runtime.status().reason_code.as_deref(),
+            Some("reconciliation_budget_exhausted")
+        );
+        assert_eq!(selections.load(Ordering::SeqCst), 3);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -848,6 +938,7 @@ mod tests {
                 executions: Arc::clone(&executions),
                 uncertain: None,
                 pending: true,
+                unresolved_uncertain: false,
                 block: None,
                 observed: Arc::clone(&observed),
                 result: ContinuationTickResult::Retrying,
@@ -880,6 +971,7 @@ mod tests {
                 executions: Arc::clone(&executions),
                 uncertain: Some("wake:redacted".to_owned()),
                 pending: false,
+                unresolved_uncertain: true,
                 block: None,
                 observed: Arc::clone(&observed),
                 result: ContinuationTickResult::Uncertain,
