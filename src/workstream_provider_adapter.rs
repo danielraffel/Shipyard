@@ -40,6 +40,10 @@ const CODESIGN: &str = "/usr/bin/codesign";
 #[cfg(target_os = "macos")]
 const MANAFLOW_TEAM_ID: &str = "7WLXT3NR37";
 const COMMAND_DEADLINE: Duration = Duration::from_secs(15);
+#[cfg(not(test))]
+const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_millis(50);
 
 /// Read one strict request from stdin and emit exactly one strict response.
 pub fn run_stdio() -> Result<(), String> {
@@ -284,13 +288,17 @@ fn handle_request(
         return response(request, uncertain("reconcile-visibility-not-yet-proven"));
     }
 
-    let (args, _private_launch) = match create_args(request, &description) {
+    let (args, private_launch) = match create_args(request, &description) {
         Ok(prepared) => prepared,
         Err(code) => return response(request, rejected(code)),
     };
     // cmux creates the workspace before it sends `--command` to the surface.
     // From this invocation onward every failure is an ambiguous acceptance.
-    let created = match runner.run(&args) {
+    let created_result = runner.run(&args);
+    if !private_launch.wait_until_consumed(PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE) {
+        return response(request, uncertain("cmux-private-launch-not-consumed"));
+    }
+    let created = match created_result {
         Ok(result) if result.success => result,
         Ok(_) | Err(_) => return response(request, uncertain("cmux-create-outcome-unknown")),
     };
@@ -446,6 +454,20 @@ impl Drop for PrivateLaunch {
         }
         if let Some(parent) = self.route_path.parent() {
             let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+impl PrivateLaunch {
+    fn wait_until_consumed(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match std::fs::symlink_metadata(&self.route_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) => return false,
+                Ok(_) if Instant::now() >= deadline => return false,
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
         }
     }
 }

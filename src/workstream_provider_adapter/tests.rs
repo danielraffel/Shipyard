@@ -55,15 +55,21 @@ impl CmuxRunner for FakeRunner {
 
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure> {
         self.calls.push(args.to_vec());
+        let result = self
+            .results
+            .pop_front()
+            .expect("test runner must provide one result per call");
         if let Some(index) = args.iter().position(|argument| argument == "--command")
             && let Some(path) = private_launch_path(&args[index + 1])
         {
             self.private_launches
                 .push(std::fs::read_to_string(&path).unwrap());
+            if result.as_ref().is_ok_and(|result| result.success) {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::remove_dir(path.parent().unwrap()).unwrap();
+            }
         }
-        self.results
-            .pop_front()
-            .expect("test runner must provide one result per call")
+        result
     }
 }
 
@@ -688,6 +694,9 @@ fn pre_create_refusal_is_retryable_but_post_create_refusal_is_uncertain() {
         ProviderWrapperOutcomeV1::Uncertain { .. }
     ));
     assert_eq!(create_refusal.calls.len(), 3);
+    let create = &create_refusal.calls[2];
+    let command = &create[create.iter().position(|arg| arg == "--command").unwrap() + 1];
+    assert!(!private_launch_path(command).unwrap().exists());
 }
 
 #[test]
