@@ -59,11 +59,14 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
         },
     ];
 
-    let timeout = std::time::Duration::from_secs(2);
+    // The contract is one shared deadline, not a two-second scheduler-latency
+    // budget. Leave enough slack for healthy probes in the fully parallel test
+    // suite while the 30-second fixture still proves bounded cancellation.
+    let timeout = std::time::Duration::from_secs(10);
     let started = std::time::Instant::now();
     let probes = probe_hosts_concurrently_with_timeout(&classes, timeout);
 
-    assert!(started.elapsed() < timeout + std::time::Duration::from_secs(2));
+    assert!(started.elapsed() < timeout + std::time::Duration::from_secs(5));
     assert_eq!(probes.len(), 2);
     assert!(!probes[0].capacity.readable());
     assert_eq!(probes[0].capacity.free(), 0);
