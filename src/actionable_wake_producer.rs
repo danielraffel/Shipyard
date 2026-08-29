@@ -1,5 +1,6 @@
 //! Singleton daemon bridge from exact shadow evidence to native wake custody.
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -27,8 +28,24 @@ pub(crate) struct ActionableWakeProducerStatus {
     pub(crate) reason_code: Option<String>,
     pub(crate) wake_enqueued: bool,
     pub(crate) model_calls: u64,
+    #[serde(default)]
+    pub(crate) repositories: BTreeMap<String, ActionableRepositoryStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct ActionableRepositoryStatus {
+    pub(crate) state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pull_request: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) head_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason_code: Option<String>,
+    pub(crate) wake_enqueued: bool,
+    pub(crate) updated_at: String,
 }
 
 impl Default for ActionableWakeProducerStatus {
@@ -41,6 +58,7 @@ impl Default for ActionableWakeProducerStatus {
             reason_code: None,
             wake_enqueued: false,
             model_calls: 0,
+            repositories: BTreeMap::new(),
             updated_at: None,
         }
     }
@@ -63,6 +81,69 @@ impl ActionableWakeProducer {
         self.status.clone()
     }
 
+    pub(crate) fn mark_in_flight(
+        &mut self,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+    ) -> ActionableWakeProducerStatus {
+        self.record(
+            repository.to_owned(),
+            pull_request,
+            head_sha.to_owned(),
+            "in_flight",
+            Some("daemon_exact_steward".to_owned()),
+            false,
+        )
+    }
+
+    pub(crate) fn mark_uncertain(
+        &mut self,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+    ) -> ActionableWakeProducerStatus {
+        self.record(
+            repository.to_owned(),
+            pull_request,
+            head_sha.to_owned(),
+            "uncertain",
+            Some("steward_result_uncertain".to_owned()),
+            false,
+        )
+    }
+
+    pub(crate) fn mark_ready(
+        &mut self,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+    ) -> ActionableWakeProducerStatus {
+        self.record(
+            repository.to_owned(),
+            pull_request,
+            head_sha.to_owned(),
+            "ready",
+            Some("steward_cycle_complete".to_owned()),
+            false,
+        )
+    }
+
+    pub(crate) fn mark_disabled(
+        &mut self,
+        repository: &str,
+        reason: &str,
+    ) -> ActionableWakeProducerStatus {
+        self.record(
+            repository.to_owned(),
+            0,
+            String::new(),
+            "disabled",
+            Some(reason.to_owned()),
+            false,
+        )
+    }
+
     /// Reapply terminal stewardship recorded while the daemon was offline.
     /// The daemon calls this before every continuation consumer tick so a
     /// persisted pending wake cannot outrun a durable terminal decision after
@@ -76,7 +157,7 @@ impl ActionableWakeProducer {
                 String::new(),
                 0,
                 String::new(),
-                "error".to_owned(),
+                "error",
                 Some("durable_terminal_reconciliation_unavailable".to_owned()),
                 false,
             );
@@ -98,13 +179,22 @@ impl ActionableWakeProducer {
                         "steward_terminal_reconstructed",
                     );
                 }
+                Ok(crate::app::ExactStewardTransition::Actionable) => {
+                    self.apply(
+                        &repository,
+                        pull_request,
+                        &head_sha,
+                        NativeStewardDisposition::Actionable,
+                        "steward_actionable_reconstructed",
+                    );
+                }
                 Ok(_) => {}
                 Err(_) => {
                     self.record(
                         repository,
                         pull_request,
                         head_sha,
-                        "error".to_owned(),
+                        "error",
                         Some("steward_authority_unavailable".to_owned()),
                         false,
                     );
@@ -139,7 +229,7 @@ impl ActionableWakeProducer {
                     transition.repo.clone(),
                     transition.pr,
                     transition.expected_head_sha.clone(),
-                    "observed".to_owned(),
+                    "observed",
                     Some("fetch_transition".to_owned()),
                     false,
                 ),
@@ -147,7 +237,7 @@ impl ActionableWakeProducer {
                     transition.repo.clone(),
                     transition.pr,
                     transition.expected_head_sha.clone(),
-                    "error".to_owned(),
+                    "error",
                     Some("steward_authority_unavailable".to_owned()),
                     false,
                 ),
@@ -176,7 +266,7 @@ impl ActionableWakeProducer {
                 observation.repo.clone(),
                 observation.pr,
                 observation.expected_head_sha.clone(),
-                "error".to_owned(),
+                "error",
                 Some("steward_authority_unavailable".to_owned()),
                 false,
             );
@@ -247,7 +337,7 @@ impl ActionableWakeProducer {
                 repository.to_owned(),
                 pull_request,
                 head_sha.to_owned(),
-                if report.matched { "ready" } else { "unmatched" }.to_owned(),
+                if report.matched { "ready" } else { "unmatched" },
                 Some(reason.to_owned()),
                 report.wake_enqueued,
             ),
@@ -255,7 +345,7 @@ impl ActionableWakeProducer {
                 repository.to_owned(),
                 pull_request,
                 head_sha.to_owned(),
-                "error".to_owned(),
+                "error",
                 Some("ledger_refused".to_owned()),
                 false,
             ),
@@ -267,20 +357,49 @@ impl ActionableWakeProducer {
         repository: String,
         pull_request: u64,
         head_sha: String,
-        state: String,
+        state: &str,
         reason_code: Option<String>,
         wake_enqueued: bool,
     ) -> ActionableWakeProducerStatus {
-        self.status = ActionableWakeProducerStatus {
-            state,
-            repository: Some(repository),
-            pull_request: Some(pull_request),
-            head_sha: Some(head_sha),
-            reason_code,
-            wake_enqueued,
-            model_calls: 0,
-            updated_at: Some(Utc::now().to_rfc3339()),
-        };
+        const MAX_REPOSITORIES: usize = 256;
+        let updated_at = Utc::now().to_rfc3339();
+        if !self.status.repositories.contains_key(&repository)
+            && self.status.repositories.len() >= MAX_REPOSITORIES
+        {
+            let oldest = self
+                .status
+                .repositories
+                .iter()
+                .min_by_key(|(_, value)| &value.updated_at)
+                .map(|(repo, _)| repo.clone());
+            if let Some(oldest) = oldest {
+                self.status.repositories.remove(&oldest);
+            }
+        }
+        if repository.is_empty() {
+            normalize_state(state).clone_into(&mut self.status.state);
+            self.status.repository = None;
+        } else {
+            self.status.repositories.insert(
+                repository.clone(),
+                ActionableRepositoryStatus {
+                    state: normalize_state(state).to_owned(),
+                    pull_request: (pull_request > 0).then_some(pull_request),
+                    head_sha: (!head_sha.is_empty()).then_some(head_sha.clone()),
+                    reason_code: reason_code.clone(),
+                    wake_enqueued,
+                    updated_at: updated_at.clone(),
+                },
+            );
+            self.status.state = aggregate_state(&self.status.repositories).to_owned();
+            self.status.repository = Some(repository);
+        }
+        self.status.pull_request = (pull_request > 0).then_some(pull_request);
+        self.status.head_sha = (!head_sha.is_empty()).then_some(head_sha);
+        self.status.reason_code = reason_code;
+        self.status.wake_enqueued = wake_enqueued;
+        self.status.model_calls = 0;
+        self.status.updated_at = Some(updated_at);
         if save_status(&self.state_dir, &self.status).is_err() {
             self.status.state.clear();
             self.status.state.push_str("status_persistence_error");
@@ -288,6 +407,38 @@ impl ActionableWakeProducer {
             self.status.wake_enqueued = false;
         }
         self.status.clone()
+    }
+}
+
+fn normalize_state(state: &str) -> &str {
+    match state {
+        "ready" => "ready",
+        "in_flight" => "in_flight",
+        "uncertain" => "uncertain",
+        "disabled" => "disabled",
+        _ => "refused",
+    }
+}
+
+fn aggregate_state(repositories: &BTreeMap<String, ActionableRepositoryStatus>) -> &str {
+    if repositories.is_empty() {
+        return "idle";
+    }
+    for candidate in ["refused", "uncertain", "in_flight"] {
+        if repositories
+            .values()
+            .any(|status| status.state == candidate)
+        {
+            return candidate;
+        }
+    }
+    if repositories
+        .values()
+        .all(|status| status.state == "disabled")
+    {
+        "disabled"
+    } else {
+        "ready"
     }
 }
 
@@ -422,10 +573,29 @@ mod tests {
         record_steward_transition(state_dir, "recorded");
     }
 
+    fn seed_repo_policy(state_dir: &Path, repository: &str) {
+        WorkLedger::open(state_dir)
+            .expect("ledger")
+            .set_repo_policy(
+                &crate::work_ledger::RepoPolicy {
+                    repo: repository.to_owned(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("repo policy");
+    }
+
     #[test]
     fn daemon_producer_is_zero_model_durable_and_idempotent() {
         let state = tempfile::tempdir().expect("state");
         let publication = request();
+        seed_repo_policy(state.path(), &publication.repository);
         WorkLedger::plan_or_apply_native_continuation(
             state.path(),
             &publication,
@@ -471,6 +641,7 @@ mod tests {
     fn restart_reconstructs_durable_terminal_before_any_shadow_observation() {
         let state = tempfile::tempdir().expect("state");
         let publication = request();
+        seed_repo_policy(state.path(), &publication.repository);
         WorkLedger::plan_or_apply_native_continuation(
             state.path(),
             &publication,
@@ -513,9 +684,10 @@ mod tests {
         let state = tempfile::tempdir().expect("state");
         let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
         let missing = producer.process(&evidence(1));
-        assert_eq!(missing.state, "unmatched");
+        assert_eq!(missing.state, "refused");
 
         let publication = request();
+        seed_repo_policy(state.path(), &publication.repository);
         WorkLedger::plan_or_apply_native_continuation(
             state.path(),
             &publication,
@@ -525,5 +697,35 @@ mod tests {
         .expect("publish after unrelated miss");
         record_actionable(state.path());
         assert!(producer.process(&evidence(1)).wake_enqueued);
+    }
+
+    #[test]
+    fn aggregate_status_is_truthful_and_repository_inventory_is_bounded() {
+        let mut repositories = BTreeMap::new();
+        for index in 0..300 {
+            repositories.insert(
+                format!("owner/repo-{index:03}"),
+                ActionableRepositoryStatus {
+                    state: "ready".to_owned(),
+                    pull_request: Some(1),
+                    head_sha: Some("a".repeat(40)),
+                    reason_code: None,
+                    wake_enqueued: false,
+                    updated_at: format!("2026-08-29T00:{:02}:00Z", index % 60),
+                },
+            );
+        }
+        assert_eq!(aggregate_state(&repositories), "ready");
+        repositories.get_mut("owner/repo-001").unwrap().state = "uncertain".to_owned();
+        assert_eq!(aggregate_state(&repositories), "uncertain");
+        repositories.get_mut("owner/repo-002").unwrap().state = "refused".to_owned();
+        assert_eq!(aggregate_state(&repositories), "refused");
+
+        let state = tempfile::tempdir().expect("state");
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        for index in 0..300 {
+            producer.mark_ready(&format!("owner/repo-{index:03}"), 1, &"a".repeat(40));
+        }
+        assert_eq!(producer.status().repositories.len(), 256);
     }
 }

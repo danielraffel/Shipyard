@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io;
 #[cfg(unix)]
@@ -36,6 +36,8 @@ use crate::daemon_ipc::{IpcServer, IpcState, github_auth_degraded_message};
 use crate::execution_supervisor::ExecutionSupervisor;
 use crate::identity::RuntimeMode;
 #[cfg(unix)]
+use crate::paths::RuntimePaths;
+#[cfg(unix)]
 use crate::reconcile::{
     RECONCILE_INTERVAL_SECONDS, ReconcileReport, ReconcileTransition, ReconcileWindow,
     reconcile_active_ship_states,
@@ -58,6 +60,8 @@ use crate::tunnel::{
 };
 #[cfg(unix)]
 use crate::webhook::{decode_webhook_event, is_valid_signature};
+#[cfg(unix)]
+use crate::work_ledger::WorkLedger;
 #[cfg(unix)]
 use crate::workstream_continuation_runtime::{
     ContinuationRuntimeStatus, WorkstreamContinuationRuntime,
@@ -256,6 +260,28 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     if let Ok(mut published) = transition_projection_error.lock() {
         *published = transition_projection_runtime.diagnostic_error();
     }
+    let configured_policy_repositories = WorkLedger::open_existing(&config.state_dir)
+        .and_then(|ledger| ledger.map_or_else(|| Ok(Vec::new()), |ledger| ledger.repo_policies()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|policy| policy.repo)
+        .collect::<BTreeSet<_>>();
+    for repository in &repos {
+        if configured_policy_repositories.contains(repository) {
+            actionable_producer.mark_ready(repository, 0, "");
+        } else {
+            actionable_producer.mark_disabled(repository, "repo_policy_absent");
+        }
+    }
+    let steward_paths = RuntimePaths::current_with_overrides(
+        config.mode,
+        Some(config.global_dir.clone()),
+        Some(config.state_dir.clone()),
+    );
+    let steward_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut pending_steward_targets = native_steward_inventory(&config.state_dir);
+    let (steward_tx, steward_rx) = mpsc::channel::<DaemonStewardResult>();
+    let mut steward_in_flight = false;
     if let Ok(mut published) = actionable_producer_status.lock() {
         *published = actionable_producer.status();
     }
@@ -290,12 +316,65 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             publish_reconcile_events(&server, &last_event_at, &result.report);
             publish_abandon_events(&server, &last_event_at, &result.abandon);
         }
+        while let Ok(completed) = steward_rx.try_recv() {
+            steward_in_flight = false;
+            if completed.result.is_err() {
+                actionable_producer.mark_uncertain(
+                    &completed.repository,
+                    completed.pull_request,
+                    &completed.head_sha,
+                );
+            } else {
+                actionable_producer.mark_ready(
+                    &completed.repository,
+                    completed.pull_request,
+                    &completed.head_sha,
+                );
+            }
+        }
 
         let shadow_transitions = shadow_lane.tick(Instant::now());
         for observation in shadow_lane.take_completed_observations() {
-            let producer_status = actionable_producer.process_observation(&observation);
+            pending_steward_targets.insert((
+                observation.repo,
+                observation.pr,
+                observation.expected_head_sha,
+            ));
+        }
+        if !steward_in_flight
+            && let Some((repository, pull_request, head_sha)) = pending_steward_targets.pop_first()
+        {
+            let status = actionable_producer.mark_in_flight(&repository, pull_request, &head_sha);
             if let Ok(mut published) = actionable_producer_status.lock() {
-                *published = producer_status;
+                *published = status;
+            }
+            let result = WorkLedger::open_existing(&config.state_dir)
+                .and_then(|ledger| {
+                    ledger.map_or_else(
+                        || Ok(None),
+                        |ledger| {
+                            ledger.native_steward_base_ref(&repository, pull_request, &head_sha)
+                        },
+                    )
+                })
+                .map_err(|error| error.to_string())
+                .and_then(|base_ref| {
+                    base_ref.ok_or_else(|| "exact native steward target is unavailable".to_owned())
+                });
+            if let Ok(base_ref) = result {
+                steward_in_flight = true;
+                start_daemon_steward_worker(
+                    config.mode,
+                    steward_paths.clone(),
+                    steward_cwd.clone(),
+                    repository,
+                    pull_request,
+                    head_sha,
+                    base_ref,
+                    steward_tx.clone(),
+                );
+            } else {
+                actionable_producer.mark_uncertain(&repository, pull_request, &head_sha);
             }
         }
         for evidence in shadow_transitions {
@@ -365,6 +444,54 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         .stop()
         .map_err(|error| DaemonRunError::Protocol(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn native_steward_inventory(state_dir: &Path) -> BTreeSet<(String, u64, String)> {
+    WorkLedger::open_existing(state_dir)
+        .and_then(|ledger| {
+            ledger.map_or_else(|| Ok(Vec::new()), |ledger| ledger.native_steward_targets())
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(unix)]
+struct DaemonStewardResult {
+    repository: String,
+    pull_request: u64,
+    head_sha: String,
+    result: Result<(), String>,
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn start_daemon_steward_worker(
+    mode: RuntimeMode,
+    runtime_paths: RuntimePaths,
+    cwd: PathBuf,
+    repository: String,
+    pull_request: u64,
+    head_sha: String,
+    base_ref: String,
+    sender: mpsc::Sender<DaemonStewardResult>,
+) {
+    thread::spawn(move || {
+        let result = crate::app::daemon_steward_repository(
+            mode,
+            &runtime_paths,
+            &cwd,
+            &repository,
+            &base_ref,
+        );
+        let _ = sender.send(DaemonStewardResult {
+            repository,
+            pull_request,
+            head_sha,
+            result,
+        });
+    });
 }
 
 #[cfg(unix)]
@@ -481,9 +608,11 @@ fn publish_shadow_transition(
             "api_requests": evidence.api_requests,
             "elapsed_ms": evidence.elapsed_ms,
             "fetch_errors": evidence.fetch_errors,
-            "activation_enabled": false,
-            "dispatch_enabled": false,
-            "model_calls": 0,
+            "observer_only": {
+                "activation_enabled": false,
+                "dispatch_enabled": false,
+                "model_calls": 0,
+            },
         }
     });
     // IPC remains a convenience; the daemon's supervised stderr sink is the

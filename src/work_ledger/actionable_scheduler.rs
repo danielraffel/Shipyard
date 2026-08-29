@@ -66,6 +66,28 @@ impl WorkLedger {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Resolve the exact base ref bound into one native target. The daemon
+    /// never guesses `main` when invoking repository stewardship.
+    pub(crate) fn native_steward_base_ref(
+        &self,
+        repo: &str,
+        pr: u64,
+        head_sha: &str,
+    ) -> WorkLedgerResult<Option<String>> {
+        let connection = self.connect_read_only()?;
+        Ok(connection
+            .query_row(
+                "SELECT base_ref FROM work_items
+              WHERE kind = 'terminal_handoff' AND lower(repo) = lower(?1)
+                AND pr = ?2 AND lower(head_sha) = lower(?3)
+                AND phase IN ('managed', 'waiting', 'actionable', 'dispatching',
+                              'agent_owned_repair', 'returned')",
+                params![repo, pr, head_sha],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Apply a classified steward observation to one exact native publication.
     pub(crate) fn apply_native_steward_disposition(
         &self,
@@ -277,6 +299,21 @@ mod tests {
     fn published() -> (tempfile::TempDir, WorkLedger, String, String) {
         let state = tempfile::tempdir().expect("state");
         let request = request();
+        WorkLedger::open(state.path())
+            .expect("ledger")
+            .set_repo_policy(
+                &crate::work_ledger::RepoPolicy {
+                    repo: request.repository.clone(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("repo policy");
         let report = WorkLedger::plan_or_apply_native_continuation(
             state.path(),
             &request,

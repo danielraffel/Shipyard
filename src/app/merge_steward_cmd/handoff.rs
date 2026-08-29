@@ -265,6 +265,8 @@ struct NativePublicationReceiptV1 {
     route_ref: String,
     wake_id: String,
     profile_digest: String,
+    #[serde(default)]
+    repo_policy_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -999,6 +1001,49 @@ fn handoff_path(directory: &Path, head: &str) -> std::path::PathBuf {
     directory.join(format!("{}.json", head.to_ascii_lowercase()))
 }
 
+pub(super) fn migrate_legacy_native_policy_authority(
+    state_dir: &Path,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<(), String> {
+    let path = state_dir
+        .join("merge-steward")
+        .join("handoffs")
+        .join(encode_path_segment(&repo.to_ascii_lowercase()))
+        .join(format!("pr-{pr}"))
+        .join(format!("{}.json", head.to_ascii_lowercase()));
+    let mut receipt = load_handoff(&path)
+        .map_err(|error| error.message)?
+        .ok_or_else(|| "legacy native handoff receipt is unavailable".to_owned())?;
+    validate_handoff_receipt_integrity(&receipt, repo, pr, head).map_err(|error| error.message)?;
+    let publication = receipt
+        .native_publication
+        .as_mut()
+        .ok_or_else(|| "legacy native publication receipt is unavailable".to_owned())?;
+    if !receipt.wake_consumer_available
+        || publication.schema_version != 1
+        || publication.state != NativePublicationStateV1::Accepted
+        || publication.repo_policy_revision != 0
+    {
+        return Err("legacy native publication is not accepted migration authority".to_owned());
+    }
+    crate::work_ledger::bind_legacy_native_policy(state_dir, repo, pr, head, &publication.work_id)
+        .map_err(|error| error.to_string())?;
+    let ledger = WorkLedger::open_existing(state_dir)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "native work ledger is unavailable".to_owned())?;
+    let policy = ledger
+        .repo_policy(repo)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "explicit repository policy is unavailable".to_owned())?;
+    publication.schema_version = 2;
+    publication.repo_policy_revision = policy.revision;
+    receipt.schema_version = 4;
+    persist_handoff(&path, receipt, HandoffPhase::Managed).map_err(|error| error.message)?;
+    Ok(())
+}
+
 /// Load and normalize one exact managed handoff into native ledger authority.
 ///
 /// This reader performs no mutation. Publication policy is intentionally
@@ -1025,6 +1070,13 @@ pub(crate) fn native_publication_request(
     let path = handoff_path(&handoff_directory(runtime_paths, repo, pr), head);
     let trusted_actions = trusted_native_publication_actions(runtime_paths, actions, repo)?;
     let source_authority = observe_native_source_authority(&trusted_actions, repo, pr, head)?;
+    let ledger = WorkLedger::open_existing(&runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+        .ok_or_else(|| CliFailure::new(1, "explicit repository policy is unavailable"))?;
+    let repo_policy = ledger
+        .repo_policy(repo)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+        .ok_or_else(|| CliFailure::new(1, "explicit repository policy is unavailable"))?;
     let receipt = load_handoff(&path)?
         .ok_or_else(|| CliFailure::new(1, "exact-head durable handoff receipt is unavailable"))?;
     validate_handoff_receipt_integrity(&receipt, repo, pr, head)?;
@@ -1103,6 +1155,7 @@ pub(crate) fn native_publication_request(
         base_ref: source_authority.base_ref,
         base_sha: source_authority.base_sha,
         github_installation_id: source_authority.installation_id,
+        repo_policy_revision: repo_policy.revision,
         terminal_authority: private_route
             .agent
             .terminal_authority
@@ -1732,7 +1785,7 @@ fn new_handoff_receipt(
     let launch_profile =
         launch_profile.map(|profile| bind_launch_profile(profile, agent_route.as_ref(), 1, 1));
     DurableStewardHandoff {
-        schema_version: 3,
+        schema_version: 4,
         repo: normalized_repo,
         pr: args.pr,
         head_sha: normalized_head,
@@ -1804,7 +1857,7 @@ fn validate_handoff_receipt_integrity(
                 && !receipt.pause_required
                 && receipt.disposition_proof.is_none()
         }
-        3 => match receipt.requested_agent_disposition {
+        3 | 4 => match receipt.requested_agent_disposition {
             AgentDisposition::Continue => {
                 receipt.agent_disposition == AgentDisposition::Continue
                     && !receipt.pause_required
@@ -1864,7 +1917,10 @@ fn validate_handoff_receipt_integrity(
     ) {
         (false, None, _) => true,
         (available, Some(publication), Some(profile)) => {
-            publication.schema_version == 1
+            ((publication.schema_version == 2 && publication.repo_policy_revision > 0)
+                || (matches!(receipt.schema_version, 2 | 3)
+                    && publication.schema_version == 1
+                    && publication.repo_policy_revision == 0))
                 && publication.profile_digest == profile.profile_digest
                 && valid_publication_identifier(&publication.work_id)
                 && valid_publication_identifier(&publication.route_ref)
@@ -1877,7 +1933,7 @@ fn validate_handoff_receipt_integrity(
         }
         _ => false,
     };
-    if !matches!(receipt.schema_version, 2 | 3)
+    if !matches!(receipt.schema_version, 2..=4)
         || !receipt.repo.eq_ignore_ascii_case(repo)
         || receipt.pr != pr
         || !receipt.head_sha.eq_ignore_ascii_case(head)
@@ -2102,6 +2158,7 @@ where
         || report.route_ref != planned.route_ref
         || report.wake_id != planned.wake_id
         || report.profile_digest != planned.profile_digest
+        || report.repo_policy_revision != planned.repo_policy_revision
     {
         return Err(CliFailure::new(
             1,
@@ -2112,6 +2169,8 @@ where
     // nevertheless a durable daemon obligation, so successful exact replay is
     // the monitoring-transfer boundary; provider delivery is deliberately not
     // part of the post-handoff disposition decision.
+    crate::work_ledger::verify_native_policy_binding(&runtime_paths.state_dir, repo, pr, head)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     bind_native_publication_accepted(path, receipt, &report)
 }
 
@@ -2120,12 +2179,13 @@ fn native_publication_receipt(
     state: NativePublicationStateV1,
 ) -> NativePublicationReceiptV1 {
     NativePublicationReceiptV1 {
-        schema_version: 1,
+        schema_version: 2,
         state,
         work_id: report.work_id.clone(),
         route_ref: report.route_ref.clone(),
         wake_id: report.wake_id.clone(),
         profile_digest: report.profile_digest.clone(),
+        repo_policy_revision: report.repo_policy_revision,
     }
 }
 
@@ -2140,6 +2200,22 @@ fn bind_native_publication_pending(
         if receipt.native_publication.as_ref() == Some(&accepted) {
             return Ok(receipt);
         }
+        if receipt
+            .native_publication
+            .as_ref()
+            .is_some_and(|publication| {
+                publication.schema_version == 1
+                    && publication.state == NativePublicationStateV1::Accepted
+                    && publication.work_id == accepted.work_id
+                    && publication.route_ref == accepted.route_ref
+                    && publication.wake_id == accepted.wake_id
+                    && publication.profile_digest == accepted.profile_digest
+            })
+        {
+            receipt.schema_version = 4;
+            receipt.native_publication = Some(accepted);
+            return persist_handoff(path, receipt, HandoffPhase::Managed);
+        }
         return Err(CliFailure::new(
             1,
             "accepted native publication cannot return to pending",
@@ -2147,6 +2223,18 @@ fn bind_native_publication_pending(
     }
     match receipt.native_publication.as_ref() {
         Some(existing) if existing == &pending => Ok(receipt),
+        Some(existing)
+            if existing.schema_version == 1
+                && existing.state == NativePublicationStateV1::Pending
+                && existing.work_id == pending.work_id
+                && existing.route_ref == pending.route_ref
+                && existing.wake_id == pending.wake_id
+                && existing.profile_digest == pending.profile_digest =>
+        {
+            receipt.schema_version = 4;
+            receipt.native_publication = Some(pending);
+            persist_handoff(path, receipt, HandoffPhase::Managed)
+        }
         Some(_) => Err(CliFailure::new(
             1,
             "native publication intent changed for an existing exact-head handoff",

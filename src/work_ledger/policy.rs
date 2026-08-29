@@ -56,6 +56,33 @@ impl RepoPolicy {
 }
 
 impl WorkLedger {
+    /// Load one exact repository policy. Native publication uses this as an
+    /// explicit authority fence; absence is never replaced by a repo default.
+    pub(crate) fn repo_policy(&self, repo: &str) -> WorkLedgerResult<Option<RepoPolicy>> {
+        Ok(self
+            .repo_policies()?
+            .into_iter()
+            .find(|policy| policy.repo == repo))
+    }
+
+    /// Refuse unless the currently trusted repository policy has the exact
+    /// revision bound into a native publication.
+    pub(crate) fn verify_repo_policy_revision(
+        &self,
+        repo: &str,
+        expected_revision: u64,
+    ) -> WorkLedgerResult<RepoPolicy> {
+        let policy = self.repo_policy(repo)?.ok_or_else(|| {
+            WorkLedgerError::Refused("explicit repository policy is unavailable".to_owned())
+        })?;
+        if expected_revision == 0 || policy.revision != expected_revision {
+            return Err(WorkLedgerError::Refused(
+                "repository policy revision no longer matches".to_owned(),
+            ));
+        }
+        Ok(policy)
+    }
+
     /// List repository policies in deterministic repository order.
     pub fn repo_policies(&self) -> WorkLedgerResult<Vec<RepoPolicy>> {
         let connection = self.connect_read_only()?;

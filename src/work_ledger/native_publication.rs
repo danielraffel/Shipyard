@@ -5,7 +5,11 @@
 //! The daemon's exact-head actionable producer is the sole bridge from a
 //! managed record to `dispatching` plus one transactional outbox row.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
 use super::dispatch::{FreshAgentLaunchProfile, WakeEnvelope, WakeProfileResolver};
 use super::registry::RouteRegistration;
@@ -31,6 +35,7 @@ pub(crate) struct NativePublicationRequest {
     pub(crate) base_ref: String,
     pub(crate) base_sha: String,
     pub(crate) github_installation_id: u64,
+    pub(crate) repo_policy_revision: u64,
     pub(crate) terminal_authority: TerminalCapabilityRequest,
     pub(crate) workstream_handle: String,
     pub(crate) context_url: Option<String>,
@@ -63,6 +68,18 @@ pub(crate) struct NativePublicationReport {
     pub(crate) route_ref: String,
     pub(crate) wake_id: String,
     pub(crate) profile_digest: String,
+    pub(crate) repo_policy_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativePolicyBindingV1 {
+    schema_version: u32,
+    repository: String,
+    pull_request: u64,
+    head_sha: String,
+    repo_policy_revision: u64,
+    work_id: String,
 }
 
 /// Exact protected-profile lookup used by the daemon's typed decoder.
@@ -143,14 +160,15 @@ impl WorkLedger {
         // Authorization must precede even SQLite creation. A refused machine,
         // repository, or malformed profile is not a native ledger event.
         validate_request(request, policy)?;
-        let ledger = if apply {
-            Self::open(state_dir)?
-        } else {
-            Self::open_existing(state_dir)?.unwrap_or_else(|| Self {
-                path: Self::path_at(state_dir),
-            })
-        };
-        ledger.publish_native_continuation(request, policy, apply)
+        let ledger = Self::open_existing(state_dir)?.ok_or_else(|| {
+            WorkLedgerError::Refused("explicit repository policy is unavailable".to_owned())
+        })?;
+        ledger.verify_repo_policy_revision(&request.repository, request.repo_policy_revision)?;
+        let report = ledger.publish_native_continuation(request, policy, apply)?;
+        if apply {
+            persist_native_policy_binding(state_dir, request, &report)?;
+        }
+        Ok(report)
     }
 
     /// Plan or apply one exact native publication. Replays return the same IDs.
@@ -170,8 +188,13 @@ impl WorkLedger {
             route_ref: identities.route_ref.clone(),
             wake_id: identities.wake_id.clone(),
             profile_digest: request.profile_digest.clone(),
+            repo_policy_revision: request.repo_policy_revision,
         };
-        if !apply || replay {
+        if !apply {
+            return Ok(report);
+        }
+        if replay {
+            self.verify_exact_shadow_target(request)?;
             return Ok(report);
         }
 
@@ -197,6 +220,7 @@ impl WorkLedger {
                 "native publication was not exact after apply".to_owned(),
             ));
         }
+        self.verify_exact_shadow_target(request)?;
         Ok(report)
     }
 
@@ -494,6 +518,214 @@ impl WorkLedger {
         )?;
         Ok(exact_profile)
     }
+
+    fn verify_exact_shadow_target(
+        &self,
+        request: &NativePublicationRequest,
+    ) -> WorkLedgerResult<()> {
+        self.verify_repo_policy_revision(&request.repository, request.repo_policy_revision)?;
+        let targets = self.shadow_pr_targets()?;
+        let matches = targets
+            .iter()
+            .filter(|target| {
+                target.repo == request.repository
+                    && target.pr == request.pull_request
+                    && target.head_sha == request.head_sha
+                    && target.policy.revision == request.repo_policy_revision
+            })
+            .count();
+        if matches != 1 {
+            return Err(WorkLedgerError::Refused(
+                "native publication is not visible as one exact shadow target".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn verify_native_policy_binding(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+) -> WorkLedgerResult<()> {
+    let binding = read_native_policy_binding(state_dir, repository, pull_request, head_sha)?
+        .ok_or_else(|| {
+            WorkLedgerError::Refused("native policy binding is unavailable".to_owned())
+        })?;
+    if binding.schema_version != 1
+        || binding.repository != repository
+        || binding.pull_request != pull_request
+        || binding.head_sha != head_sha
+        || binding.repo_policy_revision == 0
+    {
+        return Err(WorkLedgerError::Refused(
+            "native policy binding is invalid".to_owned(),
+        ));
+    }
+    let ledger = WorkLedger::open_existing(state_dir)?
+        .ok_or_else(|| WorkLedgerError::Refused("native work ledger is unavailable".to_owned()))?;
+    ledger.verify_repo_policy_revision(repository, binding.repo_policy_revision)?;
+    Ok(())
+}
+
+pub(crate) fn bind_legacy_native_policy(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+    work_id: &str,
+) -> WorkLedgerResult<()> {
+    let ledger = WorkLedger::open_existing(state_dir)?
+        .ok_or_else(|| WorkLedgerError::Refused("native work ledger is unavailable".to_owned()))?;
+    let policy = ledger.repo_policy(repository)?.ok_or_else(|| {
+        WorkLedgerError::Refused("explicit repository policy is unavailable".to_owned())
+    })?;
+    let exact_targets = ledger
+        .shadow_pr_targets()?
+        .into_iter()
+        .filter(|target| {
+            target.repo == repository
+                && target.pr == pull_request
+                && target.head_sha == head_sha
+                && target.policy.revision == policy.revision
+        })
+        .count();
+    let exact_work: bool = ledger.connect_read_only()?.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = ?1
+          AND kind = 'terminal_handoff' AND lower(repo) = lower(?2)
+          AND pr = ?3 AND lower(head_sha) = lower(?4)
+          AND phase IN ('managed', 'waiting', 'actionable', 'dispatching',
+                        'agent_owned_repair', 'returned'))",
+        params![work_id, repository, pull_request, head_sha],
+        |row| row.get(0),
+    )?;
+    if exact_targets != 1 || !exact_work {
+        return Err(WorkLedgerError::Refused(
+            "legacy publication is not one exact managed shadow target".to_owned(),
+        ));
+    }
+    let binding = NativePolicyBindingV1 {
+        schema_version: 1,
+        repository: repository.to_owned(),
+        pull_request,
+        head_sha: head_sha.to_owned(),
+        repo_policy_revision: policy.revision,
+        work_id: work_id.to_owned(),
+    };
+    persist_native_policy_binding_value(state_dir, repository, pull_request, head_sha, &binding)
+}
+
+fn native_policy_binding_path(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+) -> PathBuf {
+    let key = digest(format!("{repository}\n{pull_request}\n{head_sha}").as_bytes());
+    state_dir
+        .join("work-ledger")
+        .join("native-policy-bindings")
+        .join(format!("{key}.json"))
+}
+
+fn persist_native_policy_binding(
+    state_dir: &Path,
+    request: &NativePublicationRequest,
+    report: &NativePublicationReport,
+) -> WorkLedgerResult<()> {
+    let binding = NativePolicyBindingV1 {
+        schema_version: 1,
+        repository: request.repository.clone(),
+        pull_request: request.pull_request,
+        head_sha: request.head_sha.clone(),
+        repo_policy_revision: request.repo_policy_revision,
+        work_id: report.work_id.clone(),
+    };
+    persist_native_policy_binding_value(
+        state_dir,
+        &request.repository,
+        request.pull_request,
+        &request.head_sha,
+        &binding,
+    )
+}
+
+fn persist_native_policy_binding_value(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+    binding: &NativePolicyBindingV1,
+) -> WorkLedgerResult<()> {
+    let path = native_policy_binding_path(state_dir, repository, pull_request, head_sha);
+    let directory = path.parent().ok_or_else(|| {
+        WorkLedgerError::Refused("native policy binding has no parent".to_owned())
+    })?;
+    crate::writer_domain_lease::ensure_protected_dir_all(directory)?;
+    let _writer = crate::writer_domain_lease::acquire_for_protected_path(directory)?;
+    if let Some(existing) =
+        read_native_policy_binding(state_dir, repository, pull_request, head_sha)?
+    {
+        return if existing == *binding {
+            Ok(())
+        } else {
+            Err(WorkLedgerError::Refused(
+                "native policy binding changed".to_owned(),
+            ))
+        };
+    }
+    let bytes = serde_json::to_vec(binding).map_err(|_| {
+        WorkLedgerError::Refused("native policy binding cannot be serialized".to_owned())
+    })?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".native-policy-")
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+    temporary.as_file_mut().write_all(&bytes)?;
+    temporary.as_file_mut().sync_all()?;
+    crate::queue::replace_file_with_windows_retry(temporary.path(), &path)?;
+    OpenOptions::new().read(true).open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn read_native_policy_binding(
+    state_dir: &Path,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+) -> WorkLedgerResult<Option<NativePolicyBindingV1>> {
+    let path = native_policy_binding_path(state_dir, repository, pull_request, head_sha);
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > 16 * 1024
+    {
+        return Err(WorkLedgerError::Refused(
+            "native policy binding metadata is unsafe".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 {
+        return Err(WorkLedgerError::Refused(
+            "native policy binding is oversized".to_owned(),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| WorkLedgerError::Refused("native policy binding is malformed".to_owned()))
 }
 
 struct PublicationIdentities {
@@ -955,6 +1187,7 @@ pub(crate) mod tests {
             base_ref: "main".into(),
             base_sha: "b".repeat(40),
             github_installation_id: 42,
+            repo_policy_revision: 1,
             terminal_authority:
                 crate::terminal_delivery_authority::TerminalCapabilityRequest::Cmux {
                     cli_path: "/test/cmux".into(),
@@ -992,17 +1225,36 @@ pub(crate) mod tests {
         }
     }
 
+    fn seed_repo_policy(state_dir: &std::path::Path, repository: &str) {
+        let ledger = WorkLedger::open(state_dir).expect("ledger");
+        ledger
+            .set_repo_policy(
+                &crate::work_ledger::RepoPolicy {
+                    repo: repository.to_owned(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("repo policy");
+    }
+
     #[test]
     fn dry_run_is_non_mutating_and_apply_replays_exactly() {
         let temp = TempDir::new().expect("temp");
         let request = request();
+        seed_repo_policy(temp.path(), &request.repository);
         let policy = policy(vec![request.repository.clone()]);
         let planned =
             WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, false)
                 .expect("plan");
         assert!(!planned.applied);
         assert!(!planned.replay);
-        assert!(!WorkLedger::path_at(temp.path()).exists());
+        assert!(WorkLedger::path_at(temp.path()).exists());
 
         let applied =
             WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
@@ -1071,9 +1323,65 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn absent_or_drifted_repo_policy_refuses_native_publication() {
+        let absent = TempDir::new().expect("temp");
+        let request = request();
+        let continuation = policy(vec![request.repository.clone()]);
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                absent.path(),
+                &request,
+                &continuation,
+                true
+            )
+            .is_err()
+        );
+        assert!(!WorkLedger::path_at(absent.path()).exists());
+
+        let drifted = TempDir::new().expect("temp");
+        seed_repo_policy(drifted.path(), &request.repository);
+        let ledger = WorkLedger::open_existing(drifted.path())
+            .expect("open")
+            .expect("ledger");
+        WorkLedger::plan_or_apply_native_continuation(
+            drifted.path(),
+            &request,
+            &continuation,
+            true,
+        )
+        .expect("initial publication");
+        let mut changed = ledger
+            .repo_policy(&request.repository)
+            .expect("policy")
+            .expect("present");
+        changed.compatibility_mode = "blocking".to_owned();
+        changed.blocking_rule = "all".to_owned();
+        ledger.set_repo_policy(&changed, 1).expect("revise");
+        assert!(
+            verify_native_policy_binding(
+                drifted.path(),
+                &request.repository,
+                request.pull_request,
+                &request.head_sha
+            )
+            .is_err()
+        );
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                drifted.path(),
+                &request,
+                &continuation,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn configured_named_agent_uses_open_registry_without_lifecycle_changes() {
         let temp = TempDir::new().expect("temp");
         let mut request = request();
+        seed_repo_policy(temp.path(), &request.repository);
         request.agent_provider = "qwen".into();
         let TerminalCapabilityRequest::Cmux { provider_kind, .. } = &mut request.terminal_authority
         else {
@@ -1163,6 +1471,7 @@ pub(crate) mod tests {
     fn resolver_returns_only_exact_protected_profile_bytes() {
         let temp = TempDir::new().expect("temp");
         let request = request();
+        seed_repo_policy(temp.path(), &request.repository);
         let policy = policy(vec![request.repository.clone()]);
         let report =
             WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
@@ -1200,6 +1509,7 @@ pub(crate) mod tests {
     fn changed_profile_cannot_duplicate_one_stable_work_identity() {
         let temp = TempDir::new().expect("temp");
         let request = request();
+        seed_repo_policy(temp.path(), &request.repository);
         let policy = policy(vec![request.repository.clone()]);
         let first =
             WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
@@ -1225,6 +1535,20 @@ pub(crate) mod tests {
         let policy = policy(vec![request.repository.clone()]);
         let identities = PublicationIdentities::new(&request);
         let ledger = WorkLedger::open(temp.path()).expect("ledger");
+        ledger
+            .set_repo_policy(
+                &crate::work_ledger::RepoPolicy {
+                    repo: request.repository.clone(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("repo policy");
 
         // Model a crash after the immutable work item and continuation pair
         // landed, but before lifecycle advancement, route binding, or wake.

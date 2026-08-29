@@ -938,6 +938,7 @@ mod tests {
             route_ref: "route:test".to_owned(),
             wake_id: "wake:test".to_owned(),
             profile_digest: "a".repeat(64),
+            repo_policy_revision: 1,
         };
         let mut output = Vec::new();
         write_publication_report(&mut output, &report, true).expect("publication json");

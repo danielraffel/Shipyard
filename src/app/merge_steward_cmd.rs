@@ -203,6 +203,11 @@ pub(crate) fn exact_steward_transition(
     pr: u64,
     head_sha: &str,
 ) -> Result<ExactStewardTransition, String> {
+    if crate::work_ledger::verify_native_policy_binding(state_dir, repo, pr, head_sha).is_err() {
+        handoff::migrate_legacy_native_policy_authority(state_dir, repo, pr, head_sha)?;
+        crate::work_ledger::verify_native_policy_binding(state_dir, repo, pr, head_sha)
+            .map_err(|error| error.to_string())?;
+    }
     let path = state_dir.join("merge-steward.json");
     let Some(ledger) = ledger::load_existing_ledger(&path).map_err(|error| error.message)? else {
         return Ok(ExactStewardTransition::None);

@@ -22,6 +22,24 @@ fn publication_actions(temp: &tempfile::TempDir, head: &str) -> GitHubActions {
     GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary)
 }
 
+fn seed_repo_policy(paths: &RuntimePaths) {
+    WorkLedger::open(&paths.state_dir)
+        .expect("ledger")
+        .set_repo_policy(
+            &crate::work_ledger::RepoPolicy {
+                repo: "owner/repo".to_owned(),
+                primary_platform: "macos".to_owned(),
+                compatibility_mode: "independent".to_owned(),
+                compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                declared_dependency_lanes: Vec::new(),
+                revision: 0,
+            },
+            0,
+        )
+        .expect("repo policy");
+}
+
 struct ActiveWorktreeFixture {
     temp: tempfile::TempDir,
     path: String,
@@ -387,6 +405,7 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
         Some(temp.path().join("global")),
         Some(temp.path().to_path_buf()),
     );
+    seed_repo_policy(&paths);
     let actions = publication_actions(&temp, &args.head);
     let publication =
         native_publication_request(&paths, &actions, "owner/repo", args.pr, &args.head)
@@ -440,6 +459,44 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
     );
 }
 
+fn assert_legacy_publication_migrates(
+    paths: &RuntimePaths,
+    args: &StewardHandoffArgs,
+    path: &Path,
+    mut legacy: DurableStewardHandoff,
+) {
+    legacy.schema_version = 3;
+    let publication = legacy.native_publication.as_mut().expect("publication");
+    publication.schema_version = 1;
+    publication.repo_policy_revision = 0;
+    persist_handoff(path, legacy, HandoffPhase::Managed).expect("legacy fixture");
+    std::fs::remove_dir_all(
+        paths
+            .state_dir
+            .join("work-ledger")
+            .join("native-policy-bindings"),
+    )
+    .expect("remove new binding fixture");
+    migrate_legacy_native_policy_authority(&paths.state_dir, "owner/repo", args.pr, &args.head)
+        .expect("migrate legacy exact publication");
+    crate::work_ledger::verify_native_policy_binding(
+        &paths.state_dir,
+        "owner/repo",
+        args.pr,
+        &args.head,
+    )
+    .expect("migrated binding");
+    let upgraded = load_handoff(path).expect("load").expect("receipt");
+    assert_eq!(upgraded.schema_version, 4);
+    assert_eq!(
+        upgraded
+            .native_publication
+            .expect("publication")
+            .schema_version,
+        2
+    );
+}
+
 #[test]
 fn managed_handoff_publishes_inert_authority_without_creating_a_wake() {
     let temp = tempfile::tempdir().expect("temp");
@@ -448,6 +505,7 @@ fn managed_handoff_publishes_inert_authority_without_creating_a_wake() {
         Some(temp.path().join("global")),
         Some(temp.path().join("state")),
     );
+    seed_repo_policy(&paths);
     let args = handoff_args();
     let actions = publication_actions(&temp, &args.head);
     let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
@@ -531,6 +589,8 @@ fn managed_handoff_publishes_inert_authority_without_creating_a_wake() {
         .expect("status");
     assert_eq!(status.pending_wakes, 0);
     assert_eq!(status.provider_deliveries, 0);
+
+    assert_legacy_publication_migrates(&paths, &args, &path, replay);
 }
 
 #[test]
@@ -541,6 +601,7 @@ fn provider_outcome_cannot_falsely_pause_a_continue_handoff() {
         Some(temp.path().join("global")),
         Some(temp.path().join("state")),
     );
+    seed_repo_policy(&paths);
     let args = handoff_args();
     let actions = publication_actions(&temp, &args.head);
     let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
@@ -590,6 +651,7 @@ fn pause_disposition_recovers_from_pending_publication_exactly_once() {
         Some(temp.path().join("global")),
         Some(temp.path().join("state")),
     );
+    seed_repo_policy(&paths);
     let mut args = handoff_args();
     args.after_handoff = "pause".into();
     let actions = publication_actions(&temp, &args.head);
@@ -811,6 +873,7 @@ fn native_publication_rejects_prompt_bearing_launch_profile() {
         Some(temp.path().join("global")),
         Some(temp.path().to_path_buf()),
     );
+    seed_repo_policy(&paths);
     let actions = publication_actions(&temp, &args.head);
     let error = native_publication_request(&paths, &actions, "owner/repo", args.pr, &args.head)
         .expect_err("native publication must reject raw prompts");
@@ -1103,12 +1166,13 @@ fn pending_native_publication_refuses_owner_transfer() {
         .clone();
     published.wake_consumer_available = false;
     published.native_publication = Some(NativePublicationReceiptV1 {
-        schema_version: 1,
+        schema_version: 2,
         state: NativePublicationStateV1::Pending,
         work_id: "wi_exact".into(),
         route_ref: "route_exact".into(),
         wake_id: "wake_exact".into(),
         profile_digest,
+        repo_policy_revision: 1,
     });
 
     let mut replacement = first.clone();

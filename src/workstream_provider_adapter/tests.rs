@@ -1251,6 +1251,7 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
         base_ref: "main".into(),
         base_sha: "5".repeat(40),
         github_installation_id: 42,
+        repo_policy_revision: 1,
         terminal_authority: crate::terminal_delivery_authority::TerminalCapabilityRequest::Cmux {
             cli_path: "/test/cmux".into(),
             socket_path: "/test/cmux.sock".into(),
@@ -1285,6 +1286,21 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
         success_continuation_digest: "6".repeat(64),
         failure_continuation_digest: "7".repeat(64),
     };
+    WorkLedger::open(temp.path())
+        .expect("ledger")
+        .set_repo_policy(
+            &crate::work_ledger::RepoPolicy {
+                repo: publication.repository.clone(),
+                primary_platform: "macos".to_owned(),
+                compatibility_mode: "independent".to_owned(),
+                compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                declared_dependency_lanes: Vec::new(),
+                revision: 0,
+            },
+            0,
+        )
+        .expect("repo policy");
     let report =
         WorkLedger::plan_or_apply_native_continuation(temp.path(), &publication, &policy, true)
             .expect("publish managed handoff");

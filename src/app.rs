@@ -40,6 +40,48 @@ pub(crate) use merge_steward_cmd::{
     ExactStewardTransition, LaunchProfileV1, decode_protected_launch_profile,
     exact_steward_transition,
 };
+
+#[cfg(unix)]
+pub(crate) fn daemon_steward_repository(
+    mode: crate::identity::RuntimeMode,
+    runtime_paths: &crate::paths::RuntimePaths,
+    cwd: &std::path::Path,
+    repository: &str,
+    base_ref: &str,
+) -> Result<(), String> {
+    let actions = crate::cloud::GitHubActions::from_cwd(mode, cwd).with_repo_override(repository);
+    let args = merge_steward_cmd::StewardCommandArgs {
+        repos: vec![repository.to_owned()],
+        base: base_ref.to_owned(),
+        opt_out_label: "shipyard:no-auto-merge".to_owned(),
+        provenance_blocking_labels: vec!["5·unresolved".to_owned()],
+        managed_label: "shipyard:managed".to_owned(),
+        handoff_context: "Shipyard managed work".to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: true,
+        preempt_capacity: false,
+        max_preemptions_per_head: 1,
+        apply: true,
+        ledger: None,
+    };
+    let mut sink = Vec::new();
+    let code = merge_steward_cmd::steward_command(
+        &args,
+        cwd,
+        mode,
+        runtime_paths,
+        &actions,
+        true,
+        &mut sink,
+    )
+    .map_err(|error| error.message)?;
+    if code == std::process::ExitCode::SUCCESS {
+        Ok(())
+    } else {
+        Err("daemon exact steward cycle was unhealthy".to_owned())
+    }
+}
 mod metrics_cmd;
 mod parallel_proof_canary_cmd;
 mod paths_cmd;

@@ -115,6 +115,7 @@ pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};
 #[allow(unused_imports)] // Consumed by the CLI/runtime integration follow-up.
 pub(crate) use native_publication::{
     ExactProtectedProfileResolver, NativePublicationReport, NativePublicationRequest,
+    bind_legacy_native_policy, verify_native_policy_binding,
 };
 pub use observation::ShadowPrTarget;
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
