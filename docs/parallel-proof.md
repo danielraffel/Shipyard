@@ -167,9 +167,19 @@ matched result explicitly retains the existing full gate as authoritative and
 reports cross-host dispatch as false. It is not an operational canary or a
 speedup measurement.
 
-### Next executable one-host canary
+### Executable canary boundary
 
-The existing supported wiring seam is
+`shipyard parallel-proof-canary --request <absolute-private-json>` now exposes
+a one-shot production CLI seam. It plans without adapter execution or state
+mutation unless `--apply` is supplied. Apply remains default-off and requires
+trusted machine-global policy that pins a native adapter digest, complete
+invocation-authority digest, execution bounds, repository/target, and exact
+builder/worker identities. Shipyard validates strict typed evidence and owns
+immutable no-overwrite receipts; core contains no Pulp commands or personal
+host defaults. A reviewed installed adapter and physical M1/M3/M5 canaries are
+still external acceptance requirements.
+
+The existing changed-surface wiring seam remains
 `src/app/ship_cmd/changed_surface_execution.rs::apply_changed_surface_execution`,
 where trusted machine-global policy can default-off rewrite an exact target's
 stages while preserving the original full execution, feeding

@@ -7,13 +7,11 @@
 //! canary can bind controller-authenticated observations and OS-reported byte
 //! counters without putting shell execution in the daemon or receipt model.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+use crate::immutable_store::{ImmutableByteStore, ImmutableStoreError};
 use crate::parallel_proof::{
     ParallelProofContext, ParallelProofError, Sha256Digest, StoreWriteOutcome,
 };
@@ -28,10 +26,10 @@ use crate::parallel_proof_canary_receipt::{
 
 const DRIVER_SCHEMA_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
-const MAX_RECORD_BYTES_U64: u64 = 4 * 1024 * 1024;
 
 /// Controller-authenticated use of one exact cache generation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservedCacheUse {
     /// Exact admitted cache generation.
     pub generation: CanaryCacheGeneration,
@@ -57,7 +55,8 @@ pub struct InterruptedTransferEvidence {
 }
 
 /// Exact controller/transport counters for artifact delivery.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactDeliveryObservation {
     /// Delivery behavior proven by the transport adapter.
     pub mode: ArtifactDeliveryMode,
@@ -72,7 +71,8 @@ pub struct ArtifactDeliveryObservation {
 }
 
 /// Result of the transfer plus distributed shadow execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DistributedExecutionObservation {
     /// Exact transport byte and interruption counters.
     pub delivery: ArtifactDeliveryObservation,
@@ -254,42 +254,15 @@ pub enum PulpMacCanaryDriverOutcome {
 /// Crash-durable, no-overwrite store for canary measurement evidence.
 #[derive(Clone, Debug)]
 pub struct PulpMacCanaryEvidenceStore {
-    root: PathBuf,
+    store: ImmutableByteStore,
 }
 
 impl PulpMacCanaryEvidenceStore {
     /// Create or reopen a controller-owned evidence root.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ParallelProofError> {
-        let root = root.into();
-        if root.file_name().is_none()
-            || root
-                .components()
-                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
-        {
-            return Err(ParallelProofError::InvalidField("canary evidence root"));
-        }
-        let parent = root
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        if !fs::symlink_metadata(parent)?.file_type().is_dir() {
-            return Err(ParallelProofError::InvalidField(
-                "canary evidence root parent",
-            ));
-        }
-        match fs::create_dir(&root) {
-            Ok(()) => sync_directory(parent)?,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !fs::symlink_metadata(&root)?.file_type().is_dir() {
-                    return Err(ParallelProofError::CorruptRecord(
-                        "canary evidence root is not a real directory".to_owned(),
-                    ));
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-        sync_directory(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            store: ImmutableByteStore::open(root, MAX_RECORD_BYTES).map_err(map_store_error)?,
+        })
     }
 
     /// Publish evidence under its correlation id without overwriting conflicts.
@@ -298,76 +271,18 @@ impl PulpMacCanaryEvidenceStore {
         evidence: &PulpMacCanaryEvidence,
     ) -> Result<StoreWriteOutcome, ParallelProofError> {
         evidence.validate()?;
-        let logical_key = &evidence.receipt.correlation_id;
-        let filename = format!(
-            "{}.json",
-            Sha256Digest::of_bytes(logical_key.as_bytes()).as_str()
-        );
-        let destination = self.root.join(filename);
-        reject_non_regular_if_present(&destination)?;
-        let lock_path = self.root.join(format!(
-            "{}.lock",
-            Sha256Digest::of_bytes(logical_key.as_bytes()).as_str()
-        ));
-        reject_non_regular_if_present(&lock_path)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
-        lock.lock_exclusive()?;
-        let result = (|| {
-            let bytes = serde_json::to_vec(evidence)?;
-            if bytes.len() > MAX_RECORD_BYTES {
-                return Err(ParallelProofError::LimitExceeded {
-                    field: "canary evidence bytes",
-                    max: MAX_RECORD_BYTES,
-                    found: bytes.len(),
-                });
-            }
-            if destination.exists() {
-                let existing = read_bounded(&destination)?;
-                return if existing == bytes {
-                    Ok(StoreWriteOutcome::AlreadyPresent)
-                } else {
-                    Err(ParallelProofError::ImmutableConflict(logical_key.clone()))
-                };
-            }
-            let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
-            temporary.write_all(&bytes)?;
-            temporary.as_file_mut().sync_all()?;
-            match temporary.persist_noclobber(&destination) {
-                Ok(_) => {
-                    sync_directory(&self.root)?;
-                    Ok(StoreWriteOutcome::Created)
-                }
-                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let existing = read_bounded(&destination)?;
-                    if existing == bytes {
-                        Ok(StoreWriteOutcome::AlreadyPresent)
-                    } else {
-                        Err(ParallelProofError::ImmutableConflict(logical_key.clone()))
-                    }
-                }
-                Err(error) => Err(error.error.into()),
-            }
-        })();
-        FileExt::unlock(&lock)?;
-        result
+        self.store
+            .put(
+                &evidence.receipt.correlation_id,
+                &serde_json::to_vec(evidence)?,
+            )
+            .map_err(map_store_error)
     }
 
     /// Load and integrity-check evidence by exact correlation id.
     pub fn load(&self, correlation_id: &str) -> Result<PulpMacCanaryEvidence, ParallelProofError> {
-        let path = self.root.join(format!(
-            "{}.json",
-            Sha256Digest::of_bytes(correlation_id.as_bytes()).as_str()
-        ));
-        reject_non_regular_if_present(&path)?;
-        if !path.exists() {
-            return Err(ParallelProofError::MissingRecord(correlation_id.to_owned()));
-        }
-        let evidence: PulpMacCanaryEvidence = serde_json::from_slice(&read_bounded(&path)?)?;
+        let evidence: PulpMacCanaryEvidence =
+            serde_json::from_slice(&self.store.load(correlation_id).map_err(map_store_error)?)?;
         evidence.validate()?;
         if evidence.receipt.correlation_id != correlation_id {
             return Err(ParallelProofError::CorruptRecord(
@@ -399,12 +314,7 @@ impl PulpMacCanaryEvidenceStore {
             PulpMacCanaryAttemptState::Failed,
         ] {
             let key = format!("attempt-{correlation_id}-{state:?}");
-            let path = self.root.join(format!(
-                "{}.json",
-                Sha256Digest::of_bytes(key.as_bytes()).as_str()
-            ));
-            reject_non_regular_if_present(&path)?;
-            if path.exists() {
+            if self.store.contains(&key).map_err(map_store_error)? {
                 return Ok(true);
             }
         }
@@ -416,65 +326,27 @@ impl PulpMacCanaryEvidenceStore {
         logical_key: &str,
         bytes: &[u8],
     ) -> Result<StoreWriteOutcome, ParallelProofError> {
-        if bytes.len() > MAX_RECORD_BYTES {
-            return Err(ParallelProofError::LimitExceeded {
-                field: "canary evidence bytes",
-                max: MAX_RECORD_BYTES,
-                found: bytes.len(),
-            });
+        self.store.put(logical_key, bytes).map_err(map_store_error)
+    }
+}
+
+fn map_store_error(error: ImmutableStoreError) -> ParallelProofError {
+    match error {
+        ImmutableStoreError::InvalidRoot => {
+            ParallelProofError::InvalidField("canary evidence root")
         }
-        let filename = format!(
-            "{}.json",
-            Sha256Digest::of_bytes(logical_key.as_bytes()).as_str()
-        );
-        let destination = self.root.join(filename);
-        reject_non_regular_if_present(&destination)?;
-        let lock_path = self.root.join(format!(
-            "{}.lock",
-            Sha256Digest::of_bytes(logical_key.as_bytes()).as_str()
-        ));
-        reject_non_regular_if_present(&lock_path)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
-        lock.lock_exclusive()?;
-        let result = (|| {
-            if destination.exists() {
-                let existing = read_bounded(&destination)?;
-                return if existing == bytes {
-                    Ok(StoreWriteOutcome::AlreadyPresent)
-                } else {
-                    Err(ParallelProofError::ImmutableConflict(
-                        logical_key.to_owned(),
-                    ))
-                };
-            }
-            let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
-            temporary.write_all(bytes)?;
-            temporary.as_file_mut().sync_all()?;
-            match temporary.persist_noclobber(&destination) {
-                Ok(_) => {
-                    sync_directory(&self.root)?;
-                    Ok(StoreWriteOutcome::Created)
-                }
-                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let existing = read_bounded(&destination)?;
-                    if existing == bytes {
-                        Ok(StoreWriteOutcome::AlreadyPresent)
-                    } else {
-                        Err(ParallelProofError::ImmutableConflict(
-                            logical_key.to_owned(),
-                        ))
-                    }
-                }
-                Err(error) => Err(error.error.into()),
-            }
-        })();
-        FileExt::unlock(&lock)?;
-        result
+        ImmutableStoreError::UnsafePath(path) => ParallelProofError::CorruptRecord(format!(
+            "unsafe canary evidence path {}",
+            path.display()
+        )),
+        ImmutableStoreError::LimitExceeded { max, found } => ParallelProofError::LimitExceeded {
+            field: "canary evidence bytes",
+            max,
+            found,
+        },
+        ImmutableStoreError::Missing(key) => ParallelProofError::MissingRecord(key),
+        ImmutableStoreError::Conflict(key) => ParallelProofError::ImmutableConflict(key),
+        ImmutableStoreError::Io(error) => ParallelProofError::Io(error),
     }
 }
 
@@ -841,41 +713,6 @@ fn domain_digest(domain: &str, value: &impl Serialize) -> Result<Sha256Digest, P
     bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
     bytes.extend_from_slice(&payload);
     Ok(Sha256Digest::of_bytes(&bytes))
-}
-
-fn reject_non_regular_if_present(path: &Path) -> Result<(), ParallelProofError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
-        Ok(_) => Err(ParallelProofError::CorruptRecord(format!(
-            "{} is not a regular file",
-            path.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn read_bounded(path: &Path) -> Result<Vec<u8>, ParallelProofError> {
-    let file = File::open(path)?;
-    if file.metadata()?.len() > MAX_RECORD_BYTES_U64 {
-        return Err(ParallelProofError::CorruptRecord(
-            "canary evidence exceeds size limit".to_owned(),
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_RECORD_BYTES_U64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_RECORD_BYTES {
-        return Err(ParallelProofError::CorruptRecord(
-            "canary evidence exceeds size limit".to_owned(),
-        ));
-    }
-    Ok(bytes)
-}
-
-fn sync_directory(path: &Path) -> Result<(), ParallelProofError> {
-    File::open(path)?.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]

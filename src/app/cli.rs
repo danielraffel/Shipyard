@@ -219,6 +219,16 @@ pub(super) enum Command {
         #[arg(long = "head")]
         head_sha: String,
     },
+    /// Plan or apply one default-off, receipt-only parallel-proof canary.
+    #[command(name = "parallel-proof-canary")]
+    ParallelProofCanary {
+        /// Private strict JSON invocation file with exact proof and policy authority.
+        #[arg(long)]
+        request: PathBuf,
+        /// Execute the digest-pinned adapter. Omit for no execution or mutation.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Clean up old logs, bundles, evidence, and optional ship-state.
     Cleanup {
         /// Indefinitely pin one job's logs for incident/audit preservation.
@@ -2243,6 +2253,35 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parallel_proof_canary_defaults_to_plan_and_apply_is_explicit() {
+        let planned = Cli::try_parse_from([
+            "shipyard",
+            "parallel-proof-canary",
+            "--request",
+            "/private/canary.json",
+        ])
+        .expect("parallel-proof canary plan");
+        assert!(matches!(
+            planned.command,
+            Command::ParallelProofCanary { request, apply: false }
+                if request == Path::new("/private/canary.json")
+        ));
+        let applied = Cli::try_parse_from([
+            "shipyard",
+            "parallel-proof-canary",
+            "--request",
+            "/private/canary.json",
+            "--apply",
+        ])
+        .expect("parallel-proof canary apply");
+        assert!(matches!(
+            applied.command,
+            Command::ParallelProofCanary { apply: true, .. }
+        ));
+        assert!(Cli::try_parse_from(["shipyard", "parallel-proof-canary"]).is_err());
     }
 
     #[test]

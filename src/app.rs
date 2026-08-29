@@ -38,6 +38,7 @@ mod merge_queue_control_cmd;
 mod merge_steward_cmd;
 pub(crate) use merge_steward_cmd::{LaunchProfileV1, decode_protected_launch_profile};
 mod metrics_cmd;
+mod parallel_proof_canary_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
@@ -88,6 +89,7 @@ use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
 use self::merge_queue_control_cmd::merge_queue_control_command;
 use self::metrics_cmd::metrics_command;
+use self::parallel_proof_canary_cmd::parallel_proof_canary_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
 use self::pr_cmd::{PrCommandArgs, StewardHandoffPreference, pr_command};
@@ -216,7 +218,9 @@ where
     // volume's cwd was temporarily unavailable.
     let cwd = if matches!(
         &cli.command,
-        Command::Daemon { .. } | Command::WriterDomainExec { .. }
+        Command::Daemon { .. }
+            | Command::WriterDomainExec { .. }
+            | Command::ParallelProofCanary { .. }
     ) {
         PathBuf::new()
     } else {
@@ -443,6 +447,18 @@ where
                 stdout,
             );
         }
+        Command::ParallelProofCanary { request, apply } => {
+            let config =
+                LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+                    .map_err(|error| CliFailure::new(2, error.to_string()))?;
+            return parallel_proof_canary_command(
+                &request,
+                apply,
+                &config,
+                &runtime_paths.state_dir,
+                stdout,
+            );
+        }
         Command::WorkLedger { command } => {
             return work_ledger_command(&command, &runtime_paths, &cwd, cli.json, stdout);
         }
@@ -538,6 +554,7 @@ fn handle_operational_variant<W: Write>(
         | Command::QueueObserve { .. }
         | Command::ChangedSurfacePlan { .. }
         | Command::ChangedSurfaceTrialStatus { .. }
+        | Command::ParallelProofCanary { .. }
         | Command::WorkLedger { .. }
         | Command::Cleanup { .. }
         | Command::Targets { .. }

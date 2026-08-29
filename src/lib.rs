@@ -65,6 +65,7 @@ pub mod host_health;
 pub mod host_pool;
 /// Product naming and runtime-mode identity.
 pub mod identity;
+pub(crate) mod immutable_store;
 /// Project initialization and ecosystem detection.
 pub mod init_config;
 /// Job and target-result domain types used by executors and queues.
@@ -91,6 +92,7 @@ pub mod output;
 pub mod parallel_proof;
 /// Default-off admission policy for the first Pulp macOS sharding canary.
 pub mod parallel_proof_canary;
+pub(crate) mod parallel_proof_canary_adapter;
 /// Default-off immutable cache-generation observation and evidence foundation.
 pub mod parallel_proof_canary_cache;
 /// Read-only physical-readiness observations for the Pulp macOS canary.

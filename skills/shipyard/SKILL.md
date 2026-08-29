@@ -297,9 +297,11 @@ both authorization boundaries. The legacy scalar remains compatible only by
 itself; replace it atomically when migrating because mixed scalar/scoped policy
 is ambiguous and fails closed.
 
-The first one-host build-once bridge is also library-only and machine-global
-default-off. It accepts only Pulp's exact numeric repository identity, `mac`
-target, Apple Silicon build contract, and M3. Bind one successful configure and
+The one-host build-once bridge remains machine-global default-off. The
+`parallel-proof-canary` command exposes a one-shot plan/apply seam; apply also
+requires a trusted digest-pinned native adapter and complete reviewed
+invocation-authority digest. Core contains no Pulp commands or personal host
+defaults. Bind one successful configure and
 one successful build receipt to the exact source, toolchain, canonical CTest
 inventory, proof manifest, and compact artifact content/layout/size identity.
 Consumption must remain in the same authenticated M3 session, verify that

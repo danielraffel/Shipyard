@@ -9,15 +9,14 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::artifact_transport::{LayoutEntry, verified_immutable_tree_inventory};
+use crate::immutable_store::{ImmutableByteStore, ImmutableStoreError};
 use crate::parallel_proof::{Sha256Digest, StoreWriteOutcome};
 use crate::parallel_proof_canary::{
     CanaryCacheGeneration, CanaryRoute, PulpMacCanaryPolicy, canary_policy_scope_valid,
@@ -34,7 +33,6 @@ pub const PULP_MAC_CACHE_EVIDENCE_SCHEMA: u32 = 3;
 const MAX_CACHE_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVIDENCE_BYTES: usize = 40 * 1024 * 1024;
-const MAX_EVIDENCE_BYTES_U64: u64 = MAX_EVIDENCE_BYTES as u64;
 const MAX_CORRELATION_ID_BYTES: usize = 128;
 
 /// One canonical entry in an immutable cache generation.
@@ -619,45 +617,15 @@ pub enum PulpMacCacheProbeOutcome {
 /// Crash-durable no-overwrite store for paired cache evidence.
 #[derive(Clone, Debug)]
 pub struct PulpMacCacheEvidenceStore {
-    root: PathBuf,
+    store: ImmutableByteStore,
 }
 
 impl PulpMacCacheEvidenceStore {
     /// Create or reopen a controller-owned evidence directory.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, CacheObserverError> {
-        let root = root.into();
-        if root.file_name().is_none()
-            || root
-                .components()
-                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
-        {
-            return Err(CacheObserverError::Invalid(
-                "cache evidence root".to_owned(),
-            ));
-        }
-        let parent = root
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        if !fs::symlink_metadata(parent)?.file_type().is_dir() {
-            return Err(CacheObserverError::Invalid(
-                "cache evidence root parent".to_owned(),
-            ));
-        }
-        match fs::create_dir(&root) {
-            Ok(()) => set_private_directory_permissions(&root)?,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = fs::symlink_metadata(&root)?;
-                if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-                    return Err(CacheObserverError::Invalid(
-                        "cache evidence root must be a real directory".to_owned(),
-                    ));
-                }
-                validate_private_directory_permissions(&metadata)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        Ok(Self { root })
+        Ok(Self {
+            store: ImmutableByteStore::open(root, MAX_EVIDENCE_BYTES).map_err(map_store_error)?,
+        })
     }
 
     /// Load and validate one exact evidence record.
@@ -671,12 +639,8 @@ impl PulpMacCacheEvidenceStore {
                 "cache evidence correlation id".to_owned(),
             ));
         }
-        let path = self.record_path(correlation_id);
-        reject_non_regular_if_present(&path)?;
-        if !path.exists() {
-            return Err(CacheObserverError::Missing(correlation_id.to_owned()));
-        }
-        let evidence: PulpMacCacheProbeEvidence = serde_json::from_slice(&read_bounded(&path)?)?;
+        let evidence: PulpMacCacheProbeEvidence =
+            serde_json::from_slice(&self.store.load(correlation_id).map_err(map_store_error)?)?;
         evidence.validate(policy)?;
         if evidence.correlation_id != correlation_id {
             return Err(CacheObserverError::Invalid(
@@ -692,60 +656,26 @@ impl PulpMacCacheEvidenceStore {
         policy: &PulpMacCanaryPolicy,
     ) -> Result<StoreWriteOutcome, CacheObserverError> {
         evidence.validate(policy)?;
-        let bytes = serde_json::to_vec(evidence)?;
-        if bytes.len() > MAX_EVIDENCE_BYTES {
-            return Err(CacheObserverError::Invalid(
-                "cache evidence exceeds size limit".to_owned(),
-            ));
-        }
-        let destination = self.record_path(&evidence.correlation_id);
-        let lock_path = destination.with_extension("lock");
-        reject_non_regular_if_present(&destination)?;
-        reject_non_regular_if_present(&lock_path)?;
-        let lock = open_lock_nofollow(&lock_path)?;
-        lock.lock_exclusive()?;
-        let result = (|| {
-            if destination.exists() {
-                let existing = read_bounded(&destination)?;
-                return if existing == bytes {
-                    Ok(StoreWriteOutcome::AlreadyPresent)
-                } else {
-                    Err(CacheObserverError::ImmutableConflict(
-                        evidence.correlation_id.clone(),
-                    ))
-                };
-            }
-            let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
-            temporary.write_all(&bytes)?;
-            temporary.as_file_mut().sync_all()?;
-            match temporary.persist_noclobber(&destination) {
-                Ok(_) => {
-                    set_private_file_permissions(&destination)?;
-                    sync_directory(&self.root)?;
-                    Ok(StoreWriteOutcome::Created)
-                }
-                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let existing = read_bounded(&destination)?;
-                    if existing == bytes {
-                        Ok(StoreWriteOutcome::AlreadyPresent)
-                    } else {
-                        Err(CacheObserverError::ImmutableConflict(
-                            evidence.correlation_id.clone(),
-                        ))
-                    }
-                }
-                Err(error) => Err(error.error.into()),
-            }
-        })();
-        FileExt::unlock(&lock)?;
-        result
+        self.store
+            .put(&evidence.correlation_id, &serde_json::to_vec(evidence)?)
+            .map_err(map_store_error)
     }
+}
 
-    fn record_path(&self, correlation_id: &str) -> PathBuf {
-        self.root.join(format!(
-            "{}.json",
-            Sha256Digest::of_bytes(correlation_id.as_bytes()).as_str()
-        ))
+fn map_store_error(error: ImmutableStoreError) -> CacheObserverError {
+    match error {
+        ImmutableStoreError::InvalidRoot => {
+            CacheObserverError::Invalid("cache evidence root".to_owned())
+        }
+        ImmutableStoreError::UnsafePath(path) => {
+            CacheObserverError::Invalid(format!("unsafe cache evidence path {}", path.display()))
+        }
+        ImmutableStoreError::LimitExceeded { .. } => {
+            CacheObserverError::Invalid("cache evidence exceeds size limit".to_owned())
+        }
+        ImmutableStoreError::Missing(key) => CacheObserverError::Missing(key),
+        ImmutableStoreError::Conflict(key) => CacheObserverError::ImmutableConflict(key),
+        ImmutableStoreError::Io(error) => CacheObserverError::Io(error),
     }
 }
 
@@ -1174,136 +1104,6 @@ fn milliseconds_ceil(duration: Duration) -> Result<u64, CacheObserverError> {
     };
     u64::try_from(millis)
         .map_err(|_| CacheObserverError::Invalid("cache observation duration overflow".to_owned()))
-}
-
-fn reject_non_regular_if_present(path: &Path) -> Result<(), CacheObserverError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
-        Ok(_) => Err(CacheObserverError::Invalid(format!(
-            "{} is not a regular file",
-            path.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn read_bounded(path: &Path) -> Result<Vec<u8>, CacheObserverError> {
-    let file = open_readonly_nofollow(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_EVIDENCE_BYTES_U64 {
-        return Err(CacheObserverError::Invalid(
-            "cache evidence exceeds size limit".to_owned(),
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_EVIDENCE_BYTES_U64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_EVIDENCE_BYTES {
-        return Err(CacheObserverError::Invalid(
-            "cache evidence exceeds size limit".to_owned(),
-        ));
-    }
-    Ok(bytes)
-}
-
-#[cfg(unix)]
-fn open_readonly_nofollow(path: &Path) -> Result<File, CacheObserverError> {
-    use rustix::fs::{Mode, OFlags, open};
-
-    Ok(File::from(
-        open(
-            path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| CacheObserverError::Io(error.into()))?,
-    ))
-}
-
-#[cfg(not(unix))]
-fn open_readonly_nofollow(path: &Path) -> Result<File, CacheObserverError> {
-    Ok(File::open(path)?)
-}
-
-#[cfg(unix)]
-fn open_lock_nofollow(path: &Path) -> Result<File, CacheObserverError> {
-    use rustix::fs::{Mode, OFlags, open};
-
-    Ok(File::from(
-        open(
-            path,
-            OFlags::CREATE | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )
-        .map_err(|error| CacheObserverError::Io(error.into()))?,
-    ))
-}
-
-#[cfg(not(unix))]
-fn open_lock_nofollow(path: &Path) -> Result<File, CacheObserverError> {
-    Ok(std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?)
-}
-
-#[cfg(unix)]
-fn set_private_directory_permissions(path: &Path) -> Result<(), CacheObserverError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_private_directory_permissions(_path: &Path) -> Result<(), CacheObserverError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_private_directory_permissions(
-    metadata: &fs::Metadata,
-) -> Result<(), CacheObserverError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if metadata.permissions().mode() & 0o777 != 0o700 {
-        return Err(CacheObserverError::Invalid(
-            "cache evidence root must have mode 0700".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_private_directory_permissions(
-    _metadata: &fs::Metadata,
-) -> Result<(), CacheObserverError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> Result<(), CacheObserverError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> Result<(), CacheObserverError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), CacheObserverError> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), CacheObserverError> {
-    Ok(())
 }
 
 #[cfg(test)]

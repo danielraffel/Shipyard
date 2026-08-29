@@ -158,33 +158,72 @@ counters. Exact cache generations and use are recorded, while avoided-byte
 claims are not representable at the adapter boundary. `model_calls` is supplied
 by neither policy nor adapter and is always zero.
 
-The execution driver has no production shell, daemon, or fleet adapter. The
-separate cache-observation path has a production-callable strict-SSH
+The execution driver now has a production-callable, shell-free adapter
+protocol. `shipyard parallel-proof-canary --request <absolute-private-json>` is
+a read-only plan with no adapter execution or state mutation by default; `--apply` additionally requires both
+`activation_enabled=true` and `apply_enabled=true` in the trusted
+machine-global `[parallel_proof_canary]` table. The table pins one normalized
+absolute executable path, its exact SHA-256, deadline and output limits, plus
+the exact repository numeric ID/slug, target/triple, and builder/worker IDs.
+It also pins `invocation_authority_sha256`, the domain-separated digest of the
+complete reviewed policy, timing thresholds, manifest, inventory, and plan;
+changing any execution or safety input requires a new reviewed activation.
+Project and checkout-local configuration cannot enable or widen it.
+
+Every adapter invocation uses cleared environment, no shell or arguments, a
+native-only executable snapshot rehashed from a no-follow source descriptor
+and kept in a fresh owner-private directory with descriptor/path identity
+checked immediately before spawn, and
+bounded stdin/stdout/stderr under a process-tree deadline. Strict JSON requests
+bind the exact correlation ID, proof-manifest digest, complete configured
+scope, complete operation payload digest, payload-derived idempotency key, and
+zero model calls. Strict responses must echo that authority, payload, and operation and return typed host,
+same-host control, or distributed transfer/execution evidence. The controller
+driver still validates every receipt, records `distributed_started` before
+physical work, refuses unreconciled retries, and owns immutable publication.
+
+The separate cache-observation path has a production-callable strict-SSH
 builder-to-worker carrier whose host identities are explicit constructor inputs,
 but it is read-only, requires protected controller authority, rejects
-ambient SSH state, and cannot execute transfer/shard work. Therefore setting
-`policy.enabled=true` alone still cannot mutate a host, cache, or staging
-root.
+ambient SSH state, and cannot execute transfer/shard work. The general adapter
+executable must implement the physical host-specific operations; Shipyard core
+contains no Pulp commands or personal host defaults. Therefore setting
+`policy.enabled=true` alone still cannot mutate a host, cache, or staging root.
 
 Successful driver evidence is published through
 `PulpMacCanaryEvidenceStore`, a controller-owned crash-durable no-overwrite
-store. Byte-identical replay is idempotent and a conflicting correlation id is
-refused. Never
+store. The canary and cache evidence stores share one descriptor-pinned,
+no-follow, owner-private 0700/0600, single-link, atomic no-replace publication
+primitive with file and directory fsync. Byte-identical replay is idempotent
+and a conflicting correlation id is refused. Never
 log credentials, private paths, or raw rsync environment. Failed and reassigned
 attempts still need bounded transition records; they must not be rewritten into
 a successful compact receipt.
 
 ### Physical canary prerequisites and command boundary
 
-There is intentionally no physical mutation command yet. Before adding one,
-the controller adapter must supply all of the following from authenticated
-APIs, not operator-entered JSON: exact configured host identities and nonzero session
+The command boundary is present, but an installed digest-pinned adapter and
+reviewed machine-global policy are still required before a physical canary.
+That executable must supply all of the following from authenticated APIs, not
+operator-entered JSON: exact configured host identities and nonzero session
 generations; current online/LAN route observations; canonical persistent staging
 roots; filesystem free-byte observations that retain the configured reserve;
 exact cache generation digests; monotonic phase timings; transport byte
 counters; authenticated partial/prefix digests; and compact execution receipts.
 
-The non-mutating proof commands for this slice are:
+Plan without adapter execution or state mutation:
+
+```sh
+shipyard --json parallel-proof-canary --request /absolute/private/invocation.json
+```
+
+Apply only after installing and digest-pinning a reviewed adapter:
+
+```sh
+shipyard --json parallel-proof-canary --request /absolute/private/invocation.json --apply
+```
+
+Focused proof commands are:
 
 ```sh
 cargo test --locked --lib parallel_proof_canary_driver
@@ -192,10 +231,18 @@ cargo test --locked --lib parallel_proof_canary_receipt
 cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
-A future physical invocation must remain an explicit default-off command shaped
-like `shipyard canary pulp-mac measure --policy <controller-policy> --dry-run`
-before any `--execute` mode is reviewed. Do not substitute ad-hoc `ssh`, `rsync`,
-claimed avoided bytes, or model-generated monitoring for that missing adapter.
+Do not substitute ad-hoc `ssh`, `rsync`, claimed avoided bytes, or
+model-generated monitoring for the protected adapter.
+
+Terminal success or actionable failure may later be offered to the separate
+transactional wake-delivery subsystem using the immutable correlation and
+receipt digests. This command does not type into cmux/HerdR, guess a target by
+label, or implement a chat bus. Cross-machine wake custody requires its own
+source outbox, destination atomically persisted inbox, exact target
+incarnation/delivery fence, single CAS/lease owner, acknowledgements,
+expiry/revalidation, successor/rebind proof, duplicate suppression, and
+restart/offline-rejoin canaries. A busy or nonempty composer is never an
+authorized delivery target.
 
 Rotate transfer logs with Shipyard's bounded log-retention primitives. Keep the
 terminal receipt and compact metrics longer than verbose transport logs; retain
