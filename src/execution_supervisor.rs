@@ -1221,6 +1221,19 @@ fn terminate_child_tree(child: &mut Child) -> io::Result<bool> {
     Ok(root_dead)
 }
 
+/// Terminate a detached daemon-owned worker tree by exact root identity.
+/// This preserves the same stopped-root descendant snapshot used by queue
+/// workers, including descendants that created another process group.
+#[cfg(unix)]
+pub(crate) fn terminate_detached_worker_tree(pid: u32) -> io::Result<bool> {
+    let descendants = signal_process_tree(pid)?;
+    let group_dead = verify_exited_worker_group_dead(pid)?;
+    Ok(group_dead
+        && descendants
+            .iter()
+            .all(|descendant| process_id_liveness(*descendant) == ProcessLiveness::Dead))
+}
+
 #[cfg(unix)]
 fn verify_exited_worker_group_dead(process_group: u32) -> io::Result<bool> {
     // Daemon workers are created as process-group leaders. If the root raced

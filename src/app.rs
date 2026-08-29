@@ -266,6 +266,7 @@ where
         Command::Daemon { .. }
             | Command::WriterDomainExec { .. }
             | Command::ParallelProofCanary { .. }
+            | Command::ParallelProofCanaryWorker { .. }
     ) {
         PathBuf::new()
     } else {
@@ -303,6 +304,17 @@ where
                 &generation,
                 cli.mode.into(),
                 &runtime_paths.global_dir,
+                &runtime_paths.state_dir,
+            );
+        }
+        Command::ParallelProofCanaryWorker { job_id, generation } => {
+            let config =
+                LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+                    .map_err(|error| CliFailure::new(2, error.to_string()))?;
+            return self::parallel_proof_canary_cmd::parallel_proof_canary_worker_command(
+                &job_id,
+                &generation,
+                &config,
                 &runtime_paths.state_dir,
             );
         }
@@ -586,6 +598,7 @@ fn handle_operational_variant<W: Write>(
         Command::WriterDomainExec { .. }
         | Command::Paths
         | Command::ExecutionWorker { .. }
+        | Command::ParallelProofCanaryWorker { .. }
         | Command::Pin { .. }
         | Command::Dependency { .. }
         | Command::Config { .. }

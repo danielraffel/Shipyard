@@ -207,6 +207,35 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let actionable_producer_status = Arc::new(Mutex::new(ActionableWakeProducerStatus::default()));
     let ship_dir = config.state_dir.join("ship");
     let ship_dir_for_list = ship_dir.clone();
+    let (mut canary_job_runtime, canary_job_init_error) =
+        match crate::config::LoadedConfig::load_machine_global_from_dir(config.global_dir.clone()) {
+            Ok(loaded) => {
+                match crate::parallel_proof_canary_job_adapter::DaemonCanaryJobRuntime::from_config(
+                    std::env::current_exe()?,
+                    config.mode,
+                    config.global_dir.clone(),
+                    &config.state_dir,
+                    &loaded,
+                ) {
+                    Ok(runtime) => (runtime, None),
+                    Err(error) => (None, Some(format!("parallel_proof_canary_job: {error}"))),
+                }
+            }
+            Err(error) => (
+                None,
+                Some(format!("parallel_proof_canary_job config: {error}")),
+            ),
+        };
+    let canary_capabilities = Arc::new(Mutex::new(
+        canary_job_runtime.as_ref().map_or_else(Vec::new, |_| {
+            vec![crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY.to_owned()]
+        }),
+    ));
+    if let Some(error) = canary_job_init_error.as_ref()
+        && let Ok(mut last_error) = execution_error.lock()
+    {
+        *last_error = Some(error.clone());
+    }
 
     let status_provider = daemon_status_provider(
         Arc::clone(&registration),
@@ -218,6 +247,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         Arc::clone(&actionable_producer_status),
         Arc::clone(&last_event_at),
         Arc::clone(&tunnel_runtime.snapshot),
+        Arc::clone(&canary_capabilities),
     );
     let mut server = IpcServer::new(daemon_dir.join("daemon.sock"), status_provider)
         .with_stop_request(move || {
@@ -290,8 +320,21 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             .tick()
             .err()
             .map(|error| format!("execution_supervisor: {error}"));
+        let canary_error = canary_job_runtime.as_mut().and_then(|runtime| {
+            runtime
+                .tick(u64::try_from(Utc::now().timestamp_millis()).unwrap_or(u64::MAX))
+                .err()
+                .map(|error| format!("parallel_proof_canary_job: {error}"))
+        });
+        if canary_error.is_some()
+            && let Ok(mut capabilities) = canary_capabilities.lock()
+        {
+            capabilities.clear();
+        }
         if let Ok(mut last_error) = execution_error.lock() {
-            *last_error = supervisor_error;
+            *last_error = supervisor_error
+                .or(canary_error)
+                .or_else(|| canary_job_init_error.clone());
         }
         drain_webhook_events(
             &webhook_rx,
@@ -537,6 +580,7 @@ fn daemon_status_provider(
     actionable_producer_status: Arc<Mutex<ActionableWakeProducerStatus>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
     tunnel_snapshot: Arc<Mutex<TunnelSnapshot>>,
+    capabilities: Arc<Mutex<Vec<String>>>,
 ) -> impl Fn() -> IpcState + Send + Sync + 'static {
     move || {
         let tunnel = tunnel_snapshot
@@ -550,6 +594,9 @@ fn daemon_status_provider(
             last_event_at: last_event_at.lock().ok().and_then(|guard| *guard),
             registered_repos: registration.published_repos(),
             configured_repos: configured_repos.clone(),
+            capabilities: capabilities
+                .lock()
+                .map_or_else(|_| Vec::new(), |guard| guard.clone()),
             rate_limit: None,
             workstream_continuation: continuation_status.lock().map_or_else(
                 |_| ContinuationRuntimeStatus::default(),
@@ -2096,6 +2143,7 @@ mod tests {
             )),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(TunnelSnapshot::inactive())),
+            Arc::new(Mutex::new(Vec::new())),
         );
 
         let registrar_io = registration.registrar.lock().expect("registrar lock");

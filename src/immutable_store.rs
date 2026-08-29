@@ -197,9 +197,12 @@ impl ImmutableByteStore {
         self.contains_name(&Self::record_name(logical_key, "json"))
     }
 
-    /// Read every committed immutable JSON record after revalidating the
-    /// directory binding. Callers retain responsibility for typed filtering.
-    pub(crate) fn list_records(&self) -> Result<Vec<Vec<u8>>, ImmutableStoreError> {
+    /// Read committed records while preserving per-record read failures so a
+    /// caller can quarantine one corrupt logical record without starving
+    /// unrelated durable work.
+    pub(crate) fn list_record_results(
+        &self,
+    ) -> Result<Vec<Result<Vec<u8>, ImmutableStoreError>>, ImmutableStoreError> {
         self.verify_directory_binding()?;
         let mut names = Vec::new();
         for entry in fs::read_dir(&self.root)? {
@@ -221,7 +224,7 @@ impl ImmutableByteStore {
         }
         let mut records = Vec::with_capacity(names.len());
         for name in names {
-            records.push(self.read_name(&name)?);
+            records.push(self.read_name(&name));
         }
         self.verify_directory_binding()?;
         Ok(records)

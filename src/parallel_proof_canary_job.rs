@@ -64,6 +64,8 @@ pub enum ApprovedCanaryOperation {
         invocation_authority_sha256: Sha256Digest,
         /// Digest of the exact provider adapter executable.
         adapter_executable_sha256: Sha256Digest,
+        /// Digest of the exact Shipyard hidden-worker binary.
+        worker_executable_sha256: Sha256Digest,
     },
 }
 
@@ -105,7 +107,8 @@ impl ApprovedCanaryOperation {
         Ok(())
     }
 
-    fn digest(&self) -> Result<Sha256Digest, ParallelProofError> {
+    /// Digest every closed operation input and authority binding.
+    pub fn digest(&self) -> Result<Sha256Digest, ParallelProofError> {
         self.validate()?;
         domain_digest("shipyard.canary-job.operation.v1", self)
     }
@@ -270,14 +273,14 @@ impl CanaryProcessTreeIdentity {
         validate_id(&self.tree_id, "canary process tree id")?;
         validate_id(&self.birth_token, "canary process birth token")?;
         let ApprovedCanaryOperation::ParallelProofDistributedShadow {
-            adapter_executable_sha256,
+            worker_executable_sha256,
             ..
         } = &job.operation;
         if self.pid == 0
             || self.launched_at_ms < job.approved_at_ms
             || self.launched_at_ms >= job.deadline_at_ms
             || self.launch_nonce_sha256 != *expected_nonce
-            || self.executable_sha256 != *adapter_executable_sha256
+            || self.executable_sha256 != *worker_executable_sha256
         {
             return Err(ParallelProofError::BindingMismatch(
                 "canary process identity",
@@ -723,22 +726,67 @@ impl CanaryJobStore {
     /// Receipt records share the immutable directory and are ignored only when
     /// they do not carry an envelope's `owner` and `operation` fields.
     pub fn pending_job_ids(&self) -> Result<Vec<String>, ParallelProofError> {
+        let (job_ids, errors) = self.pending_job_scan()?;
+        if let Some(error) = errors.into_iter().next() {
+            return Err(ParallelProofError::CorruptRecord(error));
+        }
+        Ok(job_ids)
+    }
+
+    /// Enumerate valid pending jobs without allowing one corrupt record to
+    /// starve unrelated custody. Callers must surface the returned warnings.
+    pub(crate) fn pending_job_scan(
+        &self,
+    ) -> Result<(Vec<String>, Vec<String>), ParallelProofError> {
         let mut job_ids = Vec::new();
-        for bytes in self.records.list_records().map_err(map_store_error)? {
-            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let mut errors = Vec::new();
+        for record in self
+            .records
+            .list_record_results()
+            .map_err(map_store_error)?
+        {
+            let bytes = match record {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    continue;
+                }
+            };
+            let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    continue;
+                }
+            };
             if value.get("owner").is_none() || value.get("operation").is_none() {
                 continue;
             }
-            let job: ApprovedCanaryJob = serde_json::from_value(value)?;
-            job.validate()?;
-            let snapshot = self.load(&job.job_id)?;
+            let job: ApprovedCanaryJob = match serde_json::from_value(value) {
+                Ok(job) => job,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    continue;
+                }
+            };
+            if let Err(error) = job.validate() {
+                errors.push(error.to_string());
+                continue;
+            }
+            let snapshot = match self.load(&job.job_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    continue;
+                }
+            };
             if !snapshot.is_terminal() {
                 job_ids.push(job.job_id);
             }
         }
         job_ids.sort();
         job_ids.dedup();
-        Ok(job_ids)
+        Ok((job_ids, errors))
     }
 
     fn load_receipt_chain(&self, job_id: &str) -> Result<CanaryJobSnapshot, ParallelProofError> {
@@ -2105,6 +2153,7 @@ mod tests {
                 artifact_bytes_total: 1_024,
                 invocation_authority_sha256: digest("authority"),
                 adapter_executable_sha256: digest("adapter"),
+                worker_executable_sha256: digest("shipyard-worker"),
             },
             approved_at_ms: 1_000,
             deadline_at_ms: 10_000,
@@ -2138,7 +2187,7 @@ mod tests {
         )
         .unwrap();
         let ApprovedCanaryOperation::ParallelProofDistributedShadow {
-            adapter_executable_sha256,
+            worker_executable_sha256,
             ..
         } = &job.operation;
         CanaryProcessTreeIdentity {
@@ -2146,7 +2195,7 @@ mod tests {
             tree_id: "pgrp:42".to_owned(),
             birth_token: "birth-1".to_owned(),
             launch_nonce_sha256: nonce,
-            executable_sha256: adapter_executable_sha256.clone(),
+            executable_sha256: worker_executable_sha256.clone(),
             launched_at_ms: 1_100,
         }
     }
@@ -3012,6 +3061,19 @@ mod tests {
         *request_sha256 = Sha256Digest::of_bytes(&large);
         reopened.record_input(&large_job, &large).unwrap();
         assert_eq!(reopened.load_input(&large_job).unwrap(), large);
+    }
+
+    #[test]
+    fn corrupt_record_does_not_starve_unrelated_pending_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CanaryJobStore::open(temp.path()).unwrap();
+        let exact_job = job();
+        store.submit(&exact_job).unwrap();
+        store.records.put("corrupt-envelope", b"{").unwrap();
+
+        let (pending, errors) = store.pending_job_scan().unwrap();
+        assert_eq!(pending, vec![exact_job.job_id]);
+        assert_eq!(errors.len(), 1);
     }
 
     #[test]

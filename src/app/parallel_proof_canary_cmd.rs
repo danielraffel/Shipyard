@@ -16,6 +16,10 @@ use crate::parallel_proof_canary_adapter::{
     DigestPinnedCanaryProtocolRunner, ProductionParallelProofCanaryExecutor,
     canary_invocation_authority_digest, trusted_parallel_proof_canary_config,
 };
+use crate::parallel_proof_canary_driver::{
+    ArtifactDeliveryObservation, DistributedExecutionObservation, ObservedCacheUse,
+    PulpMacCanaryDriverOutcome, PulpMacCanaryEvidenceStore, drive_pulp_mac_canary,
+};
 use crate::parallel_proof_canary_job::{
     ApprovedCanaryJob, ApprovedCanaryOperation, CanaryCancellationPolicy,
     CanaryCancellationRequest, CanaryJobOwner, CanaryJobReceiptState, CanaryJobStore,
@@ -37,6 +41,245 @@ struct ParallelProofCanaryInvocation {
     inventory: TestInventory,
     plan: ShardPlan,
     custody: CanaryCustodyAuthority,
+}
+
+pub(super) fn parallel_proof_canary_worker_command(
+    job_id: &str,
+    generation: &str,
+    config: &LoadedConfig,
+    state_dir: &Path,
+) -> Result<ExitCode, CliFailure> {
+    let process = crate::parallel_proof_canary_job_adapter::verify_worker_authority(
+        state_dir, job_id, generation,
+    )
+    .map_err(|error| CliFailure::new(3, error))?;
+    let running_binary =
+        std::env::current_exe().map_err(|error| CliFailure::new(3, error.to_string()))?;
+    let running_binary_sha256 =
+        crate::parallel_proof_canary_job_adapter::executable_digest(&running_binary)
+            .map_err(|error| CliFailure::new(3, error))?;
+    if running_binary_sha256 != process.executable_sha256 {
+        return Err(CliFailure::new(
+            3,
+            "canary worker running binary digest does not match launch authority",
+        ));
+    }
+    let result = run_parallel_proof_canary_worker(job_id, config, state_dir, &process);
+    let (exit_code, artifact) = match result {
+        Ok(artifact) => {
+            if let Err(error) =
+                record_worker_log(state_dir, job_id, b"phase=complete\nstatus=succeeded\n")
+            {
+                let _ = crate::parallel_proof_canary_job_adapter::record_worker_completion(
+                    state_dir, job_id, generation, 1, None,
+                );
+                return Err(CliFailure::new(1, error));
+            }
+            (0, Some(artifact))
+        }
+        Err(error) => {
+            let _ = record_worker_log(state_dir, job_id, b"phase=complete\nstatus=failed\n");
+            let _ = crate::parallel_proof_canary_job_adapter::record_worker_completion(
+                state_dir, job_id, generation, 1, None,
+            );
+            return Err(error);
+        }
+    };
+    crate::parallel_proof_canary_job_adapter::record_worker_completion(
+        state_dir, job_id, generation, exit_code, artifact,
+    )
+    .map_err(|error| CliFailure::new(1, error))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn record_worker_log(state_dir: &Path, job_id: &str, bytes: &[u8]) -> Result<(), String> {
+    let store = CanaryJobStore::open(state_dir.join("parallel-proof-canary").join("jobs"))
+        .map_err(|error| error.to_string())?;
+    store
+        .record_log_segment(job_id, 0, bytes)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_parallel_proof_canary_worker(
+    job_id: &str,
+    config: &LoadedConfig,
+    state_dir: &Path,
+    process: &crate::parallel_proof_canary_job::CanaryProcessTreeIdentity,
+) -> Result<crate::parallel_proof_canary_job::CanaryJobArtifact, CliFailure> {
+    let store = CanaryJobStore::open(state_dir.join("parallel-proof-canary").join("jobs"))
+        .map_err(|error| canary_failure(&error))?;
+    let snapshot = store.load(job_id).map_err(|error| canary_failure(&error))?;
+    let input = store
+        .load_input(&snapshot.job)
+        .map_err(|error| canary_failure(&error))?;
+    let invocation: ParallelProofCanaryInvocation = serde_json::from_slice(&input)
+        .map_err(|_| CliFailure::new(2, "canary worker input is not strict schema-v1 JSON"))?;
+    let proof = ParallelProofContext::new(
+        &invocation.manifest,
+        &invocation.inventory,
+        &invocation.plan,
+    )
+    .map_err(|error| canary_failure(&error))?;
+    let manifest_sha256 = invocation
+        .manifest
+        .digest(&invocation.inventory, &invocation.plan)
+        .map_err(|error| canary_failure(&error))?;
+    let invocation_authority_sha256 = canary_invocation_authority_digest(
+        &invocation.policy,
+        &invocation.timing,
+        &invocation.manifest,
+        &invocation.inventory,
+        &invocation.plan,
+    )
+    .map_err(|error| canary_failure(&error))?;
+    let activation = trusted_parallel_proof_canary_config(config)
+        .map_err(|error| CliFailure::new(2, error.to_string()))?
+        .ok_or_else(|| CliFailure::new(2, "canary activation disappeared after admission"))?;
+    let ApprovedCanaryOperation::ParallelProofDistributedShadow {
+        repository_id,
+        repository,
+        target,
+        target_triple,
+        builder_host_id,
+        worker_host_id,
+        manifest_sha256: admitted_manifest,
+        request_sha256,
+        release_sha256,
+        builder_session_generation,
+        worker_session_generation,
+        cache_authority_sha256,
+        storage_authority_sha256,
+        artifact_bytes_total,
+        invocation_authority_sha256: admitted_invocation,
+        adapter_executable_sha256,
+        worker_executable_sha256,
+    } = &snapshot.job.operation;
+    let expected_release = authority_digest(&(
+        &invocation.manifest.build,
+        &invocation.manifest.artifact,
+        &invocation.manifest.trust,
+    ))?;
+    let expected_cache = authority_digest(&invocation.policy.required_cache_generations)?;
+    if snapshot.job.job_id != invocation.custody.job_id
+        || snapshot.job.correlation_id != invocation.correlation_id
+        || snapshot.job.owner.controller_id != invocation.custody.controller_id
+        || snapshot.job.owner.controller_incarnation != invocation.custody.controller_incarnation
+        || snapshot.job.owner.approval_sha256 != invocation.custody.approval_sha256
+        || *repository_id != invocation.policy.repository_id
+        || *repository != invocation.policy.repository
+        || *target != invocation.policy.target
+        || *target_triple != invocation.policy.target_triple
+        || *builder_host_id != invocation.policy.builder_host_id
+        || *worker_host_id != invocation.policy.worker_host_id
+        || *admitted_manifest != manifest_sha256
+        || *request_sha256 != crate::parallel_proof::Sha256Digest::of_bytes(&input)
+        || *release_sha256 != invocation.custody.release_sha256
+        || *release_sha256 != expected_release
+        || *builder_session_generation != invocation.custody.builder_session_generation
+        || *worker_session_generation != invocation.custody.worker_session_generation
+        || *cache_authority_sha256 != invocation.custody.cache_authority_sha256
+        || *cache_authority_sha256 != expected_cache
+        || *storage_authority_sha256 != invocation.custody.storage_authority_sha256
+        || *artifact_bytes_total != invocation.manifest.artifact.size_bytes
+        || *admitted_invocation != invocation_authority_sha256
+        || *adapter_executable_sha256 != activation.adapter.executable_sha256
+        || *worker_executable_sha256 != process.executable_sha256
+    {
+        return Err(CliFailure::new(2, "canary worker custody binding mismatch"));
+    }
+    let mut executor = ProductionParallelProofCanaryExecutor::new(
+        DigestPinnedCanaryProtocolRunner::new(activation.adapter.clone()),
+        &activation.adapter,
+        proof,
+        &invocation.policy,
+        invocation.correlation_id.clone(),
+    )
+    .map_err(|error| canary_failure(&error))?;
+    let evidence_store =
+        PulpMacCanaryEvidenceStore::open(state_dir.join("parallel-proof-canary").join("evidence"))
+            .map_err(|error| canary_failure(&error))?;
+    let PulpMacCanaryDriverOutcome::Recorded { evidence, .. } = drive_pulp_mac_canary(
+        proof,
+        &invocation.policy,
+        &invocation.timing,
+        invocation.correlation_id,
+        &mut executor,
+        &evidence_store,
+    )
+    .map_err(|error| canary_failure(&error))?
+    else {
+        return Err(CliFailure::new(
+            2,
+            "canary worker did not produce admitted evidence",
+        ));
+    };
+    let observed_cache_generations = evidence
+        .receipt
+        .caches
+        .iter()
+        .map(|cache| cache.generation.clone())
+        .collect::<Vec<_>>();
+    if evidence.receipt.builder_session_generation != *builder_session_generation
+        || evidence.receipt.worker_session_generation != *worker_session_generation
+        || authority_digest(&observed_cache_generations)? != *cache_authority_sha256
+        || authority_digest(&evidence.pre_execution_host_observations)? != *storage_authority_sha256
+    {
+        return Err(CliFailure::new(2, "canary worker observed authority drift"));
+    }
+    let receipt = &evidence.receipt;
+    let observation = DistributedExecutionObservation {
+        delivery: ArtifactDeliveryObservation {
+            mode: receipt.delivery_mode,
+            artifact_bytes_total: receipt.artifact_bytes_total,
+            artifact_bytes_reused: receipt.artifact_bytes_reused,
+            artifact_bytes_transferred: receipt.artifact_bytes_transferred,
+            interruption: evidence.interrupted_transfer.clone(),
+        },
+        setup_ms: receipt.setup_ms,
+        transfer_ms: receipt.transfer_ms,
+        verification_ms: receipt.verification_ms,
+        dispatch_ms: receipt.dispatch_ms,
+        shard_execution_ms: receipt.shard_execution_ms,
+        worker_active_ms: receipt.worker_active_ms,
+        submit_to_receipt_ms: receipt.submit_to_receipt_ms,
+        caches: receipt
+            .caches
+            .iter()
+            .map(|cache| ObservedCacheUse {
+                generation: cache.generation.clone(),
+                usage: cache.usage,
+            })
+            .collect(),
+    };
+    store
+        .record_artifact(
+            job_id,
+            &crate::parallel_proof_canary_job::CanaryJobResponse {
+                schema_version: snapshot.job.success.artifact_schema_version,
+                operation_sha256: snapshot
+                    .job
+                    .operation
+                    .digest()
+                    .map_err(|error| canary_failure(&error))?,
+                job_sha256: snapshot
+                    .job
+                    .digest()
+                    .map_err(|error| canary_failure(&error))?,
+                launch_nonce_sha256: process.launch_nonce_sha256.clone(),
+                observation,
+            },
+        )
+        .map_err(|error| canary_failure(&error))
+}
+
+fn authority_digest(
+    value: &impl Serialize,
+) -> Result<crate::parallel_proof::Sha256Digest, CliFailure> {
+    serde_json::to_vec(value)
+        .map(|bytes| crate::parallel_proof::Sha256Digest::of_bytes(&bytes))
+        .map_err(|error| CliFailure::new(2, error.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -246,6 +489,20 @@ pub(super) fn parallel_proof_canary_command<W: std::io::Write>(
             "parallel-proof canary apply authority does not match the exact request",
         ));
     }
+    if invocation.custody.release_sha256
+        != authority_digest(&(
+            &invocation.manifest.build,
+            &invocation.manifest.artifact,
+            &invocation.manifest.trust,
+        ))?
+        || invocation.custody.cache_authority_sha256
+            != authority_digest(&invocation.policy.required_cache_generations)?
+    {
+        return Err(CliFailure::new(
+            2,
+            "parallel-proof canary release or cache authority does not match the request",
+        ));
+    }
     let daemon_status = crate::daemon_ipc::read_daemon_status(state_dir).ok_or_else(|| {
         CliFailure::new(
             3,
@@ -272,6 +529,10 @@ pub(super) fn parallel_proof_canary_command<W: std::io::Write>(
     crate::writer_domain_lease::ensure_protected_dir_all(&store_parent)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let custody = &invocation.custody;
+    let worker_executable_sha256 = crate::parallel_proof_canary_job_adapter::executable_digest(
+        &std::env::current_exe().map_err(|error| CliFailure::new(1, error.to_string()))?,
+    )
+    .map_err(|error| CliFailure::new(1, error))?;
     let manifest_sha256 = invocation
         .manifest
         .digest(&invocation.inventory, &invocation.plan)
@@ -302,6 +563,7 @@ pub(super) fn parallel_proof_canary_command<W: std::io::Write>(
             artifact_bytes_total: invocation.manifest.artifact.size_bytes,
             invocation_authority_sha256,
             adapter_executable_sha256: activation.adapter.executable_sha256.clone(),
+            worker_executable_sha256,
         },
         approved_at_ms: custody.approved_at_ms,
         deadline_at_ms: custody.deadline_at_ms,

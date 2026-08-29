@@ -102,6 +102,8 @@ pub struct IpcState {
     /// Repositories the daemon is configured to watch, independent of whether
     /// webhook registration has currently succeeded.
     pub configured_repos: Vec<String>,
+    /// Exact optional daemon lanes fully available in this process.
+    pub capabilities: Vec<String>,
     /// Rate-limit snapshot if known.
     pub rate_limit: Option<Value>,
     /// Redacted durable-continuation lane state.
@@ -445,6 +447,7 @@ fn status_frame(state: &IpcState) -> Value {
         "last_event_at": state.last_event_at,
         "registered_repos": state.registered_repos,
         "configured_repos": state.configured_repos,
+        "capabilities": state.capabilities,
         "rate_limit": state.rate_limit,
         "workstream_continuation": state.workstream_continuation,
         "actionable_wake_producer": state.actionable_wake_producer,
@@ -612,6 +615,7 @@ mod tests {
             last_event_at: None,
             registered_repos: vec!["org/repo".to_owned()],
             configured_repos: vec!["org/repo".to_owned(), "org/pending".to_owned()],
+            capabilities: Vec::new(),
             rate_limit: None,
             workstream_continuation:
                 crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
@@ -638,6 +642,22 @@ mod tests {
         );
         let encoded = frame.to_string();
         assert!(!encoded.contains("wake-") && !encoded.contains("route-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_capability_is_absent_by_default_and_exact_when_available() {
+        assert_eq!(
+            super::status_frame(&dummy_state())["capabilities"],
+            json!([])
+        );
+        let mut present = dummy_state();
+        present.capabilities =
+            vec![crate::parallel_proof_canary_job_adapter::DAEMON_CANARY_JOB_CAPABILITY.to_owned()];
+        assert_eq!(
+            super::status_frame(&present)["capabilities"],
+            json!(["parallel_proof_canary_job_v1"])
+        );
     }
 
     #[cfg(unix)]

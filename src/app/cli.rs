@@ -57,6 +57,16 @@ pub(super) enum Command {
         #[arg(long)]
         generation: String,
     },
+    /// Internal daemon-owned typed parallel-proof canary worker.
+    #[command(name = "parallel-proof-canary-worker", hide = true)]
+    ParallelProofCanaryWorker {
+        /// Exact durable canary job identifier.
+        #[arg(long)]
+        job_id: String,
+        /// Immutable launch generation used for receipt fencing.
+        #[arg(long)]
+        generation: String,
+    },
     /// Print the resolved runtime paths for the selected mode.
     Paths,
     /// Show or bump a consumer repo's Shipyard version pin.
