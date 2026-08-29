@@ -15,7 +15,7 @@ use crate::parallel_proof_canary::{
 };
 
 /// Current immutable measurement-receipt schema.
-pub const PULP_MAC_CANARY_MEASUREMENT_SCHEMA: u32 = 1;
+pub const PULP_MAC_CANARY_MEASUREMENT_SCHEMA: u32 = 2;
 const MINIMUM_SAVINGS_MS: u64 = 120_000;
 const MINIMUM_SAVINGS_PERCENT: u64 = 10;
 const MAX_OVERHEAD_PERCENT: u64 = 15;
@@ -52,11 +52,8 @@ pub struct CanaryCacheMeasurement {
     pub generation: CanaryCacheGeneration,
     /// Whether this execution consumed the generation.
     pub usage: CacheUse,
-    /// Untrusted diagnostic claim of bytes avoided by this generation.
-    ///
-    /// This value is retained for later reconciliation but is not a measured
-    /// promotion metric until a controller-owned cache measurement receipt is
-    /// defined and linked.
+    /// Reserved untrusted diagnostic field; canonical receipts require zero.
+    /// Actual transfer counters are recorded separately by the controller.
     pub claimed_bytes_avoided: u64,
 }
 
@@ -478,8 +475,7 @@ impl PulpMacCanaryMeasurementReceipt {
     }
 
     /// Total untrusted diagnostic claim of bytes avoided by cache reuse.
-    ///
-    /// `meets_speed_gate` deliberately ignores this value.
+    /// Canonical controller receipts require this to remain zero.
     pub fn claimed_cache_bytes_avoided(&self) -> Result<u64, ParallelProofError> {
         checked_sum(
             self.caches.iter().map(|cache| cache.claimed_bytes_avoided),
@@ -576,7 +572,7 @@ fn validate_input(
     validate_cache_measurements(&input.caches, Some(&worker.cache_generations))
 }
 
-fn validate_correlation_id(value: &str) -> Result<(), ParallelProofError> {
+pub(crate) fn validate_correlation_id(value: &str) -> Result<(), ParallelProofError> {
     if value.is_empty()
         || value.len() > MAX_CORRELATION_ID_BYTES
         || !value
@@ -688,8 +684,7 @@ fn validate_cache_measurements(
         || caches.iter().any(|cache| {
             !valid_label(&cache.generation.name)
                 || !valid_label(&cache.generation.generation)
-                || (cache.usage == CacheUse::Hit && cache.claimed_bytes_avoided == 0)
-                || (cache.usage == CacheUse::PresentUnused && cache.claimed_bytes_avoided != 0)
+                || cache.claimed_bytes_avoided != 0
         })
     {
         return Err(ParallelProofError::InvalidField(
@@ -884,7 +879,7 @@ mod tests {
             caches: vec![CanaryCacheMeasurement {
                 generation: cache(),
                 usage: CacheUse::Hit,
-                claimed_bytes_avoided: 5_000,
+                claimed_bytes_avoided: 0,
             }],
             model_calls: 0,
         }
@@ -909,7 +904,7 @@ mod tests {
         let fixture = fixture();
         let receipt = receipt(&fixture, input(&fixture)).expect("receipt");
         assert_eq!(receipt.cache_hit_counts(), (1, 1));
-        assert_eq!(receipt.claimed_cache_bytes_avoided().expect("bytes"), 5_000);
+        assert_eq!(receipt.claimed_cache_bytes_avoided().expect("bytes"), 0);
         assert_eq!(receipt.transport_overhead_ms(), 70_000);
         assert!(receipt.meets_speed_gate());
         assert!(!receipt.satisfies_merge_readiness());
@@ -1032,31 +1027,12 @@ mod tests {
             ))
         ));
 
-        let mut overflow = receipt(&fixture, input(&fixture)).expect("receipt");
-        overflow.caches = vec![
-            CanaryCacheMeasurement {
-                generation: CanaryCacheGeneration {
-                    name: "a".to_owned(),
-                    generation: "one".to_owned(),
-                    sha256: digest("a"),
-                },
-                usage: CacheUse::Hit,
-                claimed_bytes_avoided: u64::MAX,
-            },
-            CanaryCacheMeasurement {
-                generation: CanaryCacheGeneration {
-                    name: "b".to_owned(),
-                    generation: "one".to_owned(),
-                    sha256: digest("b"),
-                },
-                usage: CacheUse::Hit,
-                claimed_bytes_avoided: 1,
-            },
-        ];
+        let mut untrusted_claim = receipt(&fixture, input(&fixture)).expect("receipt");
+        untrusted_claim.caches[0].claimed_bytes_avoided = 1;
         assert!(matches!(
-            overflow.validate(),
+            untrusted_claim.validate(),
             Err(ParallelProofError::InvalidField(
-                "claimed cache bytes avoided"
+                "canary cache measurements"
             ))
         ));
     }
@@ -1099,14 +1075,14 @@ mod tests {
             ))
         ));
 
-        let original = receipt(&fixture, input(&fixture)).expect("receipt");
         let mut different_claim = input(&fixture);
         different_claim.caches[0].claimed_bytes_avoided = 1;
-        let different_claim = receipt(&fixture, different_claim).expect("receipt");
-        assert_eq!(
-            original.meets_speed_gate(),
-            different_claim.meets_speed_gate()
-        );
+        assert!(matches!(
+            receipt(&fixture, different_claim),
+            Err(ParallelProofError::InvalidField(
+                "canary cache measurements"
+            ))
+        ));
     }
 
     #[test]

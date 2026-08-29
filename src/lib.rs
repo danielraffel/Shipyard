@@ -91,6 +91,8 @@ pub mod output;
 pub mod parallel_proof;
 /// Default-off admission policy for the first Pulp macOS sharding canary.
 pub mod parallel_proof_canary;
+/// Default-off controller driver for measured Pulp macOS shadow receipts.
+pub mod parallel_proof_canary_driver;
 /// Immutable measurement receipts for the default-off Pulp macOS sharding canary.
 pub mod parallel_proof_canary_receipt;
 /// Default-off one-host build-once consumption proof for the Pulp M3 shadow canary.
