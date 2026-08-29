@@ -50,6 +50,13 @@ fn private_launch_path(command: &str) -> Option<PathBuf> {
 }
 
 impl CmuxRunner for FakeRunner {
+    fn verify_subrouter(
+        &mut self,
+        _request: &ProviderWrapperRequestV1,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+
     fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
         self.bound_endpoints.push(endpoint.clone());
         self.verification.take().unwrap_or(Ok(()))
@@ -211,6 +218,7 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
                 "model_reasoning_effort=\"medium\"".to_owned(),
                 "native-session-a".to_owned(),
             ],
+            executable_sha256: "9".repeat(64),
             environment: std::collections::BTreeMap::from([
                 (
                     format!("SUBROUTER_{}_ACCOUNT_ID", provider.to_ascii_uppercase()),
@@ -636,6 +644,33 @@ fn private_launch_capsule_sets_route_environment_and_deletes_itself() {
     assert!(observed.starts_with("account-a\nqwen\nresume\n"));
     assert!(observed.contains("native-session-a"));
     assert!(observed.contains("Resume tracked workstream GEN-43"));
+}
+
+#[cfg(unix)]
+#[test]
+fn subrouter_executable_is_digest_pinned_and_permission_checked() {
+    let scope = tempfile::tempdir().unwrap();
+    let executable = scope.path().join("subrouter");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut request = request("qwen", ProviderWrapperOperationV1::Submit);
+    request.protected_route.argv[0] = executable.to_string_lossy().into_owned();
+    request.protected_route.executable_sha256 =
+        hex::encode(Sha256::digest(std::fs::read(&executable).unwrap()));
+    verify_subrouter_executable(&request).expect("exact executable");
+
+    std::fs::write(&executable, b"#!/bin/sh\nexit 1\n").unwrap();
+    assert_eq!(
+        verify_subrouter_executable(&request),
+        Err("subrouter-executable-drift")
+    );
+    request.protected_route.executable_sha256 =
+        hex::encode(Sha256::digest(std::fs::read(&executable).unwrap()));
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o722)).unwrap();
+    assert_eq!(
+        verify_subrouter_executable(&request),
+        Err("subrouter-executable-untrusted")
+    );
 }
 
 #[test]

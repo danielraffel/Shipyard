@@ -30,6 +30,8 @@ pub(crate) struct LaunchProfileV1 {
     pub(super) schema_version: u32,
     pub(super) launch_argv: Vec<String>,
     pub(super) resume_argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) subrouter_executable_sha256: Option<String>,
     /// Private Subrouter routing headers/environment restored with either argv.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) route_environment: BTreeMap<String, String>,
@@ -52,6 +54,12 @@ impl LaunchProfileV1 {
     }
 
     pub(crate) fn validate_native_fresh_agent_grammar(&self) -> Result<(), CliFailure> {
+        if self.subrouter_executable_sha256.is_none() {
+            return Err(CliFailure::new(
+                1,
+                "native fresh-agent route requires a pinned Subrouter executable",
+            ));
+        }
         if let Some(model_id) = self.provider.model.as_deref() {
             validate_provider_option("model ID", model_id)?;
         }
@@ -66,6 +74,7 @@ impl LaunchProfileV1 {
     ) -> crate::provider_wrapper::ProtectedProviderRouteV1 {
         crate::provider_wrapper::ProtectedProviderRouteV1 {
             argv: self.resume_argv.clone(),
+            executable_sha256: self.subrouter_executable_sha256.clone().unwrap_or_default(),
             environment: self.route_environment.clone(),
             account_id: self.provider.account.clone(),
             native_session_id: self
@@ -242,6 +251,9 @@ pub(super) fn validate_launch_profile(profile: &LaunchProfileV1) -> Result<(), C
     }
     validate_argv("launch", &profile.launch_argv)?;
     validate_argv("resume", &profile.resume_argv)?;
+    if let Some(digest) = profile.subrouter_executable_sha256.as_deref() {
+        validate_sha256("Subrouter executable digest", digest)?;
+    }
     validate_route_environment(profile)?;
     validate_metadata("provider ID", &profile.provider.provider)?;
     if let Some(account_id) = profile.provider.account.as_deref() {
@@ -663,6 +675,7 @@ mod tests {
                 "--resume".into(),
                 "session-7".into(),
             ],
+            subrouter_executable_sha256: Some("9".repeat(64)),
             route_environment: BTreeMap::from([(
                 "SUBROUTER_SUBSCRIPTION_ROUTER_ACCOUNT_ID".into(),
                 "account-a".into(),
@@ -953,9 +966,14 @@ mod tests {
             .as_object_mut()
             .expect("profile object")
             .remove("route_environment");
+        value
+            .as_object_mut()
+            .expect("profile object")
+            .remove("subrouter_executable_sha256");
         let mut decoded: LaunchProfileV1 = serde_json::from_value(value).expect("legacy decode");
         validate_launch_profile(&decoded).expect("legacy profile remains valid");
         assert!(decoded.route_environment.is_empty());
+        assert!(decoded.subrouter_executable_sha256.is_none());
         assert!(decoded.validate_native_fresh_agent_grammar().is_err());
         assert!(!FreshAgentLaunchProfile::permits_fresh_agent(&decoded));
         decoded.recovery_policy = RecoveryPolicyV1::FreshCheckpointOnly;

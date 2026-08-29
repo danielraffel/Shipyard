@@ -146,6 +146,7 @@ struct CommandResult {
 }
 
 trait CmuxRunner {
+    fn verify_subrouter(&mut self, request: &ProviderWrapperRequestV1) -> Result<(), &'static str>;
     fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure>;
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure>;
     fn provider_process_presence(
@@ -169,6 +170,10 @@ struct ProductionCmuxRunner {
 }
 
 impl CmuxRunner for ProductionCmuxRunner {
+    fn verify_subrouter(&mut self, request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
+        verify_subrouter_executable(request)
+    }
+
     fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
         verify_authorized_cmux(endpoint)?;
         self.endpoint = Some(endpoint.clone());
@@ -270,6 +275,13 @@ fn handle_request(
         };
         return response(request, outcome);
     }
+    if let Err(code) = runner.verify_subrouter(request) {
+        let outcome = match request.operation {
+            ProviderWrapperOperationV1::Submit => rejected(code),
+            ProviderWrapperOperationV1::Reconcile => uncertain(code),
+        };
+        return response(request, outcome);
+    }
     match runner.bind(&request.cmux_endpoint) {
         #[cfg(any(target_os = "macos", test))]
         Err(RunnerFailure::Untrusted) => {
@@ -348,6 +360,51 @@ fn handle_request(
             Err(code) => uncertain(code),
         },
     )
+}
+
+#[cfg(unix)]
+fn verify_subrouter_executable(request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
+    const MAX_SUBROUTER_BYTES: u64 = 128 * 1024 * 1024;
+    let path = Path::new(&request.protected_route.argv[0]);
+    let mut executable = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(path)
+        .map_err(|_| "subrouter-executable-unavailable")?;
+    let before = executable
+        .metadata()
+        .map_err(|_| "subrouter-executable-untrusted")?;
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    if !before.is_file()
+        || (before.uid() != 0 && before.uid() != effective_uid)
+        || before.nlink() != 1
+        || before.len() == 0
+        || before.len() > MAX_SUBROUTER_BYTES
+        || before.mode() & 0o111 == 0
+        || before.mode() & 0o022 != 0
+    {
+        return Err("subrouter-executable-untrusted");
+    }
+    let mut hasher = Sha256::new();
+    let copied = std::io::copy(&mut executable, &mut HashWriter(&mut hasher))
+        .map_err(|_| "subrouter-executable-unreadable")?;
+    let after = executable
+        .metadata()
+        .map_err(|_| "subrouter-executable-untrusted")?;
+    if copied != before.len()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || hex::encode(hasher.finalize()) != request.protected_route.executable_sha256
+    {
+        return Err("subrouter-executable-drift");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_subrouter_executable(_: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
+    Err("subrouter-executable-verification-unavailable")
 }
 
 fn reconcile_existing_workspace(

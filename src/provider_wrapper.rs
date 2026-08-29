@@ -157,6 +157,8 @@ pub(crate) struct CmuxEndpointV1 {
 pub(crate) struct ProtectedProviderRouteV1 {
     /// Exact Subrouter resume argv. The adapter appends only Shipyard's prompt.
     pub(crate) argv: Vec<String>,
+    /// Digest of the exact Subrouter executable accepted by the profile.
+    pub(crate) executable_sha256: String,
     /// Exact private routing headers/environment from the protected profile.
     pub(crate) environment: BTreeMap<String, String>,
     /// Selected Subrouter account, retained only inside the protected request.
@@ -511,6 +513,7 @@ fn validate_protected_route(
     const MAX_ROUTE_ENVIRONMENT: usize = 16;
 
     let route = &request.protected_route;
+    validate_digest(&route.executable_sha256)?;
     validate_digest(&route.profile_digest)?;
     if route.profile_digest != request.delivery_fence.payload_digest
         || route.argv.len() < 3
@@ -1304,6 +1307,7 @@ mod tests {
                     "model_reasoning_effort=\"medium\"".into(),
                     "session-1".into(),
                 ],
+                executable_sha256: "9".repeat(64),
                 environment: BTreeMap::new(),
                 account_id: None,
                 native_session_id: "session-1".into(),

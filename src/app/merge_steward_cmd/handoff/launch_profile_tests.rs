@@ -122,6 +122,7 @@ fn profile(resume_flag: &str) -> LaunchProfileV1 {
             resume_flag.into(),
             "provider-session-7".into(),
         ],
+        subrouter_executable_sha256: Some("9".repeat(64)),
         route_environment: std::collections::BTreeMap::from([(
             "SUBROUTER_OPAQUE_PROVIDER_ACCOUNT_ID".into(),
             "subscription-a".into(),
