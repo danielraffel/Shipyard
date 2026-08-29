@@ -2258,6 +2258,19 @@ mod tests {
 
     #[test]
     fn cancel_json_requests_running_job_cancellation_without_freeing_capacity() {
+        // Rust's test harness uses a smaller worker stack than the CLI process.
+        // This path exercises the large top-level command enum plus a running
+        // job snapshot, so run it with the normal executable-sized stack.
+        std::thread::Builder::new()
+            .name("cancel-running-json".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(cancel_json_requests_running_job_cancellation_inner)
+            .expect("spawn cancellation test")
+            .join()
+            .expect("cancellation test panicked");
+    }
+
+    fn cancel_json_requests_running_job_cancellation_inner() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
