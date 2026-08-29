@@ -4,9 +4,10 @@ use super::*;
 #[test]
 fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     let codex = request("codex", ProviderWrapperOperationV1::Submit);
+    let subrouter = native_absolute_test_path("subrouter");
     let codex_body =
         launch_command(&codex, Path::new(&codex.protected_route.argv[0]), false).unwrap();
-    assert!(codex_body.starts_with("export 'SUBROUTER_CODEX_ACCOUNT_ID=account-a'\nexport 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test'\nexec '/opt/subrouter' 'codex' '--model'"));
+    assert!(codex_body.starts_with(&format!("export 'SUBROUTER_CODEX_ACCOUNT_ID=account-a'\nexport 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test'\nexec '{subrouter}' 'codex' '--model'")));
     assert!(!codex_body.contains("'resume'"));
     assert!(!codex_body.contains("'native-session-a'"));
     assert!(!codex_body.contains("cmux-codex-wrapper"));
@@ -32,7 +33,7 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
         "account-a",
         "agent@example.test",
         "native-session-a",
-        "/opt/subrouter",
+        &subrouter,
     ] {
         assert!(!public_response.contains(private));
     }
@@ -41,7 +42,7 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     claude.launch_options.model_id = Some("fable".to_owned());
     claude.launch_options.reasoning_effort = Some(ProviderReasoningEffortV1::High);
     claude.protected_route.argv = vec![
-        "/opt/subrouter".into(),
+        subrouter.clone(),
         "claude".into(),
         "--model".into(),
         "fable".into(),
@@ -51,7 +52,7 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
         "native-session-a".into(),
     ];
     claude.protected_route.fresh_argv = vec![
-        "/opt/subrouter".into(),
+        subrouter.clone(),
         "claude".into(),
         "--model".into(),
         "fable".into(),
@@ -60,7 +61,7 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     ];
     let claude_body =
         launch_command(&claude, Path::new(&claude.protected_route.argv[0]), false).unwrap();
-    assert!(claude_body.contains("exec '/opt/subrouter' 'claude' '--model' 'fable'"));
+    assert!(claude_body.contains(&format!("exec '{subrouter}' 'claude' '--model' 'fable'")));
     assert!(!claude_body.contains("cmux-claude-wrapper"));
 }
 
@@ -81,6 +82,7 @@ fn production_subrouter_launch_refuses_without_unix_custody() {
 #[test]
 fn cmux_transport_choice_is_orthogonal_to_subrouter_provider_route() {
     let request = request("claude", ProviderWrapperOperationV1::Submit);
+    let subrouter = native_absolute_test_path("subrouter");
     let expected_terminal = request.terminal_endpoint.clone();
     let mut terminal = FakeRunner {
         results: VecDeque::from([
@@ -105,9 +107,9 @@ fn cmux_transport_choice_is_orthogonal_to_subrouter_provider_route() {
     assert_eq!(provider.prepare_calls, 1);
     assert_eq!(
         provider.verified_routes,
-        vec![("/opt/subrouter".to_owned(), "claude".to_owned())]
+        vec![(subrouter.clone(), "claude".to_owned())]
     );
-    assert!(terminal.private_launches[0].contains("exec '/opt/subrouter' 'claude'"));
+    assert!(terminal.private_launches[0].contains(&format!("exec '{subrouter}' 'claude'")));
 }
 
 #[test]
@@ -238,8 +240,8 @@ fn each_request_binds_enumeration_and_mutation_to_its_exact_cmux_endpoint() {
     let first = request("codex", ProviderWrapperOperationV1::Reconcile);
     let mut second = first.clone();
     second.terminal_endpoint = TerminalEndpointV1::Cmux(CmuxEndpointV1 {
-        executable_path: "/test/cmux-b".into(),
-        socket_path: "/test/cmux-b.sock".into(),
+        executable_path: native_absolute_test_path("cmux-b"),
+        socket_path: native_absolute_test_path("cmux-b.sock"),
         signing_team_id: "ABCDEFGHIJ".into(),
     });
     let mut runner = FakeRunner {

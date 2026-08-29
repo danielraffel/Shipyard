@@ -400,7 +400,7 @@ fn safe_absolute_macos_path(path: &Path) -> bool {
     let Some(value) = path.to_str() else {
         return false;
     };
-    path.is_absolute()
+    value.starts_with('/')
         && value != "/"
         && !value.ends_with('/')
         && !value.chars().any(char::is_control)

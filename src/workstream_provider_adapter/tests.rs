@@ -32,7 +32,7 @@ const SESSION_UUID: &str = "323E4567-E89B-12D3-A456-426614174000";
 
 fn native_absolute_test_path(leaf: &str) -> String {
     if cfg!(windows) {
-        format!(r"C:\Shipyard\{leaf}")
+        format!("C:/Shipyard/{leaf}")
     } else {
         format!("/tmp/shipyard/{leaf}")
     }
@@ -279,13 +279,13 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
         adapter_id: ADAPTER_ID.to_owned(),
         delivery_fence: fence,
         terminal_endpoint: TerminalEndpointV1::Cmux(CmuxEndpointV1 {
-            executable_path: "/test/cmux-a".to_owned(),
-            socket_path: "/test/cmux-a.sock".to_owned(),
+            executable_path: native_absolute_test_path("cmux-a"),
+            socket_path: native_absolute_test_path("cmux-a.sock"),
             signing_team_id: "7WLXT3NR37".to_owned(),
         }),
         protected_route: ProtectedProviderRouteV1 {
             argv: vec![
-                "/opt/subrouter".to_owned(),
+                native_absolute_test_path("subrouter"),
                 provider.to_owned(),
                 "resume".to_owned(),
                 "--model".to_owned(),
@@ -295,7 +295,7 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
                 "native-session-a".to_owned(),
             ],
             fresh_argv: vec![
-                "/opt/subrouter".to_owned(),
+                native_absolute_test_path("subrouter"),
                 provider.to_owned(),
                 "--model".to_owned(),
                 "gpt-5.6-sol".to_owned(),

@@ -317,7 +317,7 @@ fn drain_projection_intents<L: ProjectionIntentLedger, I: ProjectionIntentIngres
     report
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::work_ledger::{

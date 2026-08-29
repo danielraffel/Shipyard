@@ -9,9 +9,10 @@ use crate::parallel_proof_canary_remote_cache::{
 };
 
 fn persistent_temp() -> TempDir {
+    let current = std::env::current_dir().unwrap().canonicalize().unwrap();
     tempfile::Builder::new()
         .prefix(".shipyard-cache-test-")
-        .tempdir_in(std::env::current_dir().unwrap())
+        .tempdir_in(current)
         .unwrap()
 }
 

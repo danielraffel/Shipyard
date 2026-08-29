@@ -317,7 +317,7 @@ fn validate_target(repo: &str, pr: u64, head_sha: &str) -> WorkLedgerResult<()> 
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 

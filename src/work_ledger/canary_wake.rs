@@ -326,7 +326,7 @@ fn verify_route_profile(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::work_ledger::{

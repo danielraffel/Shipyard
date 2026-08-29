@@ -666,6 +666,14 @@ fn validate_lower_sha256(label: &str, value: &str) -> Result<(), CliFailure> {
 mod tests {
     use super::*;
 
+    fn subrouter_path() -> String {
+        if cfg!(windows) {
+            "C:/Shipyard/subrouter".to_owned()
+        } else {
+            "/opt/subrouter".to_owned()
+        }
+    }
+
     fn profile() -> LaunchProfileV1 {
         LaunchProfileV1 {
             schema_version: 1,
@@ -779,7 +787,7 @@ mod tests {
             BTreeMap::from([("SUBROUTER_CODEX_ACCOUNT_ID".into(), "account-a".into())]);
         codex.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
         codex.launch_argv = vec![
-            "/opt/subrouter".into(),
+            subrouter_path(),
             "codex".into(),
             "--model".into(),
             "model-x".into(),
@@ -787,7 +795,7 @@ mod tests {
             "model_reasoning_effort=\"medium\"".into(),
         ];
         codex.resume_argv = vec![
-            "/opt/subrouter".into(),
+            subrouter_path(),
             "codex".into(),
             "resume".into(),
             "--model".into(),
@@ -806,7 +814,7 @@ mod tests {
             BTreeMap::from([("SUBROUTER_CLAUDE_ACCOUNT_ID".into(), "account-a".into())]);
         claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::High);
         claude.launch_argv = vec![
-            "/opt/subrouter".into(),
+            subrouter_path(),
             "claude".into(),
             "--model".into(),
             "model-x".into(),
@@ -814,7 +822,7 @@ mod tests {
             "high".into(),
         ];
         claude.resume_argv = vec![
-            "/opt/subrouter".into(),
+            subrouter_path(),
             "claude".into(),
             "--model".into(),
             "model-x".into(),
@@ -841,13 +849,13 @@ mod tests {
         qwen.route_environment =
             BTreeMap::from([("SUBROUTER_QWEN_ACCOUNT_ID".into(), "account-a".into())]);
         qwen.launch_argv = vec![
-            "/opt/subrouter".into(),
+            subrouter_path(),
             "qwen".into(),
             "--model".into(),
             "model-x".into(),
         ];
         qwen.resume_argv = vec![
-            "/opt/subrouter".into(),
+            subrouter_path(),
             "qwen".into(),
             "resume".into(),
             "--model".into(),
@@ -878,13 +886,13 @@ mod tests {
         qwen.route_environment =
             BTreeMap::from([("SUBROUTER_QWEN_ACCOUNT_ID".into(), "account-a".into())]);
         qwen.launch_argv = vec![
-            "/opt/subrouter".into(),
+            subrouter_path(),
             "qwen".into(),
             "--model".into(),
             "model-x".into(),
         ];
         qwen.resume_argv = vec![
-            "/opt/subrouter".into(),
+            subrouter_path(),
             "qwen".into(),
             "resume".into(),
             "--model".into(),

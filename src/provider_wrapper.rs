@@ -1429,7 +1429,7 @@ mod tests {
             }),
             protected_route: ProtectedProviderRouteV1 {
                 argv: vec![
-                    "/opt/subrouter".into(),
+                    native_absolute_test_path("subrouter"),
                     "codex".into(),
                     "resume".into(),
                     "--model".into(),
@@ -1439,7 +1439,7 @@ mod tests {
                     "session-1".into(),
                 ],
                 fresh_argv: vec![
-                    "/opt/subrouter".into(),
+                    native_absolute_test_path("subrouter"),
                     "codex".into(),
                     "--model".into(),
                     "gpt-5.6-sol".into(),

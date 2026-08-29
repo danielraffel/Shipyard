@@ -21,7 +21,7 @@ use command::{local_update_command, remote_update_command, render_host_result, r
 
 #[cfg(all(test, unix))]
 use evidence::execute_plan_with_timeout;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use evidence::{
     AuthSupportEvidence, BinaryEvidence, BinaryPairEvidence, SourceIdentityBasis,
     SupportFileEvidence,
@@ -31,7 +31,7 @@ use release_authority::{
     GitHubReleaseAuthorityVerifier, ReleaseAuthority, ReleaseAuthorityVerifier,
 };
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
 use super::CliFailure;
@@ -130,6 +130,12 @@ pub(super) fn fleet_update_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    if cfg!(not(unix)) {
+        return Err(CliFailure::new(
+            1,
+            "fleet-update requires a Unix rollout controller",
+        ));
+    }
     let target = normalize_exact_tag(&args.to)?;
     // Fleet mutation topology is machine policy. Never let a repository's
     // tracked overlay select SSH destinations or executable paths.
@@ -160,6 +166,43 @@ pub(super) fn fleet_update_command<W: Write>(
     }
 
     apply_plans(&plans, &target, json, stdout, execute_plan)
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use super::*;
+
+    #[test]
+    fn fleet_update_refuses_before_loading_or_mutating_machine_state() {
+        let temp = tempfile::tempdir().expect("temp");
+        let global_dir = temp.path().join("global");
+        let state_dir = temp.path().join("state");
+        let paths = RuntimePaths::current_with_overrides(
+            RuntimeMode::Shipyard,
+            Some(global_dir.clone()),
+            Some(state_dir.clone()),
+        );
+        let args = FleetUpdateArgs {
+            to: "v0.127.4".to_owned(),
+            host_classes: vec!["m1".to_owned()],
+            all_hosts: false,
+            apply: true,
+        };
+        let mut output = Vec::new();
+        let error = fleet_update_command(
+            &args,
+            RuntimeMode::Shipyard,
+            temp.path(),
+            &paths,
+            true,
+            &mut output,
+        )
+        .expect_err("non-Unix fleet mutation must fail closed");
+        assert!(error.message.contains("requires a Unix rollout controller"));
+        assert!(output.is_empty());
+        assert!(!global_dir.exists());
+        assert!(!state_dir.exists());
+    }
 }
 
 fn select_host_classes<'a>(
@@ -618,12 +661,12 @@ fn transaction_marker_paths(path: &Path) -> [PathBuf; 2] {
     [marker(".shipyard-rollback"), marker(".shipyard-was-absent")]
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdatePlan, CliFailure> {
     host_update_plan_with_authority(class, target, &test_release_authority(target))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn test_release_authority(tag: &str) -> ReleaseAuthority {
     use release_authority::ReleaseAssetAuthority;
 

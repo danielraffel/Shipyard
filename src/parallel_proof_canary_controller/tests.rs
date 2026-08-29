@@ -155,6 +155,7 @@ fn remote_cache_authority(
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn strict_ssh_observer_uses_only_explicit_read_only_authority() {
     let temp = TempDir::new().unwrap();
@@ -222,6 +223,32 @@ fn strict_ssh_observer_uses_only_explicit_read_only_authority() {
     );
     assert!(!rendered.iter().any(|arg| arg.contains("accept-new")));
     assert!(!rendered.iter().any(|arg| arg == "--execute"));
+}
+
+#[cfg(not(unix))]
+#[test]
+fn strict_ssh_observer_refuses_without_unix_authority() {
+    let temp = TempDir::new().unwrap();
+    let known_hosts = temp.path().join("known_hosts");
+    let identity = temp.path().join("identity");
+    fs::write(&known_hosts, "m1-lan ssh-ed25519 AAAATEST\n").unwrap();
+    fs::write(&identity, "private-test-key").unwrap();
+    let target = StrictSshCanaryTarget::new(
+        std::env::current_exe().expect("current executable"),
+        "m1-lan",
+        &known_hosts,
+        &identity,
+        22,
+    )
+    .unwrap();
+    let result = target.prepare_remote_command("/usr/bin/true", &[]);
+    let Err(error) = result else {
+        panic!("non-Unix strict SSH authority must fail closed");
+    };
+    assert!(matches!(
+        error,
+        CanaryObserverError::InvalidConfiguration(_)
+    ));
 }
 
 #[test]

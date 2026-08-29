@@ -6,6 +6,14 @@ use super::*;
 use crate::config::LocalOverlaySource;
 use crate::transition_projection::{ProjectionEvidence, TransitionKind};
 
+fn inert_executable() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from("C:/Windows/System32/where.exe")
+    } else {
+        PathBuf::from("/bin/false")
+    }
+}
+
 fn draft(receipt: &[u8], sequence: u64, kind: TransitionKind) -> TransitionDraft {
     TransitionDraft {
         workstream_id: "GEN-14".to_owned(),
@@ -78,7 +86,7 @@ fn protected_config_ignores_overlays_and_rejects_secret_argv() {
     fs::write(&secret, b"not-read-at-config-time").unwrap();
     fs::write(
         temp.path().join("config.toml"),
-        policy(Path::new("/bin/false"), &"a".repeat(64), &secret),
+        policy(&inert_executable(), &"a".repeat(64), &secret),
     )
     .unwrap();
     assert!(
@@ -87,7 +95,7 @@ fn protected_config_ignores_overlays_and_rejects_secret_argv() {
             .is_some()
     );
 
-    let over_lease = policy(Path::new("/bin/false"), &"a".repeat(64), &secret)
+    let over_lease = policy(&inert_executable(), &"a".repeat(64), &secret)
         .replace("deadline_seconds = 2", "deadline_seconds = 28");
     fs::write(temp.path().join("config.toml"), over_lease).unwrap();
     assert!(trusted_projection_runner_config(RuntimeMode::Shipyard, temp.path().into()).is_err());
@@ -197,6 +205,7 @@ fn every_allowed_transition_kind_uses_the_same_committed_ingress() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sqlite_intent_drainer_recovers_append_before_mark_idempotently() {
     use crate::work_ledger::{
         RepoPolicy, native_publication_test_policy as native_policy,
@@ -228,7 +237,7 @@ fn sqlite_intent_drainer_recovers_append_before_mark_idempotently() {
     )
     .expect("publication");
     let config = ProjectionRunnerConfig {
-        executable_path: "/bin/false".into(),
+        executable_path: inert_executable(),
         executable_sha256: "a".repeat(64),
         argv: vec!["linear-v1".into()],
         secret_files: BTreeMap::new(),
@@ -269,6 +278,7 @@ fn sqlite_intent_drainer_recovers_append_before_mark_idempotently() {
 }
 
 #[test]
+#[cfg(unix)]
 fn corrupt_workstream_is_quarantined_without_starving_another() {
     use crate::work_ledger::{
         RepoPolicy, native_publication_test_policy as native_policy,

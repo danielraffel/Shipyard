@@ -703,14 +703,16 @@ mod tests {
 
     #[test]
     fn parse_host_classes_reads_only_explicit_absolute_token_helper() {
-        let cfg = table(
-            "[host_class.studio]\ngithub_token_helper = \"/Users/ci/.config/shipyard/bin/shipyard-github-app-token\"\n",
-        );
+        let helper = if cfg!(windows) {
+            "C:/Users/ci/.config/shipyard/bin/shipyard-github-app-token"
+        } else {
+            "/Users/ci/.config/shipyard/bin/shipyard-github-app-token"
+        };
+        let cfg = table(&format!(
+            "[host_class.studio]\ngithub_token_helper = \"{helper}\"\n"
+        ));
         let classes = parse_host_classes(&cfg).expect("parse");
-        assert_eq!(
-            classes[0].github_token_helper.as_deref(),
-            Some("/Users/ci/.config/shipyard/bin/shipyard-github-app-token")
-        );
+        assert_eq!(classes[0].github_token_helper.as_deref(), Some(helper));
         assert!(
             parse_host_classes(&table(
                 "[host_class.studio]\ngithub_token_helper = \"relative/helper\"\n"
