@@ -1287,16 +1287,28 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_pid_eventually_gone(pid: &str, failure_message: &str) {
+    fn assert_pid_eventually_not_running(pid: &str, failure_message: &str) {
+        let pid = pid
+            .trim()
+            .parse::<u32>()
+            .expect("fixture wrote a valid PID");
+        let pid = pid.to_string();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let status = Command::new("kill")
-                .args(["-0", "--", pid.trim()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+            let output = Command::new("/bin/ps")
+                .args(["-o", "state=", "-p", &pid])
+                .output()
                 .unwrap();
-            if !status.success() {
+            let state = String::from_utf8(output.stdout).unwrap();
+            let state = state.trim();
+            if !output.status.success() && state.is_empty() && output.stderr.is_empty() {
+                return;
+            }
+            assert!(output.status.success(), "malformed process-state probe");
+            let Some(state) = state.chars().next() else {
+                panic!("process-state probe returned no state");
+            };
+            if state == 'Z' {
                 return;
             }
             assert!(Instant::now() < deadline, "{failure_message}");
@@ -1512,7 +1524,7 @@ mod tests {
             ProviderWrapperRunResult::Uncertain { .. }
         ));
         let child_pid = fs::read_to_string(directory.path().join("child.pid")).unwrap();
-        assert_pid_eventually_gone(&child_pid, "descendant survived timeout");
+        assert_pid_eventually_not_running(&child_pid, "descendant survived timeout");
 
         let (_directory, path, sha) = wrapper_c(
             "char block[4096] = {0}; for (;;) { if (write(1, block, sizeof(block)) < 0) return 1; }",
@@ -1537,7 +1549,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn timeout_reaps_setsid_descendant_without_pipe_reader_threads() {
+    fn timeout_terminates_setsid_descendant_without_pipe_reader_threads() {
         let request = request(ProviderWrapperOperationV1::Submit);
         let (directory, path, sha) = wrapper_c(
             "pid_t child = fork(); if (child == 0) { setsid(); const char *home = getenv(\"HOME\"); char path[4096]; snprintf(path, sizeof(path), \"%s/detached.pid\", home); FILE *file = fopen(path, \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; } waitpid(child, 0, 0); return 0;",
@@ -1559,12 +1571,12 @@ mod tests {
             "timeout cleanup plus serialized fixture admission wedged"
         );
         let child_pid = fs::read_to_string(directory.path().join("detached.pid")).unwrap();
-        assert_pid_eventually_gone(&child_pid, "setsid descendant survived timeout");
+        assert_pid_eventually_not_running(&child_pid, "setsid descendant survived timeout");
     }
 
     #[cfg(unix)]
     #[test]
-    fn successful_parent_exit_with_setsid_child_is_refused_and_reaped() {
+    fn successful_parent_exit_with_setsid_child_is_refused_and_terminated() {
         let request = request(ProviderWrapperOperationV1::Submit);
         let directory = tempfile::tempdir().unwrap();
         let detached_pid = directory.path().join("detached-success.pid");
@@ -1586,7 +1598,7 @@ mod tests {
         .unwrap();
         assert!(matches!(result, ProviderWrapperRunResult::Uncertain { .. }));
         let child_pid = fs::read_to_string(&detached_pid).unwrap();
-        assert_pid_eventually_gone(
+        assert_pid_eventually_not_running(
             &child_pid,
             "setsid child survived successful wrapper-parent exit",
         );
