@@ -57,6 +57,13 @@ impl CmuxRunner for FakeRunner {
         Ok(())
     }
 
+    fn prepare_private_launch(
+        &mut self,
+        request: &ProviderWrapperRequestV1,
+    ) -> Result<PrivateLaunch, &'static str> {
+        prepare_private_launch(request, false)
+    }
+
     fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
         self.bound_endpoints.push(endpoint.clone());
         self.verification.take().unwrap_or(Ok(()))
@@ -554,11 +561,11 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
 #[test]
 fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     let codex = request("codex", ProviderWrapperOperationV1::Submit);
-    let codex_body = launch_command(&codex).unwrap();
+    let codex_body = launch_command(&codex, Path::new(&codex.protected_route.argv[0])).unwrap();
     assert!(codex_body.starts_with("export 'SUBROUTER_CODEX_ACCOUNT_ID=account-a'\nexport 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test'\nexec '/opt/subrouter' 'codex' 'resume'"));
     assert!(codex_body.contains("'native-session-a'"));
     assert!(!codex_body.contains("cmux-codex-wrapper"));
-    let codex_launch = prepare_private_launch(&codex).unwrap();
+    let codex_launch = prepare_private_launch(&codex, false).unwrap();
     assert!(!codex_launch.command.contains("account-a"));
     assert!(!codex_launch.command.contains("agent@example.test"));
     assert!(!codex_launch.command.contains("native-session-a"));
@@ -598,7 +605,7 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
         "--resume".into(),
         "native-session-a".into(),
     ];
-    let claude_body = launch_command(&claude).unwrap();
+    let claude_body = launch_command(&claude, Path::new(&claude.protected_route.argv[0])).unwrap();
     assert!(claude_body.contains("exec '/opt/subrouter' 'claude' '--model' 'fable'"));
     assert!(!claude_body.contains("cmux-claude-wrapper"));
 }
@@ -628,7 +635,9 @@ fn private_launch_capsule_sets_route_environment_and_deletes_itself() {
             output.to_string_lossy().into_owned(),
         ),
     ]);
-    let private_launch = prepare_private_launch(&request).unwrap();
+    request.protected_route.executable_sha256 =
+        hex::encode(Sha256::digest(std::fs::read(&subrouter).unwrap()));
+    let private_launch = prepare_private_launch(&request, true).unwrap();
     let launch_path = private_launch_path(&private_launch.command).unwrap();
     let launch_directory = launch_path.parent().unwrap().to_path_buf();
     assert!(
@@ -639,6 +648,7 @@ fn private_launch_capsule_sets_route_environment_and_deletes_itself() {
             .success()
     );
     assert!(!launch_path.exists());
+    drop(private_launch);
     assert!(!launch_directory.exists());
     let observed = std::fs::read_to_string(output).unwrap();
     assert!(observed.starts_with("account-a\nqwen\nresume\n"));

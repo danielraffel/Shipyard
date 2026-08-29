@@ -147,6 +147,10 @@ struct CommandResult {
 
 trait CmuxRunner {
     fn verify_subrouter(&mut self, request: &ProviderWrapperRequestV1) -> Result<(), &'static str>;
+    fn prepare_private_launch(
+        &mut self,
+        request: &ProviderWrapperRequestV1,
+    ) -> Result<PrivateLaunch, &'static str>;
     fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure>;
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure>;
     fn provider_process_presence(
@@ -172,6 +176,13 @@ struct ProductionCmuxRunner {
 impl CmuxRunner for ProductionCmuxRunner {
     fn verify_subrouter(&mut self, request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
         verify_subrouter_executable(request)
+    }
+
+    fn prepare_private_launch(
+        &mut self,
+        request: &ProviderWrapperRequestV1,
+    ) -> Result<PrivateLaunch, &'static str> {
+        prepare_private_launch(request, true)
     }
 
     fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
@@ -330,10 +341,11 @@ fn handle_request(
         return response(request, uncertain("reconcile-visibility-not-yet-proven"));
     }
 
-    let (args, private_launch) = match create_args(request, &description) {
-        Ok(prepared) => prepared,
+    let private_launch = match runner.prepare_private_launch(request) {
+        Ok(launch) => launch,
         Err(code) => return response(request, rejected(code)),
     };
+    let (args, private_launch) = create_args(request, &description, private_launch);
     // cmux creates the workspace before it sends `--command` to the surface.
     // From this invocation onward every failure is an ambiguous acceptance.
     let created_result = runner.run(&args);
@@ -466,7 +478,7 @@ fn recover_existing_surface(
     workspace_id: &str,
     surface_id: &str,
 ) -> ProviderWrapperOutcomeV1 {
-    let private_launch = match prepare_private_launch(request) {
+    let private_launch = match runner.prepare_private_launch(request) {
         Ok(launch) => launch,
         Err(code) => return uncertain(code),
     };
@@ -585,8 +597,8 @@ fn cmux_prefix<const N: usize>(tail: [&str; N]) -> Vec<String> {
 fn create_args(
     request: &ProviderWrapperRequestV1,
     description: &str,
-) -> Result<(Vec<String>, PrivateLaunch), &'static str> {
-    let private_launch = prepare_private_launch(request)?;
+    private_launch: PrivateLaunch,
+) -> (Vec<String>, PrivateLaunch) {
     let mut args = cmux_prefix(["workspace", "create"]);
     args.extend([
         "--name".to_owned(),
@@ -603,12 +615,13 @@ fn create_args(
         "--command".to_owned(),
         private_launch.command.clone(),
     ]);
-    Ok((args, private_launch))
+    (args, private_launch)
 }
 
 struct PrivateLaunch {
     command: String,
     route_path: PathBuf,
+    executable_path: PathBuf,
 }
 
 impl Drop for PrivateLaunch {
@@ -618,6 +631,7 @@ impl Drop for PrivateLaunch {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return,
         }
+        let _ = std::fs::remove_file(&self.executable_path);
         if let Some(parent) = self.route_path.parent() {
             let _ = std::fs::remove_dir(parent);
         }
@@ -638,7 +652,10 @@ impl PrivateLaunch {
     }
 }
 
-fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static str> {
+fn launch_command(
+    request: &ProviderWrapperRequestV1,
+    executable_path: &Path,
+) -> Result<String, &'static str> {
     let prompt = format!(
         "Resume tracked workstream {}. First run `shipyard --json work-ledger context-challenge --wake {}` and reconstruct that exact durable context. Write the matching receipt to a private file, then run `shipyard --json work-ledger acknowledge-context --wake {} --receipt <private-path>`. Complete the remaining work and keep Linear current. Before handoff, run `shipyard --json work-ledger return-challenge --ownership <ownership-id>`, write separate reviewed expectation and receipt files proving a newer checkpoint, evidence, and remote acknowledgement, then run `shipyard --json work-ledger return-ownership --ownership <ownership-id> --expectation <private-path> --receipt <private-path>`. Never put receipt JSON or secrets in argv.",
         request.resume_expectation.workstream_handle,
@@ -653,12 +670,17 @@ fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static
             shell_word(&format!("{name}={value}")).map(|word| format!("export {word}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut invocation = request
-        .protected_route
-        .argv
-        .iter()
-        .map(|value| shell_word(value))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut invocation = vec![shell_word(
+        executable_path
+            .to_str()
+            .ok_or("private-launch-path-invalid")?,
+    )?];
+    invocation.extend(
+        request.protected_route.argv[1..]
+            .iter()
+            .map(|value| shell_word(value))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     invocation.push(shell_word(&prompt)?);
     lines.push(format!("exec {}", invocation.join(" ")));
     Ok(lines.join("\n"))
@@ -666,13 +688,21 @@ fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static
 
 fn prepare_private_launch(
     request: &ProviderWrapperRequestV1,
+    snapshot_executable: bool,
 ) -> Result<PrivateLaunch, &'static str> {
-    let body = launch_command(request)?;
     let directory = tempfile::Builder::new()
         .prefix(".shipyard-workstream-route-")
         .tempdir()
         .map_err(|_| "private-launch-directory-unavailable")?;
     let directory_path = directory.path().to_path_buf();
+    let executable_path = directory_path.join("subrouter");
+    let launch_executable = if snapshot_executable {
+        snapshot_subrouter(request, &executable_path)?;
+        executable_path.as_path()
+    } else {
+        Path::new(&request.protected_route.argv[0])
+    };
+    let body = launch_command(request, launch_executable)?;
     let route_path = directory_path.join("launch.sh");
     let mut route = OpenOptions::new()
         .create_new(true)
@@ -685,9 +715,7 @@ fn prepare_private_launch(
             .to_str()
             .ok_or("private-launch-path-invalid")?,
     )?;
-    let prologue = format!(
-        "#!/bin/sh\nset -eu\nroute_dir={directory_word}\nrm -f -- \"$0\"\nrmdir -- \"$route_dir\"\n"
-    );
+    let prologue = format!("#!/bin/sh\nset -eu\nroute_dir={directory_word}\nrm -f -- \"$0\"\n");
     route
         .write_all(prologue.as_bytes())
         .and_then(|()| route.write_all(body.as_bytes()))
@@ -704,7 +732,65 @@ fn prepare_private_launch(
             shell_word(route_path.to_str().ok_or("private-launch-path-invalid")?)?
         ),
         route_path,
+        executable_path,
     })
+}
+
+#[cfg(unix)]
+fn snapshot_subrouter(
+    request: &ProviderWrapperRequestV1,
+    destination: &Path,
+) -> Result<(), &'static str> {
+    let source_path = Path::new(&request.protected_route.argv[0]);
+    let mut source = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(source_path)
+        .map_err(|_| "subrouter-executable-unavailable")?;
+    let before = source
+        .metadata()
+        .map_err(|_| "subrouter-executable-untrusted")?;
+    let mut destination = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o500)
+        .open(destination)
+        .map_err(|_| "subrouter-snapshot-unavailable")?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut copied = 0_u64;
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| "subrouter-executable-unreadable")?;
+        if read == 0 {
+            break;
+        }
+        copied = copied.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|_| "subrouter-snapshot-unwritable")?;
+    }
+    let after = source
+        .metadata()
+        .map_err(|_| "subrouter-executable-untrusted")?;
+    if copied != before.len()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || hex::encode(hasher.finalize()) != request.protected_route.executable_sha256
+    {
+        return Err("subrouter-executable-drift");
+    }
+    destination
+        .sync_all()
+        .map_err(|_| "subrouter-snapshot-unwritable")
+}
+
+#[cfg(not(unix))]
+fn snapshot_subrouter(_: &ProviderWrapperRequestV1, _: &Path) -> Result<(), &'static str> {
+    Err("subrouter-executable-verification-unavailable")
 }
 
 fn sync_directory(path: &Path) -> Result<(), &'static str> {
