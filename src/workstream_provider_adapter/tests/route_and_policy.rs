@@ -221,7 +221,9 @@ fn profile_route_drift_refuses_before_terminal_enumeration() {
         match mutate {
             "digest" => request.protected_route.profile_digest = "f".repeat(64),
             "provider" => request.protected_route.argv[1] = "kimi".into(),
-            "wrapper" => request.protected_route.argv[0] = "/opt/qwen".into(),
+            "wrapper" => {
+                request.protected_route.argv[0] = native_absolute_test_path("qwen");
+            }
             _ => unreachable!(),
         }
         let mut runner = FakeRunner::default();
@@ -270,7 +272,7 @@ fn each_request_binds_enumeration_and_mutation_to_its_exact_cmux_endpoint() {
 fn herdr_shape_never_falls_back_to_cmux_even_with_declared_proofs() {
     let mut request = request("codex", ProviderWrapperOperationV1::Submit);
     request.terminal_endpoint = TerminalEndpointV1::HerdR {
-        socket_path: "/test/herdr.sock".into(),
+        socket_path: native_absolute_test_path("herdr.sock"),
         server_incarnation: Some("server-epoch-1".into()),
         direct_fresh_launch_proven: true,
     };
@@ -401,7 +403,7 @@ fn untrusted_cmux_and_direct_provider_fallback_refuse_before_any_command() {
     assert!(untrusted.calls.is_empty());
 
     let mut unsupported = request("other", ProviderWrapperOperationV1::Submit);
-    unsupported.protected_route.argv[0] = "/opt/other".into();
+    unsupported.protected_route.argv[0] = native_absolute_test_path("other");
     let mut runner = FakeRunner::default();
     let response = handle_with_default_provider(&unsupported, &mut runner);
     assert!(matches!(
@@ -447,7 +449,7 @@ fn reconcile_preflight_failures_preserve_uncertainty() {
     }
 
     let mut unsupported = request("other", ProviderWrapperOperationV1::Reconcile);
-    unsupported.protected_route.argv[0] = "/opt/direct-provider".into();
+    unsupported.protected_route.argv[0] = native_absolute_test_path("direct-provider");
     let mut runner = FakeRunner::default();
     let response = handle_with_default_provider(&unsupported, &mut runner);
     assert!(matches!(
