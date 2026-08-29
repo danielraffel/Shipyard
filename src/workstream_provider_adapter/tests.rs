@@ -40,6 +40,7 @@ struct FakeRunner {
     calls: Vec<Vec<String>>,
     private_launches: Vec<String>,
     provider_process_presence: Option<Result<ProviderProcessPresence, RunnerFailure>>,
+    presence_calls: usize,
 }
 
 fn private_launch_path(command: &str) -> Option<PathBuf> {
@@ -79,6 +80,7 @@ impl CmuxRunner for FakeRunner {
         _native_session_id: &str,
         _provider_id: &str,
     ) -> Result<ProviderProcessPresence, RunnerFailure> {
+        self.presence_calls += 1;
         self.provider_process_presence
             .take()
             .unwrap_or(Ok(ProviderProcessPresence::Absent))
@@ -317,6 +319,7 @@ fn workspace_created_before_agent_hook_session_is_not_accepted() {
         ProviderWrapperOutcomeV1::Uncertain { .. }
     ));
     assert_eq!(runner.calls.len(), 4);
+    assert_eq!(runner.presence_calls, 1);
     assert!(runner.calls.iter().all(|call| {
         call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
     }));
@@ -453,6 +456,7 @@ fn reconciliation_respawns_one_stranded_surface_with_the_exact_private_route() {
     };
     let response = handle_request(&request, &mut runner);
     assert_delivered(&response, "qwen");
+    assert_eq!(runner.presence_calls, 3);
     let respawn = &runner.calls[4];
     assert_eq!(respawn[3], "respawn-pane");
     assert_eq!(

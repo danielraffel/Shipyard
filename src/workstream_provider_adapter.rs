@@ -47,6 +47,10 @@ const COMMAND_DEADLINE: Duration = Duration::from_secs(15);
 const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const PROVIDER_ABSENCE_STABILIZATION: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const PROVIDER_ABSENCE_STABILIZATION: Duration = Duration::ZERO;
 
 /// Read one strict request from stdin and emit exactly one strict response.
 pub fn run_stdio() -> Result<(), String> {
@@ -361,7 +365,8 @@ fn reconcile_existing_workspace(
         [] if request.operation == ProviderWrapperOperationV1::Reconcile
             && state.surface_ids.len() == 1 =>
         {
-            match runner.provider_process_presence(
+            match stable_provider_process_presence(
+                runner,
                 &state.surface_ids[0],
                 &request.protected_route.native_session_id,
                 &request.provider_id,
@@ -378,6 +383,24 @@ fn reconcile_existing_workspace(
         [] => uncertain("cmux-session-binding-not-yet-visible"),
         _ => uncertain("multiple-provider-session-bindings"),
     }
+}
+
+fn stable_provider_process_presence(
+    runner: &mut impl CmuxRunner,
+    surface_id: &str,
+    native_session_id: &str,
+    provider_id: &str,
+) -> Result<ProviderProcessPresence, RunnerFailure> {
+    for observation in 0..3 {
+        match runner.provider_process_presence(surface_id, native_session_id, provider_id)? {
+            ProviderProcessPresence::Present => return Ok(ProviderProcessPresence::Present),
+            ProviderProcessPresence::Absent if observation < 2 => {
+                std::thread::sleep(PROVIDER_ABSENCE_STABILIZATION);
+            }
+            ProviderProcessPresence::Absent => return Ok(ProviderProcessPresence::Absent),
+        }
+    }
+    Err(RunnerFailure::Unavailable)
 }
 
 fn recover_existing_surface(

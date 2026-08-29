@@ -72,8 +72,11 @@ pub(crate) fn observe_provider_on_cmux_surface(
         provider_kind,
     )?;
     for pid in candidate_agent_pids(provider_kind)? {
-        let target = resolve_pid(cli_path, socket_path, pid)
-            .map_err(|_| TerminalCapabilityRefusal::Unobservable)?;
+        let target = match resolve_pid(cli_path, socket_path, pid) {
+            Ok(target) => target,
+            Err(TerminalCapabilityRefusal::NoMatch) => continue,
+            Err(_) => return Err(TerminalCapabilityRefusal::Unobservable),
+        };
         if target.surface_id == surface_id && process_has_argument(pid, native_session_id)? {
             return Ok(ProviderProcessPresence::Present);
         }
