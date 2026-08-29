@@ -2325,6 +2325,19 @@ mod tests {
 
     #[test]
     fn logs_prints_selected_target_log() {
+        // Rust's test harness uses a smaller worker stack than the CLI process.
+        // This path exercises the large top-level command enum plus a populated
+        // target result, so run it with the normal executable-sized stack.
+        std::thread::Builder::new()
+            .name("logs-selected-target".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(logs_prints_selected_target_log_inner)
+            .expect("spawn logs test")
+            .join()
+            .expect("logs test panicked");
+    }
+
+    fn logs_prints_selected_target_log_inner() {
         let temp = tempfile::tempdir().expect("tempdir");
         let log_path = temp.path().join("linux.log");
         std::fs::write(&log_path, "target log\n").expect("write log");
