@@ -19,6 +19,7 @@ use chrono::{Duration, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+use crate::daemon_worker_capacity::{DaemonWorkerCapacity, DaemonWorkerClaim};
 use crate::execution_termination::{TerminationAction, TerminationPhase, TerminationStore};
 use crate::host_pool::{HostPoolLeaseError, HostPoolLeaseStore, default_lease_path};
 use crate::identity::RuntimeMode;
@@ -206,6 +207,7 @@ impl ExecutionSupervisor {
         self.terminate_cancelled_workers()?;
         let unknown_worker = self.reconcile_running()?;
         if !unknown_worker {
+            self.heartbeat_running_worker_capacity()?;
             self.admit_pending()?;
         }
         Ok(())
@@ -685,6 +687,7 @@ impl ExecutionSupervisor {
 
         let pending = queue.get_pending()?;
         let mut selected = Vec::new();
+        let mut selected_capacity = Vec::new();
         let mut selected_native_count = 0usize;
         let mut selected_metadata_count = 0usize;
         let mut cancellations = Vec::new();
@@ -759,6 +762,17 @@ impl ExecutionSupervisor {
             if !admissible(&envelope, &occupied) {
                 continue;
             }
+            if !metadata_controller {
+                let authority = envelope
+                    .provenance
+                    .as_ref()
+                    .map_or("", |provenance| provenance.head_sha.as_str());
+                let claim = DaemonWorkerClaim::queue(&job.id, authority);
+                if !DaemonWorkerCapacity::new(&self.state_dir).claim_or_heartbeat(&claim)? {
+                    continue;
+                }
+                selected_capacity.push(claim);
+            }
             if metadata_controller {
                 selected_metadata_count += 1;
             } else {
@@ -781,8 +795,20 @@ impl ExecutionSupervisor {
         let started = if running_resources.errors.is_empty() {
             queue.start_pending_jobs_for_drain(&lock, &selected)?
         } else {
+            for claim in &selected_capacity {
+                DaemonWorkerCapacity::new(&self.state_dir).release(claim)?;
+            }
             Vec::new()
         };
+        let started_ids = started
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for claim in &selected_capacity {
+            if !started_ids.contains(claim.work_id()) {
+                DaemonWorkerCapacity::new(&self.state_dir).release(claim)?;
+            }
+        }
         for job in started {
             if let Err(error) = self.spawn_worker(&job) {
                 queue.requeue_deferred_running_jobs_for_drain(
@@ -793,6 +819,8 @@ impl ExecutionSupervisor {
                         defer_until: Some(Utc::now() + Duration::seconds(5)),
                     }],
                 )?;
+                DaemonWorkerCapacity::new(&self.state_dir)
+                    .release(&DaemonWorkerClaim::queue(&job.id, ""))?;
             }
         }
         Ok(())
@@ -932,6 +960,40 @@ impl ExecutionSupervisor {
 
     fn release_host_pool_leases(&self, job_id: &str) -> Result<(), SupervisorError> {
         HostPoolLeaseStore::new(default_lease_path(&self.state_dir)).release_for_job(job_id)?;
+        DaemonWorkerCapacity::new(&self.state_dir)
+            .release(&DaemonWorkerClaim::queue(job_id, ""))?;
+        Ok(())
+    }
+
+    fn heartbeat_running_worker_capacity(&self) -> Result<(), SupervisorError> {
+        let request_store = QueueRequestStore::new(&self.state_dir)?;
+        let mut queue = Queue::new(&self.state_dir)?;
+        let capacity = DaemonWorkerCapacity::new(&self.state_dir);
+        let running = queue.get_running()?;
+        capacity
+            .release_inactive_queue_claims(&running.iter().map(|job| job.id.clone()).collect())?;
+        for job in running {
+            let probe = DaemonWorkerClaim::queue(&job.id, "");
+            if capacity.heartbeat_existing(&probe)? {
+                continue;
+            }
+            let authority = match request_store.load(&job.id) {
+                Ok(Some(envelope)) if envelope.is_metadata_authority_controller() => continue,
+                Ok(Some(envelope)) => envelope
+                    .provenance
+                    .as_ref()
+                    .map_or("unknown-running-request", |provenance| {
+                        provenance.head_sha.as_str()
+                    })
+                    .to_owned(),
+                Ok(None) | Err(_) => "unknown-running-request".to_owned(),
+            };
+            if !capacity.claim_or_heartbeat(&DaemonWorkerClaim::queue(&job.id, &authority))? {
+                return Err(SupervisorError::Outcome(
+                    "native worker capacity is owned by another daemon runtime".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 

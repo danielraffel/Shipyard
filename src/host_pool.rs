@@ -304,6 +304,104 @@ impl HostPoolLeaseStore {
         })
     }
 
+    /// Acquire a lease or heartbeat the exact existing logical-job lease.
+    ///
+    /// This is the atomic restart-safe form used by daemon schedulers: an
+    /// exact owner may resume its claim, while a contradictory reuse of the
+    /// same job identity fails closed instead of silently taking capacity.
+    pub(crate) fn acquire_or_heartbeat_exact(
+        &self,
+        request: &HostPoolLeaseRequest,
+    ) -> HostPoolLeaseResult<Option<HostPoolLease>> {
+        self.with_lock(|_| {
+            let now = Utc::now();
+            let mut leases = self.read_leases()?;
+            leases.retain(|lease| !lease.is_stale(now));
+            if let Some(existing) = leases.iter_mut().find(|lease| {
+                lease.job_id == request.job_id && lease.pool_name == request.pool_name
+            }) {
+                if existing.member_id != request.member_id
+                    || existing.target_name != request.target_name
+                    || existing.backend != request.backend
+                    || existing.host != request.host
+                    || existing.branch != request.branch
+                    || existing.sha != request.sha
+                {
+                    return Err(HostPoolLeaseError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "existing lease contradicts exact logical-job authority",
+                    )));
+                }
+                existing.heartbeat_at = now;
+                existing.expires_at = now
+                    + chrono::Duration::seconds(
+                        i64::try_from(request.lease_stale_seconds).unwrap_or(i64::MAX),
+                    );
+                let lease = existing.clone();
+                self.save_leases(&leases)?;
+                return Ok(Some(lease));
+            }
+            let active = leases
+                .iter()
+                .filter(|lease| {
+                    lease.pool_name == request.pool_name && lease.member_id == request.member_id
+                })
+                .count();
+            if active >= request.max_concurrency as usize {
+                self.save_leases(&leases)?;
+                return Ok(None);
+            }
+            let lease = HostPoolLease {
+                lease_id: new_lease_id(now),
+                pool_name: request.pool_name.clone(),
+                member_id: request.member_id.clone(),
+                target_name: request.target_name.clone(),
+                backend: request.backend.clone(),
+                host: request.host.clone(),
+                job_id: request.job_id.clone(),
+                branch: request.branch.clone(),
+                sha: request.sha.clone(),
+                owner_pid: process::id(),
+                acquired_at: now,
+                heartbeat_at: now,
+                expires_at: now
+                    + chrono::Duration::seconds(
+                        i64::try_from(request.lease_stale_seconds).unwrap_or(i64::MAX),
+                    ),
+            };
+            leases.push(lease.clone());
+            self.save_leases(&leases)?;
+            Ok(Some(lease))
+        })
+    }
+
+    pub(crate) fn heartbeat_existing_job(
+        &self,
+        pool_name: &str,
+        member_id: &str,
+        job_id: &str,
+        lease_stale_seconds: u64,
+    ) -> HostPoolLeaseResult<bool> {
+        self.with_lock(|_| {
+            let now = Utc::now();
+            let mut leases = self.read_leases()?;
+            leases.retain(|lease| !lease.is_stale(now));
+            let Some(existing) = leases.iter_mut().find(|lease| {
+                lease.pool_name == pool_name
+                    && lease.member_id == member_id
+                    && lease.job_id.as_deref() == Some(job_id)
+            }) else {
+                self.save_leases(&leases)?;
+                return Ok(false);
+            };
+            existing.heartbeat_at = now;
+            existing.expires_at = now
+                + chrono::Duration::seconds(i64::try_from(lease_stale_seconds).unwrap_or(i64::MAX));
+            self.save_leases(&leases)?;
+            Ok(true)
+        })
+    }
+
     /// Refresh one lease heartbeat.
     pub fn heartbeat(&self, lease_id: &str, lease_stale_seconds: u64) -> HostPoolLeaseResult<bool> {
         self.with_lock(|_| {

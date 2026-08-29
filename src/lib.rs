@@ -40,6 +40,7 @@ pub mod daemon_ipc;
 pub mod daemon_runtime;
 /// Shared daemon/CLI version comparison helpers.
 pub mod daemon_version;
+pub(crate) mod daemon_worker_capacity;
 /// Typed dependency-channel policy and immutable consumer locks.
 pub mod dependency;
 /// Phase 1 failure diagnostics for cloud (GitHub Actions) targets.
