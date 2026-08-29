@@ -2202,6 +2202,38 @@ mod tests {
         assert_eq!(status.configured_repos, vec!["owner/repo", "owner/pending"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_surfaces_transition_projection_drain_failure() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let registration = Arc::new(RegistrationState::new(Registrar::new(state_dir.path())));
+        let projection_error = Arc::new(Mutex::new(Some(
+            "transition-projection-intent-drain-state-mutation".to_owned(),
+        )));
+        let provider = daemon_status_provider(
+            registration,
+            Vec::new(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            projection_error,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(
+                crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
+            )),
+            Arc::new(Mutex::new(
+                crate::actionable_wake_producer::ActionableWakeProducerStatus::default(),
+            )),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(TunnelSnapshot::inactive())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+
+        assert_eq!(
+            provider().last_error.as_deref(),
+            Some("transition-projection-intent-drain-state-mutation")
+        );
+    }
+
     #[test]
     fn canary_capability_recovers_after_a_later_clean_tick() {
         let mut capabilities =

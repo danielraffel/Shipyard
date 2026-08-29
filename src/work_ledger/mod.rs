@@ -107,6 +107,7 @@ mod observation;
 mod persistence;
 mod policy;
 mod projection_intents;
+pub(crate) use projection_intents::PendingProjectionIntent;
 #[allow(dead_code)] // Platform-specific helpers are not used on every target.
 mod protected_objects;
 mod registry;
