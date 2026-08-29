@@ -444,7 +444,7 @@ where
             );
         }
         Command::WorkLedger { command } => {
-            return work_ledger_command(&command, &runtime_paths, cli.json, stdout);
+            return work_ledger_command(&command, &runtime_paths, &cwd, cli.json, stdout);
         }
         Command::Wait { command } => {
             return handle_wait_command(

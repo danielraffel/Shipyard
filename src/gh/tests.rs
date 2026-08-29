@@ -698,6 +698,32 @@ fn parses_json_helper_stdout_with_expiry() {
 }
 
 #[test]
+fn parses_numeric_installation_identity_from_helper_metadata() {
+    let now = Utc::now();
+    let stdout = serde_json::json!({
+        "token": "ghs_json",
+        "kind": "github-app-installation",
+        "installation_id": "135929628"
+    })
+    .to_string();
+    let token =
+        parse_helper_stdout(&stdout, now, None, DEFAULT_REFRESH_SKEW_SECONDS).expect("token");
+    assert_eq!(token.installation_id, Some(135_929_628));
+}
+
+#[test]
+fn malformed_installation_identity_fails_closed() {
+    let now = Utc::now();
+    let stdout = serde_json::json!({
+        "token": "ghs_json",
+        "kind": "github-app-installation",
+        "installation_id": "not-an-id"
+    })
+    .to_string();
+    assert!(parse_helper_stdout(&stdout, now, None, DEFAULT_REFRESH_SKEW_SECONDS).is_err());
+}
+
+#[test]
 fn rejects_expired_json_helper_token() {
     let now = Utc::now();
     let expires_at = now + chrono::Duration::seconds(30);

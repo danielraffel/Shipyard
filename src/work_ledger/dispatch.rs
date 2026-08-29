@@ -19,18 +19,24 @@ use crate::provider_wrapper::ProviderReasoningEffortV1;
 
 use super::lifecycle::record_event;
 use super::registry::validated_route_matches_launch;
-use super::route::OpaqueRef;
+use super::route::{OpaqueRef, RouteProvenanceRecord};
 use super::{
     DeliveryAuthorization, LifecycleState, OptionalExtension, ProtectedObjectKind, Transaction,
     TransactionBehavior, Utc, WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable,
     create_database_file_no_follow, digest, opaque_ref, params, validate_digest, validate_token,
     verify_integrity, verify_supported_schema,
 };
+use crate::terminal_delivery_authority::TerminalCapabilityRequest;
 
 /// A wake may consume at most this many provider delivery attempts. A
 /// retryable outcome on the final attempt is terminal so a permanently
 /// unavailable provider cannot grow attempts and protected receipts forever.
 const MAX_PROVIDER_DELIVERY_ATTEMPTS: u64 = 3;
+
+pub(crate) struct CurrentDeliveryAuthorityRequest {
+    pub(crate) expected: super::DeliveryAuthorityExpectation,
+    pub(crate) terminal: TerminalCapabilityRequest,
+}
 
 /// Includes the initial uncertain submit observation. Once this durable budget
 /// is exhausted, automatic reconciliation stops while the wake remains
@@ -425,7 +431,242 @@ fn is_exact_git_sha(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn verify_delivery_route_for_provider_io(
+    transaction: &Transaction<'_>,
+    fence: &DeliveryFence,
+    uncertain: bool,
+) -> WorkLedgerResult<()> {
+    if uncertain {
+        verify_uncertain_fence(transaction, fence)?;
+    } else {
+        verify_claim(transaction, fence)?;
+    }
+    let delivery_exact: Option<bool> = transaction
+        .query_row(
+            "SELECT request_object_ref = ?2 AND activation_id = ?3
+                    AND idempotency_key = ?4 AND adapter_id = ?5
+                    AND state IN ('prepared', 'launched', 'uncertain')
+             FROM provider_deliveries WHERE delivery_id = ?1",
+            params![
+                fence.delivery_id,
+                fence.request_object_ref,
+                fence.activation_id,
+                fence.idempotency_key,
+                fence.adapter_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if delivery_exact != Some(true) {
+        return Err(WorkLedgerError::Refused(
+            "delivery request changed before provider I/O".to_owned(),
+        ));
+    }
+    let (work_head, work_base, route_head, route_payload): (
+        String,
+        Option<String>,
+        String,
+        Vec<u8>,
+    ) = transaction.query_row(
+        "SELECT work.head_sha, work.base_ref, route.head_sha, route.payload_json
+           FROM work_items work
+           JOIN route_records route ON route.work_item_id = work.id
+          WHERE work.id = ?1 AND route.route_ref = ?2",
+        params![fence.work_item_id, fence.route_ref],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let route: RouteProvenanceRecord = serde_json::from_slice(&route_payload).map_err(|_| {
+        WorkLedgerError::Refused("delivery route authority is malformed".to_owned())
+    })?;
+    route.validate().map_err(|_| {
+        WorkLedgerError::Refused("delivery route authority failed integrity".to_owned())
+    })?;
+    let route_base = route
+        .delivery_authority
+        .as_ref()
+        .map(|authority| authority.base_ref.as_str());
+    if work_head != route_head || work_base.as_deref() != route_base {
+        return Err(WorkLedgerError::Refused(
+            "delivery head/base changed before provider I/O".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 impl WorkLedger {
+    // Keep the exact protected request, claim, work item, and route checks in
+    // one immediate transaction so a helper cannot accidentally weaken their
+    // shared authorization boundary.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn current_delivery_authority_request(
+        &self,
+        fence: &DeliveryFence,
+    ) -> WorkLedgerResult<CurrentDeliveryAuthorityRequest> {
+        let (request_record, request_bytes) =
+            self.open_protected_object(&fence.request_object_ref)?;
+        if request_record.work_item_id != fence.work_item_id
+            || request_record.kind != "provider_request"
+        {
+            return Err(WorkLedgerError::Refused(
+                "delivery request authority changed".to_owned(),
+            ));
+        }
+        let request: StoredProviderRequest =
+            serde_json::from_slice(&request_bytes).map_err(|_| {
+                WorkLedgerError::Refused("delivery request authority is malformed".to_owned())
+            })?;
+        if request.wake_id != fence.wake_id
+            || request.profile_digest != fence.payload_digest
+            || request.idempotency_key != fence.idempotency_key
+        {
+            return Err(WorkLedgerError::Refused(
+                "delivery request authority no longer matches its fence".to_owned(),
+            ));
+        }
+        let mut connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if verify_claim(&transaction, fence).is_err() {
+            verify_uncertain_fence(&transaction, fence)?;
+        }
+        let delivery_exact: Option<bool> = transaction
+            .query_row(
+                "SELECT request_object_ref = ?2 AND activation_id = ?3
+                        AND idempotency_key = ?4 AND adapter_id = ?5
+                        AND state IN ('prepared', 'launched', 'uncertain')
+                 FROM provider_deliveries WHERE delivery_id = ?1",
+                params![
+                    fence.delivery_id,
+                    fence.request_object_ref,
+                    fence.activation_id,
+                    fence.idempotency_key,
+                    fence.adapter_id,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if delivery_exact != Some(true) {
+            return Err(WorkLedgerError::Refused(
+                "delivery request changed before authorization".to_owned(),
+            ));
+        }
+        let (repository, pull_request, head_sha, base_ref): (
+            Option<String>,
+            Option<u64>,
+            Option<String>,
+            Option<String>,
+        ) = transaction.query_row(
+            "SELECT repo, pr, head_sha, base_ref FROM work_items WHERE id = ?1",
+            [&fence.work_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let (route_payload, provider_kind): (Vec<u8>, String) = transaction.query_row(
+            "SELECT payload_json, provider_kind FROM route_records WHERE route_ref = ?1",
+            [&fence.route_ref],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        transaction.commit()?;
+        let repository = repository
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                WorkLedgerError::Refused("delivery repository authority is missing".to_owned())
+            })?;
+        let pull_request = pull_request.filter(|number| *number > 0).ok_or_else(|| {
+            WorkLedgerError::Refused("delivery pull-request authority is missing".to_owned())
+        })?;
+        let head_sha = head_sha.filter(|value| !value.is_empty()).ok_or_else(|| {
+            WorkLedgerError::Refused("delivery head authority is missing".to_owned())
+        })?;
+        let base_ref = base_ref.filter(|value| !value.is_empty()).ok_or_else(|| {
+            WorkLedgerError::Refused("delivery base authority is missing".to_owned())
+        })?;
+        if repository != request.resume.repository || head_sha != request.resume.head_sha {
+            return Err(WorkLedgerError::Refused(
+                "delivery request exact head changed before authorization".to_owned(),
+            ));
+        }
+        if provider_kind != "subrouter" {
+            return Err(WorkLedgerError::Refused(
+                super::DeliveryAuthorityRefusal::DirectProviderForbidden
+                    .code()
+                    .to_owned(),
+            ));
+        }
+        let provenance: RouteProvenanceRecord =
+            serde_json::from_slice(&route_payload).map_err(|_| {
+                WorkLedgerError::Refused("delivery route authority is malformed".to_owned())
+            })?;
+        provenance.validate().map_err(|_| {
+            WorkLedgerError::Refused("delivery route authority failed integrity".to_owned())
+        })?;
+        let authority = provenance.delivery_authority.ok_or_else(|| {
+            WorkLedgerError::Refused(
+                super::DeliveryAuthorityRefusal::StaticRouteMetadataOnly
+                    .code()
+                    .to_owned(),
+            )
+        })?;
+        if authority.base_ref != base_ref {
+            return Err(WorkLedgerError::Refused(
+                "delivery base authority differs from its route".to_owned(),
+            ));
+        }
+        let execution_provider = provenance
+            .launch_profile
+            .execution_provider_kind()
+            .to_owned();
+        let (terminal_instance, native_session_id, process) = match &authority.terminal {
+            TerminalCapabilityRequest::Cmux {
+                surface_id,
+                native_session_id,
+                provider_kind,
+                process,
+                ..
+            } if provider_kind == &execution_provider => (
+                surface_id.clone(),
+                native_session_id.clone(),
+                process.clone(),
+            ),
+            TerminalCapabilityRequest::Cmux { .. } => {
+                return Err(WorkLedgerError::Refused(
+                    "terminal authority provider differs from its Subrouter execution provider"
+                        .to_owned(),
+                ));
+            }
+            TerminalCapabilityRequest::HerdR { .. } => {
+                return Err(WorkLedgerError::Refused(
+                    super::DeliveryAuthorityRefusal::TerminalAuthorityUnavailable
+                        .code()
+                        .to_owned(),
+                ));
+            }
+        };
+        Ok(CurrentDeliveryAuthorityRequest {
+            expected: super::DeliveryAuthorityExpectation {
+                installation_id: authority.github_installation_id,
+                repository,
+                pull_request,
+                head_sha,
+                base_ref,
+                base_sha: authority.base_sha,
+                requested_terminal_instance: terminal_instance,
+                requested_process: super::ProcessIncarnation {
+                    boot_id: process.boot_id,
+                    pid: process.pid,
+                    start_identity: process.start_identity,
+                },
+                native_session_id,
+                source_work_generation: fence.work_generation,
+                source_owner_generation: fence.owner_generation,
+                target_work_generation: fence.work_generation,
+                target_owner_generation: fence.owner_generation,
+            },
+            terminal: authority.terminal,
+        })
+    }
+
     /// Re-read the exact claim and classify why its stored route cannot yet
     /// authorize live delivery. This is intentionally a read-only transaction:
     /// static route metadata is never promoted to runtime authority.
@@ -660,16 +901,7 @@ impl WorkLedger {
             }
         } else if delivery_was_launched {
             if claim_idempotent {
-                let authority = match adapter
-                    .authorize(&fence, ProviderAuthorizationOperation::Reconcile)
-                {
-                    Ok(authority) => authority,
-                    Err(outcome) => {
-                        return self
-                            .finalize_wake(&fence, reconciliation_authorization_failure(outcome));
-                    }
-                };
-                reconcile_outcome_without_redispatch(adapter.reconcile(&fence, authority))
+                self.reconcile_with_authority(&fence, adapter, false)?
             } else {
                 ProviderOutcome::Uncertain {
                     evidence: format!(
@@ -680,29 +912,35 @@ impl WorkLedger {
                 }
             }
         } else {
-            let authority = match adapter.authorize(&fence, ProviderAuthorizationOperation::Submit)
-            {
-                Ok(authority) => authority,
-                Err(outcome) => return self.finalize_wake(&fence, outcome),
-            };
-            self.mark_delivery_launched(&fence)?;
-            adapter.launch(ProviderLaunchRequest { fence: &fence }, authority)
+            self.launch_with_authority(&fence, adapter)?
         };
         self.finalize_wake(&fence, outcome)
     }
 
-    fn mark_delivery_launched(&self, fence: &DeliveryFence) -> WorkLedgerResult<()> {
+    fn launch_with_authority<A: ProviderAdapter>(
+        &self,
+        fence: &DeliveryFence,
+        adapter: &mut A,
+    ) -> WorkLedgerResult<ProviderOutcome> {
         let parent = self
             .path
             .parent()
             .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        // Acquire the potentially blocking single-writer lease before taking
+        // the live witness. `authorize` performs its own exact ledger re-read,
+        // so it must complete before this function opens the marking
+        // transaction on a second SQLite connection.
+        let authority = match adapter.authorize(fence, ProviderAuthorizationOperation::Submit) {
+            Ok(authority) => authority,
+            Err(outcome) => return Ok(outcome),
+        };
         let mut connection = self.connect_read_write()?;
         configure_durable(&connection)?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        verify_claim(&transaction, fence)?;
+        verify_delivery_route_for_provider_io(&transaction, fence, false)?;
         let changed = transaction.execute(
             "UPDATE provider_deliveries SET state = 'launched', updated_at = ?1
              WHERE delivery_id = ?2 AND wake_id = ?3 AND attempt = ?4
@@ -726,7 +964,39 @@ impl WorkLedger {
             ));
         }
         transaction.commit()?;
-        Ok(())
+        // Keep the single-writer lease through provider I/O just as the
+        // reconciliation path does; no sibling can supersede the accepted
+        // one-shot witness between marking and submission.
+        Ok(adapter.launch(ProviderLaunchRequest { fence }, authority))
+    }
+
+    fn reconcile_with_authority<A: ProviderAdapter>(
+        &self,
+        fence: &DeliveryFence,
+        adapter: &mut A,
+        uncertain: bool,
+    ) -> WorkLedgerResult<ProviderOutcome> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let authority = match adapter.authorize(fence, ProviderAuthorizationOperation::Reconcile) {
+            Ok(authority) => authority,
+            Err(outcome) => return Ok(reconciliation_authorization_failure(outcome)),
+        };
+        let mut connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_delivery_route_for_provider_io(&transaction, fence, uncertain)?;
+        transaction.commit()?;
+        // Keep the single-writer lease through provider I/O so no sibling can
+        // supersede the exact claim after its one-shot witness is accepted.
+        Ok(reconcile_outcome_without_redispatch(
+            adapter.reconcile(fence, authority),
+        ))
     }
 
     /// Reconcile one uncertain provider delivery by its original idempotency
@@ -759,16 +1029,7 @@ impl WorkLedger {
                 "provider adapter changed before evidence reconciliation".to_owned(),
             ));
         }
-        let authority = match adapter.authorize(&fence, ProviderAuthorizationOperation::Reconcile) {
-            Ok(authority) => authority,
-            Err(outcome) => {
-                return self.finalize_uncertain_wake(
-                    &fence,
-                    reconciliation_authorization_failure(outcome),
-                );
-            }
-        };
-        let outcome = reconcile_outcome_without_redispatch(adapter.reconcile(&fence, authority));
+        let outcome = self.reconcile_with_authority(&fence, adapter, true)?;
         self.finalize_uncertain_wake(&fence, outcome)
     }
 

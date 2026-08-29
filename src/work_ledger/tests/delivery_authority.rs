@@ -30,6 +30,7 @@ fn expectation() -> DeliveryAuthorityExpectation {
         pull_request: 148,
         head_sha: "a".repeat(40),
         base_ref: "main".to_owned(),
+        base_sha: "c".repeat(40),
         requested_terminal_instance: "cmux:surface-a".to_owned(),
         requested_process: ProcessIncarnation {
             boot_id: "boot-a".to_owned(),
@@ -53,6 +54,7 @@ fn probe(now: DateTime<Utc>) -> Probe {
             pull_request: 148,
             head_sha: "a".repeat(40),
             base_ref: "main".to_owned(),
+            base_sha: "c".repeat(40),
             observed_at: now,
         }),
         terminal: Ok(TerminalAuthorityObservation {
@@ -79,7 +81,8 @@ fn probe(now: DateTime<Utc>) -> Probe {
 fn exact_current_route_produces_one_shot_authority() {
     let now = Utc::now();
     let mut probe = probe(now);
-    let authority = verify_delivery_authority(&mut probe, &expectation(), now).expect("authority");
+    let authority =
+        verify_delivery_authority_at(&mut probe, &expectation(), now).expect("authority");
     assert_eq!(probe.terminal_calls, 1);
     assert_eq!(authority.terminal_instance(), "cmux:surface-a");
     assert_eq!(authority.receipt_digest().len(), 64);
@@ -96,7 +99,7 @@ fn head_or_base_drift_refuses_before_terminal_io() {
         } else {
             github.base_ref = "release".to_owned();
         }
-        let error = verify_delivery_authority(&mut probe, &expectation(), now)
+        let error = verify_delivery_authority_at(&mut probe, &expectation(), now)
             .expect_err("drift must refuse");
         assert!(matches!(
             error,
@@ -113,7 +116,7 @@ fn moved_terminal_requires_verified_rebind_and_exact_generations() {
     let terminal = first_probe.terminal.as_mut().expect("terminal");
     terminal.actual_terminal_instance = "cmux:surface-b".to_owned();
     assert_eq!(
-        verify_delivery_authority(&mut first_probe, &expectation(), now),
+        verify_delivery_authority_at(&mut first_probe, &expectation(), now),
         Err(DeliveryAuthorityRefusal::TerminalInstanceMismatch)
     );
 
@@ -123,8 +126,22 @@ fn moved_terminal_requires_verified_rebind_and_exact_generations() {
     terminal.transactionally_rebound = true;
     terminal.target_owner_generation += 1;
     assert_eq!(
-        verify_delivery_authority(&mut rebound_probe, &expectation(), now),
+        verify_delivery_authority_at(&mut rebound_probe, &expectation(), now),
         Err(DeliveryAuthorityRefusal::GenerationMismatch)
+    );
+}
+
+#[test]
+fn claimed_rebind_never_waives_process_incarnation() {
+    let now = Utc::now();
+    let mut hostile = probe(now);
+    let terminal = hostile.terminal.as_mut().expect("terminal");
+    terminal.actual_terminal_instance = "cmux:surface-b".to_owned();
+    terminal.transactionally_rebound = true;
+    terminal.process.start_identity = "different-process".to_owned();
+    assert_eq!(
+        verify_delivery_authority_at(&mut hostile, &expectation(), now),
+        Err(DeliveryAuthorityRefusal::ProcessIncarnationMismatch)
     );
 }
 
@@ -139,7 +156,7 @@ fn dead_or_reused_process_and_unavailable_adapter_fail_closed() {
         .process
         .start_identity = "reused-start".to_owned();
     assert_eq!(
-        verify_delivery_authority(&mut dead_probe, &expectation(), now),
+        verify_delivery_authority_at(&mut dead_probe, &expectation(), now),
         Err(DeliveryAuthorityRefusal::ProcessIncarnationMismatch)
     );
 
@@ -151,7 +168,7 @@ fn dead_or_reused_process_and_unavailable_adapter_fail_closed() {
         let mut unavailable_probe = probe(now);
         unavailable_probe.terminal = Err(refusal);
         assert_eq!(
-            verify_delivery_authority(&mut unavailable_probe, &expectation(), now),
+            verify_delivery_authority_at(&mut unavailable_probe, &expectation(), now),
             Err(refusal)
         );
     }

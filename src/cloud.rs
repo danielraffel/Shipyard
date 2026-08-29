@@ -341,6 +341,22 @@ impl GitHubActions {
         self
     }
 
+    /// Confirm the configured credential is a repository-scoped GitHub App
+    /// installation token without exposing token material.
+    pub(crate) fn app_installation_id(&self) -> Result<u64, GitHubError> {
+        #[cfg(test)]
+        if self.gh_binary_override.is_some() {
+            return Ok(42);
+        }
+        let client = self
+            .gh
+            .as_ref()
+            .map_err(|error| GitHubError::command_failed(&[], None, error.as_bytes()))?;
+        client
+            .app_installation_id(&self.cwd)
+            .map_err(|error| GitHubError::command_failed(&[], None, error.to_string().as_bytes()))
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
         self.gh_binary_override = Some(gh_binary.into());

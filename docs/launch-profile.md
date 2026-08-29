@@ -143,6 +143,16 @@ remains `uncertain` and is never blindly relaunched. A successful
 acknowledgement advances the same canonical work item to agent-owned repair in
 the final transaction.
 
+Before provider I/O, native publication binds the exact PR head, base ref, base
+SHA, GitHub App installation identity, and a live terminal capability. cmux
+authority requires a unique local process/surface match plus the exact native
+checkpoint from `surface resume show`; workspace moves are evidence updates,
+not identity changes. Stored labels never authorize delivery. HerdR is an
+explicit capability request but remains refused until its runtime exposes an
+equivalent independently observable server/process/checkpoint contract.
+Subrouter/account/model/resume argv remain digest-bound; refusal never falls
+back to direct Codex.
+
 Activation is explicit trusted machine-global policy and default-off. The
 subscriber-independent daemon owns delivery only after exact handoff
 publication succeeds. Its wrapper revalidates the canonical work item, route,

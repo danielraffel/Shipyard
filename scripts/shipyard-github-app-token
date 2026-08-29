@@ -97,6 +97,7 @@ def main() -> int:
         output: dict[str, Any] = {
             "token": token,
             "kind": "github-app-installation",
+            "installation_id": installation_id,
         }
         if isinstance(expires_at, str) and expires_at:
             output["expires_at"] = expires_at
@@ -485,6 +486,7 @@ def public_token_payload(payload: dict[str, Any]) -> dict[str, Any]:
     output = {
         "token": payload["token"],
         "kind": payload.get("kind", "github-app-installation"),
+        "installation_id": payload["installation_id"],
     }
     if payload.get("expires_at"):
         output["expires_at"] = payload["expires_at"]

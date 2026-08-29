@@ -2075,6 +2075,13 @@ and distribution eligibility to the lock.
 
 ## Cutover Discipline
 
+For native continuation delivery, require fresh exact PR head/base SHA and the
+numeric repository-scoped GitHub App installation identity. Treat cmux labels
+as provenance only: delivery authority is a unique local process/surface plus
+the exact live native checkpoint, rechecked immediately before provider I/O.
+HerdR remains typed-refused until it exposes equivalent independent evidence.
+Never replace a refused Subrouter route with direct provider execution.
+
 Release/cutover is a human decision, not an implementation side effect. Before
 asking for go/no-go, ensure:
 

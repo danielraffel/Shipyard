@@ -165,6 +165,7 @@ pub mod stacked_pr;
 /// spawn site that participates in the supervised PR / ship / merge
 /// pipeline; diagnostic subcommands deliberately skip this.
 pub mod supervised;
+mod terminal_delivery_authority;
 /// Working-tree drift detection shared by future `shipyard run` wiring.
 pub mod tree_drift;
 /// Tunnel readiness, Tailscale probe decoding, and supervisor retry policy.

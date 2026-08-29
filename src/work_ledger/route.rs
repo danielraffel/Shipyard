@@ -5,6 +5,7 @@
 
 use std::fmt::{self, Display, Formatter};
 
+use crate::terminal_delivery_authority::TerminalCapabilityRequest;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -389,6 +390,8 @@ pub(super) struct LaunchProfileRecord {
     pub wrapper_ref: OpaqueRef,
     pub configuration_sha256: Sha256Digest,
     pub provider_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_provider_kind: Option<String>,
 }
 
 impl LaunchProfileRecord {
@@ -410,9 +413,25 @@ impl LaunchProfileRecord {
             wrapper_ref,
             configuration_sha256,
             provider_kind,
+            execution_provider_kind: None,
         };
         record.validate()?;
         Ok(record)
+    }
+
+    pub(super) fn bind_execution_provider(
+        mut self,
+        provider_kind: String,
+    ) -> Result<Self, RouteProvenanceError> {
+        self.execution_provider_kind = Some(provider_kind);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub(super) fn execution_provider_kind(&self) -> &str {
+        self.execution_provider_kind
+            .as_deref()
+            .unwrap_or(&self.provider_kind)
     }
 
     fn validate(&self) -> Result<(), RouteProvenanceError> {
@@ -432,6 +451,15 @@ impl LaunchProfileRecord {
                 "unsupported launch-profile provider".to_owned(),
             ));
         }
+        if self
+            .execution_provider_kind
+            .as_deref()
+            .is_some_and(|value| !is_registry_name(value))
+        {
+            return Err(RouteProvenanceError::Serialization(
+                "unsupported launch-profile execution provider".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -444,6 +472,17 @@ struct IntegrityPayload<'a> {
     agent: &'a AgentRouteRecord,
     provider: &'a ProviderRouteRecord,
     launch_profile: &'a LaunchProfileRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_authority: Option<&'a NativeDeliveryAuthorityRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NativeDeliveryAuthorityRecord {
+    pub(super) github_installation_id: u64,
+    pub(super) base_ref: String,
+    pub(super) base_sha: String,
+    pub(super) terminal: TerminalCapabilityRequest,
 }
 
 /// Complete, integrity-bound route provenance. Deserialization alone is not
@@ -456,6 +495,8 @@ pub(super) struct RouteProvenanceRecord {
     pub agent: AgentRouteRecord,
     pub provider: ProviderRouteRecord,
     pub launch_profile: LaunchProfileRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_authority: Option<NativeDeliveryAuthorityRecord>,
     pub integrity_sha256: Sha256Digest,
 }
 
@@ -472,6 +513,7 @@ impl RouteProvenanceRecord {
             agent,
             provider,
             launch_profile,
+            delivery_authority: None,
             integrity_sha256: Sha256Digest::of_bytes(&[]),
         };
         record.validate_components()?;
@@ -487,10 +529,30 @@ impl RouteProvenanceRecord {
             agent: &self.agent,
             provider: &self.provider,
             launch_profile: &self.launch_profile,
+            delivery_authority: self.delivery_authority.as_ref(),
         };
         let bytes = serde_json::to_vec(&payload)
             .map_err(|error| RouteProvenanceError::Serialization(error.to_string()))?;
         Ok(Sha256Digest::of_bytes(&bytes))
+    }
+
+    pub(super) fn bind_delivery_authority(
+        mut self,
+        authority: NativeDeliveryAuthorityRecord,
+    ) -> Result<Self, RouteProvenanceError> {
+        if authority.github_installation_id == 0
+            || authority.base_ref.is_empty()
+            || authority.base_sha.len() != 40
+            || !authority
+                .base_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(RouteProvenanceError::IntegrityMismatch);
+        }
+        self.delivery_authority = Some(authority);
+        self.integrity_sha256 = self.recompute_integrity()?;
+        Ok(self)
     }
 
     /// Fail closed on missing, malformed, unsupported, or tampered provenance.
@@ -566,6 +628,17 @@ impl RouteProvenanceRecord {
             binding.validate()?;
         }
         if self.provider_kind() != self.launch_profile.provider_kind {
+            return Err(RouteProvenanceError::IntegrityMismatch);
+        }
+        if self.delivery_authority.as_ref().is_some_and(|authority| {
+            authority.github_installation_id == 0
+                || authority.base_ref.is_empty()
+                || authority.base_sha.len() != 40
+                || !authority
+                    .base_sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
             return Err(RouteProvenanceError::IntegrityMismatch);
         }
         let session_wrapper = match &self.agent.route {

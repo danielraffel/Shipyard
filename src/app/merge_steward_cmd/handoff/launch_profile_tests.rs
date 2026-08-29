@@ -12,6 +12,19 @@ use crate::workstream_continuation_config::{ProviderWrapperConfig, WorkstreamCon
 use std::process::Command;
 use std::sync::OnceLock;
 
+fn publication_actions(temp: &tempfile::TempDir, head: &str) -> GitHubActions {
+    let response = serde_json::json!({
+        "state": "OPEN",
+        "headRefOid": head,
+        "baseRefName": "main",
+        "baseRefOid": "b".repeat(40),
+    })
+    .to_string();
+    let source = format!("fn main() {{ print!(\"{{}}\", {response:?}); }}");
+    let binary = crate::test_support::compile_native_test_program(temp.path(), "gh", &source);
+    GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary)
+}
+
 struct ActiveWorktreeFixture {
     temp: tempfile::TempDir,
     path: String,
@@ -156,6 +169,7 @@ fn native_profile() -> LaunchProfileV1 {
     profile.provider.provider = "codex".into();
     profile.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
     profile.launch_argv = vec![
+        "subrouter".into(),
         "codex".into(),
         "--model".into(),
         "model-tier-a".into(),
@@ -163,6 +177,7 @@ fn native_profile() -> LaunchProfileV1 {
         "model_reasoning_effort=\"medium\"".into(),
     ];
     profile.resume_argv = vec![
+        "subrouter".into(),
         "codex".into(),
         "resume".into(),
         "--model".into(),
@@ -377,8 +392,10 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
         Some(temp.path().join("global")),
         Some(temp.path().to_path_buf()),
     );
-    let publication = native_publication_request(&paths, "owner/repo", args.pr, &args.head)
-        .expect("normalize native publication");
+    let actions = publication_actions(&temp, &args.head);
+    let publication =
+        native_publication_request(&paths, &actions, "owner/repo", args.pr, &args.head)
+            .expect("normalize native publication");
     assert_eq!(publication.repository, "owner/repo");
     assert_eq!(publication.workstream_handle, "GEN-43");
     assert_eq!(publication.origin_machine, "m3");
@@ -404,7 +421,7 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
 
     std::fs::remove_file(&route_path).expect("remove private agent route");
     assert!(
-        native_publication_request(&paths, "owner/repo", args.pr, &args.head).is_err(),
+        native_publication_request(&paths, &actions, "owner/repo", args.pr, &args.head).is_err(),
         "native publication must fail closed after private route loss"
     );
     let unresolved =
@@ -437,6 +454,7 @@ fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
         Some(temp.path().join("state")),
     );
     let args = handoff_args();
+    let actions = publication_actions(&temp, &args.head);
     let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
         .expect("resolve agent")
         .expect("agent");
@@ -463,6 +481,7 @@ fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
 
     let interrupted = publish_managed_handoff_with_consumer(
         &paths,
+        &actions,
         &path,
         managed,
         "owner/repo",
@@ -493,12 +512,13 @@ fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
 
     assert_pending_publication_fences_owner_replacement(&args, &pending);
 
-    assert_publication_without_consumer_is_not_transfer(&paths, &args);
+    assert_publication_without_consumer_is_not_transfer(&paths, &actions, &args);
 
     deliver_pending_native_wake(&paths);
 
     let published = publish_managed_handoff(
         &paths,
+        &actions,
         &path,
         pending,
         "owner/repo",
@@ -515,6 +535,7 @@ fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
 
     let replay = publish_managed_handoff(
         &paths,
+        &actions,
         &path,
         published,
         "owner/repo",
@@ -567,9 +588,10 @@ fn assert_pending_publication_fences_owner_replacement(
 
 fn assert_publication_without_consumer_is_not_transfer(
     paths: &RuntimePaths,
+    actions: &GitHubActions,
     args: &StewardHandoffArgs,
 ) {
-    let request = native_publication_request(paths, "owner/repo", args.pr, &args.head)
+    let request = native_publication_request(paths, actions, "owner/repo", args.pr, &args.head)
         .expect("native request");
     let report = WorkLedger::plan_or_apply_native_continuation(
         &paths.state_dir,
@@ -612,6 +634,7 @@ fn failed_publication_never_claims_monitoring_transfer() {
         Some(temp.path().join("state")),
     );
     let args = handoff_args();
+    let actions = publication_actions(&temp, &args.head);
     let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
         .expect("resolve agent")
         .expect("agent");
@@ -639,6 +662,7 @@ fn failed_publication_never_claims_monitoring_transfer() {
     assert!(
         publish_managed_handoff(
             &paths,
+            &actions,
             &path,
             managed,
             "owner/repo",
@@ -697,7 +721,8 @@ fn native_publication_rejects_prompt_bearing_launch_profile() {
         Some(temp.path().join("global")),
         Some(temp.path().to_path_buf()),
     );
-    let error = native_publication_request(&paths, "owner/repo", args.pr, &args.head)
+    let actions = publication_actions(&temp, &args.head);
+    let error = native_publication_request(&paths, &actions, "owner/repo", args.pr, &args.head)
         .expect_err("native publication must reject raw prompts");
     assert!(error.message().contains("prompt"));
 }

@@ -56,7 +56,14 @@ mod delivery_ownership;
 #[allow(dead_code)] // Some generic adapter surfaces are exercised only by native dispatch.
 mod dispatch;
 mod importer;
-pub(crate) use delivery_authority::{DeliveryAuthorityRefusal, DeliveryAuthorization};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use delivery_authority::verify_delivery_authority_at;
+pub(crate) use delivery_authority::{
+    DeliveryAuthorityExpectation, DeliveryAuthorityProbe, DeliveryAuthorityRefusal,
+    DeliveryAuthorization, GitHubAuthorityObservation, ProcessIncarnation,
+    TerminalAuthorityObservation, verify_delivery_authority,
+};
 #[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
 pub(crate) use delivery_ownership::{
     AgentContextChallenge, AgentContextReceipt, AgentOwnershipReceipt, AgentReturnChallenge,

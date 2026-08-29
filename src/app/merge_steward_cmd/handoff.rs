@@ -18,8 +18,13 @@ use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(not(test))]
+use crate::config::LoadedConfig;
 use crate::paths::RuntimePaths;
 use crate::queue::replace_file_with_windows_retry;
+use crate::terminal_delivery_authority::{
+    ProductionTerminalEvidenceAdapter, TerminalCapabilityRequest, TerminalEvidenceAdapter,
+};
 use crate::work_ledger::{
     FreshAgentLaunchProfile, NativePublicationReport, NativePublicationRequest, WorkLedger,
 };
@@ -82,6 +87,8 @@ struct AgentResumeContext {
     surface_provenance: SurfaceProvenance,
     #[serde(default)]
     terminal_provenance: TerminalProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_authority: Option<TerminalCapabilityRequest>,
     goal_managed: bool,
     goal_lifecycle: GoalLifecycle,
     goal_status: GoalStatus,
@@ -351,6 +358,7 @@ pub(crate) fn steward_handoff_command<W: Write>(
             let ready = ready_workstream_activation(runtime_paths)?;
             receipt = publish_managed_handoff(
                 runtime_paths,
+                actions,
                 &path,
                 receipt,
                 &repo,
@@ -443,26 +451,77 @@ struct AgentEnvironment {
 fn resolve_agent_context(
     args: &StewardHandoffArgs,
 ) -> Result<Option<AgentResumeContext>, CliFailure> {
-    resolve_agent_context_with_environment(
-        args,
-        &AgentEnvironment {
-            codex_session: env::var("CODEX_THREAD_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            claude_session: env::var("CLAUDE_CODE_SESSION_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            surface_id: env::var("CMUX_SURFACE_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            goal_managed: env::var("SHIPYARD_GOAL_MANAGED").as_deref() == Ok("1"),
-            herdr_env: env::var("HERDR_ENV").ok(),
-            herdr_session: env::var("HERDR_SESSION").ok(),
-            herdr_workspace_id: env::var("HERDR_WORKSPACE_ID").ok(),
-            herdr_tab_id: env::var("HERDR_TAB_ID").ok(),
-            herdr_pane_id: env::var("HERDR_PANE_ID").ok(),
-        },
-    )
+    let environment = AgentEnvironment {
+        codex_session: env::var("CODEX_THREAD_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        claude_session: env::var("CLAUDE_CODE_SESSION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        surface_id: env::var("CMUX_SURFACE_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        goal_managed: env::var("SHIPYARD_GOAL_MANAGED").as_deref() == Ok("1"),
+        herdr_env: env::var("HERDR_ENV").ok(),
+        herdr_session: env::var("HERDR_SESSION").ok(),
+        herdr_workspace_id: env::var("HERDR_WORKSPACE_ID").ok(),
+        herdr_tab_id: env::var("HERDR_TAB_ID").ok(),
+        herdr_pane_id: env::var("HERDR_PANE_ID").ok(),
+    };
+    let mut resolved = resolve_agent_context_with_environment(args, &environment)?;
+    if let Some(agent) = resolved.as_mut() {
+        agent.terminal_authority = match &agent.terminal_provenance {
+            TerminalProvenance::Cmux { surface_id } => {
+                let socket_path = env::var("CMUX_SOCKET_PATH")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        CliFailure::new(1, "cmux terminal authority requires CMUX_SOCKET_PATH")
+                    })?;
+                let cli_path = resolve_path_executable("cmux")?;
+                Some(
+                    ProductionTerminalEvidenceAdapter
+                        .capture_cmux(
+                            &cli_path,
+                            &socket_path,
+                            surface_id,
+                            &agent.session_id,
+                            &agent.provider,
+                        )
+                        .map_err(|failure| {
+                            CliFailure::new(
+                                1,
+                                format!("cmux terminal authority refused: {failure:?}"),
+                            )
+                        })?,
+                )
+            }
+            TerminalProvenance::HerdR {
+                session_id,
+                pane_id,
+                ..
+            } => Some(TerminalCapabilityRequest::HerdR {
+                selector: session_id.clone(),
+                terminal_id: Some(pane_id.clone()),
+                native_session_id: agent.session_id.clone(),
+                provider_kind: agent.provider.clone(),
+            }),
+            TerminalProvenance::Absent => None,
+        };
+    }
+    Ok(resolved)
+}
+
+fn resolve_path_executable(name: &str) -> Result<String, CliFailure> {
+    let path = env::var_os("PATH")
+        .into_iter()
+        .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| CliFailure::new(1, format!("{name} executable is unavailable")))?;
+    path.canonicalize()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| CliFailure::new(1, format!("resolve {name} executable: {error}")))
 }
 
 fn resolve_agent_context_with_environment(
@@ -554,6 +613,7 @@ fn resolve_agent_context_with_environment(
         surface_id,
         surface_provenance,
         terminal_provenance,
+        terminal_authority: None,
         goal_managed,
         goal_lifecycle: if goal_managed {
             GoalLifecycle::Managed
@@ -872,8 +932,10 @@ fn handoff_path(directory: &Path, head: &str) -> std::path::PathBuf {
 ///
 /// This reader performs no mutation. Publication policy is intentionally
 /// applied later, before the ledger can create storage.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn native_publication_request(
     runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
     repo: &str,
     pr: u64,
     head: &str,
@@ -890,6 +952,8 @@ pub(crate) fn native_publication_request(
         ));
     }
     let path = handoff_path(&handoff_directory(runtime_paths, repo, pr), head);
+    let trusted_actions = trusted_native_publication_actions(runtime_paths, actions, repo)?;
+    let source_authority = observe_native_source_authority(&trusted_actions, repo, pr, head)?;
     let receipt = load_handoff(&path)?
         .ok_or_else(|| CliFailure::new(1, "exact-head durable handoff receipt is unavailable"))?;
     validate_handoff_receipt_integrity(&receipt, repo, pr, head)?;
@@ -950,11 +1014,29 @@ pub(crate) fn native_publication_request(
     let protected_profile_bytes = profile
         .protected_profile_bytes()
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let native_resume_bytes = serde_json::to_vec(&profile.resume_argv)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let route_wrapper = profile
+        .resume_argv
+        .first()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| CliFailure::new(1, "native resume wrapper is missing"))?;
 
     Ok(NativePublicationRequest {
         repository: receipt.repo.to_ascii_lowercase(),
         pull_request: receipt.pr,
         head_sha: receipt.head_sha.to_ascii_lowercase(),
+        base_ref: source_authority.base_ref,
+        base_sha: source_authority.base_sha,
+        github_installation_id: source_authority.installation_id,
+        terminal_authority: private_route
+            .agent
+            .terminal_authority
+            .or_else(test_terminal_authority)
+            .ok_or_else(|| {
+                CliFailure::new(1, "native publication requires live terminal authority")
+            })?,
         workstream_handle: bootstrap.workstream_handle.clone(),
         context_url: bootstrap.context_url.clone(),
         origin_machine: receipt.origin_machine.clone(),
@@ -962,6 +1044,18 @@ pub(crate) fn native_publication_request(
         owner_generation: receipt.ownership_generation,
         agent_provider: route.provider.clone(),
         agent_session_id: private_route.agent.session_id,
+        route_account: profile
+            .provider
+            .account
+            .clone()
+            .unwrap_or_else(|| "unselected-account".into()),
+        route_model: profile
+            .provider
+            .model
+            .clone()
+            .unwrap_or_else(|| "unselected-model".into()),
+        route_wrapper,
+        native_resume_digest: hex::encode(Sha256::digest(native_resume_bytes)),
         route_id: route.route_id.clone(),
         profile_generation: stored.generation,
         profile_revision: stored.revision,
@@ -970,6 +1064,108 @@ pub(crate) fn native_publication_request(
         protected_profile_bytes,
         success_continuation_digest: bootstrap.success_continuation_digest.clone(),
         failure_continuation_digest: bootstrap.failure_continuation_digest.clone(),
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn trusted_native_publication_actions(
+    _: &RuntimePaths,
+    actions: &GitHubActions,
+    repo: &str,
+) -> Result<GitHubActions, CliFailure> {
+    Ok(actions.clone().with_repo_override(repo))
+}
+
+#[cfg(not(test))]
+fn trusted_native_publication_actions(
+    runtime_paths: &RuntimePaths,
+    _: &GitHubActions,
+    repo: &str,
+) -> Result<GitHubActions, CliFailure> {
+    let config = LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| CliFailure::new(1, format!("resolve native authority cwd: {error}")))?;
+    Ok(GitHubActions::from_loaded_config(cwd, &config).with_repo_override(repo))
+}
+
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn test_terminal_authority() -> Option<TerminalCapabilityRequest> {
+    Some(TerminalCapabilityRequest::Cmux {
+        cli_path: "/test/cmux".into(),
+        socket_path: "/test/cmux.sock".into(),
+        surface_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+        workspace_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
+        native_session_id: "provider-session-7".into(),
+        provider_kind: "codex".into(),
+        process: crate::terminal_delivery_authority::LocalProcessIncarnation {
+            boot_id: "test-boot".into(),
+            pid: 42,
+            start_identity: "test-start".into(),
+        },
+    })
+}
+
+#[cfg(not(test))]
+fn test_terminal_authority() -> Option<TerminalCapabilityRequest> {
+    None
+}
+
+struct NativeSourceAuthority {
+    installation_id: u64,
+    base_ref: String,
+    base_sha: String,
+}
+
+fn observe_native_source_authority(
+    actions: &GitHubActions,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<NativeSourceAuthority, CliFailure> {
+    let installation_id = actions
+        .app_installation_id()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let snapshot = gh_json(
+        actions,
+        &[
+            "pr".into(),
+            "view".into(),
+            pr.to_string(),
+            "--repo".into(),
+            repo.to_owned(),
+            "--json".into(),
+            "state,headRefOid,baseRefName,baseRefOid".into(),
+        ],
+        "observe exact native publication source",
+    )
+    .map_err(|error| CliFailure::new(1, error))?;
+    let pull_request = &snapshot;
+    let observed_head = pull_request.get("headRefOid").and_then(Value::as_str);
+    let base_ref = pull_request
+        .get("baseRefName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let base_sha = pull_request
+        .get("baseRefOid")
+        .and_then(Value::as_str)
+        .filter(|value| is_full_sha(value));
+    if pull_request.get("state").and_then(Value::as_str) != Some("OPEN")
+        || observed_head != Some(head)
+        || base_ref.is_none()
+        || base_sha.is_none()
+    {
+        return Err(CliFailure::new(
+            1,
+            "native publication source head/base authority changed",
+        ));
+    }
+    Ok(NativeSourceAuthority {
+        installation_id,
+        base_ref: base_ref.expect("checked").to_owned(),
+        base_sha: base_sha.expect("checked").to_ascii_lowercase(),
     })
 }
 
@@ -1689,8 +1885,10 @@ fn ready_workstream_activation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_managed_handoff(
     runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
     path: &Path,
     receipt: DurableStewardHandoff,
     repo: &str,
@@ -1700,6 +1898,7 @@ fn publish_managed_handoff(
 ) -> Result<DurableStewardHandoff, CliFailure> {
     publish_managed_handoff_with_consumer(
         runtime_paths,
+        actions,
         path,
         receipt,
         repo,
@@ -1713,6 +1912,7 @@ fn publish_managed_handoff(
 #[allow(clippy::too_many_arguments)]
 fn publish_managed_handoff_with_consumer<F>(
     runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
     path: &Path,
     receipt: DurableStewardHandoff,
     repo: &str,
@@ -1724,7 +1924,7 @@ fn publish_managed_handoff_with_consumer<F>(
 where
     F: FnOnce(&RuntimePaths, &NativePublicationReport) -> Result<(), CliFailure>,
 {
-    let request = native_publication_request(runtime_paths, repo, pr, head)?;
+    let request = native_publication_request(runtime_paths, actions, repo, pr, head)?;
     if ready.machine_tag != request.origin_machine {
         return Err(CliFailure::new(
             1,
@@ -2220,6 +2420,12 @@ fn reconcile_surface_route(
         reconciled.terminal_provenance = TerminalProvenance::Cmux {
             surface_id: surface_id.clone(),
         };
+        // Live cmux evidence is refreshable for the same native session. The
+        // immutable owner identity and generation stay unchanged; publication
+        // later binds the newly observed process/surface tuple atomically.
+        reconciled
+            .terminal_authority
+            .clone_from(&incoming.terminal_authority);
     }
     Ok(reconciled)
 }

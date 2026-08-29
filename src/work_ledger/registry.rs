@@ -352,8 +352,8 @@ pub(super) fn validated_route_matches_launch(
         .map_err(|_| WorkLedgerError::Refused("stored route payload is malformed".to_owned()))?;
     Ok(
         provenance.launch_profile.profile_ref.as_str() == profile_ref
-            && provenance.launch_profile.provider_kind == provider_kind
-            && provenance.provider_kind() == provider_kind,
+            && provenance.launch_profile.execution_provider_kind() == provider_kind
+            && provenance.provider_kind() == provenance.launch_profile.provider_kind,
     )
 }
 

@@ -18,6 +18,7 @@ pub(crate) struct DeliveryAuthorityExpectation {
     pub(crate) pull_request: u64,
     pub(crate) head_sha: String,
     pub(crate) base_ref: String,
+    pub(crate) base_sha: String,
     pub(crate) requested_terminal_instance: String,
     pub(crate) requested_process: ProcessIncarnation,
     pub(crate) native_session_id: String,
@@ -35,6 +36,7 @@ pub(crate) struct GitHubAuthorityObservation {
     pub(crate) pull_request: u64,
     pub(crate) head_sha: String,
     pub(crate) base_ref: String,
+    pub(crate) base_sha: String,
     pub(crate) observed_at: DateTime<Utc>,
 }
 
@@ -128,6 +130,7 @@ struct GitHubReceiptPayload<'a> {
     pull_request: u64,
     head_sha: &'a str,
     base_ref: &'a str,
+    base_sha: &'a str,
     observed_at: &'a str,
 }
 
@@ -175,7 +178,23 @@ impl DeliveryAuthorization {
 pub(crate) fn verify_delivery_authority<P: DeliveryAuthorityProbe>(
     probe: &mut P,
     expected: &DeliveryAuthorityExpectation,
+) -> Result<DeliveryAuthorization, DeliveryAuthorityRefusal> {
+    verify_delivery_authority_inner(probe, expected, None)
+}
+
+#[cfg(test)]
+pub(crate) fn verify_delivery_authority_at<P: DeliveryAuthorityProbe>(
+    probe: &mut P,
+    expected: &DeliveryAuthorityExpectation,
     now: DateTime<Utc>,
+) -> Result<DeliveryAuthorization, DeliveryAuthorityRefusal> {
+    verify_delivery_authority_inner(probe, expected, Some(now))
+}
+
+fn verify_delivery_authority_inner<P: DeliveryAuthorityProbe>(
+    probe: &mut P,
+    expected: &DeliveryAuthorityExpectation,
+    fixed_now: Option<DateTime<Utc>>,
 ) -> Result<DeliveryAuthorization, DeliveryAuthorityRefusal> {
     if expected.base_ref.is_empty() {
         return Err(DeliveryAuthorityRefusal::BaseRefMissing);
@@ -199,7 +218,12 @@ pub(crate) fn verify_delivery_authority<P: DeliveryAuthorityProbe>(
     if github.base_ref != expected.base_ref {
         return Err(DeliveryAuthorityRefusal::BaseRefMismatch);
     }
-    let age = now.signed_duration_since(github.observed_at);
+    if github.base_sha != expected.base_sha {
+        return Err(DeliveryAuthorityRefusal::BaseRefMismatch);
+    }
+    let age = fixed_now
+        .unwrap_or_else(Utc::now)
+        .signed_duration_since(github.observed_at);
     if age < Duration::zero() || age > MAX_GITHUB_OBSERVATION_AGE {
         return Err(DeliveryAuthorityRefusal::ObservationStale);
     }
@@ -211,6 +235,7 @@ pub(crate) fn verify_delivery_authority<P: DeliveryAuthorityProbe>(
         pull_request: github.pull_request,
         head_sha: &github.head_sha,
         base_ref: &github.base_ref,
+        base_sha: &github.base_sha,
         observed_at: &observed_at,
     })
     .expect("fixed GitHub authority receipt is serializable");
@@ -224,14 +249,16 @@ pub(crate) fn verify_delivery_authority<P: DeliveryAuthorityProbe>(
     {
         return Err(DeliveryAuthorityRefusal::TerminalInstanceMismatch);
     }
-    let terminal_age = now.signed_duration_since(terminal.observed_at);
+    let terminal_age = fixed_now
+        .unwrap_or_else(Utc::now)
+        .signed_duration_since(terminal.observed_at);
     if terminal_age < Duration::zero() || terminal_age > MAX_GITHUB_OBSERVATION_AGE {
         return Err(DeliveryAuthorityRefusal::ObservationStale);
     }
     if terminal.process.pid == 0
         || terminal.process.boot_id.is_empty()
         || terminal.process.start_identity.is_empty()
-        || (!terminal.transactionally_rebound && terminal.process != expected.requested_process)
+        || terminal.process != expected.requested_process
     {
         return Err(DeliveryAuthorityRefusal::ProcessIncarnationMismatch);
     }

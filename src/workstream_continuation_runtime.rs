@@ -5,20 +5,29 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::app::{LaunchProfileV1, decode_protected_launch_profile};
+use crate::cloud::GitHubActions;
+use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
 use crate::provider_wrapper::{
     FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderLaunchOptionsV1,
     ProviderWrapperEnvironment, ProviderWrapperOperationV1, ProviderWrapperRequestV1,
     ProviderWrapperRunResult, provider_wrapper_execution_supported, run_provider_wrapper,
 };
+use crate::terminal_delivery_authority::{
+    ProductionTerminalEvidenceAdapter, TerminalCapabilityRefusal, TerminalEvidenceAdapter,
+};
 use crate::work_ledger::{
-    DeliveryAuthorityRefusal, DeliveryAuthorization, DeliveryFence, ExactProtectedProfileResolver,
-    FreshAgentLaunchProfile, ProviderAdapter, ProviderAuthorizationOperation, ProviderCapability,
-    ProviderLaunchRequest, ProviderOutcome, StoredProviderRequest, WakeConsumerPolicy,
-    WakeDeliveryResult, WorkLedger,
+    DeliveryAuthorityExpectation, DeliveryAuthorityProbe, DeliveryAuthorityRefusal,
+    DeliveryAuthorization, DeliveryFence, ExactProtectedProfileResolver, FreshAgentLaunchProfile,
+    GitHubAuthorityObservation, ProcessIncarnation, ProviderAdapter,
+    ProviderAuthorizationOperation, ProviderCapability, ProviderLaunchRequest, ProviderOutcome,
+    StoredProviderRequest, TerminalAuthorityObservation, WakeConsumerPolicy, WakeDeliveryResult,
+    WorkLedger, verify_delivery_authority,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 use crate::workstream_continuation_config::WorkstreamContinuationConfig;
@@ -251,41 +260,186 @@ impl ProviderAdapter for WorkLedgerProviderAdapter<'_> {
         fence: &DeliveryFence,
         operation: ProviderAuthorizationOperation,
     ) -> Result<DeliveryAuthorization, ProviderOutcome> {
-        // Native publication currently records a static route label and leaves
-        // base_ref unbound. Neither is live delivery authority. Refuse before
-        // marking the delivery launched or invoking the provider wrapper.
-        let refusal = self
+        let wrapper_operation = match operation {
+            ProviderAuthorizationOperation::Submit => ProviderWrapperOperationV1::Submit,
+            ProviderAuthorizationOperation::Reconcile => ProviderWrapperOperationV1::Reconcile,
+        };
+        let request = self
             .ledger
-            .current_delivery_authority_gap(fence)
-            .unwrap_or(DeliveryAuthorityRefusal::TerminalAuthorityUnavailable);
-        Err(authority_refusal(
-            match operation {
-                ProviderAuthorizationOperation::Submit => ProviderWrapperOperationV1::Submit,
-                ProviderAuthorizationOperation::Reconcile => ProviderWrapperOperationV1::Reconcile,
-            },
-            refusal,
-        ))
+            .current_delivery_authority_request(fence)
+            .map_err(|error| {
+                authority_refusal(
+                    wrapper_operation,
+                    map_authority_request_error(&error.to_string()),
+                )
+            })?;
+        let cwd = std::env::current_dir().map_err(|_| {
+            authority_refusal(
+                wrapper_operation,
+                DeliveryAuthorityRefusal::GitHubAppAuthorityUnavailable,
+            )
+        })?;
+        let trusted_config =
+            LoadedConfig::load_machine_global(RuntimeMode::Shipyard).map_err(|_| {
+                authority_refusal(
+                    wrapper_operation,
+                    DeliveryAuthorityRefusal::GitHubAppAuthorityUnavailable,
+                )
+            })?;
+        let mut probe = ProductionDeliveryAuthorityProbe {
+            github: GitHubActions::from_loaded_config(cwd, &trusted_config)
+                .with_repo_override(&request.expected.repository),
+            terminal: request.terminal,
+            terminal_adapter: ProductionTerminalEvidenceAdapter,
+        };
+        verify_delivery_authority(&mut probe, &request.expected)
+            .map_err(|refusal| authority_refusal(wrapper_operation, refusal))
     }
 
     fn launch(
         &mut self,
         request: ProviderLaunchRequest<'_>,
-        _authority: DeliveryAuthorization,
+        authority: DeliveryAuthorization,
     ) -> ProviderOutcome {
-        self.run(request.fence, ProviderWrapperOperationV1::Submit)
+        self.run(request.fence, ProviderWrapperOperationV1::Submit, authority)
     }
 
     fn reconcile(
         &mut self,
         fence: &DeliveryFence,
-        _authority: DeliveryAuthorization,
+        authority: DeliveryAuthorization,
     ) -> ProviderOutcome {
-        self.run(fence, ProviderWrapperOperationV1::Reconcile)
+        self.run(fence, ProviderWrapperOperationV1::Reconcile, authority)
     }
 }
 
+struct ProductionDeliveryAuthorityProbe {
+    github: GitHubActions,
+    terminal: crate::terminal_delivery_authority::TerminalCapabilityRequest,
+    terminal_adapter: ProductionTerminalEvidenceAdapter,
+}
+
+impl DeliveryAuthorityProbe for ProductionDeliveryAuthorityProbe {
+    fn observe_github(
+        &mut self,
+        expected: &DeliveryAuthorityExpectation,
+    ) -> Result<GitHubAuthorityObservation, DeliveryAuthorityRefusal> {
+        let installation_id = self
+            .github
+            .app_installation_id()
+            .map_err(|_| DeliveryAuthorityRefusal::GitHubAppAuthorityUnavailable)?;
+        let raw = self
+            .github
+            .run_gh_with_timeout(
+                &[
+                    "pr".into(),
+                    "view".into(),
+                    expected.pull_request.to_string(),
+                    "--repo".into(),
+                    expected.repository.clone(),
+                    "--json".into(),
+                    "state,headRefOid,baseRefName,baseRefOid".into(),
+                ],
+                Duration::from_secs(15),
+            )
+            .map_err(|_| DeliveryAuthorityRefusal::GitHubAppAuthorityUnavailable)?;
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|_| DeliveryAuthorityRefusal::GitHubAppAuthorityUnavailable)?;
+        if value.get("state").and_then(Value::as_str) != Some("OPEN") {
+            return Err(DeliveryAuthorityRefusal::HeadMismatch);
+        }
+        Ok(GitHubAuthorityObservation {
+            app_authenticated: true,
+            installation_id,
+            repository: expected.repository.clone(),
+            pull_request: expected.pull_request,
+            head_sha: value
+                .get("headRefOid")
+                .and_then(Value::as_str)
+                .ok_or(DeliveryAuthorityRefusal::HeadMismatch)?
+                .to_ascii_lowercase(),
+            base_ref: value
+                .get("baseRefName")
+                .and_then(Value::as_str)
+                .ok_or(DeliveryAuthorityRefusal::BaseRefMissing)?
+                .to_owned(),
+            base_sha: value
+                .get("baseRefOid")
+                .and_then(Value::as_str)
+                .ok_or(DeliveryAuthorityRefusal::BaseRefMissing)?
+                .to_ascii_lowercase(),
+            observed_at: Utc::now(),
+        })
+    }
+
+    fn verify_terminal_once(
+        &mut self,
+        expected: &DeliveryAuthorityExpectation,
+    ) -> Result<TerminalAuthorityObservation, DeliveryAuthorityRefusal> {
+        let observed = self
+            .terminal_adapter
+            .verify_once(&self.terminal)
+            .map_err(map_terminal_refusal)?;
+        Ok(TerminalAuthorityObservation {
+            requested_terminal_instance: expected.requested_terminal_instance.clone(),
+            actual_terminal_instance: observed.terminal_instance,
+            process: ProcessIncarnation {
+                boot_id: observed.process.boot_id,
+                pid: observed.process.pid,
+                start_identity: observed.process.start_identity,
+            },
+            native_session_id: observed.native_session_id,
+            source_work_generation: expected.source_work_generation,
+            source_owner_generation: expected.source_owner_generation,
+            target_work_generation: expected.target_work_generation,
+            target_owner_generation: expected.target_owner_generation,
+            transactionally_rebound: false,
+            observed_at: Utc::now(),
+        })
+    }
+}
+
+fn map_terminal_refusal(value: TerminalCapabilityRefusal) -> DeliveryAuthorityRefusal {
+    match value {
+        TerminalCapabilityRefusal::MethodMissing => DeliveryAuthorityRefusal::MethodMissing,
+        TerminalCapabilityRefusal::NoMatch => DeliveryAuthorityRefusal::NoTerminalMatch,
+        TerminalCapabilityRefusal::MultipleMatches => {
+            DeliveryAuthorityRefusal::MultipleTerminalMatches
+        }
+        TerminalCapabilityRefusal::ProcessIncarnationChanged => {
+            DeliveryAuthorityRefusal::ProcessIncarnationMismatch
+        }
+        TerminalCapabilityRefusal::NativeSessionMismatch => {
+            DeliveryAuthorityRefusal::NativeSessionMismatch
+        }
+        TerminalCapabilityRefusal::Unsupported
+        | TerminalCapabilityRefusal::Unobservable
+        | TerminalCapabilityRefusal::InvalidResponse => {
+            DeliveryAuthorityRefusal::TerminalAuthorityUnavailable
+        }
+    }
+}
+
+fn map_authority_request_error(error: &str) -> DeliveryAuthorityRefusal {
+    for refusal in [
+        DeliveryAuthorityRefusal::DirectProviderForbidden,
+        DeliveryAuthorityRefusal::StaticRouteMetadataOnly,
+        DeliveryAuthorityRefusal::BaseRefMissing,
+    ] {
+        if error.contains(refusal.code()) {
+            return refusal;
+        }
+    }
+    DeliveryAuthorityRefusal::TerminalAuthorityUnavailable
+}
+
 impl WorkLedgerProviderAdapter<'_> {
-    fn run(&self, fence: &DeliveryFence, operation: ProviderWrapperOperationV1) -> ProviderOutcome {
+    fn run(
+        &self,
+        fence: &DeliveryFence,
+        operation: ProviderWrapperOperationV1,
+        _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         let Ok(request) = self.wrapper_request(fence, operation) else {
             return preflight_refusal(operation);
         };

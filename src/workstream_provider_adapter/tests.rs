@@ -792,6 +792,7 @@ impl ProviderAdapter for LedgerCmuxAdapter {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
     let temp = tempfile::tempdir().expect("temp");
     let profile_bytes = b"strict-test-profile".to_vec();
@@ -813,6 +814,22 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
         repository: "generous-corp/shipyard".to_owned(),
         pull_request: 43,
         head_sha: "4".repeat(40),
+        base_ref: "main".into(),
+        base_sha: "5".repeat(40),
+        github_installation_id: 42,
+        terminal_authority: crate::terminal_delivery_authority::TerminalCapabilityRequest::Cmux {
+            cli_path: "/test/cmux".into(),
+            socket_path: "/test/cmux.sock".into(),
+            surface_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+            workspace_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
+            native_session_id: "session-gen43".into(),
+            provider_kind: "codex".into(),
+            process: crate::terminal_delivery_authority::LocalProcessIncarnation {
+                boot_id: "boot".into(),
+                pid: 42,
+                start_identity: "start".into(),
+            },
+        },
         workstream_handle: "GEN-43".to_owned(),
         context_url: Some("https://linear.example/GEN-43".to_owned()),
         origin_machine: "m5".to_owned(),
@@ -820,6 +837,10 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
         owner_generation: 1,
         agent_provider: "codex".to_owned(),
         agent_session_id: "session-gen43".to_owned(),
+        route_account: "account-a".into(),
+        route_model: "model-a".into(),
+        route_wrapper: "subrouter".into(),
+        native_resume_digest: "9".repeat(64),
         route_id: "route-gen43".to_owned(),
         profile_generation: 1,
         profile_revision: 1,

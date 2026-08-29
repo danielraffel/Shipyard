@@ -269,17 +269,20 @@ fn validate_native_argv(
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     let provider = profile.provider.provider.as_str();
-    if executable != provider || !matches!(provider, "codex" | "claude") {
+    if executable != "subrouter"
+        || !matches!(provider, "codex" | "claude")
+        || argv.get(1).map(String::as_str) != Some(provider)
+    {
         return Err(CliFailure::new(
             1,
-            "native fresh-agent argv uses an unrecognized provider executable",
+            "native fresh-agent argv requires an exact Subrouter provider wrapper",
         ));
     }
     let expected_session = profile
         .session
         .as_ref()
         .map(|session| session.provider_session_id.as_str());
-    let mut index = 1;
+    let mut index = 2;
     if resume && provider == "codex" {
         if argv.get(index).map(String::as_str) != Some("resume") {
             return Err(CliFailure::new(1, "native codex resume grammar is invalid"));
@@ -754,6 +757,7 @@ mod tests {
         codex.provider.provider = "codex".into();
         codex.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
         codex.launch_argv = vec![
+            "subrouter".into(),
             "codex".into(),
             "--model".into(),
             "model-x".into(),
@@ -761,6 +765,7 @@ mod tests {
             "model_reasoning_effort=\"medium\"".into(),
         ];
         codex.resume_argv = vec![
+            "subrouter".into(),
             "codex".into(),
             "resume".into(),
             "--model".into(),
@@ -777,6 +782,7 @@ mod tests {
         claude.provider.provider = "claude".into();
         claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::High);
         claude.launch_argv = vec![
+            "subrouter".into(),
             "claude".into(),
             "--model".into(),
             "model-x".into(),
@@ -784,6 +790,7 @@ mod tests {
             "high".into(),
         ];
         claude.resume_argv = vec![
+            "subrouter".into(),
             "claude".into(),
             "--model".into(),
             "model-x".into(),
@@ -798,8 +805,8 @@ mod tests {
 
         let mut unsupported_claude = claude.clone();
         unsupported_claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Ultra);
-        unsupported_claude.launch_argv[4] = "ultra".into();
-        unsupported_claude.resume_argv[4] = "ultra".into();
+        unsupported_claude.launch_argv[5] = "ultra".into();
+        unsupported_claude.resume_argv[5] = "ultra".into();
         assert!(
             unsupported_claude
                 .validate_native_fresh_agent_grammar()
@@ -807,7 +814,7 @@ mod tests {
         );
 
         let mut unrecognized_effort = codex.clone();
-        unrecognized_effort.launch_argv[4] = "model_reasoning_effort=\"wrong\"".into();
+        unrecognized_effort.launch_argv[5] = "model_reasoning_effort=\"wrong\"".into();
         assert!(
             unrecognized_effort
                 .validate_native_fresh_agent_grammar()

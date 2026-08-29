@@ -6,13 +6,14 @@ use super::dispatch::{FreshAgentLaunchProfile, WakeEnvelope, WakeProfileResolver
 use super::registry::RouteRegistration;
 use super::route::{
     AdapterAxis, AdapterBindingRecord, AgentRoute, AgentRouteRecord, LaunchProfileRecord,
-    NativeSessionRoute, OpaqueRef, ProviderRoute, ProviderRouteRecord, RouteProvenanceRecord,
-    Sha256Digest, TerminalRoute, TerminalRouteRecord,
+    NativeDeliveryAuthorityRecord, NativeSessionRoute, OpaqueRef, ProviderRoute,
+    ProviderRouteRecord, RouteProvenanceRecord, Sha256Digest, TerminalRoute, TerminalRouteRecord,
 };
 use super::{
     ContinuationSet, ImportCandidate, LifecycleState, OptionalExtension, WorkLedger,
     WorkLedgerError, WorkLedgerResult, digest, opaque_ref, params, validate_digest,
 };
+use crate::terminal_delivery_authority::TerminalCapabilityRequest;
 use crate::workstream_continuation_config::WorkstreamContinuationConfig;
 
 /// Complete normalized authority needed to publish one native continuation.
@@ -21,6 +22,10 @@ pub(crate) struct NativePublicationRequest {
     pub(crate) repository: String,
     pub(crate) pull_request: u64,
     pub(crate) head_sha: String,
+    pub(crate) base_ref: String,
+    pub(crate) base_sha: String,
+    pub(crate) github_installation_id: u64,
+    pub(crate) terminal_authority: TerminalCapabilityRequest,
     pub(crate) workstream_handle: String,
     pub(crate) context_url: Option<String>,
     pub(crate) origin_machine: String,
@@ -28,6 +33,10 @@ pub(crate) struct NativePublicationRequest {
     pub(crate) owner_generation: u64,
     pub(crate) agent_provider: String,
     pub(crate) agent_session_id: String,
+    pub(crate) route_account: String,
+    pub(crate) route_model: String,
+    pub(crate) route_wrapper: String,
+    pub(crate) native_resume_digest: String,
     pub(crate) route_id: String,
     pub(crate) profile_generation: u64,
     pub(crate) profile_revision: u64,
@@ -250,7 +259,7 @@ impl WorkLedger {
             repo: Some(request.repository.clone()),
             pr: Some(request.pull_request),
             head_sha: Some(request.head_sha.clone()),
-            base_ref: None,
+            base_ref: Some(request.base_ref.clone()),
             goal_id: Some(opaque_ref("goal", &request.workstream_handle)),
             goal_generation: 1,
             lane: Some("fresh_agent_continuation".to_owned()),
@@ -517,12 +526,19 @@ impl PublicationIdentities {
             .to_owned();
         let publication_digest = digest(
             format!(
-                "shipyard-native-publication-authority-v1\n{authority_seed}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                "shipyard-native-publication-authority-v2\n{authority_seed}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 request.context_url.as_deref().unwrap_or(""),
+                request.base_ref,
+                request.base_sha,
+                request.github_installation_id,
                 request.origin_machine,
                 request.owner_id,
                 request.agent_provider,
                 request.agent_session_id,
+                request.route_account,
+                request.route_model,
+                request.route_wrapper,
+                request.native_resume_digest,
                 request.route_id,
                 request.profile_generation,
                 request.profile_revision,
@@ -554,9 +570,22 @@ fn validate_request(
     request: &NativePublicationRequest,
     policy: &WorkstreamContinuationConfig,
 ) -> WorkLedgerResult<()> {
+    let (terminal_provider, terminal_session) = match &request.terminal_authority {
+        TerminalCapabilityRequest::Cmux {
+            provider_kind,
+            native_session_id,
+            ..
+        }
+        | TerminalCapabilityRequest::HerdR {
+            provider_kind,
+            native_session_id,
+            ..
+        } => (provider_kind, native_session_id),
+    };
     if !policy.allows_repository(&request.repository)
         || request.origin_machine != policy.origin_machine
         || request.pull_request == 0
+        || request.github_installation_id == 0
         || request.owner_generation == 0
         || request.profile_generation == 0
         || request.profile_revision == 0
@@ -572,13 +601,27 @@ fn validate_request(
         || request.owner_id.len() > 512
         || request.agent_session_id.is_empty()
         || request.agent_session_id.len() > 512
+        || terminal_provider != &request.agent_provider
+        || terminal_session != &request.agent_session_id
         || request.route_id.is_empty()
+        || request.route_wrapper.is_empty()
+        || std::path::Path::new(&request.route_wrapper)
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some("subrouter")
         || request.route_id.len() > 512
         || request.head_sha.len() != 40
         || !request
             .head_sha
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || request.base_sha.len() != 40
+        || !request
+            .base_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || request.base_ref.is_empty()
+        || request.base_ref.len() > 255
         || request.context_url.as_deref().is_some_and(|url| {
             url.is_empty() || url.len() > 4096 || url.chars().any(char::is_control)
         })
@@ -588,6 +631,7 @@ fn validate_request(
         ));
     }
     validate_digest("native profile digest", &request.profile_digest)?;
+    validate_digest("native resume digest", &request.native_resume_digest)?;
     validate_digest(
         "native success continuation digest",
         &request.success_continuation_digest,
@@ -599,6 +643,7 @@ fn validate_request(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn native_route(
     request: &NativePublicationRequest,
     policy: &WorkstreamContinuationConfig,
@@ -618,7 +663,8 @@ fn native_route(
         )
         .as_bytes(),
     );
-    let wrapper_ref = OpaqueRef::derive("provider-wrapper", wrapper.executable_sha256.as_bytes());
+    let provider_wrapper_ref =
+        OpaqueRef::derive("provider-wrapper", wrapper.executable_sha256.as_bytes());
     let terminal = adapter(
         AdapterAxis::Terminal,
         "session_host",
@@ -633,24 +679,28 @@ fn native_route(
         digest(request.agent_session_id.as_bytes()),
         digest(b"fresh-agent-resume"),
     )?;
-    let provider = adapter(
-        AdapterAxis::Provider,
-        &wrapper.provider_id,
-        wrapper.executable_sha256.clone(),
-        config_digest.clone(),
-        digest(format!("{}\nfresh_agent\nidempotent", wrapper.adapter_id).as_bytes()),
-    )?;
     let session = NativeSessionRoute {
         native_session_ref: OpaqueRef::derive(
             "native-session",
             request.agent_session_id.as_bytes(),
         ),
-        native_resume_ref: OpaqueRef::derive("native-resume", request.workstream_handle.as_bytes()),
-        account_ref: OpaqueRef::derive("account", request.agent_provider.as_bytes()),
-        model_ref: OpaqueRef::derive("model", b"fresh-agent"),
-        wrapper_ref: wrapper_ref.clone(),
-        session_headers_ref: OpaqueRef::derive("session-headers", request.route_id.as_bytes()),
-        session_headers_sha256: Sha256Digest::of_bytes(request.route_id.as_bytes()),
+        native_resume_ref: OpaqueRef::derive(
+            "native-resume",
+            request.native_resume_digest.as_bytes(),
+        ),
+        account_ref: OpaqueRef::derive("account", request.route_account.as_bytes()),
+        model_ref: OpaqueRef::derive("model", request.route_model.as_bytes()),
+        wrapper_ref: provider_wrapper_ref.clone(),
+        session_headers_ref: OpaqueRef::derive(
+            "session-headers-and-routing-wrapper",
+            format!(
+                "{}\n{}",
+                request.route_wrapper, request.native_resume_digest
+            )
+            .as_bytes(),
+        ),
+        session_headers_sha256: Sha256Digest::parse(request.native_resume_digest.clone())
+            .map_err(route_error)?,
     };
     let agent_route = match request.agent_provider.as_str() {
         "codex" => AgentRoute::Codex { session },
@@ -663,21 +713,33 @@ fn native_route(
             route_ref: OpaqueRef::derive("terminal-route", request.route_id.as_bytes()),
         }),
         AgentRouteRecord::new(agent.clone(), agent_route).map_err(route_error)?,
-        ProviderRouteRecord::new(ProviderRoute::Registered {
-            adapter: provider.clone(),
-            route_ref: OpaqueRef::derive("provider-route", wrapper.adapter_id.as_bytes()),
+        ProviderRouteRecord::new(ProviderRoute::Subrouter {
+            server_ref: OpaqueRef::derive("subrouter-server", request.route_wrapper.as_bytes()),
+            route_ref: OpaqueRef::derive(
+                "subrouter-route",
+                request.native_resume_digest.as_bytes(),
+            ),
         }),
         LaunchProfileRecord::new(
             OpaqueRef::parse(identities.profile_ref.clone()).map_err(route_error)?,
             request.profile_generation,
             request.profile_revision,
             Sha256Digest::parse(wrapper.executable_sha256.clone()).map_err(route_error)?,
-            wrapper_ref,
+            provider_wrapper_ref,
             Sha256Digest::parse(config_digest).map_err(route_error)?,
-            wrapper.provider_id.clone(),
+            "subrouter".to_owned(),
         )
+        .map_err(route_error)?
+        .bind_execution_provider(wrapper.provider_id.clone())
         .map_err(route_error)?,
     )
+    .map_err(route_error)?
+    .bind_delivery_authority(NativeDeliveryAuthorityRecord {
+        github_installation_id: request.github_installation_id,
+        base_ref: request.base_ref.clone(),
+        base_sha: request.base_sha.clone(),
+        terminal: request.terminal_authority.clone(),
+    })
     .map_err(route_error)?;
     let route = RouteRegistration::new(
         identities.route_ref.clone(),
@@ -690,7 +752,7 @@ fn native_route(
         opaque_ref("machine", &request.origin_machine),
         provenance,
     )?;
-    Ok((route, vec![terminal, agent, provider]))
+    Ok((route, vec![terminal, agent]))
 }
 
 fn adapter(
@@ -855,6 +917,23 @@ mod tests {
             repository: "owner/repo".to_owned(),
             pull_request: 43,
             head_sha: "a".repeat(40),
+            base_ref: "main".into(),
+            base_sha: "b".repeat(40),
+            github_installation_id: 42,
+            terminal_authority:
+                crate::terminal_delivery_authority::TerminalCapabilityRequest::Cmux {
+                    cli_path: "/test/cmux".into(),
+                    socket_path: "/test/cmux.sock".into(),
+                    surface_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+                    workspace_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
+                    native_session_id: "session-43".into(),
+                    provider_kind: "codex".into(),
+                    process: crate::terminal_delivery_authority::LocalProcessIncarnation {
+                        boot_id: "boot".into(),
+                        pid: 42,
+                        start_identity: "start".into(),
+                    },
+                },
             workstream_handle: "GEN-43".to_owned(),
             context_url: Some("https://linear.example/GEN-43".to_owned()),
             origin_machine: "m5".to_owned(),
@@ -862,6 +941,10 @@ mod tests {
             owner_generation: 1,
             agent_provider: "codex".to_owned(),
             agent_session_id: "session-43".to_owned(),
+            route_account: "account-a".into(),
+            route_model: "model-a".into(),
+            route_wrapper: "subrouter".into(),
+            native_resume_digest: digest(b"subrouter resume session-43"),
             route_id: "route-43".to_owned(),
             profile_generation: 1,
             profile_revision: 1,
@@ -960,6 +1043,13 @@ mod tests {
                     ..request()
                 },
             ),
+            (
+                policy(vec!["owner/repo".to_owned()]),
+                NativePublicationRequest {
+                    route_wrapper: "codex".to_owned(),
+                    ..request()
+                },
+            ),
         ] {
             let temp = TempDir::new().expect("temp");
             assert!(
@@ -973,6 +1063,42 @@ mod tests {
             );
             assert!(!WorkLedger::path_at(temp.path()).exists());
         }
+    }
+
+    #[test]
+    fn cross_provider_terminal_authority_fails_before_storage_creation() {
+        let temp = TempDir::new().expect("temp");
+        let mut request = request();
+        let TerminalCapabilityRequest::Cmux { provider_kind, .. } = &mut request.terminal_authority
+        else {
+            panic!("cmux fixture")
+        };
+        *provider_kind = "claude".to_owned();
+        let policy = policy(vec![request.repository.clone()]);
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
+                .is_err()
+        );
+        assert!(!WorkLedger::path_at(temp.path()).exists());
+    }
+
+    #[test]
+    fn cross_session_terminal_authority_fails_before_storage_creation() {
+        let temp = TempDir::new().expect("temp");
+        let mut request = request();
+        let TerminalCapabilityRequest::Cmux {
+            native_session_id, ..
+        } = &mut request.terminal_authority
+        else {
+            panic!("cmux fixture")
+        };
+        *native_session_id = "different-session".to_owned();
+        let policy = policy(vec![request.repository.clone()]);
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
+                .is_err()
+        );
+        assert!(!WorkLedger::path_at(temp.path()).exists());
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use serde_json::Value;
 
+use crate::cloud::GitHubActions;
 use crate::daemon_ipc::read_daemon_status;
 use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
@@ -24,6 +25,7 @@ const MAX_AGENT_RECEIPT_BYTES: u64 = 64 * 1024;
 pub(super) fn work_ledger_command<W: Write>(
     command: &WorkLedgerCommand,
     runtime_paths: &RuntimePaths,
+    cwd: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -111,7 +113,8 @@ pub(super) fn work_ledger_command<W: Write>(
                     "native publication is available only against canonical production roots",
                 ));
             }
-            let request = native_publication_request(runtime_paths, repo, *pr, head)?;
+            let actions = GitHubActions::new(cwd).with_repo_override(repo);
+            let request = native_publication_request(runtime_paths, &actions, repo, *pr, head)?;
             let mut loader = WorkstreamActivationLoader::production();
             let ready = match loader.revalidate_for_tick() {
                 WorkstreamActivationState::Ready(ready) => ready,
