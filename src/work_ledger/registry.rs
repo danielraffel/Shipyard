@@ -323,6 +323,40 @@ pub(super) fn validated_route_exists(
     Ok(true)
 }
 
+/// Revalidate a route and return whether its protected launch-profile and
+/// provider identities match the exact profile selected for this wake.
+pub(super) fn validated_route_matches_launch(
+    transaction: &Transaction<'_>,
+    route_ref: &str,
+    work_id: &str,
+    work_generation: u64,
+    owner_generation: u64,
+    profile_ref: &str,
+    provider_kind: &str,
+) -> WorkLedgerResult<bool> {
+    if !validated_route_exists(
+        transaction,
+        route_ref,
+        work_id,
+        work_generation,
+        owner_generation,
+    )? {
+        return Ok(false);
+    }
+    let payload: Vec<u8> = transaction.query_row(
+        "SELECT payload_json FROM route_records WHERE route_ref = ?1",
+        [route_ref],
+        |row| row.get(0),
+    )?;
+    let provenance: RouteProvenanceRecord = serde_json::from_slice(&payload)
+        .map_err(|_| WorkLedgerError::Refused("stored route payload is malformed".to_owned()))?;
+    Ok(
+        provenance.launch_profile.profile_ref.as_str() == profile_ref
+            && provenance.launch_profile.provider_kind == provider_kind
+            && provenance.provider_kind() == provider_kind,
+    )
+}
+
 fn registered_adapters_present(
     transaction: &Transaction<'_>,
     provenance: &RouteProvenanceRecord,

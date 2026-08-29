@@ -4,7 +4,7 @@ use std::process::Command;
 
 use super::{
     CliFailure, LoadedConfig, ResolvedPrContext, ShipStewardHandoff, StewardHandoffArgs,
-    steward_handoff_command,
+    steward_handoff_command, steward_handoff_transfer_report,
 };
 use crate::cloud::GitHubActions;
 use crate::paths::RuntimePaths;
@@ -14,6 +14,10 @@ pub(super) struct AppliedStewardHandoff {
     pub(super) workstream_id: String,
     pub(super) context_url: Option<String>,
     pub(super) head: String,
+    pub(super) monitoring_transferred: bool,
+    pub(super) publication_work_id: Option<String>,
+    pub(super) publication_route_ref: Option<String>,
+    pub(super) publication_wake_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -207,8 +211,8 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
             agent_session_id: None,
             agent_parent_session_id: None,
             agent_surface_id: None,
-            launch_profile: None,
-            goal_managed: false,
+            launch_profile: request.launch_profile.clone(),
+            goal_managed: request.launch_profile.is_some(),
             after_handoff: "continue".to_owned(),
             transfer_agent_owner: false,
             apply: true,
@@ -219,11 +223,12 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
         false,
         &mut sink,
     )?;
+    let transfer = steward_handoff_transfer_report(runtime_paths, repo, pr.number, head)?;
     if !json_mode {
         writeln!(
             stdout,
-            "▸ Durable steward receipt: PR #{} head={} workstream={workstream_id}",
-            pr.number, head
+            "▸ Durable steward receipt: PR #{} head={} workstream={workstream_id} monitoring_transferred={}",
+            pr.number, head, transfer.wake_consumer_available
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
@@ -231,5 +236,9 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
         workstream_id,
         context_url,
         head: head.to_owned(),
+        monitoring_transferred: transfer.wake_consumer_available,
+        publication_work_id: transfer.publication_work_id,
+        publication_route_ref: transfer.publication_route_ref,
+        publication_wake_id: transfer.publication_wake_id,
     }))
 }

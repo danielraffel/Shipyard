@@ -18,12 +18,13 @@ use std::thread;
 #[cfg(unix)]
 use std::time::Duration;
 
+use crate::workstream_continuation_runtime::ContinuationRuntimeStatus;
 use serde_json::Value;
 #[cfg(unix)]
 use serde_json::json;
 
 /// IPC protocol version. Bump when the wire contract changes.
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
+pub const IPC_PROTOCOL_VERSION: u32 = 3;
 /// Number of historical events replayed to new subscribers.
 pub const RING_BUFFER_SIZE: usize = 100;
 
@@ -101,6 +102,8 @@ pub struct IpcState {
     pub configured_repos: Vec<String>,
     /// Rate-limit snapshot if known.
     pub rate_limit: Option<Value>,
+    /// Redacted durable-continuation lane state.
+    pub workstream_continuation: ContinuationRuntimeStatus,
     /// Last recoverable daemon warning/error, if any. Doubles as the
     /// menu-bar app's pause-reason channel: an auth-degraded pause is encoded
     /// here via [`github_auth_degraded_message`].
@@ -174,7 +177,7 @@ impl IpcServer {
         self
     }
 
-    /// Install a ship-state-list provider for IPC protocol v2.
+    /// Install a ship-state-list provider for IPC protocol v2 and later.
     #[must_use]
     pub fn with_ship_state_list_provider<F>(mut self, provider: F) -> Self
     where
@@ -438,6 +441,7 @@ fn status_frame(state: &IpcState) -> Value {
         "registered_repos": state.registered_repos,
         "configured_repos": state.configured_repos,
         "rate_limit": state.rate_limit,
+        "workstream_continuation": state.workstream_continuation,
         "last_error": state.last_error,
         "shipyard_version": env!("CARGO_PKG_VERSION"),
         "protocol": IPC_PROTOCOL_VERSION,
@@ -603,8 +607,29 @@ mod tests {
             registered_repos: vec!["org/repo".to_owned()],
             configured_repos: vec!["org/repo".to_owned(), "org/pending".to_owned()],
             rate_limit: None,
+            workstream_continuation:
+                crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
             last_error: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_frame_exposes_only_redacted_continuation_state() {
+        let mut state = dummy_state();
+        state.workstream_continuation =
+            crate::workstream_continuation_runtime::ContinuationRuntimeStatus {
+                state: crate::workstream_continuation_runtime::ContinuationRuntimeState::Refused,
+                reason_code: Some("activation_drift".to_owned()),
+            };
+        let frame = super::status_frame(&state);
+        assert_eq!(frame["workstream_continuation"]["state"], "refused");
+        assert_eq!(
+            frame["workstream_continuation"]["reason_code"],
+            "activation_drift"
+        );
+        let encoded = frame.to_string();
+        assert!(!encoded.contains("wake-") && !encoded.contains("route-"));
     }
 
     #[cfg(unix)]

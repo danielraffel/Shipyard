@@ -7,6 +7,7 @@ use super::post_validation::{
     ShipRenderState, green_not_merged, green_pending_merge_readiness,
     green_validation_state_missing, post_run_merge_state, render_green_pending_merge_readiness,
 };
+use super::provenance::AppliedStewardHandoff;
 use super::render::{
     render_green_not_merged, render_green_not_merged_client_defect, render_green_not_merged_flaky,
     render_green_not_merged_head_superseded, render_json,
@@ -241,6 +242,28 @@ fn foreground_json_uses_the_final_post_validation_state() {
     assert_eq!(
         value.get("status").and_then(Value::as_str),
         Some("green_pending_merge_readiness")
+    );
+
+    let transfer = AppliedStewardHandoff {
+        workstream_id: "GEN-43".to_owned(),
+        context_url: Some("https://linear.example/GEN-43".to_owned()),
+        head: "a".repeat(40),
+        monitoring_transferred: true,
+        publication_work_id: Some("wi_exact".to_owned()),
+        publication_route_ref: Some("route_exact".to_owned()),
+        publication_wake_id: Some("wake_exact".to_owned()),
+    };
+    output.clear();
+    render_json(&mut output, 7751, &outcome, &state, &[], Some(&transfer))
+        .expect("render transfer receipt");
+    let value: Value = serde_json::from_slice(&output).expect("JSON envelope");
+    assert_eq!(
+        value.pointer("/steward_handoff/monitoring_transferred"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(
+        value.pointer("/steward_handoff/publication_wake_id"),
+        Some(&Value::String("wake_exact".to_owned()))
     );
 }
 

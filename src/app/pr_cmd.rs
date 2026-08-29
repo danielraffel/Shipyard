@@ -34,6 +34,7 @@ pub(super) struct PrCommandArgs {
     pub(super) adopt_head: bool,
     pub(super) workstream_id: Option<String>,
     pub(super) context_url: Option<String>,
+    pub(super) launch_profile: Option<PathBuf>,
     pub(super) steward_handoff_preference: StewardHandoffPreference,
     pub(super) python_command: Option<PathBuf>,
 }
@@ -89,11 +90,27 @@ pub(super) fn pr_command<W: Write>(
         ));
     }
     if args.steward_handoff_preference == StewardHandoffPreference::Disabled
-        && (args.workstream_id.is_some() || args.context_url.is_some())
+        && (args.workstream_id.is_some()
+            || args.context_url.is_some()
+            || args.launch_profile.is_some())
     {
         return Err(CliFailure::new(
             2,
-            "--no-steward-handoff conflicts with --workstream-id/--context-url.",
+            "--no-steward-handoff conflicts with --workstream-id/--context-url/--launch-profile.",
+        ));
+    }
+    if args.launch_profile.is_some() && args.apply_bumps {
+        return Err(CliFailure::new(
+            2,
+            "--launch-profile requires --no-apply-bumps so the private profile can bind the final exact head; apply and commit required bumps before generating the profile",
+        ));
+    }
+    if args.launch_profile.is_some()
+        && (!args.skip_bump.is_empty() || !args.skip_skill_update.is_empty())
+    {
+        return Err(CliFailure::new(
+            2,
+            "--launch-profile cannot amend shortcut trailers; commit all required trailers before generating the final exact-head profile",
         ));
     }
 
@@ -166,10 +183,14 @@ fn resolve_steward_handoff(
     protected_default: bool,
 ) -> Option<super::ship_cmd::ShipStewardHandoff> {
     (args.steward_handoff_preference != StewardHandoffPreference::Disabled
-        && (protected_default || args.workstream_id.is_some() || args.context_url.is_some()))
+        && (protected_default
+            || args.workstream_id.is_some()
+            || args.context_url.is_some()
+            || args.launch_profile.is_some()))
     .then(|| super::ship_cmd::ShipStewardHandoff {
         workstream_id: args.workstream_id.clone(),
         context_url: args.context_url.clone(),
+        launch_profile: args.launch_profile.clone(),
     })
 }
 
@@ -593,6 +614,7 @@ mod tests {
             adopt_head: false,
             workstream_id: None,
             context_url: None,
+            launch_profile: None,
             steward_handoff_preference: StewardHandoffPreference::ProjectDefault,
             python_command: None,
         }
@@ -703,6 +725,16 @@ mod tests {
         };
         let resolved = resolve_steward_handoff(&explicit, false).expect("explicit");
         assert_eq!(resolved.workstream_id.as_deref(), Some("GEN-7"));
+
+        let profiled = PrCommandArgs {
+            launch_profile: Some(PathBuf::from("/private/profile.json")),
+            ..pr_args()
+        };
+        let resolved = resolve_steward_handoff(&profiled, false).expect("profile enables handoff");
+        assert_eq!(
+            resolved.launch_profile.as_deref(),
+            Some(Path::new("/private/profile.json"))
+        );
 
         let disabled = PrCommandArgs {
             steward_handoff_preference: StewardHandoffPreference::Disabled,
@@ -1014,5 +1046,46 @@ esac
 
         assert_eq!(error.code, 2);
         assert!(error.message.contains("--skip-skill-update requires"));
+    }
+
+    #[test]
+    fn launch_profile_refuses_a_head_changing_bump_pass() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let args = PrCommandArgs {
+            launch_profile: Some(temp.path().join("profile.json")),
+            ..pr_args()
+        };
+
+        let error = pr_command(
+            args,
+            &empty_config(),
+            temp.path(),
+            &RuntimePaths::current(crate::identity::RuntimeMode::Isolated),
+            false,
+            &mut Vec::new(),
+        )
+        .expect_err("profile cannot precede automatic bumps");
+
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("--no-apply-bumps"));
+        assert!(error.message.contains("final exact head"));
+
+        let args = PrCommandArgs {
+            apply_bumps: false,
+            launch_profile: Some(temp.path().join("profile.json")),
+            skip_bump: vec!["sdk".to_owned()],
+            bump_reason: Some("already handled".to_owned()),
+            ..pr_args()
+        };
+        let error = pr_command(
+            args,
+            &empty_config(),
+            temp.path(),
+            &RuntimePaths::current(crate::identity::RuntimeMode::Isolated),
+            false,
+            &mut Vec::new(),
+        )
+        .expect_err("profile cannot precede a trailer amend");
+        assert!(error.message.contains("cannot amend shortcut trailers"));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "shipyard"
-version = "0.126.2"
+version = "0.127.2"
 edition = "2024"
 description = "Cross-platform CI coordination for local, SSH, and cloud runners."
 rust-version = "1.92"
@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "shipyard"
 path = "src/main.rs"
+
+[[bin]]
+name = "shipyard-workstream-provider"
+path = "src/bin/shipyard-workstream-provider.rs"
 
 [dependencies]
 base64 = "0.22.1"

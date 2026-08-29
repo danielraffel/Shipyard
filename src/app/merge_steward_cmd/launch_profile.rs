@@ -4,21 +4,25 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
+use crate::provider_wrapper::ProviderReasoningEffortV1;
+
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_ARGV_ITEMS: usize = 64;
 const MAX_ARG_BYTES: usize = 4 * 1024;
 const MAX_ARGV_BYTES: usize = 16 * 1024;
 const MAX_METADATA_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4 * 1024;
+const MAX_CONTEXT_URL_BYTES: usize = 4 * 1024;
+const PROTECTED_PROFILE_PREFIX: &[u8] = b"shipyard-launch-profile-v1\0";
 
 /// Private, provider- and terminal-neutral process restoration contract.
 ///
-/// Shipyard persists this data but does not interpret or execute it. A trusted
-/// executor must bind the exact profile and work-item generation to its own
-/// process-launch contract before using either argv.
+/// Generic handoff storage does not interpret or execute this data. The native
+/// fresh-agent publication path separately accepts only a strict prompt-free
+/// grammar before projecting typed metadata into its provider request.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct LaunchProfileV1 {
+pub(crate) struct LaunchProfileV1 {
     pub(super) schema_version: u32,
     pub(super) launch_argv: Vec<String>,
     pub(super) resume_argv: Vec<String>,
@@ -27,7 +31,48 @@ pub(super) struct LaunchProfileV1 {
     pub(super) session: Option<SessionProvenanceV1>,
     pub(super) checkpoint: CheckpointProvenanceV1,
     pub(super) worktree: WorktreeProvenanceV1,
+    /// Immutable inputs a fresh process must reconstruct before it can accept
+    /// ownership. Older profiles decode without this field but cannot authorize
+    /// fresh-agent dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) continuation_bootstrap: Option<ContinuationBootstrapV1>,
     pub(super) recovery_policy: RecoveryPolicyV1,
+}
+
+impl LaunchProfileV1 {
+    pub(crate) fn worktree_path(&self) -> &str {
+        &self.worktree.path
+    }
+
+    pub(crate) fn validate_native_fresh_agent_grammar(&self) -> Result<(), CliFailure> {
+        if let Some(model_id) = self.provider.model.as_deref() {
+            validate_provider_option("model ID", model_id)?;
+        }
+        validate_native_argv(self, &self.launch_argv, false)?;
+        validate_native_argv(self, &self.resume_argv, true)
+    }
+}
+
+/// Exact, provider-neutral expectation for a handle-only fresh-agent resume.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ContinuationBootstrapV1 {
+    pub(super) workstream_handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) context_url: Option<String>,
+    pub(super) plan_sha256: String,
+    pub(super) root_revision: u64,
+    pub(super) issue_revision: u64,
+    pub(super) projection_revision: u64,
+    pub(super) material_event_revision: u64,
+    pub(super) checkpoint_id: String,
+    pub(super) checkpoint_generation: u64,
+    pub(super) checkpoint_digest: String,
+    pub(super) repository: String,
+    pub(super) head_sha: String,
+    pub(super) expected_resume_context_digest: String,
+    pub(super) success_continuation_digest: String,
+    pub(super) failure_continuation_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -50,6 +95,12 @@ pub(super) struct ProviderMetadataV1 {
     pub(super) account: Option<String>,
     #[serde(default, rename = "model_id", skip_serializing_if = "Option::is_none")]
     pub(super) model: Option<String>,
+    #[serde(
+        default,
+        rename = "reasoning_effort",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) reasoning_effort: Option<ProviderReasoningEffortV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -75,6 +126,72 @@ pub(super) enum RecoveryPolicyV1 {
     ExactSessionOnly,
     ExactSessionThenFreshCheckpoint,
     FreshCheckpointOnly,
+}
+
+impl crate::work_ledger::FreshAgentLaunchProfile for LaunchProfileV1 {
+    fn provider_id(&self) -> &str {
+        &self.provider.provider
+    }
+
+    fn provider_launch_options(&self) -> crate::work_ledger::FreshAgentProviderLaunchOptions {
+        crate::work_ledger::FreshAgentProviderLaunchOptions {
+            model_id: self.provider.model.clone(),
+            reasoning_effort: self.provider.reasoning_effort,
+        }
+    }
+
+    fn profile_digest(&self) -> crate::work_ledger::WorkLedgerResult<String> {
+        launch_profile_digest(self).map_err(|error| {
+            crate::work_ledger::WorkLedgerError::Refused(format!(
+                "launch profile is invalid: {}",
+                error.message()
+            ))
+        })
+    }
+
+    fn protected_profile_bytes(&self) -> crate::work_ledger::WorkLedgerResult<Vec<u8>> {
+        launch_profile_protected_bytes(self).map_err(|error| {
+            crate::work_ledger::WorkLedgerError::Refused(format!(
+                "launch profile is invalid: {}",
+                error.message()
+            ))
+        })
+    }
+
+    fn permits_fresh_agent(&self) -> bool {
+        matches!(
+            self.recovery_policy,
+            RecoveryPolicyV1::ExactSessionThenFreshCheckpoint
+                | RecoveryPolicyV1::FreshCheckpointOnly
+        ) && self
+            .continuation_bootstrap
+            .as_ref()
+            .is_some_and(|bootstrap| validate_continuation_bootstrap(self, bootstrap).is_ok())
+    }
+
+    fn resume_expectation(&self) -> Option<crate::work_ledger::FreshAgentResumeExpectation<'_>> {
+        let bootstrap = self
+            .continuation_bootstrap
+            .as_ref()
+            .filter(|bootstrap| validate_continuation_bootstrap(self, bootstrap).is_ok())?;
+        Some(crate::work_ledger::FreshAgentResumeExpectation {
+            workstream_handle: &bootstrap.workstream_handle,
+            context_url: bootstrap.context_url.as_deref(),
+            plan_sha256: &bootstrap.plan_sha256,
+            root_revision: bootstrap.root_revision,
+            issue_revision: bootstrap.issue_revision,
+            projection_revision: bootstrap.projection_revision,
+            material_event_revision: bootstrap.material_event_revision,
+            checkpoint_id: &bootstrap.checkpoint_id,
+            checkpoint_generation: bootstrap.checkpoint_generation,
+            checkpoint_digest: &bootstrap.checkpoint_digest,
+            repository: &bootstrap.repository,
+            head_sha: &bootstrap.head_sha,
+            expected_resume_context_digest: &bootstrap.expected_resume_context_digest,
+            success_continuation_digest: &bootstrap.success_continuation_digest,
+            failure_continuation_digest: &bootstrap.failure_continuation_digest,
+        })
+    }
 }
 
 pub(super) fn load_launch_profile(path: &Path) -> Result<LaunchProfileV1, CliFailure> {
@@ -133,17 +250,300 @@ pub(super) fn validate_launch_profile(profile: &LaunchProfileV1) -> Result<(), C
         ));
     }
     validate_metadata("worktree lineage ID", &profile.worktree.lineage_id)?;
+    if let Some(bootstrap) = profile.continuation_bootstrap.as_ref() {
+        validate_continuation_bootstrap(profile, bootstrap)?;
+    }
+    Ok(())
+}
+
+fn validate_native_argv(
+    profile: &LaunchProfileV1,
+    argv: &[String],
+    resume: bool,
+) -> Result<(), CliFailure> {
+    let executable = argv
+        .first()
+        .map(String::as_str)
+        .map(Path::new)
+        .and_then(|path| path.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let provider = profile.provider.provider.as_str();
+    if executable != provider || !matches!(provider, "codex" | "claude") {
+        return Err(CliFailure::new(
+            1,
+            "native fresh-agent argv uses an unrecognized provider executable",
+        ));
+    }
+    let expected_session = profile
+        .session
+        .as_ref()
+        .map(|session| session.provider_session_id.as_str());
+    let mut index = 1;
+    if resume && provider == "codex" {
+        if argv.get(index).map(String::as_str) != Some("resume") {
+            return Err(CliFailure::new(1, "native codex resume grammar is invalid"));
+        }
+        index += 1;
+    }
+    let mut model = None;
+    let mut reasoning_effort = None;
+    let mut session = None;
+    while index < argv.len() {
+        match (provider, argv[index].as_str()) {
+            (_, "--model") if model.is_none() => {
+                model = Some(argv.get(index + 1).map(String::as_str).ok_or_else(|| {
+                    CliFailure::new(1, "native fresh-agent model flag has no value")
+                })?);
+                index += 2;
+            }
+            ("codex", "-c") if reasoning_effort.is_none() => {
+                let value = argv.get(index + 1).map(String::as_str).ok_or_else(|| {
+                    CliFailure::new(1, "native codex reasoning flag has no value")
+                })?;
+                reasoning_effort = parse_codex_reasoning_config(value);
+                if reasoning_effort.is_none() {
+                    return Err(CliFailure::new(
+                        1,
+                        "native codex reasoning config is invalid",
+                    ));
+                }
+                index += 2;
+            }
+            ("claude", "--effort") if reasoning_effort.is_none() => {
+                let value = argv
+                    .get(index + 1)
+                    .map(String::as_str)
+                    .ok_or_else(|| CliFailure::new(1, "native claude effort flag has no value"))?;
+                reasoning_effort = parse_claude_reasoning_effort(value);
+                if reasoning_effort.is_none() {
+                    return Err(CliFailure::new(1, "native claude effort is invalid"));
+                }
+                index += 2;
+            }
+            ("claude", "--resume") if resume && session.is_none() => {
+                session = Some(argv.get(index + 1).map(String::as_str).ok_or_else(|| {
+                    CliFailure::new(1, "native claude resume flag has no session")
+                })?);
+                index += 2;
+            }
+            ("codex", value) if resume && session.is_none() => {
+                session = Some(value);
+                index += 1;
+            }
+            _ => {
+                return Err(CliFailure::new(
+                    1,
+                    "native fresh-agent argv contains a prompt, secret-bearing, or unrecognized argument",
+                ));
+            }
+        }
+    }
+    if model != profile.provider.model.as_deref()
+        || reasoning_effort != profile.provider.reasoning_effort
+        || (resume && session != expected_session)
+        || (!resume && session.is_some())
+    {
+        return Err(CliFailure::new(
+            1,
+            "native fresh-agent argv does not exactly match validated provider metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_codex_reasoning_config(value: &str) -> Option<ProviderReasoningEffortV1> {
+    let value = value
+        .strip_prefix("model_reasoning_effort=\"")?
+        .strip_suffix('"')?;
+    parse_reasoning_effort(value)
+}
+
+fn parse_reasoning_effort(value: &str) -> Option<ProviderReasoningEffortV1> {
+    match value {
+        "low" => Some(ProviderReasoningEffortV1::Low),
+        "medium" => Some(ProviderReasoningEffortV1::Medium),
+        "high" => Some(ProviderReasoningEffortV1::High),
+        "xhigh" => Some(ProviderReasoningEffortV1::Xhigh),
+        "max" => Some(ProviderReasoningEffortV1::Max),
+        "ultra" => Some(ProviderReasoningEffortV1::Ultra),
+        _ => None,
+    }
+}
+
+fn parse_claude_reasoning_effort(value: &str) -> Option<ProviderReasoningEffortV1> {
+    match parse_reasoning_effort(value) {
+        Some(ProviderReasoningEffortV1::Ultra) | None => None,
+        supported => supported,
+    }
+}
+
+fn validate_provider_option(label: &str, value: &str) -> Result<(), CliFailure> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-' | b':')
+        })
+    {
+        return Err(CliFailure::new(
+            1,
+            format!("{label} must be a bounded canonical provider token"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_continuation_bootstrap(
+    profile: &LaunchProfileV1,
+    bootstrap: &ContinuationBootstrapV1,
+) -> Result<(), CliFailure> {
+    if bootstrap.workstream_handle.is_empty()
+        || bootstrap.workstream_handle.len() > 124
+        || bootstrap.workstream_handle.chars().any(char::is_whitespace)
+        || bootstrap.workstream_handle.chars().any(char::is_control)
+    {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap workstream handle must be 1-124 non-whitespace characters",
+        ));
+    }
+    if let Some(context_url) = bootstrap.context_url.as_deref() {
+        validate_context_url(context_url)?;
+    }
+    validate_lower_sha256("bootstrap plan digest", &bootstrap.plan_sha256)?;
+    if bootstrap.projection_revision == 0 {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap projection revision must be positive",
+        ));
+    }
+    validate_metadata("bootstrap checkpoint ID", &bootstrap.checkpoint_id)?;
+    if bootstrap.checkpoint_generation == 0 {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap checkpoint generation must be positive",
+        ));
+    }
+    for (label, digest) in [
+        ("bootstrap checkpoint digest", &bootstrap.checkpoint_digest),
+        (
+            "bootstrap expected resume-context digest",
+            &bootstrap.expected_resume_context_digest,
+        ),
+        (
+            "bootstrap success continuation digest",
+            &bootstrap.success_continuation_digest,
+        ),
+        (
+            "bootstrap failure continuation digest",
+            &bootstrap.failure_continuation_digest,
+        ),
+    ] {
+        validate_lower_sha256(label, digest)?;
+    }
+    validate_repository(&bootstrap.repository)?;
+    if !is_full_sha(&bootstrap.head_sha)
+        || !bootstrap
+            .head_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap head must be a full lowercase 40-character SHA-1",
+        ));
+    }
+    if bootstrap.checkpoint_id != profile.checkpoint.checkpoint_id
+        || bootstrap.checkpoint_generation != profile.checkpoint.generation
+        || bootstrap.checkpoint_digest != profile.checkpoint.digest
+        || bootstrap.repository != profile.worktree.repository
+        || bootstrap.head_sha != profile.worktree.head_sha
+    {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap checkpoint, repository, or head does not match launch provenance",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_context_url(value: &str) -> Result<(), CliFailure> {
+    let remainder = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"));
+    let authority = remainder.and_then(|remainder| remainder.split(['/', '?', '#']).next());
+    if value.len() > MAX_CONTEXT_URL_BYTES
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+        || authority.is_none_or(str::is_empty)
+        || authority.is_some_and(|authority| authority.contains('@'))
+        || value.contains('#')
+    {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap context URL must be a bounded canonical HTTP(S) URL without userinfo or fragment",
+        ));
+    }
     Ok(())
 }
 
 pub(super) fn launch_profile_digest(profile: &LaunchProfileV1) -> Result<String, CliFailure> {
+    let bytes = launch_profile_protected_bytes(profile)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn launch_profile_protected_bytes(profile: &LaunchProfileV1) -> Result<Vec<u8>, CliFailure> {
     validate_launch_profile(profile)?;
-    let bytes = serde_json::to_vec(profile)
+    let canonical = serde_json::to_vec(profile)
         .map_err(|error| CliFailure::new(1, format!("serialize launch profile: {error}")))?;
-    let mut digest = Sha256::new();
-    digest.update(b"shipyard-launch-profile-v1\0");
-    digest.update(bytes);
-    Ok(hex::encode(digest.finalize()))
+    let mut bytes = Vec::with_capacity(PROTECTED_PROFILE_PREFIX.len() + canonical.len());
+    bytes.extend_from_slice(PROTECTED_PROFILE_PREFIX);
+    bytes.extend_from_slice(&canonical);
+    Ok(bytes)
+}
+
+/// Decode only the canonical domain-separated bytes protected by the ledger.
+#[allow(dead_code)] // Activated by the daemon wake-loop integration slice.
+pub(crate) fn decode_protected_launch_profile(
+    bytes: &[u8],
+) -> crate::work_ledger::WorkLedgerResult<LaunchProfileV1> {
+    let canonical = bytes
+        .strip_prefix(PROTECTED_PROFILE_PREFIX)
+        .ok_or_else(|| {
+            crate::work_ledger::WorkLedgerError::Refused(
+                "protected launch profile has the wrong domain".to_owned(),
+            )
+        })?;
+    if canonical.starts_with(PROTECTED_PROFILE_PREFIX) {
+        return Err(crate::work_ledger::WorkLedgerError::Refused(
+            "protected launch profile has repeated domain separation".to_owned(),
+        ));
+    }
+    let profile: LaunchProfileV1 = serde_json::from_slice(canonical).map_err(|_| {
+        crate::work_ledger::WorkLedgerError::Refused(
+            "protected launch profile JSON is invalid".to_owned(),
+        )
+    })?;
+    validate_launch_profile(&profile).map_err(|error| {
+        crate::work_ledger::WorkLedgerError::Refused(format!(
+            "protected launch profile is invalid: {}",
+            error.message()
+        ))
+    })?;
+    let recomputed = launch_profile_protected_bytes(&profile).map_err(|error| {
+        crate::work_ledger::WorkLedgerError::Refused(format!(
+            "protected launch profile cannot be canonicalized: {}",
+            error.message()
+        ))
+    })?;
+    if recomputed != bytes {
+        return Err(crate::work_ledger::WorkLedgerError::Refused(
+            "protected launch profile bytes are not canonical".to_owned(),
+        ));
+    }
+    Ok(profile)
 }
 
 pub(super) fn launch_profile_integrity_hash(
@@ -229,6 +629,21 @@ fn validate_sha256(label: &str, value: &str) -> Result<(), CliFailure> {
     }
 }
 
+fn validate_lower_sha256(label: &str, value: &str) -> Result<(), CliFailure> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(CliFailure::new(
+            1,
+            format!("{label} must be 64 lowercase hexadecimal characters"),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +662,7 @@ mod tests {
                 provider: "subscription-router".into(),
                 account: Some("account-a".into()),
                 model: Some("model-x".into()),
+                reasoning_effort: None,
             },
             session: Some(SessionProvenanceV1 {
                 agent_provider: "agent-protocol".into(),
@@ -267,6 +683,23 @@ mod tests {
                 head_sha: "b".repeat(40),
                 lineage_id: "lineage-7".into(),
             },
+            continuation_bootstrap: Some(ContinuationBootstrapV1 {
+                workstream_handle: "GEN-43".into(),
+                context_url: Some("https://linear.example/GEN-43".into()),
+                plan_sha256: "f".repeat(64),
+                root_revision: 0,
+                issue_revision: 0,
+                projection_revision: 4,
+                material_event_revision: 0,
+                checkpoint_id: "checkpoint-7".into(),
+                checkpoint_generation: 3,
+                checkpoint_digest: "a".repeat(64),
+                repository: "owner/repo".into(),
+                head_sha: "b".repeat(40),
+                expected_resume_context_digest: "c".repeat(64),
+                success_continuation_digest: "d".repeat(64),
+                failure_continuation_digest: "e".repeat(64),
+            }),
             recovery_policy: RecoveryPolicyV1::ExactSessionThenFreshCheckpoint,
         }
     }
@@ -295,6 +728,121 @@ mod tests {
     }
 
     #[test]
+    fn wake_consumer_projects_only_validated_provider_metadata() {
+        use crate::work_ledger::FreshAgentLaunchProfile;
+
+        let mut profile = profile();
+        profile.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
+        assert_eq!(
+            FreshAgentLaunchProfile::provider_launch_options(&profile).model_id,
+            Some("model-x".to_owned())
+        );
+        assert_eq!(
+            FreshAgentLaunchProfile::provider_launch_options(&profile).reasoning_effort,
+            Some(ProviderReasoningEffortV1::Medium)
+        );
+        assert_eq!(
+            FreshAgentLaunchProfile::profile_digest(&profile).expect("consumer digest"),
+            launch_profile_digest(&profile).expect("stored digest")
+        );
+        assert!(FreshAgentLaunchProfile::permits_fresh_agent(&profile));
+    }
+
+    #[test]
+    fn native_grammar_is_prompt_free_and_exactly_matches_metadata() {
+        let mut codex = profile();
+        codex.provider.provider = "codex".into();
+        codex.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
+        codex.launch_argv = vec![
+            "codex".into(),
+            "--model".into(),
+            "model-x".into(),
+            "-c".into(),
+            "model_reasoning_effort=\"medium\"".into(),
+        ];
+        codex.resume_argv = vec![
+            "codex".into(),
+            "resume".into(),
+            "--model".into(),
+            "model-x".into(),
+            "-c".into(),
+            "model_reasoning_effort=\"medium\"".into(),
+            "session-7".into(),
+        ];
+        codex
+            .validate_native_fresh_agent_grammar()
+            .expect("codex grammar");
+
+        let mut claude = profile();
+        claude.provider.provider = "claude".into();
+        claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::High);
+        claude.launch_argv = vec![
+            "claude".into(),
+            "--model".into(),
+            "model-x".into(),
+            "--effort".into(),
+            "high".into(),
+        ];
+        claude.resume_argv = vec![
+            "claude".into(),
+            "--model".into(),
+            "model-x".into(),
+            "--effort".into(),
+            "high".into(),
+            "--resume".into(),
+            "session-7".into(),
+        ];
+        claude
+            .validate_native_fresh_agent_grammar()
+            .expect("claude grammar");
+
+        let mut unsupported_claude = claude.clone();
+        unsupported_claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Ultra);
+        unsupported_claude.launch_argv[4] = "ultra".into();
+        unsupported_claude.resume_argv[4] = "ultra".into();
+        assert!(
+            unsupported_claude
+                .validate_native_fresh_agent_grammar()
+                .is_err()
+        );
+
+        let mut unrecognized_effort = codex.clone();
+        unrecognized_effort.launch_argv[4] = "model_reasoning_effort=\"wrong\"".into();
+        assert!(
+            unrecognized_effort
+                .validate_native_fresh_agent_grammar()
+                .is_err()
+        );
+        codex.launch_argv.push("raw prompt with a secret".into());
+        assert!(codex.validate_native_fresh_agent_grammar().is_err());
+        assert_eq!(codex.provider.model.as_deref(), Some("model-x"));
+        assert!(Path::new(codex.worktree_path()).is_absolute());
+    }
+
+    #[test]
+    fn protected_decoder_requires_one_exact_domain_and_canonical_json() {
+        let profile = profile();
+        let bytes = launch_profile_protected_bytes(&profile).expect("protected bytes");
+        assert_eq!(
+            decode_protected_launch_profile(&bytes).expect("strict decode"),
+            profile
+        );
+        assert!(decode_protected_launch_profile(&bytes[PROTECTED_PROFILE_PREFIX.len()..]).is_err());
+
+        let mut doubled = PROTECTED_PROFILE_PREFIX.to_vec();
+        doubled.extend_from_slice(&bytes);
+        assert!(decode_protected_launch_profile(&doubled).is_err());
+
+        let mut noncanonical = PROTECTED_PROFILE_PREFIX.to_vec();
+        noncanonical.extend_from_slice(
+            serde_json::to_string_pretty(&profile)
+                .expect("pretty profile")
+                .as_bytes(),
+        );
+        assert!(decode_protected_launch_profile(&noncanonical).is_err());
+    }
+
+    #[test]
     fn incomplete_or_unknown_profiles_fail_closed() {
         let mut value = serde_json::to_value(profile()).expect("value");
         value["unexpected"] = serde_json::json!(true);
@@ -309,5 +857,194 @@ mod tests {
         invalid = profile();
         invalid.worktree.path = "relative/path".into();
         assert!(validate_launch_profile(&invalid).is_err());
+    }
+
+    #[test]
+    fn legacy_profile_decodes_but_cannot_authorize_fresh_dispatch() {
+        use crate::work_ledger::FreshAgentLaunchProfile;
+
+        let mut value = serde_json::to_value(profile()).expect("value");
+        value
+            .as_object_mut()
+            .expect("profile object")
+            .remove("continuation_bootstrap");
+        let mut decoded: LaunchProfileV1 = serde_json::from_value(value).expect("legacy decode");
+        validate_launch_profile(&decoded).expect("legacy profile remains valid");
+        assert!(!FreshAgentLaunchProfile::permits_fresh_agent(&decoded));
+        decoded.recovery_policy = RecoveryPolicyV1::FreshCheckpointOnly;
+        assert!(!FreshAgentLaunchProfile::permits_fresh_agent(&decoded));
+    }
+
+    #[test]
+    fn fresh_checkpoint_dispatch_requires_and_exposes_exact_bootstrap() {
+        use crate::work_ledger::FreshAgentLaunchProfile;
+
+        let mut complete = profile();
+        complete.recovery_policy = RecoveryPolicyV1::FreshCheckpointOnly;
+        assert!(FreshAgentLaunchProfile::permits_fresh_agent(&complete));
+        let expectation = FreshAgentLaunchProfile::resume_expectation(&complete)
+            .expect("typed resume expectation");
+        assert_eq!(expectation.workstream_handle, "GEN-43");
+        assert_eq!(
+            expectation.context_url,
+            Some("https://linear.example/GEN-43")
+        );
+        assert_eq!(expectation.plan_sha256, "f".repeat(64));
+        assert_eq!(expectation.root_revision, 0);
+        assert_eq!(expectation.issue_revision, 0);
+        assert_eq!(expectation.projection_revision, 4);
+        assert_eq!(expectation.material_event_revision, 0);
+        assert_eq!(expectation.checkpoint_id, "checkpoint-7");
+        assert_eq!(expectation.checkpoint_generation, 3);
+        assert_eq!(expectation.checkpoint_digest, "a".repeat(64));
+        assert_eq!(expectation.repository, "owner/repo");
+        assert_eq!(expectation.head_sha, "b".repeat(40));
+        assert_eq!(expectation.expected_resume_context_digest, "c".repeat(64));
+        assert_eq!(expectation.success_continuation_digest, "d".repeat(64));
+        assert_eq!(expectation.failure_continuation_digest, "e".repeat(64));
+
+        complete.continuation_bootstrap = None;
+        assert!(!FreshAgentLaunchProfile::permits_fresh_agent(&complete));
+        assert!(FreshAgentLaunchProfile::resume_expectation(&complete).is_none());
+    }
+
+    #[test]
+    fn bootstrap_is_strict_and_bound_to_exact_launch_provenance() {
+        let base = profile();
+        let mut invalid = base.clone();
+        invalid
+            .continuation_bootstrap
+            .as_mut()
+            .expect("bootstrap")
+            .workstream_handle = "GEN 43".into();
+        assert!(validate_launch_profile(&invalid).is_err());
+
+        let mutations: [fn(&mut ContinuationBootstrapV1); 9] = [
+            |bootstrap| bootstrap.plan_sha256 = "F".repeat(64),
+            |bootstrap| bootstrap.projection_revision = 0,
+            |bootstrap| bootstrap.checkpoint_generation += 1,
+            |bootstrap| bootstrap.checkpoint_digest = "f".repeat(64),
+            |bootstrap| bootstrap.repository = "owner/other".into(),
+            |bootstrap| bootstrap.head_sha = "f".repeat(40),
+            |bootstrap| bootstrap.expected_resume_context_digest = "F".repeat(64),
+            |bootstrap| bootstrap.success_continuation_digest = "short".into(),
+            |bootstrap| bootstrap.failure_continuation_digest = "short".into(),
+        ];
+        for mutation in mutations {
+            let mut invalid = base.clone();
+            mutation(invalid.continuation_bootstrap.as_mut().expect("bootstrap"));
+            assert!(validate_launch_profile(&invalid).is_err());
+        }
+
+        let mut invalid_url = base.clone();
+        invalid_url
+            .continuation_bootstrap
+            .as_mut()
+            .expect("bootstrap")
+            .context_url = Some("file:///tmp/context".into());
+        assert!(validate_launch_profile(&invalid_url).is_err());
+        for url in [
+            "https://",
+            "https://user@example.test/GEN-43",
+            "https://linear.example/GEN-43#mutable-fragment",
+        ] {
+            let mut invalid = base.clone();
+            invalid
+                .continuation_bootstrap
+                .as_mut()
+                .expect("bootstrap")
+                .context_url = Some(url.into());
+            assert!(validate_launch_profile(&invalid).is_err());
+        }
+
+        let mut value = serde_json::to_value(base).expect("value");
+        value["continuation_bootstrap"]["forged"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<LaunchProfileV1>(value).is_err());
+
+        for required in [
+            "workstream_handle",
+            "plan_sha256",
+            "root_revision",
+            "issue_revision",
+            "projection_revision",
+            "material_event_revision",
+            "checkpoint_id",
+            "checkpoint_generation",
+            "checkpoint_digest",
+            "repository",
+            "head_sha",
+            "expected_resume_context_digest",
+            "success_continuation_digest",
+            "failure_continuation_digest",
+        ] {
+            let mut value = serde_json::to_value(profile()).expect("value");
+            value["continuation_bootstrap"]
+                .as_object_mut()
+                .expect("bootstrap object")
+                .remove(required);
+            assert!(
+                serde_json::from_value::<LaunchProfileV1>(value).is_err(),
+                "missing bootstrap field {required} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_fields_are_exact_and_digest_bound() {
+        let profile = profile();
+        let bootstrap = profile.continuation_bootstrap.as_ref().expect("bootstrap");
+        assert_eq!(bootstrap.workstream_handle, "GEN-43");
+        assert_eq!(bootstrap.plan_sha256, "f".repeat(64));
+        assert_eq!(bootstrap.root_revision, 0);
+        assert_eq!(bootstrap.issue_revision, 0);
+        assert_eq!(bootstrap.projection_revision, 4);
+        assert_eq!(bootstrap.material_event_revision, 0);
+        assert_eq!(bootstrap.checkpoint_id, profile.checkpoint.checkpoint_id);
+        assert_eq!(
+            bootstrap.checkpoint_generation,
+            profile.checkpoint.generation
+        );
+        assert_eq!(bootstrap.checkpoint_digest, profile.checkpoint.digest);
+        assert_eq!(bootstrap.repository, profile.worktree.repository);
+        assert_eq!(bootstrap.head_sha, profile.worktree.head_sha);
+
+        let original = launch_profile_digest(&profile).expect("original digest");
+        let protected = launch_profile_protected_bytes(&profile).expect("protected bytes");
+        assert_eq!(
+            protected.strip_prefix(b"shipyard-launch-profile-v1\0"),
+            Some(
+                serde_json::to_vec(&profile)
+                    .expect("canonical json")
+                    .as_slice()
+            )
+        );
+        assert_eq!(original, hex::encode(Sha256::digest(&protected)));
+        assert!(
+            !protected
+                .strip_prefix(b"shipyard-launch-profile-v1\0")
+                .expect("single prefix")
+                .starts_with(b"shipyard-launch-profile-v1\0")
+        );
+        let mut changed = profile.clone();
+        changed
+            .continuation_bootstrap
+            .as_mut()
+            .expect("bootstrap")
+            .projection_revision += 1;
+        assert_ne!(
+            original,
+            launch_profile_digest(&changed).expect("changed digest")
+        );
+
+        let mut changed_plan = profile;
+        changed_plan
+            .continuation_bootstrap
+            .as_mut()
+            .expect("bootstrap")
+            .plan_sha256 = "0".repeat(64);
+        assert_ne!(
+            original,
+            launch_profile_digest(&changed_plan).expect("changed plan digest")
+        );
     }
 }

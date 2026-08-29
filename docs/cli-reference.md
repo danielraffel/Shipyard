@@ -106,6 +106,7 @@ shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable a
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --agent-provider codex --agent-session-id SESSION --launch-profile ./launch-profile.json --apply
+shipyard pr --workstream-id GEN-7 --context-url https://linear.app/... --launch-profile ./launch-profile.json
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
 shipyard runner recovery-worker --drain --apply     # process one bounded pending snapshot (maximum 32)
@@ -119,6 +120,7 @@ shipyard work-ledger policy set --repo generous-corp/forge --primary-platform ma
 # On the protected base branch, make every `shipyard pr` submission durable
 # immediately after PR creation. A PR branch cannot opt itself in.
 # Optional CLI --workstream-id/--context-url values override the fallbacks.
+# --launch-profile atomically publishes a wake when the trusted consumer is enabled.
 # In .shipyard/config.toml:
 # [merge_steward]
 # auto_handoff = true
@@ -196,7 +198,7 @@ at most one model call even if normalized evidence changes. A retarget, newer
 head, recovered check, or changed merge state supersedes the old request
 instead of spending an attempt on stale evidence.
 
-`work-ledger` is a migration and inspection surface, not a scheduler switch.
+`work-ledger` is a migration and inspection surface, not an activation switch.
 Its versioned SQLite database uses WAL, full synchronous durability, foreign
 keys, integrity checks, protected permissions, and the machine writer-domain
 fence. Import selects canonical lifecycle fields and opaque digests from the
@@ -207,12 +209,50 @@ eligible continuation contract. Native route records keep terminal, agent, and
 provider axes separate and integrity-bound; missing provider provenance never
 means Direct and cannot dispatch. Native transitions are closed/typed and
 commit their deterministic event with any outbox wake.
+The schema also contains durable per-attempt wake delivery records. An internal
+consumer contract can claim and finalize one canonical wake around an exact
+argv-array provider call, reconcile idempotent restart claims, and retain
+non-idempotent ambiguity as `uncertain`. It has no CLI or daemon activation
+surface; it cannot run under the default-off policy.
 Dry-run is byte-stable and creates no database. Apply is idempotent and leaves
 every legacy record authoritative and untouched. Apply holds a bounded
 exclusive production-writer snapshot barrier from legacy scan through the
 SQLite commit, so it cannot materialize a mixed live-state snapshot. Both
-`activation_enabled` and
-`dispatch_enabled` remain false in this phase.
+`activation_enabled` and `dispatch_enabled` remain false in this phase.
+When the daemon is running, it independently reads policy-covered native
+nonterminal exact `(repo, PR, head)` projections from this ledger; inert
+`shadow_imported` history is never scheduled. It coalesces relevant
+webhooks for two seconds (with a ten-second maximum coalescing age) and performs
+an eight-target round-robin catch-up every five minutes, even with zero IPC
+subscribers. Webhook overflow is requeued, the same target has a 30-second
+cooldown, at most four reads run concurrently, and a rolling-hour 240-request
+ceiling bounds passive cost by reserving each selected target's worst-case page
+budget durably before a pass, reconciling it to actual cost afterward, and
+conservatively restoring in-flight or recent usage after restart.
+A shared one-minute deadline covers auth preparation and reads so one slow batch
+cannot starve later triggers. Each target uses a read-only, producer-
+provenanced head/check snapshot through its exact repository App route and the
+daemon's trusted machine-global configuration only; repository and local
+overlays cannot replace unattended auth. Non-App command credentials fail
+closed; one repository-scoped App installation token is pinned for the complete
+paginated target observation. The App token is attached only to the
+configured, validated native privileged `gh` executable under a cleared child
+environment. Rollups paginate at most 1,000 contexts
+and fail closed beyond that bound; request evidence counts every page. Unchanged observations and
+initial baselines emit no event. Auth preparation is bounded and is not counted
+as a GitHub request when it fails before the command boundary.
+A changed snapshot emits `shadow_observation_transition` to IPC and the
+daemon's retained supervised stderr log with request count,
+wall-clock latency, exact-head verdict, policy revision, and zero model calls.
+Fetch failure and recovery also emit once per state change; repeated identical
+failures stay quiet and expose only a stable error class, never command output.
+The observer cannot update the ledger, GitHub, an outbox, Linear, or an agent.
+Its failed-check count is observation evidence, not rerun authority. A later
+active phase must resolve exact failed Actions job IDs, preview the complete
+dependency closure, estimate worker-minutes against a revision-fenced per-repo
+ceiling, and refuse `gh run rerun --failed` whenever closure is unknown or
+larger than the classified failed-job set. This shadow phase never reruns CI and
+does not invent closure or cost data from check-rollup names.
 Legacy import is currently supported only on Unix hosts, where the configured
 state directory and every relative component are opened through pinned
 no-follow handles. Windows import is explicitly deferred and does not block
@@ -227,7 +267,11 @@ block another lane only through the default
 compatibility lane can block only with evidenced shared-integrity failure.
 Dry-run is the default and an
 apply with a stale expected revision refuses rather than overwriting a newer
-decision. This policy is inspectable but not consumed by the scheduler yet.
+decision. The shadow observer consumes the policy only as an explicit
+repository-enrollment and evidence seam; it does not make a blocking decision.
+Pulp, Forge, and Vellum can revise their macOS-first and compatibility rules
+independently without enabling dispatch. A repository without a policy is not
+observed.
 An apply-mode repository or GitHub preflight error remains pending without
 spending the attempt, but is durably moved behind untouched pending work so a
 persistently unavailable repository cannot block the machine-global queue.

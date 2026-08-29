@@ -1,8 +1,14 @@
 use super::*;
 use crate::app::merge_steward_cmd::launch_profile::{
-    CheckpointProvenanceV1, LaunchProfileV1, ProviderMetadataV1, RecoveryPolicyV1,
-    SessionProvenanceV1, WorktreeProvenanceV1,
+    CheckpointProvenanceV1, ContinuationBootstrapV1, LaunchProfileV1, ProviderMetadataV1,
+    RecoveryPolicyV1, SessionProvenanceV1, WorktreeProvenanceV1,
 };
+use crate::provider_wrapper::ProviderReasoningEffortV1;
+use crate::work_ledger::{
+    ExactProtectedProfileResolver, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
+    ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult,
+};
+use crate::workstream_continuation_config::{ProviderWrapperConfig, WorkstreamContinuationConfig};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -74,8 +80,8 @@ fn handoff_args() -> StewardHandoffArgs {
         repo: Some("owner/repo".into()),
         pr: 7,
         head: fixture.head.clone(),
-        workstream_id: "SY-LF-TEST".into(),
-        context_url: Some("https://linear.example/SY-LF-TEST".into()),
+        workstream_id: "GEN-43".into(),
+        context_url: Some("https://linear.example/GEN-43".into()),
         agent_provider: Some("codex".into()),
         agent_session_id: Some("provider-session-7".into()),
         agent_parent_session_id: None,
@@ -107,6 +113,7 @@ fn profile(resume_flag: &str) -> LaunchProfileV1 {
             provider: "opaque-provider".into(),
             account: Some("subscription-a".into()),
             model: Some("model-tier-a".into()),
+            reasoning_effort: None,
         },
         session: Some(SessionProvenanceV1 {
             agent_provider: "codex".into(),
@@ -123,7 +130,90 @@ fn profile(resume_flag: &str) -> LaunchProfileV1 {
             head_sha: fixture.head.clone(),
             lineage_id: fixture.branch.clone(),
         },
+        continuation_bootstrap: Some(ContinuationBootstrapV1 {
+            workstream_handle: "GEN-43".into(),
+            context_url: Some("https://linear.example/GEN-43".into()),
+            plan_sha256: "a".repeat(64),
+            root_revision: 0,
+            issue_revision: 0,
+            projection_revision: 1,
+            material_event_revision: 0,
+            checkpoint_id: "checkpoint-7".into(),
+            checkpoint_generation: 4,
+            checkpoint_digest: "b".repeat(64),
+            repository: "owner/repo".into(),
+            head_sha: fixture.head.clone(),
+            expected_resume_context_digest: "c".repeat(64),
+            success_continuation_digest: "d".repeat(64),
+            failure_continuation_digest: "e".repeat(64),
+        }),
         recovery_policy: RecoveryPolicyV1::ExactSessionThenFreshCheckpoint,
+    }
+}
+
+fn native_profile() -> LaunchProfileV1 {
+    let mut profile = profile("-r");
+    profile.provider.provider = "codex".into();
+    profile.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
+    profile.launch_argv = vec![
+        "codex".into(),
+        "--model".into(),
+        "model-tier-a".into(),
+        "-c".into(),
+        "model_reasoning_effort=\"medium\"".into(),
+    ];
+    profile.resume_argv = vec![
+        "codex".into(),
+        "resume".into(),
+        "--model".into(),
+        "model-tier-a".into(),
+        "-c".into(),
+        "model_reasoning_effort=\"medium\"".into(),
+        "provider-session-7".into(),
+    ];
+    profile
+}
+
+fn continuation_activation() -> ReadyWorkstreamActivation {
+    ReadyWorkstreamActivation {
+        machine_tag: "m3".into(),
+        config: WorkstreamContinuationConfig {
+            origin_machine: "m3".into(),
+            repositories: vec!["owner/repo".into()],
+            provider_wrapper: ProviderWrapperConfig {
+                executable_path: "/opt/shipyard-workstream-provider".into(),
+                executable_sha256: "f".repeat(64),
+                provider_id: "codex".into(),
+                adapter_id: "cmux-workstream-v1".into(),
+                deadline_seconds: 30,
+                max_stdout_bytes: 65_536,
+                max_stderr_bytes: 65_536,
+            },
+        },
+    }
+}
+
+struct DeliveredAdapter;
+
+impl ProviderAdapter for DeliveredAdapter {
+    fn capability(&self, provider_id: &str) -> Option<ProviderCapability> {
+        (provider_id == "codex").then(|| ProviderCapability {
+            adapter_id: "cmux-workstream-v1".to_owned(),
+            fresh_agent_launch: true,
+            idempotent_launch: true,
+        })
+    }
+
+    fn launch(&mut self, _request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+        ProviderOutcome::Delivered {
+            receipt: b"provider accepted continuation".to_vec(),
+        }
+    }
+
+    fn reconcile(&mut self, _fence: &crate::work_ledger::DeliveryFence) -> ProviderOutcome {
+        ProviderOutcome::Delivered {
+            receipt: b"provider reconciled continuation".to_vec(),
+        }
     }
 }
 
@@ -202,10 +292,11 @@ fn superseded_worktree_provenance_fails_before_publication() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn exact_launch_profile_survives_receipt_restart_without_translation() {
     let temp = tempfile::tempdir().expect("temp");
     let args = handoff_args();
-    let profile = prepare_launch_profile_candidate(profile("-r"), "owner/repo", &args.head)
+    let profile = prepare_launch_profile_candidate(native_profile(), "owner/repo", &args.head)
         .expect("valid profile");
     let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
         .expect("resolve agent")
@@ -251,9 +342,35 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
             .expect("profile")
             .profile
             .resume_argv,
-        vec!["/opt/provider-router", "agent", "-r", "provider-session-7"]
+        vec![
+            "codex",
+            "resume",
+            "--model",
+            "model-tier-a",
+            "-c",
+            "model_reasoning_effort=\"medium\"",
+            "provider-session-7"
+        ]
     );
     assert!(!restarted.wake_consumer_available);
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().to_path_buf()),
+    );
+    let publication = native_publication_request(&paths, "owner/repo", args.pr, &args.head)
+        .expect("normalize native publication");
+    assert_eq!(publication.repository, "owner/repo");
+    assert_eq!(publication.workstream_handle, "GEN-43");
+    assert_eq!(publication.origin_machine, "m3");
+    assert_eq!(publication.agent_provider, "codex");
+    assert_eq!(publication.agent_session_id, "provider-session-7");
+    assert_eq!(publication.profile_provider, "codex");
+    assert_eq!(publication.profile_digest, stored.profile_digest);
+    assert_eq!(
+        hex::encode(Sha256::digest(&publication.protected_profile_bytes)),
+        publication.profile_digest
+    );
     let terminal = terminal_owner_route(temp.path(), "owner/repo", args.pr, &args.head)
         .expect("valid terminal owner")
         .expect("managed owner");
@@ -262,11 +379,15 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
     assert_eq!(provider_route.integrity_hash, stored.integrity_hash);
     assert_eq!(provider_route.generation, 1);
     assert_eq!(provider_route.revision, 1);
-    assert_eq!(provider_route.provider, "opaque-provider");
+    assert_eq!(provider_route.provider, "codex");
     assert_eq!(provider_route.account.as_deref(), Some("subscription-a"));
     assert_eq!(provider_route.model.as_deref(), Some("model-tier-a"));
 
     std::fs::remove_file(&route_path).expect("remove private agent route");
+    assert!(
+        native_publication_request(&paths, "owner/repo", args.pr, &args.head).is_err(),
+        "native publication must fail closed after private route loss"
+    );
     let unresolved =
         terminal_owner_route_or_unresolved(temp.path(), "owner/repo", args.pr, &args.head)
             .expect("validated public receipt remains an unresolved obligation");
@@ -281,11 +402,285 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
             integrity_hash: stored.integrity_hash.clone(),
             generation: stored.generation,
             revision: stored.revision,
-            provider: "opaque-provider".to_owned(),
+            provider: "codex".to_owned(),
             account: Some("subscription-a".to_owned()),
             model: Some("model-tier-a".to_owned()),
         })
     );
+}
+
+#[test]
+fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let args = handoff_args();
+    let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
+        .expect("resolve agent")
+        .expect("agent");
+    let route = agent_route_reference(&agent, "m3");
+    persist_agent_route(&agent_route_path(&paths, &route.route_id), &route, &agent)
+        .expect("private route");
+    let profile = prepare_launch_profile_candidate(native_profile(), "owner/repo", &args.head)
+        .expect("native profile");
+    let receipt = prepare_handoff_receipt_with_profile(
+        None,
+        &args,
+        "owner/repo",
+        "m3",
+        Some(route),
+        Some(profile),
+    )
+    .expect("handoff");
+    let path = handoff_path(
+        &handoff_directory(&paths, "owner/repo", args.pr),
+        &args.head,
+    );
+    let managed = persist_handoff(&path, receipt, HandoffPhase::Managed).expect("managed");
+    assert!(!managed.wake_consumer_available);
+
+    let interrupted = publish_managed_handoff_with_consumer(
+        &paths,
+        &path,
+        managed,
+        "owner/repo",
+        args.pr,
+        &args.head,
+        &continuation_activation(),
+        |_, _| {
+            Err(CliFailure::new(
+                1,
+                "simulated stop after durable publication",
+            ))
+        },
+    )
+    .expect_err("interrupted acceptance remains pending");
+    assert!(interrupted.message.contains("simulated stop"));
+    let pending = load_handoff(&path)
+        .expect("reload pending receipt")
+        .expect("pending receipt");
+    assert!(!pending.wake_consumer_available);
+    let pending_publication = pending
+        .native_publication
+        .as_ref()
+        .expect("durable pending publication");
+    assert_eq!(pending_publication.state, NativePublicationStateV1::Pending);
+    assert!(!pending_publication.work_id.is_empty());
+    assert!(!pending_publication.route_ref.is_empty());
+    assert!(!pending_publication.wake_id.is_empty());
+
+    assert_pending_publication_fences_owner_replacement(&args, &pending);
+
+    assert_publication_without_consumer_is_not_transfer(&paths, &args);
+
+    deliver_pending_native_wake(&paths);
+
+    let published = publish_managed_handoff(
+        &paths,
+        &path,
+        pending,
+        "owner/repo",
+        args.pr,
+        &args.head,
+        &continuation_activation(),
+    )
+    .expect("publication");
+    assert!(published.wake_consumer_available);
+    assert!(published.native_publication.is_some());
+    validate_handoff_receipt_integrity(&published, "owner/repo", args.pr, &args.head)
+        .expect("published receipt integrity");
+    let first_revision = published.revision;
+
+    let replay = publish_managed_handoff(
+        &paths,
+        &path,
+        published,
+        "owner/repo",
+        args.pr,
+        &args.head,
+        &continuation_activation(),
+    )
+    .expect("idempotent replay");
+    assert_eq!(replay.revision, first_revision);
+    let status = WorkLedger::open_existing(&paths.state_dir)
+        .expect("ledger")
+        .expect("present")
+        .status()
+        .expect("status");
+    assert_eq!(status.pending_wakes, 0);
+    assert_eq!(status.provider_deliveries, 1);
+}
+
+fn assert_pending_publication_fences_owner_replacement(
+    args: &StewardHandoffArgs,
+    pending: &DurableStewardHandoff,
+) {
+    let mut replacement = args.clone();
+    replacement.agent_session_id = Some("replacement-session-8".into());
+    replacement.transfer_agent_owner = true;
+    let mut replacement_profile = native_profile();
+    replacement_profile
+        .session
+        .as_mut()
+        .expect("session")
+        .provider_session_id = "replacement-session-8".into();
+    *replacement_profile
+        .resume_argv
+        .last_mut()
+        .expect("session argv") = "replacement-session-8".into();
+    let replacement_profile =
+        prepare_launch_profile_candidate(replacement_profile, "owner/repo", &replacement.head)
+            .expect("replacement profile");
+    let transfer_error = prepare_handoff_receipt_with_profile(
+        Some(pending.clone()),
+        &replacement,
+        "owner/repo",
+        "m5",
+        Some(route_at(&replacement, "m5")),
+        Some(replacement_profile),
+    )
+    .expect_err("pending publication fences owner replacement");
+    assert!(transfer_error.message.contains("cannot be transferred"));
+}
+
+fn assert_publication_without_consumer_is_not_transfer(
+    paths: &RuntimePaths,
+    args: &StewardHandoffArgs,
+) {
+    let request = native_publication_request(paths, "owner/repo", args.pr, &args.head)
+        .expect("native request");
+    let report = WorkLedger::plan_or_apply_native_continuation(
+        &paths.state_dir,
+        &request,
+        &continuation_activation().config,
+        true,
+    )
+    .expect("publish pending wake");
+    let unavailable = wait_for_native_consumer_ownership_for(paths, &report, Duration::ZERO)
+        .expect_err("publication without a daemon is not transfer");
+    assert!(unavailable.message.contains("did not accept"));
+}
+
+fn deliver_pending_native_wake(paths: &RuntimePaths) {
+    let ledger = WorkLedger::open_existing(&paths.state_dir)
+        .expect("open ledger")
+        .expect("published ledger");
+    let mut resolver =
+        ExactProtectedProfileResolver::new(&ledger, crate::app::decode_protected_launch_profile);
+    let delivered = ledger
+        .consume_one_wake(
+            WakeConsumerPolicy {
+                activation_enabled: true,
+                dispatch_enabled: true,
+                authorized_repositories: vec!["owner/repo".to_owned()],
+            },
+            &mut resolver,
+            &mut DeliveredAdapter,
+        )
+        .expect("consumer delivery");
+    assert_eq!(delivered, WakeDeliveryResult::Delivered);
+}
+
+#[test]
+fn failed_publication_never_claims_monitoring_transfer() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let args = handoff_args();
+    let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
+        .expect("resolve agent")
+        .expect("agent");
+    let route = agent_route_reference(&agent, "m3");
+    persist_agent_route(&agent_route_path(&paths, &route.route_id), &route, &agent)
+        .expect("private route");
+    let profile = prepare_launch_profile_candidate(native_profile(), "owner/repo", &args.head)
+        .expect("native profile");
+    let receipt = prepare_handoff_receipt_with_profile(
+        None,
+        &args,
+        "owner/repo",
+        "m3",
+        Some(route),
+        Some(profile),
+    )
+    .expect("handoff");
+    let path = handoff_path(
+        &handoff_directory(&paths, "owner/repo", args.pr),
+        &args.head,
+    );
+    let managed = persist_handoff(&path, receipt, HandoffPhase::Managed).expect("managed");
+    let mut wrong_policy = continuation_activation();
+    wrong_policy.config.repositories = vec!["owner/other".into()];
+    assert!(
+        publish_managed_handoff(
+            &paths,
+            &path,
+            managed,
+            "owner/repo",
+            args.pr,
+            &args.head,
+            &wrong_policy,
+        )
+        .is_err()
+    );
+    let stored = load_handoff(&path)
+        .expect("read receipt")
+        .expect("managed receipt");
+    assert!(!stored.wake_consumer_available);
+    assert!(stored.native_publication.is_none());
+}
+
+#[test]
+fn native_publication_rejects_prompt_bearing_launch_profile() {
+    let temp = tempfile::tempdir().expect("temp");
+    let args = handoff_args();
+    let mut unsafe_profile = native_profile();
+    unsafe_profile
+        .launch_argv
+        .push("raw prompt containing a secret".into());
+    let profile = prepare_launch_profile_candidate(unsafe_profile, "owner/repo", &args.head)
+        .expect("legacy profile storage remains supported");
+    let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
+        .expect("resolve agent")
+        .expect("agent route");
+    let route = agent_route_reference(&agent, "m3");
+    let route_path = temp
+        .path()
+        .join("merge-steward")
+        .join("agent-routes")
+        .join(format!("{}.json", route.route_id));
+    persist_agent_route(&route_path, &route, &agent).expect("persist private route");
+    let receipt = prepare_handoff_receipt_with_profile(
+        None,
+        &args,
+        "owner/repo",
+        "m3",
+        Some(route),
+        Some(profile),
+    )
+    .expect("receipt");
+    let path = temp
+        .path()
+        .join("merge-steward")
+        .join("handoffs")
+        .join(encode_path_segment("owner/repo"))
+        .join(format!("pr-{}", args.pr))
+        .join(format!("{}.json", args.head));
+    persist_handoff(&path, receipt, HandoffPhase::Managed).expect("durable receipt");
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().to_path_buf()),
+    );
+    let error = native_publication_request(&paths, "owner/repo", args.pr, &args.head)
+        .expect_err("native publication must reject raw prompts");
+    assert!(error.message().contains("prompt"));
 }
 
 #[test]
@@ -552,11 +947,77 @@ fn explicit_owner_transfer_can_add_the_first_profile_to_a_legacy_receipt() {
 }
 
 #[test]
+fn pending_native_publication_refuses_owner_transfer() {
+    let first = handoff_args();
+    let first_profile = prepare_launch_profile_candidate(profile("-r"), "owner/repo", &first.head)
+        .expect("profile");
+    let mut published = prepare_handoff_receipt_with_profile(
+        None,
+        &first,
+        "owner/repo",
+        "m3",
+        Some(route(&first)),
+        Some(first_profile),
+    )
+    .expect("initial receipt");
+    published.revision = 1;
+    let profile_digest = published
+        .launch_profile
+        .as_ref()
+        .expect("stored profile")
+        .profile_digest
+        .clone();
+    published.wake_consumer_available = false;
+    published.native_publication = Some(NativePublicationReceiptV1 {
+        schema_version: 1,
+        state: NativePublicationStateV1::Pending,
+        work_id: "wi_exact".into(),
+        route_ref: "route_exact".into(),
+        wake_id: "wake_exact".into(),
+        profile_digest,
+    });
+
+    let mut replacement = first.clone();
+    replacement.agent_session_id = Some("replacement-session-8".into());
+    replacement.transfer_agent_owner = true;
+    let mut replacement_profile = profile("--resume");
+    replacement_profile
+        .session
+        .as_mut()
+        .expect("session")
+        .provider_session_id = "replacement-session-8".into();
+    replacement_profile.resume_argv[3] = "replacement-session-8".into();
+    let replacement_profile =
+        prepare_launch_profile_candidate(replacement_profile, "owner/repo", &replacement.head)
+            .expect("replacement profile");
+
+    let error = prepare_handoff_receipt_with_profile(
+        Some(published),
+        &replacement,
+        "owner/repo",
+        "m5",
+        Some(route_at(&replacement, "m5")),
+        Some(replacement_profile),
+    )
+    .expect_err("published ownership is immutable");
+    assert!(error.message.contains("cannot be transferred"));
+}
+
+#[test]
 fn public_receipt_render_never_projects_private_profile_fields() {
     let args = handoff_args();
     let route = route(&args);
     let mut output = Vec::new();
-    render(&args, "owner/repo", Some(&route), "m3", true, &mut output).expect("render");
+    render(
+        &args,
+        "owner/repo",
+        Some(&route),
+        "m3",
+        true,
+        false,
+        &mut output,
+    )
+    .expect("render");
     let rendered = String::from_utf8(output).expect("UTF-8");
     for private in [
         "/opt/provider-router",

@@ -59,6 +59,14 @@ class CiMatrixTests(unittest.TestCase):
         rows = {row["key"]: row for row in matrix["include"]}
         self.assertEqual(rows["macos-arm64"]["package_args"], "--dmg --ci-mode")
         self.assertEqual(rows["windows"]["binary"], "target/release/shipyard.exe")
+        self.assertEqual(
+            rows["windows"]["companion_binary"],
+            "target/release/shipyard-workstream-provider.exe",
+        )
+        self.assertEqual(
+            rows["linux"]["companion_binary"],
+            "target/release/shipyard-workstream-provider",
+        )
         self.assertEqual(rows["linux"]["package_target"], "linux-x64")
 
     def test_release_matrix_carries_all_release_platforms(self) -> None:

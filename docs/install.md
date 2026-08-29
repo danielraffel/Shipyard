@@ -2,11 +2,12 @@
 
 ## Canonical install location
 
-Every supported install path writes the `shipyard` binary to the same
-place by default:
+Every supported install path writes the `shipyard` CLI and its provider
+companion to the same directory by default:
 
 ```
 ~/.local/bin/shipyard
+~/.local/bin/shipyard-workstream-provider
 ```
 
 | Path | Lands at |
@@ -26,8 +27,9 @@ running" confusion.
 curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
 ```
 
-Downloads the right binary for your platform and installs it at
-`~/.local/bin/shipyard`.
+Downloads the matched CLI/provider pair for your platform and installs both in
+`~/.local/bin`. A rollback to a release before v0.127.0 removes the newer
+provider after the older CLI passes its smoke test.
 
 ## First-run auth
 
@@ -304,13 +306,39 @@ and import auth settings into other repositories. A repo-relative helper such as
 export SHIPYARD_GITHUB_APP_ID=123456
 export SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$HOME/.config/shipyard/github-app.pem"
 
-# Optional. If absent, the helper uses --repo owner/name to look up the
-# installation id for that repository.
+# Repo-less compatibility only. Do not set this for a helper shared across
+# personal and organization installations; --repo is authoritative.
 export SHIPYARD_GITHUB_APP_INSTALLATION_ID=987654
 ```
 
 Shipyard only runs the helper, reads stdout, caches the returned token in
-memory until expiry, and injects it into child `gh` commands.
+memory until expiry, and injects it into child `gh` commands. Cache entries are
+partitioned by the fully expanded helper argv, so `{repo_slug}` keeps tokens for
+different repositories/installations separate.
+
+For one App installed on multiple accounts, always keep `--repo
+"{repo_slug}"` in `token_command` and remove any fixed installation id from the
+shared wrapper. The helper asks GitHub for the installation attached to that
+exact repository. A legacy `SHIPYARD_GITHUB_APP_INSTALLATION_ID` is ignored
+when `--repo` is present; an explicit `--installation-id` alongside `--repo`
+becomes a fail-closed assertion and must match GitHub's lookup.
+
+The optional `--cache-dir` (or `SHIPYARD_GITHUB_APP_CACHE_DIR`) stores one
+expiry-checked entry per API host, App, and repository/installation. The helper
+requires the directory to be `0700` and every token entry to be `0600`, writes
+atomically, and refuses entries that are malformed, aliased, owned by another
+account, or provenance-mismatched. The App key likewise must be a current-user
+owned `0600` regular file inside a current-user owned `0700` directory. Leave
+the disk cache unset when Shipyard's own in-memory cache is sufficient.
+On Windows, disk caching currently fails closed because this helper does not yet
+prove private Windows ACLs; leave `--cache-dir` and its environment variable
+unset there. Non-cache token minting remains available. This is a bounded
+confidentiality restriction, not a promise of POSIX-mode emulation on Windows.
+
+The helper resolves `openssl` only from trusted absolute platform paths. Set
+`SHIPYARD_GITHUB_APP_OPENSSL` to another absolute executable only when the host
+does not provide one of those paths; never rely on a repository-controlled
+`PATH` for a process that can read the App key.
 
 Preferred helper stdout for expiring tokens:
 
@@ -411,12 +439,12 @@ SHIPYARD_INSTALL_DIR="${HOME}/mytools/bin" bash install.sh
 
 ## Platform binaries
 
-| OS | Architecture | Binary |
+| OS | Architecture | Release assets |
 |----|-------------|--------|
-| macOS | Apple Silicon (ARM64) | `shipyard-macos-arm64.dmg` |
-| Windows | x64 | `shipyard-windows-x64.exe` |
-| Linux | x64 | `shipyard-linux-x64` |
-| Linux | ARM64 | `shipyard-linux-arm64` |
+| macOS | Apple Silicon (ARM64) | `shipyard-macos-arm64.dmg` (contains both binaries) |
+| Windows | x64 | `shipyard-windows-x64.exe`, `shipyard-workstream-provider-windows-x64.exe` |
+| Linux | x64 | `shipyard-linux-x64`, `shipyard-workstream-provider-linux-x64` |
+| Linux | ARM64 | `shipyard-linux-arm64`, `shipyard-workstream-provider-linux-arm64` |
 
 Intel Macs (x86_64) are not supported from v0.50.0 onward. Apple Silicon only. Older releases (v0.44.0–v0.49.0) that shipped Intel dmgs remain installable by pinning `SHIPYARD_VERSION`; `install.sh` on an Intel Mac surfaces a clear "unsupported" message instead of a 404 on v0.50.0+.
 
@@ -433,6 +461,7 @@ git clone https://github.com/danielraffel/Shipyard.git
 cd Shipyard
 cargo build --release --locked
 target/release/shipyard --version
+target/release/shipyard-workstream-provider --version
 ```
 
 Run the main local gates before relying on a source build:
@@ -452,6 +481,7 @@ release binary and refresh the `sy` symlink:
 ```bash
 mkdir -p ~/.local/bin
 cp target/release/shipyard ~/.local/bin/shipyard
+cp target/release/shipyard-workstream-provider ~/.local/bin/shipyard-workstream-provider
 ln -sf ~/.local/bin/shipyard ~/.local/bin/sy
 ```
 

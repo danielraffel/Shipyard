@@ -1,7 +1,7 @@
-//! Shadow-only canonical work-item persistence.
+//! Canonical work-item persistence and the protected continuation lane.
 //!
-//! This module is deliberately not wired into scheduling or dispatch. It gives
-//! migrations a crash-consistent target while legacy stores remain authoritative.
+//! Imports remain compatible with the legacy stores, while native continuation
+//! publication and daemon dispatch use this ledger as their fenced authority.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 6;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -49,10 +49,30 @@ macro_rules! candidate_params {
     };
 }
 
+#[allow(dead_code)] // Some ownership lifecycle operations remain future-facing.
+mod delivery_ownership;
+#[allow(dead_code)] // Some generic adapter surfaces are exercised only by native dispatch.
+mod dispatch;
 mod importer;
+#[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
+pub(crate) use delivery_ownership::{
+    AgentContextChallenge, AgentContextReceipt, AgentOwnershipReceipt, AgentReturnChallenge,
+    AgentReturnExpectation, AgentReturnReceipt,
+};
+pub(crate) use dispatch::{
+    DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
+    FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
+    ProviderOutcome, StoredProviderRequest, WakeConsumerPolicy, WakeDeliveryResult,
+};
+#[cfg(test)]
+pub(crate) use dispatch::{WakeEnvelope, WakeProfileResolver};
 mod lifecycle;
+mod native_publication;
+mod observation;
 mod persistence;
 mod policy;
+#[allow(dead_code)] // Platform-specific helpers are not used on every target.
+mod protected_objects;
 mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.
 mod route;
@@ -61,9 +81,16 @@ use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};
 pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};
+#[allow(unused_imports)] // Consumed by the CLI/runtime integration follow-up.
+pub(crate) use native_publication::{
+    ExactProtectedProfileResolver, NativePublicationReport, NativePublicationRequest,
+};
+pub use observation::ShadowPrTarget;
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
 pub use policy::RepoPolicy;
 pub(crate) use policy::validate_repo_policy;
+#[allow(unused_imports)] // The production provider slice consumes this internal boundary.
+pub(crate) use protected_objects::{ProtectedObjectKind, ProtectedObjectRecord};
 #[cfg(test)]
 use registry::{RouteRegistration, validated_route_exists};
 use route::{AdapterBindingRecord, RouteProvenanceRecord};
@@ -206,6 +233,14 @@ pub struct LedgerStatus {
     pub uncertain_wakes: u64,
     /// Imported source count.
     pub imports: u64,
+    /// Immutable protected-object metadata rows.
+    pub protected_objects: u64,
+    /// Durable provider-delivery rows.
+    pub provider_deliveries: u64,
+    /// Durable agent-ownership rows.
+    pub agent_ownership: u64,
+    /// Append-only activation ownership epochs.
+    pub activation_epochs: u64,
     /// Activation is deliberately unavailable in this phase.
     pub activation_enabled: bool,
     /// Dispatch is deliberately unavailable in this phase.

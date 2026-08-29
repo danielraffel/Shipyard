@@ -97,7 +97,22 @@ fn sample_registered_route(work_id: &str) -> (RouteRegistration, Vec<AdapterBind
 }
 
 fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, AdapterBindingRecord) {
-    let opaque = |label: &str| OpaqueRef::derive("test", label.as_bytes());
+    sample_route_labeled(work_id, work_generation, "")
+}
+
+fn sample_route_labeled(
+    work_id: &str,
+    work_generation: u64,
+    suffix: &str,
+) -> (RouteRegistration, AdapterBindingRecord) {
+    let labeled = |label: &str| {
+        if suffix.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{label}:{suffix}")
+        }
+    };
+    let opaque = |label: &str| OpaqueRef::derive("test", labeled(label).as_bytes());
     let agent_adapter = adapter_binding(AdapterAxis::Agent, "codex", "codex");
     let provenance = RouteProvenanceRecord::new(
         TerminalRouteRecord::new(TerminalRoute::Cmux {
@@ -125,7 +140,7 @@ fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, Adap
             route_ref: opaque("subrouter route"),
         }),
         LaunchProfileRecord::new(
-            opaque("profile"),
+            OpaqueRef::derive("launch-profile", digest(b"profile").as_bytes()),
             3,
             1,
             Sha256Digest::of_bytes(b"binary"),
@@ -137,7 +152,7 @@ fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, Adap
     )
     .expect("provenance");
     let route = RouteRegistration::new(
-        opaque_ref("route", "registered"),
+        opaque_ref("route", &labeled("registered")),
         work_id.to_owned(),
         "0123456789012345678901234567890123456789".to_owned(),
         work_generation,
@@ -151,6 +166,8 @@ fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, Adap
     (route, agent_adapter)
 }
 
+mod dispatch;
 mod importer;
 mod lifecycle;
 mod persistence;
+mod protected_objects;

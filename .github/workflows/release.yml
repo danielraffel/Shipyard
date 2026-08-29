@@ -102,8 +102,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release --locked --bin shipyard
+      - name: Build release binaries
+        run: cargo build --release --locked --bin shipyard --bin shipyard-workstream-provider
 
       - name: Package non-macOS artifact
         if: matrix.package_target != 'macos-arm64'
@@ -113,6 +113,7 @@ jobs:
           ${{ matrix.python }} scripts/package_release.py \
             --skip-build \
             --binary "${{ matrix.binary }}" \
+            --companion-binary "${{ matrix.companion_binary }}" \
             --target "${{ matrix.package_target }}" \
             --tag "${{ github.ref_name }}" \
             --dist-dir artifacts/release
@@ -131,6 +132,7 @@ jobs:
         run: |
           set -euo pipefail
           target/release/shipyard --version
+          target/release/shipyard-workstream-provider --version
           echo "macOS release artifacts are intentionally not uploaded from this unsigned build."
           echo "Run scripts/release-macos-local.sh --tag ${{ github.ref_name }} --upload to sign, notarize, upload, verify, and publish."
 

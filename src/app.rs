@@ -36,6 +36,7 @@ mod init_cmd;
 mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
+pub(crate) use merge_steward_cmd::{LaunchProfileV1, decode_protected_launch_profile};
 mod metrics_cmd;
 mod paths_cmd;
 mod pin_cmd;
@@ -443,7 +444,7 @@ where
             );
         }
         Command::WorkLedger { command } => {
-            return work_ledger_command(&command, &runtime_paths.state_dir, cli.json, stdout);
+            return work_ledger_command(&command, &runtime_paths, cli.json, stdout);
         }
         Command::Wait { command } => {
             return handle_wait_command(
@@ -825,6 +826,7 @@ fn handle_pr_variant<W: Write>(
         adopt_head,
         workstream_id,
         context_url,
+        launch_profile,
         no_steward_handoff,
     } = command
     else {
@@ -846,6 +848,7 @@ fn handle_pr_variant<W: Write>(
             adopt_head,
             workstream_id,
             context_url,
+            launch_profile,
             steward_handoff_preference: if no_steward_handoff {
                 StewardHandoffPreference::Disabled
             } else {

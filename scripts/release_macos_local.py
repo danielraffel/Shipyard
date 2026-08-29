@@ -39,6 +39,7 @@ class ReleaseConfig:
     skip_build: bool
     binary: Path | None
     cargo_target: str | None
+    companion_binary: Path | None = None
     rollback_tag: str | None = None
     install_sh: Path = ROOT / "install.sh"
 
@@ -155,8 +156,18 @@ def require_arm64(arch: str) -> None:
         )
 
 
-def expected_macos_dmgs(artifact_prefix: str) -> tuple[str, ...]:
-    return (f"{artifact_prefix}-macos-arm64.dmg",)
+def expected_release_assets(artifact_prefix: str) -> tuple[str, ...]:
+    companion = package_release.COMPANION_BIN_NAME
+    return (
+        f"{artifact_prefix}-linux-x64",
+        f"{companion}-linux-x64",
+        f"{artifact_prefix}-linux-arm64",
+        f"{companion}-linux-arm64",
+        f"{artifact_prefix}-windows-x64.exe",
+        f"{companion}-windows-x64.exe",
+        f"{artifact_prefix}-macos-arm64.dmg",
+        "checksums.sha256",
+    )
 
 
 def package_signed_dmg(config: ReleaseConfig) -> Path:
@@ -173,12 +184,15 @@ def package_signed_dmg(config: ReleaseConfig) -> Path:
         "--sign-macos",
         "--notarize",
     ]
-    if config.ci_mode:
+    # Publication is never allowed to soften the mounted-DMG launch gate.
+    if config.ci_mode and not config.upload:
         args.append("--ci-mode")
     if config.skip_build:
         args.append("--skip-build")
     if config.binary:
         args.extend(["--binary", str(config.binary)])
+    if config.companion_binary:
+        args.extend(["--companion-binary", str(config.companion_binary)])
     if config.cargo_target:
         args.extend(["--cargo-target", config.cargo_target])
 
@@ -224,6 +238,42 @@ def release_is_draft(config: ReleaseConfig, runner: CommandRunner) -> bool:
         capture=True,
     )
     return output == "true"
+
+
+def missing_release_checksums(
+    config: ReleaseConfig,
+    expected_assets: tuple[str, ...],
+    runner: CommandRunner,
+) -> list[str]:
+    with tempfile.TemporaryDirectory(prefix="shipyard-release-checksums-proof-") as temp:
+        checksums = Path(temp) / "checksums.sha256"
+        runner.run(
+            [
+                "gh",
+                "release",
+                "download",
+                "--repo",
+                config.repo,
+                config.tag,
+                "--pattern",
+                "checksums.sha256",
+                "--output",
+                str(checksums),
+                "--clobber",
+            ]
+        )
+        covered = {
+            fields[1].lstrip("*")
+            for line in checksums.read_text(encoding="utf-8").splitlines()
+            if len(fields := line.split(maxsplit=1)) == 2
+            and len(fields[0]) == 64
+            and all(character in "0123456789abcdefABCDEF" for character in fields[0])
+        }
+    return [
+        name
+        for name in expected_assets
+        if name != "checksums.sha256" and name not in covered
+    ]
 
 
 def upload_artifact_and_checksums(
@@ -296,10 +346,31 @@ def merge_release_checksum(
 
 
 def publish_if_ready(config: ReleaseConfig, runner: CommandRunner) -> str:
+    expected_assets = expected_release_assets(config.artifact_prefix)
     assets = set(release_asset_names(config, runner))
-    missing = [name for name in expected_macos_dmgs(config.artifact_prefix) if name not in assets]
+    missing = [
+        name for name in expected_assets
+        if name not in assets
+    ]
+    if not missing:
+        missing = [
+            f"checksum:{name}"
+            for name in missing_release_checksums(config, expected_assets, runner)
+        ]
     if missing:
-        print("keeping release draft; missing macOS DMG(s): " + ", ".join(missing))
+        if not release_is_draft(config, runner):
+            runner.run(
+                [
+                    "gh",
+                    "release",
+                    "edit",
+                    "--repo",
+                    config.repo,
+                    config.tag,
+                    "--draft=true",
+                ]
+            )
+        print("keeping release draft; missing release asset(s): " + ", ".join(missing))
         return "partial"
 
     was_draft = release_is_draft(config, runner)
@@ -320,23 +391,19 @@ def publish_if_ready(config: ReleaseConfig, runner: CommandRunner) -> str:
 
     try:
         wait_for_public_release_assets(config, runner)
-        if config.ci_mode:
-            print("skipping install E2E because --ci-mode is set")
-            return "published-ci" if did_publish else "already-public-ci"
         run_install_e2e(config, runner)
     except SystemExit:
-        if did_publish or was_draft:
-            runner.run(
-                [
-                    "gh",
-                    "release",
-                    "edit",
-                    "--repo",
-                    config.repo,
-                    config.tag,
-                    "--draft=true",
-                ]
-            )
+        runner.run(
+            [
+                "gh",
+                "release",
+                "edit",
+                "--repo",
+                config.repo,
+                config.tag,
+                "--draft=true",
+            ]
+        )
         raise SystemExit(4)
 
     return "published" if did_publish else "already-public"
@@ -349,7 +416,7 @@ def wait_for_public_release_assets(
     timeout_secs: int = PUBLIC_ASSET_VISIBILITY_TIMEOUT_SECS,
     poll_secs: int = PUBLIC_ASSET_VISIBILITY_POLL_SECS,
 ) -> None:
-    expected = set(expected_macos_dmgs(config.artifact_prefix))
+    expected = set(expected_release_assets(config.artifact_prefix))
     url = f"https://api.github.com/repos/{config.repo}/releases/tags/{config.tag}"
     deadline = time.monotonic() + timeout_secs
     last_detail = "not checked"
@@ -397,14 +464,22 @@ def _install_env(config: ReleaseConfig, install_dir: Path, tag: str) -> dict[str
     return env
 
 
-def _binary_name(config: ReleaseConfig) -> str:
-    return config.artifact_prefix
+def _provider_expected_for_tag(tag: str) -> bool:
+    if tag == "latest":
+        return True
+    value = tag.removeprefix("v")
+    try:
+        major, minor, patch = (int(part) for part in value.split(".", 2))
+    except ValueError:
+        return True
+    return (major, minor, patch) >= (0, 127, 0)
 
 
 def run_install_e2e(config: ReleaseConfig, runner: CommandRunner) -> str:
     with tempfile.TemporaryDirectory(prefix="shipyard-install-e2e-") as temp:
         install_dir = Path(temp) / "bin"
-        binary = install_dir / _binary_name(config)
+        binary = install_dir / package_release.BIN_NAME
+        companion = install_dir / package_release.COMPANION_BIN_NAME
         observed: list[str] = []
 
         def install_and_probe(tag: str, phase: str) -> None:
@@ -413,9 +488,30 @@ def run_install_e2e(config: ReleaseConfig, runner: CommandRunner) -> str:
                 env=_install_env(config, install_dir, tag),
             )
             output = runner.run([str(binary), "--version"], capture=True)
-            if not output:
-                raise SystemExit(f"{phase} install smoke returned empty --version output")
-            observed.append(f"{phase}:{tag}:{output}")
+            primary_version = package_release.parse_binary_version(
+                output,
+                package_release.BIN_NAME,
+                source=f"{phase} installed CLI",
+            )
+            if _provider_expected_for_tag(tag):
+                provider_output = runner.run([str(companion), "--version"], capture=True)
+                provider_version = package_release.parse_binary_version(
+                    provider_output,
+                    package_release.COMPANION_BIN_NAME,
+                    source=f"{phase} installed provider",
+                )
+                if provider_version != primary_version:
+                    raise SystemExit(
+                        f"{phase} installed binary version mismatch: "
+                        f"{primary_version} != {provider_version}"
+                    )
+                observed.append(f"{phase}:{tag}:{output}:{provider_output}")
+            else:
+                if companion.exists():
+                    raise SystemExit(
+                        f"{phase} rollback left a newer provider binary installed"
+                    )
+                observed.append(f"{phase}:{tag}:{output}:provider-absent")
 
         if config.rollback_tag:
             install_and_probe(config.rollback_tag, "baseline")
@@ -441,10 +537,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--ci-mode",
         action="store_true",
-        help="Allow same-runner DMG mount skips and skip post-publish install E2E",
+        help=(
+            "Allow same-runner DMG mount skips only for non-upload diagnostics; "
+            "publication still requires mounted-DMG and public install E2E proof"
+        ),
     )
     parser.add_argument("--skip-build", action="store_true", help="Use an existing --binary instead of building")
     parser.add_argument("--binary", type=Path, help="Existing shipyard binary to package")
+    parser.add_argument(
+        "--companion-binary", type=Path, help="Existing provider binary to package"
+    )
     parser.add_argument("--cargo-target", help="Optional Rust target triple")
     parser.add_argument(
         "--rollback-tag",
@@ -488,6 +590,7 @@ def main(argv: list[str] | None = None) -> int:
         skip_build=args.skip_build,
         binary=args.binary,
         cargo_target=args.cargo_target,
+        companion_binary=args.companion_binary,
         rollback_tag=args.rollback_tag,
     )
     dmg = package_signed_dmg(config)

@@ -83,24 +83,28 @@ PACKAGE_ROWS = {
     "linux": {
         "package_target": "linux-x64",
         "binary": "target/release/shipyard",
+        "companion_binary": "target/release/shipyard-workstream-provider",
         "python": "python3",
         "package_args": "",
     },
     "linux-arm64": {
         "package_target": "linux-arm64",
         "binary": "target/release/shipyard",
+        "companion_binary": "target/release/shipyard-workstream-provider",
         "python": "python3",
         "package_args": "",
     },
     "macos-arm64": {
         "package_target": "macos-arm64",
         "binary": "target/release/shipyard",
+        "companion_binary": "target/release/shipyard-workstream-provider",
         "python": "python3",
         "package_args": "--dmg --ci-mode",
     },
     "windows": {
         "package_target": "windows-x64",
         "binary": "target/release/shipyard.exe",
+        "companion_binary": "target/release/shipyard-workstream-provider.exe",
         "python": "python",
         "package_args": "",
     },

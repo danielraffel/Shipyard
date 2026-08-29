@@ -110,6 +110,7 @@ pub mod prepared_state;
 mod process;
 /// Proof gates for applying a routing profile to GitHub variables.
 pub mod profile_apply;
+pub(crate) mod provider_wrapper;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
 /// Crash-safe, opt-in recovery of exact ship work missing from the queue.
@@ -135,6 +136,8 @@ pub mod reroute;
 pub mod runner_provision;
 /// Self-hosted runner watchdog detection logic.
 pub mod runner_watchdog;
+/// Subscriber-independent, read-only canonical-ledger shadow observation.
+pub mod shadow_scheduler;
 /// Ship execution orchestration helpers.
 pub mod ship;
 /// Read-only orphan/liveness classification for in-flight ship states.
@@ -172,6 +175,12 @@ pub mod webhook;
 pub mod work_ledger;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;
+pub(crate) mod workstream_activation_loader;
+/// Trusted machine-global policy for future workstream continuation dispatch.
+pub mod workstream_continuation_config;
+pub(crate) mod workstream_continuation_runtime;
+/// Digest-pinnable cmux adapter for fresh workstream continuation sessions.
+pub mod workstream_provider_adapter;
 /// Host-global production-writer coordination for sandbox E2E isolation.
 mod writer_domain_lease;
 

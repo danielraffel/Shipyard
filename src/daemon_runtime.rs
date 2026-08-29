@@ -42,6 +42,8 @@ use crate::reconcile::{
 #[cfg(unix)]
 use crate::registrar::{Registrar, RegistrarError, WEBHOOK_SCOPE_COMMAND};
 #[cfg(unix)]
+use crate::shadow_scheduler::{ShadowDaemonLane, ShadowTransitionEvidence};
+#[cfg(unix)]
 use crate::ship_resume::{AbandonReport, AbandonedShipState, sweep_orphaned_ship_states};
 use crate::ship_state::ShipStateStore;
 #[cfg(unix)]
@@ -53,6 +55,10 @@ use crate::tunnel::{
 };
 #[cfg(unix)]
 use crate::webhook::{decode_webhook_event, is_valid_signature};
+#[cfg(unix)]
+use crate::workstream_continuation_runtime::{
+    ContinuationRuntimeStatus, WorkstreamContinuationRuntime,
+};
 
 #[cfg(unix)]
 const SHIP_STATE_SCAN_INTERVAL: Duration = Duration::from_secs(1);
@@ -189,6 +195,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let registration = Arc::new(RegistrationState::new(registrar));
     let registration_error = Arc::new(Mutex::new(None::<String>));
     let execution_error = Arc::new(Mutex::new(None::<String>));
+    let continuation_status = Arc::new(Mutex::new(ContinuationRuntimeStatus::default()));
     let ship_dir = config.state_dir.join("ship");
     let ship_dir_for_list = ship_dir.clone();
 
@@ -197,6 +204,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         repos.clone(),
         Arc::clone(&registration_error),
         Arc::clone(&execution_error),
+        Arc::clone(&continuation_status),
         Arc::clone(&last_event_at),
         Arc::clone(&tunnel_runtime.snapshot),
     );
@@ -217,12 +225,21 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut previous_states = ship_state_map(&ship_dir);
     let mut next_ship_state_scan_at = Instant::now() + SHIP_STATE_SCAN_INTERVAL;
     let mut registration_sync = RegistrationSyncState::default();
+    let mut shadow_lane = ShadowDaemonLane::new(
+        config.mode,
+        config.global_dir.clone(),
+        config.state_dir.clone(),
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        Instant::now(),
+    );
     let mut execution_supervisor = ExecutionSupervisor::new(
         std::env::current_exe()?,
         config.mode,
         config.global_dir.clone(),
         config.state_dir.clone(),
     );
+    let mut continuation_runtime =
+        WorkstreamContinuationRuntime::for_daemon(config.mode, config.state_dir.clone());
     while running.load(Ordering::Acquire) {
         let supervisor_error = execution_supervisor
             .tick()
@@ -231,12 +248,17 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         if let Ok(mut last_error) = execution_error.lock() {
             *last_error = supervisor_error;
         }
+        continuation_runtime.tick();
+        if let Ok(mut published) = continuation_status.lock() {
+            *published = continuation_runtime.status();
+        }
         drain_webhook_events(
             &webhook_rx,
             &server,
             &last_event_at,
             &ship_dir,
             &mut previous_states,
+            &mut shadow_lane,
         );
         sync_tunnel_registration(
             &tunnel_runtime,
@@ -252,6 +274,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             reconcile_window = result.window;
             publish_reconcile_events(&server, &last_event_at, &result.report);
             publish_abandon_events(&server, &last_event_at, &result.abandon);
+        }
+
+        for evidence in shadow_lane.tick(Instant::now()) {
+            publish_shadow_transition(&server, &last_event_at, &evidence);
         }
 
         let now = Instant::now();
@@ -335,6 +361,7 @@ fn daemon_status_provider(
     configured_repos: Vec<String>,
     registration_error: Arc<Mutex<Option<String>>>,
     execution_error: Arc<Mutex<Option<String>>>,
+    continuation_status: Arc<Mutex<ContinuationRuntimeStatus>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
     tunnel_snapshot: Arc<Mutex<TunnelSnapshot>>,
 ) -> impl Fn() -> IpcState + Send + Sync + 'static {
@@ -351,6 +378,10 @@ fn daemon_status_provider(
             registered_repos: registration.published_repos(),
             configured_repos: configured_repos.clone(),
             rate_limit: None,
+            workstream_continuation: continuation_status.lock().map_or_else(
+                |_| ContinuationRuntimeStatus::default(),
+                |guard| guard.clone(),
+            ),
             last_error: registration_error
                 .lock()
                 .ok()
@@ -367,8 +398,10 @@ fn drain_webhook_events(
     last_event_at: &Arc<Mutex<Option<f64>>>,
     ship_dir: &Path,
     previous_states: &mut BTreeMap<(String, u64), ShipState>,
+    shadow_lane: &mut ShadowDaemonLane,
 ) {
     while let Ok(event) = webhook_rx.try_recv() {
+        shadow_lane.note_webhook(&event, Instant::now());
         let archived_event =
             archive_closed_pull_request_ship_state(&event, ship_dir, previous_states);
         publish_daemon_event(server, last_event_at, event);
@@ -376,6 +409,32 @@ fn drain_webhook_events(
             publish_daemon_event(server, last_event_at, archived_event);
         }
     }
+}
+
+#[cfg(unix)]
+fn publish_shadow_transition(
+    server: &IpcServer,
+    last_event_at: &Arc<Mutex<Option<f64>>>,
+    evidence: &ShadowTransitionEvidence,
+) {
+    let event = serde_json::json!({
+        "kind": "shadow_observation_transition",
+        "payload": {
+            "transition": evidence.transition,
+            "trigger": evidence.trigger,
+            "api_requests": evidence.api_requests,
+            "elapsed_ms": evidence.elapsed_ms,
+            "fetch_errors": evidence.fetch_errors,
+            "activation_enabled": false,
+            "dispatch_enabled": false,
+            "model_calls": 0,
+        }
+    });
+    // IPC remains a convenience; the daemon's supervised stderr sink is the
+    // retained, subscriber-independent audit trail for transition-only shadow
+    // evidence. The payload is redacted before it reaches this boundary.
+    eprintln!("{}", serde_json::to_string(&event).unwrap_or_default());
+    publish_daemon_event(server, last_event_at, event);
 }
 
 #[cfg(unix)]
@@ -1843,6 +1902,9 @@ mod tests {
             vec!["owner/repo".to_owned(), "owner/pending".to_owned()],
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(
+                crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
+            )),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(TunnelSnapshot::inactive())),
         );

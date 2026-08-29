@@ -388,6 +388,10 @@ pub(super) enum Command {
         /// Durable context URL for the steward receipt. Defaults to the PR URL.
         #[arg(long = "context-url", conflicts_with = "no_steward_handoff")]
         context_url: Option<String>,
+        /// Private JSON `LaunchProfileV1` atomically published with the
+        /// exact-head steward handoff.
+        #[arg(long = "launch-profile", conflicts_with = "no_steward_handoff")]
+        launch_profile: Option<PathBuf>,
         /// Disable a project-configured automatic steward handoff.
         #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
         no_steward_handoff: bool,
@@ -498,6 +502,58 @@ pub(super) enum WorkLedgerCommand {
         /// Commit selected redacted projections to the shadow ledger.
         #[arg(long)]
         apply: bool,
+    },
+    /// Publish one exact managed handoff for daemon-owned continuation.
+    Publish {
+        /// Canonical lowercase owner/repository slug.
+        #[arg(long)]
+        repo: String,
+        /// Pull request number bound by the durable handoff.
+        #[arg(long)]
+        pr: u64,
+        /// Exact lowercase 40-character head SHA.
+        #[arg(long)]
+        head: String,
+        /// Commit the publication. Dry-run is the default.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Inspect the exact redacted context challenge for one delivered wake.
+    #[command(name = "context-challenge")]
+    ContextChallenge {
+        /// Exact delivered wake ID.
+        #[arg(long)]
+        wake: String,
+    },
+    /// Acknowledge reconstructed context using an exact authority-bound receipt.
+    #[command(name = "acknowledge-context")]
+    AcknowledgeContext {
+        /// Exact delivered wake ID.
+        #[arg(long)]
+        wake: String,
+        /// Bounded private receipt file, or `-` for strict stdin.
+        #[arg(long)]
+        receipt: PathBuf,
+    },
+    /// Inspect the exact redacted checkpoint floor for acknowledged ownership.
+    #[command(name = "return-challenge")]
+    ReturnChallenge {
+        /// Exact acknowledged ownership ID.
+        #[arg(long)]
+        ownership: String,
+    },
+    /// Return ownership with a newer checkpoint and reviewed evidence.
+    #[command(name = "return-ownership")]
+    ReturnOwnership {
+        /// Exact acknowledged ownership ID.
+        #[arg(long)]
+        ownership: String,
+        /// Reviewed return expectation file, or `-` for strict stdin.
+        #[arg(long)]
+        expectation: PathBuf,
+        /// Independently produced return receipt file, or `-` for strict stdin.
+        #[arg(long)]
+        receipt: PathBuf,
     },
     /// Inspect or revise repository lane policy in the shadow ledger.
     Policy {
@@ -2106,6 +2162,8 @@ impl From<PathMode> for RuntimeMode {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::Parser;
 
     use super::{
@@ -2231,6 +2289,123 @@ mod tests {
             Command::WorkLedger {
                 command: WorkLedgerCommand::Import { apply: true }
             }
+        ));
+    }
+
+    #[test]
+    fn work_ledger_publish_is_exact_and_dry_run_by_default() {
+        let head = "a".repeat(40);
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "publish",
+            "--repo",
+            "generous-corp/shipyard",
+            "--pr",
+            "43",
+            "--head",
+            &head,
+        ])
+        .expect("publication plan");
+        assert!(matches!(
+            cli.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::Publish {
+                    repo,
+                    pr: 43,
+                    head: parsed_head,
+                    apply: false,
+                }
+            } if repo == "generous-corp/shipyard" && parsed_head == head
+        ));
+
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "publish",
+            "--repo",
+            "generous-corp/shipyard",
+            "--pr",
+            "43",
+            "--head",
+            &head,
+            "--apply",
+        ])
+        .expect("publication apply");
+        assert!(matches!(
+            cli.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::Publish { apply: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn work_ledger_agent_handshake_uses_file_or_stdin_receipt_inputs() {
+        let challenge = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "context-challenge",
+            "--wake",
+            "wake:gen43:1",
+        ])
+        .expect("context challenge");
+        assert!(matches!(
+            challenge.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::ContextChallenge { wake }
+            } if wake == "wake:gen43:1"
+        ));
+
+        let acknowledge = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "acknowledge-context",
+            "--wake",
+            "wake:gen43:1",
+            "--receipt",
+            "-",
+        ])
+        .expect("context acknowledgement");
+        assert!(matches!(
+            acknowledge.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::AcknowledgeContext { receipt, .. }
+            } if receipt == Path::new("-")
+        ));
+
+        let return_challenge = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "return-challenge",
+            "--ownership",
+            "ao:gen43",
+        ])
+        .expect("return challenge");
+        assert!(matches!(
+            return_challenge.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::ReturnChallenge { ownership }
+            } if ownership == "ao:gen43"
+        ));
+
+        let returned = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "return-ownership",
+            "--ownership",
+            "ao:gen43",
+            "--expectation",
+            "/tmp/expectation.json",
+            "--receipt",
+            "/tmp/receipt.json",
+        ])
+        .expect("ownership return");
+        assert!(matches!(
+            returned.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::ReturnOwnership { ownership, .. }
+            } if ownership == "ao:gen43"
         ));
     }
 

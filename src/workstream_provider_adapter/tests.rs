@@ -1,0 +1,876 @@
+#![allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+
+use std::collections::VecDeque;
+
+use super::*;
+use crate::provider_wrapper::{
+    FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderLaunchOptionsV1,
+};
+use crate::work_ledger::{
+    DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
+    FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
+    ProviderOutcome, WakeEnvelope, WakeProfileResolver,
+};
+#[cfg(unix)]
+use crate::work_ledger::{
+    NativePublicationRequest, WakeConsumerPolicy, WakeDeliveryResult, WorkLedger,
+};
+
+const UUID: &str = "123E4567-E89B-12D3-A456-426614174000";
+const OTHER_WINDOW_UUID: &str = "923E4567-E89B-12D3-A456-426614174000";
+const SURFACE_UUID: &str = "223E4567-E89B-12D3-A456-426614174000";
+const SESSION_UUID: &str = "323E4567-E89B-12D3-A456-426614174000";
+
+fn native_absolute_test_path(leaf: &str) -> String {
+    if cfg!(windows) {
+        format!(r"C:\Shipyard\{leaf}")
+    } else {
+        format!("/tmp/shipyard/{leaf}")
+    }
+}
+
+#[derive(Default)]
+struct FakeRunner {
+    verification: Option<Result<(), RunnerFailure>>,
+    results: VecDeque<Result<CommandResult, RunnerFailure>>,
+    calls: Vec<Vec<String>>,
+}
+
+impl CmuxRunner for FakeRunner {
+    fn verify(&mut self) -> Result<(), RunnerFailure> {
+        self.verification.take().unwrap_or(Ok(()))
+    }
+
+    fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure> {
+        self.calls.push(args.to_vec());
+        self.results
+            .pop_front()
+            .expect("test runner must provide one result per call")
+    }
+}
+
+fn successful_json(value: serde_json::Value) -> Result<CommandResult, RunnerFailure> {
+    Ok(CommandResult {
+        success: true,
+        stdout: serde_json::to_vec(&value).unwrap(),
+    })
+}
+
+fn list(workspaces: serde_json::Value) -> Result<CommandResult, RunnerFailure> {
+    successful_json(serde_json::json!({"window_id": UUID, "workspaces": workspaces}))
+}
+
+fn list_for_window(
+    window_id: &str,
+    workspaces: serde_json::Value,
+) -> Result<CommandResult, RunnerFailure> {
+    successful_json(serde_json::json!({"window_id": window_id, "workspaces": workspaces}))
+}
+
+fn windows(ids: &[&str]) -> Result<CommandResult, RunnerFailure> {
+    successful_json(serde_json::Value::Array(
+        ids.iter()
+            .map(|id| serde_json::json!({"id": id, "index": 0, "key": true}))
+            .collect(),
+    ))
+}
+
+fn created() -> Result<CommandResult, RunnerFailure> {
+    successful_json(serde_json::json!({
+        "window_id": UUID,
+        "workspace_id": UUID,
+        "surface_id": SURFACE_UUID,
+        "group_id": null
+    }))
+}
+
+#[test]
+fn live_create_shape_accepts_additive_metadata_and_requires_uuid_ids() {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "window_id": OTHER_WINDOW_UUID,
+        "workspace_id": UUID,
+        "surface_id": SURFACE_UUID,
+        "group_id": null,
+        "future_additive_field": {"ignored": true}
+    }))
+    .unwrap();
+
+    let parsed = parse_created_workspace(&bytes).expect("live cmux create shape");
+    assert_eq!(parsed.workspace_id, UUID.to_ascii_lowercase());
+    assert_eq!(parsed.surface_id, SURFACE_UUID.to_ascii_lowercase());
+
+    let invalid = serde_json::to_vec(&serde_json::json!({
+        "workspace_id": "workspace:1",
+        "surface_id": SURFACE_UUID,
+        "group_id": null
+    }))
+    .unwrap();
+    assert!(parse_created_workspace(&invalid).is_err());
+}
+
+fn surface_health(surface_ids: &[&str]) -> Result<CommandResult, RunnerFailure> {
+    successful_json(serde_json::json!({
+        "window_id": OTHER_WINDOW_UUID,
+        "workspace_id": UUID,
+        "surfaces": surface_ids.iter().map(|id| serde_json::json!({
+            "id": id,
+            "in_window": true,
+            "index": 0,
+            "type": "terminal"
+        })).collect::<Vec<_>>()
+    }))
+}
+
+fn session_evidence(provider: Option<&str>) -> Result<CommandResult, RunnerFailure> {
+    successful_json(serde_json::json!({
+        "window_id": OTHER_WINDOW_UUID,
+        "workspace_id": UUID,
+        "pane_id": "423E4567-E89B-12D3-A456-426614174000",
+        "surface_id": SURFACE_UUID,
+        "cleared": false,
+        "restore_record": null,
+        "resume_binding": provider.map(|kind| serde_json::json!({
+            "checkpoint_id": SESSION_UUID,
+            "kind": kind,
+            "source": "agent-hook",
+            "cwd": "/tmp/shipyard-gen43"
+        }))
+    }))
+}
+
+fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWrapperRequestV1 {
+    let mut fence = ProviderDeliveryFenceV1 {
+        wake_id: "wake:gen43:1".to_owned(),
+        work_item_id: "work:gen43".to_owned(),
+        work_generation: 2,
+        owner_generation: 1,
+        route_ref: "route:gen43".to_owned(),
+        payload_digest: "1".repeat(64),
+        attempt: 1,
+        consumer_epoch: 1,
+        consumer_owner_ref: "consumer:m5".to_owned(),
+        idempotency_key: String::new(),
+    };
+    fence.bind_idempotency_key();
+    ProviderWrapperRequestV1 {
+        schema_version: 1,
+        operation,
+        provider_id: provider.to_owned(),
+        adapter_id: ADAPTER_ID.to_owned(),
+        delivery_fence: fence,
+        resume_expectation: FreshResumeExpectationV1 {
+            workstream_handle: "GEN-43".to_owned(),
+            context_url: Some("https://linear.app/generous/issue/GEN-43".to_owned()),
+            plan_sha256: "2".repeat(64),
+            root_revision: 0,
+            issue_revision: 0,
+            material_event_revision: 0,
+            projection_revision: 1,
+            checkpoint_id: "checkpoint-gen43".to_owned(),
+            checkpoint_generation: 1,
+            checkpoint_digest: "3".repeat(64),
+            repository: "generous-corp/shipyard".to_owned(),
+            worktree_path: native_absolute_test_path("shipyard-gen43"),
+            head_sha: "4".repeat(40),
+            expected_resume_context_digest: "5".repeat(64),
+            success_continuation_digest: "6".repeat(64),
+            failure_continuation_digest: "7".repeat(64),
+        },
+        launch_options: ProviderLaunchOptionsV1 {
+            model_id: Some("gpt-5.6-sol".to_owned()),
+            reasoning_effort: Some(ProviderReasoningEffortV1::Medium),
+        },
+    }
+}
+
+fn description(request: &ProviderWrapperRequestV1) -> String {
+    format!(
+        "shipyard-workstream-delivery:{}",
+        request.delivery_fence.idempotency_key
+    )
+}
+
+fn workspace(description: &str) -> serde_json::Value {
+    serde_json::json!({"id": UUID, "description": description, "title": "ignored"})
+}
+
+fn assert_delivered(response: &ProviderWrapperResponseV1, provider: &str) {
+    let ProviderWrapperOutcomeV1::Delivered {
+        provider_session_ref,
+        receipt_digest,
+        ..
+    } = &response.outcome
+    else {
+        panic!("expected delivered, got {:?}", response.outcome);
+    };
+    assert_eq!(
+        provider_session_ref,
+        &format!("session:{provider}:{}", SESSION_UUID.to_ascii_lowercase())
+    );
+    assert_eq!(receipt_digest.len(), 64);
+}
+
+#[test]
+fn exact_replay_returns_existing_workspace_without_create() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(Some("codex")),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_request(&request, &mut runner);
+
+    assert_delivered(&response, "codex");
+    assert_eq!(runner.calls.len(), 4);
+    assert_eq!(runner.calls[0], cmux_prefix(["list-windows"]));
+    assert_eq!(runner.calls[1][3..5], ["workspace", "list"]);
+}
+
+#[test]
+fn workspace_created_before_agent_hook_session_is_not_accepted() {
+    let request = request("codex", ProviderWrapperOperationV1::Reconcile);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(None),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_request(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 4);
+    assert!(runner.calls.iter().all(|call| {
+        call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+    }));
+}
+
+#[test]
+fn lost_create_response_reconciles_without_second_create() {
+    let submit = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut submit_runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            Err(RunnerFailure::Unavailable),
+        ]),
+        ..FakeRunner::default()
+    };
+    let submit_response = handle_request(&submit, &mut submit_runner);
+    assert!(matches!(
+        submit_response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(submit_runner.calls.len(), 3);
+    assert_eq!(submit_runner.calls[2][3..5], ["workspace", "create"]);
+
+    let mut reconcile = submit.clone();
+    reconcile.operation = ProviderWrapperOperationV1::Reconcile;
+    let mut reconcile_runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID, OTHER_WINDOW_UUID]),
+            list(serde_json::json!([])),
+            list_for_window(
+                OTHER_WINDOW_UUID,
+                serde_json::json!([workspace(&description(&reconcile))]),
+            ),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(Some("codex")),
+        ]),
+        ..FakeRunner::default()
+    };
+    let reconciled = handle_request(&reconcile, &mut reconcile_runner);
+    assert_delivered(&reconciled, "codex");
+    assert_eq!(reconcile_runner.calls.len(), 5);
+    assert!(reconcile_runner.calls.iter().all(|call| {
+        call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+    }));
+}
+
+#[test]
+fn reconcile_with_no_match_never_creates() {
+    let request = request("codex", ProviderWrapperOperationV1::Reconcile);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([windows(&[UUID]), list(serde_json::json!([]))]),
+        ..FakeRunner::default()
+    };
+    let response = handle_request(&request, &mut runner);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 2);
+}
+
+#[test]
+fn delayed_workspace_visibility_keeps_one_fence_and_never_creates_again() {
+    let submit = request("codex", ProviderWrapperOperationV1::Submit);
+    let original_key = submit.delivery_fence.idempotency_key.clone();
+    let mut submit_runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            Err(RunnerFailure::Unavailable),
+        ]),
+        ..FakeRunner::default()
+    };
+    let submitted = handle_request(&submit, &mut submit_runner);
+    assert!(matches!(
+        submitted.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(submitted.idempotency_key, original_key);
+
+    let mut reconcile = submit.clone();
+    reconcile.operation = ProviderWrapperOperationV1::Reconcile;
+    let mut hidden_runner = FakeRunner {
+        results: VecDeque::from([windows(&[UUID]), list(serde_json::json!([]))]),
+        ..FakeRunner::default()
+    };
+    let hidden = handle_request(&reconcile, &mut hidden_runner);
+    assert!(matches!(
+        hidden.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(hidden.idempotency_key, original_key);
+
+    let mut visible_runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&reconcile))])),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(Some("codex")),
+        ]),
+        ..FakeRunner::default()
+    };
+    let visible = handle_request(&reconcile, &mut visible_runner);
+    assert_delivered(&visible, "codex");
+    assert_eq!(visible.idempotency_key, original_key);
+    assert_eq!(reconcile.delivery_fence.idempotency_key, original_key);
+    let create_count = submit_runner
+        .calls
+        .iter()
+        .chain(&hidden_runner.calls)
+        .chain(&visible_runner.calls)
+        .filter(|call| {
+            call.get(3..5) == Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+        })
+        .count();
+    assert_eq!(create_count, 1);
+}
+
+#[test]
+fn same_title_with_wrong_description_does_not_replay() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(
+                "shipyard-workstream-delivery:wrong"
+            )])),
+            created(),
+            session_evidence(Some("codex")),
+        ]),
+        ..FakeRunner::default()
+    };
+    let response = handle_request(&request, &mut runner);
+    assert_delivered(&response, "codex");
+    assert_eq!(runner.calls.len(), 4);
+    let create = &runner.calls[2];
+    assert_eq!(create[3..5], ["workspace", "create"]);
+    let description_index = create
+        .iter()
+        .position(|arg| arg == "--description")
+        .unwrap();
+    assert_eq!(create[description_index + 1], description(&request));
+}
+
+#[test]
+fn structured_launch_quotes_cwd_and_excludes_raw_context() {
+    let mut request = request("codex", ProviderWrapperOperationV1::Submit);
+    let quoted_worktree = native_absolute_test_path("work tree'quoted");
+    request.resume_expectation.worktree_path = quoted_worktree.clone();
+    request.resume_expectation.context_url =
+        Some("https://linear.app/generous/private-secret'raw".to_owned());
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            created(),
+            session_evidence(Some("codex")),
+        ]),
+        ..FakeRunner::default()
+    };
+    let response = handle_request(&request, &mut runner);
+    assert_delivered(&response, "codex");
+    let create = &runner.calls[2];
+    assert_eq!(create[..3], ["--json", "--id-format", "uuids"]);
+    let cwd_index = create.iter().position(|arg| arg == "--cwd").unwrap();
+    assert_eq!(create[cwd_index + 1], quoted_worktree);
+    let command_index = create.iter().position(|arg| arg == "--command").unwrap();
+    let command = &create[command_index + 1];
+    assert!(!command.contains("private-secret"));
+    assert!(!command.contains("context_url"));
+    assert!(command.contains("GEN-43"));
+    assert!(command.contains("wake:gen43:1"));
+    for command_name in [
+        "context-challenge",
+        "acknowledge-context",
+        "return-challenge",
+        "return-ownership",
+    ] {
+        assert!(command.contains(command_name));
+    }
+    assert!(command.contains("Never put receipt JSON or secrets in argv"));
+}
+
+#[test]
+fn codex_and_claude_use_provider_owned_command_grammars() {
+    let codex = request("codex", ProviderWrapperOperationV1::Submit);
+    let codex_command = launch_command(&codex).unwrap();
+    assert!(codex_command.starts_with(&shell_word(CODEX_WRAPPER).unwrap()));
+    assert!(codex_command.contains("--model 'gpt-5.6-sol'"));
+    assert!(codex_command.contains("-c 'model_reasoning_effort=\"medium\"'"));
+
+    let mut claude = request("claude", ProviderWrapperOperationV1::Submit);
+    claude.launch_options.model_id = Some("fable".to_owned());
+    claude.launch_options.reasoning_effort = Some(ProviderReasoningEffortV1::High);
+    let claude_command = launch_command(&claude).unwrap();
+    assert!(claude_command.starts_with(&shell_word(CLAUDE_WRAPPER).unwrap()));
+    assert!(claude_command.contains("--model 'fable'"));
+    assert!(claude_command.contains("--effort high"));
+    assert!(!claude_command.contains("model_reasoning_effort"));
+
+    claude.launch_options.reasoning_effort = Some(ProviderReasoningEffortV1::Ultra);
+    assert_eq!(
+        validate_adapter_request(&claude),
+        Err("claude-ultra-effort-unsupported")
+    );
+}
+
+#[test]
+fn ambiguous_or_duplicate_workspace_evidence_is_never_delivered() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let exact = workspace(&description(&request));
+    let mut duplicate = exact.clone();
+    duplicate["id"] = serde_json::json!("323E4567-E89B-12D3-A456-426614174000");
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([exact, duplicate])),
+        ]),
+        ..FakeRunner::default()
+    };
+    let response = handle_request(&request, &mut runner);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 2);
+}
+
+#[test]
+fn pre_create_refusal_is_retryable_but_post_create_refusal_is_uncertain() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut list_refusal = FakeRunner {
+        results: VecDeque::from([Ok(CommandResult {
+            success: false,
+            stdout: Vec::new(),
+        })]),
+        ..FakeRunner::default()
+    };
+    let before_create = handle_request(&request, &mut list_refusal);
+    assert!(matches!(
+        before_create.outcome,
+        ProviderWrapperOutcomeV1::Retryable { .. }
+    ));
+    assert_eq!(list_refusal.calls.len(), 1);
+
+    let mut create_refusal = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            Ok(CommandResult {
+                success: false,
+                stdout: Vec::new(),
+            }),
+        ]),
+        ..FakeRunner::default()
+    };
+    let after_create = handle_request(&request, &mut create_refusal);
+    assert!(matches!(
+        after_create.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(create_refusal.calls.len(), 3);
+}
+
+#[test]
+fn partial_app_wide_enumeration_refuses_create() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID, OTHER_WINDOW_UUID]),
+            list(serde_json::json!([])),
+            Err(RunnerFailure::Unavailable),
+        ]),
+        ..FakeRunner::default()
+    };
+    let response = handle_request(&request, &mut runner);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Retryable { .. }
+    ));
+    assert_eq!(runner.calls.len(), 3);
+    assert!(
+        !runner
+            .calls
+            .iter()
+            .flatten()
+            .any(|argument| argument == "create")
+    );
+}
+
+#[test]
+fn untrusted_cmux_and_unsupported_provider_refuse_before_any_command() {
+    let valid_request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut untrusted = FakeRunner {
+        verification: Some(Err(RunnerFailure::Untrusted)),
+        ..FakeRunner::default()
+    };
+    let response = handle_request(&valid_request, &mut untrusted);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Rejected { .. }
+    ));
+    assert!(untrusted.calls.is_empty());
+
+    let unsupported = request("other", ProviderWrapperOperationV1::Submit);
+    let mut runner = FakeRunner::default();
+    let response = handle_request(&unsupported, &mut runner);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Rejected { .. }
+    ));
+    assert!(runner.calls.is_empty());
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn production_cmux_adapter_refuses_before_running_any_cmux_command() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let response = handle_request(&request, &mut ProductionCmuxRunner);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Retryable { .. }
+    ));
+}
+
+#[test]
+fn reconcile_preflight_failures_preserve_uncertainty() {
+    let reconcile = request("codex", ProviderWrapperOperationV1::Reconcile);
+    for verification in [RunnerFailure::Unavailable, RunnerFailure::Untrusted] {
+        let mut runner = FakeRunner {
+            verification: Some(Err(verification)),
+            ..FakeRunner::default()
+        };
+        let response = handle_request(&reconcile, &mut runner);
+        assert!(matches!(
+            response.outcome,
+            ProviderWrapperOutcomeV1::Uncertain { .. }
+        ));
+        assert_eq!(
+            response.idempotency_key,
+            reconcile.delivery_fence.idempotency_key
+        );
+        assert!(runner.calls.is_empty());
+    }
+
+    let unsupported = request("other", ProviderWrapperOperationV1::Reconcile);
+    let mut runner = FakeRunner::default();
+    let response = handle_request(&unsupported, &mut runner);
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(
+        response.idempotency_key,
+        unsupported.delivery_fence.idempotency_key
+    );
+    assert!(runner.calls.is_empty());
+}
+
+#[derive(Clone)]
+struct LedgerProfile {
+    digest: String,
+    bytes: Vec<u8>,
+}
+
+impl FreshAgentLaunchProfile for LedgerProfile {
+    fn provider_id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn provider_launch_options(&self) -> FreshAgentProviderLaunchOptions {
+        FreshAgentProviderLaunchOptions {
+            model_id: Some("gpt-5.6-sol".to_owned()),
+            reasoning_effort: Some(ProviderReasoningEffortV1::Medium),
+        }
+    }
+
+    fn profile_digest(&self) -> crate::work_ledger::WorkLedgerResult<String> {
+        Ok(self.digest.clone())
+    }
+
+    fn permits_fresh_agent(&self) -> bool {
+        true
+    }
+
+    fn protected_profile_bytes(&self) -> crate::work_ledger::WorkLedgerResult<Vec<u8>> {
+        Ok(self.bytes.clone())
+    }
+
+    fn resume_expectation(&self) -> Option<FreshAgentResumeExpectation<'_>> {
+        Some(FreshAgentResumeExpectation {
+            workstream_handle: "GEN-43",
+            context_url: Some("https://linear.example/GEN-43"),
+            plan_sha256: "2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f",
+            root_revision: 0,
+            issue_revision: 0,
+            projection_revision: 1,
+            material_event_revision: 0,
+            checkpoint_id: "checkpoint-gen43",
+            checkpoint_generation: 1,
+            checkpoint_digest: "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f",
+            repository: "generous-corp/shipyard",
+            head_sha: "4444444444444444444444444444444444444444",
+            expected_resume_context_digest: "5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+            success_continuation_digest: "6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f",
+            failure_continuation_digest: "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+        })
+    }
+}
+
+struct LedgerResolver(LedgerProfile);
+
+impl WakeProfileResolver for LedgerResolver {
+    type Profile = LedgerProfile;
+
+    fn resolve(
+        &mut self,
+        _wake: &WakeEnvelope,
+    ) -> crate::work_ledger::WorkLedgerResult<Self::Profile> {
+        Ok(self.0.clone())
+    }
+}
+
+#[derive(Default)]
+struct LedgerCmuxAdapter {
+    launch_fence: Option<DeliveryFence>,
+    reconcile_fence: Option<DeliveryFence>,
+    wrapper_keys: Vec<String>,
+    create_count: usize,
+}
+
+impl LedgerCmuxAdapter {
+    fn wrapper_request(
+        fence: &DeliveryFence,
+        operation: ProviderWrapperOperationV1,
+    ) -> ProviderWrapperRequestV1 {
+        let mut request = request("codex", operation);
+        request.delivery_fence = ProviderDeliveryFenceV1 {
+            wake_id: fence.wake_id.clone(),
+            work_item_id: fence.work_item_id.clone(),
+            work_generation: fence.work_generation,
+            owner_generation: fence.owner_generation,
+            route_ref: fence.route_ref.clone(),
+            payload_digest: fence.payload_digest.clone(),
+            attempt: fence.attempt,
+            consumer_epoch: fence.consumer_epoch,
+            consumer_owner_ref: fence.consumer_owner_ref.clone(),
+            idempotency_key: String::new(),
+        };
+        request.delivery_fence.bind_idempotency_key();
+        request
+    }
+
+    fn map(response: ProviderWrapperResponseV1) -> ProviderOutcome {
+        match response.outcome {
+            ProviderWrapperOutcomeV1::Delivered { .. } => ProviderOutcome::Delivered {
+                receipt: b"delivered".to_vec(),
+            },
+            ProviderWrapperOutcomeV1::Retryable { .. } => ProviderOutcome::Retryable {
+                evidence: b"retryable".to_vec(),
+            },
+            ProviderWrapperOutcomeV1::Uncertain { .. } => ProviderOutcome::Uncertain {
+                evidence: b"uncertain".to_vec(),
+            },
+            ProviderWrapperOutcomeV1::Rejected { .. } => ProviderOutcome::Rejected {
+                evidence: b"rejected".to_vec(),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for LedgerCmuxAdapter {
+    fn capability(&self, provider_id: &str) -> Option<ProviderCapability> {
+        (provider_id == "codex").then(|| ProviderCapability {
+            adapter_id: ADAPTER_ID.to_owned(),
+            fresh_agent_launch: true,
+            idempotent_launch: true,
+        })
+    }
+
+    fn launch(&mut self, launch: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+        self.launch_fence = Some(launch.fence.clone());
+        let request = Self::wrapper_request(launch.fence, ProviderWrapperOperationV1::Submit);
+        self.wrapper_keys
+            .push(request.delivery_fence.idempotency_key.clone());
+        let mut runner = FakeRunner {
+            results: VecDeque::from([
+                windows(&[UUID]),
+                list(serde_json::json!([])),
+                Err(RunnerFailure::Unavailable),
+            ]),
+            ..FakeRunner::default()
+        };
+        let response = handle_request(&request, &mut runner);
+        self.create_count += runner
+            .calls
+            .iter()
+            .filter(|call| {
+                call.get(3..5) == Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+            })
+            .count();
+        Self::map(response)
+    }
+
+    fn reconcile(&mut self, fence: &DeliveryFence) -> ProviderOutcome {
+        self.reconcile_fence = Some(fence.clone());
+        let request = Self::wrapper_request(fence, ProviderWrapperOperationV1::Reconcile);
+        self.wrapper_keys
+            .push(request.delivery_fence.idempotency_key.clone());
+        let mut runner = FakeRunner {
+            verification: Some(Err(RunnerFailure::Unavailable)),
+            ..FakeRunner::default()
+        };
+        let response = handle_request(&request, &mut runner);
+        assert!(runner.calls.is_empty());
+        Self::map(response)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
+    let temp = tempfile::tempdir().expect("temp");
+    let profile_bytes = b"strict-test-profile".to_vec();
+    let profile_digest = hex::encode(Sha256::digest(&profile_bytes));
+    let policy = crate::workstream_continuation_config::WorkstreamContinuationConfig {
+        origin_machine: "m5".to_owned(),
+        repositories: vec!["generous-corp/shipyard".to_owned()],
+        provider_wrapper: ProviderWrapperConfig {
+            executable_path: PathBuf::from(native_absolute_test_path("cmux-provider")),
+            executable_sha256: "8".repeat(64),
+            provider_id: "codex".to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            deadline_seconds: 15,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 65_536,
+        },
+    };
+    let publication = NativePublicationRequest {
+        repository: "generous-corp/shipyard".to_owned(),
+        pull_request: 43,
+        head_sha: "4".repeat(40),
+        workstream_handle: "GEN-43".to_owned(),
+        context_url: Some("https://linear.example/GEN-43".to_owned()),
+        origin_machine: "m5".to_owned(),
+        owner_id: "owner-gen43".to_owned(),
+        owner_generation: 1,
+        agent_provider: "codex".to_owned(),
+        agent_session_id: "session-gen43".to_owned(),
+        route_id: "route-gen43".to_owned(),
+        profile_generation: 1,
+        profile_revision: 1,
+        profile_provider: "codex".to_owned(),
+        profile_digest: profile_digest.clone(),
+        protected_profile_bytes: profile_bytes.clone(),
+        success_continuation_digest: "6".repeat(64),
+        failure_continuation_digest: "7".repeat(64),
+    };
+    let report =
+        WorkLedger::plan_or_apply_native_continuation(temp.path(), &publication, &policy, true)
+            .expect("publish wake");
+    let profile = LedgerProfile {
+        digest: profile_digest,
+        bytes: profile_bytes,
+    };
+    let mut resolver = LedgerResolver(profile.clone());
+    let mut adapter = LedgerCmuxAdapter::default();
+    let ledger = WorkLedger::open_existing(temp.path())
+        .expect("open ledger")
+        .expect("ledger exists");
+    let consumer = WakeConsumerPolicy {
+        activation_enabled: true,
+        dispatch_enabled: true,
+        authorized_repositories: vec!["generous-corp/shipyard".to_owned()],
+    };
+    assert_eq!(
+        ledger
+            .consume_one_wake(consumer.clone(), &mut resolver, &mut adapter)
+            .expect("uncertain submit"),
+        WakeDeliveryResult::Uncertain
+    );
+    drop(ledger);
+
+    let reopened = WorkLedger::open_existing(temp.path())
+        .expect("reopen ledger")
+        .expect("ledger exists");
+    assert_eq!(
+        reopened
+            .reconcile_uncertain_wake(&consumer, &report.wake_id, &mut adapter)
+            .expect("unavailable reconciliation"),
+        WakeDeliveryResult::Uncertain
+    );
+    drop(reopened);
+
+    let reopened = WorkLedger::open_existing(temp.path())
+        .expect("reopen after reconciliation")
+        .expect("ledger exists");
+    assert_eq!(
+        reopened
+            .next_uncertain_wake_id(&consumer)
+            .expect("uncertain selection"),
+        Some(report.wake_id.clone())
+    );
+    let mut resolver = LedgerResolver(profile);
+    assert_eq!(
+        reopened
+            .consume_one_wake(consumer, &mut resolver, &mut adapter)
+            .expect("no pending retry"),
+        WakeDeliveryResult::Empty
+    );
+    let launch_fence = adapter.launch_fence.as_ref().expect("launch fence");
+    let reconcile_fence = adapter.reconcile_fence.as_ref().expect("reconcile fence");
+    assert_eq!(launch_fence.attempt, 1);
+    assert_eq!(reconcile_fence.attempt, 1);
+    assert_eq!(
+        launch_fence.idempotency_key,
+        reconcile_fence.idempotency_key
+    );
+    assert_eq!(adapter.wrapper_keys.len(), 2);
+    assert_eq!(adapter.wrapper_keys[0], adapter.wrapper_keys[1]);
+    assert_eq!(adapter.create_count, 1);
+}

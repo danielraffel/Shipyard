@@ -28,8 +28,9 @@ explicit disposition or wake owner.
 
 Until the receipt reports `wake_consumer_available=true`, the originating
 agent retains the last monitoring obligation and must not park solely in
-reliance on Shipyard. The current durable receipt foundation records a safe
-route but deliberately reports that the wake consumer is unavailable.
+reliance on Shipyard. A launch profile plus an enabled trusted machine-global
+consumer publishes the wake before reporting transfer; a basic receipt records
+only the safe route and does not transfer monitoring.
 
 Shipyard records terminal provenance using explicit terminal contracts. A
 HerdR handoff requires `HERDR_ENV=1` plus workspace, tab, and pane identity;
@@ -39,18 +40,19 @@ one. Partial or conflicting metadata fails closed. Existing cmux handoffs
 preserve their legacy route hash, while an ordinary terminal remains
 terminal-agnostic. Raw terminal
 and provider-session identifiers stay in Shipyard's private ledger and are not
-published to GitHub. Typed provenance is only a future wake address: until a
-trusted consumer advertises availability, it does not authorize pausing,
-resuming, or transferring monitoring.
+published to GitHub. Typed provenance is only a wake address: until a trusted
+consumer advertises availability, it does not authorize pausing, resuming, or
+transferring monitoring.
 
 When an exact wrapper or provider-specific resume command must survive the
 handoff, pass a private `LaunchProfileV1` JSON file with `--launch-profile`.
 Preserve launch and resume argv as exact arrays; never translate provider flags
 or put credentials in the profile. The contract also binds opaque
 provider/account/model metadata, checkpoint generation/digest, and exact
-repository/worktree/head/lineage provenance. Shipyard stores but does not
-execute this contract, and it must continue to report
-`wake_consumer_available=false`. See `docs/launch-profile.md`.
+repository/worktree/head/lineage provenance. Shipyard never executes the
+stored argv directly. It validates the prompt-free native grammar, projects
+typed model/reasoning options into the pinned provider adapter, and reports
+transfer only after durable publication. See `docs/launch-profile.md`.
 
 After an acknowledged handoff whose receipt proves the wake consumer is
 available:
@@ -490,6 +492,22 @@ macOS `~/Library/Application Support/shipyard/config.toml`) to cover every repo
 on the machine — not the tracked project config. The same App private key works
 across multiple Macs (M1/Studio/M5). Full setup, permissions, and the
 additional-client steps: [`docs/github-app-quota.md`](../../docs/github-app-quota.md).
+
+For multi-account App installations, `{repo_slug}` is the authority boundary:
+the helper must look up that repository's installation and must not let a fixed
+environment installation id override it. Shipyard partitions its in-memory
+token cache by the fully expanded command, preserving separate repo/installation
+entries. Keep the fleet's absolute `ghapp` wrapper as `token_command[0]` when
+tartci policy pins it; use its reviewed `token --repo {repo_slug}` mode for
+Shipyard while the audited `shipyard-v1` CLI surface remains available to
+tartci. Remove the old fixed installation id. Missing repo provenance fails
+closed. The privileged wrapper is not a
+general native-`gh` drop-in, and unknown commands or flags fail before minting.
+The wrapper/helper must resolve trusted Python, `openssl`, and native `gh` through
+absolute paths, preserve the installed merge/queue/close guards, and never put
+the token in process argv. Guards that query GitHub must receive the same
+repo-routed token and exact native binary as the guarded command and still run
+before native `gh`; the PR-close guard inspects every command shape itself.
 
 The standalone App helper must remain usable from stripped SSH/daemon
 environments without weakening TLS. It first uses Python's default trust store.
@@ -1137,7 +1155,8 @@ exact-head management authority before making the final POST.
 Stewardship is opt-in per immutable head. Prefer making the receipt atomic with
 PR creation: set `[merge_steward].auto_handoff = true` on the protected base
 branch and run `shipyard pr`, optionally adding `--workstream-id ID
---context-url URL`. Shipyard never trusts the PR branch to enable that default.
+--context-url URL --launch-profile PRIVATE_JSON`. Shipyard never trusts the PR
+branch to enable that default.
 Immediately after the PR exists and before validation starts, Shipyard writes
 the receipt; without explicit values it uses `OWNER/REPO#PR` and the PR URL.
 Use `--no-steward-handoff` only as an explicit project-default override.
@@ -1170,7 +1189,8 @@ wait behind unrelated work only to fail at worker start. Never auto-adopt.
 
 For an already-created PR, the submitting agent must run
 `shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
---workstream-id ID [--context-url URL] --apply`. That command writes a
+--workstream-id ID [--context-url URL] [--launch-profile PRIVATE_JSON] --apply`.
+That command writes a
 successful `shipyard/steward-handoff` status on the expected head, re-reads the
 PR, and only then adds `shipyard:managed` and removes `shipyard:unmanaged`.
 Shipyard persists a stable private machine identity on first use; later host
@@ -1217,7 +1237,44 @@ import is intended. Import is idempotent, redacted, and fail-closed: it selects
 canonical fields and opaque digests from legacy stores, leaves those stores
 authoritative and untouched, and cannot schedule, wake, call a model, mutate
 GitHub, or project to Linear. Both activation and dispatch remain disabled.
-The future transactional wake API derives a deterministic wake ID from the
+The daemon does run a subscriber-independent **read-only shadow observer** over
+policy-covered native nonterminal exact PR heads; inert `shadow_imported`
+history is never scheduled. Relevant webhooks debounce for two
+seconds with a ten-second maximum burst age; overflow is requeued. A missed-
+event catch-up samples at most eight exact targets every five minutes in
+deterministic round-robin order. The same target has a 30-second webhook
+cooldown, no more than four reads run concurrently, and a rolling-hour
+240-request ceiling reserves worst-case pagination before target selection.
+Worst-case cost is reserved durably before a pass and reconciled to actual cost
+afterward; in-flight and recent usage is conservatively restored on restart. A
+shared one-minute deadline covers auth preparation and reads so a slow endpoint
+cannot starve later triggers.
+Multiple ledger records for one
+exact `(repo, PR, head)` cost one bounded paginated observation. Provenance is
+exhaustive through 1,000 contexts and fails closed beyond that bound; API cost
+counts every GraphQL page.
+The daemon loads only its trusted machine-global configuration, selects exact-
+repository App auth, and bounds token-helper preparation separately; repository
+and local overlays cannot replace unattended auth. Non-App command credentials
+fail closed, and one repository-scoped App installation token is pinned per
+target observation. The token reaches only the
+configured validated native privileged `gh` under a cleared child environment;
+a preparation failure
+does not count as a GitHub request. Baselines and unchanged snapshots stay
+silent; a changed snapshot publishes `shadow_observation_transition` to IPC and
+the retained supervised daemon stderr log with the
+exact-head fence, policy revision, API-request count, elapsed milliseconds, and
+`model_calls=0`. This path has no GitHub write, ledger write, outbox wake,
+Linear projection, model, activation, or dispatch capability. Fetch failure and
+recovery emit once per state change with a stable redacted class; repeated
+failures do not spam logs or expose command output.
+Treat `failed_checks` as observation only, never as permission to use
+`gh run rerun --failed`. Active rerun planning must first carry exact failed job
+IDs, preview the dependency closure, estimate worker-minutes against a
+revision-fenced per-repository ceiling, and refuse when closure is unknown or
+exceeds the classified failed-job set. Shadow observation must not invent that
+graph or cost evidence from check names.
+The transactional wake API derives a deterministic wake ID from the
 complete work/owner generation and delivery fence; a caller-supplied identity
 that does not match that derivation is rejected before commit.
 The route must also resolve to a protected, integrity-valid record for the same
@@ -1231,14 +1288,24 @@ the same versioned lifecycle boundary and require an active protected adapter
 record with exact generation, revision, and implementation/configuration/
 capability digests. Imported records remain inert until both continuation outcomes exist
 and a legal typed transition records its audit event transactionally.
+The internal wake-consumer seam holds a host-local exclusive lease, records
+append-only ownership epochs, binds the protected launch-profile and provider
+identities, and durably claims and finalizes exact-array provider launches. No
+CLI, daemon, or schedule can activate it. Restart may reconcile an idempotent
+claim only after the prior live lease is gone; ambiguous non-idempotent delivery
+stays `uncertain` and is never blindly repeated.
 Use `shipyard work-ledger policy set` to plan a per-repository platform policy;
 apply requires the exact current revision. The primary platform is explicit
 (use macOS for Pulp, Forge, and Vellum), with a complete repeatable
 `--compatibility-lane` inventory and independent compatibility scheduling.
 Repeat `--declared-dependency-lane` only for an inventoried lane with a real
 artifact dependency; unknown lanes fail closed and other
-cross-lane blocking requires evidenced shared-integrity fault. This remains an
-inspectable shadow and cannot influence scheduling in the current phase.
+cross-lane blocking requires evidenced shared-integrity fault. A policy row
+enrolls that repository in shadow observation and is attached to evidence, but
+cannot influence GitHub or queue state in the current phase. Keep separate
+revision-fenced rows for `generous-corp/pulp`, `generous-corp/forge`, and
+`generous-corp/vellum`; change one row when a repository needs a different
+platform or dependency rule rather than changing a fleet-wide default.
 
 The preferred unattended credential has Commit statuses and Issues read/write.
 A local read-oriented GitHub App that receives the exact integration-permission
@@ -1372,6 +1439,18 @@ notarization. Do not use a persistent or login keychain when this preparation
 fails, do not continue after a failed probe, and never ask for a password.
 Restore the exact search-list snapshot before deleting the disposable
 keychain; preserve it and fail if restoration cannot be proven.
+
+The v0.127.0+ installer manages `shipyard` and
+`shipyard-workstream-provider` as one version-matched pair. A partial install
+must be reported without an implicit plugin upgrade, and rollback to an older
+tag must remove the provider introduced by the newer release.
+The pair is valid only when both launch from the same install directory and
+report the exact same parsed semantic version. Installer replacement and
+pre-provider rollback are transactions: preserve and restore both old binaries
+and the alias on any move, remove, or post-move smoke failure.
+If automatic restoration itself fails, never delete its backup. Preserve the
+pair/alias backups and `.shipyard-install-recovery.*` journal, print their exact
+source and destination paths, and fail for manual recovery.
 
 ### CI routing profiles
 
