@@ -44,6 +44,14 @@ pub(super) fn render_report<W: Write>(
             }
         )
         .map_err(|error| io_failure(&error))?;
+        writeln!(
+            stdout,
+            "  stale-pr-run-wedge policy={} candidates={} receipts={}",
+            repo.stale_pr_run_wedge.policy,
+            repo.stale_pr_run_wedge.candidates.len(),
+            repo.stale_pr_run_wedge.receipts.len(),
+        )
+        .map_err(|error| io_failure(&error))?;
         for pr in &repo.prs {
             writeln!(
                 stdout,

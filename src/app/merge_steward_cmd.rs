@@ -20,11 +20,11 @@ use crate::merge_queue_control::{
 };
 use crate::merge_steward::{
     CapacityPreemptionPolicy, QueueFrontPressure, RequiredCheck, RunCancellation,
-    RunCancellationReason, StewardCheck, StewardDecision, StewardJob, StewardPolicy,
-    StewardPullRequest, StewardRun, classify_pr, coalescing_reason_authorizes,
+    RunCancellationReason, StalePrRunWedgeCandidate, StewardCheck, StewardDecision, StewardJob,
+    StewardPolicy, StewardPullRequest, StewardRun, classify_pr, coalescing_reason_authorizes,
     has_successful_status, is_capacity_preemption_workflow, is_full_sha,
-    is_safe_capacity_preemption, plan_capacity_preemptions, plan_run_coalescing, preemption_key,
-    queue_front_waits_for_pool,
+    is_safe_capacity_preemption, plan_capacity_preemptions, plan_run_coalescing,
+    plan_stale_pr_run_wedges, preemption_key, queue_front_waits_for_pool,
 };
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
@@ -113,7 +113,15 @@ struct RepoReport {
     required_contexts: Vec<String>,
     prs: Vec<PrReport>,
     cancellations: Vec<CancellationReport>,
+    stale_pr_run_wedge: StalePrRunWedgeRepoStatus,
     errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StalePrRunWedgeRepoStatus {
+    policy: String,
+    candidates: Vec<StalePrRunWedgeCandidate>,
+    receipts: Vec<StalePrRunWedgeReceipt>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -125,6 +133,8 @@ struct StewardLedger {
     #[serde(default)]
     pending_cancellations: BTreeMap<String, PendingCancellation>,
     #[serde(default)]
+    stale_pr_run_wedge_receipts: BTreeMap<String, StalePrRunWedgeReceipt>,
+    #[serde(default)]
     queue_witnesses: BTreeMap<String, QueueWitness>,
     #[serde(default)]
     queue_recovery_receipts: BTreeMap<String, QueueRecoveryReceipt>,
@@ -134,6 +144,26 @@ struct StewardLedger {
     resume_records: BTreeMap<String, resume_record::ResumeRecordV1>,
     #[serde(default)]
     audit: Vec<LedgerAudit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StalePrRunWedgeReceipt {
+    candidate: StalePrRunWedgeCandidate,
+    phase: StalePrRunWedgeReceiptPhase,
+    mutation_correlation_id: String,
+    created_at: String,
+    updated_at: String,
+    detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StalePrRunWedgeReceiptPhase {
+    Intent,
+    Accepted,
+    Terminal,
+    Skipped,
+    Uncertain,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -416,6 +446,7 @@ mod launch_profile;
 pub(crate) use launch_profile::{LaunchProfileV1, decode_protected_launch_profile};
 mod recovery;
 use recovery::{reconcile_management_label, reconcile_recovery_signal};
+mod stale_pr_wedge;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdmissionVerdict {
@@ -956,17 +987,7 @@ pub(super) fn steward_command<W: Write>(
             }
             Err(error) => {
                 unhealthy = true;
-                reports.push(RepoReport {
-                    repo,
-                    base: args.base.clone(),
-                    allow_auto_merge: false,
-                    merge_queue: false,
-                    merge_path: "unreadable".to_owned(),
-                    required_contexts: Vec::new(),
-                    prs: Vec::new(),
-                    cancellations: Vec::new(),
-                    errors: vec![error],
-                });
+                reports.push(unreadable_repo_report(&repo, &args.base, &ledger, error));
             }
         }
     }
@@ -993,6 +1014,26 @@ pub(super) fn steward_command<W: Write>(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn unreadable_repo_report(
+    repo: &str,
+    base: &str,
+    ledger: &StewardLedger,
+    error: String,
+) -> RepoReport {
+    RepoReport {
+        repo: repo.to_owned(),
+        base: base.to_owned(),
+        allow_auto_merge: false,
+        merge_queue: false,
+        merge_path: "unreadable".to_owned(),
+        required_contexts: Vec::new(),
+        prs: Vec::new(),
+        cancellations: Vec::new(),
+        stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, repo),
+        errors: vec![error],
+    }
 }
 
 fn normalized_steward_args(
@@ -1052,7 +1093,7 @@ fn append_unmatched_recovery_errors(
             .find(|pending| pending.repo == repo)
             .map_or_else(|| default_base.to_owned(), |pending| pending.base.clone());
         reports.push(RepoReport {
-            repo,
+            repo: repo.clone(),
             base,
             allow_auto_merge: false,
             merge_queue: false,
@@ -1060,6 +1101,7 @@ fn append_unmatched_recovery_errors(
             required_contexts: Vec::new(),
             prs: Vec::new(),
             cancellations,
+            stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, &repo),
             errors,
         });
     }
@@ -1089,6 +1131,7 @@ fn persist_final_ledger(
             required_contexts: Vec::new(),
             prs: Vec::new(),
             cancellations: Vec::new(),
+            stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, "steward"),
             errors: vec![message],
         });
     }
@@ -1162,15 +1205,15 @@ use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,
 };
 use cancellation_recovery::resume_pending_cancellations;
-#[cfg(all(test, unix))]
 use cancellation_revalidation::pull_request;
 use cancellation_revalidation::{
-    acquire_pr_mutation_guard, acquire_run_mutation_guard, attempts_for,
-    authoritative_head_still_superseded, current_pull_request_heads, exact_run_still_queued,
-    merge_group_pr_number, opted_out_pull_requests, pull_request_is_managed,
+    acquire_pr_mutation_guard, acquire_run_mutation_guard,
+    acquire_run_mutation_guard_with_correlation, attempts_for, authoritative_head_still_superseded,
+    current_pull_request_heads, exact_run_still_queued, merge_group_pr_number,
+    opted_out_pull_requests, pull_request_is_managed, pull_request_opted_out,
     pull_request_provenance_blocked, pull_request_with_required_checks,
     pull_request_with_required_checks_before, revalidate_capacity_preemption,
-    revalidate_coalescing_cancellation, revalidate_pending_pr_authority,
+    revalidate_coalescing_cancellation, revalidate_pending_pr_authority, run_mutation_state,
 };
 use cancellation_terminalization::{
     acquire_pending_cancellation_guard, active_runner_targets, clear_pending_cancellation,
@@ -1187,7 +1230,7 @@ use observation::{
     active_runs, complete_checks_for_head, fetch_run_jobs, fetch_run_jobs_before, gh_json,
     gh_json_before, gh_json_timeout, hydrate_required_check_identities,
     hydrate_required_check_identities_before, merge_queue_snapshot, merge_queue_snapshot_before,
-    observe_repo, parse_job, parse_pr, parse_run, pull_requests, resolve_repos,
+    observe_repo, parse_job, parse_pr, parse_run, pull_requests, required_checks, resolve_repos,
 };
 #[cfg(test)]
 use pr_mutations::mutate_pr;

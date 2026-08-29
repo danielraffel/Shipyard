@@ -169,6 +169,8 @@ pub mod ship_retry;
 pub mod ship_state;
 /// GitHub stacked pull request discovery and initial fail-closed policy.
 pub mod stacked_pr;
+/// Pulp-specific stale PR workflow concurrency-wedge classification.
+pub mod stale_pr_wedge;
 /// Subprocess helpers that mark supervised child processes with
 /// `SHIPYARD_PR_RUNNING=1` (issue #266). Used by every `git` / `gh`
 /// spawn site that participates in the supervised PR / ship / merge

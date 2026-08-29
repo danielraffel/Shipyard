@@ -578,6 +578,7 @@ fn head_move_a_to_b_to_a_does_not_leave_cached_superseded_proof() {
 
 fn job(name: &str, status: &str, labels: &[&str]) -> StewardJob {
     StewardJob {
+        id: 1,
         name: name.to_owned(),
         status: status.to_owned(),
         conclusion: (status == "skipped").then(|| "skipped".to_owned()),
@@ -951,6 +952,156 @@ fn capacity_preemption_policy_is_explicitly_pulp_only() {
             },
             &BTreeSet::new(),
             1,
+        )
+        .is_empty()
+    );
+}
+
+fn wedge_runs() -> (StewardPullRequest, Vec<StewardRun>) {
+    let mut pr = green_pr();
+    pr.number = 7895;
+    pr.head_sha = sha('b');
+    pr.head_branch = "feature/wedge".to_owned();
+    let old = StewardRun {
+        id: 100,
+        workflow_id: 77,
+        run_attempt: 1,
+        workflow: "Build and Test".to_owned(),
+        head_sha: sha('a'),
+        head_branch: pr.head_branch.clone(),
+        status: "in_progress".to_owned(),
+        event: "pull_request".to_owned(),
+        pull_request_number: Some(pr.number),
+        created_at: "2026-08-29T08:55:28Z".to_owned(),
+        jobs: vec![StewardJob {
+            id: 900,
+            name: "macos".to_owned(),
+            status: "in_progress".to_owned(),
+            conclusion: None,
+            labels: [
+                "self-hosted",
+                "macOS",
+                "ARM64",
+                "pulp-build",
+                "pulp-build-vm",
+                "pulp-build-pr-head",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            runner_name: Some("pulp-macos-gate-slot2".to_owned()),
+        }],
+    };
+    let current = StewardRun {
+        id: 200,
+        workflow_id: old.workflow_id,
+        run_attempt: 1,
+        workflow: old.workflow.clone(),
+        head_sha: pr.head_sha.clone(),
+        head_branch: pr.head_branch.clone(),
+        status: "pending".to_owned(),
+        event: "pull_request".to_owned(),
+        pull_request_number: Some(pr.number),
+        created_at: "2026-08-29T09:00:57Z".to_owned(),
+        jobs: Vec::new(),
+    };
+    (pr, vec![old, current])
+}
+
+fn wedge_required_checks() -> Vec<RequiredCheck> {
+    vec![RequiredCheck {
+        context: "macos".to_owned(),
+        app_id: Some(15_368),
+    }]
+}
+
+#[test]
+fn stale_pr_wedge_requires_pending_zero_job_successor_and_preserves_current_head() {
+    let (pr, runs) = wedge_runs();
+    let plan = plan_stale_pr_run_wedges(
+        "Generous-Corp/pulp",
+        &runs,
+        std::slice::from_ref(&pr),
+        &wedge_required_checks(),
+    );
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].old_run_id, 100);
+    assert_eq!(plan[0].new_run_id, 200);
+    assert_eq!(plan[0].new_head_sha, pr.head_sha);
+    assert_eq!(plan[0].local_required_job.id, 900);
+
+    let mut materialized = runs.clone();
+    let materialized_job = materialized[0].jobs[0].clone();
+    materialized[1].jobs.push(materialized_job);
+    assert!(
+        plan_stale_pr_run_wedges(
+            "Generous-Corp/pulp",
+            &materialized,
+            &[pr],
+            &wedge_required_checks(),
+        )
+        .is_empty(),
+        "a successor with any materialized job is not the proven scheduler wedge"
+    );
+}
+
+#[test]
+fn stale_pr_wedge_rejects_head_change_push_and_merge_group() {
+    let (mut pr, runs) = wedge_runs();
+    pr.head_sha = sha('c');
+    assert!(
+        plan_stale_pr_run_wedges("Generous-Corp/pulp", &runs, &[pr], &wedge_required_checks(),)
+            .is_empty()
+    );
+
+    let (pr, mut push) = wedge_runs();
+    push[0].event = "push".to_owned();
+    assert!(
+        plan_stale_pr_run_wedges(
+            "Generous-Corp/pulp",
+            &push,
+            std::slice::from_ref(&pr),
+            &wedge_required_checks(),
+        )
+        .is_empty()
+    );
+
+    let (_, mut merge_group) = wedge_runs();
+    merge_group[0].event = "merge_group".to_owned();
+    merge_group[0].head_branch = "gh-readonly-queue/main/pr-7895-deadbeef".to_owned();
+    assert!(
+        plan_stale_pr_run_wedges(
+            "Generous-Corp/pulp",
+            &merge_group,
+            &[pr],
+            &wedge_required_checks(),
+        )
+        .is_empty(),
+        "merge-group cleanup remains a separate fully-paginated queue-absence rule"
+    );
+}
+
+#[test]
+fn stale_pr_wedge_is_pulp_macos_policy_only() {
+    let (pr, runs) = wedge_runs();
+    assert!(
+        plan_stale_pr_run_wedges(
+            "another-owner/pulp",
+            &runs,
+            std::slice::from_ref(&pr),
+            &wedge_required_checks(),
+        )
+        .is_empty()
+    );
+    assert!(
+        plan_stale_pr_run_wedges(
+            "Generous-Corp/pulp",
+            &runs,
+            &[pr],
+            &[RequiredCheck {
+                context: "linux".to_owned(),
+                app_id: None,
+            }],
         )
         .is_empty()
     );

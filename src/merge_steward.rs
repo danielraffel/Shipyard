@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+pub use crate::stale_pr_wedge::{StalePrRunWedgeCandidate, plan_stale_pr_run_wedges};
 
 /// One current-head check observed on a pull request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -556,8 +558,10 @@ pub struct StewardRun {
 }
 
 /// One workflow job used by conservative capacity-preemption policy.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StewardJob {
+    /// Workflow job database ID.
+    pub id: u64,
     /// Job display name.
     pub name: String,
     /// GitHub job status.
