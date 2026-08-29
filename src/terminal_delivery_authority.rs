@@ -72,8 +72,10 @@ pub(crate) fn observe_provider_on_cmux_surface(
         provider_kind,
     )?;
     for pid in cmux_surface_process_pids(cli_path, socket_path, surface_id)? {
-        if process_has_argument(pid, native_session_id)? {
-            return Ok(ProviderProcessPresence::Present);
+        match process_has_argument(pid, native_session_id) {
+            Ok(true) => return Ok(ProviderProcessPresence::Present),
+            Ok(false) | Err(TerminalCapabilityRefusal::Unobservable) => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(ProviderProcessPresence::Absent)
