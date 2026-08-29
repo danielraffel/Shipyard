@@ -39,6 +39,7 @@ struct FakeRunner {
     results: VecDeque<Result<CommandResult, RunnerFailure>>,
     calls: Vec<Vec<String>>,
     private_launches: Vec<String>,
+    provider_process_presence: Option<Result<ProviderProcessPresence, RunnerFailure>>,
 }
 
 fn private_launch_path(command: &str) -> Option<PathBuf> {
@@ -70,6 +71,17 @@ impl CmuxRunner for FakeRunner {
             }
         }
         result
+    }
+
+    fn provider_process_presence(
+        &mut self,
+        _surface_id: &str,
+        _native_session_id: &str,
+        _provider_id: &str,
+    ) -> Result<ProviderProcessPresence, RunnerFailure> {
+        self.provider_process_presence
+            .take()
+            .unwrap_or(Ok(ProviderProcessPresence::Absent))
     }
 }
 
@@ -293,9 +305,8 @@ fn workspace_created_before_agent_hook_session_is_not_accepted() {
             list(serde_json::json!([workspace(&description(&request))])),
             surface_health(&[SURFACE_UUID]),
             session_evidence(None),
-            successful_json(serde_json::json!({"ok": true})),
-            session_evidence(None),
         ]),
+        provider_process_presence: Some(Ok(ProviderProcessPresence::Present)),
         ..FakeRunner::default()
     };
 
@@ -305,8 +316,7 @@ fn workspace_created_before_agent_hook_session_is_not_accepted() {
         response.outcome,
         ProviderWrapperOutcomeV1::Uncertain { .. }
     ));
-    assert_eq!(runner.calls.len(), 6);
-    assert_eq!(runner.calls[4][3], "respawn-pane");
+    assert_eq!(runner.calls.len(), 4);
     assert!(runner.calls.iter().all(|call| {
         call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
     }));

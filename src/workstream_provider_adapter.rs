@@ -30,6 +30,9 @@ use crate::provider_wrapper::{
     ProviderWrapperOutcomeV1, ProviderWrapperRequestV1, ProviderWrapperResponseV1, UnknownV1,
     validate_request,
 };
+use crate::terminal_delivery_authority::{
+    ProviderProcessPresence, observe_provider_on_cmux_surface,
+};
 use crate::workstream_continuation_config::ProviderWrapperConfig;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -141,6 +144,12 @@ struct CommandResult {
 trait CmuxRunner {
     fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure>;
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure>;
+    fn provider_process_presence(
+        &mut self,
+        surface_id: &str,
+        native_session_id: &str,
+        provider_id: &str,
+    ) -> Result<ProviderProcessPresence, RunnerFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,6 +188,23 @@ impl CmuxRunner for ProductionCmuxRunner {
             success: output.status.success(),
             stdout: output.stdout,
         })
+    }
+
+    fn provider_process_presence(
+        &mut self,
+        surface_id: &str,
+        native_session_id: &str,
+        provider_id: &str,
+    ) -> Result<ProviderProcessPresence, RunnerFailure> {
+        let endpoint = self.endpoint.as_ref().ok_or(RunnerFailure::Unavailable)?;
+        observe_provider_on_cmux_surface(
+            &endpoint.executable_path,
+            &endpoint.socket_path,
+            surface_id,
+            native_session_id,
+            provider_id,
+        )
+        .map_err(|_| RunnerFailure::Unavailable)
     }
 }
 
@@ -335,7 +361,19 @@ fn reconcile_existing_workspace(
         [] if request.operation == ProviderWrapperOperationV1::Reconcile
             && state.surface_ids.len() == 1 =>
         {
-            recover_existing_surface(request, runner, workspace_id, &state.surface_ids[0])
+            match runner.provider_process_presence(
+                &state.surface_ids[0],
+                &request.protected_route.native_session_id,
+                &request.provider_id,
+            ) {
+                Ok(ProviderProcessPresence::Absent) => {
+                    recover_existing_surface(request, runner, workspace_id, &state.surface_ids[0])
+                }
+                Ok(ProviderProcessPresence::Present) => {
+                    uncertain("cmux-provider-process-live-without-binding")
+                }
+                Err(_) => uncertain("cmux-provider-process-presence-unavailable"),
+            }
         }
         [] => uncertain("cmux-session-binding-not-yet-visible"),
         _ => uncertain("multiple-provider-session-bindings"),

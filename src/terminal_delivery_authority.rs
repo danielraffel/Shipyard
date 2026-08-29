@@ -50,6 +50,48 @@ pub(crate) enum TerminalCapabilityRefusal {
     NativeSessionMismatch,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderProcessPresence {
+    Absent,
+    Present,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn observe_provider_on_cmux_surface(
+    cli_path: &str,
+    socket_path: &str,
+    surface_id: &str,
+    native_session_id: &str,
+    provider_kind: &str,
+) -> Result<ProviderProcessPresence, TerminalCapabilityRefusal> {
+    validate_cmux_inputs(
+        cli_path,
+        socket_path,
+        surface_id,
+        native_session_id,
+        provider_kind,
+    )?;
+    for pid in candidate_agent_pids(provider_kind)? {
+        let target = resolve_pid(cli_path, socket_path, pid)
+            .map_err(|_| TerminalCapabilityRefusal::Unobservable)?;
+        if target.surface_id == surface_id {
+            return Ok(ProviderProcessPresence::Present);
+        }
+    }
+    Ok(ProviderProcessPresence::Absent)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn observe_provider_on_cmux_surface(
+    _: &str,
+    _: &str,
+    _: &str,
+    _: &str,
+    _: &str,
+) -> Result<ProviderProcessPresence, TerminalCapabilityRefusal> {
+    Err(TerminalCapabilityRefusal::Unsupported)
+}
+
 pub(crate) trait TerminalEvidenceAdapter {
     fn capture_cmux(
         &mut self,
