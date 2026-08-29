@@ -762,7 +762,10 @@ impl<T: RemoteM1CacheTransport> PairedAuthenticatedCacheObserver<T> {
     ) -> Result<Self, CacheObserverError> {
         let builder_host_id = builder_host_id.into();
         let worker_host_id = worker_host_id.into();
-        if builder_host_id == worker_host_id || remote.worker_host_id != worker_host_id {
+        if builder_host_id == worker_host_id
+            || remote.source_host_id != builder_host_id
+            || remote.worker_host_id != worker_host_id
+        {
             return Err(CacheObserverError::Invalid(
                 "paired cache observer host binding".to_owned(),
             ));
@@ -1430,6 +1433,28 @@ mod tests {
             receipt.remote_authority.unwrap().authority.source_host_id,
             "builder-a"
         );
+    }
+
+    #[test]
+    fn paired_observer_rejects_a_remote_source_other_than_its_builder() {
+        let remote = AuthenticatedRemoteM1CacheObserver::new(
+            FakeTransport {
+                authorities: VecDeque::new(),
+                calls: Vec::new(),
+                tamper_stats: false,
+                remote_clock_ms: None,
+            },
+            "other-builder",
+            "worker-b",
+            Duration::from_secs(1),
+            60_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            PairedAuthenticatedCacheObserver::new("builder-a", "worker-b", remote),
+            Err(CacheObserverError::Invalid(message))
+                if message == "paired cache observer host binding"
+        ));
     }
 
     #[test]
