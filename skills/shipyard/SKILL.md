@@ -1991,6 +1991,14 @@ controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an
 explicit operator fallback when fleet status says the local Macs are
 offline/unhealthy, or when the workflow intentionally asks for hosted coverage.
 
+For the default-off Pulp M3/M1 performance canary, cache readiness requires an
+immutable content manifest produced by the read-only no-follow tree observer.
+Observe every required M3 generation before probing M1, preserve exact policy
+generation and freshness fences, record `model_calls=0`, and publish only
+crash-durable no-overwrite paired receipts. Cache proof closes only the cache
+gap; it never supplies session, LAN-route, capability, staging, reserve,
+transport, or execution authority. See `docs/pulp-mac-cache-readiness.md`.
+
 For Vellum's repository-scoped disposable lanes, treat an `offline + busy`
 runner as an ownership mismatch until TartCI proves otherwise. Run the bounded
 two-snapshot check, correlate the exact VM/lease/supervisor and in-progress job,

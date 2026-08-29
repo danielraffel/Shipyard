@@ -1714,6 +1714,15 @@ timestamp. Only when that condition was present at restart, immediately requeue
 unstarted claims and contain started claims as uncertain without retry. Record
 terminal evidence at the durable floor.
 
+**Pulp macOS cache readiness is exact and default-off.** Generate cache
+identities from the complete read-only no-follow tree inventory; a directory
+name or `claimed_bytes_avoided` is not evidence. Probe all required M3
+generations before M1, require exact policy inventory and freshness on both,
+and persist paired zero-model evidence without overwrite. This proof does not
+authorize cache mutation or substitute for session, LAN-route, capability,
+staging, reserve, transfer, or execution fences. See
+`docs/pulp-mac-cache-readiness.md`.
+
 **Detached daemon temp roots must not depend on the launching shell.** A daemon
 started from launchd or a minimal SSH environment may inherit no `TMPDIR`.
 Platform libraries then fall back to `/tmp`, which is a symlink on macOS and is

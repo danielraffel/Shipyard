@@ -22,6 +22,7 @@ use crate::parallel_proof::Sha256Digest;
 use crate::parallel_proof_canary::{
     CanaryIneligibleReason, PulpMacCanaryDecision, PulpMacCanaryPolicy,
 };
+use crate::parallel_proof_canary_cache::PulpMacCacheProbeEvidence;
 use crate::process::run_output_until;
 
 const MAX_KNOWN_HOSTS_BYTES: u64 = 64 * 1024;
@@ -476,18 +477,35 @@ pub fn classify_pulp_mac_dry_run_readiness(
     artifact_bytes_total: u64,
     receipts: &[ReadOnlyCanaryHostReceipt],
 ) -> Result<PulpMacDryRunReadiness, CanaryObserverError> {
+    classify_pulp_mac_dry_run_readiness_with_cache(policy, artifact_bytes_total, receipts, None)
+}
+
+/// Classify dry-run physical readiness with optional exact paired cache proof.
+///
+/// Valid cache evidence closes only the cache-generation gap. Session, route,
+/// capability, staging, and reserve authorities remain independently required,
+/// so this library tranche still cannot return `Eligible`.
+pub fn classify_pulp_mac_dry_run_readiness_with_cache(
+    policy: &PulpMacCanaryPolicy,
+    artifact_bytes_total: u64,
+    receipts: &[ReadOnlyCanaryHostReceipt],
+    cache_evidence: Option<&PulpMacCacheProbeEvidence>,
+) -> Result<PulpMacDryRunReadiness, CanaryObserverError> {
     if artifact_bytes_total == 0 {
         return Err(CanaryObserverError::InvalidConfiguration(
             "artifact byte size must be nonzero".to_owned(),
         ));
     }
     let mut gaps = BTreeSet::new();
+    let cache_proven = cache_evidence_proves_current_hosts(policy, receipts, cache_evidence)?;
     let mut reasons = BTreeSet::from([
         CanaryIneligibleReason::SessionGenerationMissing,
         CanaryIneligibleReason::RouteIneligible,
-        CanaryIneligibleReason::CacheGenerationMismatch,
         CanaryIneligibleReason::CapabilityMismatch,
     ]);
+    if !cache_proven {
+        reasons.insert(CanaryIneligibleReason::CacheGenerationMismatch);
+    }
     for host_id in [&policy.builder_host_id, &policy.worker_host_id] {
         let mut matching = receipts
             .iter()
@@ -506,11 +524,13 @@ pub fn classify_pulp_mac_dry_run_readiness(
                 host_id: host_id.clone(),
             },
         );
-        gaps.insert(
-            PhysicalCanaryReadinessGap::CacheGenerationAuthorityMissing {
-                host_id: host_id.clone(),
-            },
-        );
+        if !cache_proven {
+            gaps.insert(
+                PhysicalCanaryReadinessGap::CacheGenerationAuthorityMissing {
+                    host_id: host_id.clone(),
+                },
+            );
+        }
         gaps.insert(PhysicalCanaryReadinessGap::CapabilityAuthorityMissing {
             host_id: host_id.clone(),
         });
@@ -557,6 +577,32 @@ pub fn classify_pulp_mac_dry_run_readiness(
         model_calls: 0,
         would_mutate: false,
     })
+}
+
+fn cache_evidence_proves_current_hosts(
+    policy: &PulpMacCanaryPolicy,
+    receipts: &[ReadOnlyCanaryHostReceipt],
+    cache_evidence: Option<&PulpMacCacheProbeEvidence>,
+) -> Result<bool, CanaryObserverError> {
+    let unique_host_receipt = |host_id: &str| {
+        let mut matching = receipts
+            .iter()
+            .filter(|receipt| receipt.host_id() == host_id);
+        let receipt = matching.next();
+        receipt.filter(|_| matching.next().is_none())
+    };
+    match (
+        cache_evidence,
+        unique_host_receipt(&policy.builder_host_id),
+        unique_host_receipt(&policy.worker_host_id),
+    ) {
+        (Some(evidence), Some(builder), Some(worker)) => {
+            let builder_digest = builder.digest()?;
+            let worker_digest = worker.digest()?;
+            Ok(evidence.proves_policy_and_hosts(policy, &builder_digest, &worker_digest))
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Failure at the read-only observation boundary.
@@ -1025,6 +1071,11 @@ mod tests {
 
     use super::*;
     use crate::parallel_proof_canary::PulpMacCanaryPolicy;
+    use crate::parallel_proof_canary_cache::{
+        CACHE_GENERATION_OBSERVATION_SCHEMA, CacheGenerationObservationReceipt,
+        PULP_MAC_CACHE_EVIDENCE_SCHEMA, PulpMacCacheProbeEvidence,
+        produce_cache_generation_manifest,
+    };
 
     #[derive(Default)]
     struct FakeRunner {
@@ -1278,6 +1329,105 @@ mod tests {
         )));
         assert_eq!(readiness.model_calls(), 0);
         assert!(!readiness.would_mutate());
+    }
+
+    #[test]
+    fn exact_cache_evidence_closes_only_the_cache_gap() {
+        let cache_root = tempfile::Builder::new()
+            .prefix(".shipyard-controller-cache-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        fs::write(cache_root.path().join("object.bin"), b"cache-object").unwrap();
+        let manifest =
+            produce_cache_generation_manifest(cache_root.path(), "skia", "m124").unwrap();
+
+        let m3_staging = "/Users/test/m3-canary";
+        let m1_staging = "/Users/test/m1-canary";
+        let mut m3 = StrictKnownHostCanaryObserver::with_runner(FakeRunner {
+            outputs: VecDeque::from([Ok(output(m3_staging))]),
+            ..FakeRunner::default()
+        });
+        let m3_receipt = m3
+            .observe(&local_spec(m3_staging), Duration::from_secs(1))
+            .unwrap();
+        let mut m1 = StrictKnownHostCanaryObserver::with_runner(FakeRunner {
+            outputs: VecDeque::from([Ok(output(m1_staging))]),
+            ..FakeRunner::default()
+        });
+        let m1_spec = ReadOnlyCanaryHostSpec::new(
+            "m1",
+            ReadOnlyCanaryTarget::Local,
+            Sha256Digest::of_bytes(uuid().as_bytes()),
+            m1_staging,
+        )
+        .unwrap();
+        let m1_receipt = m1.observe(&m1_spec, Duration::from_secs(1)).unwrap();
+        let assessed_at_ms = controller_now_ms().unwrap();
+        let cache_receipt =
+            |host_id: &str, host_observation_sha256| CacheGenerationObservationReceipt {
+                schema_version: CACHE_GENERATION_OBSERVATION_SCHEMA,
+                host_id: host_id.to_owned(),
+                host_observation_sha256,
+                observed_at_ms: assessed_at_ms,
+                probe_elapsed_ms: 1,
+                cache_root: cache_root.path().to_str().unwrap().to_owned(),
+                manifest_sha256: manifest.digest().unwrap(),
+                manifest: manifest.clone(),
+                model_calls: 0,
+            };
+        let m3_digest = m3_receipt.digest().unwrap();
+        let m1_digest = m1_receipt.digest().unwrap();
+        let cache_evidence = PulpMacCacheProbeEvidence {
+            schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,
+            correlation_id: "controller-cache-proof".to_owned(),
+            assessed_at_ms,
+            builder: vec![cache_receipt("m3", m3_digest)],
+            worker: vec![cache_receipt("m1", m1_digest)],
+            model_calls: 0,
+        };
+        let policy = PulpMacCanaryPolicy {
+            enabled: true,
+            assessed_at_ms,
+            minimum_free_bytes: 1024,
+            required_cache_generations: vec![manifest.generation],
+            ..PulpMacCanaryPolicy::default()
+        };
+        let host_receipts = [m3_receipt, m1_receipt];
+        let readiness = classify_pulp_mac_dry_run_readiness_with_cache(
+            &policy,
+            4096,
+            &host_receipts,
+            Some(&cache_evidence),
+        )
+        .unwrap();
+        assert!(matches!(
+            readiness.decision(),
+            PulpMacCanaryDecision::Ineligible { reasons }
+                if !reasons.contains(&CanaryIneligibleReason::CacheGenerationMismatch)
+                    && reasons.contains(&CanaryIneligibleReason::SessionGenerationMissing)
+                    && reasons.contains(&CanaryIneligibleReason::RouteIneligible)
+                    && reasons.contains(&CanaryIneligibleReason::CapabilityMismatch)
+        ));
+        assert!(!readiness.gaps().iter().any(|gap| matches!(
+            gap,
+            PhysicalCanaryReadinessGap::CacheGenerationAuthorityMissing { .. }
+        )));
+
+        let mut detached_cache_evidence = cache_evidence;
+        detached_cache_evidence.builder[0].host_observation_sha256 =
+            Sha256Digest::of_bytes(b"different-host-observation");
+        let detached = classify_pulp_mac_dry_run_readiness_with_cache(
+            &policy,
+            4096,
+            &host_receipts,
+            Some(&detached_cache_evidence),
+        )
+        .unwrap();
+        assert!(matches!(
+            detached.decision(),
+            PulpMacCanaryDecision::Ineligible { reasons }
+                if reasons.contains(&CanaryIneligibleReason::CacheGenerationMismatch)
+        ));
     }
 
     #[test]
