@@ -560,7 +560,7 @@ mod tests {
             ])
             .spawn()
             .expect("worker fixture");
-        wait_for_file(&detached_pid);
+        let detached = wait_for_numeric_pid(&detached_pid);
         let receipt = receipt_for(&child, "detached", "g-detached");
         let store = TerminationStore::new(temp.path());
 
@@ -568,12 +568,10 @@ mod tests {
             .begin(&receipt, TerminationAction::Cancel)
             .expect("freeze detached tree");
         assert!(
-            transaction.descendants.iter().any(|identity| {
-                fs::read_to_string(&detached_pid)
-                    .ok()
-                    .and_then(|pid| pid.trim().parse::<u32>().ok())
-                    == Some(identity.pid)
-            }),
+            transaction
+                .descendants
+                .iter()
+                .any(|identity| identity.pid == detached),
             "a child in a detached process group remains part of the frozen parent tree"
         );
         assert!(
@@ -610,20 +608,15 @@ mod tests {
             .expect("worker fixture");
         wait_for_file(&ready);
         let receipt = receipt_for(&child, "fork-race", "g-fork");
-        let mut triggered = false;
+        let mut forked = None;
         let (root_command, descendants) = freeze_complete_tree_with_hook(&receipt, |scan| {
-            if scan == 0 && !triggered {
+            if scan == 0 && forked.is_none() {
                 fs::write(&trigger, b"go").expect("fork trigger");
-                wait_for_file(&forked_pid);
-                triggered = true;
+                forked = Some(wait_for_numeric_pid(&forked_pid));
             }
         })
         .expect("freeze racing fork tree");
-        let forked = fs::read_to_string(&forked_pid)
-            .expect("forked pid")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric pid");
+        let forked = forked.expect("forked pid");
         assert!(descendants.iter().any(|identity| identity.pid == forked));
         let store = TerminationStore::new(temp.path());
         let mut transaction = TerminationTransaction {
@@ -653,5 +646,26 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(path.exists(), "fixture did not publish {}", path.display());
+    }
+
+    fn wait_for_numeric_pid(path: &Path) -> u32 {
+        // Creating and writing a PID file are separate filesystem operations.
+        // Observe the complete value rather than treating an empty file as a
+        // published fixture under full-suite scheduler pressure.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            if let Ok(contents) = fs::read_to_string(path) {
+                last = contents;
+                if let Ok(pid) = last.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "fixture did not publish numeric PID at {} (last value: {last:?})",
+            path.display()
+        );
     }
 }
