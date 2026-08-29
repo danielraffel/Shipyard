@@ -97,11 +97,32 @@ fn handoff_args() -> StewardHandoffArgs {
         agent_parent_session_id: None,
         agent_surface_id: None,
         launch_profile: None,
+        task_graph: None,
         goal_managed: true,
         after_handoff: "continue".into(),
         transfer_agent_owner: false,
         apply: false,
     }
+}
+
+fn pause_task_graph(temp: &tempfile::TempDir) -> std::path::PathBuf {
+    let path = temp.path().join("task-graph.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "workstream_id": "GEN-43",
+            "revision": 7,
+            "handoff_task_id": "steward-pr-7",
+            "nodes": [
+                {"id": "steward-pr-7", "state": "handed_off"},
+                {"id": "land-dependent", "state": "blocked", "depends_on": ["steward-pr-7"]}
+            ]
+        }))
+        .expect("serialize task graph"),
+    )
+    .expect("write task graph");
+    path
 }
 
 fn profile(resume_flag: &str) -> LaunchProfileV1 {
@@ -465,23 +486,28 @@ fn managed_handoff_publishes_inert_authority_without_creating_a_wake() {
         |_, _| panic!("ordinary handoff must not await a wake consumer"),
     )
     .expect("inert publication");
-    let pending = load_handoff(&path)
-        .expect("reload pending receipt")
-        .expect("pending receipt");
-    assert!(!pending.wake_consumer_available);
-    let pending_publication = pending
+    let accepted = load_handoff(&path)
+        .expect("reload accepted receipt")
+        .expect("accepted receipt");
+    assert!(accepted.wake_consumer_available);
+    let accepted_publication = accepted
         .native_publication
         .as_ref()
-        .expect("durable pending publication");
-    assert_eq!(pending_publication.state, NativePublicationStateV1::Pending);
-    assert!(!pending_publication.work_id.is_empty());
-    assert!(!pending_publication.route_ref.is_empty());
-    assert!(!pending_publication.wake_id.is_empty());
+        .expect("durable accepted publication");
+    assert_eq!(
+        accepted_publication.state,
+        NativePublicationStateV1::Accepted
+    );
+    assert!(!accepted_publication.work_id.is_empty());
+    assert!(!accepted_publication.route_ref.is_empty());
+    assert!(!accepted_publication.wake_id.is_empty());
 
-    assert_pending_publication_fences_owner_replacement(&args, &pending);
+    assert_pending_publication_fences_owner_replacement(&args, &accepted);
 
-    assert_eq!(published, pending);
-    assert!(!published.wake_consumer_available);
+    assert_eq!(published, accepted);
+    assert!(published.wake_consumer_available);
+    assert_eq!(published.agent_disposition, AgentDisposition::Continue);
+    assert!(!published.pause_required);
     validate_handoff_receipt_integrity(&published, "owner/repo", args.pr, &args.head)
         .expect("published receipt integrity");
     let first_revision = published.revision;
@@ -505,6 +531,156 @@ fn managed_handoff_publishes_inert_authority_without_creating_a_wake() {
         .expect("status");
     assert_eq!(status.pending_wakes, 0);
     assert_eq!(status.provider_deliveries, 0);
+}
+
+#[test]
+fn provider_outcome_cannot_falsely_pause_a_continue_handoff() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let args = handoff_args();
+    let actions = publication_actions(&temp, &args.head);
+    let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
+        .expect("resolve agent")
+        .expect("agent");
+    let route = agent_route_reference(&agent, "m3");
+    persist_agent_route(&agent_route_path(&paths, &route.route_id), &route, &agent)
+        .expect("private route");
+    let profile = prepare_launch_profile_candidate(native_profile(), "owner/repo", &args.head)
+        .expect("native profile");
+    let receipt = prepare_handoff_receipt_with_profile(
+        None,
+        &args,
+        "owner/repo",
+        "m3",
+        Some(route),
+        Some(profile),
+    )
+    .expect("handoff");
+    let path = handoff_path(
+        &handoff_directory(&paths, "owner/repo", args.pr),
+        &args.head,
+    );
+    let managed = persist_handoff(&path, receipt, HandoffPhase::Managed).expect("managed");
+    let published = publish_managed_handoff_with_consumer(
+        &paths,
+        &actions,
+        &path,
+        managed,
+        "owner/repo",
+        args.pr,
+        &args.head,
+        &continuation_activation(),
+        |_, _| Err(CliFailure::new(1, "provider would claim pause")),
+    )
+    .expect("provider callback is outside disposition authority");
+    assert!(published.wake_consumer_available);
+    assert_eq!(published.agent_disposition, AgentDisposition::Continue);
+    assert!(!published.pause_required);
+}
+
+#[test]
+fn pause_disposition_recovers_from_pending_publication_exactly_once() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let mut args = handoff_args();
+    args.after_handoff = "pause".into();
+    let actions = publication_actions(&temp, &args.head);
+    let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
+        .expect("resolve agent")
+        .expect("agent");
+    let agent_route = agent_route_reference(&agent, "m3");
+    persist_agent_route(
+        &agent_route_path(&paths, &agent_route.route_id),
+        &agent_route,
+        &agent,
+    )
+    .expect("private route");
+    let proof = load_pause_proof(&pause_task_graph(&temp), &args.workstream_id)
+        .expect("valid dependency boundary");
+    let profile = prepare_launch_profile_candidate(native_profile(), "owner/repo", &args.head)
+        .expect("native profile");
+    let receipt = prepare_handoff_receipt_with_profile_and_disposition(
+        None,
+        &args,
+        "owner/repo",
+        "m3",
+        Some(agent_route.clone()),
+        Some(profile),
+        Some(proof.clone()),
+    )
+    .expect("pause handoff");
+    let path = handoff_path(
+        &handoff_directory(&paths, "owner/repo", args.pr),
+        &args.head,
+    );
+    let managed = persist_handoff(&path, receipt, HandoffPhase::Managed).expect("managed");
+    let request = native_publication_request(&paths, &actions, "owner/repo", args.pr, &args.head)
+        .expect("publication request");
+    let planned = WorkLedger::plan_or_apply_native_continuation(
+        &paths.state_dir,
+        &request,
+        &continuation_activation().config,
+        false,
+    )
+    .expect("plan publication");
+    let pending = bind_native_publication_pending(&path, managed, &planned)
+        .expect("crash-window pending receipt");
+
+    let restarted = prepare_handoff_receipt_with_profile_and_disposition(
+        Some(pending),
+        &args,
+        "owner/repo",
+        "m3",
+        Some(agent_route),
+        None,
+        None,
+    )
+    .expect("restart reuses durable profile and proof");
+    assert_eq!(restarted.disposition_proof.as_ref(), Some(&proof));
+    let accepted = publish_managed_handoff(
+        &paths,
+        &actions,
+        &path,
+        restarted,
+        "owner/repo",
+        args.pr,
+        &args.head,
+        &continuation_activation(),
+    )
+    .expect("restart completes publication");
+    assert!(accepted.wake_consumer_available);
+    assert_eq!(accepted.agent_disposition, AgentDisposition::Pause);
+    assert!(accepted.pause_required);
+    let revision = accepted.revision;
+    let replay = publish_managed_handoff(
+        &paths,
+        &actions,
+        &path,
+        accepted,
+        "owner/repo",
+        args.pr,
+        &args.head,
+        &continuation_activation(),
+    )
+    .expect("accepted replay");
+    assert_eq!(replay.revision, revision);
+    assert_eq!(
+        WorkLedger::open_existing(&paths.state_dir)
+            .expect("ledger")
+            .expect("present")
+            .status()
+            .expect("status")
+            .pending_wakes,
+        0
+    );
 }
 
 fn assert_pending_publication_fences_owner_replacement(
@@ -972,6 +1148,8 @@ fn public_receipt_render_never_projects_private_profile_fields() {
         Some(&route),
         "m3",
         true,
+        false,
+        AgentDisposition::Continue,
         false,
         &mut output,
     )

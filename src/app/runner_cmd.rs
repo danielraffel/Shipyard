@@ -284,6 +284,7 @@ pub(super) fn runner_command<W: Write>(
             launch_profile,
             goal_managed,
             after_handoff,
+            task_graph,
             transfer_agent_owner,
             apply,
         } => super::merge_steward_cmd::steward_handoff_command(
@@ -298,6 +299,7 @@ pub(super) fn runner_command<W: Write>(
                 agent_parent_session_id,
                 agent_surface_id,
                 launch_profile,
+                task_graph,
                 goal_managed,
                 after_handoff,
                 transfer_agent_owner,

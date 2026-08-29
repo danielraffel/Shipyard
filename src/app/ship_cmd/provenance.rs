@@ -19,6 +19,8 @@ pub(super) struct AppliedStewardHandoff {
     pub(super) context_url: Option<String>,
     pub(super) head: String,
     pub(super) monitoring_transferred: bool,
+    pub(super) agent_disposition: String,
+    pub(super) pause_required: bool,
     pub(super) publication_work_id: Option<String>,
     pub(super) publication_route_ref: Option<String>,
     pub(super) publication_wake_id: Option<String>,
@@ -215,8 +217,9 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
         agent_parent_session_id: None,
         agent_surface_id: None,
         launch_profile: request.launch_profile.clone(),
+        task_graph: request.task_graph.clone(),
         goal_managed: request.launch_profile.is_some(),
-        after_handoff: "continue".to_owned(),
+        after_handoff: request.after_handoff.clone(),
         transfer_agent_owner: false,
         apply: true,
     };
@@ -235,8 +238,12 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
     if !json_mode {
         writeln!(
             stdout,
-            "▸ Durable steward receipt: PR #{} head={} workstream={workstream_id} monitoring_transferred={}",
-            pr.number, head, transfer.wake_consumer_available
+            "▸ Durable steward receipt: PR #{} head={} workstream={workstream_id} monitoring_transferred={} agent_disposition={} pause_required={}",
+            pr.number,
+            head,
+            transfer.wake_consumer_available,
+            transfer.agent_disposition,
+            transfer.pause_required
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
@@ -245,6 +252,8 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
         context_url,
         head: head.to_owned(),
         monitoring_transferred: transfer.wake_consumer_available,
+        agent_disposition: transfer.agent_disposition,
+        pause_required: transfer.pause_required,
         publication_work_id: transfer.publication_work_id,
         publication_route_ref: transfer.publication_route_ref,
         publication_wake_id: transfer.publication_wake_id,

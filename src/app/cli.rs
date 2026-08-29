@@ -402,6 +402,13 @@ pub(super) enum Command {
         /// exact-head steward handoff.
         #[arg(long = "launch-profile", conflicts_with = "no_steward_handoff")]
         launch_profile: Option<PathBuf>,
+        /// Post-handoff owner disposition. Continue is always safe; pause also
+        /// requires a private durable task graph proving no runnable sibling.
+        #[arg(long = "after-handoff", value_parser = ["continue", "pause"], default_value = "continue", conflicts_with = "no_steward_handoff")]
+        after_handoff: String,
+        /// Private `TaskGraphV1` used only to authorize --after-handoff pause.
+        #[arg(long = "task-graph", conflicts_with = "no_steward_handoff")]
+        task_graph: Option<PathBuf>,
         /// Disable a project-configured automatic steward handoff.
         #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
         no_steward_handoff: bool,
@@ -1320,6 +1327,10 @@ pub(super) enum RunnerCommand {
         /// default; pause only when this PR is its remaining blocker.
         #[arg(long = "after-handoff", value_parser = ["continue", "pause"], default_value = "continue")]
         after_handoff: String,
+        /// Private `TaskGraphV1` proving the handed-off task is the only
+        /// remaining runnable boundary before the original owner may pause.
+        #[arg(long = "task-graph")]
+        task_graph: Option<PathBuf>,
         /// Explicitly transfer an existing exact-head receipt to a replacement
         /// provider session, incrementing its durable ownership generation.
         #[arg(long = "transfer-agent-owner")]

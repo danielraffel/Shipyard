@@ -33,10 +33,11 @@ committed. Shipyard refuses `--launch-profile` in its default bump-apply mode
 because a new bump commit would invalidate the profile's exact-head authority.
 
 When trusted machine-global continuation is enabled, apply mode publishes the
-exact profile and waits for the live daemon to complete its fenced provider
-delivery before returning `monitoring_transferred=true`. A missing, disabled,
-refused, wrong-machine, or unauthorized consumer fails closed and leaves
-`wake_consumer_available=false`.
+exact profile as a zero-wake durable daemon obligation before returning
+`monitoring_transferred=true`. Provider delivery does not control transfer or
+agent disposition. A missing, disabled, refused, wrong-machine, or unauthorized
+consumer fails closed and leaves `wake_consumer_available=false`. See
+`post-handoff-disposition.md` for the optional task-graph-proven pause contract.
 
 The JSON schema is intentionally composed only of strings, argv arrays, exact
 provenance, and a recovery-policy enum:

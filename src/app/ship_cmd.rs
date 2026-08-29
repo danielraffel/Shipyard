@@ -95,6 +95,8 @@ pub(super) struct ShipStewardHandoff {
     pub(super) workstream_id: Option<String>,
     pub(super) context_url: Option<String>,
     pub(super) launch_profile: Option<std::path::PathBuf>,
+    pub(super) after_handoff: String,
+    pub(super) task_graph: Option<std::path::PathBuf>,
 }
 
 mod changed_surface_execution;

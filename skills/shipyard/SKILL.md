@@ -26,11 +26,13 @@ judgment. A handoff with only a success trigger is invalid: terminal failure,
 head drift, cancellation, timeout, and ambiguous process loss each need an
 explicit disposition or wake owner.
 
-Until the receipt reports `wake_consumer_available=true`, the originating
-agent retains the last monitoring obligation and must not park solely in
-reliance on Shipyard. A launch profile plus an enabled trusted machine-global
-consumer publishes the wake before reporting transfer; a basic receipt records
-only the safe route and does not transfer monitoring.
+Until the receipt reports `monitoring_transferred=true`, the originating agent
+retains the last monitoring obligation. Durable publication creates a
+zero-wake daemon obligation; it does not launch a provider process. Stop
+monitor-only children after transfer, but continue independent runnable work by
+default. Park only when the exact machine-readable tuple is
+`monitoring_transferred=true`, `agent_disposition=pause`, and
+`pause_required=true`, backed by `--after-handoff pause --task-graph`.
 
 Shipyard records terminal provenance using explicit terminal contracts. A
 HerdR handoff requires `HERDR_ENV=1` plus workspace, tab, and pane identity;
@@ -54,8 +56,7 @@ stored argv directly. It validates the prompt-free native grammar, projects
 typed model/reasoning options into the pinned provider adapter, and reports
 transfer only after durable publication. See `docs/launch-profile.md`.
 
-After an acknowledged handoff whose receipt proves the wake consumer is
-available:
+After an acknowledged handoff whose receipt proves monitoring is transferred:
 
 - Shipyard owns process lifetime, monitoring, bounded deterministic retries,
   transition-only logs, terminal receipts, and recovery after its own restart.
@@ -71,6 +72,9 @@ available:
 - A provider timeout with an uncertain dispatch outcome is recorded and is not
   blindly repeated. Session death, quota exhaustion, host reboot, and
   offline/rejoin must not erase an acknowledged obligation.
+
+See `docs/post-handoff-disposition.md` for the task-graph schema, crash windows,
+and Pulp/Forge Modular/Forge Sequencer/Vellum workflow rules.
 
 This contract applies to bounded jobs as well as PRs: CMake/CTest proofs,
 artifact builds, release publication, notarization, benchmark matrices, cache
