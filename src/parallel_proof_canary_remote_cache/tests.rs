@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;

@@ -16,6 +16,13 @@ use wait_timeout::ChildExt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessLiveness {
+    #[cfg_attr(
+        windows,
+        expect(
+            dead_code,
+            reason = "Windows process custody refuses before live observation"
+        )
+    )]
     Alive,
     Dead,
     Unknown,

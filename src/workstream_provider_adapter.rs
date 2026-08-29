@@ -106,8 +106,10 @@ pub(crate) fn verify_current_companion_digest(
     Err("companion-digest-verification-unavailable".to_owned())
 }
 
+#[cfg(unix)]
 struct HashWriter<'a>(&'a mut Sha256);
 
+#[cfg(unix)]
 impl Write for HashWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.update(bytes);

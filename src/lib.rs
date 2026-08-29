@@ -8,7 +8,6 @@ mod actionable_wake_producer;
 // explicit fail-closed stubs remain type-checked. Keep lint accommodations on
 // those modules instead of suppressing Windows diagnostics crate-wide.
 /// CLI entrypoint and command dispatch.
-#[cfg_attr(windows, allow(dead_code, unused_imports, unused_variables))]
 pub mod app;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.
 pub mod artifact_transport;
@@ -37,7 +36,6 @@ pub mod cloud_records;
 pub mod config;
 /// Pure, fail-closed translation from CTest JSON-v1 metadata into a canonical test inventory.
 pub mod ctest_inventory;
-#[cfg_attr(windows, allow(dead_code))]
 pub(crate) mod custody_transport;
 /// Unix socket IPC primitives for daemon subscribers and status reads.
 pub mod daemon_ipc;
@@ -100,7 +98,6 @@ pub mod merge_queue_control;
 /// Read-only merge-queue front/check/fleet liveness correlation.
 pub mod merge_queue_liveness;
 /// Conservative cross-repository merge and queued-run stewardship.
-#[cfg_attr(windows, allow(dead_code))]
 pub mod merge_steward;
 pub mod metadata_authority;
 /// Runner and CI timing metrics store and analysis helpers.
@@ -127,12 +124,10 @@ pub mod parallel_proof_canary_driver;
 /// Restart-reconcilable, session-independent execution custody for protected canary jobs.
 pub mod parallel_proof_canary_job;
 /// Typed daemon-supervisor adapter for restartable parallel-proof canary jobs.
-#[cfg_attr(windows, allow(dead_code, unused_imports, clippy::unnecessary_wraps))]
 pub mod parallel_proof_canary_job_adapter;
 /// Immutable measurement receipts for the default-off Pulp macOS sharding canary.
 pub mod parallel_proof_canary_receipt;
 /// Authenticated companion protocol for read-only remote M1 cache observation.
-#[cfg_attr(windows, allow(unused_imports))]
 pub mod parallel_proof_canary_remote_cache;
 /// Default-off one-host build-once consumption proof for the Pulp M3 shadow canary.
 pub mod parallel_proof_one_host;
@@ -150,7 +145,6 @@ pub mod pr_text;
 pub mod preflight;
 /// Prepared-state cache for warm stage reruns.
 pub mod prepared_state;
-#[cfg_attr(windows, allow(dead_code))]
 mod process;
 /// Proof gates for applying a routing profile to GitHub variables.
 pub mod profile_apply;
@@ -181,7 +175,6 @@ pub mod runner_provision;
 /// Self-hosted runner watchdog detection logic.
 pub mod runner_watchdog;
 /// Subscriber-independent, read-only canonical-ledger shadow observation.
-#[cfg_attr(windows, allow(dead_code))]
 pub mod shadow_scheduler;
 /// Ship execution orchestration helpers.
 pub mod ship;
@@ -202,7 +195,6 @@ pub mod stale_pr_wedge;
 /// spawn site that participates in the supervised PR / ship / merge
 /// pipeline; diagnostic subcommands deliberately skip this.
 pub mod supervised;
-#[cfg_attr(windows, allow(dead_code))]
 mod terminal_delivery_authority;
 /// Optional local outbox and adapter contract for external transition projection.
 pub mod transition_projection;
@@ -225,19 +217,15 @@ pub mod watch;
 /// GitHub webhook signature validation and event decoding.
 pub mod webhook;
 /// Shadow-only canonical work-item ledger and legacy-state importer.
-#[cfg_attr(windows, allow(dead_code, unused_imports))]
 pub mod work_ledger;
-#[cfg_attr(windows, allow(dead_code))]
 pub(crate) mod worker_process_custody;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;
-#[cfg_attr(windows, allow(clippy::large_enum_variant))]
 pub(crate) mod workstream_activation_loader;
 /// Trusted machine-global policy for future workstream continuation dispatch.
 pub mod workstream_continuation_config;
 pub(crate) mod workstream_continuation_runtime;
 /// Digest-pinnable cmux adapter for fresh workstream continuation sessions.
-#[cfg_attr(windows, allow(dead_code))]
 pub mod workstream_provider_adapter;
 /// Host-global production-writer coordination for sandbox E2E isolation.
 mod writer_domain_lease;

@@ -218,6 +218,7 @@ enum TerminalHandoffPhase {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(unix)]
 pub(crate) enum ExactStewardTransition {
     None,
     Actionable,
@@ -227,6 +228,7 @@ pub(crate) enum ExactStewardTransition {
 /// Read the merge steward's authenticated, exact-head transition ledger. An
 /// aggregate check-rollup failure is never itself agent-launch authority; only
 /// the steward path that evaluated required-check policy may record this fact.
+#[cfg(unix)]
 pub(crate) fn exact_steward_transition(
     state_dir: &Path,
     repo: &str,

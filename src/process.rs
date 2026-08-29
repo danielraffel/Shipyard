@@ -66,6 +66,7 @@ pub(crate) fn run_output_until(
 
 /// Capture one command with exact bounded stdin under the same descendant-safe
 /// deadline contract as [`run_output_until`].
+#[cfg(unix)]
 pub(crate) fn run_output_with_input_until(
     command: &mut Command,
     input: &[u8],

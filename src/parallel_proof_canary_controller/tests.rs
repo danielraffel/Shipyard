@@ -241,12 +241,12 @@ fn identity_drift_and_symlinked_known_hosts_fail_closed() {
 
     let temp = TempDir::new().unwrap();
     let authority = temp.path().join("authority");
-    let link = temp.path().join("known_hosts");
     let identity = temp.path().join("identity");
     fs::write(&authority, "host ssh-ed25519 key\n").unwrap();
     fs::write(&identity, "private-test-key").unwrap();
     #[cfg(unix)]
     {
+        let link = temp.path().join("known_hosts");
         std::os::unix::fs::symlink(&authority, &link).unwrap();
         let target =
             StrictSshCanaryTarget::new("/usr/bin/ssh", "m1", &link, &identity, 22).unwrap();

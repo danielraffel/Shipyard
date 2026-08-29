@@ -68,6 +68,13 @@ pub(crate) struct VerifiedTerminalEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    windows,
+    expect(
+        dead_code,
+        reason = "Windows retains the refusal taxonomy while only Unsupported is reachable"
+    )
+)]
 pub(crate) enum TerminalCapabilityRefusal {
     Unsupported,
     Unobservable,
@@ -655,6 +662,13 @@ fn validate_cmux_inputs(
     Ok(())
 }
 
+#[cfg_attr(
+    windows,
+    expect(
+        dead_code,
+        reason = "UUID validation is consumed by the Unix cmux evidence adapter"
+    )
+)]
 fn is_uuid(value: &str) -> bool {
     value.len() == 36
         && value.chars().enumerate().all(|(index, ch)| {

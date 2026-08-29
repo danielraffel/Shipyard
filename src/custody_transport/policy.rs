@@ -50,6 +50,13 @@ struct RawPeer {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(
+        dead_code,
+        reason = "outbound custody fields are consumed only by the Unix transport runtime"
+    )
+)]
 pub(crate) struct CustodyTransportPolicy {
     pub(super) local_machine_ref: String,
     pub(super) local_incarnation_ref: String,
@@ -67,6 +74,13 @@ pub(crate) struct CustodyTransportPolicy {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    windows,
+    expect(
+        dead_code,
+        reason = "outbound peer fields are consumed only by the Unix transport runtime"
+    )
+)]
 pub(super) struct CustodyPeer {
     pub(super) machine_ref: String,
     pub(super) incarnation_ref: String,

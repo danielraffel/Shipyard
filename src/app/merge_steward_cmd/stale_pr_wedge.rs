@@ -593,12 +593,14 @@ fn combined_errors(first: Option<String>, second: Option<String>) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::identity::RuntimeMode;
-    use crate::merge_steward::{
-        CapacityPreemptionPolicy, RequiredCheck, StewardCheck, StewardCheckSource, StewardJob,
-        StewardPullRequest,
-    };
+    #[cfg(unix)]
+    use crate::merge_steward::{CapacityPreemptionPolicy, StewardCheck, StewardCheckSource};
+    use crate::merge_steward::{RequiredCheck, StewardJob, StewardPullRequest};
+    #[cfg(unix)]
     use crate::ship_state::ShipStateStore;
+    #[cfg(unix)]
     use std::fs;
 
     fn sha(byte: char) -> String {

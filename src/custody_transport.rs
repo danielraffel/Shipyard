@@ -8,32 +8,46 @@
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+#[cfg(any(unix, test))]
+use std::sync::mpsc::Receiver;
+#[cfg(unix)]
+use std::sync::mpsc::{self, TryRecvError};
+#[cfg(unix)]
 use std::thread;
+#[cfg(any(unix, test))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(unix, test))]
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(any(unix, test))]
 use crate::identity::RuntimeMode;
 use crate::work_ledger::{
     CustodyControl, CustodyControlReceipt, CustodyReceipt, CustodySuccessorRebind,
     CustodySuccessorReceipt, CustodyTransfer, CustodyTransportAuthenticator, ProcessedReceipt,
     WorkLedger, WorkLedgerError, WorkLedgerResult, authenticate_custody_control,
+    authenticate_custody_successor_rebind, authenticate_custody_transfer,
+    authenticate_processed_receipt,
+};
+#[cfg(any(unix, test))]
+use crate::work_ledger::{
     authenticate_custody_control_receipt, authenticate_custody_receipt,
-    authenticate_custody_successor_rebind, authenticate_custody_successor_receipt,
-    authenticate_custody_transfer, authenticate_processed_receipt,
+    authenticate_custody_successor_receipt,
 };
 
 mod policy;
 
+#[cfg(any(unix, test))]
 use policy::CustodyPeer;
 pub(crate) use policy::{CustodyTransportPolicy, load_custody_transport_policy};
 
 const SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_CUSTODY_WIRE_BYTES: u64 = 1024 * 1024;
+#[cfg(any(unix, test))]
 const MAX_BATCH: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -270,6 +284,7 @@ fn handle_incoming_request_inner(
     }
 }
 
+#[cfg(any(unix, test))]
 trait CustodyCarrier {
     fn exchange(
         &mut self,
@@ -280,8 +295,10 @@ trait CustodyCarrier {
     ) -> Result<(CustodyTransportResponse, String), String>;
 }
 
+#[cfg(unix)]
 struct SshCustodyCarrier;
 
+#[cfg(unix)]
 impl CustodyCarrier for SshCustodyCarrier {
     fn exchange(
         &mut self,
@@ -362,6 +379,14 @@ impl CustodyCarrier for SshCustodyCarrier {
     }
 }
 
+#[cfg(any(unix, test))]
+#[cfg_attr(
+    all(windows, test),
+    allow(
+        dead_code,
+        reason = "Windows tests retain the fail-closed runtime shape without a daemon consumer"
+    )
+)]
 pub(crate) struct CustodyTransportRuntime {
     policy: Option<CustodyTransportPolicy>,
     policy_refused: bool,
@@ -371,6 +396,7 @@ pub(crate) struct CustodyTransportRuntime {
     result_rx: Option<Receiver<Result<(), String>>>,
 }
 
+#[cfg(any(unix, test))]
 impl CustodyTransportRuntime {
     pub(crate) fn for_daemon(mode: RuntimeMode, global_dir: PathBuf, state_dir: PathBuf) -> Self {
         match load_custody_transport_policy(mode, global_dir) {
@@ -393,6 +419,13 @@ impl CustodyTransportRuntime {
         }
     }
 
+    #[cfg_attr(
+        all(windows, test),
+        allow(
+            dead_code,
+            reason = "Windows has no custody daemon diagnostic consumer"
+        )
+    )]
     pub(crate) fn diagnostic_error(&self) -> Option<String> {
         self.last_error.clone()
     }
@@ -400,6 +433,10 @@ impl CustodyTransportRuntime {
     /// Synchronously stage local native obligations before the provider lane
     /// can inspect them. Once cross-machine policy elects another machine,
     /// this host must never race local delivery against custody transfer.
+    #[cfg_attr(
+        all(windows, test),
+        allow(dead_code, reason = "Windows has no outbound custody daemon")
+    )]
     pub(crate) fn prepare_native_obligations(&mut self) {
         let Some(policy) = self.policy.as_ref() else {
             return;
@@ -426,6 +463,7 @@ impl CustodyTransportRuntime {
             })
     }
 
+    #[cfg(unix)]
     pub(crate) fn tick(&mut self) {
         if let Some(receiver) = &self.result_rx {
             match receiver.try_recv() {
@@ -457,6 +495,7 @@ impl CustodyTransportRuntime {
 }
 
 #[allow(clippy::too_many_lines)] // One ordered pass preserves rebind/control/delivery/processed ordering.
+#[cfg(any(unix, test))]
 fn reconcile_once<C: CustodyCarrier>(
     policy: &CustodyTransportPolicy,
     state_dir: &Path,
@@ -633,6 +672,7 @@ fn reconcile_once<C: CustodyCarrier>(
     first_error.map_or(Ok(()), Err)
 }
 
+#[cfg(any(unix, test))]
 fn stage_native_obligations(
     policy: &CustodyTransportPolicy,
     ledger: &WorkLedger,
@@ -667,6 +707,7 @@ fn stage_native_obligations(
     first_error.map_or(Ok(()), Err)
 }
 
+#[cfg(any(unix, test))]
 fn exchange<C: CustodyCarrier>(
     policy: &CustodyTransportPolicy,
     peer: &CustodyPeer,
@@ -681,6 +722,7 @@ fn exchange<C: CustodyCarrier>(
     )
 }
 
+#[cfg(any(unix, test))]
 fn peer<'a>(policy: &'a CustodyTransportPolicy, machine: &str) -> Result<&'a CustodyPeer, String> {
     policy
         .peers
@@ -721,11 +763,13 @@ impl CustodyTransportAuthenticator for BoundAuthenticator {
     }
 }
 
+#[cfg(any(unix, test))]
 struct WitnessAuthenticator {
     peer: String,
     witness: String,
 }
 
+#[cfg(any(unix, test))]
 impl WitnessAuthenticator {
     fn new(peer: &str, witness: &str) -> Self {
         Self {
@@ -735,6 +779,7 @@ impl WitnessAuthenticator {
     }
 }
 
+#[cfg(any(unix, test))]
 impl CustodyTransportAuthenticator for WitnessAuthenticator {
     fn authenticate(&mut self, peer: &str, payload: &str) -> WorkLedgerResult<String> {
         if peer != self.peer {
@@ -815,6 +860,7 @@ fn validate_digest(value: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn read_bounded_authority(path: &Path, max: u64) -> Result<String, String> {
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -917,6 +963,10 @@ fn validate_private_file(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    dead_code,
+    reason = "non-Unix custody validation remains an explicit fail-closed boundary"
+)]
 fn validate_private_file(_path: &Path) -> Result<(), String> {
     Err("custody-platform-unavailable".to_owned())
 }
@@ -944,10 +994,15 @@ fn validate_executable(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    dead_code,
+    reason = "non-Unix custody validation remains an explicit fail-closed boundary"
+)]
 fn validate_executable(_path: &Path) -> Result<(), String> {
     Err("custody-platform-unavailable".to_owned())
 }
 
+#[cfg(any(unix, test))]
 fn map_ledger(_error: WorkLedgerError) -> String {
     "custody-ledger-refused".to_owned()
 }

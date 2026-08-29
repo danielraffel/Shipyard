@@ -5,29 +5,46 @@
 //! capability below may instantiate this backend. There is deliberately no
 //! foreground, shell, `nohup`, or ambient-cwd fallback.
 
+#[cfg(any(unix, test))]
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+#[cfg(any(unix, test))]
+use std::path::PathBuf;
+#[cfg(any(unix, test))]
+use std::process::Child;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(unix, test))]
 use crate::identity::RuntimeMode;
+#[cfg(any(unix, test))]
 use crate::immutable_store::{ImmutableByteStore, ImmutableStoreError};
 use crate::parallel_proof::Sha256Digest;
+#[cfg(unix)]
+use crate::parallel_proof_canary_job::ApprovedCanaryOperation;
 use crate::parallel_proof_canary_job::{
-    ApprovedCanaryJob, ApprovedCanaryOperation, CanaryCancellationObservation, CanaryJobBackend,
-    CanaryProcessObservation, CanaryProcessTreeIdentity,
+    ApprovedCanaryJob, CanaryCancellationObservation, CanaryJobBackend, CanaryProcessObservation,
+    CanaryProcessTreeIdentity,
 };
 
 /// Exact daemon status capability required before production submission.
 pub const DAEMON_CANARY_JOB_CAPABILITY: &str = "parallel_proof_canary_job_v1";
 const MAX_WORKER_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+#[cfg(any(unix, test))]
 const MAX_SUPERVISOR_RECORD_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
 const MAX_DAEMON_CANARY_TICK_INTERVAL_MS: u64 = 1_000;
+#[cfg(unix)]
 const MAX_DAEMON_CANARY_JOBS_PER_TICK: usize = 1;
 
 pub(crate) fn executable_digest(path: &Path) -> Result<Sha256Digest, String> {
@@ -172,6 +189,7 @@ impl<S: CanaryProcessSupervisor> CanaryJobBackend for DaemonCanaryJobBackend<S> 
     }
 }
 
+#[cfg(any(unix, test))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CanarySupervisorReceipt {
@@ -180,6 +198,7 @@ struct CanarySupervisorReceipt {
     process: CanaryProcessTreeIdentity,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CanaryWorkerCompletion {
@@ -190,11 +209,13 @@ struct CanaryWorkerCompletion {
     artifact: Option<crate::parallel_proof_canary_job::CanaryJobArtifact>,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Clone, Debug)]
 struct CanarySupervisorStore {
     records: ImmutableByteStore,
 }
 
+#[cfg(any(unix, test))]
 impl CanarySupervisorStore {
     fn open(state_dir: &Path) -> Result<Self, String> {
         let parent = state_dir.join("parallel-proof-canary");
@@ -205,6 +226,7 @@ impl CanarySupervisorStore {
             .map_err(|error| store_error(&error))
     }
 
+    #[cfg(unix)]
     fn put_receipt(&self, receipt: &CanarySupervisorReceipt) -> Result<(), String> {
         self.records
             .put(
@@ -219,6 +241,7 @@ impl CanarySupervisorStore {
         load_optional(&self.records, &format!("{job_id}-receipt"))
     }
 
+    #[cfg(unix)]
     fn put_completion(&self, completion: &CanaryWorkerCompletion) -> Result<(), String> {
         self.records
             .put(
@@ -234,6 +257,7 @@ impl CanarySupervisorStore {
     }
 }
 
+#[cfg(any(unix, test))]
 fn load_optional<T: for<'de> Deserialize<'de>>(
     store: &ImmutableByteStore,
     key: &str,
@@ -247,11 +271,13 @@ fn load_optional<T: for<'de> Deserialize<'de>>(
     }
 }
 
+#[cfg(any(unix, test))]
 fn store_error(error: &ImmutableStoreError) -> String {
     error.to_string()
 }
 
 /// Daemon-owned implementation of the closed worker protocol.
+#[cfg(unix)]
 pub(crate) struct ShipyardCanaryProcessSupervisor {
     binary: PathBuf,
     binary_sha256: Sha256Digest,
@@ -262,6 +288,13 @@ pub(crate) struct ShipyardCanaryProcessSupervisor {
     children: BTreeMap<String, Child>,
 }
 
+#[cfg(all(not(unix), test))]
+pub(crate) struct ShipyardCanaryProcessSupervisor {
+    store: CanarySupervisorStore,
+    children: BTreeMap<String, Child>,
+}
+
+#[cfg(unix)]
 impl ShipyardCanaryProcessSupervisor {
     pub(crate) fn new(
         binary: PathBuf,
@@ -366,16 +399,32 @@ impl ShipyardCanaryProcessSupervisor {
     }
 }
 
+#[cfg(all(not(unix), test))]
+impl ShipyardCanaryProcessSupervisor {
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the refusal stub preserves the Unix constructor contract exactly"
+    )]
+    pub(crate) fn new(
+        binary: PathBuf,
+        _mode: RuntimeMode,
+        _global_dir: PathBuf,
+        state_dir: PathBuf,
+    ) -> Result<Self, String> {
+        executable_digest(&binary)?;
+        Ok(Self {
+            store: CanarySupervisorStore::open(&state_dir)?,
+            children: BTreeMap::new(),
+        })
+    }
+}
+
+#[cfg(unix)]
 impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
     fn launch_typed_worker(
         &mut self,
         request: &CanarySupervisedLaunch,
     ) -> Result<CanaryProcessTreeIdentity, String> {
-        if !cfg!(unix) {
-            return Err(
-                "canary worker custody requires Unix process birth and group identity".to_owned(),
-            );
-        }
         request.validate()?;
         let ApprovedCanaryOperation::ParallelProofDistributedShadow {
             worker_executable_sha256,
@@ -509,6 +558,42 @@ impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
     }
 }
 
+#[cfg(all(not(unix), test))]
+impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
+    fn launch_typed_worker(
+        &mut self,
+        _request: &CanarySupervisedLaunch,
+    ) -> Result<CanaryProcessTreeIdentity, String> {
+        Err("canary worker custody requires Unix process birth and group identity".to_owned())
+    }
+
+    fn discover_typed_worker(
+        &mut self,
+        _job: &ApprovedCanaryJob,
+        _launch_nonce_sha256: &Sha256Digest,
+    ) -> Result<CanaryProcessObservation, String> {
+        Err("canary worker custody requires Unix process birth and group identity".to_owned())
+    }
+
+    fn observe_typed_worker(
+        &mut self,
+        _job: &ApprovedCanaryJob,
+        _process: &CanaryProcessTreeIdentity,
+    ) -> Result<CanaryProcessObservation, String> {
+        Err("canary worker custody requires Unix process birth and group identity".to_owned())
+    }
+
+    fn cancel_typed_worker(
+        &mut self,
+        _job: &ApprovedCanaryJob,
+        _process: &CanaryProcessTreeIdentity,
+        _grace_ms: u64,
+    ) -> Result<CanaryCancellationObservation, String> {
+        Err("canary worker custody requires Unix process birth and group identity".to_owned())
+    }
+}
+
+#[cfg(unix)]
 fn capture_worker_start_identity(
     child: &mut Child,
     probe: impl FnOnce(u32) -> Result<Option<Sha256Digest>, String>,
@@ -530,6 +615,7 @@ fn capture_worker_start_identity(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(unix)]
 enum WorkerLiveness {
     Alive,
     Dead,
@@ -537,44 +623,37 @@ enum WorkerLiveness {
     Unknown,
 }
 
+#[cfg(unix)]
 fn worker_process_liveness(receipt: &CanarySupervisorReceipt) -> WorkerLiveness {
-    #[cfg(unix)]
-    {
-        match os_process_start_identity(receipt.process.pid) {
-            Ok(Some(identity)) if identity == receipt.process.os_start_identity_sha256 => {}
-            Ok(Some(_)) => return WorkerLiveness::IdentityMismatch,
-            Ok(None) => return WorkerLiveness::Dead,
-            Err(_) => return WorkerLiveness::Unknown,
-        }
-        let output = Command::new("/bin/ps")
-            .args([
-                "-ww",
-                "-p",
-                &receipt.process.pid.to_string(),
-                "-o",
-                "command=",
-            ])
-            .output();
-        let Ok(output) = output else {
-            return WorkerLiveness::Unknown;
-        };
-        let command = String::from_utf8_lossy(&output.stdout);
-        if output.status.success()
-            && command.contains("parallel-proof-canary-worker")
-            && command.contains(&receipt.job_id)
-            && command.contains(&receipt.generation)
-        {
-            WorkerLiveness::Alive
-        } else if !output.status.success() && !output.stderr.is_empty() {
-            WorkerLiveness::Unknown
-        } else {
-            WorkerLiveness::Dead
-        }
+    match os_process_start_identity(receipt.process.pid) {
+        Ok(Some(identity)) if identity == receipt.process.os_start_identity_sha256 => {}
+        Ok(Some(_)) => return WorkerLiveness::IdentityMismatch,
+        Ok(None) => return WorkerLiveness::Dead,
+        Err(_) => return WorkerLiveness::Unknown,
     }
-    #[cfg(not(unix))]
+    let output = Command::new("/bin/ps")
+        .args([
+            "-ww",
+            "-p",
+            &receipt.process.pid.to_string(),
+            "-o",
+            "command=",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return WorkerLiveness::Unknown;
+    };
+    let command = String::from_utf8_lossy(&output.stdout);
+    if output.status.success()
+        && command.contains("parallel-proof-canary-worker")
+        && command.contains(&receipt.job_id)
+        && command.contains(&receipt.generation)
     {
-        let _ = receipt;
+        WorkerLiveness::Alive
+    } else if !output.status.success() && !output.stderr.is_empty() {
         WorkerLiveness::Unknown
+    } else {
+        WorkerLiveness::Dead
     }
 }
 
@@ -585,11 +664,6 @@ fn os_process_start_identity(pid: u32) -> Result<Option<Sha256Digest>, String> {
         .map_err(|_| "canary worker OS start identity is unavailable".to_owned())
 }
 
-#[cfg(not(unix))]
-fn os_process_start_identity(_pid: u32) -> Result<Option<Sha256Digest>, String> {
-    Err("canary worker OS start identity is unavailable on this platform".to_owned())
-}
-
 #[cfg(unix)]
 fn terminate_process_group(pid: u32, grace: Duration) -> Result<bool, String> {
     let _ = grace;
@@ -597,15 +671,12 @@ fn terminate_process_group(pid: u32, grace: Duration) -> Result<bool, String> {
         .map_err(|error| error.to_string())
 }
 
-#[cfg(not(unix))]
-fn terminate_process_group(_pid: u32, _grace: Duration) -> Result<bool, String> {
-    Ok(false)
-}
-
+#[cfg(unix)]
 fn controller_now_ms() -> Result<u64, String> {
     u64::try_from(Utc::now().timestamp_millis()).map_err(|_| "controller time overflow".to_owned())
 }
 
+#[cfg(unix)]
 pub(crate) fn verify_canary_worker_authority(
     state_dir: &Path,
     job_id: &str,
@@ -633,6 +704,16 @@ pub(crate) fn verify_canary_worker_authority(
     }
 }
 
+#[cfg(not(unix))]
+pub(crate) fn verify_canary_worker_authority(
+    _state_dir: &Path,
+    _job_id: &str,
+    _generation: &str,
+) -> Result<CanaryProcessTreeIdentity, String> {
+    Err("canary worker custody requires Unix process birth and group identity".to_owned())
+}
+
+#[cfg(unix)]
 pub(crate) fn record_worker_completion(
     state_dir: &Path,
     job_id: &str,
@@ -649,7 +730,19 @@ pub(crate) fn record_worker_completion(
     })
 }
 
+#[cfg(not(unix))]
+pub(crate) fn record_worker_completion(
+    _state_dir: &Path,
+    _job_id: &str,
+    _generation: &str,
+    _exit_code: i32,
+    _artifact: Option<crate::parallel_proof_canary_job::CanaryJobArtifact>,
+) -> Result<(), String> {
+    Err("canary worker custody requires Unix process birth and group identity".to_owned())
+}
+
 /// One default-off daemon lane for pending/restartable canary custody.
+#[cfg(unix)]
 pub(crate) struct DaemonCanaryJobRuntime {
     store: crate::parallel_proof_canary_job::CanaryJobStore,
     backend: DaemonCanaryJobBackend<ShipyardCanaryProcessSupervisor>,
@@ -659,12 +752,14 @@ pub(crate) struct DaemonCanaryJobRuntime {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(unix)]
 pub(crate) struct DaemonCanaryTickReport {
     pub(crate) ran: bool,
     pub(crate) processed_jobs: usize,
     pub(crate) warning: Option<String>,
 }
 
+#[cfg(unix)]
 impl DaemonCanaryJobRuntime {
     /// Construct only when trusted machine-global activation is complete.
     pub(crate) fn from_config(
@@ -884,6 +979,7 @@ impl DaemonCanaryJobRuntime {
     }
 }
 
+#[cfg(unix)]
 fn bounded_job_batch(job_ids: &[String], after: Option<&str>, limit: usize) -> Vec<String> {
     if job_ids.is_empty() || limit == 0 {
         return Vec::new();

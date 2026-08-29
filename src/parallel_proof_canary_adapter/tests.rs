@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use super::*;
+#[cfg(unix)]
 fn config(path: PathBuf, digest: Sha256Digest) -> ParallelProofCanaryAdapterConfig {
     ParallelProofCanaryAdapterConfig {
         executable_path: path,

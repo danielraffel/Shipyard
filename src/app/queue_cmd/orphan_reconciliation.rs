@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::ExitCode;
 
 use chrono::Utc;
 use serde_json::Value;

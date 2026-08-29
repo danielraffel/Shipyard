@@ -13,14 +13,16 @@ mod command;
 mod evidence;
 mod release_authority;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use command::{exact_asset_curl_shim, remote_pair_probe};
 use command::{local_update_command, remote_update_command, render_host_result, render_plan};
 
+#[cfg(all(test, unix))]
+use evidence::execute_plan_with_timeout;
 #[cfg(test)]
 use evidence::{
     AuthSupportEvidence, BinaryEvidence, BinaryPairEvidence, SourceIdentityBasis,
-    SupportFileEvidence, execute_plan_with_timeout,
+    SupportFileEvidence,
 };
 use evidence::{HostUpdateEvidence, PlanExecutionError, execute_plan, validate_evidence};
 use release_authority::{

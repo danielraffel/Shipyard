@@ -114,6 +114,7 @@ impl PendingProjectionIntent {
 }
 
 impl WorkLedger {
+    #[cfg(any(unix, test))]
     pub(super) fn stage_waiting_observation(
         &self,
         work_item_id: &str,

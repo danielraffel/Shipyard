@@ -7,7 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -135,7 +137,7 @@ impl WorkLedger {
     /// after the daemon has completed a fenced provider delivery. Merely
     /// claiming, retrying, or becoming uncertain is not enough to let the
     /// originating agent relinquish the final monitoring obligation.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn native_wake_consumer_owns(&self, wake_id: &str) -> WorkLedgerResult<bool> {
         let connection = self.connect_read_only()?;
         let observed: Option<(String, bool)> = connection
@@ -599,6 +601,7 @@ pub(crate) fn verify_native_policy_binding(
     Ok(())
 }
 
+#[cfg(unix)]
 pub(crate) fn bind_legacy_native_policy(
     state_dir: &Path,
     repository: &str,
@@ -1074,8 +1077,7 @@ fn route_error(error: impl std::fmt::Display) -> WorkLedgerError {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::work_ledger::{
-        DeliveryAuthorization, NativeStewardDisposition, ProviderAuthorizationOperation,
-        ReconciliationAuthorization,
+        DeliveryAuthorization, ProviderAuthorizationOperation, ReconciliationAuthorization,
     };
     use std::path::PathBuf;
 
@@ -1084,9 +1086,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::work_ledger::{
         DeliveryFence, FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability,
-        ProviderLaunchRequest, ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult,
-        WakeEnvelope, WakeProfileResolver,
+        ProviderLaunchRequest, ProviderOutcome, WakeEnvelope, WakeProfileResolver,
     };
+    #[cfg(unix)]
+    use crate::work_ledger::{NativeStewardDisposition, WakeConsumerPolicy, WakeDeliveryResult};
     use crate::workstream_continuation_config::ProviderWrapperConfig;
 
     #[derive(Clone)]
@@ -1297,6 +1300,7 @@ pub(crate) mod tests {
         assert!(!state_dir.exists());
     }
 
+    #[cfg(unix)]
     fn seed_repo_policy(state_dir: &std::path::Path, repository: &str) {
         let ledger = WorkLedger::open(state_dir).expect("ledger");
         ledger
@@ -1468,6 +1472,7 @@ pub(crate) mod tests {
             .expect("named provider publication");
     }
 
+    #[cfg(unix)]
     fn planned_with_apply(mut report: NativePublicationReport) -> NativePublicationReport {
         report.applied = true;
         report

@@ -49,6 +49,7 @@ macro_rules! candidate_params {
     };
 }
 
+#[cfg(any(unix, test))]
 mod actionable_scheduler;
 mod canary_wake;
 #[allow(dead_code)] // Live cmux/HerdR proof remains default-off until upstream contracts ship.
@@ -114,16 +115,21 @@ mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.
 mod route;
 mod storage;
-pub(crate) use actionable_scheduler::{NativeStewardApplyReport, NativeStewardDisposition};
+#[cfg(unix)]
+pub(crate) use actionable_scheduler::NativeStewardApplyReport;
+#[cfg(any(unix, test))]
+pub(crate) use actionable_scheduler::NativeStewardDisposition;
 use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};
 pub(crate) use lifecycle::deterministic_wake_id;
 pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};
+#[cfg(unix)]
+pub(crate) use native_publication::bind_legacy_native_policy;
 #[allow(unused_imports)] // Consumed by the CLI/runtime integration follow-up.
 pub(crate) use native_publication::{
     ExactProtectedProfileResolver, NativePublicationReport, NativePublicationRequest,
-    bind_legacy_native_policy, verify_native_policy_binding,
+    verify_native_policy_binding,
 };
 pub use observation::ShadowPrTarget;
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};

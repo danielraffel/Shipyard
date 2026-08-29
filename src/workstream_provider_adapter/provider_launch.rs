@@ -4,7 +4,9 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+#[cfg(any(unix, test))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -12,7 +14,9 @@ use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use super::HashWriter;
-use crate::provider_wrapper::{ProviderDeliveryTargetV1, ProviderWrapperRequestV1};
+#[cfg(any(unix, test))]
+use crate::provider_wrapper::ProviderDeliveryTargetV1;
+use crate::provider_wrapper::ProviderWrapperRequestV1;
 
 #[cfg(not(test))]
 pub(super) const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_secs(5);
@@ -128,6 +132,7 @@ impl PrivateLaunch {
     }
 }
 
+#[cfg(any(unix, test))]
 pub(super) fn launch_command(
     request: &ProviderWrapperRequestV1,
     executable_path: &Path,
@@ -328,17 +333,14 @@ fn snapshot_subrouter(
         .map_err(|_| "subrouter-snapshot-unwritable")
 }
 
-#[cfg(not(unix))]
-fn snapshot_subrouter(_: &ProviderWrapperRequestV1, _: &Path) -> Result<(), &'static str> {
-    Err("subrouter-executable-verification-unavailable")
-}
-
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), &'static str> {
     std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| "private-launch-directory-unwritable")
 }
 
+#[cfg(any(unix, test))]
 fn shell_word(value: &str) -> Result<String, &'static str> {
     if value.is_empty()
         || value

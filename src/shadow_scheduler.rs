@@ -285,6 +285,7 @@ impl ShadowDaemonLane {
     /// unchanged catch-up snapshots. Active consumers must not depend on the
     /// transition-only event stream, because a daemon restart intentionally
     /// forgets its in-memory transition baseline.
+    #[cfg(any(unix, test))]
     pub(crate) fn take_completed_observations(&mut self) -> Vec<ShadowObservation> {
         std::mem::take(&mut self.completed_observations)
     }

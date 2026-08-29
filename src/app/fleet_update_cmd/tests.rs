@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::process::Command;
 
 use super::*;
@@ -316,6 +317,7 @@ fn local_rollout_rejects_a_filename_the_installer_cannot_replace() {
     assert!(error.message.contains("must end in /shipyard"));
 }
 
+#[cfg(unix)]
 #[cfg(unix)]
 #[test]
 fn one_stalled_host_is_terminated_at_its_bound() {
