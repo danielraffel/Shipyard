@@ -235,7 +235,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         config.global_dir.clone(),
         config.state_dir.clone(),
     );
+    let mut continuation_runtime =
+        crate::workstream_continuation_runtime::WorkstreamContinuationRuntime::new(config.mode);
     while running.load(Ordering::Acquire) {
+        continuation_runtime.tick();
         let supervisor_error = execution_supervisor
             .tick()
             .err()

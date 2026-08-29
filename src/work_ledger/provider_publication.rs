@@ -79,6 +79,55 @@ pub(super) struct PublishedProviderReceipt {
 }
 
 impl WorkLedger {
+    /// Recover the exact protected resume expectation for one acknowledged
+    /// delivery. Context acknowledgement must never accept caller-invented
+    /// reconstruction evidence.
+    pub(super) fn expected_resume_context_digest(
+        &self,
+        claim: &DeliveryClaim,
+    ) -> WorkLedgerResult<String> {
+        let expected_fence = delivery_fence(claim);
+        let mut matches = self
+            .protected_objects_for_work_kind(&claim.work_id, ProtectedObjectKind::ProviderRequest)?
+            .into_iter()
+            .map(|bytes| {
+                serde_json::from_slice::<NativeProviderRequestV1>(&bytes).map_err(|_| {
+                    WorkLedgerError::Refused(
+                        "protected provider request is not strict schema v1".to_owned(),
+                    )
+                })
+            })
+            .collect::<WorkLedgerResult<Vec<_>>>()?
+            .into_iter()
+            .filter(|request| {
+                request.schema_version == NATIVE_PROVIDER_SCHEMA_VERSION
+                    && request.wrapper.delivery_fence == expected_fence
+                    && request.route == claim.route
+                    && request.wrapper.resume_expectation.head_sha == claim.head_sha
+            });
+        let request = matches.next().ok_or_else(|| {
+            WorkLedgerError::Refused(
+                "acknowledged delivery has no matching protected provider request".to_owned(),
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(WorkLedgerError::Refused(
+                "acknowledged delivery has ambiguous protected provider requests".to_owned(),
+            ));
+        }
+        validate_digest(
+            "expected resume context",
+            &request
+                .wrapper
+                .resume_expectation
+                .expected_resume_context_digest,
+        )?;
+        Ok(request
+            .wrapper
+            .resume_expectation
+            .expected_resume_context_digest)
+    }
+
     /// Publish an exact request without crossing the external delivery boundary.
     pub(super) fn publish_native_provider_request(
         &self,

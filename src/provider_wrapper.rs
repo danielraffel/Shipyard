@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{
@@ -24,22 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::process::ProcessTree;
-
-/// Immutable, digest-pinned wrapper identity and bounded execution policy.
-///
-/// No configuration loader or daemon consumes this type in this tranche, so
-/// provider execution remains default-off until a later activation slice
-/// supplies separately authenticated machine policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProviderWrapperConfig {
-    pub(crate) executable_path: PathBuf,
-    pub(crate) executable_sha256: String,
-    pub(crate) provider_id: String,
-    pub(crate) adapter_id: String,
-    pub(crate) deadline_seconds: u64,
-    pub(crate) max_stdout_bytes: u64,
-    pub(crate) max_stderr_bytes: u64,
-}
+pub(crate) use crate::workstream_continuation_config::ProviderWrapperConfig;
 
 mod execution_sentinel;
 #[cfg(not(unix))]

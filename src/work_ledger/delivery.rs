@@ -406,6 +406,37 @@ impl DeliveryReceipt {
 }
 
 impl WorkLedger {
+    /// Recover the immutable claim behind an acknowledged provider delivery.
+    pub(super) fn recover_acknowledged_claim(
+        &self,
+        wake_id: &str,
+    ) -> WorkLedgerResult<DeliveryClaim> {
+        validate_opaque_ref("wake_id", wake_id, "wake")?;
+        let connection = self.connect_read_only()?;
+        let payload: Vec<u8> = connection
+            .query_row(
+                "SELECT claim_payload_json FROM outbox
+                 WHERE wake_id = ?1 AND state = 'acknowledged'
+                   AND receipt_kind = 'accepted'",
+                [wake_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                WorkLedgerError::Refused("wake has no acknowledged provider delivery".to_owned())
+            })?;
+        let claim: DeliveryClaim = serde_json::from_slice(&payload).map_err(|_| {
+            WorkLedgerError::Refused("acknowledged delivery claim is malformed".to_owned())
+        })?;
+        claim.validate_identity()?;
+        if claim.wake_id != wake_id {
+            return Err(WorkLedgerError::Refused(
+                "acknowledged delivery claim identity differs".to_owned(),
+            ));
+        }
+        Ok(claim)
+    }
+
     /// Create an inert, process-lifetime dispatcher epoch for this ledger.
     pub(super) fn dispatcher_epoch(&self) -> WorkLedgerResult<DispatcherEpoch> {
         Ok(DispatcherEpoch {

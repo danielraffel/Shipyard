@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::route::OpaqueRef;
 use super::{
@@ -48,6 +48,177 @@ pub(crate) struct ProtectedObjectRecord {
 }
 
 impl WorkLedger {
+    /// Read a bounded object family for one work item after one complete
+    /// protected-storage verification. Historical immutable objects remain
+    /// available so callers can select using stronger delivery fences.
+    pub(super) fn protected_objects_for_work_kind(
+        &self,
+        work_item_id: &str,
+        kind: ProtectedObjectKind,
+    ) -> WorkLedgerResult<Vec<Vec<u8>>> {
+        let connection = self.connect_read_only()?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        self.verify_protected_object_storage(&connection)?;
+        let mut statement = connection.prepare(
+            "SELECT object_ref, work_item_id, kind, profile_ref, storage_name,
+                    content_digest, byte_length
+             FROM protected_objects
+             WHERE work_item_id = ?1 AND kind = ?2
+             ORDER BY object_ref LIMIT 4097",
+        )?;
+        let rows = statement
+            .query_map(params![work_item_id, kind.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(4)?,
+                    ProtectedObjectRecord {
+                        object_ref: row.get(0)?,
+                        work_item_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        profile_ref: row.get(3)?,
+                        content_digest: row.get(5)?,
+                        byte_length: row.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.len() > MAX_PROTECTED_OBJECT_ROWS {
+            return Err(WorkLedgerError::Refused(
+                "protected object family scan exceeds its bound".to_owned(),
+            ));
+        }
+        drop(statement);
+        drop(connection);
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let directory = open_object_directory(parent, false)?;
+        let bytes = rows
+            .into_iter()
+            .map(|(storage_name, record)| {
+                read_object_from_directory(&directory, &storage_name, &record)
+            })
+            .collect::<WorkLedgerResult<Vec<_>>>()?;
+        verify_directory_binding(parent, &directory)?;
+        Ok(bytes)
+    }
+
+    /// Persist an immutable object while applying an exact ledger fence in the
+    /// same `SQLite` transaction. The caller-supplied operation may also perform
+    /// the lifecycle mutation certified by the object. The writer-domain lease
+    /// covers file publication and the complete database transaction.
+    pub(super) fn put_protected_object_with_transaction<F>(
+        &self,
+        work_item_id: &str,
+        kind: ProtectedObjectKind,
+        profile_ref: Option<&str>,
+        expected_digest: &str,
+        bytes: &[u8],
+        fenced_operation: F,
+    ) -> WorkLedgerResult<ProtectedObjectRecord>
+    where
+        F: FnOnce(&Transaction<'_>, &str) -> WorkLedgerResult<()>,
+    {
+        let (record, storage_name) = prepare_protected_object_record(
+            work_item_id,
+            kind,
+            profile_ref,
+            expected_digest,
+            bytes,
+        )?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let directory = open_object_directory(parent, true)?;
+        reconcile_pending_objects(&directory)?;
+        let mut connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let operation_at = self.clock.observe(&transaction)?.timestamp.to_rfc3339();
+        let existing = protected_object_record(&transaction, &record.object_ref)?;
+        if let Some(existing) = existing {
+            if existing != record {
+                return Err(WorkLedgerError::Refused(
+                    "protected object identity collides with different metadata".to_owned(),
+                ));
+            }
+            let observed = read_object_from_directory(&directory, &storage_name, &record)?;
+            if observed != bytes {
+                return Err(WorkLedgerError::Refused(
+                    "protected object replay bytes differ".to_owned(),
+                ));
+            }
+            fenced_operation(&transaction, &operation_at)?;
+            super::clock::LedgerClock::finalize(&transaction)?;
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        let work_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = ?1)",
+            [work_item_id],
+            |row| row.get(0),
+        )?;
+        if !work_exists {
+            return Err(WorkLedgerError::Refused(
+                "protected object work item does not exist".to_owned(),
+            ));
+        }
+        if let Some(profile_ref) = profile_ref {
+            let collision: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM protected_objects
+                                WHERE work_item_id = ?1 AND profile_ref = ?2)",
+                params![work_item_id, profile_ref],
+                |row| row.get(0),
+            )?;
+            if collision {
+                return Err(WorkLedgerError::Refused(
+                    "launch profile already binds a different protected object".to_owned(),
+                ));
+            }
+        }
+        ensure_protected_object_capacity(&transaction, record.byte_length)?;
+        transaction.execute(
+            "INSERT INTO protected_objects
+             (object_ref, work_item_id, kind, profile_ref, storage_name,
+              content_digest, byte_length, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.object_ref,
+                record.work_item_id,
+                record.kind,
+                record.profile_ref,
+                storage_name,
+                record.content_digest,
+                record.byte_length,
+                operation_at,
+            ],
+        )?;
+        fenced_operation(&transaction, &operation_at)?;
+        super::clock::LedgerClock::finalize(&transaction)?;
+        write_object_to_directory(&directory, &storage_name, &record, bytes)?;
+        if let Err(error) = verify_directory_binding(parent, &directory) {
+            cleanup_failed_publication(&directory, &storage_name, &record, bytes, &error)?;
+            return Err(error);
+        }
+        if let Err(error) = transaction.commit() {
+            let error = WorkLedgerError::Sql(error);
+            cleanup_failed_publication(&directory, &storage_name, &record, bytes, &error)?;
+            return Err(error);
+        }
+        let observed = read_object_from_directory(&directory, &storage_name, &record)?;
+        if observed != bytes {
+            return Err(WorkLedgerError::Refused(
+                "committed protected object bytes differ".to_owned(),
+            ));
+        }
+        Ok(record)
+    }
+
     /// Remove only safe, unpublished temporary objects while the caller owns
     /// the work-ledger writer domain. A ledger-local immediate transaction
     /// serializes reconciliation with publication; final files are untouched.

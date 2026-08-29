@@ -51,6 +51,8 @@ macro_rules! candidate_params {
 
 mod clock;
 mod delivery;
+#[allow(dead_code)] // Invoked by the future private receipt CLI surface.
+mod delivery_ownership;
 mod importer;
 mod lifecycle;
 mod observation;

@@ -8,6 +8,7 @@ use crate::provider_wrapper::{
     ProviderLaunchOptionsV1, ProviderWrapperConfig, ProviderWrapperOperationV1,
     ProviderWrapperOutcomeV1, ProviderWrapperResponseV1,
 };
+use crate::work_ledger::delivery_ownership::{AgentContextReceipt, AgentReturnReceipt};
 
 fn at(second: u32) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2030, 8, 28, 12, 0, second)
@@ -224,6 +225,42 @@ fn provider_response(
     }
 }
 
+fn publish_context_request(
+    ledger: &WorkLedger,
+    claim: &DeliveryClaim,
+) -> super::super::provider_publication::PublishedProviderRequest {
+    ledger
+        .publish_native_provider_request(
+            claim,
+            ProviderWrapperOperationV1::Submit,
+            &provider_config(claim),
+            head_authority(claim),
+            resume_expectation(claim),
+            ProviderLaunchOptionsV1::default(),
+        )
+        .expect("protected context request")
+}
+
+fn add_historical_provider_request(
+    ledger: &WorkLedger,
+    claim: &DeliveryClaim,
+    published: &super::super::provider_publication::PublishedProviderRequest,
+) {
+    let mut historical = published.request.clone();
+    historical.wrapper.delivery_fence.claim_id = opaque_ref("claim", "historical");
+    historical.wrapper.delivery_fence.bind_idempotency_key();
+    let bytes = serde_json::to_vec(&historical).expect("historical request");
+    ledger
+        .put_protected_object(
+            &claim.work_id,
+            ProtectedObjectKind::ProviderRequest,
+            None,
+            &digest(&bytes),
+            &bytes,
+        )
+        .expect("historical provider request");
+}
+
 #[test]
 fn provider_request_is_crash_replay_safe_and_preserves_route_axes() {
     let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
@@ -409,6 +446,149 @@ fn provider_receipt_is_exact_and_replay_safe_before_acknowledgment() {
     assert!(
         ledger
             .publish_native_provider_receipt(&started, &cross_delivery, &response)
+            .is_err()
+    );
+}
+
+#[test]
+fn context_acknowledgement_and_return_are_receipt_fenced() {
+    let (_temp, ledger, work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    let published_request = publish_context_request(&ledger, &claim);
+    add_historical_provider_request(&ledger, &claim, &published_request);
+    let started = start_at(&ledger, &claim, at(1)).expect("start");
+    let delivery_receipt = DeliveryReceipt::new(
+        &started,
+        claim.route.native_session_ref.clone(),
+        digest(b"transport"),
+    )
+    .expect("delivery receipt");
+    acknowledge_at(&ledger, &started, &delivery_receipt, at(2)).expect("ack delivery");
+
+    let challenge = ledger
+        .agent_context_challenge(&wake_id)
+        .expect("context challenge");
+    let context = AgentContextReceipt {
+        schema_version: 1,
+        ownership_id: challenge.ownership_id.clone(),
+        wake_id: challenge.wake_id.clone(),
+        claim_id: challenge.claim_id.clone(),
+        head_sha: challenge.head_sha.clone(),
+        delivery_identity_digest: challenge.delivery_identity_digest.clone(),
+        reconstructed_context_digest: digest(b"resume"),
+        agent_evidence_digest: digest(b"agent evidence"),
+    };
+    let ownership = ledger
+        .acknowledge_agent_context(&challenge, &context)
+        .expect("ack context");
+    let returned = AgentReturnReceipt {
+        schema_version: 1,
+        ownership_id: ownership.challenge.ownership_id.clone(),
+        context_receipt_digest: ownership.context_receipt_digest.clone(),
+        next_checkpoint_digest: digest(b"new checkpoint"),
+        evidence_digest: digest(b"completion evidence"),
+        remote_acknowledgement_digest: digest(b"remote ack"),
+    };
+    let returned_digest = digest(&serde_json::to_vec(&returned).expect("return receipt bytes"));
+    ledger
+        .connect_read_write()
+        .expect("writer")
+        .execute_batch(
+            "CREATE TRIGGER fail_agent_return_event
+             BEFORE INSERT ON events
+             WHEN NEW.kind = 'agent_ownership_returned'
+             BEGIN SELECT RAISE(ABORT, 'simulated event failure'); END;",
+        )
+        .expect("failure trigger");
+    assert!(
+        ledger
+            .return_agent_ownership(&ownership, &returned)
+            .is_err()
+    );
+    let connection = ledger.connect_read_only().expect("ledger");
+    let rolled_back: (String, i64) = connection
+        .query_row(
+            "SELECT phase,
+                    (SELECT COUNT(*) FROM protected_objects WHERE content_digest = ?2)
+             FROM work_items WHERE id = ?1",
+            rusqlite::params![work_id, returned_digest],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("rolled-back return state");
+    assert_eq!(rolled_back, ("agent_owned_repair".to_owned(), 0));
+    drop(connection);
+    ledger
+        .connect_read_write()
+        .expect("writer")
+        .execute_batch("DROP TRIGGER fail_agent_return_event;")
+        .expect("drop failure trigger");
+    ledger
+        .return_agent_ownership(&ownership, &returned)
+        .expect("return ownership");
+
+    let phase: String = ledger
+        .connect_read_only()
+        .expect("ledger")
+        .query_row(
+            "SELECT phase FROM work_items WHERE id = ?1",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("phase");
+    assert_eq!(phase, "returned");
+    assert!(
+        ledger
+            .return_agent_ownership(&ownership, &returned)
+            .is_err()
+    );
+    assert!(
+        ledger
+            .acknowledge_agent_context(&challenge, &context)
+            .is_err()
+    );
+}
+
+#[test]
+fn context_receipt_mismatch_never_grants_ownership() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    publish_context_request(&ledger, &claim);
+    let started = start_at(&ledger, &claim, at(1)).expect("start");
+    let receipt = DeliveryReceipt::new(
+        &started,
+        claim.route.native_session_ref.clone(),
+        digest(b"transport"),
+    )
+    .expect("receipt");
+    acknowledge_at(&ledger, &started, &receipt, at(2)).expect("ack");
+    let challenge = ledger.agent_context_challenge(&wake_id).expect("challenge");
+    let mismatch = AgentContextReceipt {
+        schema_version: 1,
+        ownership_id: challenge.ownership_id.clone(),
+        wake_id: challenge.wake_id.clone(),
+        claim_id: challenge.claim_id.clone(),
+        head_sha: "ffffffffffffffffffffffffffffffffffffffff".to_owned(),
+        delivery_identity_digest: challenge.delivery_identity_digest.clone(),
+        reconstructed_context_digest: digest(b"context"),
+        agent_evidence_digest: digest(b"evidence"),
+    };
+    assert!(
+        ledger
+            .acknowledge_agent_context(&challenge, &mismatch)
             .is_err()
     );
 }
