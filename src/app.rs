@@ -98,6 +98,7 @@ mod run_cmd;
 mod runner_cmd;
 mod runner_kill_cmd;
 mod runner_provision_cmd;
+mod sandbox_audit_cmd;
 mod ship_cmd;
 mod ship_state_cmd;
 mod targets_cmd;
@@ -266,6 +267,7 @@ where
         &cli.command,
         Command::Daemon { .. }
             | Command::WriterDomainExec { .. }
+            | Command::SandboxAuditExec { .. }
             | Command::ParallelProofCanary { .. }
             | Command::ParallelProofCanaryWorker { .. }
     ) {
@@ -298,6 +300,18 @@ where
                     .unwrap_or(1)
             };
             return Ok(ExitCode::from(code));
+        }
+        Command::SandboxAuditExec {
+            work_id,
+            authority_sha,
+            command,
+        } => {
+            return sandbox_audit_cmd::sandbox_audit_exec_command(
+                &runtime_paths.state_dir,
+                &work_id,
+                &authority_sha,
+                &command,
+            );
         }
         Command::ExecutionWorker { job_id, generation } => {
             return execution_worker_command(
@@ -599,6 +613,7 @@ fn handle_operational_variant<W: Write>(
             handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
         }
         Command::WriterDomainExec { .. }
+        | Command::SandboxAuditExec { .. }
         | Command::Paths
         | Command::ExecutionWorker { .. }
         | Command::ParallelProofCanaryWorker { .. }

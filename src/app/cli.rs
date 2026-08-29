@@ -47,6 +47,19 @@ pub(super) enum Command {
         #[arg(last = true, required = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
+    /// Internal queue-idle admission wrapper for production-home sandbox audits.
+    #[command(name = "sandbox-audit-exec", hide = true)]
+    SandboxAuditExec {
+        /// Stable identity for this exact audit attempt.
+        #[arg(long)]
+        work_id: String,
+        /// Immutable source authority being audited.
+        #[arg(long)]
+        authority_sha: String,
+        /// Sandbox audit command and arguments.
+        #[arg(last = true, required = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
     /// Internal daemon-owned queue worker.
     #[command(name = "execution-worker", hide = true)]
     ExecutionWorker {
@@ -2240,6 +2253,32 @@ mod tests {
         Cli, Command, DependencyCommand, PulpDependencyCommand, RunnerCommand, WorkLedgerCommand,
         WorkLedgerPolicyCommand,
     };
+
+    #[test]
+    fn sandbox_audit_exec_requires_explicit_authority_and_child() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "sandbox-audit-exec",
+            "--work-id",
+            "audit-1",
+            "--authority-sha",
+            "a1b2c3",
+            "--",
+            "/usr/bin/true",
+        ])
+        .expect("sandbox audit command");
+        assert!(matches!(
+            cli.command,
+            Command::SandboxAuditExec {
+                work_id,
+                authority_sha,
+                command,
+            } if work_id == "audit-1"
+                && authority_sha == "a1b2c3"
+                && command == [std::ffi::OsString::from("/usr/bin/true")]
+        ));
+        assert!(Cli::try_parse_from(["shipyard", "sandbox-audit-exec"]).is_err());
+    }
 
     #[test]
     fn dependency_pulp_commands_have_an_explicit_operation() {
