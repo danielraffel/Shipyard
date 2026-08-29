@@ -371,7 +371,7 @@ impl ProviderAdapter for WorkLedgerProviderAdapter<'_> {
         {
             return preflight_refusal(ProviderWrapperOperationV1::Reconcile);
         }
-        self.run_reconciliation(fence, authority)
+        self.run_reconciliation(fence, &authority)
     }
 }
 
@@ -559,7 +559,7 @@ impl WorkLedgerProviderAdapter<'_> {
     fn run_reconciliation(
         &self,
         fence: &DeliveryFence,
-        authority: ReconciliationAuthorization,
+        authority: &ReconciliationAuthorization,
     ) -> ProviderOutcome {
         let operation = ProviderWrapperOperationV1::Reconcile;
         let Ok(request) = self.wrapper_request(fence, operation, authority.terminal_endpoint())

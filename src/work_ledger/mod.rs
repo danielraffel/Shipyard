@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -55,6 +55,8 @@ mod delivery_authority;
 mod delivery_ownership;
 #[allow(dead_code)] // Some generic adapter surfaces are exercised only by native dispatch.
 mod dispatch;
+#[allow(dead_code)] // Enabled with the cross-machine daemon transport canary.
+mod durable_custody;
 mod importer;
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -80,6 +82,15 @@ pub(crate) use dispatch::{
 };
 #[cfg(test)]
 pub(crate) use dispatch::{WakeEnvelope, WakeProfileResolver};
+#[allow(unused_imports)] // Consumed by the cross-machine transport adapter follow-up.
+pub(crate) use durable_custody::{
+    AuthenticatedCustodyControl, AuthenticatedCustodyControlReceipt, AuthenticatedCustodyReceipt,
+    AuthenticatedCustodyTransfer, AuthenticatedProcessedReceipt, CustodyControl,
+    CustodyControlReceipt, CustodyEnvelope, CustodyKind, CustodyReceipt, CustodyRelation,
+    CustodyTransfer, CustodyTransportAuthenticator, InboxAuthority, InboxClaim, ProcessedReceipt,
+    SenderClaim, authenticate_custody_control, authenticate_custody_control_receipt,
+    authenticate_custody_receipt, authenticate_custody_transfer, authenticate_processed_receipt,
+};
 mod lifecycle;
 mod native_publication;
 mod observation;
