@@ -149,7 +149,7 @@ The script runs the full pipeline on the local Mac:
 3. Signs both Mach-O binaries with `--options runtime --timestamp` (notarytool prerequisites).
 4. Packages both signed binaries into one `.dmg`, signs the DMG, submits it via `xcrun notarytool submit --wait`, and staples the accepted ticket.
 5. **Runs both binaries' `--version` from the mounted DMG locally.** If either fails, the script exits and does NOT upload. This is the whole point — the Mac running the script is the same Mac that will need to launch the binaries tomorrow.
-6. On launch success: uploads via `gh release upload --clobber`, updates `checksums.sha256`, verifies public asset visibility, and runs the `install.sh` E2E.
+6. On launch success: uploads via `gh release upload --clobber`, updates `checksums.sha256`, verifies public asset visibility, and runs the `install.sh` E2E. The enclosing release workflow then publishes GitHub build-provenance attestations for the signed/notarized DMG; non-macOS release assets are attested by the release job before the draft is created.
 7. With `--rollback-tag`, verifies baseline install, pair upgrade, and rollback in an isolated temp install directory; rollback before v0.127.0 must remove the provider companion.
 
 Running without `--upload` is the diagnostic mode (used to confirm the local signing path actually works on a given Mac). Script-helper tests under `scripts/test_*.py` ensure missing creds / bad flags / bash syntax errors all surface before the expensive build step.

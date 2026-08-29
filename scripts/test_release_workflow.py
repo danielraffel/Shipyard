@@ -69,6 +69,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('--companion-binary "${{ matrix.companion_binary }}"', text)
         self.assertIn("target/release/shipyard-workstream-provider --version", text)
 
+    def test_release_workflow_attests_every_executable_release_asset(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("attestations: write", text)
+        self.assertIn("id-token: write", text)
+        self.assertEqual(text.count("uses: actions/attest@v4"), 2)
+        self.assertIn("release/shipyard-linux-*", text)
+        self.assertIn("release/shipyard-windows-*.exe", text)
+        self.assertIn("release/shipyard-workstream-provider-linux-*", text)
+        self.assertIn("release/shipyard-workstream-provider-windows-*.exe", text)
+        self.assertIn(
+            "dist/${{ github.ref_name }}/shipyard-macos-arm64.dmg",
+            text,
+        )
+
     def test_auto_release_workflow_supports_doctor_release_chain(self) -> None:
         text = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("workflow_dispatch:", text)
