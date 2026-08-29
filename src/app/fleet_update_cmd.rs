@@ -14,7 +14,9 @@ mod evidence;
 mod release_authority;
 
 #[cfg(all(test, unix))]
-use command::{exact_asset_curl_shim, remote_pair_probe};
+use command::exact_asset_curl_shim;
+#[cfg(all(test, target_os = "macos"))]
+use command::remote_pair_probe;
 use command::{local_update_command, remote_update_command, render_host_result, render_plan};
 
 #[cfg(all(test, unix))]
