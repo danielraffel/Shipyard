@@ -130,6 +130,14 @@ because it holds the obsolete process-lifetime lease. Pre-v0.108.1 binaries do
 not participate at all; drain them and prove exact-binary fleet convergence
 before trusting the audit.
 
+If the guardian refuses before any transition because production workers are
+active, the workflow may classify that result as a safe INFRA deferral only by
+passing the complete receipt through `scripts/sandbox_admission_deferral.py`.
+The resulting marker remains valid only while the installed hash, exact
+mutation-probe path, absent lease, daemon PID, and live process start identity
+still match at both workflow checkpoints. Never treat the deferral as a test
+failure, rerun the production work, or accept a missing/null receipt field.
+
 On macOS, advisory-lock contention can briefly appear before `lsof` reports its
 holder, and a corrected daemon can briefly be the sole reported holder while it
 finishes one mutation-scoped write. The guardian may observe only those exact
