@@ -49,7 +49,13 @@ pub(super) fn terminate_sentinel_processes(
         // race: any child created before its parent dies inherited this same
         // private descriptor and appears on the next pass.
         for pid in observed.iter().rev() {
-            let _ = signal(*pid, "-KILL");
+            if Instant::now() >= deadline {
+                return SentinelCleanup {
+                    proven: false,
+                    residual_detected,
+                };
+            }
+            let _ = signal(*pid, "-KILL", deadline);
         }
         std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())));
     }
@@ -59,25 +65,36 @@ pub(super) fn terminate_sentinel_processes(
     }
 }
 
-fn signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    let status = Command::new("/bin/kill")
+fn signal(pid: u32, signal: &str, deadline: Instant) -> std::io::Result<()> {
+    let mut command = Command::new("/bin/kill");
+    command
         .args([signal, "--", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    status
+        .stderr(Stdio::null());
+    let output = crate::process::run_output_until(&mut command, deadline, "provider sentinel kill")
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    output
+        .status
         .success()
         .then_some(())
         .ok_or_else(|| std::io::Error::other(format!("could not signal process {pid}")))
 }
 
 #[cfg(target_os = "linux")]
-fn sentinel_processes(path: &Path, _deadline: Instant) -> Option<BTreeSet<u32>> {
+fn sentinel_processes(path: &Path, deadline: Instant) -> Option<BTreeSet<u32>> {
+    use std::os::unix::fs::MetadataExt;
+
+    if Instant::now() >= deadline {
+        return None;
+    }
     let expected = path.canonicalize().ok()?;
-    let current_uid = linux_effective_uid(&std::fs::read_to_string("/proc/self/status").ok()?)?;
+    let current_uid = std::fs::metadata("/proc/self").ok()?.uid();
     let mut pids = BTreeSet::new();
     for entry in std::fs::read_dir("/proc").ok()? {
+        if Instant::now() >= deadline {
+            return None;
+        }
         let entry = entry.ok()?;
         let Some(pid) = entry
             .file_name()
@@ -86,12 +103,11 @@ fn sentinel_processes(path: &Path, _deadline: Instant) -> Option<BTreeSet<u32>> 
         else {
             continue;
         };
-        let status = match std::fs::read_to_string(entry.path().join("status")) {
-            Ok(status) => status,
+        let process_uid = match entry.metadata() {
+            Ok(metadata) => metadata.uid(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return None,
         };
-        let process_uid = linux_effective_uid(&status)?;
         let same_uid = process_uid == current_uid;
         let descriptors = match std::fs::read_dir(entry.path().join("fd")) {
             Ok(descriptors) => descriptors,
@@ -99,6 +115,9 @@ fn sentinel_processes(path: &Path, _deadline: Instant) -> Option<BTreeSet<u32>> 
             Err(_) => return None,
         };
         for descriptor in descriptors {
+            if Instant::now() >= deadline {
+                return None;
+            }
             let descriptor = match descriptor {
                 Ok(descriptor) => descriptor,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound || !same_uid => continue,
@@ -115,20 +134,7 @@ fn sentinel_processes(path: &Path, _deadline: Instant) -> Option<BTreeSet<u32>> 
             }
         }
     }
-    Some(pids)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_effective_uid(status: &str) -> Option<u32> {
-    let mut values = status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))?
-        .split_whitespace();
-    let _real = values.next()?.parse::<u32>().ok()?;
-    let effective = values.next()?.parse::<u32>().ok()?;
-    let _saved = values.next()?.parse::<u32>().ok()?;
-    let _filesystem = values.next()?.parse::<u32>().ok()?;
-    values.next().is_none().then_some(effective)
+    (Instant::now() < deadline).then_some(pids)
 }
 
 #[cfg(target_os = "macos")]
@@ -152,15 +158,21 @@ fn parse_lsof_output(
     if status_code != Some(0) || stdout.is_empty() || !stderr.is_empty() {
         return None;
     }
-    let pids = std::str::from_utf8(stdout)
-        .ok()?
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::parse)
-        .collect::<Result<BTreeSet<u32>, _>>()
-        .ok()?;
-    (!pids.is_empty() && pids.iter().all(|pid| *pid != 0)).then_some(pids)
+    let body = stdout.strip_suffix(b"\n")?;
+    if body.is_empty() {
+        return None;
+    }
+    let mut pids = BTreeSet::new();
+    for line in body.split(|byte| *byte == b'\n') {
+        if line.is_empty() || line[0] == b'0' || !line.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let pid = std::str::from_utf8(line).ok()?.parse::<u32>().ok()?;
+        if pid == 0 || pid.to_string().as_bytes() != line || !pids.insert(pid) {
+            return None;
+        }
+    }
+    Some(pids)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -175,7 +187,7 @@ mod tests {
     #[test]
     fn lsof_output_accepts_only_exact_holder_or_no_match_shapes() {
         assert_eq!(
-            parse_lsof_output(Some(0), b"42\n7\n42\n", b"")
+            parse_lsof_output(Some(0), b"42\n7\n", b"")
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
@@ -187,6 +199,12 @@ mod tests {
             (Some(0), b"".as_slice(), b"".as_slice()),
             (Some(0), b"\n".as_slice(), b"".as_slice()),
             (Some(0), b"0\n".as_slice(), b"".as_slice()),
+            (Some(0), b"042\n".as_slice(), b"".as_slice()),
+            (Some(0), b" 42\n".as_slice(), b"".as_slice()),
+            (Some(0), b"42 \n".as_slice(), b"".as_slice()),
+            (Some(0), b"42\n\n".as_slice(), b"".as_slice()),
+            (Some(0), b"42".as_slice(), b"".as_slice()),
+            (Some(0), b"42\n42\n".as_slice(), b"".as_slice()),
             (Some(0), b"invalid\n".as_slice(), b"".as_slice()),
             (Some(0), b"42\n".as_slice(), b"warning".as_slice()),
             (Some(1), b"42\n".as_slice(), b"".as_slice()),
@@ -198,27 +216,6 @@ mod tests {
                 parse_lsof_output(status, stdout, stderr).is_none(),
                 "accepted status={status:?}, stdout={stdout:?}, stderr={stderr:?}"
             );
-        }
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::linux_effective_uid;
-
-    #[test]
-    fn proc_status_requires_one_complete_uid_row() {
-        assert_eq!(
-            linux_effective_uid("Name:\twrapper\nUid:\t501\t502\t503\t504\n"),
-            Some(502)
-        );
-        for status in [
-            "Name:\twrapper\n",
-            "Uid:\t501\t502\t503\n",
-            "Uid:\t501\t502\t503\t504\t505\n",
-            "Uid:\t501\tinvalid\t503\t504\n",
-        ] {
-            assert_eq!(linux_effective_uid(status), None);
         }
     }
 }
