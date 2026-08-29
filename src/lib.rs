@@ -99,6 +99,8 @@ pub mod parallel_proof_canary_controller;
 pub mod parallel_proof_canary_driver;
 /// Immutable measurement receipts for the default-off Pulp macOS sharding canary.
 pub mod parallel_proof_canary_receipt;
+/// Authenticated companion protocol for read-only remote M1 cache observation.
+pub mod parallel_proof_canary_remote_cache;
 /// Default-off one-host build-once consumption proof for the Pulp M3 shadow canary.
 pub mod parallel_proof_one_host;
 /// Filesystem path resolution for isolated and compatible modes.

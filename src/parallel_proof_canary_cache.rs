@@ -22,13 +22,14 @@ use crate::parallel_proof::{Sha256Digest, StoreWriteOutcome};
 use crate::parallel_proof_canary::{
     CanaryCacheGeneration, INITIAL_BUILDER, INITIAL_WORKER, PulpMacCanaryPolicy,
 };
+use crate::parallel_proof_canary_remote_cache::RemoteM1CacheAuthorityReceipt;
 
 /// Current immutable cache manifest schema.
 pub const CACHE_GENERATION_MANIFEST_SCHEMA: u32 = 1;
 /// Current host cache-observation schema.
-pub const CACHE_GENERATION_OBSERVATION_SCHEMA: u32 = 1;
+pub const CACHE_GENERATION_OBSERVATION_SCHEMA: u32 = 2;
 /// Current paired M3/M1 evidence schema.
-pub const PULP_MAC_CACHE_EVIDENCE_SCHEMA: u32 = 1;
+pub const PULP_MAC_CACHE_EVIDENCE_SCHEMA: u32 = 2;
 
 const MAX_CACHE_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
@@ -197,6 +198,18 @@ impl CacheGenerationProbeSpec {
     pub fn generation(&self) -> &CanaryCacheGeneration {
         &self.expected_manifest.generation
     }
+
+    pub(crate) fn host_observation_sha256(&self) -> &Sha256Digest {
+        &self.host_observation_sha256
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn expected_manifest(&self) -> &CacheGenerationManifest {
+        &self.expected_manifest
+    }
 }
 
 /// Immutable point-in-time proof of an exact cache tree on one host.
@@ -220,6 +233,10 @@ pub struct CacheGenerationObservationReceipt {
     pub manifest: CacheGenerationManifest,
     /// Digest of the complete manifest.
     pub manifest_sha256: Sha256Digest,
+    /// Authenticated companion/transport authority. Required for M1 and
+    /// forbidden for the local M3 observer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_authority: Option<RemoteM1CacheAuthorityReceipt>,
     /// Routine observation uses no model.
     pub model_calls: u64,
 }
@@ -236,6 +253,26 @@ impl CacheGenerationObservationReceipt {
             || self.manifest.digest()? != self.manifest_sha256
             || self.probe_elapsed_ms == 0
             || self.model_calls != 0
+            || match self.remote_authority.as_ref() {
+                Some(authority) => {
+                    self.host_id != INITIAL_WORKER
+                        || authority.validate().is_err()
+                        || authority.authority.host_observation_sha256
+                            != self.host_observation_sha256
+                        || authority.authority.observed_at_ms > self.observed_at_ms
+                        || !matches!(
+                            authority.binds_cache_observation(
+                                &self.host_observation_sha256,
+                                &self.cache_root,
+                                &self.manifest,
+                                self.observed_at_ms,
+                                self.probe_elapsed_ms,
+                            ),
+                            Ok(true)
+                        )
+                }
+                None => self.host_id == INITIAL_WORKER,
+            }
         {
             return Err(CacheObserverError::Invalid(
                 "cache generation observation receipt".to_owned(),
@@ -376,6 +413,7 @@ impl CacheGenerationObserver for LocalCacheGenerationObserver {
                 .to_owned(),
             manifest_sha256: actual.digest()?,
             manifest: actual,
+            remote_authority: None,
             model_calls: 0,
         };
         receipt.validate()?;
@@ -472,6 +510,42 @@ impl PulpMacCacheProbeEvidence {
                 .is_ok_and(|digest| digest.as_ref() == Some(builder_host_observation_sha256))
             && role_host_digest(&self.worker, &policy.required_cache_generations)
                 .is_ok_and(|digest| digest.as_ref() == Some(worker_host_observation_sha256))
+    }
+
+    /// Return the singleton authenticated remote M1 authority when it binds
+    /// the exact host receipt and current readiness assessment.
+    #[must_use]
+    pub fn remote_worker_authority(
+        &self,
+        policy: &PulpMacCanaryPolicy,
+        worker_host_observation_sha256: &Sha256Digest,
+        artifact_bytes_total: u64,
+    ) -> Option<&RemoteM1CacheAuthorityReceipt> {
+        if self.validate(policy).is_err() || self.worker.is_empty() {
+            return None;
+        }
+        let mut authorities = self
+            .worker
+            .iter()
+            .filter_map(|receipt| receipt.remote_authority.as_ref());
+        let authority = authorities.next()?;
+        if !authority.proves(
+            worker_host_observation_sha256,
+            artifact_bytes_total,
+            policy.assessed_at_ms,
+            policy.maximum_observation_age_ms,
+        ) || authorities.any(|candidate| {
+            !candidate.has_same_controller_fence(authority)
+                || !candidate.proves(
+                    worker_host_observation_sha256,
+                    artifact_bytes_total,
+                    policy.assessed_at_ms,
+                    policy.maximum_observation_age_ms,
+                )
+        }) {
+            return None;
+        }
+        Some(authority)
     }
 
     /// Domain-separated digest of the validated evidence.
@@ -831,6 +905,8 @@ fn validate_receipt_bindings(
                 || receipt.host_observation_sha256 != spec.host_observation_sha256
                 || receipt.manifest != spec.expected_manifest
                 || receipt.cache_root != spec.root.to_str().unwrap_or_default()
+                || (spec.host_id == INITIAL_WORKER && receipt.remote_authority.is_none())
+                || (spec.host_id == INITIAL_BUILDER && receipt.remote_authority.is_some())
         })
     {
         return Err(CacheObserverError::Invalid(
@@ -888,6 +964,13 @@ fn validate_role_receipts(
             if receipt.host_id != host_id || stale {
                 return Err(CacheObserverError::Invalid(
                     "cache observation host or freshness fence".to_owned(),
+                ));
+            }
+            if (host_id == INITIAL_WORKER && receipt.remote_authority.is_none())
+                || (host_id == INITIAL_BUILDER && receipt.remote_authority.is_some())
+            {
+                return Err(CacheObserverError::Invalid(
+                    "cache observation transport authority".to_owned(),
                 ));
             }
             Ok(receipt.manifest.generation.clone())
@@ -1178,6 +1261,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::parallel_proof_canary::{CanaryRoute, CanaryStagingClass};
+    use crate::parallel_proof_canary_remote_cache::{
+        RemoteM1CacheAuthority, test_remote_authority_receipt,
+    };
 
     fn persistent_temp() -> TempDir {
         tempfile::Builder::new()
@@ -1208,21 +1295,51 @@ mod tests {
         Sha256Digest::of_bytes(format!("host:{host_id}").as_bytes())
     }
 
+    fn remote_authority(observed_at_ms: u64) -> RemoteM1CacheAuthority {
+        RemoteM1CacheAuthority {
+            host_id: "m1".to_owned(),
+            host_observation_sha256: host_digest("m1"),
+            host_session_generation: 7,
+            route: CanaryRoute::Lan,
+            capabilities: vec!["macos-arm64".to_owned()],
+            staging_root: "/Users/test/shipyard-staging".to_owned(),
+            staging_class: CanaryStagingClass::Persistent,
+            free_bytes: 10,
+            artifact_bytes_total: 1,
+            minimum_reserve_bytes: 1,
+            terminal_instance_sha256: Sha256Digest::of_bytes(b"terminal"),
+            companion_executable_sha256: Sha256Digest::of_bytes(b"companion"),
+            observed_at_ms,
+            model_calls: 0,
+        }
+    }
+
     fn receipt(
         host_id: &str,
         root: &Path,
         manifest: CacheGenerationManifest,
         observed_at_ms: u64,
     ) -> CacheGenerationObservationReceipt {
+        let cache_root = root.to_str().unwrap().to_owned();
+        let remote_authority = (host_id == "m1").then(|| {
+            test_remote_authority_receipt(
+                remote_authority(observed_at_ms),
+                &cache_root,
+                &manifest,
+                observed_at_ms,
+                1,
+            )
+        });
         CacheGenerationObservationReceipt {
             schema_version: CACHE_GENERATION_OBSERVATION_SCHEMA,
             host_id: host_id.to_owned(),
             host_observation_sha256: host_digest(host_id),
             observed_at_ms,
             probe_elapsed_ms: 1,
-            cache_root: root.to_str().unwrap().to_owned(),
+            cache_root,
             manifest_sha256: manifest.digest().unwrap(),
             manifest,
+            remote_authority,
             model_calls: 0,
         }
     }
@@ -1417,6 +1534,39 @@ mod tests {
             Err(CacheObserverError::ImmutableConflict(key)) if key == "cache-proof-1"
         ));
         assert_eq!(observer.calls, ["m3", "m1"]);
+    }
+
+    #[test]
+    fn remote_authority_accepts_manifest_specific_transport_receipts() {
+        let root = cache_tree();
+        let first = produce_cache_generation_manifest(root.path(), "first", "v1").unwrap();
+        let second = produce_cache_generation_manifest(root.path(), "second", "v1").unwrap();
+        let policy = PulpMacCanaryPolicy {
+            enabled: true,
+            assessed_at_ms: 1_000,
+            maximum_observation_age_ms: 100,
+            required_cache_generations: vec![first.generation.clone(), second.generation.clone()],
+            ..PulpMacCanaryPolicy::default()
+        };
+        let evidence = PulpMacCacheProbeEvidence {
+            schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,
+            correlation_id: "multi-generation-authority".to_owned(),
+            assessed_at_ms: 1_000,
+            builder: vec![
+                receipt("m3", root.path(), first.clone(), 990),
+                receipt("m3", root.path(), second.clone(), 991),
+            ],
+            worker: vec![
+                receipt("m1", root.path(), first, 995),
+                receipt("m1", root.path(), second, 996),
+            ],
+            model_calls: 0,
+        };
+
+        let authority = evidence
+            .remote_worker_authority(&policy, &host_digest("m1"), 1)
+            .expect("each manifest-bound transport may differ under one controller fence");
+        assert_eq!(authority.authority.host_session_generation, 7);
     }
 
     #[test]

@@ -1718,9 +1718,12 @@ terminal evidence at the durable floor.
 identities from the complete read-only no-follow tree inventory; a directory
 name or `claimed_bytes_avoided` is not evidence. Probe all required M3
 generations before M1, require exact policy inventory and freshness on both,
-and persist paired zero-model evidence without overwrite. This proof does not
-authorize cache mutation or substitute for session, LAN-route, capability,
-staging, reserve, transfer, or execution fences. See
+and persist paired zero-model evidence without overwrite. Remote M1 proof must
+cross the protected digest-pinned companion transport and bind exact
+host/session/direct-LAN/capability/staging/reserve/terminal/manifest authority
+plus carrier-origin byte, digest, and monotonic timing counters. Never fall
+back to direct SSH/config. The proof supplies no authority beyond its exact
+receipt and never authorizes cache mutation or canary execution. See
 `docs/pulp-mac-cache-readiness.md`.
 
 **Detached daemon temp roots must not depend on the launching shell.** A daemon

@@ -19,6 +19,16 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
+        (Some(flag), None) if flag == "--observe-m1-cache" => {
+            match shipyard::parallel_proof_canary_remote_cache::run_remote_m1_cache_observer_stdio()
+            {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("shipyard-workstream-provider: {error}");
+                    std::process::ExitCode::from(2)
+                }
+            }
+        }
         (None, None) => match shipyard::workstream_provider_adapter::run_stdio() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(error) => {

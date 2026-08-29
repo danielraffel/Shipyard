@@ -492,6 +492,16 @@ fn verify_current_companion(request: &ProviderWrapperRequestV1) -> Result<(), St
     verify_executable(&current, &request.subrouter_routing.companion_sha256)
 }
 
+/// Reuse the companion's pinned executable verification for auxiliary strict
+/// read-only protocols shipped in the same paired binary.
+pub(crate) fn verify_current_companion_digest(
+    expected_digest: &crate::parallel_proof::Sha256Digest,
+) -> Result<(), String> {
+    let current =
+        std::env::current_exe().map_err(|_| "companion-identity-unavailable".to_owned())?;
+    verify_executable(&current, expected_digest.as_str())
+}
+
 fn read_pinned_file(
     path: &Path,
     expected_digest: Option<&str>,
