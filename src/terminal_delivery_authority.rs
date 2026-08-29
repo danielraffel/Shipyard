@@ -74,11 +74,33 @@ pub(crate) fn observe_provider_on_cmux_surface(
     for pid in candidate_agent_pids(provider_kind)? {
         let target = resolve_pid(cli_path, socket_path, pid)
             .map_err(|_| TerminalCapabilityRefusal::Unobservable)?;
-        if target.surface_id == surface_id {
+        if target.surface_id == surface_id && process_has_argument(pid, native_session_id)? {
             return Ok(ProviderProcessPresence::Present);
         }
     }
     Ok(ProviderProcessPresence::Absent)
+}
+
+#[cfg(target_os = "macos")]
+fn process_has_argument(pid: u32, expected: &str) -> Result<bool, TerminalCapabilityRefusal> {
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .env_clear();
+    let output = crate::process::run_output_until(
+        &mut command,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+        "terminal provider argv",
+    )
+    .map_err(|_| TerminalCapabilityRefusal::Unobservable)?;
+    if !output.status.success() || output.stdout.len() > 64 * 1024 {
+        return Err(TerminalCapabilityRefusal::Unobservable);
+    }
+    let command = std::str::from_utf8(&output.stdout)
+        .map_err(|_| TerminalCapabilityRefusal::InvalidResponse)?;
+    Ok(command
+        .split_ascii_whitespace()
+        .any(|value| value == expected))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -847,5 +869,23 @@ mod tests {
         assert!(native_session_matches(&value, "native", "codex"));
         value["resume_binding"]["kind"] = serde_json::json!("claude");
         assert!(!native_session_matches(&value, "native", "codex"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_process_presence_requires_the_exact_native_session_argument() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "while :; do sleep 1; done",
+                "shipyard-route-test",
+                "native-session-exact",
+            ])
+            .spawn()
+            .expect("spawn argument fixture");
+        assert!(process_has_argument(child.id(), "native-session-exact").unwrap());
+        assert!(!process_has_argument(child.id(), "other-session").unwrap());
+        child.kill().expect("stop argument fixture");
+        child.wait().expect("reap argument fixture");
     }
 }
