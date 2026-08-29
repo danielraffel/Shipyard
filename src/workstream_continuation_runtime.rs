@@ -554,6 +554,20 @@ impl WorkstreamContinuationRuntime {
     }
 }
 
+// Windows does not start this daemon lane yet, but keep the complete runtime
+// compile-checked there instead of hiding platform drift behind dead-code
+// allowances. This uncalled function roots construction and a complete tick
+// for strict cross-target linting without executing either.
+#[cfg(not(unix))]
+fn compile_check_unsupported_runtime(state_dir: PathBuf) {
+    let mut runtime = WorkstreamContinuationRuntime::for_daemon(RuntimeMode::Shipyard, state_dir);
+    runtime.tick();
+    drop(runtime.status());
+}
+
+#[cfg(not(unix))]
+const _: fn(PathBuf) = compile_check_unsupported_runtime;
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

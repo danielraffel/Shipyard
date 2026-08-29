@@ -17,7 +17,9 @@ fn ledger_with_work() -> (TempDir, WorkLedger, String) {
 fn unsupported_production_platform_uses_test_only_storage_backend() {
     use crate::work_ledger::protected_objects::PRODUCTION_PROTECTED_OBJECT_STORAGE_SUPPORTED;
 
-    assert!(!PRODUCTION_PROTECTED_OBJECT_STORAGE_SUPPORTED);
+    assert!(!std::hint::black_box(
+        PRODUCTION_PROTECTED_OBJECT_STORAGE_SUPPORTED
+    ));
     let (temp, ledger, work_id) = ledger_with_work();
     assert_eq!(
         ledger.status().expect("absent storage").protected_objects,

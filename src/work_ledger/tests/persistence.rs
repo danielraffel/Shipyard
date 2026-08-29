@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::work_ledger::route::OpaqueRef;
 
 fn install_exact_v4_schema(connection: &Connection) {

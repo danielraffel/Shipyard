@@ -86,7 +86,7 @@ enum RootAuthority {
     #[cfg(test)]
     Inspection {
         mode: RuntimeMode,
-        paths: RuntimePaths,
+        paths: Box<RuntimePaths>,
     },
 }
 
@@ -240,7 +240,7 @@ impl WorkstreamActivationLoader {
                 RuntimePaths::for_platform(*platform, home, RuntimeMode::Shipyard)
             }
             #[cfg(test)]
-            RootAuthority::Inspection { paths, .. } => paths.clone(),
+            RootAuthority::Inspection { paths, .. } => paths.as_ref().clone(),
         }
     }
 
@@ -296,7 +296,7 @@ impl WorkstreamActivationLoader {
         Self {
             root_authority: RootAuthority::Inspection {
                 mode,
-                paths: paths.clone(),
+                paths: Box::new(paths.clone()),
             },
             initial_roots: paths,
             baseline: None,
