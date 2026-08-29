@@ -55,12 +55,6 @@ pub(crate) struct TerminalAuthorityObservation {
     pub(crate) native_session_id: String,
     /// Exact endpoint on which the terminal evidence was observed.
     pub(crate) mutation_endpoint: TerminalMutationEndpoint,
-    pub(crate) source_work_generation: u64,
-    pub(crate) source_owner_generation: u64,
-    pub(crate) target_work_generation: u64,
-    pub(crate) target_owner_generation: u64,
-    /// True only when the verifier observed a source+target generation CAS.
-    pub(crate) transactionally_rebound: bool,
     pub(crate) observed_at: DateTime<Utc>,
 }
 
@@ -168,8 +162,19 @@ impl DeliveryAuthorization {
         &self.terminal_instance
     }
 
-    pub(crate) fn into_mutation_endpoint(self) -> TerminalMutationEndpoint {
-        self.mutation_endpoint
+    pub(crate) fn into_mutation_endpoint_for(
+        self,
+        work_generation: u64,
+        owner_generation: u64,
+    ) -> Result<TerminalMutationEndpoint, DeliveryAuthorityRefusal> {
+        if self.source_work_generation != work_generation
+            || self.source_owner_generation != owner_generation
+            || self.target_work_generation != work_generation
+            || self.target_owner_generation != owner_generation
+        {
+            return Err(DeliveryAuthorityRefusal::GenerationMismatch);
+        }
+        Ok(self.mutation_endpoint)
     }
 
     #[cfg(test)]
@@ -264,9 +269,7 @@ fn verify_delivery_authority_inner<P: DeliveryAuthorityProbe>(
     if terminal.requested_terminal_instance != expected.requested_terminal_instance {
         return Err(DeliveryAuthorityRefusal::TerminalInstanceMismatch);
     }
-    if terminal.actual_terminal_instance != expected.requested_terminal_instance
-        && !terminal.transactionally_rebound
-    {
+    if terminal.actual_terminal_instance != expected.requested_terminal_instance {
         return Err(DeliveryAuthorityRefusal::TerminalInstanceMismatch);
     }
     let terminal_age = fixed_now
@@ -285,32 +288,16 @@ fn verify_delivery_authority_inner<P: DeliveryAuthorityProbe>(
     if terminal.native_session_id != expected.native_session_id {
         return Err(DeliveryAuthorityRefusal::NativeSessionMismatch);
     }
-    let observed_generations = (
-        terminal.source_work_generation,
-        terminal.source_owner_generation,
-        terminal.target_work_generation,
-        terminal.target_owner_generation,
-    );
-    let expected_generations = (
-        expected.source_work_generation,
-        expected.source_owner_generation,
-        expected.target_work_generation,
-        expected.target_owner_generation,
-    );
-    if observed_generations != expected_generations {
-        return Err(DeliveryAuthorityRefusal::GenerationMismatch);
-    }
-
     Ok(DeliveryAuthorization {
         github_receipt_digest: digest(&receipt),
         terminal_instance: terminal.actual_terminal_instance,
         process: terminal.process,
         native_session_id: terminal.native_session_id,
         mutation_endpoint: terminal.mutation_endpoint,
-        source_work_generation: terminal.source_work_generation,
-        source_owner_generation: terminal.source_owner_generation,
-        target_work_generation: terminal.target_work_generation,
-        target_owner_generation: terminal.target_owner_generation,
+        source_work_generation: expected.source_work_generation,
+        source_owner_generation: expected.source_owner_generation,
+        target_work_generation: expected.target_work_generation,
+        target_owner_generation: expected.target_owner_generation,
     })
 }
 

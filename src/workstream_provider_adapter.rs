@@ -30,9 +30,6 @@ use crate::provider_wrapper::{
     ProviderWrapperOutcomeV1, ProviderWrapperRequestV1, ProviderWrapperResponseV1, UnknownV1,
     validate_request,
 };
-use crate::terminal_delivery_authority::{
-    ProviderProcessPresence, observe_provider_on_cmux_surface,
-};
 use crate::workstream_continuation_config::ProviderWrapperConfig;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -47,10 +44,6 @@ const COMMAND_DEADLINE: Duration = Duration::from_secs(15);
 const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_millis(50);
-#[cfg(not(test))]
-const PROVIDER_ABSENCE_STABILIZATION: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const PROVIDER_ABSENCE_STABILIZATION: Duration = Duration::ZERO;
 
 /// Read one strict request from stdin and emit exactly one strict response.
 pub fn run_stdio() -> Result<(), String> {
@@ -153,12 +146,6 @@ trait CmuxRunner {
     ) -> Result<PrivateLaunch, &'static str>;
     fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure>;
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure>;
-    fn provider_process_presence(
-        &mut self,
-        surface_id: &str,
-        native_session_id: &str,
-        provider_id: &str,
-    ) -> Result<ProviderProcessPresence, RunnerFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,23 +195,6 @@ impl CmuxRunner for ProductionCmuxRunner {
             success: output.status.success(),
             stdout: output.stdout,
         })
-    }
-
-    fn provider_process_presence(
-        &mut self,
-        surface_id: &str,
-        native_session_id: &str,
-        provider_id: &str,
-    ) -> Result<ProviderProcessPresence, RunnerFailure> {
-        let endpoint = self.endpoint.as_ref().ok_or(RunnerFailure::Unavailable)?;
-        observe_provider_on_cmux_surface(
-            &endpoint.executable_path,
-            &endpoint.socket_path,
-            surface_id,
-            native_session_id,
-            provider_id,
-        )
-        .map_err(|_| RunnerFailure::Unavailable)
     }
 }
 
@@ -286,13 +256,6 @@ fn handle_request(
         };
         return response(request, outcome);
     }
-    if let Err(code) = runner.verify_subrouter(request) {
-        let outcome = match request.operation {
-            ProviderWrapperOperationV1::Submit => rejected(code),
-            ProviderWrapperOperationV1::Reconcile => uncertain(code),
-        };
-        return response(request, outcome);
-    }
     match runner.bind(&request.cmux_endpoint) {
         #[cfg(any(target_os = "macos", test))]
         Err(RunnerFailure::Untrusted) => {
@@ -339,6 +302,13 @@ fn handle_request(
     }
     if request.operation == ProviderWrapperOperationV1::Reconcile {
         return response(request, uncertain("reconcile-visibility-not-yet-proven"));
+    }
+
+    // Exact executable bytes are launch authority, not observation authority.
+    // Reconciliation above must remain able to prove an already accepted
+    // session after the configured Subrouter binary has moved or upgraded.
+    if let Err(code) = runner.verify_subrouter(request) {
+        return response(request, rejected(code));
     }
 
     let private_launch = match runner.prepare_private_launch(request) {
@@ -425,92 +395,15 @@ fn reconcile_existing_workspace(
     workspace_id: &str,
     description: &str,
 ) -> ProviderWrapperOutcomeV1 {
-    let state = match session_bindings_for_workspace(runner, workspace_id, &request.provider_id) {
-        Ok(state) => state,
+    let bindings = match session_bindings_for_workspace(runner, workspace_id, &request.provider_id)
+    {
+        Ok(bindings) => bindings,
         Err(code) => return uncertain(code),
     };
-    match state.bindings.as_slice() {
+    match bindings.as_slice() {
         [binding] => delivered(request, workspace_id, description, binding),
-        [] if request.operation == ProviderWrapperOperationV1::Reconcile
-            && state.surface_ids.len() == 1 =>
-        {
-            match stable_provider_process_presence(
-                runner,
-                &state.surface_ids[0],
-                &request.protected_route.native_session_id,
-                &request.provider_id,
-            ) {
-                Ok(ProviderProcessPresence::Absent) => {
-                    recover_existing_surface(request, runner, workspace_id, &state.surface_ids[0])
-                }
-                Ok(ProviderProcessPresence::Present) => {
-                    uncertain("cmux-provider-process-live-without-binding")
-                }
-                Err(_) => uncertain("cmux-provider-process-presence-unavailable"),
-            }
-        }
         [] => uncertain("cmux-session-binding-not-yet-visible"),
         _ => uncertain("multiple-provider-session-bindings"),
-    }
-}
-
-fn stable_provider_process_presence(
-    runner: &mut impl CmuxRunner,
-    surface_id: &str,
-    native_session_id: &str,
-    provider_id: &str,
-) -> Result<ProviderProcessPresence, RunnerFailure> {
-    for observation in 0..3 {
-        match runner.provider_process_presence(surface_id, native_session_id, provider_id)? {
-            ProviderProcessPresence::Present => return Ok(ProviderProcessPresence::Present),
-            ProviderProcessPresence::Absent if observation < 2 => {
-                std::thread::sleep(PROVIDER_ABSENCE_STABILIZATION);
-            }
-            ProviderProcessPresence::Absent => return Ok(ProviderProcessPresence::Absent),
-        }
-    }
-    Err(RunnerFailure::Unavailable)
-}
-
-fn recover_existing_surface(
-    request: &ProviderWrapperRequestV1,
-    runner: &mut impl CmuxRunner,
-    workspace_id: &str,
-    surface_id: &str,
-) -> ProviderWrapperOutcomeV1 {
-    let private_launch = match runner.prepare_private_launch(request) {
-        Ok(launch) => launch,
-        Err(code) => return uncertain(code),
-    };
-    let mut args = cmux_prefix(["respawn-pane"]);
-    args.extend([
-        "--workspace".to_owned(),
-        workspace_id.to_owned(),
-        "--surface".to_owned(),
-        surface_id.to_owned(),
-        "--command".to_owned(),
-        private_launch.command.clone(),
-    ]);
-    let result = runner.run(&args);
-    if !private_launch.wait_until_consumed(PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE) {
-        return uncertain("cmux-private-relaunch-not-consumed");
-    }
-    match result {
-        Ok(result) if result.success => {}
-        Ok(_) | Err(_) => return uncertain("cmux-respawn-outcome-unknown"),
-    }
-    match session_binding_for_surface(runner, workspace_id, surface_id, &request.provider_id) {
-        Ok(Some(binding)) => delivered(
-            request,
-            workspace_id,
-            &format!(
-                "shipyard-workstream-delivery:{}",
-                request.delivery_fence.idempotency_key
-            ),
-            &binding,
-        ),
-        Ok(None) => uncertain("cmux-session-binding-not-yet-visible-after-respawn"),
-        Err(code) => uncertain(code),
     }
 }
 
@@ -627,13 +520,16 @@ struct PrivateLaunch {
 impl Drop for PrivateLaunch {
     fn drop(&mut self) {
         match std::fs::remove_file(&self.route_path) {
-            Ok(()) => {}
+            Ok(()) => {
+                let _ = std::fs::remove_file(&self.executable_path);
+                if let Some(parent) = self.route_path.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+            // A consumed production launch opened the snapshot by descriptor and
+            // unlinked both capsule files before exec. Never race that descriptor.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return,
-        }
-        let _ = std::fs::remove_file(&self.executable_path);
-        if let Some(parent) = self.route_path.parent() {
-            let _ = std::fs::remove_dir(parent);
+            Err(_) => {}
         }
     }
 }
@@ -655,6 +551,7 @@ impl PrivateLaunch {
 fn launch_command(
     request: &ProviderWrapperRequestV1,
     executable_path: &Path,
+    wait_for_child_cleanup: bool,
 ) -> Result<String, &'static str> {
     let prompt = format!(
         "Resume tracked workstream {}. First run `shipyard --json work-ledger context-challenge --wake {}` and reconstruct that exact durable context. Write the matching receipt to a private file, then run `shipyard --json work-ledger acknowledge-context --wake {} --receipt <private-path>`. Complete the remaining work and keep Linear current. Before handoff, run `shipyard --json work-ledger return-challenge --ownership <ownership-id>`, write separate reviewed expectation and receipt files proving a newer checkpoint, evidence, and remote acknowledgement, then run `shipyard --json work-ledger return-ownership --ownership <ownership-id> --expectation <private-path> --receipt <private-path>`. Never put receipt JSON or secrets in argv.",
@@ -682,7 +579,18 @@ fn launch_command(
             .collect::<Result<Vec<_>, _>>()?,
     );
     invocation.push(shell_word(&prompt)?);
-    lines.push(format!("exec {}", invocation.join(" ")));
+    if wait_for_child_cleanup {
+        // The production snapshot must remain named while the provider is
+        // running. Keep this shell as its parent so the installed trap removes
+        // the snapshot and capsule directory after every normal/signal exit.
+        lines.push("set +e".to_owned());
+        lines.push(invocation.join(" "));
+        lines.push("provider_status=$?".to_owned());
+        lines.push("set -e".to_owned());
+        lines.push("exit \"$provider_status\"".to_owned());
+    } else {
+        lines.push(format!("exec {}", invocation.join(" ")));
+    }
     Ok(lines.join("\n"))
 }
 
@@ -696,13 +604,31 @@ fn prepare_private_launch(
         .map_err(|_| "private-launch-directory-unavailable")?;
     let directory_path = directory.path().to_path_buf();
     let executable_path = directory_path.join("subrouter");
-    let launch_executable = if snapshot_executable {
+    let (launch_executable, prologue) = if snapshot_executable {
         snapshot_subrouter(request, &executable_path)?;
-        executable_path.as_path()
+        let executable_word = shell_word(
+            executable_path
+                .to_str()
+                .ok_or("private-launch-path-invalid")?,
+        )?;
+        let directory_word = shell_word(
+            directory_path
+                .to_str()
+                .ok_or("private-launch-path-invalid")?,
+        )?;
+        (
+            executable_path.as_path(),
+            format!(
+                "#!/bin/sh\nset -eu\nrm -f -- \"$0\"\ncleanup() {{ rm -f -- {executable_word}; rmdir -- {directory_word} 2>/dev/null || :; }}\ntrap cleanup EXIT HUP INT TERM\n"
+            ),
+        )
     } else {
-        Path::new(&request.protected_route.argv[0])
+        (
+            Path::new(&request.protected_route.argv[0]),
+            "#!/bin/sh\nset -eu\nrm -f -- \"$0\"\n".to_owned(),
+        )
     };
-    let body = launch_command(request, launch_executable)?;
+    let body = launch_command(request, launch_executable, snapshot_executable)?;
     let route_path = directory_path.join("launch.sh");
     let mut route = OpenOptions::new()
         .create_new(true)
@@ -710,12 +636,6 @@ fn prepare_private_launch(
         .mode(0o600)
         .open(&route_path)
         .map_err(|_| "private-launch-file-unavailable")?;
-    let directory_word = shell_word(
-        directory_path
-            .to_str()
-            .ok_or("private-launch-path-invalid")?,
-    )?;
-    let prologue = format!("#!/bin/sh\nset -eu\nroute_dir={directory_word}\nrm -f -- \"$0\"\n");
     route
         .write_all(prologue.as_bytes())
         .and_then(|()| route.write_all(body.as_bytes()))
@@ -872,16 +792,11 @@ struct SurfaceResumeEvidence {
     resume_binding: Option<AgentSessionBinding>,
 }
 
-struct WorkspaceSessionState {
-    surface_ids: Vec<String>,
-    bindings: Vec<AgentSessionBinding>,
-}
-
 fn session_bindings_for_workspace(
     runner: &mut impl CmuxRunner,
     workspace_id: &str,
     provider_id: &str,
-) -> Result<WorkspaceSessionState, &'static str> {
+) -> Result<Vec<AgentSessionBinding>, &'static str> {
     let mut args = cmux_prefix(["surface-health"]);
     args.extend(["--workspace".to_owned(), workspace_id.to_owned()]);
     let result = runner
@@ -913,10 +828,7 @@ fn session_bindings_for_workspace(
             bindings.push(binding);
         }
     }
-    Ok(WorkspaceSessionState {
-        surface_ids,
-        bindings,
-    })
+    Ok(bindings)
 }
 
 fn session_binding_for_surface(

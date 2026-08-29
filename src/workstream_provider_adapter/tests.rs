@@ -34,13 +34,12 @@ fn native_absolute_test_path(leaf: &str) -> String {
 
 #[derive(Default)]
 struct FakeRunner {
+    subrouter_verification: Option<Result<(), &'static str>>,
     verification: Option<Result<(), RunnerFailure>>,
     bound_endpoints: Vec<CmuxEndpointV1>,
     results: VecDeque<Result<CommandResult, RunnerFailure>>,
     calls: Vec<Vec<String>>,
     private_launches: Vec<String>,
-    provider_process_presence: Option<Result<ProviderProcessPresence, RunnerFailure>>,
-    presence_calls: usize,
 }
 
 fn private_launch_path(command: &str) -> Option<PathBuf> {
@@ -54,7 +53,7 @@ impl CmuxRunner for FakeRunner {
         &mut self,
         _request: &ProviderWrapperRequestV1,
     ) -> Result<(), &'static str> {
-        Ok(())
+        self.subrouter_verification.take().unwrap_or(Ok(()))
     }
 
     fn prepare_private_launch(
@@ -86,18 +85,6 @@ impl CmuxRunner for FakeRunner {
             }
         }
         result
-    }
-
-    fn provider_process_presence(
-        &mut self,
-        _surface_id: &str,
-        _native_session_id: &str,
-        _provider_id: &str,
-    ) -> Result<ProviderProcessPresence, RunnerFailure> {
-        self.presence_calls += 1;
-        self.provider_process_presence
-            .take()
-            .unwrap_or(Ok(ProviderProcessPresence::Absent))
     }
 }
 
@@ -323,7 +310,6 @@ fn workspace_created_before_agent_hook_session_is_not_accepted() {
             surface_health(&[SURFACE_UUID]),
             session_evidence(None),
         ]),
-        provider_process_presence: Some(Ok(ProviderProcessPresence::Present)),
         ..FakeRunner::default()
     };
 
@@ -334,10 +320,29 @@ fn workspace_created_before_agent_hook_session_is_not_accepted() {
         ProviderWrapperOutcomeV1::Uncertain { .. }
     ));
     assert_eq!(runner.calls.len(), 4);
-    assert_eq!(runner.presence_calls, 1);
     assert!(runner.calls.iter().all(|call| {
         call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
     }));
+}
+
+#[test]
+fn reconciliation_of_existing_session_does_not_require_launch_executable() {
+    let request = request("codex", ProviderWrapperOperationV1::Reconcile);
+    let mut runner = FakeRunner {
+        subrouter_verification: Some(Err("subrouter-executable-drift")),
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(Some("codex")),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_request(&request, &mut runner);
+
+    assert_delivered(&response, "codex");
+    assert!(runner.subrouter_verification.is_some());
 }
 
 #[test]
@@ -455,40 +460,6 @@ fn delayed_workspace_visibility_keeps_one_fence_and_never_creates_again() {
 }
 
 #[test]
-fn reconciliation_respawns_one_stranded_surface_with_the_exact_private_route() {
-    let mut request = request("qwen", ProviderWrapperOperationV1::Reconcile);
-    request.protected_route.argv[1] = "qwen".into();
-    let mut runner = FakeRunner {
-        results: VecDeque::from([
-            windows(&[UUID]),
-            list(serde_json::json!([workspace(&description(&request))])),
-            surface_health(&[SURFACE_UUID]),
-            session_evidence(None),
-            successful_json(serde_json::json!({"ok": true})),
-            session_evidence(Some("qwen")),
-        ]),
-        ..FakeRunner::default()
-    };
-    let response = handle_request(&request, &mut runner);
-    assert_delivered(&response, "qwen");
-    assert_eq!(runner.presence_calls, 3);
-    let respawn = &runner.calls[4];
-    assert_eq!(respawn[3], "respawn-pane");
-    assert_eq!(
-        respawn[respawn.iter().position(|arg| arg == "--workspace").unwrap() + 1],
-        UUID.to_ascii_lowercase()
-    );
-    assert_eq!(
-        respawn[respawn.iter().position(|arg| arg == "--surface").unwrap() + 1],
-        SURFACE_UUID.to_ascii_lowercase()
-    );
-    let command = &respawn[respawn.iter().position(|arg| arg == "--command").unwrap() + 1];
-    assert!(!command.contains("account-a"));
-    assert!(!command.contains("native-session-a"));
-    assert!(runner.private_launches[0].contains("exec '/opt/subrouter' 'qwen' 'resume'"));
-}
-
-#[test]
 fn same_title_with_wrong_description_does_not_replay() {
     let request = request("codex", ProviderWrapperOperationV1::Submit);
     let mut runner = FakeRunner {
@@ -561,7 +532,8 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
 #[test]
 fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     let codex = request("codex", ProviderWrapperOperationV1::Submit);
-    let codex_body = launch_command(&codex, Path::new(&codex.protected_route.argv[0])).unwrap();
+    let codex_body =
+        launch_command(&codex, Path::new(&codex.protected_route.argv[0]), false).unwrap();
     assert!(codex_body.starts_with("export 'SUBROUTER_CODEX_ACCOUNT_ID=account-a'\nexport 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test'\nexec '/opt/subrouter' 'codex' 'resume'"));
     assert!(codex_body.contains("'native-session-a'"));
     assert!(!codex_body.contains("cmux-codex-wrapper"));
@@ -605,7 +577,8 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
         "--resume".into(),
         "native-session-a".into(),
     ];
-    let claude_body = launch_command(&claude, Path::new(&claude.protected_route.argv[0])).unwrap();
+    let claude_body =
+        launch_command(&claude, Path::new(&claude.protected_route.argv[0]), false).unwrap();
     assert!(claude_body.contains("exec '/opt/subrouter' 'claude' '--model' 'fable'"));
     assert!(!claude_body.contains("cmux-claude-wrapper"));
 }
@@ -640,6 +613,10 @@ fn private_launch_capsule_sets_route_environment_and_deletes_itself() {
     let private_launch = prepare_private_launch(&request, true).unwrap();
     let launch_path = private_launch_path(&private_launch.command).unwrap();
     let launch_directory = launch_path.parent().unwrap().to_path_buf();
+    let launch_script = std::fs::read_to_string(&launch_path).unwrap();
+    assert!(launch_script.contains("trap cleanup EXIT HUP INT TERM"));
+    assert!(launch_script.contains("provider_status=$?"));
+    assert!(!launch_script.contains("exec '/"));
     assert!(
         std::process::Command::new("/bin/sh")
             .args(["-c", &private_launch.command])

@@ -937,17 +937,21 @@ fn run_provider_wrapper_unix(
         .write(true)
         .open(&sentinel_path)
         .map_err(|_| refusal("provider wrapper execution sentinel cannot be created"))?;
-    #[cfg(unix)]
-    let sentinel_fd = {
-        use std::os::fd::AsRawFd;
-        rustix::io::fcntl_setfd(&sentinel, rustix::io::FdFlags::empty())
-            .map_err(|_| refusal("provider wrapper execution sentinel cannot be inherited"))?;
-        sentinel.as_raw_fd()
-    };
-    let mut command = Command::new(&prepared.path);
+    drop(sentinel);
+    // Keep the parent descriptor table untouched. Clearing CLOEXEC in this
+    // multi-threaded process allowed an unrelated concurrent child to inherit
+    // another invocation's sentinel and be mistaken for its descendant. The
+    // fixed system shell opens only this invocation's private sentinel in the
+    // child immediately before replacing itself with the verified snapshot.
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "exec 9<>\"$1\" || exit 126\nshift\nexec \"$@\"",
+        "shipyard-provider-sentinel",
+    ]);
+    command.arg(&sentinel_path).arg(&prepared.path);
     command.env_clear().envs(environment.0.iter());
-    #[cfg(unix)]
-    command.env(EXECUTION_SENTINEL_FD_ENV, sentinel_fd.to_string());
+    command.env(EXECUTION_SENTINEL_FD_ENV, "9");
     command
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout.try_clone().map_err(|_| {
@@ -961,9 +965,6 @@ fn run_provider_wrapper_unix(
     let Ok(mut process) = ProcessTree::spawn(&mut command) else {
         return Ok(uncertain("verified-wrapper-launch-outcome-unknown"));
     };
-    #[cfg(unix)]
-    rustix::io::fcntl_setfd(&sentinel, rustix::io::FdFlags::CLOEXEC)
-        .map_err(|_| refusal("provider wrapper execution sentinel cannot be isolated"))?;
     let mut status = None;
     let mut uncertain_reason = None;
     loop {
@@ -1714,7 +1715,12 @@ mod tests {
             response_bytes,
         );
         let (_wrapper_dir, path, sha) = wrapper_c(&body);
-        let config = config(&path, sha);
+        let mut config = config(&path, sha);
+        // This two-invocation fixture runs inside the fully parallel library
+        // suite, where process startup can exceed the tiny default test budget.
+        // Keep its private wrapper/state while allowing both exact invocations
+        // the same production-scale launch budget.
+        config.deadline_seconds = 15;
         assert!(matches!(
             run_provider_wrapper(&config, &ProviderWrapperEnvironment::default(), &submit).unwrap(),
             ProviderWrapperRunResult::Uncertain { .. }

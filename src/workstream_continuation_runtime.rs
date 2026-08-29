@@ -403,11 +403,6 @@ impl DeliveryAuthorityProbe for ProductionDeliveryAuthorityProbe {
             },
             native_session_id: observed.native_session_id,
             mutation_endpoint,
-            source_work_generation: expected.source_work_generation,
-            source_owner_generation: expected.source_owner_generation,
-            target_work_generation: expected.target_work_generation,
-            target_owner_generation: expected.target_owner_generation,
-            transactionally_rebound: false,
             observed_at: Utc::now(),
         })
     }
@@ -454,7 +449,11 @@ impl WorkLedgerProviderAdapter<'_> {
         operation: ProviderWrapperOperationV1,
         authority: DeliveryAuthorization,
     ) -> ProviderOutcome {
-        let mutation_endpoint = authority.into_mutation_endpoint();
+        let Ok(mutation_endpoint) =
+            authority.into_mutation_endpoint_for(fence.work_generation, fence.owner_generation)
+        else {
+            return preflight_refusal(operation);
+        };
         let Ok(request) = self.wrapper_request(fence, operation, &mutation_endpoint) else {
             return preflight_refusal(operation);
         };
