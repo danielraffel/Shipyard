@@ -327,6 +327,15 @@ mod tests {
     use crate::config::LocalOverlaySource;
 
     const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[cfg(not(windows))]
+    const WRAPPER_PATH: &str = "/opt/shipyard/bin/workstream-provider";
+    #[cfg(windows)]
+    const WRAPPER_PATH: &str = "C:/Program Files/Shipyard/workstream-provider.exe";
+    #[cfg(not(windows))]
+    const WRAPPER_PARENT_PATH: &str = "/opt/shipyard/../bin/workstream-provider";
+    #[cfg(windows)]
+    const WRAPPER_PARENT_PATH: &str =
+        "C:/Program Files/Shipyard/../Shipyard/workstream-provider.exe";
 
     fn enabled_policy(repositories: &str) -> String {
         format!(
@@ -337,7 +346,7 @@ origin_machine = "m5"
 repositories = {repositories}
 
 [workstream_continuation.provider_wrapper]
-executable_path = "/opt/shipyard/bin/workstream-provider"
+executable_path = "{WRAPPER_PATH}"
 executable_sha256 = "{DIGEST}"
 provider_id = "codex"
 adapter_id = "codex-cli-v1"
@@ -416,7 +425,7 @@ max_stderr_bytes = 16384
         );
         assert_eq!(
             policy.provider_wrapper.executable_path,
-            Path::new("/opt/shipyard/bin/workstream-provider")
+            Path::new(WRAPPER_PATH)
         );
         assert_eq!(policy.provider_wrapper.executable_sha256, DIGEST);
         assert_eq!(policy.provider_wrapper.deadline_seconds, 120);
@@ -476,15 +485,9 @@ max_stderr_bytes = 16384
             ),
             valid.replace("generous-corp/shipyard", "Generous-Corp/Shipyard"),
             valid.replace("[\"generous-corp/shipyard\"]", "[\"z/repo\", \"a/repo\"]"),
-            valid.replace("/opt/shipyard/bin/workstream-provider", "relative/provider"),
-            valid.replace(
-                "/opt/shipyard/bin/workstream-provider",
-                "/opt/shipyard/bin/workstream-provider\\nforged",
-            ),
-            valid.replace(
-                "/opt/shipyard/bin/workstream-provider",
-                "/opt/shipyard/../bin/workstream-provider",
-            ),
+            valid.replace(WRAPPER_PATH, "relative/provider"),
+            valid.replace(WRAPPER_PATH, &format!("{WRAPPER_PATH}\\nforged")),
+            valid.replace(WRAPPER_PATH, WRAPPER_PARENT_PATH),
             valid.replace(DIGEST, &"A".repeat(64)),
             valid.replace("provider_id = \"codex\"\n", ""),
             valid.replace("adapter_id = \"codex-cli-v1\"", "adapter_id = \"codex!\""),

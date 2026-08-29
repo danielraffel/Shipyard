@@ -424,6 +424,10 @@ mod tests {
     use crate::platform::Platform;
 
     const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[cfg(not(windows))]
+    const WRAPPER_PATH: &str = "/opt/shipyard/bin/workstream-provider";
+    #[cfg(windows)]
+    const WRAPPER_PATH: &str = "C:/Program Files/Shipyard/workstream-provider.exe";
 
     fn policy(machine: &str, repositories: &str, wrapper_digest: &str) -> String {
         format!(
@@ -434,7 +438,7 @@ origin_machine = "{machine}"
 repositories = {repositories}
 
 [workstream_continuation.provider_wrapper]
-executable_path = "/opt/shipyard/bin/workstream-provider"
+executable_path = "{WRAPPER_PATH}"
 executable_sha256 = "{wrapper_digest}"
 provider_id = "codex"
 adapter_id = "codex-wrapper-v1"
@@ -458,7 +462,8 @@ max_stderr_bytes = 65536
                 .expect("canonical temp")
                 .join("home");
             fs::create_dir_all(&home).expect("home");
-            let paths = RuntimePaths::for_platform(Platform::MacOs, &home, RuntimeMode::Shipyard);
+            let paths =
+                RuntimePaths::for_platform(Platform::current(), &home, RuntimeMode::Shipyard);
             fs::create_dir_all(&paths.global_dir).expect("global");
             fs::create_dir_all(&paths.state_dir).expect("state");
             Self {
@@ -481,7 +486,7 @@ max_stderr_bytes = 65536
         }
 
         fn production_loader(&self) -> WorkstreamActivationLoader {
-            WorkstreamActivationLoader::simulated_production(Platform::MacOs, self.home.clone())
+            WorkstreamActivationLoader::simulated_production(Platform::current(), self.home.clone())
         }
     }
 
