@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -125,7 +126,8 @@ class PathFingerprint:
 
 
 def _fingerprint(path: Path) -> PathFingerprint:
-    stat = path.lstat()
+    metadata = path.lstat()
+    is_directory = stat.S_ISDIR(metadata.st_mode)
     digest = None
     if path.is_file() and not path.is_symlink():
         hasher = hashlib.sha256()
@@ -134,11 +136,16 @@ def _fingerprint(path: Path) -> PathFingerprint:
                 hasher.update(chunk)
         digest = hasher.hexdigest()
     return PathFingerprint(
-        mode=stat.st_mode,
-        size=stat.st_size,
-        mtime_ns=stat.st_mtime_ns,
-        device=stat.st_dev,
-        inode=stat.st_ino,
+        mode=metadata.st_mode,
+        # A directory's size and mtime describe filesystem bookkeeping, not
+        # its durable tree. A transient entry can perturb them even when the
+        # entry is gone before either protected-tree snapshot. Descendant
+        # fingerprints below remain authoritative for durable topology and
+        # content changes.
+        size=0 if is_directory else metadata.st_size,
+        mtime_ns=0 if is_directory else metadata.st_mtime_ns,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
         digest=digest,
     )
 
