@@ -100,9 +100,12 @@ For a release that changes merge-queue behavior, add these fleet gates:
    enters while `merge_queue/mutations.jsonl` records the winning correlation.
 5. Replay the incident timelines for stale head/base, ambiguous enqueue,
    manual removal, `failed_checks`, `invalid_merge_commit`, and base advance.
-6. Install the same release on every fleet host and verify both
-   `shipyard --version` and the artifact checksum before activating the sole
-   authority.
+6. Install the same release on every fleet host and verify the primary and
+   `shipyard-workstream-provider` companion paths, versions, and artifact
+   checksums before activating the sole authority. Treat pre-install source
+   provenance as unverified; only a successful verified exact-target installer
+   binds post-install source identity.
+   A legacy rollback must prove the companion absent; never accept a mixed pair.
 
 For release candidates, also validate the package/install path in an
 isolated sandbox:

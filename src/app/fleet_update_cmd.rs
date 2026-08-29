@@ -11,7 +11,9 @@ use serde_json::Value;
 mod evidence;
 
 #[cfg(test)]
-use evidence::execute_plan_with_timeout;
+use evidence::{
+    BinaryEvidence, BinaryPairEvidence, SourceIdentityBasis, execute_plan_with_timeout,
+};
 use evidence::{HostUpdateEvidence, PlanExecutionError, execute_plan, validate_evidence};
 
 use super::CliFailure;
@@ -27,8 +29,16 @@ const REMOTE_MINIMAL_PATH: &str =
 const HOST_UPDATE_TIMEOUT: Duration = Duration::from_mins(10);
 const REMOTE_UPDATE_TIMEOUT: Duration = Duration::from_mins(9);
 const MIN_FLEET_UPDATE_TARGET: [u64; 3] = [0, 100, 0];
-const REMOTE_SHA256_PREFIX: &str = "SHIPYARD_FLEET_SHA256=";
-const REMOTE_CLI_VERSION_PREFIX: &str = "SHIPYARD_FLEET_CLI_VERSION=";
+const MIN_PAIRED_BINARY_TARGET: [u64; 3] = [0, 126, 3];
+const COMPANION_BINARY_NAME: &str = "shipyard-workstream-provider";
+const REMOTE_BEFORE_PRIMARY_SHA256_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_PRIMARY_SHA256=";
+const REMOTE_BEFORE_PRIMARY_VERSION_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_PRIMARY_VERSION=";
+const REMOTE_BEFORE_COMPANION_SHA256_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_COMPANION_SHA256=";
+const REMOTE_BEFORE_COMPANION_VERSION_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_COMPANION_VERSION=";
+const REMOTE_AFTER_PRIMARY_SHA256_PREFIX: &str = "SHIPYARD_FLEET_AFTER_PRIMARY_SHA256=";
+const REMOTE_AFTER_PRIMARY_VERSION_PREFIX: &str = "SHIPYARD_FLEET_AFTER_PRIMARY_VERSION=";
+const REMOTE_AFTER_COMPANION_SHA256_PREFIX: &str = "SHIPYARD_FLEET_AFTER_COMPANION_SHA256=";
+const REMOTE_AFTER_COMPANION_VERSION_PREFIX: &str = "SHIPYARD_FLEET_AFTER_COMPANION_VERSION=";
 const REMOTE_BEFORE_STATUS_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_STATUS=";
 const REMOTE_REFRESH_PREFIX: &str = "SHIPYARD_FLEET_REFRESH=";
 const REMOTE_AFTER_STATUS_PREFIX: &str = "SHIPYARD_FLEET_AFTER_STATUS=";
@@ -79,7 +89,10 @@ struct HostUpdatePlan {
     class: String,
     ssh: Option<String>,
     binary: PathBuf,
+    companion_binary: PathBuf,
     target: String,
+    source_identity: String,
+    companion_required: bool,
     command: String,
     runtime_mode: RuntimeMode,
     global_dir: PathBuf,
@@ -258,6 +271,19 @@ fn normalize_exact_tag(raw: &str) -> Result<String, CliFailure> {
     Ok(format!("v{version}"))
 }
 
+fn tag_requires_companion(tag: &str) -> bool {
+    let parsed = tag
+        .trim_start_matches('v')
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>();
+    parsed.is_ok_and(|parts| parts.as_slice() >= MIN_PAIRED_BINARY_TARGET.as_slice())
+}
+
+fn release_source_identity(tag: &str) -> String {
+    format!("github.com/danielraffel/Shipyard:release:{tag}")
+}
+
 #[allow(clippy::too_many_lines)] // One fail-closed validation boundary for the complete host profile.
 fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdatePlan, CliFailure> {
     if let Some(host) = &class.ssh
@@ -329,6 +355,20 @@ fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdateP
             ),
         ));
     }
+    let expected_companion_name = format!(
+        "{COMPANION_BINARY_NAME}{}",
+        if is_remote {
+            ""
+        } else {
+            std::env::consts::EXE_SUFFIX
+        }
+    );
+    // The verified installer owns the pair transaction and always places the
+    // companion adjacent to the primary under this canonical name.
+    let companion_binary = binary
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .join(expected_companion_name);
     let mode = class.shipyard_mode.as_deref().ok_or_else(|| {
         CliFailure::new(
             2,
@@ -409,6 +449,7 @@ fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdateP
         }
         remote_update_command(
             &binary,
+            &companion_binary,
             target,
             &helper,
             runtime_mode.as_str(),
@@ -422,7 +463,10 @@ fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdateP
         class: class.class.clone(),
         ssh: class.ssh.clone(),
         binary,
+        companion_binary,
         target: target.to_owned(),
+        source_identity: release_source_identity(target),
+        companion_required: tag_requires_companion(target),
         command,
         runtime_mode,
         global_dir,
@@ -436,6 +480,7 @@ fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdateP
 
 fn remote_update_command(
     binary: &Path,
+    companion_binary: &Path,
     target: &str,
     auth_helper: &Path,
     mode: &str,
@@ -446,8 +491,17 @@ fn remote_update_command(
     let version = target.strip_prefix('v').unwrap_or(target);
     let installer_url =
         format!("https://raw.githubusercontent.com/danielraffel/Shipyard/{target}/install.sh");
+    let before_pair = remote_pair_probe(binary, companion_binary, "before", None, false);
+    let after_pair = remote_pair_probe(
+        binary,
+        companion_binary,
+        "after",
+        Some(version),
+        tag_requires_companion(target),
+    );
     let script = format!(
         "set -euo pipefail\n\
+         {}\n\
          before_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
          token=\"$({} auth token)\"\n\
          installer=\"$(/usr/bin/mktemp)\"\n\
@@ -461,17 +515,22 @@ fn remote_update_command(
          \"$staged_binary\" --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
          SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR={} SHIPYARD_CURL_BIN=/usr/bin/curl /bin/bash \"$installer\" >/dev/null\n\
          unset token\n\
-         actual_version=\"$({} --version)\"\n\
-         test \"$actual_version\" = {}\n\
+         {}\n\
          {} --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
          refresh_receipt=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon refresh | /usr/bin/tr -d '\\n')\"\n\
          after_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
-         installed_sha256=\"$(/usr/bin/shasum -a 256 {} | /usr/bin/awk '{{print $1}}')\"\n\
-         printf '%s%s\\n' {} \"$installed_sha256\"\n\
-         printf '%s%s\\n' {} \"$actual_version\"\n\
+         printf '%s%s\\n' {} \"$before_primary_sha256\"\n\
+         printf '%s%s\\n' {} \"$before_primary_version\"\n\
+         printf '%s%s\\n' {} \"$before_companion_sha256\"\n\
+         printf '%s%s\\n' {} \"$before_companion_version\"\n\
+         printf '%s%s\\n' {} \"$after_primary_sha256\"\n\
+         printf '%s%s\\n' {} \"$after_primary_version\"\n\
+         printf '%s%s\\n' {} \"$after_companion_sha256\"\n\
+         printf '%s%s\\n' {} \"$after_companion_version\"\n\
          printf '%s%s\\n' {} \"$before_status\"\n\
          printf '%s%s\\n' {} \"$refresh_receipt\"\n\
          printf '%s%s\\n' {} \"$after_status\"",
+        before_pair,
         shlex_quote(&binary.display().to_string()),
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
@@ -486,8 +545,7 @@ fn remote_update_command(
         shlex_quote(target),
         shlex_quote(version),
         shlex_quote(&install_dir.display().to_string()),
-        shlex_quote(&binary.display().to_string()),
-        shlex_quote(&format!("shipyard {version}")),
+        after_pair,
         shlex_quote(&binary.display().to_string()),
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
@@ -501,9 +559,14 @@ fn remote_update_command(
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
         shlex_quote(&state_dir.display().to_string()),
-        shlex_quote(&binary.display().to_string()),
-        shlex_quote(REMOTE_SHA256_PREFIX),
-        shlex_quote(REMOTE_CLI_VERSION_PREFIX),
+        shlex_quote(REMOTE_BEFORE_PRIMARY_SHA256_PREFIX),
+        shlex_quote(REMOTE_BEFORE_PRIMARY_VERSION_PREFIX),
+        shlex_quote(REMOTE_BEFORE_COMPANION_SHA256_PREFIX),
+        shlex_quote(REMOTE_BEFORE_COMPANION_VERSION_PREFIX),
+        shlex_quote(REMOTE_AFTER_PRIMARY_SHA256_PREFIX),
+        shlex_quote(REMOTE_AFTER_PRIMARY_VERSION_PREFIX),
+        shlex_quote(REMOTE_AFTER_COMPANION_SHA256_PREFIX),
+        shlex_quote(REMOTE_AFTER_COMPANION_VERSION_PREFIX),
         shlex_quote(REMOTE_BEFORE_STATUS_PREFIX),
         shlex_quote(REMOTE_REFRESH_PREFIX),
         shlex_quote(REMOTE_AFTER_STATUS_PREFIX),
@@ -514,6 +577,77 @@ fn remote_update_command(
         shlex_quote(REMOTE_SUPERVISOR),
         REMOTE_UPDATE_TIMEOUT.as_secs(),
         shlex_quote(&script),
+    )
+}
+
+fn remote_pair_probe(
+    binary: &Path,
+    companion: &Path,
+    prefix: &str,
+    expected_version: Option<&str>,
+    companion_required: bool,
+) -> String {
+    let binary = shlex_quote(&binary.display().to_string());
+    let companion = shlex_quote(&companion.display().to_string());
+    let [minimum_major, minimum_minor, minimum_patch] = MIN_PAIRED_BINARY_TARGET;
+    let expected = expected_version.map_or_else(String::new, |version| {
+        let primary = shlex_quote(&format!("shipyard {version}"));
+        let provider = shlex_quote(&format!("{COMPANION_BINARY_NAME} {version}"));
+        if companion_required {
+            format!(
+                "test \"${prefix}_primary_version\" = {primary}\n\
+                 test \"${prefix}_companion_version\" = {provider}"
+            )
+        } else {
+            format!(
+                "test \"${prefix}_primary_version\" = {primary}\n\
+                 test \"${prefix}_companion_version\" = absent"
+            )
+        }
+    });
+    let inferred = expected_version.map_or_else(
+        || format!(
+            "{prefix}_semver=\"${{{prefix}_primary_version#shipyard }}\"\n\
+             test \"${prefix}_primary_version\" = \"shipyard ${{{prefix}_semver}}\"\n\
+             case \"${{{prefix}_semver}}\" in *.*.*) ;; *) exit 1 ;; esac\n\
+             case \"${{{prefix}_semver}}\" in *.*.*.*) exit 1 ;; esac\n\
+             IFS=. read -r {prefix}_major {prefix}_minor {prefix}_patch <<EOF\n\
+             ${{{prefix}_semver}}\n\
+             EOF\n\
+             for {prefix}_component in \"${{{prefix}_major}}\" \"${{{prefix}_minor}}\" \"${{{prefix}_patch}}\"; do\n\
+               case \"${{{prefix}_component}}\" in *[!0-9]*|'') exit 1 ;; esac\n\
+               case \"${{{prefix}_component}}\" in 0|[1-9]*) ;; *) exit 1 ;; esac\n\
+               if [ \"${{#{prefix}_component}}\" -gt 20 ] || {{ [ \"${{#{prefix}_component}}\" -eq 20 ] && [ \"${{{prefix}_component}}\" \\> 18446744073709551615 ]; }}; then exit 1; fi\n\
+             done\n\
+             {prefix}_decimal_gt() {{\n\
+               [ \"${{#1}}\" -gt \"${{#2}}\" ] || {{ [ \"${{#1}}\" -eq \"${{#2}}\" ] && [ \"$1\" \\> \"$2\" ]; }}\n\
+             }}\n\
+             {prefix}_requires=0\n\
+             if {prefix}_decimal_gt \"${{{prefix}_major}}\" {minimum_major} || {{ [ \"${{{prefix}_major}}\" = {minimum_major} ] && {{ {prefix}_decimal_gt \"${{{prefix}_minor}}\" {minimum_minor} || {{ [ \"${{{prefix}_minor}}\" = {minimum_minor} ] && {{ [ \"${{{prefix}_patch}}\" = {minimum_patch} ] || {prefix}_decimal_gt \"${{{prefix}_patch}}\" {minimum_patch}; }}; }}; }}; }}; then {prefix}_requires=1; fi\n\
+             if [ \"${{{prefix}_requires}}\" -eq 1 ]; then\n\
+               test \"${prefix}_companion_version\" = \"{COMPANION_BINARY_NAME} ${{{prefix}_semver}}\"\n\
+             else\n\
+               test \"${prefix}_companion_version\" = absent\n\
+             fi"
+        ),
+        |_| expected,
+    );
+    format!(
+        "{prefix}_primary_sha256_before=\"$(/usr/bin/shasum -a 256 {binary} | /usr/bin/awk '{{print $1}}')\"\n\
+         {prefix}_primary_version=\"$({binary} --version)\"\n\
+         {prefix}_primary_sha256=\"$(/usr/bin/shasum -a 256 {binary} | /usr/bin/awk '{{print $1}}')\"\n\
+         test \"${prefix}_primary_sha256_before\" = \"${prefix}_primary_sha256\"\n\
+         if [ -e {companion} ] || [ -L {companion} ]; then\n\
+           test -x {companion}\n\
+           {prefix}_companion_sha256_before=\"$(/usr/bin/shasum -a 256 {companion} | /usr/bin/awk '{{print $1}}')\"\n\
+           {prefix}_companion_version=\"$({companion} --version)\"\n\
+           {prefix}_companion_sha256=\"$(/usr/bin/shasum -a 256 {companion} | /usr/bin/awk '{{print $1}}')\"\n\
+           test \"${prefix}_companion_sha256_before\" = \"${prefix}_companion_sha256\"\n\
+         else\n\
+           {prefix}_companion_version=absent\n\
+           {prefix}_companion_sha256=absent\n\
+         fi\n\
+         {inferred}"
     )
 }
 
@@ -558,6 +692,9 @@ fn render_plan<W: Write>(
                             "class": plan.class,
                             "ssh": plan.ssh,
                             "binary": plan.binary,
+                            "companion_binary": plan.companion_binary,
+                            "source_identity": plan.source_identity,
+                            "companion_required": plan.companion_required,
                             "command": plan.command,
                         })
                     })
@@ -608,6 +745,14 @@ fn render_host_result<W: Write>(
             Value::from(plan.binary.display().to_string()),
         );
         data.insert(
+            "companion_binary".to_owned(),
+            Value::from(plan.companion_binary.display().to_string()),
+        );
+        data.insert(
+            "source_identity".to_owned(),
+            Value::from(plan.source_identity.clone()),
+        );
+        data.insert(
             "daemon_mode".to_owned(),
             Value::from(plan.runtime_mode.as_str()),
         );
@@ -620,6 +765,7 @@ fn render_host_result<W: Write>(
             Value::from(plan.state_dir.display().to_string()),
         );
         if let Some(evidence) = evidence {
+            insert_binary_pair_evidence(&mut data, evidence)?;
             data.insert(
                 "executable_sha256".to_owned(),
                 Value::from(evidence.executable_sha256.clone()),
@@ -657,9 +803,15 @@ fn render_host_result<W: Write>(
     } else if ok {
         writeln!(
             stdout,
-            "{}: updated to {target}; sha256={}; daemon pid={} version={}; configured repos preserved={}",
+            "{}: updated to {target}; primary sha256={}; companion sha256={}; source={}; daemon pid={} version={}; configured repos preserved={}",
             plan.class,
             evidence.map_or("unavailable", |value| value.executable_sha256.as_str()),
+            evidence
+                .and_then(|value| value.after_pair.companion.as_ref())
+                .map_or("absent", |value| value.sha256.as_str()),
+            evidence
+                .and_then(|value| value.after_pair.primary.source_identity.as_deref())
+                .unwrap_or("unavailable"),
             evidence.map_or(0, |value| value.daemon_pid),
             evidence.map_or("unavailable", |value| value.daemon_version.as_str()),
             evidence
@@ -676,6 +828,23 @@ fn render_host_result<W: Write>(
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
+    Ok(())
+}
+
+fn insert_binary_pair_evidence(
+    data: &mut BTreeMap<String, Value>,
+    evidence: &HostUpdateEvidence,
+) -> Result<(), CliFailure> {
+    data.insert(
+        "binary_pair_before".to_owned(),
+        serde_json::to_value(&evidence.before_pair)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?,
+    );
+    data.insert(
+        "binary_pair_after".to_owned(),
+        serde_json::to_value(&evidence.after_pair)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?,
+    );
     Ok(())
 }
 
@@ -706,7 +875,7 @@ mod tests {
     fn remote_plan_uses_absolute_binary_and_minimal_canonical_path() {
         let plan = host_update_plan(
             &host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard")),
-            "v0.98.1",
+            "v0.126.3",
         )
         .expect("plan");
         assert!(plan.command.starts_with("/usr/bin/env -i HOME=\"$HOME\""));
@@ -721,7 +890,7 @@ mod tests {
         )));
         assert!(plan.command.contains("/Users/ci/.local/bin/shipyard"));
         assert!(plan.command.contains("/Users/ci/.local/bin/ghapp"));
-        assert!(plan.command.contains("Shipyard/v0.98.1/install.sh"));
+        assert!(plan.command.contains("Shipyard/v0.126.3/install.sh"));
         assert!(plan.command.contains("--mode shipyard"));
         assert!(
             plan.command
@@ -729,7 +898,16 @@ mod tests {
         );
         assert!(
             plan.command
-                .contains("update --to v0.98.1 --check --unattended-fleet")
+                .contains("update --to v0.126.3 --check --unattended-fleet")
+        );
+        assert_eq!(
+            plan.companion_binary,
+            PathBuf::from("/Users/ci/.local/bin/shipyard-workstream-provider")
+        );
+        assert!(plan.companion_required);
+        assert_eq!(
+            plan.source_identity,
+            "github.com/danielraffel/Shipyard:release:v0.126.3"
         );
         assert!(plan.command.contains("/usr/bin/shasum -a 256"));
         assert!(plan.command.contains(REMOTE_BEFORE_STATUS_PREFIX));
@@ -754,6 +932,72 @@ mod tests {
             preflight < replacement,
             "governed config and helper must pass before binary replacement"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remote_pair_probe_rejects_mixed_or_malformed_preinstall_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let primary = temp.path().join("shipyard");
+        let companion = temp.path().join(COMPANION_BINARY_NAME);
+        let write_binary = |path: &Path, label: &str, version: &str| {
+            std::fs::write(
+                path,
+                format!("#!/bin/sh\nprintf '%s\\n' '{label} {version}'\n"),
+            )
+            .expect("fixture");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        };
+        write_binary(&primary, "shipyard", "0.126.2");
+        let legacy_probe = remote_pair_probe(&primary, &companion, "before", None, false);
+        assert!(
+            Command::new("/bin/bash")
+                .args(["-c", &legacy_probe])
+                .status()
+                .expect("legacy probe")
+                .success()
+        );
+
+        write_binary(&companion, COMPANION_BINARY_NAME, "0.126.3");
+        assert!(
+            !Command::new("/bin/bash")
+                .args(["-c", &legacy_probe])
+                .status()
+                .expect("mixed probe")
+                .success()
+        );
+
+        write_binary(&primary, "shipyard", "0.126.3");
+        let paired_probe = remote_pair_probe(&primary, &companion, "before", None, false);
+        assert!(
+            Command::new("/bin/bash")
+                .args(["-c", &paired_probe])
+                .status()
+                .expect("paired probe")
+                .success()
+        );
+
+        for malformed in [
+            "0.126.",
+            "0.0126.3",
+            "0.126.3.1",
+            "18446744073709551616.0.0",
+        ] {
+            write_binary(&primary, "shipyard", malformed);
+            write_binary(&companion, COMPANION_BINARY_NAME, malformed);
+            let malformed_probe = remote_pair_probe(&primary, &companion, "before", None, false);
+            assert!(
+                !Command::new("/bin/bash")
+                    .args(["-c", &malformed_probe])
+                    .status()
+                    .expect("malformed probe")
+                    .success(),
+                "malformed preinstall version {malformed:?} must fail before rollout"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -907,6 +1151,8 @@ mod tests {
         assert!(normalize_exact_tag("v0.98").is_err());
         assert!(normalize_exact_tag("v0.98.1-rc1").is_err());
         assert!(normalize_exact_tag("v18446744073709551616.0.0").is_err());
+        assert!(!tag_requires_companion("v0.126.2"));
+        assert!(tag_requires_companion("v0.126.3"));
     }
 
     fn named_host(name: &str) -> HostClassConfig {
@@ -915,10 +1161,36 @@ mod tests {
         class
     }
 
+    fn pair(version: &str, verified: bool) -> BinaryPairEvidence {
+        let source_identity = verified.then(|| release_source_identity(&format!("v{version}")));
+        let source_identity_basis = if verified {
+            SourceIdentityBasis::VerifiedInstallerTarget
+        } else {
+            SourceIdentityBasis::UnverifiedPreinstall
+        };
+        let primary = BinaryEvidence {
+            path: PathBuf::from("/Users/ci/.local/bin/shipyard"),
+            semantic_version: version.to_owned(),
+            sha256: "a".repeat(64),
+            source_identity: source_identity.clone(),
+            source_identity_basis,
+        };
+        let companion = tag_requires_companion(&format!("v{version}")).then(|| BinaryEvidence {
+            path: PathBuf::from("/Users/ci/.local/bin/shipyard-workstream-provider"),
+            semantic_version: version.to_owned(),
+            sha256: "b".repeat(64),
+            source_identity,
+            source_identity_basis,
+        });
+        BinaryPairEvidence { primary, companion }
+    }
+
     fn evidence(version: &str) -> HostUpdateEvidence {
         HostUpdateEvidence {
             executable_sha256: "a".repeat(64),
             cli_version: format!("shipyard {version}"),
+            before_pair: pair(version, false),
+            after_pair: pair(version, true),
             daemon_version: version.to_owned(),
             daemon_pid: 42,
             configured_repos_before: Some(vec!["owner/repo".to_owned()]),
@@ -986,10 +1258,53 @@ mod tests {
         assert_eq!(receipts[0]["host_class"], "m1");
         assert_eq!(receipts[0]["target"], "v0.100.0");
         assert_eq!(receipts[0]["executable_sha256"], "a".repeat(64));
+        assert_eq!(
+            receipts[0]["binary_pair_before"]["primary"]["source_identity"],
+            Value::Null
+        );
+        assert_eq!(
+            receipts[0]["binary_pair_before"]["primary"]["source_identity_basis"],
+            "unverified_preinstall"
+        );
+        assert_eq!(receipts[0]["binary_pair_after"]["companion"], Value::Null);
         assert_eq!(receipts[0]["daemon_pid"], 42);
         assert_eq!(receipts[0]["configured_repos_preserved"], true);
         assert_eq!(receipts[1]["host_class"], "m3");
         assert_eq!(receipts[1]["ok"], false);
         assert!(!rendered.contains("\"host_class\": \"m5\""));
+    }
+
+    #[test]
+    fn paired_host_receipt_exposes_reconcilable_before_and_after_identities() {
+        let plan = host_update_plan(&named_host("m1"), "v0.126.3").expect("plan");
+        let evidence = evidence("0.126.3");
+        let mut output = Vec::new();
+        render_host_result(
+            &mut output,
+            true,
+            "v0.126.3",
+            &plan,
+            true,
+            Some(&evidence),
+            None,
+        )
+        .expect("receipt");
+        let receipt: Value = serde_json::from_slice(&output).expect("json");
+        for phase in ["binary_pair_before", "binary_pair_after"] {
+            assert_eq!(receipt[phase]["primary"]["semantic_version"], "0.126.3");
+            assert_eq!(receipt[phase]["companion"]["semantic_version"], "0.126.3");
+            assert_eq!(
+                receipt[phase]["primary"]["source_identity"],
+                receipt[phase]["companion"]["source_identity"]
+            );
+        }
+        assert_eq!(
+            receipt["binary_pair_before"]["primary"]["source_identity_basis"],
+            "unverified_preinstall"
+        );
+        assert_eq!(
+            receipt["binary_pair_after"]["primary"]["source_identity_basis"],
+            "verified_installer_target"
+        );
     }
 }

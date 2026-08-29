@@ -288,9 +288,14 @@ uninstalled. Fleet rollout rejects targets older than v0.100.0 before mutation;
 use an older release's documented manual procedure when rollback crosses that
 bootstrap boundary.
 
-Each successful JSON host receipt binds the exact release tag to the installed
-CLI version and SHA-256, refreshed daemon PID and version, absolute configured
-binary/runtime paths, and configured-repository preservation verdict. A host
+Each successful JSON host receipt includes before/after primary and adjacent
+`shipyard-workstream-provider` path, version, and SHA-256 evidence. Pre-install
+source provenance is explicitly unverified; post-install source identity is
+bound to the successful verified exact-target installer. Paired releases must
+match exactly and legacy rollback releases must prove the companion absent.
+The receipt also binds the exact release tag to the installed CLI version and
+SHA-256, refreshed daemon PID and version, absolute configured binary/runtime
+paths, and configured-repository preservation verdict. A host
 without a prior daemon reports repository preservation as `null` rather than
 inventing a comparison. Version, daemon, digest-shape, or repository drift is a
 failed host result and prevents every later selected host from starting. Keep

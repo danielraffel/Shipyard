@@ -98,6 +98,7 @@ shipyard runner watch --reap-stale-runs   # also cancel stale workflow runs repo
 shipyard runner watch --reap-stale-runs --dry-run   # preview reaper, cancel nothing
 shipyard runner fleet-status --repo OWNER/REPO      # TartCI, registered runners, storage + queue liveness
 shipyard runner fleet-status --json                 # periodic-monitor JSON + nonzero alerts
+shipyard runner fleet-update --to vX.Y.Z --host-class m5 [--apply] --json
 shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
 shipyard runner steward --apply                     # exact-head, green-gated mutations
 shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption

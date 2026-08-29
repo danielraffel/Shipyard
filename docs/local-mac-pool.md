@@ -175,16 +175,23 @@ use an App-authenticated GitHub wrapper, set `github_cli = "ghapp"` on each
 
 For unattended Shipyard rollout, set `shipyard_bin` to an absolute path on
 every remote host class and make its existing `github_cli` an absolute governed
-helper path. Also declare `shipyard_mode`, `shipyard_global_dir`, and
+helper path. The verified installer owns `shipyard-workstream-provider`
+adjacent to the primary under that canonical name. Also declare
+`shipyard_mode`, `shipyard_global_dir`, and
 `shipyard_state_dir`; rollout fails closed without that exact daemon context.
 Use `shipyard runner fleet-update --to vX.Y.Z --host-class <class>` to inspect
 one host plan and add `--apply` only for the exact release being deployed.
 Repeat the selector for an intentionally ordered subset, or use the explicit
 `--all-hosts` compatibility selector; an implicit whole-fleet rollout is
-refused. Apply stops after the first host failure, so its typed version,
-installed SHA-256, daemon PID/version, and configured-repository preservation
-receipt can be accepted before the next host. The same selection path installs
-a known-good rollback tag at or above `v0.100.0`.
+refused. Apply validates and receipts primary/companion path, semantic version,
+and SHA-256 before and after each host. Pre-install source provenance is
+explicitly unverified; post-install source provenance is bound to the verified
+exact-target installer. Receipts also include daemon PID/version and
+configured-repository preservation. Mixed pairs are
+never accepted: paired releases require both identities to match, while legacy
+rollback releases require the companion to be absent. Accept one host receipt
+before advancing to the next host. The same selection path installs a
+known-good rollback tag at or above `v0.100.0`.
 Each remote invocation starts from `env -i`, restores Shipyard's canonical
 automation PATH internally, requires a self-contained machine-global
 `github.auth.source = "command"` helper, installs the exact tag, and refreshes
