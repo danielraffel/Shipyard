@@ -244,6 +244,23 @@ class CiMatrixTests(unittest.TestCase):
         self.assertIn('.real_home == env.HOME', workflow)
         self.assertIn('.mode == "shipyard"', workflow)
         self.assertIn('(.active_runs == [])', workflow)
+        self.assertIn('"$canary_root/admission-deferred.json"', workflow)
+        self.assertIn(
+            'scripts/sandbox_admission_deferral.py',
+            workflow,
+        )
+        self.assertEqual(workflow.count('ps -p "$production_pid" -o lstart='), 2)
+        self.assertEqual(
+            workflow.count(
+                'jq -r .old_production_start_time "$canary_root/admission-deferred.json'
+            ),
+            2,
+        )
+        self.assertEqual(workflow.count('jq -r .mutation_probe_output'), 2)
+        self.assertIn(
+            '::notice::Sandbox E2E safely deferred because production workers are active',
+            workflow,
+        )
         self.assertIn('.final_production_pid', workflow)
         self.assertIn("legacy-lifetime-lock-quiesce-restore", workflow)
         self.assertIn("corrected-idle-preserve-fence", workflow)

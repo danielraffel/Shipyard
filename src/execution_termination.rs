@@ -645,7 +645,10 @@ mod tests {
     }
 
     fn wait_for_file(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Full macOS CI runs thousands of process tests concurrently. The
+        // fixture is healthy once its file appears; allow scheduler pressure
+        // without turning a delayed fork into a product verdict.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !path.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }

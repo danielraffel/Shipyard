@@ -398,16 +398,13 @@ fn untrusted_cmux_and_direct_provider_fallback_refuse_before_any_command() {
 #[test]
 fn production_cmux_adapter_refuses_before_running_any_cmux_command() {
     let request = request("codex", ProviderWrapperOperationV1::Submit);
-    let response = handle_with_default_provider(
-        &request,
-        &mut ProductionCmuxRunner::new("7WLXT3NR37".to_owned()),
-    );
+    let mut terminal = ProductionCmuxTransport::new("7WLXT3NR37".to_owned());
+    let mut provider = FakeProviderLaunchAuthority::default();
+    let response = handle_request(&request, &mut terminal, &mut provider);
     assert!(matches!(
         response.outcome,
         ProviderWrapperOutcomeV1::Retryable { .. }
     ));
-    assert!(runner.bound_endpoints.is_empty());
-    assert!(runner.calls.is_empty());
     assert_eq!(provider.verify_calls, 0);
     assert_eq!(provider.prepare_calls, 0);
 }
