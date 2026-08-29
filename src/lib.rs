@@ -101,6 +101,8 @@ pub mod parallel_proof_canary_cache;
 pub mod parallel_proof_canary_controller;
 /// Default-off controller driver for measured Pulp macOS shadow receipts.
 pub mod parallel_proof_canary_driver;
+/// Restart-reconcilable, session-independent execution custody for protected canary jobs.
+pub mod parallel_proof_canary_job;
 /// Immutable measurement receipts for the default-off Pulp macOS sharding canary.
 pub mod parallel_proof_canary_receipt;
 /// Authenticated companion protocol for read-only remote M1 cache observation.
