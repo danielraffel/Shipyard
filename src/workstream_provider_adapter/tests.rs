@@ -343,6 +343,10 @@ fn workspace(description: &str) -> serde_json::Value {
     serde_json::json!({"id": UUID, "description": description, "title": "ignored"})
 }
 
+fn workspace_with_id(id: &str, description: &str) -> serde_json::Value {
+    serde_json::json!({"id": id, "description": description, "title": "ignored"})
+}
+
 fn assert_delivered(response: &ProviderWrapperResponseV1, provider: &str) {
     let ProviderWrapperOutcomeV1::Delivered {
         provider_session_ref,
@@ -468,6 +472,34 @@ fn exact_replay_returns_existing_workspace_without_create() {
 }
 
 #[test]
+fn cross_window_exact_description_duplicates_refuse_without_create() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let exact = description(&request);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID, OTHER_WINDOW_UUID]),
+            list(serde_json::json!([workspace(&exact)])),
+            list_for_window(
+                OTHER_WINDOW_UUID,
+                serde_json::json!([workspace_with_id(SURFACE_UUID, &exact)]),
+            ),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_with_default_provider(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 3);
+    assert!(runner.calls.iter().all(|call| {
+        call.get(3..5) != Some(["rpc".to_owned(), "workspace.create".to_owned()].as_slice())
+    }));
+}
+
+#[test]
 fn workspace_created_before_agent_hook_session_is_not_accepted() {
     let request = request("codex", ProviderWrapperOperationV1::Reconcile);
     let mut runner = FakeRunner {
@@ -551,6 +583,99 @@ fn post_create_window_and_workspace_fence_mismatch_is_uncertain() {
     ));
     assert_eq!(runner.calls.len(), 6);
     assert_eq!(runner.private_launches.len(), 1);
+}
+
+#[test]
+fn post_create_returned_workspace_id_mismatch_is_uncertain() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            workspace_create_capabilities(),
+            created(),
+            windows(&[UUID]),
+            list(serde_json::json!([workspace_with_id(
+                OTHER_WINDOW_UUID,
+                &description(&request),
+            )])),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_with_default_provider(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 6);
+}
+
+#[test]
+fn sole_provider_binding_on_different_returned_surface_is_uncertain() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut other_evidence = session_evidence(Some("codex")).unwrap().stdout;
+    let mut value: serde_json::Value = serde_json::from_slice(&other_evidence).unwrap();
+    value["surface_id"] = serde_json::json!(OTHER_WINDOW_UUID);
+    other_evidence = serde_json::to_vec(&value).unwrap();
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            workspace_create_capabilities(),
+            created(),
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[OTHER_WINDOW_UUID]),
+            Ok(CommandResult {
+                success: true,
+                stdout: other_evidence,
+            }),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_with_default_provider(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 8);
+}
+
+#[test]
+fn matching_provider_with_non_agent_hook_source_is_uncertain() {
+    let request = request("codex", ProviderWrapperOperationV1::Submit);
+    let mut untrusted_evidence = session_evidence(Some("codex")).unwrap().stdout;
+    let mut value: serde_json::Value = serde_json::from_slice(&untrusted_evidence).unwrap();
+    value["resume_binding"]["source"] = serde_json::json!("manual");
+    untrusted_evidence = serde_json::to_vec(&value).unwrap();
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            workspace_create_capabilities(),
+            created(),
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
+            Ok(CommandResult {
+                success: true,
+                stdout: untrusted_evidence,
+            }),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_with_default_provider(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 8);
 }
 
 #[test]
