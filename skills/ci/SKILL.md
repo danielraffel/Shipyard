@@ -1744,3 +1744,12 @@ live or uncertain. Current TartCI emits `offline_busy_wait_for_github`, not a
 machine-checked orphan verdict, so preserve and escalate that state. Do not
 invent recovery authority from missing telemetry; a future orphan verdict must
 land in TartCI and be pinned before job-specific recovery is permitted.
+
+**Rust CLI tests need executable-sized harness stacks.** Shipyard's top-level
+Clap dispatch enum is sized for a normal CLI process, while Rust test-harness
+workers default to smaller stacks on Linux and Windows. Keep
+`RUST_MIN_STACK=8388608` on both the ordinary CI test step and the coverage test
+step. A stack overflow that moves between otherwise unrelated `Cli::parse_from`
+tests is a harness-policy failure: do not rerun it blindly or keep wrapping
+individual tests. Focused low-stack controls may still prove a particular test
+body, but they do not replace the shared CI worker-stack contract.
