@@ -204,13 +204,32 @@ impl ProviderAdapter for DeliveredAdapter {
         })
     }
 
-    fn launch(&mut self, _request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+    fn authorize(
+        &mut self,
+        fence: &crate::work_ledger::DeliveryFence,
+        _operation: crate::work_ledger::ProviderAuthorizationOperation,
+    ) -> Result<crate::work_ledger::DeliveryAuthorization, ProviderOutcome> {
+        Ok(crate::work_ledger::DeliveryAuthorization::for_test(
+            fence.work_generation,
+            fence.owner_generation,
+        ))
+    }
+
+    fn launch(
+        &mut self,
+        _request: ProviderLaunchRequest<'_>,
+        _authority: crate::work_ledger::DeliveryAuthorization,
+    ) -> ProviderOutcome {
         ProviderOutcome::Delivered {
             receipt: b"provider accepted continuation".to_vec(),
         }
     }
 
-    fn reconcile(&mut self, _fence: &crate::work_ledger::DeliveryFence) -> ProviderOutcome {
+    fn reconcile(
+        &mut self,
+        _fence: &crate::work_ledger::DeliveryFence,
+        _authority: crate::work_ledger::DeliveryAuthorization,
+    ) -> ProviderOutcome {
         ProviderOutcome::Delivered {
             receipt: b"provider reconciled continuation".to_vec(),
         }

@@ -15,9 +15,10 @@ use crate::provider_wrapper::{
     ProviderWrapperRunResult, provider_wrapper_execution_supported, run_provider_wrapper,
 };
 use crate::work_ledger::{
-    DeliveryFence, ExactProtectedProfileResolver, FreshAgentLaunchProfile, ProviderAdapter,
-    ProviderCapability, ProviderLaunchRequest, ProviderOutcome, StoredProviderRequest,
-    WakeConsumerPolicy, WakeDeliveryResult, WorkLedger,
+    DeliveryAuthorityRefusal, DeliveryAuthorization, DeliveryFence, ExactProtectedProfileResolver,
+    FreshAgentLaunchProfile, ProviderAdapter, ProviderAuthorizationOperation, ProviderCapability,
+    ProviderLaunchRequest, ProviderOutcome, StoredProviderRequest, WakeConsumerPolicy,
+    WakeDeliveryResult, WorkLedger,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 use crate::workstream_continuation_config::WorkstreamContinuationConfig;
@@ -226,11 +227,40 @@ impl ProviderAdapter for WorkLedgerProviderAdapter<'_> {
         })
     }
 
-    fn launch(&mut self, request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+    fn authorize(
+        &mut self,
+        fence: &DeliveryFence,
+        operation: ProviderAuthorizationOperation,
+    ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+        // Native publication currently records a static route label and leaves
+        // base_ref unbound. Neither is live delivery authority. Refuse before
+        // marking the delivery launched or invoking the provider wrapper.
+        let refusal = self
+            .ledger
+            .current_delivery_authority_gap(fence)
+            .unwrap_or(DeliveryAuthorityRefusal::TerminalAuthorityUnavailable);
+        Err(authority_refusal(
+            match operation {
+                ProviderAuthorizationOperation::Submit => ProviderWrapperOperationV1::Submit,
+                ProviderAuthorizationOperation::Reconcile => ProviderWrapperOperationV1::Reconcile,
+            },
+            refusal,
+        ))
+    }
+
+    fn launch(
+        &mut self,
+        request: ProviderLaunchRequest<'_>,
+        _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         self.run(request.fence, ProviderWrapperOperationV1::Submit)
     }
 
-    fn reconcile(&mut self, fence: &DeliveryFence) -> ProviderOutcome {
+    fn reconcile(
+        &mut self,
+        fence: &DeliveryFence,
+        _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         self.run(fence, ProviderWrapperOperationV1::Reconcile)
     }
 }
@@ -355,6 +385,17 @@ fn preflight_refusal(operation: ProviderWrapperOperationV1) -> ProviderOutcome {
         ProviderWrapperOperationV1::Reconcile => ProviderOutcome::Uncertain {
             evidence: b"provider-wrapper-reconcile-refused".to_vec(),
         },
+    }
+}
+
+fn authority_refusal(
+    operation: ProviderWrapperOperationV1,
+    refusal: DeliveryAuthorityRefusal,
+) -> ProviderOutcome {
+    let evidence = format!("delivery-authority-refused:{}", refusal.code()).into_bytes();
+    match operation {
+        ProviderWrapperOperationV1::Submit => ProviderOutcome::Rejected { evidence },
+        ProviderWrapperOperationV1::Reconcile => ProviderOutcome::Uncertain { evidence },
     }
 }
 

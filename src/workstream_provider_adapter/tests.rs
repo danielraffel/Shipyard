@@ -7,9 +7,9 @@ use crate::provider_wrapper::{
     FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderLaunchOptionsV1,
 };
 use crate::work_ledger::{
-    DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
-    FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
-    ProviderOutcome, WakeEnvelope, WakeProfileResolver,
+    DeliveryAuthorization, DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
+    FreshAgentResumeExpectation, ProviderAdapter, ProviderAuthorizationOperation,
+    ProviderCapability, ProviderLaunchRequest, ProviderOutcome, WakeEnvelope, WakeProfileResolver,
 };
 #[cfg(unix)]
 use crate::work_ledger::{
@@ -732,7 +732,22 @@ impl ProviderAdapter for LedgerCmuxAdapter {
         })
     }
 
-    fn launch(&mut self, launch: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+    fn authorize(
+        &mut self,
+        fence: &DeliveryFence,
+        _operation: ProviderAuthorizationOperation,
+    ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+        Ok(DeliveryAuthorization::for_test(
+            fence.work_generation,
+            fence.owner_generation,
+        ))
+    }
+
+    fn launch(
+        &mut self,
+        launch: ProviderLaunchRequest<'_>,
+        _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         self.launch_fence = Some(launch.fence.clone());
         let request = Self::wrapper_request(launch.fence, ProviderWrapperOperationV1::Submit);
         self.wrapper_keys
@@ -756,7 +771,11 @@ impl ProviderAdapter for LedgerCmuxAdapter {
         Self::map(response)
     }
 
-    fn reconcile(&mut self, fence: &DeliveryFence) -> ProviderOutcome {
+    fn reconcile(
+        &mut self,
+        fence: &DeliveryFence,
+        _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         self.reconcile_fence = Some(fence.clone());
         let request = Self::wrapper_request(fence, ProviderWrapperOperationV1::Reconcile);
         self.wrapper_keys

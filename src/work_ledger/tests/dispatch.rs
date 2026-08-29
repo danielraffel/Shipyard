@@ -90,6 +90,8 @@ struct Adapter {
     launch_fences: Vec<DeliveryFence>,
     reconcile_fences: Vec<DeliveryFence>,
     panic_after_claim: bool,
+    authorization_refusal: Option<ProviderOutcome>,
+    authorization_count: usize,
 }
 
 impl Adapter {
@@ -110,6 +112,8 @@ impl Adapter {
             launch_fences: Vec::new(),
             reconcile_fences: Vec::new(),
             panic_after_claim: false,
+            authorization_refusal: None,
+            authorization_count: 0,
         }
     }
 }
@@ -121,7 +125,26 @@ impl ProviderAdapter for Adapter {
             .flatten()
     }
 
-    fn launch(&mut self, request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+    fn authorize(
+        &mut self,
+        fence: &DeliveryFence,
+        _operation: ProviderAuthorizationOperation,
+    ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+        self.authorization_count += 1;
+        if let Some(refusal) = self.authorization_refusal.take() {
+            return Err(refusal);
+        }
+        Ok(DeliveryAuthorization::for_test(
+            fence.work_generation,
+            fence.owner_generation,
+        ))
+    }
+
+    fn launch(
+        &mut self,
+        request: ProviderLaunchRequest<'_>,
+        _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         self.launch_count += 1;
         self.launch_fences.push(request.fence.clone());
         assert!(
@@ -131,10 +154,45 @@ impl ProviderAdapter for Adapter {
         self.launch_outcomes.remove(0)
     }
 
-    fn reconcile(&mut self, fence: &DeliveryFence) -> ProviderOutcome {
+    fn reconcile(
+        &mut self,
+        fence: &DeliveryFence,
+        _authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         self.reconcile_fences.push(fence.clone());
         self.reconcile_outcome.clone()
     }
+}
+
+#[test]
+fn authority_refusal_never_marks_launched_or_enters_provider() {
+    let (_temp, ledger, profile, _work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut adapter = Adapter::successful(true);
+    adapter.authorization_refusal = Some(ProviderOutcome::Rejected {
+        evidence: b"delivery-authority-refused:head_mismatch".to_vec(),
+    });
+
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+            .expect("durable authority refusal"),
+        WakeDeliveryResult::Failed
+    );
+    assert_eq!(adapter.authorization_count, 1);
+    assert_eq!(adapter.launch_count, 0);
+    let from_state: String = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT from_state FROM provider_delivery_observations observation
+             JOIN provider_deliveries delivery USING(delivery_id)
+             WHERE delivery.wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("authority refusal observation");
+    assert_eq!(from_state, "prepared");
 }
 
 struct DriftingReconcileAdapter {
@@ -148,11 +206,27 @@ impl ProviderAdapter for DriftingReconcileAdapter {
         self.inner.capability(provider_id)
     }
 
-    fn launch(&mut self, request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
-        self.inner.launch(request)
+    fn authorize(
+        &mut self,
+        fence: &DeliveryFence,
+        operation: ProviderAuthorizationOperation,
+    ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+        self.inner.authorize(fence, operation)
     }
 
-    fn reconcile(&mut self, fence: &DeliveryFence) -> ProviderOutcome {
+    fn launch(
+        &mut self,
+        request: ProviderLaunchRequest<'_>,
+        authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
+        self.inner.launch(request, authority)
+    }
+
+    fn reconcile(
+        &mut self,
+        fence: &DeliveryFence,
+        authority: DeliveryAuthorization,
+    ) -> ProviderOutcome {
         rusqlite::Connection::open(&self.database_path)
             .expect("concurrent connection")
             .execute(
@@ -160,7 +234,7 @@ impl ProviderAdapter for DriftingReconcileAdapter {
                 [&self.work_item_id],
             )
             .expect("plant concurrent lifecycle change");
-        self.inner.reconcile(fence)
+        self.inner.reconcile(fence, authority)
     }
 }
 
@@ -1634,7 +1708,22 @@ fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() 
             })
         }
 
-        fn launch(&mut self, _request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+        fn authorize(
+            &mut self,
+            fence: &DeliveryFence,
+            _operation: ProviderAuthorizationOperation,
+        ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+            Ok(DeliveryAuthorization::for_test(
+                fence.work_generation,
+                fence.owner_generation,
+            ))
+        }
+
+        fn launch(
+            &mut self,
+            _request: ProviderLaunchRequest<'_>,
+            _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
             self.entered.send(()).expect("announce provider entry");
             self.release.recv().expect("release provider");
             ProviderOutcome::Delivered {
@@ -1642,7 +1731,11 @@ fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() 
             }
         }
 
-        fn reconcile(&mut self, _fence: &DeliveryFence) -> ProviderOutcome {
+        fn reconcile(
+            &mut self,
+            _fence: &DeliveryFence,
+            _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
             panic!("a concurrent live owner must not be treated as restart recovery");
         }
     }

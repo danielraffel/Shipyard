@@ -49,11 +49,14 @@ macro_rules! candidate_params {
     };
 }
 
+#[allow(dead_code)] // Live cmux/HerdR proof remains default-off until upstream contracts ship.
+mod delivery_authority;
 #[allow(dead_code)] // Some ownership lifecycle operations remain future-facing.
 mod delivery_ownership;
 #[allow(dead_code)] // Some generic adapter surfaces are exercised only by native dispatch.
 mod dispatch;
 mod importer;
+pub(crate) use delivery_authority::{DeliveryAuthorityRefusal, DeliveryAuthorization};
 #[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
 pub(crate) use delivery_ownership::{
     AgentContextChallenge, AgentContextReceipt, AgentOwnershipReceipt, AgentReturnChallenge,
@@ -61,8 +64,9 @@ pub(crate) use delivery_ownership::{
 };
 pub(crate) use dispatch::{
     DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
-    FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
-    ProviderOutcome, StoredProviderRequest, WakeConsumerPolicy, WakeDeliveryResult,
+    FreshAgentResumeExpectation, ProviderAdapter, ProviderAuthorizationOperation,
+    ProviderCapability, ProviderLaunchRequest, ProviderOutcome, StoredProviderRequest,
+    WakeConsumerPolicy, WakeDeliveryResult,
 };
 #[cfg(test)]
 pub(crate) use dispatch::{WakeEnvelope, WakeProfileResolver};

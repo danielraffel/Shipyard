@@ -719,6 +719,7 @@ fn route_error(error: impl std::fmt::Display) -> WorkLedgerError {
 
 #[cfg(test)]
 mod tests {
+    use crate::work_ledger::{DeliveryAuthorization, ProviderAuthorizationOperation};
     use std::path::PathBuf;
 
     use tempfile::TempDir;
@@ -799,13 +800,32 @@ mod tests {
             })
         }
 
-        fn launch(&mut self, _request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+        fn authorize(
+            &mut self,
+            fence: &DeliveryFence,
+            _operation: ProviderAuthorizationOperation,
+        ) -> Result<DeliveryAuthorization, ProviderOutcome> {
+            Ok(DeliveryAuthorization::for_test(
+                fence.work_generation,
+                fence.owner_generation,
+            ))
+        }
+
+        fn launch(
+            &mut self,
+            _request: ProviderLaunchRequest<'_>,
+            _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
             ProviderOutcome::Delivered {
                 receipt: b"provider accepted agent".to_vec(),
             }
         }
 
-        fn reconcile(&mut self, _fence: &DeliveryFence) -> ProviderOutcome {
+        fn reconcile(
+            &mut self,
+            _fence: &DeliveryFence,
+            _authority: DeliveryAuthorization,
+        ) -> ProviderOutcome {
             ProviderOutcome::Delivered {
                 receipt: b"provider reconciled agent".to_vec(),
             }
