@@ -474,18 +474,7 @@ fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
 
     assert_pending_publication_fences_owner_replacement(&args, &pending);
 
-    let request = native_publication_request(&paths, "owner/repo", args.pr, &args.head)
-        .expect("native request");
-    let report = WorkLedger::plan_or_apply_native_continuation(
-        &paths.state_dir,
-        &request,
-        &continuation_activation().config,
-        true,
-    )
-    .expect("publish pending wake");
-    let unavailable = wait_for_native_consumer_ownership_for(&paths, &report, Duration::ZERO)
-        .expect_err("publication without a daemon is not transfer");
-    assert!(unavailable.message.contains("did not accept"));
+    assert_publication_without_consumer_is_not_transfer(&paths, &args);
 
     deliver_pending_native_wake(&paths);
 
@@ -555,6 +544,24 @@ fn assert_pending_publication_fences_owner_replacement(
     )
     .expect_err("pending publication fences owner replacement");
     assert!(transfer_error.message.contains("cannot be transferred"));
+}
+
+fn assert_publication_without_consumer_is_not_transfer(
+    paths: &RuntimePaths,
+    args: &StewardHandoffArgs,
+) {
+    let request = native_publication_request(paths, "owner/repo", args.pr, &args.head)
+        .expect("native request");
+    let report = WorkLedger::plan_or_apply_native_continuation(
+        &paths.state_dir,
+        &request,
+        &continuation_activation().config,
+        true,
+    )
+    .expect("publish pending wake");
+    let unavailable = wait_for_native_consumer_ownership_for(paths, &report, Duration::ZERO)
+        .expect_err("publication without a daemon is not transfer");
+    assert!(unavailable.message.contains("did not accept"));
 }
 
 fn deliver_pending_native_wake(paths: &RuntimePaths) {
