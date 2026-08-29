@@ -255,6 +255,17 @@ fn disabled_probe_calls_neither_observer_nor_cache() {
 fn probe_is_m3_first_crash_durable_and_exactly_replayable() {
     let builder_root = cache_tree();
     let worker_root = cache_tree();
+    #[cfg(unix)]
+    let manifest = {
+        let builder =
+            produce_cache_generation_manifest(builder_root.path(), "skia", "m124").unwrap();
+        assert_eq!(
+            builder,
+            produce_cache_generation_manifest(worker_root.path(), "skia", "m124").unwrap()
+        );
+        builder
+    };
+    #[cfg(not(unix))]
     let manifest = synthetic_cache_generation_manifest("skia", "m124");
     let policy = policy(&manifest);
     let request = PulpMacCacheProbeRequest {
