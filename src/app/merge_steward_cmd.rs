@@ -352,6 +352,8 @@ pub(super) const RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
 pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
 
 mod handoff;
+#[cfg(test)]
+pub(crate) use handoff::steward_handoff_command_without_ambient;
 pub(crate) use handoff::{
     StewardHandoffArgs, native_publication_request, steward_handoff_command,
     steward_handoff_transfer_report,

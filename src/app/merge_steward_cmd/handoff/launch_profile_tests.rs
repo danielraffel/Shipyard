@@ -377,6 +377,7 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
             .profile
             .resume_argv,
         vec![
+            "subrouter",
             "codex",
             "resume",
             "--model",

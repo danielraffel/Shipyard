@@ -2,10 +2,14 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(not(test))]
+use super::steward_handoff_command;
 use super::{
     CliFailure, LoadedConfig, ResolvedPrContext, ShipStewardHandoff, StewardHandoffArgs,
-    steward_handoff_command, steward_handoff_transfer_report,
+    steward_handoff_transfer_report,
 };
+#[cfg(test)]
+use crate::app::merge_steward_cmd::steward_handoff_command_without_ambient;
 use crate::cloud::GitHubActions;
 use crate::paths::RuntimePaths;
 
@@ -200,23 +204,27 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
         .unwrap_or_else(|| format!("{repo}#{}", pr.number));
     let context_url = request.context_url.clone().or_else(|| pr.pr_url.clone());
     let mut sink = std::io::sink();
-    steward_handoff_command(
-        &StewardHandoffArgs {
-            repo: Some(repo.to_owned()),
-            pr: pr.number,
-            head: head.to_owned(),
-            workstream_id: workstream_id.clone(),
-            context_url: context_url.clone(),
-            agent_provider: None,
-            agent_session_id: None,
-            agent_parent_session_id: None,
-            agent_surface_id: None,
-            launch_profile: request.launch_profile.clone(),
-            goal_managed: request.launch_profile.is_some(),
-            after_handoff: "continue".to_owned(),
-            transfer_agent_owner: false,
-            apply: true,
-        },
+    let handoff_args = StewardHandoffArgs {
+        repo: Some(repo.to_owned()),
+        pr: pr.number,
+        head: head.to_owned(),
+        workstream_id: workstream_id.clone(),
+        context_url: context_url.clone(),
+        agent_provider: None,
+        agent_session_id: None,
+        agent_parent_session_id: None,
+        agent_surface_id: None,
+        launch_profile: request.launch_profile.clone(),
+        goal_managed: request.launch_profile.is_some(),
+        after_handoff: "continue".to_owned(),
+        transfer_agent_owner: false,
+        apply: true,
+    };
+    #[cfg(not(test))]
+    steward_handoff_command(&handoff_args, cwd, runtime_paths, actions, false, &mut sink)?;
+    #[cfg(test)]
+    steward_handoff_command_without_ambient(
+        &handoff_args,
         cwd,
         runtime_paths,
         actions,

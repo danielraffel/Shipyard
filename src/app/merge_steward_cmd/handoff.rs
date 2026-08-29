@@ -282,13 +282,56 @@ pub(crate) fn steward_handoff_command<W: Write>(
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    steward_handoff_command_with_resolver(
+        args,
+        cwd,
+        runtime_paths,
+        actions,
+        json_output,
+        stdout,
+        resolve_agent_context,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn steward_handoff_command_without_ambient<W: Write>(
+    args: &StewardHandoffArgs,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
+    json_output: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    steward_handoff_command_with_resolver(
+        args,
+        cwd,
+        runtime_paths,
+        actions,
+        json_output,
+        stdout,
+        |args| resolve_agent_context_with_environment(args, &AgentEnvironment::default()),
+    )
+}
+
+fn steward_handoff_command_with_resolver<W: Write, F>(
+    args: &StewardHandoffArgs,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
+    json_output: bool,
+    stdout: &mut W,
+    resolve_agent: F,
+) -> Result<ExitCode, CliFailure>
+where
+    F: FnOnce(&StewardHandoffArgs) -> Result<Option<AgentResumeContext>, CliFailure>,
+{
     validate_args(args)?;
     let repo = resolve_repos(args.repo.clone().into_iter().collect(), cwd)?
         .into_iter()
         .next()
         .ok_or_else(|| CliFailure::new(1, "repository was not resolved"))?;
     verify_exact_open_pr(actions, &repo, args.pr, &args.head)?;
-    let agent = resolve_agent_context(args)?;
+    let agent = resolve_agent(args)?;
     let launch_profile = args
         .launch_profile
         .as_deref()
@@ -3074,9 +3117,10 @@ fn main() {{
         assert!(resolve_agent_context(&managed).is_err());
 
         managed.agent_session_id = Some("019d-test-thread".to_owned());
-        let context = resolve_agent_context(&managed)
-            .expect("valid context")
-            .expect("captured context");
+        let context =
+            resolve_agent_context_with_environment(&managed, &AgentEnvironment::default())
+                .expect("valid context")
+                .expect("captured context");
         assert_eq!(context.provider, "codex");
         assert_eq!(context.resume_transport, "codex_queue");
         assert!(context.goal_managed);
@@ -3260,7 +3304,7 @@ fn main() {{
         paused.goal_managed = true;
         paused.after_handoff = "pause".to_owned();
         paused.apply = true;
-        let error = steward_handoff_command(
+        let error = steward_handoff_command_without_ambient(
             &paused,
             temp.path(),
             &paths,
@@ -3968,7 +4012,7 @@ fn main() {{
         let (actions, count) = handoff_status_failing_gh(&temp, &args().head);
         let mut handoff_args = explicit_agent_args("codex", "intent-owner-session");
         handoff_args.apply = true;
-        let error = steward_handoff_command(
+        let error = steward_handoff_command_without_ambient(
             &handoff_args,
             temp.path(),
             &paths,
@@ -4009,7 +4053,7 @@ fn main() {{
         handoff_args.apply = true;
         let (actions, log) = handoff_success_gh(&temp, &handoff_args.head, "[]");
 
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             temp.path(),
             &paths,
@@ -4030,7 +4074,7 @@ fn main() {{
         .to_string();
         let (replay_actions, replay_log) =
             handoff_success_gh(&replay_temp, &handoff_args.head, &statuses);
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             replay_temp.path(),
             &paths,
@@ -4109,7 +4153,7 @@ fn main() {{
         }])
         .to_string();
         let (actions, log) = handoff_success_gh(&temp, &handoff_args.head, &statuses);
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             temp.path(),
             &paths,
@@ -4147,7 +4191,7 @@ fn main() {{
         let mut handoff_args = explicit_agent_args("codex", "status-repair-session");
         handoff_args.apply = true;
         let (actions, _) = handoff_success_gh(&temp, &handoff_args.head, "[]");
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             temp.path(),
             &paths,
@@ -4179,7 +4223,7 @@ fn main() {{
         .to_string();
         let (replay_actions, replay_log) =
             handoff_success_gh(&replay_temp, &handoff_args.head, &statuses);
-        steward_handoff_command(
+        steward_handoff_command_without_ambient(
             &handoff_args,
             replay_temp.path(),
             &paths,
