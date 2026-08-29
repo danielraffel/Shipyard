@@ -341,7 +341,7 @@ impl WorkLedgerProviderAdapter<'_> {
             },
             launch_options: ProviderLaunchOptionsV1 {
                 model_id: stored.launch_options.model_id,
-                reasoning_effort: None,
+                reasoning_effort: stored.launch_options.reasoning_effort,
             },
         })
     }

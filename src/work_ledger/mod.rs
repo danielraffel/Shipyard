@@ -1,7 +1,7 @@
-//! Shadow-only canonical work-item persistence.
+//! Canonical work-item persistence and the protected continuation lane.
 //!
-//! This module is deliberately not wired into scheduling or dispatch. It gives
-//! migrations a crash-consistent target while legacy stores remain authoritative.
+//! Imports remain compatible with the legacy stores, while native continuation
+//! publication and daemon dispatch use this ledger as their fenced authority.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
@@ -49,9 +49,9 @@ macro_rules! candidate_params {
     };
 }
 
-#[allow(dead_code)] // Activated only by the later daemon/provider integration slice.
+#[allow(dead_code)] // Some ownership lifecycle operations remain future-facing.
 mod delivery_ownership;
-#[allow(dead_code)] // Activation remains false; this is the inert Phase 3 consumer contract.
+#[allow(dead_code)] // Some generic adapter surfaces are exercised only by native dispatch.
 mod dispatch;
 mod importer;
 #[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
@@ -71,7 +71,7 @@ mod native_publication;
 mod observation;
 mod persistence;
 mod policy;
-#[allow(dead_code)] // Production provider activation lands after the protected store.
+#[allow(dead_code)] // Platform-specific helpers are not used on every target.
 mod protected_objects;
 mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.

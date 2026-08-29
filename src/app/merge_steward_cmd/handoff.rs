@@ -15,10 +15,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::process::{Command, ExitCode};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::paths::RuntimePaths;
 use crate::queue::replace_file_with_windows_retry;
-use crate::work_ledger::{FreshAgentLaunchProfile, NativePublicationRequest};
+use crate::work_ledger::{
+    FreshAgentLaunchProfile, NativePublicationReport, NativePublicationRequest, WorkLedger,
+};
+use crate::workstream_activation_loader::{
+    ReadyWorkstreamActivation, WorkstreamActivationLoader, WorkstreamActivationState,
+};
 
 #[derive(Clone)]
 pub(crate) struct StewardHandoffArgs {
@@ -228,8 +235,36 @@ struct DurableStewardHandoff {
     agent_disposition: String,
     pause_required: bool,
     wake_consumer_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_publication: Option<NativePublicationReceiptV1>,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativePublicationReceiptV1 {
+    schema_version: u32,
+    state: NativePublicationStateV1,
+    work_id: String,
+    route_ref: String,
+    wake_id: String,
+    profile_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativePublicationStateV1 {
+    Pending,
+    Accepted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StewardHandoffTransferReport {
+    pub(crate) wake_consumer_available: bool,
+    pub(crate) publication_work_id: Option<String>,
+    pub(crate) publication_route_ref: Option<String>,
+    pub(crate) publication_wake_id: Option<String>,
 }
 
 pub(crate) fn steward_handoff_command<W: Write>(
@@ -264,6 +299,7 @@ pub(crate) fn steward_handoff_command<W: Write>(
         .map(|agent| agent_route_reference(agent, &origin_machine));
     validate_launch_profile_route(launch_profile.as_ref(), agent_route.as_ref())?;
 
+    let mut wake_consumer_available = false;
     if args.apply {
         let directory = handoff_directory(runtime_paths, &repo, args.pr);
         ensure_private_directory(&directory)?;
@@ -311,6 +347,19 @@ pub(crate) fn steward_handoff_command<W: Write>(
         add_label(actions, &repo, args.pr, MANAGED_LABEL)?;
         verify_exact_open_pr(actions, &repo, args.pr, &args.head)?;
         receipt = persist_handoff(&path, receipt, HandoffPhase::Managed)?;
+        if receipt.launch_profile.is_some() {
+            let ready = ready_workstream_activation(runtime_paths)?;
+            receipt = publish_managed_handoff(
+                runtime_paths,
+                &path,
+                receipt,
+                &repo,
+                args.pr,
+                &args.head.to_ascii_lowercase(),
+                &ready,
+            )?;
+        }
+        wake_consumer_available = receipt.wake_consumer_available;
         remove_label(actions, &repo, args.pr, UNMANAGED_LABEL)?;
         debug_assert_eq!(receipt.phase, HandoffPhase::Managed);
     }
@@ -321,6 +370,7 @@ pub(crate) fn steward_handoff_command<W: Write>(
         agent_route.as_ref(),
         &origin_machine,
         json_output,
+        wake_consumer_available,
         stdout,
     )?;
     Ok(ExitCode::SUCCESS)
@@ -923,6 +973,36 @@ pub(crate) fn native_publication_request(
     })
 }
 
+pub(crate) fn steward_handoff_transfer_report(
+    runtime_paths: &RuntimePaths,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<StewardHandoffTransferReport, CliFailure> {
+    let path = handoff_path(&handoff_directory(runtime_paths, repo, pr), head);
+    let receipt = load_handoff(&path)?
+        .ok_or_else(|| CliFailure::new(1, "exact-head durable handoff receipt is unavailable"))?;
+    validate_handoff_receipt_integrity(&receipt, repo, pr, head)?;
+    if receipt.phase != HandoffPhase::Managed {
+        return Err(CliFailure::new(1, "durable handoff is not managed"));
+    }
+    Ok(StewardHandoffTransferReport {
+        wake_consumer_available: receipt.wake_consumer_available,
+        publication_work_id: receipt
+            .native_publication
+            .as_ref()
+            .map(|publication| publication.work_id.clone()),
+        publication_route_ref: receipt
+            .native_publication
+            .as_ref()
+            .map(|publication| publication.route_ref.clone()),
+        publication_wake_id: receipt
+            .native_publication
+            .as_ref()
+            .map(|publication| publication.wake_id.clone()),
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct TerminalOwnerRoute {
     pub(super) origin_machine: String,
@@ -1357,6 +1437,7 @@ fn new_handoff_receipt(
         agent_disposition: args.after_handoff.clone(),
         pause_required,
         wake_consumer_available: false,
+        native_publication: None,
         phase: HandoffPhase::Intent,
         created_at: now.clone(),
         updated_at: now,
@@ -1428,17 +1509,37 @@ fn validate_handoff_receipt_integrity(
                 || stored.profile.recovery_policy
                     == super::launch_profile::RecoveryPolicyV1::FreshCheckpointOnly)
     });
+    let publication_consistent = match (
+        receipt.wake_consumer_available,
+        receipt.native_publication.as_ref(),
+        receipt.launch_profile.as_ref(),
+    ) {
+        (false, None, _) => true,
+        (available, Some(publication), Some(profile)) => {
+            publication.schema_version == 1
+                && publication.profile_digest == profile.profile_digest
+                && valid_publication_identifier(&publication.work_id)
+                && valid_publication_identifier(&publication.route_ref)
+                && valid_publication_identifier(&publication.wake_id)
+                && matches!(
+                    (available, publication.state),
+                    (false, NativePublicationStateV1::Pending)
+                        | (true, NativePublicationStateV1::Accepted)
+                )
+        }
+        _ => false,
+    };
     if receipt.schema_version != 2
         || !receipt.repo.eq_ignore_ascii_case(repo)
         || receipt.pr != pr
         || !receipt.head_sha.eq_ignore_ascii_case(head)
         || receipt.ownership_generation == 0
         || receipt.revision == 0
-        || receipt.wake_consumer_available
         || !matches!(receipt.agent_disposition.as_str(), "continue" | "pause")
         || !route_consistent
         || !pause_consistent
         || !launch_profile_consistent
+        || !publication_consistent
     {
         return Err(CliFailure::new(
             1,
@@ -1447,6 +1548,14 @@ fn validate_handoff_receipt_integrity(
     }
     validate_agent_identifier("origin machine", &receipt.origin_machine)?;
     Ok(())
+}
+
+fn valid_publication_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn launch_profile_session_matches_route(
@@ -1502,6 +1611,12 @@ fn transfer_handoff_owner(
     {
         return Ok(existing);
     }
+    if existing.native_publication.is_some() {
+        return Err(CliFailure::new(
+            1,
+            "published native continuation ownership cannot be transferred; create a new exact-head handoff",
+        ));
+    }
     if existing.owner_id == owner_id && existing.agent_route == agent_route {
         return Err(CliFailure::new(
             1,
@@ -1545,6 +1660,218 @@ fn transfer_handoff_owner(
     };
     existing.ownership_generation = next_generation;
     Ok(existing)
+}
+
+fn ready_workstream_activation(
+    runtime_paths: &RuntimePaths,
+) -> Result<ReadyWorkstreamActivation, CliFailure> {
+    let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+    if runtime_paths != &production_paths {
+        return Err(CliFailure::new(
+            1,
+            "automatic native continuation publication requires canonical production roots",
+        ));
+    }
+    let mut loader = WorkstreamActivationLoader::production();
+    match loader.revalidate_for_tick() {
+        WorkstreamActivationState::Ready(ready) => Ok(ready),
+        WorkstreamActivationState::Disabled => Err(CliFailure::new(
+            1,
+            "workstream continuation activation is disabled; monitoring ownership was not transferred",
+        )),
+        WorkstreamActivationState::Refused(reason) => Err(CliFailure::new(
+            1,
+            format!(
+                "workstream continuation activation refused: {}; monitoring ownership was not transferred",
+                reason.code()
+            ),
+        )),
+    }
+}
+
+fn publish_managed_handoff(
+    runtime_paths: &RuntimePaths,
+    path: &Path,
+    receipt: DurableStewardHandoff,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    ready: &ReadyWorkstreamActivation,
+) -> Result<DurableStewardHandoff, CliFailure> {
+    publish_managed_handoff_with_consumer(
+        runtime_paths,
+        path,
+        receipt,
+        repo,
+        pr,
+        head,
+        ready,
+        wait_for_native_consumer_ownership,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_managed_handoff_with_consumer<F>(
+    runtime_paths: &RuntimePaths,
+    path: &Path,
+    receipt: DurableStewardHandoff,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    ready: &ReadyWorkstreamActivation,
+    await_consumer: F,
+) -> Result<DurableStewardHandoff, CliFailure>
+where
+    F: FnOnce(&RuntimePaths, &NativePublicationReport) -> Result<(), CliFailure>,
+{
+    let request = native_publication_request(runtime_paths, repo, pr, head)?;
+    if ready.machine_tag != request.origin_machine {
+        return Err(CliFailure::new(
+            1,
+            "durable handoff belongs to a different continuation consumer machine",
+        ));
+    }
+    let planned = WorkLedger::plan_or_apply_native_continuation(
+        &runtime_paths.state_dir,
+        &request,
+        &ready.config,
+        false,
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let receipt = bind_native_publication_pending(path, receipt, &planned)?;
+    let report = WorkLedger::plan_or_apply_native_continuation(
+        &runtime_paths.state_dir,
+        &request,
+        &ready.config,
+        true,
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if report.work_id != planned.work_id
+        || report.route_ref != planned.route_ref
+        || report.wake_id != planned.wake_id
+        || report.profile_digest != planned.profile_digest
+    {
+        return Err(CliFailure::new(
+            1,
+            "native continuation publication changed after durable intent",
+        ));
+    }
+    await_consumer(runtime_paths, &report)?;
+    bind_native_publication(path, receipt, &report)
+}
+
+fn native_publication_receipt(
+    report: &NativePublicationReport,
+    state: NativePublicationStateV1,
+) -> NativePublicationReceiptV1 {
+    NativePublicationReceiptV1 {
+        schema_version: 1,
+        state,
+        work_id: report.work_id.clone(),
+        route_ref: report.route_ref.clone(),
+        wake_id: report.wake_id.clone(),
+        profile_digest: report.profile_digest.clone(),
+    }
+}
+
+fn bind_native_publication_pending(
+    path: &Path,
+    mut receipt: DurableStewardHandoff,
+    report: &NativePublicationReport,
+) -> Result<DurableStewardHandoff, CliFailure> {
+    let pending = native_publication_receipt(report, NativePublicationStateV1::Pending);
+    let accepted = native_publication_receipt(report, NativePublicationStateV1::Accepted);
+    if receipt.wake_consumer_available {
+        if receipt.native_publication.as_ref() == Some(&accepted) {
+            return Ok(receipt);
+        }
+        return Err(CliFailure::new(
+            1,
+            "accepted native publication cannot return to pending",
+        ));
+    }
+    match receipt.native_publication.as_ref() {
+        Some(existing) if existing == &pending => Ok(receipt),
+        Some(_) => Err(CliFailure::new(
+            1,
+            "native publication intent changed for an existing exact-head handoff",
+        )),
+        None => {
+            receipt.native_publication = Some(pending);
+            persist_handoff(path, receipt, HandoffPhase::Managed)
+        }
+    }
+}
+
+fn wait_for_native_consumer_ownership(
+    runtime_paths: &RuntimePaths,
+    report: &NativePublicationReport,
+) -> Result<(), CliFailure> {
+    wait_for_native_consumer_ownership_for(runtime_paths, report, Duration::from_secs(5))
+}
+
+fn wait_for_native_consumer_ownership_for(
+    runtime_paths: &RuntimePaths,
+    report: &NativePublicationReport,
+    timeout: Duration,
+) -> Result<(), CliFailure> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ledger = WorkLedger::open_existing(&runtime_paths.state_dir)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?
+            .ok_or_else(|| CliFailure::new(1, "native continuation ledger disappeared"))?;
+        if ledger
+            .native_wake_consumer_owns(&report.wake_id)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(CliFailure::new(
+                1,
+                "native continuation daemon did not accept the published wake; monitoring ownership was not transferred",
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn bind_native_publication(
+    path: &Path,
+    mut receipt: DurableStewardHandoff,
+    report: &NativePublicationReport,
+) -> Result<DurableStewardHandoff, CliFailure> {
+    let profile_digest = receipt
+        .launch_profile
+        .as_ref()
+        .map(|profile| profile.profile_digest.as_str())
+        .ok_or_else(|| CliFailure::new(1, "native publication lost its launch profile"))?;
+    if report.profile_digest != profile_digest {
+        return Err(CliFailure::new(
+            1,
+            "native publication receipt does not match the protected launch profile",
+        ));
+    }
+    let pending = native_publication_receipt(report, NativePublicationStateV1::Pending);
+    let publication = native_publication_receipt(report, NativePublicationStateV1::Accepted);
+    if receipt.wake_consumer_available {
+        if receipt.native_publication.as_ref() == Some(&publication) {
+            return Ok(receipt);
+        }
+        return Err(CliFailure::new(
+            1,
+            "native publication receipt changed for an existing exact-head handoff",
+        ));
+    }
+    if receipt.native_publication.as_ref() != Some(&pending) {
+        return Err(CliFailure::new(
+            1,
+            "native publication acceptance lacks its durable pending intent",
+        ));
+    }
+    receipt.wake_consumer_available = true;
+    receipt.native_publication = Some(publication);
+    persist_handoff(path, receipt, HandoffPhase::Managed)
 }
 
 fn prepare_launch_profile_candidate(
@@ -2211,6 +2538,7 @@ fn render<W: Write>(
     agent_route: Option<&AgentRouteReference>,
     origin_machine: &str,
     json_output: bool,
+    wake_consumer_available: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
     let pause_requested = args.after_handoff == "pause";
@@ -2220,80 +2548,21 @@ fn render<W: Write>(
         args.after_handoff.as_str()
     };
     if json_output {
-        let mut data = BTreeMap::new();
-        data.insert("apply".to_owned(), Value::from(args.apply));
-        data.insert("repo".to_owned(), Value::from(repo));
-        data.insert("pr".to_owned(), Value::from(args.pr));
-        data.insert("head_sha".to_owned(), Value::from(args.head.clone()));
-        data.insert(
-            "workstream_id".to_owned(),
-            Value::from(args.workstream_id.clone()),
-        );
-        data.insert("managed_label".to_owned(), Value::from(MANAGED_LABEL));
-        data.insert("handoff_context".to_owned(), Value::from(HANDOFF_CONTEXT));
-        data.insert("monitoring_transferred".to_owned(), Value::from(false));
-        data.insert(
-            "agent_disposition".to_owned(),
-            Value::from(effective_disposition),
-        );
-        data.insert(
-            "requested_agent_disposition".to_owned(),
-            Value::from(args.after_handoff.clone()),
-        );
-        data.insert(
-            "agent_disposition_supported".to_owned(),
-            Value::from(!pause_requested),
-        );
-        data.insert("pause_required".to_owned(), Value::from(false));
-        data.insert("pause_supported".to_owned(), Value::from(false));
-        data.insert("wake_consumer_available".to_owned(), Value::from(false));
-        data.insert(
-            "origin_machine".to_owned(),
-            Value::from(origin_machine.to_owned()),
-        );
-        data.insert(
-            "repair_route".to_owned(),
-            Value::from(if agent_route.is_some() {
-                "original_agent"
-            } else {
-                "fresh_agent_only"
-            }),
-        );
-        data.insert(
-            "goal_lifecycle".to_owned(),
-            Value::from(if agent_route.is_some_and(|route| route.goal_managed) {
-                "managed"
-            } else {
-                "unmanaged"
-            }),
-        );
-        data.insert(
-            "goal_status".to_owned(),
-            serde_json::to_value(
-                agent_route.map_or(GoalStatus::Unmanaged, |route| route.goal_status),
-            )
-            .map_err(|error| CliFailure::new(1, error.to_string()))?,
-        );
-        data.insert(
-            "goal_status_provenance".to_owned(),
-            Value::from("not_observed"),
-        );
-        if let Some(agent_route) = agent_route {
-            data.insert(
-                "agent_route".to_owned(),
-                serde_json::to_value(agent_route)
-                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
-            );
-        }
-        if let Some(url) = args.context_url.as_deref() {
-            data.insert("context_url".to_owned(), Value::from(url));
-        }
+        let data = render_json_data(
+            args,
+            repo,
+            agent_route,
+            origin_machine,
+            effective_disposition,
+            pause_requested,
+            wake_consumer_available,
+        )?;
         return write_json_envelope(stdout, "runner.steward-handoff", data)
             .map_err(|error| CliFailure::new(1, error.to_string()));
     }
     writeln!(
         stdout,
-        "steward handoff: mode={} repo={} pr=#{} head={} workstream={} label={} requested_disposition={} disposition={} disposition_supported={} pause_supported=false pause_required=false wake_consumer_available=false origin_machine={} repair_route={}",
+        "steward handoff: mode={} repo={} pr=#{} head={} workstream={} label={} requested_disposition={} disposition={} disposition_supported={} pause_supported=false pause_required=false wake_consumer_available={} origin_machine={} repair_route={}",
         if args.apply { "apply" } else { "dry-run" },
         repo,
         args.pr,
@@ -2303,6 +2572,7 @@ fn render<W: Write>(
         args.after_handoff,
         effective_disposition,
         !pause_requested,
+        wake_consumer_available,
         origin_machine,
         if agent_route.is_some() {
             "original_agent"
@@ -2311,6 +2581,92 @@ fn render<W: Write>(
         }
     )
     .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_json_data(
+    args: &StewardHandoffArgs,
+    repo: &str,
+    agent_route: Option<&AgentRouteReference>,
+    origin_machine: &str,
+    effective_disposition: &str,
+    pause_requested: bool,
+    wake_consumer_available: bool,
+) -> Result<BTreeMap<String, Value>, CliFailure> {
+    let mut data = BTreeMap::from([
+        ("apply".to_owned(), Value::from(args.apply)),
+        ("repo".to_owned(), Value::from(repo)),
+        ("pr".to_owned(), Value::from(args.pr)),
+        ("head_sha".to_owned(), Value::from(args.head.clone())),
+        (
+            "workstream_id".to_owned(),
+            Value::from(args.workstream_id.clone()),
+        ),
+        ("managed_label".to_owned(), Value::from(MANAGED_LABEL)),
+        ("handoff_context".to_owned(), Value::from(HANDOFF_CONTEXT)),
+        (
+            "monitoring_transferred".to_owned(),
+            Value::from(wake_consumer_available),
+        ),
+        (
+            "agent_disposition".to_owned(),
+            Value::from(effective_disposition),
+        ),
+        (
+            "requested_agent_disposition".to_owned(),
+            Value::from(args.after_handoff.clone()),
+        ),
+        (
+            "agent_disposition_supported".to_owned(),
+            Value::from(!pause_requested),
+        ),
+        ("pause_required".to_owned(), Value::from(false)),
+        ("pause_supported".to_owned(), Value::from(false)),
+        (
+            "wake_consumer_available".to_owned(),
+            Value::from(wake_consumer_available),
+        ),
+        (
+            "origin_machine".to_owned(),
+            Value::from(origin_machine.to_owned()),
+        ),
+        (
+            "repair_route".to_owned(),
+            Value::from(if agent_route.is_some() {
+                "original_agent"
+            } else {
+                "fresh_agent_only"
+            }),
+        ),
+        (
+            "goal_lifecycle".to_owned(),
+            Value::from(if agent_route.is_some_and(|route| route.goal_managed) {
+                "managed"
+            } else {
+                "unmanaged"
+            }),
+        ),
+        (
+            "goal_status_provenance".to_owned(),
+            Value::from("not_observed"),
+        ),
+    ]);
+    data.insert(
+        "goal_status".to_owned(),
+        serde_json::to_value(agent_route.map_or(GoalStatus::Unmanaged, |route| route.goal_status))
+            .map_err(|error| CliFailure::new(1, error.to_string()))?,
+    );
+    if let Some(agent_route) = agent_route {
+        data.insert(
+            "agent_route".to_owned(),
+            serde_json::to_value(agent_route)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+    }
+    if let Some(url) = args.context_url.as_deref() {
+        data.insert("context_url".to_owned(), Value::from(url));
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -2715,8 +3071,16 @@ fn main() {{
             .expect("dry-run agent");
         let route = agent_route_reference(&agent, "m3");
         let mut output = Vec::new();
-        render(&paused, "owner/repo", Some(&route), "m3", true, &mut output)
-            .expect("render dry run");
+        render(
+            &paused,
+            "owner/repo",
+            Some(&route),
+            "m3",
+            true,
+            false,
+            &mut output,
+        )
+        .expect("render dry run");
         let value: Value = serde_json::from_slice(&output).expect("dry-run json");
         assert_eq!(value["requested_agent_disposition"], "pause");
         assert_eq!(value["agent_disposition"], "unsupported");

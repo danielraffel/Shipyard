@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
+use crate::provider_wrapper::ProviderReasoningEffortV1;
+
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_ARGV_ITEMS: usize = 64;
 const MAX_ARG_BYTES: usize = 4 * 1024;
@@ -93,6 +95,12 @@ pub(super) struct ProviderMetadataV1 {
     pub(super) account: Option<String>,
     #[serde(default, rename = "model_id", skip_serializing_if = "Option::is_none")]
     pub(super) model: Option<String>,
+    #[serde(
+        default,
+        rename = "reasoning_effort",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) reasoning_effort: Option<ProviderReasoningEffortV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -128,6 +136,7 @@ impl crate::work_ledger::FreshAgentLaunchProfile for LaunchProfileV1 {
     fn provider_launch_options(&self) -> crate::work_ledger::FreshAgentProviderLaunchOptions {
         crate::work_ledger::FreshAgentProviderLaunchOptions {
             model_id: self.provider.model.clone(),
+            reasoning_effort: self.provider.reasoning_effort,
         }
     }
 
@@ -278,6 +287,7 @@ fn validate_native_argv(
         index += 1;
     }
     let mut model = None;
+    let mut reasoning_effort = None;
     let mut session = None;
     while index < argv.len() {
         match (provider, argv[index].as_str()) {
@@ -285,6 +295,30 @@ fn validate_native_argv(
                 model = Some(argv.get(index + 1).map(String::as_str).ok_or_else(|| {
                     CliFailure::new(1, "native fresh-agent model flag has no value")
                 })?);
+                index += 2;
+            }
+            ("codex", "-c") if reasoning_effort.is_none() => {
+                let value = argv.get(index + 1).map(String::as_str).ok_or_else(|| {
+                    CliFailure::new(1, "native codex reasoning flag has no value")
+                })?;
+                reasoning_effort = parse_codex_reasoning_config(value);
+                if reasoning_effort.is_none() {
+                    return Err(CliFailure::new(
+                        1,
+                        "native codex reasoning config is invalid",
+                    ));
+                }
+                index += 2;
+            }
+            ("claude", "--effort") if reasoning_effort.is_none() => {
+                let value = argv
+                    .get(index + 1)
+                    .map(String::as_str)
+                    .ok_or_else(|| CliFailure::new(1, "native claude effort flag has no value"))?;
+                reasoning_effort = parse_claude_reasoning_effort(value);
+                if reasoning_effort.is_none() {
+                    return Err(CliFailure::new(1, "native claude effort is invalid"));
+                }
                 index += 2;
             }
             ("claude", "--resume") if resume && session.is_none() => {
@@ -306,6 +340,7 @@ fn validate_native_argv(
         }
     }
     if model != profile.provider.model.as_deref()
+        || reasoning_effort != profile.provider.reasoning_effort
         || (resume && session != expected_session)
         || (!resume && session.is_some())
     {
@@ -315,6 +350,32 @@ fn validate_native_argv(
         ));
     }
     Ok(())
+}
+
+fn parse_codex_reasoning_config(value: &str) -> Option<ProviderReasoningEffortV1> {
+    let value = value
+        .strip_prefix("model_reasoning_effort=\"")?
+        .strip_suffix('"')?;
+    parse_reasoning_effort(value)
+}
+
+fn parse_reasoning_effort(value: &str) -> Option<ProviderReasoningEffortV1> {
+    match value {
+        "low" => Some(ProviderReasoningEffortV1::Low),
+        "medium" => Some(ProviderReasoningEffortV1::Medium),
+        "high" => Some(ProviderReasoningEffortV1::High),
+        "xhigh" => Some(ProviderReasoningEffortV1::Xhigh),
+        "max" => Some(ProviderReasoningEffortV1::Max),
+        "ultra" => Some(ProviderReasoningEffortV1::Ultra),
+        _ => None,
+    }
+}
+
+fn parse_claude_reasoning_effort(value: &str) -> Option<ProviderReasoningEffortV1> {
+    match parse_reasoning_effort(value) {
+        Some(ProviderReasoningEffortV1::Ultra) | None => None,
+        supported => supported,
+    }
 }
 
 fn validate_provider_option(label: &str, value: &str) -> Result<(), CliFailure> {
@@ -601,6 +662,7 @@ mod tests {
                 provider: "subscription-router".into(),
                 account: Some("account-a".into()),
                 model: Some("model-x".into()),
+                reasoning_effort: None,
             },
             session: Some(SessionProvenanceV1 {
                 agent_provider: "agent-protocol".into(),
@@ -669,10 +731,15 @@ mod tests {
     fn wake_consumer_projects_only_validated_provider_metadata() {
         use crate::work_ledger::FreshAgentLaunchProfile;
 
-        let profile = profile();
+        let mut profile = profile();
+        profile.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
         assert_eq!(
             FreshAgentLaunchProfile::provider_launch_options(&profile).model_id,
             Some("model-x".to_owned())
+        );
+        assert_eq!(
+            FreshAgentLaunchProfile::provider_launch_options(&profile).reasoning_effort,
+            Some(ProviderReasoningEffortV1::Medium)
         );
         assert_eq!(
             FreshAgentLaunchProfile::profile_digest(&profile).expect("consumer digest"),
@@ -685,12 +752,21 @@ mod tests {
     fn native_grammar_is_prompt_free_and_exactly_matches_metadata() {
         let mut codex = profile();
         codex.provider.provider = "codex".into();
-        codex.launch_argv = vec!["codex".into(), "--model".into(), "model-x".into()];
+        codex.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
+        codex.launch_argv = vec![
+            "codex".into(),
+            "--model".into(),
+            "model-x".into(),
+            "-c".into(),
+            "model_reasoning_effort=\"medium\"".into(),
+        ];
         codex.resume_argv = vec![
             "codex".into(),
             "resume".into(),
             "--model".into(),
             "model-x".into(),
+            "-c".into(),
+            "model_reasoning_effort=\"medium\"".into(),
             "session-7".into(),
         ];
         codex
@@ -699,11 +775,20 @@ mod tests {
 
         let mut claude = profile();
         claude.provider.provider = "claude".into();
-        claude.launch_argv = vec!["claude".into(), "--model".into(), "model-x".into()];
+        claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::High);
+        claude.launch_argv = vec![
+            "claude".into(),
+            "--model".into(),
+            "model-x".into(),
+            "--effort".into(),
+            "high".into(),
+        ];
         claude.resume_argv = vec![
             "claude".into(),
             "--model".into(),
             "model-x".into(),
+            "--effort".into(),
+            "high".into(),
             "--resume".into(),
             "session-7".into(),
         ];
@@ -711,10 +796,18 @@ mod tests {
             .validate_native_fresh_agent_grammar()
             .expect("claude grammar");
 
+        let mut unsupported_claude = claude.clone();
+        unsupported_claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Ultra);
+        unsupported_claude.launch_argv[4] = "ultra".into();
+        unsupported_claude.resume_argv[4] = "ultra".into();
+        assert!(
+            unsupported_claude
+                .validate_native_fresh_agent_grammar()
+                .is_err()
+        );
+
         let mut unrecognized_effort = codex.clone();
-        unrecognized_effort
-            .launch_argv
-            .extend(["-c".into(), "model_reasoning_effort=\"medium\"".into()]);
+        unrecognized_effort.launch_argv[4] = "model_reasoning_effort=\"wrong\"".into();
         assert!(
             unrecognized_effort
                 .validate_native_fresh_agent_grammar()

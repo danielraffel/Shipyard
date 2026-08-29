@@ -28,8 +28,9 @@ explicit disposition or wake owner.
 
 Until the receipt reports `wake_consumer_available=true`, the originating
 agent retains the last monitoring obligation and must not park solely in
-reliance on Shipyard. The current durable receipt foundation records a safe
-route but deliberately reports that the wake consumer is unavailable.
+reliance on Shipyard. A launch profile plus an enabled trusted machine-global
+consumer publishes the wake before reporting transfer; a basic receipt records
+only the safe route and does not transfer monitoring.
 
 Shipyard records terminal provenance using explicit terminal contracts. A
 HerdR handoff requires `HERDR_ENV=1` plus workspace, tab, and pane identity;
@@ -39,18 +40,19 @@ one. Partial or conflicting metadata fails closed. Existing cmux handoffs
 preserve their legacy route hash, while an ordinary terminal remains
 terminal-agnostic. Raw terminal
 and provider-session identifiers stay in Shipyard's private ledger and are not
-published to GitHub. Typed provenance is only a future wake address: until a
-trusted consumer advertises availability, it does not authorize pausing,
-resuming, or transferring monitoring.
+published to GitHub. Typed provenance is only a wake address: until a trusted
+consumer advertises availability, it does not authorize pausing, resuming, or
+transferring monitoring.
 
 When an exact wrapper or provider-specific resume command must survive the
 handoff, pass a private `LaunchProfileV1` JSON file with `--launch-profile`.
 Preserve launch and resume argv as exact arrays; never translate provider flags
 or put credentials in the profile. The contract also binds opaque
 provider/account/model metadata, checkpoint generation/digest, and exact
-repository/worktree/head/lineage provenance. Shipyard stores but does not
-execute this contract, and it must continue to report
-`wake_consumer_available=false`. See `docs/launch-profile.md`.
+repository/worktree/head/lineage provenance. Shipyard never executes the
+stored argv directly. It validates the prompt-free native grammar, projects
+typed model/reasoning options into the pinned provider adapter, and reports
+transfer only after durable publication. See `docs/launch-profile.md`.
 
 After an acknowledged handoff whose receipt proves the wake consumer is
 available:
@@ -1153,7 +1155,8 @@ exact-head management authority before making the final POST.
 Stewardship is opt-in per immutable head. Prefer making the receipt atomic with
 PR creation: set `[merge_steward].auto_handoff = true` on the protected base
 branch and run `shipyard pr`, optionally adding `--workstream-id ID
---context-url URL`. Shipyard never trusts the PR branch to enable that default.
+--context-url URL --launch-profile PRIVATE_JSON`. Shipyard never trusts the PR
+branch to enable that default.
 Immediately after the PR exists and before validation starts, Shipyard writes
 the receipt; without explicit values it uses `OWNER/REPO#PR` and the PR URL.
 Use `--no-steward-handoff` only as an explicit project-default override.
@@ -1186,7 +1189,8 @@ wait behind unrelated work only to fail at worker start. Never auto-adopt.
 
 For an already-created PR, the submitting agent must run
 `shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
---workstream-id ID [--context-url URL] --apply`. That command writes a
+--workstream-id ID [--context-url URL] [--launch-profile PRIVATE_JSON] --apply`.
+That command writes a
 successful `shipyard/steward-handoff` status on the expected head, re-reads the
 PR, and only then adds `shipyard:managed` and removes `shipyard:unmanaged`.
 Shipyard persists a stable private machine identity on first use; later host

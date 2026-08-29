@@ -388,6 +388,10 @@ pub(super) enum Command {
         /// Durable context URL for the steward receipt. Defaults to the PR URL.
         #[arg(long = "context-url", conflicts_with = "no_steward_handoff")]
         context_url: Option<String>,
+        /// Private JSON `LaunchProfileV1` atomically published with the
+        /// exact-head steward handoff.
+        #[arg(long = "launch-profile", conflicts_with = "no_steward_handoff")]
+        launch_profile: Option<PathBuf>,
         /// Disable a project-configured automatic steward handoff.
         #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
         no_steward_handoff: bool,

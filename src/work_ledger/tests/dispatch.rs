@@ -218,6 +218,7 @@ fn add_wake_labeled(
         provider: "subrouter".to_owned(),
         launch_options: FreshAgentProviderLaunchOptions {
             model_id: Some("model-tier-a".to_owned()),
+            reasoning_effort: None,
         },
         digest: digest(b"profile"),
         repository: "danielraffel/pulp".to_owned(),

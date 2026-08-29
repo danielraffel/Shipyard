@@ -90,6 +90,33 @@ where
 }
 
 impl WorkLedger {
+    /// Whether the daemon has durably accepted responsibility for this wake.
+    ///
+    /// Publication alone is not consumer availability. This becomes true only
+    /// after the daemon has completed a fenced provider delivery. Merely
+    /// claiming, retrying, or becoming uncertain is not enough to let the
+    /// originating agent relinquish the final monitoring obligation.
+    pub(crate) fn native_wake_consumer_owns(&self, wake_id: &str) -> WorkLedgerResult<bool> {
+        let connection = self.connect_read_only()?;
+        let observed: Option<(String, bool)> = connection
+            .query_row(
+                "SELECT wake.state,
+                        EXISTS(
+                          SELECT 1 FROM wake_attempts attempt
+                           WHERE attempt.wake_id = wake.wake_id
+                             AND attempt.state IN
+                               ('claimed', 'delivered', 'acknowledged', 'retry', 'uncertain')
+                        )
+                   FROM outbox wake WHERE wake.wake_id = ?1",
+                [wake_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(observed.is_some_and(|(state, attempt)| {
+            attempt && matches!(state.as_str(), "delivered" | "acknowledged")
+        }))
+    }
+
     pub(crate) fn plan_or_apply_native_continuation(
         state_dir: &std::path::Path,
         request: &NativePublicationRequest,
@@ -697,11 +724,16 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::work_ledger::{
+        DeliveryFence, FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability,
+        ProviderLaunchRequest, ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult,
+        WakeEnvelope, WakeProfileResolver,
+    };
     use crate::workstream_continuation_config::ProviderWrapperConfig;
 
     #[derive(Clone)]
     struct TestProfile {
-        digest: String,
+        request: NativePublicationRequest,
     }
 
     impl FreshAgentLaunchProfile for TestProfile {
@@ -714,11 +746,69 @@ mod tests {
         }
 
         fn profile_digest(&self) -> WorkLedgerResult<String> {
-            Ok(self.digest.clone())
+            Ok(self.request.profile_digest.clone())
         }
 
         fn permits_fresh_agent(&self) -> bool {
             true
+        }
+
+        fn protected_profile_bytes(&self) -> WorkLedgerResult<Vec<u8>> {
+            Ok(self.request.protected_profile_bytes.clone())
+        }
+
+        fn resume_expectation(&self) -> Option<FreshAgentResumeExpectation<'_>> {
+            Some(FreshAgentResumeExpectation {
+                workstream_handle: &self.request.workstream_handle,
+                context_url: self.request.context_url.as_deref(),
+                plan_sha256: "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+                root_revision: 1,
+                issue_revision: 1,
+                projection_revision: 1,
+                material_event_revision: 1,
+                checkpoint_id: "checkpoint-test",
+                checkpoint_generation: 1,
+                checkpoint_digest: "2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f",
+                repository: &self.request.repository,
+                head_sha: &self.request.head_sha,
+                expected_resume_context_digest: "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f",
+                success_continuation_digest: &self.request.success_continuation_digest,
+                failure_continuation_digest: &self.request.failure_continuation_digest,
+            })
+        }
+    }
+
+    struct Resolver(TestProfile);
+
+    impl WakeProfileResolver for Resolver {
+        type Profile = TestProfile;
+
+        fn resolve(&mut self, _wake: &WakeEnvelope) -> WorkLedgerResult<Self::Profile> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct Adapter;
+
+    impl ProviderAdapter for Adapter {
+        fn capability(&self, provider_id: &str) -> Option<ProviderCapability> {
+            (provider_id == "provider").then(|| ProviderCapability {
+                adapter_id: "provider-wrapper-v1".to_owned(),
+                fresh_agent_launch: true,
+                idempotent_launch: true,
+            })
+        }
+
+        fn launch(&mut self, _request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+            ProviderOutcome::Delivered {
+                receipt: b"provider accepted agent".to_vec(),
+            }
+        }
+
+        fn reconcile(&mut self, _fence: &DeliveryFence) -> ProviderOutcome {
+            ProviderOutcome::Delivered {
+                receipt: b"provider reconciled agent".to_vec(),
+            }
         }
     }
 
@@ -806,6 +896,32 @@ mod tests {
             )
             .expect("native state");
         assert_eq!(state, ("dispatching".to_owned(), "pending".to_owned()));
+        assert!(
+            !ledger
+                .native_wake_consumer_owns(&planned.wake_id)
+                .expect("pending")
+        );
+
+        let mut resolver = Resolver(TestProfile {
+            request: request.clone(),
+        });
+        let delivered = ledger
+            .consume_one_wake(
+                WakeConsumerPolicy {
+                    activation_enabled: true,
+                    dispatch_enabled: true,
+                    authorized_repositories: vec![request.repository.clone()],
+                },
+                &mut resolver,
+                &mut Adapter,
+            )
+            .expect("daemon delivery");
+        assert_eq!(delivered, WakeDeliveryResult::Delivered);
+        assert!(
+            ledger
+                .native_wake_consumer_owns(&planned.wake_id)
+                .expect("delivered")
+        );
     }
 
     fn planned_with_apply(mut report: NativePublicationReport) -> NativePublicationReport {
@@ -852,20 +968,23 @@ mod tests {
             .expect("ledger");
         let expected_bytes = request.protected_profile_bytes.clone();
         let expected_digest = request.profile_digest.clone();
+        let profile_template = request.clone();
         let mut resolver = ExactProtectedProfileResolver::new(&ledger, move |bytes: &[u8]| {
             if bytes != expected_bytes {
                 return Err(WorkLedgerError::Refused(
                     "unexpected profile bytes".to_owned(),
                 ));
             }
+            let mut profile_request = profile_template.clone();
+            profile_request.profile_digest.clone_from(&expected_digest);
             Ok(TestProfile {
-                digest: expected_digest.clone(),
+                request: profile_request,
             })
         });
         let profile: TestProfile = resolver
             .resolve_exact(&report.work_id, &request.profile_digest)
             .expect("exact profile");
-        assert_eq!(profile.digest, request.profile_digest);
+        assert_eq!(profile.request.profile_digest, request.profile_digest);
         assert!(
             resolver
                 .resolve_exact::<TestProfile>(&report.work_id, &digest(b"other"))

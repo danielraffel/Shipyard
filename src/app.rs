@@ -826,6 +826,7 @@ fn handle_pr_variant<W: Write>(
         adopt_head,
         workstream_id,
         context_url,
+        launch_profile,
         no_steward_handoff,
     } = command
     else {
@@ -847,6 +848,7 @@ fn handle_pr_variant<W: Write>(
             adopt_head,
             workstream_id,
             context_url,
+            launch_profile,
             steward_handoff_preference: if no_steward_handoff {
                 StewardHandoffPreference::Disabled
             } else {

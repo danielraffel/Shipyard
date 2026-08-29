@@ -68,7 +68,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Maintain Pulp's expiring disposable-Linux route** | `shipyard runner local-linux-lease --repo Generous-Corp/pulp [--apply] [--watch --interval-secs 60] [--json]` (dry-run by default; profile-derived exact labels; queued matching jobs reserve idle slots; renews only for unreserved online idle ephemeral capacity; unhealthy/unreadable clears; 15-minute maximum TTL; no workflow or MQ mutation) |
 | **Gate TartCI JIT registration on an exact stale-run census** | `shipyard runner admission-clean --repo <owner/repo> --base main --labels self-hosted,<exact-labels> --apply --json` (flat versioned TartCI contract: 0=`admit`, 3=`defer`, 1=operational error, 2=invalid configuration; only managed queued PR/merge-group runs whose immutable head is superseded and whose queued job labels are a subset of the prospective runner may block or be cancelled; a non-authority host never mutates) |
 | **Cross-repo merge-on-green stewardship** | Prefer atomic submission: configure `[merge_steward].auto_handoff = true` on the protected base branch and use `shipyard pr [--workstream-id <id>] [--context-url <url>]` (a PR branch cannot opt itself in); otherwise hand off one immutable head with `shipyard runner steward-handoff --repo <owner/repo> --pr <n> --head <sha> --workstream-id <id> [--context-url <url>] --apply`, then reconcile with `shipyard runner steward --repo <owner/pulp> --repo <owner/forge> --repo <owner/vellum> [--json]` (dry-run by default; only PRs carrying both the `shipyard:managed` label and a successful `shipyard/steward-handoff` status on their current head may be mutated, so apply mode explicitly labels old backlog `shipyard:unmanaged` without adopting it and exact handoff removes that explanatory label; `--apply` requires the trusted machine-global mutation authority, obeys central `HOLD`, serializes and write-ahead audits every GitHub mutation, emits one deduplicated `shipyard:needs-agent` plus `shipyard/steward-recovery` failure signal for semantic blockers, resumes durable exact-run pending cancellations before planning, re-enrolls only the current exact green head, and preserves native queue order unless the separately default-off `--recover-hosted-setup-eviction-priority` flag has a durable pre-removal witness plus exact linked required GitHub-hosted setup-only provider-DNS failure proof for one once-per-removal/run `jump: true`; it refuses mutation without authoritative required-check governance and refuses client-side direct merge when GitHub cannot atomically bind the validated base revision, bounds transient reruns with both write-ahead intent and GitHub's durable `run_attempt`, cancels only queued runs whose immutable PR/merge-group head is provably superseded, and may preempt one exact allow-listed advisory Pulp workflow holding `pulp-preamble` after a 15-minute exact-front pool wait; same-head duplicates, required workflows, pushes, unknown work, and unmanaged PRs are never cancelled; opt out with `shipyard:no-auto-merge` or disable preemption with `--no-preempt-capacity`) |
-| **Persist an exact agent launch recipe** | Add `--launch-profile <private-json>` to `runner steward-handoff`. `LaunchProfileV1` stores exact launch/resume argv plus opaque provider/account/model, checkpoint, and worktree provenance with generation/revision/integrity fencing. The internal default-off consumer passes the stored launch array directly to a capability-matched adapter and durably records ack/retry/uncertainty; no CLI, daemon, or schedule can activate it, and `wake_consumer_available=false`. Private fields are never projected to GitHub/Linear. See `docs/launch-profile.md`. |
+| **Publish an exact agent continuation** | Add `--launch-profile <private-json>` to `shipyard pr` or `runner steward-handoff`. `LaunchProfileV1` binds exact prompt-free launch/resume argv plus typed provider/account/model/reasoning effort, checkpoint, bootstrap, and worktree provenance. With trusted machine-global activation, Shipyard publishes the native wake transactionally and reports `wake_consumer_available=true`; any refusal leaves monitoring with the origin. Private fields are never projected to GitHub/Linear. See `docs/launch-profile.md`. |
 
 | **Triage a steward exception without a resident agent** | `shipyard runner recovery-worker` inspects/revalidates one durable exact-head request without launching a model; add `--apply` for one bounded phase-1 classification attempt, or `--drain --apply` for the bounded current snapshot. Policy is machine-global only; Shipyard constructs a tool-disabled argv, clears the inherited environment, uses a global model lease and overall deadline, and accepts strict JSON that can classify/escalate but cannot authorize repairs, paths, or tests. Provider/quota failures terminalize; unsafe findings escalate; neither blocks unrelated PRs. |
 | **Inspect the canonical lifecycle migration shadow** | `shipyard work-ledger status --json` never creates storage. `shipyard work-ledger import --json` emits a deterministic, redacted, no-write plan; add `--apply` only to populate the SQLite/WAL shadow idempotently. Legacy stores remain authoritative and untouched; activation and dispatch remain false. |
@@ -1048,11 +1048,12 @@ An intentional replacement must use the explicit transfer option with the same
 immutable work identity; Shipyard increments the ownership generation and
 rejects ambiguous provider context, head drift, or competing route ownership.
 
-This receipt foundation does **not** yet wake or resume an agent. Until a
-deployed consumer reports `wake_consumer_available=true`, apply-mode pause is
-rejected, `monitoring_transferred` remains false, and the originating agent
-retains the last monitor. Do not terminate a goal or claim Shipyard owns the
-watch solely because the receipt exists. Status reconciliation is bounded and
+An exact launch profile plus enabled trusted consumer publishes a native wake
+before the command reports `wake_consumer_available=true`. Without that exact
+receipt, apply-mode pause is rejected, `monitoring_transferred` remains false,
+and the originating agent retains the last monitor. Do not terminate a goal or
+claim Shipyard owns the watch solely because a basic handoff receipt exists.
+Status reconciliation is bounded and
 paginated, selects the newest matching status, and reconciles uncertain writes
 before retrying so a restart cannot blindly duplicate the public handoff.
 
@@ -1066,7 +1067,9 @@ terminal records no terminal-specific route.
 Shipyard stores raw terminal identifiers only in its private ledger and never
 publishes them in GitHub status. These records remain inactive while the typed
 wake consumer is unavailable; recording a HerdR or cmux route is not proof
-that Shipyard can resume it.
+that Shipyard can resume it. An exact launch profile and a receipt with
+`wake_consumer_available=true` are the proof surface for native continuation
+ownership.
 
 ## Target configuration
 

@@ -2,8 +2,9 @@
 
 `LaunchProfileV1` is Shipyard's private, terminal-neutral contract for preserving
 the exact process recipe needed to launch or restore an agent after a durable
-steward handoff. Shipyard stores and validates the profile; it does not execute
-the argv, choose a model, translate provider flags, or enable wake delivery.
+steward handoff. Shipyard stores and validates the profile, projects only typed
+provider options into its protected adapter request, and can publish a wake to
+the enabled daemon consumer. It never executes profile argv directly.
 
 Pass a profile when creating a steward handoff:
 
@@ -19,18 +20,37 @@ shipyard runner steward-handoff \
   --apply
 ```
 
+The atomic PR path accepts the same private file:
+
+```bash
+shipyard pr --no-apply-bumps --workstream-id SY-LF-123 \
+  --context-url https://linear.app/example/issue/SY-LF-123/example \
+  --launch-profile ./launch-profile.json
+```
+
+Generate the profile only after automatic version and skill bumps have been
+committed. Shipyard refuses `--launch-profile` in its default bump-apply mode
+because a new bump commit would invalidate the profile's exact-head authority.
+
+When trusted machine-global continuation is enabled, apply mode publishes the
+exact profile and waits for the live daemon to complete its fenced provider
+delivery before returning `monitoring_transferred=true`. A missing, disabled,
+refused, wrong-machine, or unauthorized consumer fails closed and leaves
+`wake_consumer_available=false`.
+
 The JSON schema is intentionally composed only of strings, argv arrays, exact
 provenance, and a recovery-policy enum:
 
 ```json
 {
   "schema_version": 1,
-  "launch_argv": ["provider-router", "agent", "--new"],
-  "resume_argv": ["provider-router", "agent", "-r", "session-7"],
+  "launch_argv": ["codex", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"medium\""],
+  "resume_argv": ["codex", "resume", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"medium\"", "session-7"],
   "provider": {
-    "provider_id": "subscription-router",
+    "provider_id": "codex",
     "account_id": "account-a",
-    "model_id": "model-tier-a"
+    "model_id": "gpt-5.6-sol",
+    "reasoning_effort": "medium"
   },
   "session": {
     "agent_provider": "codex",
@@ -46,6 +66,23 @@ provenance, and a recovery-policy enum:
     "path": "/absolute/private/worktree/path",
     "head_sha": "0123456789abcdef0123456789abcdef01234567",
     "lineage_id": "feature/exact-worktree-branch"
+  },
+  "continuation_bootstrap": {
+    "workstream_handle": "SY-LF-123",
+    "context_url": "https://linear.app/example/issue/SY-LF-123/example",
+    "plan_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "root_revision": 7,
+    "issue_revision": 9,
+    "projection_revision": 4,
+    "material_event_revision": 6,
+    "checkpoint_id": "checkpoint-7",
+    "checkpoint_generation": 4,
+    "checkpoint_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "repository": "owner/repo",
+    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    "expected_resume_context_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "success_continuation_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "failure_continuation_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
   },
   "recovery_policy": "exact_session_then_fresh_checkpoint"
 }
@@ -90,7 +127,7 @@ never projected to GitHub or Linear. Do not put credentials, environment values,
 raw prompts, or tokens in a profile. Use wrapper-owned credential lookup and
 opaque account identifiers instead.
 
-## Inert executor boundary
+## Protected executor boundary
 
 Shipyard now contains an internal, default-off wake-consumer contract. It
 selects the canonical outbox, durably claims a generation-fenced wake, and
@@ -106,13 +143,10 @@ remains `uncertain` and is never blindly relaunched. A successful
 acknowledgement advances the same canonical work item to agent-owned repair in
 the final transaction.
 
-This is an implementation and deterministic-test seam, not an enabled daemon
-feature. No CLI or schedule can set its internal activation policy. A future
-trusted route resolver and provider adapter may use it only after revalidating
-the canonical work item, route, profile digest, and owner generations.
-Executor-specific types still do not live in `LaunchProfileV1`.
-
-`wake_consumer_available` remains `false`. Persisting a launch profile does not
-transfer monitoring, authorize pausing, start a process, or make Linear an
-execution authority. The deterministic monitor continues to run without a
-model.
+Activation is explicit trusted machine-global policy and default-off. The
+subscriber-independent daemon owns delivery only after exact handoff
+publication succeeds. Its wrapper revalidates the canonical work item, route,
+profile digest, owner generations, machine, repository allowlist, and pinned
+adapter identity. Persisting a profile alone does not transfer monitoring; the
+returned receipt is the authority. Linear remains execution state, not process
+authority.

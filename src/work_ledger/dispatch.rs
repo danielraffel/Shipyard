@@ -15,6 +15,8 @@ use fs2::FileExt;
 use rusqlite::params_from_iter;
 use serde::{Deserialize, Serialize};
 
+use crate::provider_wrapper::ProviderReasoningEffortV1;
+
 use super::lifecycle::record_event;
 use super::registry::validated_route_matches_launch;
 use super::route::OpaqueRef;
@@ -96,6 +98,8 @@ pub(crate) trait FreshAgentLaunchProfile {
 pub(crate) struct FreshAgentProviderLaunchOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_effort: Option<ProviderReasoningEffortV1>,
 }
 
 /// Protected profile lookup, kept separate from provider execution.

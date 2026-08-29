@@ -451,6 +451,12 @@ fn codex_and_claude_use_provider_owned_command_grammars() {
     assert!(claude_command.contains("--model 'fable'"));
     assert!(claude_command.contains("--effort high"));
     assert!(!claude_command.contains("model_reasoning_effort"));
+
+    claude.launch_options.reasoning_effort = Some(ProviderReasoningEffortV1::Ultra);
+    assert_eq!(
+        validate_adapter_request(&claude),
+        Err("claude-ultra-effort-unsupported")
+    );
 }
 
 #[test]
@@ -619,6 +625,7 @@ impl FreshAgentLaunchProfile for LedgerProfile {
     fn provider_launch_options(&self) -> FreshAgentProviderLaunchOptions {
         FreshAgentProviderLaunchOptions {
             model_id: Some("gpt-5.6-sol".to_owned()),
+            reasoning_effort: Some(ProviderReasoningEffortV1::Medium),
         }
     }
 

@@ -352,7 +352,10 @@ pub(super) const RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
 pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
 
 mod handoff;
-pub(crate) use handoff::{StewardHandoffArgs, native_publication_request, steward_handoff_command};
+pub(crate) use handoff::{
+    StewardHandoffArgs, native_publication_request, steward_handoff_command,
+    steward_handoff_transfer_report,
+};
 mod launch_profile;
 #[allow(unused_imports)] // Consumed by the daemon wake-loop integration slice.
 pub(crate) use launch_profile::{LaunchProfileV1, decode_protected_launch_profile};
