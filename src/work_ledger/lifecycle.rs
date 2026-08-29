@@ -1,6 +1,7 @@
 //! Lifecycle transitions, continuation contracts, and transactional wake publication.
 #![allow(dead_code)] // Native lifecycle activation follows the shadow phase.
 
+use super::projection_intents::ProjectionIntentKind;
 use super::registry::validated_route_exists;
 use super::{
     OptionalExtension, Transaction, TransactionBehavior, Utc, WorkLedger, WorkLedgerError,
@@ -173,6 +174,28 @@ impl WorkLedger {
         next: LifecycleState,
         wake: Option<&WakeIntent>,
     ) -> WorkLedgerResult<bool> {
+        self.transition_with_wake_and_projection(
+            work_id,
+            expected_work_generation,
+            expected_owner_generation,
+            next,
+            wake,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn transition_with_wake_and_projection(
+        &self,
+        work_id: &str,
+        expected_work_generation: u64,
+        expected_owner_generation: u64,
+        next: LifecycleState,
+        wake: Option<&WakeIntent>,
+        explicit_projection: Option<ProjectionIntentKind>,
+        terminal_disposition: Option<&str>,
+    ) -> WorkLedgerResult<bool> {
         validate_opaque_ref("work_id", work_id, "wi")?;
         let parent = self
             .path
@@ -255,6 +278,38 @@ impl WorkLedger {
             &event_payload,
             &now,
         )?;
+        let projection_kind = explicit_projection.or(match next {
+            LifecycleState::Managed
+            | LifecycleState::Dispatching
+            | LifecycleState::AgentOwnedRepair => Some(ProjectionIntentKind::Handoff),
+            LifecycleState::Waiting => Some(ProjectionIntentKind::Waiting),
+            LifecycleState::Actionable => Some(ProjectionIntentKind::Actionable),
+            LifecycleState::Returned => Some(ProjectionIntentKind::NewHead),
+            LifecycleState::ShadowImported
+            | LifecycleState::Published
+            | LifecycleState::Ready
+            | LifecycleState::Terminal => None,
+        });
+        let projection_bound: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workstream_projection_bindings WHERE work_item_id = ?1)",
+            [work_id],
+            |row| row.get(0),
+        )?;
+        if projection_bound && let Some(kind) = projection_kind {
+            Self::stage_projection_intent(
+                &transaction,
+                work_id,
+                expected_work_generation + 1,
+                expected_owner_generation,
+                kind,
+                "lifecycle_transition",
+                Some(current.as_str()),
+                next.as_str(),
+                &event_payload,
+                terminal_disposition,
+                &now,
+            )?;
+        }
         transaction.commit()?;
         Ok(true)
     }

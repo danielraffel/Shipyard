@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -105,6 +105,7 @@ pub(crate) use native_publication::tests::{
 mod observation;
 mod persistence;
 mod policy;
+mod projection_intents;
 #[allow(dead_code)] // Platform-specific helpers are not used on every target.
 mod protected_objects;
 mod registry;
@@ -278,6 +279,10 @@ pub struct LedgerStatus {
     pub pending_wakes: u64,
     /// Ambiguous outbox count, which requires reconciliation rather than retry.
     pub uncertain_wakes: u64,
+    /// Authenticated transition projections waiting for the optional drainer.
+    pub pending_projection_intents: u64,
+    /// Projection intents isolated after a local digest or identity contradiction.
+    pub quarantined_projection_intents: u64,
     /// Imported source count.
     pub imports: u64,
     /// Immutable protected-object metadata rows.

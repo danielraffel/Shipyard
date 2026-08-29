@@ -22,6 +22,8 @@ pub fn absent_status() -> LedgerStatus {
         work_items: 0,
         pending_wakes: 0,
         uncertain_wakes: 0,
+        pending_projection_intents: 0,
+        quarantined_projection_intents: 0,
         imports: 0,
         protected_objects: 0,
         provider_deliveries: 0,
@@ -174,6 +176,10 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     if version == 9 {
         migrate_v9_to_v10(connection)?;
+        version = 10;
+    }
+    if version == 10 {
+        migrate_v10_to_v11(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
@@ -688,6 +694,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     install_schema_identity(&transaction)?;
     install_custody_schema(&transaction)?;
     install_custody_successor_schema(&transaction)?;
+    install_projection_intent_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -737,7 +744,7 @@ pub(super) fn verify_open_lineage(connection: &Connection, version: i64) -> Work
     if version == SCHEMA_VERSION {
         return verify_schema_identity(connection);
     }
-    if version == 8 || version == 9 {
+    if version == 8 || version == 9 || version == 10 {
         return verify_schema_identity(connection);
     }
     if version == 7 {
@@ -886,10 +893,102 @@ fn migrate_v9_to_v10(connection: &mut Connection) -> WorkLedgerResult<()> {
     verify_open_lineage(&transaction, 9)?;
     validate_relational_integrity(&transaction)?;
     install_custody_successor_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", 10)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v10_to_v11(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 10 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the projection intent migration fence"
+                .to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 10)?;
+    validate_relational_integrity(&transaction)?;
+    install_projection_intent_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     verify_schema_identity(&transaction)?;
     validate_relational_integrity(&transaction)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn install_projection_intent_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE workstream_projection_bindings (
+           work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT,
+           workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
+           plan_sha256 TEXT NOT NULL
+             CHECK(length(plan_sha256) = 64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+           root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
+           issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
+           projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
+           material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
+           repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
+           exact_head TEXT NOT NULL
+             CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           UNIQUE(workstream_handle, repository, exact_head)
+         );
+         CREATE TRIGGER workstream_projection_binding_identity_immutable
+         BEFORE UPDATE OF work_item_id, workstream_handle, plan_sha256, root_revision,
+                          issue_revision, projection_revision, material_event_revision,
+                          repository, created_at
+         ON workstream_projection_bindings
+         BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
+         CREATE TRIGGER workstream_projection_binding_no_delete
+         BEFORE DELETE ON workstream_projection_bindings
+         BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
+         CREATE TABLE projection_intents (
+           intent_id TEXT PRIMARY KEY
+             CHECK(length(intent_id) = 64 AND intent_id NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
+           sequence INTEGER NOT NULL CHECK(sequence > 0),
+           kind TEXT NOT NULL CHECK(kind IN ('handoff', 'waiting', 'actionable', 'new_head',
+                                              'merge', 'configured_closure')),
+           source_revision TEXT NOT NULL
+             CHECK(length(source_revision) = 64 AND source_revision NOT GLOB '*[^0-9a-f]*'),
+           exact_head TEXT
+             CHECK(exact_head IS NULL OR
+                   (length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*')),
+           receipt_snapshot BLOB NOT NULL CHECK(length(receipt_snapshot) BETWEEN 2 AND 1048576),
+           receipt_sha256 TEXT NOT NULL
+             CHECK(length(receipt_sha256) = 64 AND receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+           transition_id TEXT NOT NULL UNIQUE
+             CHECK(length(transition_id) = 64 AND transition_id NOT GLOB '*[^0-9a-f]*'),
+           supersedes_transition_id TEXT
+             CHECK(supersedes_transition_id IS NULL OR
+                   (length(supersedes_transition_id) = 64 AND
+                    supersedes_transition_id NOT GLOB '*[^0-9a-f]*')),
+           state TEXT NOT NULL CHECK(state IN ('pending', 'projected', 'quarantined')),
+           attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+           retry_at_unix_ms INTEGER NOT NULL DEFAULT 0 CHECK(retry_at_unix_ms >= 0),
+           failure_class TEXT,
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           updated_at TEXT NOT NULL CHECK(length(updated_at) >= 20),
+           UNIQUE(workstream_handle, sequence),
+           CHECK(length(receipt_sha256) = 64)
+         );
+         CREATE INDEX projection_intents_drain
+           ON projection_intents(state, retry_at_unix_ms, workstream_handle, sequence);
+         CREATE TRIGGER projection_intent_identity_immutable
+         BEFORE UPDATE OF intent_id, work_item_id, workstream_handle, sequence, kind,
+                          source_revision, exact_head, receipt_snapshot, receipt_sha256,
+                          transition_id, supersedes_transition_id, created_at
+         ON projection_intents
+         BEGIN SELECT RAISE(ABORT, 'projection intent identity is immutable'); END;
+         CREATE TRIGGER projection_intent_no_delete
+         BEFORE DELETE ON projection_intents
+         BEGIN SELECT RAISE(ABORT, 'projection intent cannot be deleted'); END;",
+    )?;
     Ok(())
 }
 
@@ -1945,16 +2044,18 @@ pub(super) fn count_where(
     column: &str,
     value: &str,
 ) -> WorkLedgerResult<u64> {
-    if table != "outbox" || column != "state" {
-        return Err(WorkLedgerError::Refused(
-            "unsupported filtered count".to_owned(),
-        ));
-    }
-    Ok(connection.query_row(
-        "SELECT COUNT(*) FROM outbox WHERE state = ?1",
-        [value],
-        |row| row.get(0),
-    )?)
+    let sql = match (table, column) {
+        ("outbox", "state") => "SELECT COUNT(*) FROM outbox WHERE state = ?1",
+        ("projection_intents", "state") => {
+            "SELECT COUNT(*) FROM projection_intents WHERE state = ?1"
+        }
+        _ => {
+            return Err(WorkLedgerError::Refused(
+                "unsupported filtered count".to_owned(),
+            ));
+        }
+    };
+    Ok(connection.query_row(sql, [value], |row| row.get(0))?)
 }
 
 #[cfg(unix)]

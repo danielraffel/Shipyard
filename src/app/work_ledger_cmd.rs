@@ -59,6 +59,18 @@ pub(super) fn work_ledger_command<W: Write>(
                 writeln!(stdout, "Work items: {}", status.work_items).map_err(failure)?;
                 writeln!(stdout, "Pending wakes: {}", status.pending_wakes).map_err(failure)?;
                 writeln!(stdout, "Uncertain wakes: {}", status.uncertain_wakes).map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Pending projection intents: {}",
+                    status.pending_projection_intents
+                )
+                .map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Quarantined projection intents: {}",
+                    status.quarantined_projection_intents
+                )
+                .map_err(failure)?;
                 writeln!(stdout, "Activation: {}", operational.activation_state)
                     .map_err(failure)?;
                 writeln!(stdout, "Dispatch: {}", operational.dispatch_state).map_err(failure)?;

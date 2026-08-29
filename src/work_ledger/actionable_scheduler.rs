@@ -127,7 +127,14 @@ impl WorkLedger {
             // Waiting/passing observations are deliberately state-preserving.
             // Advancing a generation here would invalidate the staged exact
             // route before a later actionable failure could consume it.
-            NativeStewardDisposition::Waiting | NativeStewardDisposition::Passing => {}
+            NativeStewardDisposition::Waiting => {
+                changed = self.stage_waiting_observation(
+                    &work.id,
+                    work.work_generation,
+                    work.owner_generation,
+                )?;
+            }
+            NativeStewardDisposition::Passing => {}
             NativeStewardDisposition::Merged
             | NativeStewardDisposition::Superseded
             | NativeStewardDisposition::StaleHead => {
@@ -140,12 +147,30 @@ impl WorkLedger {
                         | "agent_owned_repair"
                         | "returned"
                 ) {
-                    let advanced = self.transition_with_wake(
+                    let projection = match disposition {
+                        NativeStewardDisposition::Merged => {
+                            Some(super::projection_intents::ProjectionIntentKind::Merge)
+                        }
+                        NativeStewardDisposition::Superseded
+                        | NativeStewardDisposition::StaleHead => {
+                            Some(super::projection_intents::ProjectionIntentKind::ConfiguredClosure)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let terminal_disposition = match disposition {
+                        NativeStewardDisposition::Merged => "merged",
+                        NativeStewardDisposition::Superseded => "superseded",
+                        NativeStewardDisposition::StaleHead => "stale_head",
+                        _ => unreachable!(),
+                    };
+                    let advanced = self.transition_with_wake_and_projection(
                         &work.id,
                         work.work_generation,
                         work.owner_generation,
                         LifecycleState::Terminal,
                         None,
+                        projection,
+                        Some(terminal_disposition),
                     )?;
                     changed = advanced;
                     work = self

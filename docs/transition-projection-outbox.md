@@ -1,9 +1,9 @@
 # External transition projection outbox
 
-Shipyard can record status transitions for an optional external projector
-without placing Linear, another network service, or a model in the stewardship
-hot path. `transition_projection` is a library boundary only; it is not started
-by the daemon and it does not change work execution authority.
+Shipyard records authenticated native status transitions for an optional
+external projector without placing Linear, another network service, or a model
+in the stewardship hot path. The daemon starts only the default-off bounded
+drainer; it does not change work execution authority.
 
 Each record binds a stable workstream handle, strictly increasing sequence,
 transition type, exact source/head/receipt evidence, and optional supersession.
@@ -28,8 +28,8 @@ reclaimable after its lease on restart. Adapter implementations must bound one
 submit/readback attempt to less than the claim lease. Newer transitions may
 supersede older unclaimed state.
 
-The existing GEN-14 Linear integration can implement this adapter contract
-without adding a Linear SDK or credentials to Shipyard. Linear remains a status
-projection, never execution authority. Disabled mode performs no validation,
-I/O, adapter call, or stewardship mutation. No live Linear object is changed by
-this module or by its tests.
+The existing GEN-14 Linear integration is the only physical adapter/configuration
+surface. This change adds no second Linear schema or project. Linear remains a
+status projection, never execution authority. Disabled mode retains schema-v11
+SQLite intents for explicit enable-later draining while performing no file
+outbox or adapter I/O. No live Linear object is changed by these tests.

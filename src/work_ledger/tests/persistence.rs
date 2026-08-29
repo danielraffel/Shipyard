@@ -17,7 +17,13 @@ fn test_schema_object_exists(connection: &Connection, object_type: &str, name: &
 fn strip_schema_identity(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TRIGGER IF EXISTS custody_processed_ack_no_delete;
+            "DROP TRIGGER IF EXISTS projection_intent_no_delete;
+             DROP TRIGGER IF EXISTS projection_intent_identity_immutable;
+             DROP TABLE IF EXISTS projection_intents;
+             DROP TRIGGER IF EXISTS workstream_projection_binding_no_delete;
+             DROP TRIGGER IF EXISTS workstream_projection_binding_identity_immutable;
+             DROP TABLE IF EXISTS workstream_projection_bindings;
+             DROP TRIGGER IF EXISTS custody_processed_ack_no_delete;
              DROP TRIGGER IF EXISTS custody_processed_ack_immutable;
              DROP TABLE IF EXISTS custody_processed_acknowledgements;
              DROP TRIGGER IF EXISTS custody_successor_no_delete;

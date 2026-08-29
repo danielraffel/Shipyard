@@ -1164,6 +1164,11 @@ pub(crate) fn native_publication_request(
                 CliFailure::new(1, "native publication requires live terminal authority")
             })?,
         workstream_handle: bootstrap.workstream_handle.clone(),
+        plan_sha256: bootstrap.plan_sha256.clone(),
+        root_revision: bootstrap.root_revision,
+        issue_revision: bootstrap.issue_revision,
+        projection_revision: bootstrap.projection_revision,
+        material_event_revision: bootstrap.material_event_revision,
         context_url: bootstrap.context_url.clone(),
         origin_machine: receipt.origin_machine.clone(),
         owner_id: receipt.owner_id.clone(),

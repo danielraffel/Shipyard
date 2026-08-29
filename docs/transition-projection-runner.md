@@ -1,8 +1,8 @@
 # External transition projection runner
 
 External status projection is an optional, downstream observation of durable
-Shipyard state. It never grants execution authority and cannot block handoff,
-queue, merge, or continuation stewardship.
+Shipyard state. It never grants execution authority. Projection I/O and adapter
+failure cannot block handoff, queue, merge, or continuation stewardship.
 
 The daemon loads `[transition_projection]` only from protected machine-global
 configuration. Absent or disabled policy performs no projection I/O. Enabled
@@ -32,10 +32,30 @@ not acknowledge an item until readback returns the exact transition and
 evidence identities. A crash after external acceptance therefore replays the
 same idempotency key after lease expiry.
 
-Authoritative producers must call the commit-before-enqueue ingress only after
-their source receipt is durable. The ingress opens that exact private receipt
-without following symlinks, hashes it, compares it with the transition evidence,
-and then appends to the repository's digest-named outbox. The supported kinds
-are handoff, waiting, actionable, new head, merge, and configured closure.
-Producer call sites are intentionally a separate integration pass so this
-runner does not infer transitions from terminal labels or mutable daemon state.
+Schema v11 stages a deterministic `projection_intents` row in the same SQLite
+transaction as every authenticated native producer transition. The intent owns
+an immutable canonical receipt snapshot and its SHA-256; no mutable handoff path
+is needed to reconstruct the draft. Its `workstream_projection_bindings` row is
+populated only from the authenticated `ContinuationBootstrapV1` carried through
+`NativePublicationRequest`: workstream handle, plan SHA-256, root/issue/
+projection/material revisions, repository, and exact head. Titles, descriptions,
+and prose are never handle or owner authority.
+The binding identity is immutable. Its exact head advances only in the same
+fenced transaction that accepts an authenticated agent-return receipt, so later
+intents continue to read their exact head from the binding.
+
+The daemon drains at most 32 eligible intents per pass, one oldest item per
+workstream, into the repository's digest-named NDJSON outbox before calling the
+existing companion. Appending precedes the SQLite projected mark, so a crash in
+between replays as `AlreadyQueued`. Retryable failures remain pending with
+bounded backoff; active-claim supersession waits at least one claim lease;
+digest and identity contradictions are quarantined. A bad workstream does not
+starve another, and repository outboxes need not have contiguous global
+sequences because ordering is per workstream. Disabled policy retains pending
+rows for an explicit later enablement. The supported kinds are handoff, waiting,
+actionable, new head, merge, and configured closure.
+
+Production producers cover managed handoff, waiting observation, actionable,
+dispatch and acknowledged ownership handoff, returned new exact head, merged,
+and configured closure. `merged` remains a merge transition; `superseded` and
+`stale_head` remain separately named configured-closure receipts.

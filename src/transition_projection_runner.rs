@@ -26,6 +26,7 @@ use crate::transition_projection::{
     ProjectionReadback, ReconcileOutcome, SubmitReceipt, TransitionDraft, TransitionOutbox,
     TransitionProjectionAdapter,
 };
+use crate::work_ledger::WorkLedger;
 
 const POLICY_KEY: &str = "transition_projection";
 const PROTOCOL_VERSION: u32 = 1;
@@ -35,6 +36,7 @@ const MAX_PROTOCOL_BYTES: u64 = 1024 * 1024;
 const PROJECTION_DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 const PROJECTION_LEASE_SAFETY_MS: u64 = 5_000;
 const PROJECTION_CALLS_PER_RECONCILE: u64 = 2;
+const MAX_COMMITTED_INTENTS_PER_DRAIN: u64 = 32;
 #[allow(dead_code)] // Activated by the authoritative producer follow-up.
 const MAX_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARGS: usize = 16;
@@ -216,6 +218,33 @@ impl CommittedTransitionIngress {
             .enqueue(draft)
             .map_err(|error| error.to_string())
     }
+
+    /// Append a draft reconstructed from the immutable `SQLite` receipt snapshot.
+    pub(crate) fn enqueue_committed_snapshot(
+        &self,
+        repository: &str,
+        draft: TransitionDraft,
+        receipt_snapshot: &[u8],
+    ) -> Result<EnqueueOutcome, String> {
+        let Some(root) = &self.root else {
+            return Ok(EnqueueOutcome::Disabled);
+        };
+        if !self.repositories.contains(repository) {
+            return Err("transition projection repository is not authorized".to_owned());
+        }
+        validate_repository(repository)?;
+        if receipt_snapshot.len() as u64 > MAX_RECEIPT_BYTES {
+            return Err("transition projection receipt snapshot exceeds its bound".to_owned());
+        }
+        let observed = hex::encode(Sha256::digest(receipt_snapshot));
+        if observed != draft.evidence.receipt_sha256 {
+            return Err("transition projection source receipt digest mismatch".to_owned());
+        }
+        open_repository_outbox(root, repository)
+            .map_err(|error| error.to_string())?
+            .enqueue(draft)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Best-effort daemon status. Errors are diagnostic only.
@@ -313,6 +342,7 @@ impl TransitionProjectionRuntime {
             return;
         }
         let config = config.clone();
+        let state_dir = self.state_dir.clone();
         let root = self.state_dir.join("transition-projection");
         let repositories = config.repositories.iter().cloned().collect::<Vec<_>>();
         let (sender, receiver) = mpsc::channel();
@@ -320,6 +350,8 @@ impl TransitionProjectionRuntime {
         self.next_run_at = Instant::now() + PROJECTION_DRAIN_INTERVAL;
         thread::spawn(move || {
             let now = unix_ms();
+            let ingress = CommittedTransitionIngress::enabled(&state_dir, &config);
+            let _ = drain_committed_projection_intents(&state_dir, &ingress, now);
             let results = repositories
                 .into_iter()
                 .map(|repository| {
@@ -331,6 +363,66 @@ impl TransitionProjectionRuntime {
             let _ = sender.send(results);
         });
     }
+}
+
+fn drain_committed_projection_intents(
+    state_dir: &Path,
+    ingress: &CommittedTransitionIngress,
+    now_unix_ms: u64,
+) -> Result<(), String> {
+    let Some(ledger) = WorkLedger::open_existing(state_dir).map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let intents = ledger
+        .pending_projection_intents(now_unix_ms, MAX_COMMITTED_INTENTS_PER_DRAIN)
+        .map_err(|error| error.to_string())?;
+    for intent in intents {
+        let Ok(draft) = intent.reconstruct() else {
+            let _ = ledger.quarantine_projection_intent(&intent.intent_id, "receipt-contradiction");
+            continue;
+        };
+        match ingress.enqueue_committed_snapshot(
+            &intent.repository,
+            draft,
+            &intent.receipt_snapshot,
+        ) {
+            Ok(EnqueueOutcome::Queued | EnqueueOutcome::AlreadyQueued) => {
+                let _ = ledger.mark_projection_intent_projected(&intent.intent_id);
+            }
+            Ok(EnqueueOutcome::Disabled) => {
+                // Retain pending: enabling projection later drains the same immutable row.
+            }
+            Err(error) if error.contains("actively claimed") => {
+                let retry_at = now_unix_ms.saturating_add(PROJECTION_CLAIM_LEASE_MS);
+                let _ = ledger.retry_projection_intent(
+                    &intent.intent_id,
+                    "active-claim-supersession",
+                    retry_at,
+                );
+            }
+            Err(error)
+                if error.contains("digest mismatch")
+                    || error.contains("collided")
+                    || error.contains("contradict")
+                    || error.contains("not present")
+                    || error.contains("not newer") =>
+            {
+                let _ = ledger
+                    .quarantine_projection_intent(&intent.intent_id, "projection-contradiction");
+            }
+            Err(_) => {
+                let exponent = intent.attempts.min(10);
+                let delay = 1_000_u64.saturating_mul(1_u64 << exponent);
+                let _ = ledger.retry_projection_intent(
+                    &intent.intent_id,
+                    "projection-io-retry",
+                    now_unix_ms.saturating_add(delay),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn outcome_name(outcome: &ReconcileOutcome) -> &'static str {
@@ -989,6 +1081,152 @@ mod tests {
                 EnqueueOutcome::Queued
             );
         }
+    }
+
+    #[test]
+    fn sqlite_intent_drainer_recovers_append_before_mark_idempotently() {
+        use crate::work_ledger::{
+            RepoPolicy, native_publication_test_policy as native_policy,
+            native_publication_test_request as request,
+        };
+
+        let temp = tempfile::tempdir().expect("state");
+        let request = request();
+        let ledger = WorkLedger::open(temp.path()).expect("ledger");
+        ledger
+            .set_repo_policy(
+                &RepoPolicy {
+                    repo: request.repository.clone(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("policy");
+        WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &request,
+            &native_policy(vec![request.repository.clone()]),
+            true,
+        )
+        .expect("publication");
+        let config = ProjectionRunnerConfig {
+            executable_path: "/bin/false".into(),
+            executable_sha256: "a".repeat(64),
+            argv: vec!["linear-v1".into()],
+            secret_files: BTreeMap::new(),
+            deadline_seconds: 1,
+            max_stdout_bytes: 1024,
+            max_stderr_bytes: 1024,
+            repositories: BTreeSet::from([request.repository.clone()]),
+        };
+        let ingress = CommittedTransitionIngress::enabled(temp.path(), &config);
+        let intent = ledger
+            .pending_projection_intents(0, 1)
+            .expect("pending")
+            .pop()
+            .expect("managed intent");
+        let draft = intent.reconstruct().expect("draft");
+        assert_eq!(
+            ingress
+                .enqueue_committed_snapshot(&intent.repository, draft, &intent.receipt_snapshot,)
+                .expect("append"),
+            EnqueueOutcome::Queued,
+        );
+        // Simulate a crash after append and before the SQLite projected mark.
+        drain_committed_projection_intents(temp.path(), &ingress, 0).expect("restart drain");
+        let state = ledger
+            .projection_intent_state(&intent.intent_id)
+            .expect("intent state");
+        assert_eq!(state, ("projected".to_owned(), 1));
+        let snapshot = open_repository_outbox(
+            &temp.path().join("transition-projection"),
+            &request.repository,
+        )
+        .expect("outbox")
+        .snapshot()
+        .expect("snapshot");
+        assert_eq!(snapshot.len(), 1);
+    }
+
+    #[test]
+    fn corrupt_workstream_is_quarantined_without_starving_another() {
+        use crate::work_ledger::{
+            RepoPolicy, native_publication_test_policy as native_policy,
+            native_publication_test_request as request,
+        };
+
+        let temp = tempfile::tempdir().expect("state");
+        let first = request();
+        let ledger = WorkLedger::open(temp.path()).expect("ledger");
+        ledger
+            .set_repo_policy(
+                &RepoPolicy {
+                    repo: first.repository.clone(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("policy");
+        let policy = native_policy(vec![first.repository.clone()]);
+        WorkLedger::plan_or_apply_native_continuation(temp.path(), &first, &policy, true)
+            .expect("first publication");
+        let mut second = first.clone();
+        second.pull_request = 44;
+        second.head_sha = "c".repeat(40);
+        second.workstream_handle = "GEN-44".to_owned();
+        second.context_url = Some("https://linear.example/GEN-44".to_owned());
+        second.plan_sha256 = "d".repeat(64);
+        WorkLedger::plan_or_apply_native_continuation(temp.path(), &second, &policy, true)
+            .expect("second publication");
+        let intents = ledger.pending_projection_intents(0, 8).expect("intents");
+        assert_eq!(intents.len(), 2);
+        let corrupt = intents
+            .iter()
+            .find(|intent| intent.reconstruct().expect("draft").workstream_id == "GEN-43")
+            .expect("corrupt target");
+        ledger
+            .corrupt_projection_receipt_for_test(&corrupt.intent_id)
+            .expect("corrupt snapshot");
+        let config = ProjectionRunnerConfig {
+            executable_path: "/bin/false".into(),
+            executable_sha256: "a".repeat(64),
+            argv: vec!["linear-v1".into()],
+            secret_files: BTreeMap::new(),
+            deadline_seconds: 1,
+            max_stdout_bytes: 1024,
+            max_stderr_bytes: 1024,
+            repositories: BTreeSet::from([first.repository.clone()]),
+        };
+        let ingress = CommittedTransitionIngress::enabled(temp.path(), &config);
+        drain_committed_projection_intents(temp.path(), &ingress, 0).expect("drain");
+        assert_eq!(
+            ledger
+                .projection_intent_state(&corrupt.intent_id)
+                .expect("corrupt state")
+                .0,
+            "quarantined",
+        );
+        let healthy = intents
+            .iter()
+            .find(|intent| intent.intent_id != corrupt.intent_id)
+            .expect("healthy");
+        assert_eq!(
+            ledger
+                .projection_intent_state(&healthy.intent_id)
+                .expect("healthy state")
+                .0,
+            "projected",
+        );
     }
 
     #[test]

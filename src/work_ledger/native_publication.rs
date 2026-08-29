@@ -38,6 +38,11 @@ pub(crate) struct NativePublicationRequest {
     pub(crate) repo_policy_revision: u64,
     pub(crate) terminal_authority: TerminalCapabilityRequest,
     pub(crate) workstream_handle: String,
+    pub(crate) plan_sha256: String,
+    pub(crate) root_revision: u64,
+    pub(crate) issue_revision: u64,
+    pub(crate) projection_revision: u64,
+    pub(crate) material_event_revision: u64,
     pub(crate) context_url: Option<String>,
     pub(crate) origin_machine: String,
     pub(crate) owner_id: String,
@@ -199,6 +204,7 @@ impl WorkLedger {
         }
 
         self.ensure_native_work_item(request, &identities)?;
+        self.ensure_projection_binding(request, &identities.work_id)?;
         self.ensure_continuations(request, &identities.work_id)?;
         self.advance_to_managed(&identities.work_id, request.owner_generation)?;
 
@@ -291,6 +297,24 @@ impl WorkLedger {
         };
         self.import_candidates(&[candidate])?;
         Ok(())
+    }
+
+    fn ensure_projection_binding(
+        &self,
+        request: &NativePublicationRequest,
+        work_id: &str,
+    ) -> WorkLedgerResult<()> {
+        self.bind_workstream_projection(
+            work_id,
+            &request.workstream_handle,
+            &request.plan_sha256,
+            request.root_revision,
+            request.issue_revision,
+            request.projection_revision,
+            request.material_event_revision,
+            &request.repository,
+            &request.head_sha,
+        )
     }
 
     fn ensure_continuations(
@@ -764,8 +788,13 @@ impl PublicationIdentities {
             .to_owned();
         let publication_digest = digest(
             format!(
-                "shipyard-native-publication-authority-v2\n{authority_seed}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                "shipyard-native-publication-authority-v3\n{authority_seed}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 request.context_url.as_deref().unwrap_or(""),
+                request.plan_sha256,
+                request.root_revision,
+                request.issue_revision,
+                request.projection_revision,
+                request.material_event_revision,
                 request.base_ref,
                 request.base_sha,
                 request.github_installation_id,
@@ -836,6 +865,7 @@ fn validate_request(
         || request.protected_profile_bytes.len() > 1_048_576
         || request.workstream_handle.is_empty()
         || request.workstream_handle.len() > 128
+        || request.projection_revision == 0
         || request.owner_id.is_empty()
         || request.owner_id.len() > 512
         || request.agent_session_id.is_empty()
@@ -870,6 +900,7 @@ fn validate_request(
         ));
     }
     validate_digest("native profile digest", &request.profile_digest)?;
+    validate_digest("native projection plan digest", &request.plan_sha256)?;
     validate_digest("native resume digest", &request.native_resume_digest)?;
     validate_digest(
         "native route environment digest",
@@ -1203,6 +1234,11 @@ pub(crate) mod tests {
                     },
                 },
             workstream_handle: "GEN-43".to_owned(),
+            plan_sha256: digest(b"GEN-43-plan"),
+            root_revision: 1,
+            issue_revision: 1,
+            projection_revision: 1,
+            material_event_revision: 1,
             context_url: Some("https://linear.example/GEN-43".to_owned()),
             origin_machine: "m5".to_owned(),
             owner_id: "agent-owner-43".to_owned(),

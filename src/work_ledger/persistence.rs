@@ -102,6 +102,18 @@ impl WorkLedger {
             work_items: count(&connection, "work_items")?,
             pending_wakes: count_where(&connection, "outbox", "state", "pending")?,
             uncertain_wakes: count_where(&connection, "outbox", "state", "uncertain")?,
+            pending_projection_intents: count_where(
+                &connection,
+                "projection_intents",
+                "state",
+                "pending",
+            )?,
+            quarantined_projection_intents: count_where(
+                &connection,
+                "projection_intents",
+                "state",
+                "quarantined",
+            )?,
             imports: count(&connection, "imports")?,
             protected_objects: count(&connection, "protected_objects")?,
             provider_deliveries: count(&connection, "provider_deliveries")?,

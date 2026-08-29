@@ -473,6 +473,26 @@ impl WorkLedger {
             &receipt_digest,
             &now,
         )?;
+        let projection_bound: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workstream_projection_bindings WHERE work_item_id = ?1)",
+            [&authority.work_item_id],
+            |row| row.get(0),
+        )?;
+        if projection_bound {
+            Self::stage_projection_intent(
+                &transaction,
+                &authority.work_item_id,
+                authority.work_generation + 1,
+                authority.owner_generation,
+                super::projection_intents::ProjectionIntentKind::Handoff,
+                "agent_context_acknowledged",
+                Some(LifecycleState::Dispatching.as_str()),
+                LifecycleState::AgentOwnedRepair.as_str(),
+                &receipt_digest,
+                None,
+                &now,
+            )?;
+        }
         transaction.commit()?;
         Ok(AgentOwnershipReceipt {
             ownership_id,
@@ -737,6 +757,36 @@ impl WorkLedger {
             &receipt_digest,
             &now,
         )?;
+        let projection_bound: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workstream_projection_bindings WHERE work_item_id = ?1)",
+            [&authority.0],
+            |row| row.get(0),
+        )?;
+        if projection_bound {
+            let rebound = transaction.execute(
+                "UPDATE workstream_projection_bindings SET exact_head = ?1
+                  WHERE work_item_id = ?2 AND exact_head = ?3",
+                params![expected.head_sha, authority.0, request.resume.head_sha],
+            )?;
+            if rebound != 1 {
+                return Err(WorkLedgerError::Refused(
+                    "workstream projection exact-head binding changed during return".to_owned(),
+                ));
+            }
+            Self::stage_projection_intent(
+                &transaction,
+                &authority.0,
+                expected_work_generation + 1,
+                authority.3,
+                super::projection_intents::ProjectionIntentKind::NewHead,
+                "agent_ownership_returned",
+                Some(LifecycleState::AgentOwnedRepair.as_str()),
+                LifecycleState::Returned.as_str(),
+                &receipt_digest,
+                None,
+                &now,
+            )?;
+        }
         transaction.commit()?;
         Ok(AgentOwnershipReceipt {
             ownership_id: ownership_id.to_owned(),

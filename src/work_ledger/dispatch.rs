@@ -1943,6 +1943,26 @@ fn transition_dispatch_failure(
         evidence_digest,
         now,
     )?;
+    let projection_bound: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workstream_projection_bindings WHERE work_item_id = ?1)",
+        [&fence.work_item_id],
+        |row| row.get(0),
+    )?;
+    if projection_bound {
+        WorkLedger::stage_projection_intent(
+            transaction,
+            &fence.work_item_id,
+            fence.work_generation + 1,
+            fence.owner_generation,
+            super::projection_intents::ProjectionIntentKind::Actionable,
+            event_kind,
+            Some(LifecycleState::Dispatching.as_str()),
+            LifecycleState::Actionable.as_str(),
+            evidence_digest,
+            None,
+            now,
+        )?;
+    }
     Ok(())
 }
 
