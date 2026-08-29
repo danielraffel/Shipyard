@@ -9,10 +9,10 @@ use crate::parallel_proof_canary::PulpMacCanaryPolicy;
 use crate::parallel_proof_canary::{CanaryRoute, CanaryStagingClass};
 use crate::parallel_proof_canary_cache::{
     CACHE_GENERATION_OBSERVATION_SCHEMA, CacheGenerationObservationReceipt,
-    PULP_MAC_CACHE_EVIDENCE_SCHEMA, PulpMacCacheProbeEvidence, produce_cache_generation_manifest,
+    PULP_MAC_CACHE_EVIDENCE_SCHEMA, PulpMacCacheProbeEvidence,
 };
 use crate::parallel_proof_canary_remote_cache::{
-    RemoteM1CacheAuthority, test_remote_authority_receipt,
+    RemoteM1CacheAuthority, synthetic_cache_generation_manifest, test_remote_authority_receipt,
 };
 
 fn pulp_policy() -> PulpMacCanaryPolicy {
@@ -371,7 +371,7 @@ fn exact_cache_evidence_closes_only_the_cache_gap() {
         .tempdir_in(current)
         .unwrap();
     fs::write(cache_root.path().join("object.bin"), b"cache-object").unwrap();
-    let manifest = produce_cache_generation_manifest(cache_root.path(), "skia", "m124").unwrap();
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
 
     let m3_staging = "/Users/test/m3-canary";
     let m1_staging = "/Users/test/m1-canary";

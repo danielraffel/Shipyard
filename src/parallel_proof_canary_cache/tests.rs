@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::parallel_proof_canary::{CanaryRoute, CanaryStagingClass};
 use crate::parallel_proof_canary_remote_cache::{
-    RemoteM1CacheAuthority, test_remote_authority_receipt,
+    RemoteM1CacheAuthority, synthetic_cache_generation_manifest, test_remote_authority_receipt,
 };
 
 fn persistent_temp() -> TempDir {
@@ -117,6 +117,7 @@ impl CacheGenerationObserver for FakeObserver {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn manifest_is_deterministic_complete_and_read_only() {
     let root = cache_tree();
@@ -133,6 +134,18 @@ fn manifest_is_deterministic_complete_and_read_only() {
     fs::write(root.path().join("nested/object.bin"), b"different-object").unwrap();
     let changed = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
     assert_ne!(first.generation.sha256, changed.generation.sha256);
+}
+
+#[cfg(not(unix))]
+#[test]
+fn manifest_production_refuses_without_no_follow_directory_handles() {
+    let root = cache_tree();
+    let error = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap_err();
+    assert!(matches!(
+        error,
+        CacheObserverError::Artifact(message)
+            if message.contains("requires no-follow directory handles")
+    ));
 }
 
 #[cfg(unix)]
@@ -164,6 +177,7 @@ fn manifest_rejects_links_and_special_or_empty_trees() {
     assert!(produce_cache_generation_manifest(linked.path(), "skia", "m124").is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn local_observer_requires_the_exact_immutable_manifest() {
     let root = cache_tree();
@@ -215,11 +229,7 @@ fn disabled_probe_calls_neither_observer_nor_cache() {
 fn probe_is_m3_first_crash_durable_and_exactly_replayable() {
     let builder_root = cache_tree();
     let worker_root = cache_tree();
-    let manifest = produce_cache_generation_manifest(builder_root.path(), "skia", "m124").unwrap();
-    assert_eq!(
-        manifest,
-        produce_cache_generation_manifest(worker_root.path(), "skia", "m124").unwrap()
-    );
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
     let policy = policy(&manifest);
     let request = PulpMacCacheProbeRequest {
         enabled: true,
@@ -291,8 +301,8 @@ fn probe_is_m3_first_crash_durable_and_exactly_replayable() {
 #[test]
 fn remote_authority_accepts_manifest_specific_transport_receipts() {
     let root = cache_tree();
-    let first = produce_cache_generation_manifest(root.path(), "first", "v1").unwrap();
-    let second = produce_cache_generation_manifest(root.path(), "second", "v1").unwrap();
+    let first = synthetic_cache_generation_manifest("first", "v1");
+    let second = synthetic_cache_generation_manifest("second", "v1");
     let policy = PulpMacCanaryPolicy {
         enabled: true,
         repository_id: 1_203_111_607,
@@ -336,7 +346,7 @@ fn remote_authority_accepts_manifest_specific_transport_receipts() {
 #[test]
 fn persisted_remote_authority_refuses_a_different_builder_source() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
     let policy = policy(&manifest);
     let mut worker = receipt("m1", root.path(), manifest.clone(), 995);
     let mut authority = remote_authority(995);
@@ -378,7 +388,7 @@ fn persisted_remote_authority_refuses_a_different_builder_source() {
 #[test]
 fn tailnet_cache_measurement_does_not_mint_lan_worker_authority() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
     let policy = PulpMacCanaryPolicy {
         enabled: true,
         repository_id: 1_203_111_607,
@@ -429,7 +439,7 @@ fn tailnet_cache_measurement_does_not_mint_lan_worker_authority() {
 #[test]
 fn failed_builder_proof_never_observes_worker() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
     let request = PulpMacCacheProbeRequest {
         enabled: true,
         correlation_id: "builder-failed".to_owned(),
@@ -461,7 +471,7 @@ fn failed_builder_proof_never_observes_worker() {
 #[test]
 fn stale_builder_proof_never_observes_worker() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
     let request = PulpMacCacheProbeRequest {
         enabled: true,
         correlation_id: "builder-stale".to_owned(),
@@ -493,7 +503,7 @@ fn stale_builder_proof_never_observes_worker() {
 #[test]
 fn stale_or_wrong_inventory_never_proves_policy() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
     let policy = policy(&manifest);
     let mut evidence = PulpMacCacheProbeEvidence {
         schema_version: PULP_MAC_CACHE_EVIDENCE_SCHEMA,

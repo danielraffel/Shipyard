@@ -3,6 +3,45 @@ use super::{
     RemoteM1CacheAuthorityReceipt, RemoteM1CacheCarrierFailureClass, RemoteM1CacheRequest,
     RemoteM1CacheResponse, RemoteM1CacheTransportStats, Sha256Digest,
 };
+use crate::parallel_proof_canary::CanaryCacheGeneration;
+use crate::parallel_proof_canary_cache::{CACHE_GENERATION_MANIFEST_SCHEMA, CacheGenerationEntry};
+
+pub(crate) fn synthetic_cache_generation_manifest(
+    name: &str,
+    generation: &str,
+) -> CacheGenerationManifest {
+    let contents = b"cache-object";
+    let entries = vec![CacheGenerationEntry::File {
+        path: "object.bin".to_owned(),
+        mode: 0o600,
+        size_bytes: contents.len() as u64,
+        sha256: Sha256Digest::of_bytes(contents),
+    }];
+    let content_sha256 = {
+        let domain = "shipyard.cache-generation.contents.v1";
+        let payload = serde_json::to_vec(&(0o700_u32, &entries)).unwrap();
+        let mut bytes = Vec::with_capacity(domain.len() + payload.len() + 16);
+        bytes.extend_from_slice(&(domain.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(domain.as_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+        Sha256Digest::of_bytes(&bytes)
+    };
+    let manifest = CacheGenerationManifest {
+        schema_version: CACHE_GENERATION_MANIFEST_SCHEMA,
+        generation: CanaryCacheGeneration {
+            name: name.to_owned(),
+            generation: generation.to_owned(),
+            sha256: content_sha256,
+        },
+        root_mode: 0o700,
+        entries,
+        total_bytes: contents.len() as u64,
+        model_calls: 0,
+    };
+    manifest.validate().unwrap();
+    manifest
+}
 
 pub(crate) fn test_remote_authority_receipt(
     authority: RemoteM1CacheAuthority,

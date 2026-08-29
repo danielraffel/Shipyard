@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 use super::*;
+#[cfg(unix)]
 use crate::parallel_proof_canary::PulpMacCanaryPolicy;
+#[cfg(unix)]
 use crate::parallel_proof_canary_cache::{
     PulpMacCacheEvidenceStore, PulpMacCacheProbeRequest, drive_pulp_mac_cache_probe,
 };
@@ -28,6 +30,18 @@ fn cache_tree() -> TempDir {
     fs::create_dir(root.path().join("objects")).unwrap();
     fs::write(root.path().join("objects/cache.bin"), b"immutable-cache").unwrap();
     root
+}
+
+fn cache_manifest(root: &Path, name: &str, generation: &str) -> CacheGenerationManifest {
+    #[cfg(unix)]
+    {
+        produce_cache_generation_manifest(root, name, generation).unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        synthetic_cache_generation_manifest(name, generation)
+    }
 }
 
 fn digest(label: &str) -> Sha256Digest {
@@ -173,8 +187,23 @@ impl RemoteM1CacheTransport for FakeTransport {
     ) -> Result<RemoteM1CacheTransportOutput, CacheObserverError> {
         self.calls.push("invoke");
         let request: RemoteM1CacheRequest = serde_json::from_slice(request_bytes)?;
+        #[cfg(unix)]
         let mut response = handle_remote_m1_cache_request(&request, |_| Ok(()))
             .map_err(CacheObserverError::Invalid)?;
+        #[cfg(not(unix))]
+        let mut response = RemoteM1CacheResponse {
+            schema_version: REMOTE_M1_CACHE_PROTOCOL_SCHEMA,
+            request_sha256: request.digest()?,
+            authority_sha256: request.authority_sha256.clone(),
+            host_id: request.host_id.clone(),
+            observed_at_ms: controller_now_ms()?,
+            probe_elapsed_ms: 1,
+            cache_root: request.cache_root.clone(),
+            manifest: request.expected_manifest.clone(),
+            manifest_sha256: request.expected_manifest.digest()?,
+            companion_executable_sha256: request.companion_executable_sha256.clone(),
+            model_calls: 0,
+        };
         if let Some(remote_clock_ms) = self.remote_clock_ms {
             response.observed_at_ms = remote_clock_ms;
         }
@@ -203,7 +232,7 @@ impl RemoteM1CacheTransport for FakeTransport {
 #[test]
 fn remote_observer_binds_every_authority_and_transport_counter() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = cache_manifest(root.path(), "skia", "m124");
     let host_digest = digest("authenticated-m1-host-observation");
     let spec =
         CacheGenerationProbeSpec::new("m1", host_digest.clone(), root.path(), manifest.clone())
@@ -245,7 +274,7 @@ fn remote_observer_binds_every_authority_and_transport_counter() {
 #[test]
 fn remote_observer_uses_explicit_non_pulp_host_pair() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = cache_manifest(root.path(), "skia", "m124");
     let host_digest = digest("worker-b-observation");
     let spec =
         CacheGenerationProbeSpec::new("worker-b", host_digest.clone(), root.path(), manifest)
@@ -300,7 +329,7 @@ fn paired_observer_rejects_a_remote_source_other_than_its_builder() {
 #[test]
 fn remote_wall_clock_is_authenticated_but_never_used_for_controller_freshness() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = cache_manifest(root.path(), "skia", "m124");
     let host_digest = digest("authenticated-m1-host-observation");
     let spec =
         CacheGenerationProbeSpec::new("m1", host_digest.clone(), root.path(), manifest).unwrap();
@@ -338,7 +367,7 @@ fn remote_wall_clock_is_authenticated_but_never_used_for_controller_freshness() 
 #[test]
 fn companion_digest_is_verified_before_cache_observation() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = cache_manifest(root.path(), "skia", "m124");
     let authority = authority(digest("authenticated-m1-host-observation"));
     let request =
         RemoteM1CacheRequest::from_parts(root.path().to_str().unwrap(), &manifest, &authority)
@@ -354,7 +383,7 @@ fn companion_digest_is_verified_before_cache_observation() {
 #[test]
 fn detached_authority_and_tampered_transport_fail_closed() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = cache_manifest(root.path(), "skia", "m124");
     let spec =
         CacheGenerationProbeSpec::new("m1", digest("expected-host"), root.path(), manifest.clone())
             .unwrap();
@@ -396,7 +425,7 @@ fn detached_authority_and_tampered_transport_fail_closed() {
 #[test]
 fn non_lan_or_insufficient_reserve_authority_is_refused_before_invocation() {
     let root = cache_tree();
-    let manifest = produce_cache_generation_manifest(root.path(), "skia", "m124").unwrap();
+    let manifest = cache_manifest(root.path(), "skia", "m124");
     let host_digest = digest("expected-host");
     let spec =
         CacheGenerationProbeSpec::new("m1", host_digest.clone(), root.path(), manifest).unwrap();
@@ -421,11 +450,12 @@ fn non_lan_or_insufficient_reserve_authority_is_refused_before_invocation() {
     assert_eq!(observer.transport.calls, ["authenticate"]);
 }
 
+#[cfg(unix)]
 #[test]
 fn paired_driver_never_reaches_m1_after_failed_local_m3_proof() {
     let m3_root = cache_tree();
     let m1_root = cache_tree();
-    let expected = produce_cache_generation_manifest(m1_root.path(), "skia", "m124").unwrap();
+    let expected = cache_manifest(m1_root.path(), "skia", "m124");
     fs::write(m3_root.path().join("objects/cache.bin"), b"different-cache").unwrap();
     let m3_digest = digest("m3-host");
     let m1_digest = digest("m1-host");
