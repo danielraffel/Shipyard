@@ -21,7 +21,7 @@ use command::{local_update_command, remote_update_command, render_host_result, r
 
 #[cfg(all(test, unix))]
 use evidence::execute_plan_with_timeout;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use evidence::{
     AuthSupportEvidence, BinaryEvidence, BinaryPairEvidence, SourceIdentityBasis,
     SupportFileEvidence,
@@ -31,7 +31,7 @@ use release_authority::{
     GitHubReleaseAuthorityVerifier, ReleaseAuthority, ReleaseAuthorityVerifier,
 };
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests;
 
 use super::CliFailure;
@@ -556,7 +556,19 @@ fn host_update_plan_with_authority(
                 ),
             )
         })?;
-    if !auth_wrapper.is_absolute() || !auth_helper.is_absolute() || auth_wrapper == auth_helper {
+    let auth_paths_are_absolute = if is_remote {
+        class
+            .github_cli
+            .as_deref()
+            .is_some_and(|path| path.starts_with('/'))
+            && class
+                .github_token_helper
+                .as_deref()
+                .is_some_and(|path| path.starts_with('/'))
+    } else {
+        auth_wrapper.is_absolute() && auth_helper.is_absolute()
+    };
+    if !auth_paths_are_absolute || auth_wrapper == auth_helper {
         return Err(CliFailure::new(
             2,
             format!(
@@ -661,12 +673,12 @@ fn transaction_marker_paths(path: &Path) -> [PathBuf; 2] {
     [marker(".shipyard-rollback"), marker(".shipyard-was-absent")]
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdatePlan, CliFailure> {
     host_update_plan_with_authority(class, target, &test_release_authority(target))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 fn test_release_authority(tag: &str) -> ReleaseAuthority {
     use release_authority::ReleaseAssetAuthority;
 

@@ -934,5 +934,5 @@ fn ssh_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ssh"))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests;

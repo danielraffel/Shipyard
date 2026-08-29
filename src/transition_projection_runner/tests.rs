@@ -30,10 +30,10 @@ fn draft(receipt: &[u8], sequence: u64, kind: TransitionKind) -> TransitionDraft
 }
 
 fn policy(executable: &Path, digest: &str, secret: &Path) -> String {
+    let executable = toml::Value::String(executable.display().to_string()).to_string();
+    let secret = toml::Value::String(secret.display().to_string()).to_string();
     format!(
-        "[transition_projection]\nenabled = true\nexecutable_path = \"{}\"\nexecutable_sha256 = \"{digest}\"\nargv = [\"linear-v1\"]\ndeadline_seconds = 2\nmax_stdout_bytes = 4096\nmax_stderr_bytes = 4096\nrepositories = [\"owner/repo\"]\n[transition_projection.secret_files]\nLINEAR_API_KEY_FILE = \"{}\"\n",
-        executable.display(),
-        secret.display()
+        "[transition_projection]\nenabled = true\nexecutable_path = {executable}\nexecutable_sha256 = \"{digest}\"\nargv = [\"linear-v1\"]\ndeadline_seconds = 2\nmax_stdout_bytes = 4096\nmax_stderr_bytes = 4096\nrepositories = [\"owner/repo\"]\n[transition_projection.secret_files]\nLINEAR_API_KEY_FILE = {secret}\n",
     )
 }
 
@@ -100,7 +100,8 @@ fn protected_config_ignores_overlays_and_rejects_secret_argv() {
     fs::write(temp.path().join("config.toml"), over_lease).unwrap();
     assert!(trusted_projection_runner_config(RuntimeMode::Shipyard, temp.path().into()).is_err());
 
-    let bad = "[transition_projection]\nenabled=true\nexecutable_path=\"/bin/x\"\nexecutable_sha256=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\nargv=[\"token=secret\"]\ndeadline_seconds=1\nmax_stdout_bytes=1\nmax_stderr_bytes=1\nrepositories=[\"owner/repo\"]\n";
+    let bad = policy(&inert_executable(), &"a".repeat(64), &secret)
+        .replace("argv = [\"linear-v1\"]", "argv = [\"token=secret\"]");
     fs::write(temp.path().join("config.toml"), bad).unwrap();
     assert!(trusted_projection_runner_config(RuntimeMode::Shipyard, temp.path().into()).is_err());
 }

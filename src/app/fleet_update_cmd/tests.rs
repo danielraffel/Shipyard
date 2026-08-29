@@ -318,7 +318,6 @@ fn local_rollout_rejects_a_filename_the_installer_cannot_replace() {
 }
 
 #[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn one_stalled_host_is_terminated_at_its_bound() {
     use std::os::unix::fs::PermissionsExt;
@@ -393,7 +392,7 @@ fn exact_release_tag_is_required() {
 }
 
 fn named_host(name: &str) -> HostClassConfig {
-    let mut class = host(None, Some("/Users/ci/.local/bin/shipyard"));
+    let mut class = host(Some(name), Some("/Users/ci/.local/bin/shipyard"));
     name.clone_into(&mut class.class);
     class
 }
