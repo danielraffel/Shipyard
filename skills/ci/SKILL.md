@@ -1679,6 +1679,16 @@ Reconcile resume records even when the authoritative terminal-handoff update is
 a no-op so legacy ledgers backfill on restart. Publish or roll back both maps as
 one crash-consistent ledger image, and keep `dispatch_enabled=false` until the
 outbox, acknowledgment, and physical canary gates are separately complete.
+
+Schema-v6 route changes are likewise inert and live in their own transactional
+ledger, not the wake outbox. Same-session terminal rebind preserves the native
+agent session and complete provider/launch facts. Fresh-owner recovery requires
+typed native-session-death and checkpoint evidence, advances ownership exactly
+once on acceptance, records started/no-receipt as uncertain without retry, and
+uses a generation-current recovery fence after definitive non-delivery only as
+the source for another fresh-owner transfer, never a same-session resume. Exact
+replay revalidates the current work, owner, route, and immutable receipt; never
+fall back from Subrouter to direct Codex.
 For the ledger gate, prove all terminal outbox shapes reject a NULL receipt
 kind on a fresh database and after every supported legacy migration. Do not
 rely on `receipt_kind = 'value'` alone inside a SQLite CHECK: NULL makes the

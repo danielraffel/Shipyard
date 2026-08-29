@@ -3,9 +3,10 @@
 
 use super::{
     AdapterBindingRecord, OptionalExtension, RouteProvenanceRecord, Transaction,
-    TransactionBehavior, Utc, WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable,
-    digest, is_lower_hex, params, validate_opaque_ref, verify_supported_schema,
+    TransactionBehavior, WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable, digest,
+    is_lower_hex, params, validate_opaque_ref, verify_supported_schema,
 };
+use chrono::Utc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RouteRegistration {
@@ -152,6 +153,7 @@ impl WorkLedger {
         configure_durable(&connection)?;
         verify_supported_schema(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = self.clock.observe(&transaction)?.timestamp.to_rfc3339();
         let matches: bool = transaction.query_row(
             "SELECT head_sha = ?2 AND work_generation = ?3 AND owner_generation = ?4
                     AND owner_id = ?5
@@ -170,50 +172,68 @@ impl WorkLedger {
                 "route does not match current work provenance".to_owned(),
             ));
         }
-        if !registered_adapters_present(&transaction, &route.provenance)? {
-            return Err(WorkLedgerError::Refused(
-                "route references an absent, retired, or changed adapter registration".to_owned(),
-            ));
-        }
-        let payload = serde_json::to_vec(&route.provenance).map_err(|_| {
-            WorkLedgerError::Refused("route provenance cannot be serialized".to_owned())
-        })?;
-        let payload_digest = digest(&payload);
-        let now = Utc::now().to_rfc3339();
-        let changed = transaction.execute(
-            "INSERT OR IGNORE INTO route_records
+        insert_route_record(&transaction, route, &now)?;
+        super::clock::LedgerClock::finalize(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+pub(super) fn insert_route_record(
+    transaction: &Transaction<'_>,
+    route: &RouteRegistration,
+    now: &str,
+) -> WorkLedgerResult<()> {
+    route
+        .provenance
+        .validate()
+        .map_err(|_| WorkLedgerError::Refused("route provenance is invalid".to_owned()))?;
+    if route.compute_envelope_integrity() != route.envelope_integrity {
+        return Err(WorkLedgerError::Refused(
+            "route envelope integrity is invalid".to_owned(),
+        ));
+    }
+    if !registered_adapters_present(transaction, &route.provenance)? {
+        return Err(WorkLedgerError::Refused(
+            "route references an absent, retired, or changed adapter registration".to_owned(),
+        ));
+    }
+    let payload = serde_json::to_vec(&route.provenance).map_err(|_| {
+        WorkLedgerError::Refused("route provenance cannot be serialized".to_owned())
+    })?;
+    let payload_digest = digest(&payload);
+    let changed = transaction.execute(
+        "INSERT OR IGNORE INTO route_records
              (route_ref, work_item_id, head_sha, work_generation, owner_ref,
               owner_generation, revision, origin_machine_ref, terminal_kind,
               agent_kind, provider_kind, payload_json, payload_digest, integrity_hash,
               created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                      ?13, ?14, ?15, ?15)",
-            params![
-                route.route_ref,
-                route.work_id,
-                route.head_sha,
-                route.work_generation,
-                route.owner_ref,
-                route.owner_generation,
-                route.revision,
-                route.origin_machine_ref,
-                route.provenance.terminal_kind(),
-                route.provenance.agent_kind(),
-                route.provenance.provider_kind(),
-                payload,
-                payload_digest,
-                route.envelope_integrity,
-                now,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(WorkLedgerError::Refused(
-                "route reference or revision already exists".to_owned(),
-            ));
-        }
-        transaction.commit()?;
-        Ok(())
+        params![
+            route.route_ref,
+            route.work_id,
+            route.head_sha,
+            route.work_generation,
+            route.owner_ref,
+            route.owner_generation,
+            route.revision,
+            route.origin_machine_ref,
+            route.provenance.terminal_kind(),
+            route.provenance.agent_kind(),
+            route.provenance.provider_kind(),
+            payload,
+            payload_digest,
+            route.envelope_integrity,
+            now,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(WorkLedgerError::Refused(
+            "route reference or revision already exists".to_owned(),
+        ));
     }
+    Ok(())
 }
 
 pub(super) fn validated_route_exists(
@@ -223,6 +243,19 @@ pub(super) fn validated_route_exists(
     work_generation: u64,
     owner_generation: u64,
 ) -> WorkLedgerResult<bool> {
+    Ok(
+        load_validated_route(transaction, route_ref)?.is_some_and(|route| {
+            route.work_id == work_id
+                && route.work_generation == work_generation
+                && route.owner_generation == owner_generation
+        }),
+    )
+}
+
+pub(super) fn load_validated_route(
+    transaction: &Transaction<'_>,
+    route_ref: &str,
+) -> WorkLedgerResult<Option<RouteRegistration>> {
     type StoredRoute = (
         String,
         String,
@@ -280,14 +313,8 @@ pub(super) fn validated_route_exists(
         payload_digest,
     )) = stored
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    if stored_work != work_id
-        || stored_generation != work_generation
-        || stored_owner_generation != owner_generation
-    {
-        return Ok(false);
-    }
     let provenance: RouteProvenanceRecord = serde_json::from_slice(&payload)
         .map_err(|_| WorkLedgerError::Refused("stored route payload is malformed".to_owned()))?;
     if digest(&payload) != payload_digest
@@ -320,7 +347,7 @@ pub(super) fn validated_route_exists(
             "stored route envelope integrity mismatch".to_owned(),
         ));
     }
-    Ok(true)
+    Ok(Some(registration))
 }
 
 fn registered_adapters_present(

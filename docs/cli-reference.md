@@ -207,6 +207,19 @@ eligible continuation contract. Native route records keep terminal, agent, and
 provider axes separate and integrity-bound; missing provider provenance never
 means Direct and cannot dispatch. Native transitions are closed/typed and
 commit their deterministic event with any outbox wake.
+
+Schema v6 also records inert, transactional route changes separately from the
+wake outbox. A verified same-native-session terminal rebind advances only the
+work generation and terminal route while preserving owner, agent session,
+provider, account/model, wrapper, headers, native resume, and launch profile.
+A fresh-owner transfer requires typed native-session-death plus checkpoint
+evidence, crosses a delivery-start no-return boundary, and advances ownership
+exactly once only on an accepted receipt. Missing receipts become uncertain and
+are never retried blindly; definitive non-delivery returns to actionable with a
+new generation-current recovery fence for another fresh-owner transfer; it
+cannot same-session resume the proven-dead native session. Missing Subrouter provenance never
+falls back to direct Codex. These storage APIs remain inactive until an adapter
+verifier is deployed.
 Schema v4 creates one random, immutable `ledger_incarnation_ref` for the
 database lifetime and verifies it on every connection. Wake, event, claim,
 delivery-start, and receipt identities retain that fence; each future daemon

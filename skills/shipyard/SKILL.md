@@ -1969,6 +1969,18 @@ verify that every record keeps dispatch disabled. Activation additionally
 requires a generation-fenced transactional outbox, durable acknowledgment,
 uncertain-delivery refusal, and physical original/fresh-owner canaries.
 
+The schema-v6 route-change ledger is separate from that outbox and remains
+inert until adapter verification is available. Same-session rebinds may change
+only verified terminal provenance and route revision; fresh-owner transfer
+requires native-session-death and checkpoint evidence, source and target CAS,
+a delivery-start boundary, and a typed immutable receipt. Accepted delivery
+advances owner generation once. Definitive non-delivery publishes a current-
+generation recovery fence usable only by another fresh-owner transfer; the
+proven-dead session cannot same-session rebind. Started delivery without a receipt is uncertain and
+must not retry. Replay must revalidate the persisted receipt, target route, and
+current work fence. Never synthesize a direct Codex route when Subrouter or
+CLIProxyAPI provenance is missing.
+
 For Pulp/tartci macOS VM work, prefer local queueing over hosted overflow: a
 full local fleet should leave jobs queued on the self-hosted VM labels until a
 controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an

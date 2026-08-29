@@ -4,6 +4,7 @@ use super::route::{
     LaunchProfileRecord, NativeSessionRoute, OpaqueRef, ProviderRoute, ProviderRouteRecord,
     RouteProvenanceRecord, Sha256Digest, TerminalRoute, TerminalRouteRecord,
 };
+use super::route_change::*;
 use super::*;
 use tempfile::TempDir;
 
@@ -156,3 +157,4 @@ mod delivery;
 mod importer;
 mod lifecycle;
 mod persistence;
+mod route_change;

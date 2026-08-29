@@ -145,8 +145,11 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     if version == SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 5 {
+        return migrate_v5_to_v6(connection);
+    }
     if version == 4 {
-        return migrate_v4_to_v5(connection);
+        return migrate_v4_to_current(connection);
     }
     let ledger_incarnation_ref = random_opaque_ref("ledger")?;
     if version == 1 {
@@ -348,6 +351,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     )?;
     upgrade_v3_incarnation(&transaction, &ledger_incarnation_ref)?;
     upgrade_v4_clock(&transaction)?;
+    upgrade_v5_route_changes(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -364,6 +368,7 @@ fn migrate_v2_to_v4(
     upgrade_v2_outbox(&transaction)?;
     upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
     upgrade_v4_clock(&transaction)?;
+    upgrade_v5_route_changes(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -488,6 +493,7 @@ fn migrate_v1_to_v4(
     upgrade_v2_outbox(&transaction)?;
     upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
     upgrade_v4_clock(&transaction)?;
+    upgrade_v5_route_changes(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -500,6 +506,7 @@ fn migrate_v3_to_v4(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
     upgrade_v4_clock(&transaction)?;
+    upgrade_v5_route_changes(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -596,9 +603,18 @@ fn upgrade_v3_incarnation(
     Ok(())
 }
 
-fn migrate_v4_to_v5(connection: &mut Connection) -> WorkLedgerResult<()> {
+fn migrate_v4_to_current(connection: &mut Connection) -> WorkLedgerResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     upgrade_v4_clock(&transaction)?;
+    upgrade_v5_route_changes(&transaction)?;
+    verify_migration_foreign_keys(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    upgrade_v5_route_changes(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -634,6 +650,15 @@ pub(super) const CLOCK_TIMESTAMP_TABLES: &[(&str, &[(&str, bool)])] = &[
     ),
     ("imports", &[("imported_at", false)]),
     ("repo_policies", &[("updated_at", false)]),
+    (
+        "route_changes",
+        &[
+            ("created_at", false),
+            ("updated_at", false),
+            ("delivery_started_at", true),
+            ("completed_at", true),
+        ],
+    ),
 ];
 
 const CLOCK_GUARD_TRIGGERS: &[(&str, &str)] = &[
@@ -755,7 +780,10 @@ fn upgrade_v4_clock(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult
            floor_revision INTEGER NOT NULL CHECK(floor_revision >= 0 AND floor_revision <= writer_revision)
          );",
     )?;
-    for (_, sql) in expected_clock_triggers() {
+    for (name, sql) in expected_clock_triggers() {
+        if name.starts_with("ledger_clock_route_changes_") {
+            continue;
+        }
         transaction.execute_batch(&format!("{sql};"))?;
     }
     transaction.execute(
@@ -764,6 +792,111 @@ fn upgrade_v4_clock(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult
          VALUES (1, ?1, 0, 0)",
         [floor],
     )?;
+    transaction.pragma_update(None, "user_version", 5)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn upgrade_v5_route_changes(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE route_changes (
+           change_id TEXT PRIMARY KEY,
+           ledger_incarnation_ref TEXT NOT NULL,
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           head_sha TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK(kind IN ('same_session_rebind', 'fresh_owner_transfer')),
+           state TEXT NOT NULL CHECK(state IN ('prepared', 'delivery_started', 'applied', 'uncertain', 'failed')),
+           source_work_generation INTEGER NOT NULL CHECK(source_work_generation > 0),
+           source_owner_ref TEXT NOT NULL,
+           source_owner_generation INTEGER NOT NULL CHECK(source_owner_generation > 0),
+           source_route_ref TEXT NOT NULL REFERENCES route_records(route_ref) ON DELETE RESTRICT,
+           intermediate_work_generation INTEGER NOT NULL CHECK(intermediate_work_generation > 0),
+           target_work_generation INTEGER NOT NULL CHECK(target_work_generation > 0),
+           target_owner_ref TEXT NOT NULL,
+           target_owner_generation INTEGER NOT NULL CHECK(target_owner_generation > 0),
+           target_route_ref TEXT NOT NULL,
+           recovery_route_ref TEXT,
+           dead_session_evidence_digest TEXT,
+           checkpoint_digest TEXT,
+           claim_integrity TEXT NOT NULL,
+           delivery_started_at TEXT,
+           adapter_evidence_digest TEXT,
+           start_integrity TEXT,
+           receipt_kind TEXT CHECK(receipt_kind IN ('accepted', 'definitive_not_delivered', 'uncertain')),
+           receipt_evidence_digest TEXT,
+           receipt_digest TEXT,
+           change_integrity TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           completed_at TEXT,
+           UNIQUE(work_item_id, source_work_generation, source_owner_generation),
+           CHECK(source_route_ref != target_route_ref),
+           CHECK(
+             (kind = 'same_session_rebind'
+               AND intermediate_work_generation = source_work_generation
+               AND target_work_generation = source_work_generation + 1
+               AND target_owner_ref = source_owner_ref
+               AND target_owner_generation = source_owner_generation
+               AND dead_session_evidence_digest IS NULL AND checkpoint_digest IS NULL
+               AND recovery_route_ref IS NULL
+               AND delivery_started_at IS NULL AND start_integrity IS NULL
+               AND state IN ('prepared', 'applied'))
+             OR
+             (kind = 'fresh_owner_transfer'
+               AND intermediate_work_generation = source_work_generation + 1
+               AND target_work_generation = source_work_generation + 2
+               AND target_owner_generation = source_owner_generation + 1
+               AND dead_session_evidence_digest IS NOT NULL
+               AND checkpoint_digest IS NOT NULL
+               AND recovery_route_ref IS NOT NULL)
+           ),
+           CHECK(
+             (state = 'prepared'
+               AND receipt_kind IS NULL AND receipt_evidence_digest IS NULL
+               AND receipt_digest IS NULL AND completed_at IS NULL)
+             OR
+             (state = 'delivery_started'
+               AND kind = 'fresh_owner_transfer'
+               AND delivery_started_at IS NOT NULL
+               AND adapter_evidence_digest IS NOT NULL AND start_integrity IS NOT NULL
+               AND receipt_kind IS NULL AND receipt_evidence_digest IS NULL
+               AND receipt_digest IS NULL AND completed_at IS NULL)
+             OR
+             (state = 'applied'
+               AND receipt_kind = 'accepted'
+               AND receipt_evidence_digest IS NOT NULL AND receipt_digest IS NOT NULL
+               AND (kind = 'same_session_rebind'
+                    OR (kind = 'fresh_owner_transfer'
+                        AND delivery_started_at IS NOT NULL
+                        AND adapter_evidence_digest IS NOT NULL
+                        AND start_integrity IS NOT NULL))
+               AND completed_at IS NOT NULL)
+             OR
+             (state = 'uncertain'
+               AND kind = 'fresh_owner_transfer'
+               AND delivery_started_at IS NOT NULL
+               AND adapter_evidence_digest IS NOT NULL AND start_integrity IS NOT NULL
+               AND receipt_kind = 'uncertain'
+               AND receipt_evidence_digest IS NOT NULL AND receipt_digest IS NOT NULL
+               AND completed_at IS NOT NULL)
+             OR
+             (state = 'failed'
+               AND kind = 'fresh_owner_transfer'
+               AND delivery_started_at IS NOT NULL
+               AND adapter_evidence_digest IS NOT NULL AND start_integrity IS NOT NULL
+               AND receipt_kind = 'definitive_not_delivered'
+               AND receipt_evidence_digest IS NOT NULL AND receipt_digest IS NOT NULL
+               AND completed_at IS NOT NULL)
+           )
+         );
+         CREATE INDEX route_changes_state
+           ON route_changes(state, updated_at, change_id);",
+    )?;
+    for (name, sql) in expected_clock_triggers() {
+        if name.starts_with("ledger_clock_route_changes_") {
+            transaction.execute_batch(&format!("{sql};"))?;
+        }
+    }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
