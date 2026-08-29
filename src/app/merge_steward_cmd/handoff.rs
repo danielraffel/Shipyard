@@ -1059,6 +1059,8 @@ pub(crate) fn native_publication_request(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let native_resume_bytes = serde_json::to_vec(&profile.resume_argv)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let route_environment_bytes = serde_json::to_vec(&profile.route_environment)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let route_wrapper = profile
         .resume_argv
         .first()
@@ -1099,6 +1101,7 @@ pub(crate) fn native_publication_request(
             .unwrap_or_else(|| "unselected-model".into()),
         route_wrapper,
         native_resume_digest: hex::encode(Sha256::digest(native_resume_bytes)),
+        route_environment_digest: hex::encode(Sha256::digest(route_environment_bytes)),
         route_id: route.route_id.clone(),
         profile_generation: stored.generation,
         profile_revision: stored.revision,

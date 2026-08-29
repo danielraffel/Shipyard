@@ -4,7 +4,8 @@ use std::collections::VecDeque;
 
 use super::*;
 use crate::provider_wrapper::{
-    FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderLaunchOptionsV1,
+    CmuxEndpointV1, FreshResumeExpectationV1, ProtectedProviderRouteV1, ProviderDeliveryFenceV1,
+    ProviderLaunchOptionsV1, ProviderReasoningEffortV1,
 };
 use crate::work_ledger::{
     DeliveryAuthorization, DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
@@ -32,12 +33,14 @@ fn native_absolute_test_path(leaf: &str) -> String {
 #[derive(Default)]
 struct FakeRunner {
     verification: Option<Result<(), RunnerFailure>>,
+    bound_endpoints: Vec<CmuxEndpointV1>,
     results: VecDeque<Result<CommandResult, RunnerFailure>>,
     calls: Vec<Vec<String>>,
 }
 
 impl CmuxRunner for FakeRunner {
-    fn verify(&mut self) -> Result<(), RunnerFailure> {
+    fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
+        self.bound_endpoints.push(endpoint.clone());
         self.verification.take().unwrap_or(Ok(()))
     }
 
@@ -158,6 +161,35 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
         provider_id: provider.to_owned(),
         adapter_id: ADAPTER_ID.to_owned(),
         delivery_fence: fence,
+        cmux_endpoint: CmuxEndpointV1 {
+            executable_path: "/test/cmux-a".to_owned(),
+            socket_path: "/test/cmux-a.sock".to_owned(),
+        },
+        protected_route: ProtectedProviderRouteV1 {
+            argv: vec![
+                "/opt/subrouter".to_owned(),
+                provider.to_owned(),
+                "resume".to_owned(),
+                "--model".to_owned(),
+                "gpt-5.6-sol".to_owned(),
+                "-c".to_owned(),
+                "model_reasoning_effort=\"medium\"".to_owned(),
+                "native-session-a".to_owned(),
+            ],
+            environment: std::collections::BTreeMap::from([
+                (
+                    format!("SUBROUTER_{}_ACCOUNT_ID", provider.to_ascii_uppercase()),
+                    "account-a".to_owned(),
+                ),
+                (
+                    format!("SUBROUTER_{}_USER_EMAIL", provider.to_ascii_uppercase()),
+                    "agent@example.test".to_owned(),
+                ),
+            ]),
+            account_id: Some("account-a".to_owned()),
+            native_session_id: "native-session-a".to_owned(),
+            profile_digest: "1".repeat(64),
+        },
         resume_expectation: FreshResumeExpectationV1 {
             workstream_handle: "GEN-43".to_owned(),
             context_url: Some("https://linear.app/generous/issue/GEN-43".to_owned()),
@@ -436,26 +468,88 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
 }
 
 #[test]
-fn codex_and_claude_use_provider_owned_command_grammars() {
+fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     let codex = request("codex", ProviderWrapperOperationV1::Submit);
     let codex_command = launch_command(&codex).unwrap();
-    assert!(codex_command.starts_with(&shell_word(CODEX_WRAPPER).unwrap()));
-    assert!(codex_command.contains("--model 'gpt-5.6-sol'"));
-    assert!(codex_command.contains("-c 'model_reasoning_effort=\"medium\"'"));
+    assert!(codex_command.starts_with("'/usr/bin/env' 'SUBROUTER_CODEX_ACCOUNT_ID=account-a' 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test' '/opt/subrouter' 'codex' 'resume'"));
+    assert!(codex_command.contains("'native-session-a'"));
+    assert!(!codex_command.contains("cmux-codex-wrapper"));
+    let public_response = serde_json::to_string(&response(&codex, rejected("test"))).unwrap();
+    for private in [
+        "account-a",
+        "agent@example.test",
+        "native-session-a",
+        "/opt/subrouter",
+    ] {
+        assert!(!public_response.contains(private));
+    }
 
     let mut claude = request("claude", ProviderWrapperOperationV1::Submit);
     claude.launch_options.model_id = Some("fable".to_owned());
     claude.launch_options.reasoning_effort = Some(ProviderReasoningEffortV1::High);
+    claude.protected_route.argv = vec![
+        "/opt/subrouter".into(),
+        "claude".into(),
+        "--model".into(),
+        "fable".into(),
+        "--effort".into(),
+        "high".into(),
+        "--resume".into(),
+        "native-session-a".into(),
+    ];
     let claude_command = launch_command(&claude).unwrap();
-    assert!(claude_command.starts_with(&shell_word(CLAUDE_WRAPPER).unwrap()));
-    assert!(claude_command.contains("--model 'fable'"));
-    assert!(claude_command.contains("--effort high"));
-    assert!(!claude_command.contains("model_reasoning_effort"));
+    assert!(claude_command.contains("'/opt/subrouter' 'claude' '--model' 'fable'"));
+    assert!(!claude_command.contains("cmux-claude-wrapper"));
+}
 
-    claude.launch_options.reasoning_effort = Some(ProviderReasoningEffortV1::Ultra);
+#[test]
+fn profile_route_drift_refuses_before_terminal_enumeration() {
+    for mutate in ["digest", "provider", "wrapper"] {
+        let mut request = request("qwen", ProviderWrapperOperationV1::Submit);
+        match mutate {
+            "digest" => request.protected_route.profile_digest = "f".repeat(64),
+            "provider" => request.protected_route.argv[1] = "kimi".into(),
+            "wrapper" => request.protected_route.argv[0] = "/opt/qwen".into(),
+            _ => unreachable!(),
+        }
+        let mut runner = FakeRunner::default();
+        let response = handle_request(&request, &mut runner);
+        assert!(matches!(
+            response.outcome,
+            ProviderWrapperOutcomeV1::Rejected { .. }
+        ));
+        assert!(runner.calls.is_empty());
+        assert!(runner.bound_endpoints.is_empty());
+    }
+}
+
+#[test]
+fn each_request_binds_enumeration_and_mutation_to_its_exact_cmux_endpoint() {
+    let first = request("codex", ProviderWrapperOperationV1::Reconcile);
+    let mut second = first.clone();
+    second.cmux_endpoint = CmuxEndpointV1 {
+        executable_path: "/test/cmux-b".into(),
+        socket_path: "/test/cmux-b.sock".into(),
+    };
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+        ]),
+        ..FakeRunner::default()
+    };
+    for request in [&first, &second] {
+        let response = handle_request(request, &mut runner);
+        assert!(matches!(
+            response.outcome,
+            ProviderWrapperOutcomeV1::Uncertain { .. }
+        ));
+    }
     assert_eq!(
-        validate_adapter_request(&claude),
-        Err("claude-ultra-effort-unsupported")
+        runner.bound_endpoints,
+        vec![first.cmux_endpoint, second.cmux_endpoint]
     );
 }
 
@@ -543,7 +637,7 @@ fn partial_app_wide_enumeration_refuses_create() {
 }
 
 #[test]
-fn untrusted_cmux_and_unsupported_provider_refuse_before_any_command() {
+fn untrusted_cmux_and_direct_provider_fallback_refuse_before_any_command() {
     let valid_request = request("codex", ProviderWrapperOperationV1::Submit);
     let mut untrusted = FakeRunner {
         verification: Some(Err(RunnerFailure::Untrusted)),
@@ -556,7 +650,8 @@ fn untrusted_cmux_and_unsupported_provider_refuse_before_any_command() {
     ));
     assert!(untrusted.calls.is_empty());
 
-    let unsupported = request("other", ProviderWrapperOperationV1::Submit);
+    let mut unsupported = request("other", ProviderWrapperOperationV1::Submit);
+    unsupported.protected_route.argv[0] = "/opt/other".into();
     let mut runner = FakeRunner::default();
     let response = handle_request(&unsupported, &mut runner);
     assert!(matches!(
@@ -570,7 +665,7 @@ fn untrusted_cmux_and_unsupported_provider_refuse_before_any_command() {
 #[test]
 fn production_cmux_adapter_refuses_before_running_any_cmux_command() {
     let request = request("codex", ProviderWrapperOperationV1::Submit);
-    let response = handle_request(&request, &mut ProductionCmuxRunner);
+    let response = handle_request(&request, &mut ProductionCmuxRunner::default());
     assert!(matches!(
         response.outcome,
         ProviderWrapperOutcomeV1::Retryable { .. }
@@ -597,7 +692,8 @@ fn reconcile_preflight_failures_preserve_uncertainty() {
         assert!(runner.calls.is_empty());
     }
 
-    let unsupported = request("other", ProviderWrapperOperationV1::Reconcile);
+    let mut unsupported = request("other", ProviderWrapperOperationV1::Reconcile);
+    unsupported.protected_route.argv[0] = "/opt/direct-provider".into();
     let mut runner = FakeRunner::default();
     let response = handle_request(&unsupported, &mut runner);
     assert!(matches!(
@@ -702,6 +798,7 @@ impl LedgerCmuxAdapter {
             idempotency_key: String::new(),
         };
         request.delivery_fence.bind_idempotency_key();
+        request.protected_route.profile_digest = fence.payload_digest.clone();
         request
     }
 
@@ -841,6 +938,7 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
         route_model: "model-a".into(),
         route_wrapper: "subrouter".into(),
         native_resume_digest: "9".repeat(64),
+        route_environment_digest: "8".repeat(64),
         route_id: "route-gen43".to_owned(),
         profile_generation: 1,
         profile_revision: 1,

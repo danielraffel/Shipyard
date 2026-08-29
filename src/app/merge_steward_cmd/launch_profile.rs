@@ -1,10 +1,13 @@
 use super::{CliFailure, is_full_sha};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::provider_wrapper::ProviderReasoningEffortV1;
+use crate::provider_wrapper::{
+    ProviderReasoningEffortV1, provider_reasoning_effort_name, subrouter_account_environment_key,
+};
 
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_ARGV_ITEMS: usize = 64;
@@ -26,6 +29,9 @@ pub(crate) struct LaunchProfileV1 {
     pub(super) schema_version: u32,
     pub(super) launch_argv: Vec<String>,
     pub(super) resume_argv: Vec<String>,
+    /// Private Subrouter routing headers/environment restored with either argv.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) route_environment: BTreeMap<String, String>,
     pub(super) provider: ProviderMetadataV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) session: Option<SessionProvenanceV1>,
@@ -48,8 +54,26 @@ impl LaunchProfileV1 {
         if let Some(model_id) = self.provider.model.as_deref() {
             validate_provider_option("model ID", model_id)?;
         }
+        validate_route_account_selection(self)?;
         validate_native_argv(self, &self.launch_argv, false)?;
         validate_native_argv(self, &self.resume_argv, true)
+    }
+
+    pub(crate) fn protected_resume_route(
+        &self,
+        profile_digest: String,
+    ) -> crate::provider_wrapper::ProtectedProviderRouteV1 {
+        crate::provider_wrapper::ProtectedProviderRouteV1 {
+            argv: self.resume_argv.clone(),
+            environment: self.route_environment.clone(),
+            account_id: self.provider.account.clone(),
+            native_session_id: self
+                .session
+                .as_ref()
+                .map(|session| session.provider_session_id.clone())
+                .unwrap_or_default(),
+            profile_digest,
+        }
     }
 }
 
@@ -217,6 +241,7 @@ pub(super) fn validate_launch_profile(profile: &LaunchProfileV1) -> Result<(), C
     }
     validate_argv("launch", &profile.launch_argv)?;
     validate_argv("resume", &profile.resume_argv)?;
+    validate_route_environment(profile)?;
     validate_metadata("provider ID", &profile.provider.provider)?;
     if let Some(account_id) = profile.provider.account.as_deref() {
         validate_metadata("account ID", account_id)?;
@@ -269,10 +294,7 @@ fn validate_native_argv(
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     let provider = profile.provider.provider.as_str();
-    if executable != "subrouter"
-        || !matches!(provider, "codex" | "claude")
-        || argv.get(1).map(String::as_str) != Some(provider)
-    {
+    if executable != "subrouter" || argv.get(1).map(String::as_str) != Some(provider) {
         return Err(CliFailure::new(
             1,
             "native fresh-agent argv requires an exact Subrouter provider wrapper",
@@ -282,70 +304,30 @@ fn validate_native_argv(
         .session
         .as_ref()
         .map(|session| session.provider_session_id.as_str());
-    let mut index = 2;
-    if resume && provider == "codex" {
-        if argv.get(index).map(String::as_str) != Some("resume") {
-            return Err(CliFailure::new(1, "native codex resume grammar is invalid"));
-        }
-        index += 1;
+    let tail = &argv[2..];
+    let matches_exact = |needle: &str| tail.iter().filter(|value| value.as_str() == needle).count();
+    if tail
+        .iter()
+        .any(|value| value.chars().any(char::is_whitespace))
+    {
+        return Err(CliFailure::new(
+            1,
+            "native fresh-agent argv contains a prompt-bearing argument",
+        ));
     }
-    let mut model = None;
-    let mut reasoning_effort = None;
-    let mut session = None;
-    while index < argv.len() {
-        match (provider, argv[index].as_str()) {
-            (_, "--model") if model.is_none() => {
-                model = Some(argv.get(index + 1).map(String::as_str).ok_or_else(|| {
-                    CliFailure::new(1, "native fresh-agent model flag has no value")
-                })?);
-                index += 2;
-            }
-            ("codex", "-c") if reasoning_effort.is_none() => {
-                let value = argv.get(index + 1).map(String::as_str).ok_or_else(|| {
-                    CliFailure::new(1, "native codex reasoning flag has no value")
-                })?;
-                reasoning_effort = parse_codex_reasoning_config(value);
-                if reasoning_effort.is_none() {
-                    return Err(CliFailure::new(
-                        1,
-                        "native codex reasoning config is invalid",
-                    ));
-                }
-                index += 2;
-            }
-            ("claude", "--effort") if reasoning_effort.is_none() => {
-                let value = argv
-                    .get(index + 1)
-                    .map(String::as_str)
-                    .ok_or_else(|| CliFailure::new(1, "native claude effort flag has no value"))?;
-                reasoning_effort = parse_claude_reasoning_effort(value);
-                if reasoning_effort.is_none() {
-                    return Err(CliFailure::new(1, "native claude effort is invalid"));
-                }
-                index += 2;
-            }
-            ("claude", "--resume") if resume && session.is_none() => {
-                session = Some(argv.get(index + 1).map(String::as_str).ok_or_else(|| {
-                    CliFailure::new(1, "native claude resume flag has no session")
-                })?);
-                index += 2;
-            }
-            ("codex", value) if resume && session.is_none() => {
-                session = Some(value);
-                index += 1;
-            }
-            _ => {
-                return Err(CliFailure::new(
-                    1,
-                    "native fresh-agent argv contains a prompt, secret-bearing, or unrecognized argument",
-                ));
-            }
-        }
-    }
-    if model != profile.provider.model.as_deref()
-        || reasoning_effort != profile.provider.reasoning_effort
-        || (resume && session != expected_session)
-        || (!resume && session.is_some())
+    if profile
+        .provider
+        .model
+        .as_deref()
+        .is_some_and(|model| matches_exact(model) != 1)
+        || profile.provider.reasoning_effort.is_some_and(|effort| {
+            let effort = provider_reasoning_effort_name(effort);
+            !tail
+                .iter()
+                .any(|value| value == effort || value.contains(&format!("=\"{effort}\"")))
+        })
+        || expected_session.is_some_and(|session| matches_exact(session) != usize::from(resume))
+        || (resume && expected_session.is_none())
     {
         return Err(CliFailure::new(
             1,
@@ -355,29 +337,51 @@ fn validate_native_argv(
     Ok(())
 }
 
-fn parse_codex_reasoning_config(value: &str) -> Option<ProviderReasoningEffortV1> {
-    let value = value
-        .strip_prefix("model_reasoning_effort=\"")?
-        .strip_suffix('"')?;
-    parse_reasoning_effort(value)
-}
-
-fn parse_reasoning_effort(value: &str) -> Option<ProviderReasoningEffortV1> {
-    match value {
-        "low" => Some(ProviderReasoningEffortV1::Low),
-        "medium" => Some(ProviderReasoningEffortV1::Medium),
-        "high" => Some(ProviderReasoningEffortV1::High),
-        "xhigh" => Some(ProviderReasoningEffortV1::Xhigh),
-        "max" => Some(ProviderReasoningEffortV1::Max),
-        "ultra" => Some(ProviderReasoningEffortV1::Ultra),
-        _ => None,
+fn validate_route_environment(profile: &LaunchProfileV1) -> Result<(), CliFailure> {
+    if profile.route_environment.len() > 16 {
+        return Err(CliFailure::new(1, "native route environment is too large"));
     }
+    for (name, value) in &profile.route_environment {
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || !name.starts_with("SUBROUTER_")
+            || value.is_empty()
+            || value.len() > MAX_ARG_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(CliFailure::new(1, "native route environment is invalid"));
+        }
+    }
+    Ok(())
 }
 
-fn parse_claude_reasoning_effort(value: &str) -> Option<ProviderReasoningEffortV1> {
-    match parse_reasoning_effort(value) {
-        Some(ProviderReasoningEffortV1::Ultra) | None => None,
-        supported => supported,
+fn validate_route_account_selection(profile: &LaunchProfileV1) -> Result<(), CliFailure> {
+    let account_values = profile
+        .route_environment
+        .iter()
+        .filter(|(name, _)| name.ends_with("_ACCOUNT_ID"))
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    let expected_account_key = subrouter_account_environment_key(&profile.provider.provider);
+    match profile.provider.account.as_deref() {
+        Some(account)
+            if account_values == [account]
+                && profile
+                    .route_environment
+                    .get(&expected_account_key)
+                    .map(String::as_str)
+                    == Some(account) =>
+        {
+            Ok(())
+        }
+        None if account_values.is_empty() => Ok(()),
+        _ => Err(CliFailure::new(
+            1,
+            "native route environment does not exactly bind the selected account",
+        )),
     }
 }
 
@@ -661,6 +665,10 @@ mod tests {
                 "--resume".into(),
                 "session-7".into(),
             ],
+            route_environment: BTreeMap::from([(
+                "SUBROUTER_SUBSCRIPTION_ROUTER_ACCOUNT_ID".into(),
+                "account-a".into(),
+            )]),
             provider: ProviderMetadataV1 {
                 provider: "subscription-router".into(),
                 account: Some("account-a".into()),
@@ -755,6 +763,8 @@ mod tests {
     fn native_grammar_is_prompt_free_and_exactly_matches_metadata() {
         let mut codex = profile();
         codex.provider.provider = "codex".into();
+        codex.route_environment =
+            BTreeMap::from([("SUBROUTER_CODEX_ACCOUNT_ID".into(), "account-a".into())]);
         codex.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Medium);
         codex.launch_argv = vec![
             "subrouter".into(),
@@ -780,6 +790,8 @@ mod tests {
 
         let mut claude = profile();
         claude.provider.provider = "claude".into();
+        claude.route_environment =
+            BTreeMap::from([("SUBROUTER_CLAUDE_ACCOUNT_ID".into(), "account-a".into())]);
         claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::High);
         claude.launch_argv = vec![
             "subrouter".into(),
@@ -803,15 +815,35 @@ mod tests {
             .validate_native_fresh_agent_grammar()
             .expect("claude grammar");
 
-        let mut unsupported_claude = claude.clone();
-        unsupported_claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Ultra);
-        unsupported_claude.launch_argv[5] = "ultra".into();
-        unsupported_claude.resume_argv[5] = "ultra".into();
-        assert!(
-            unsupported_claude
-                .validate_native_fresh_agent_grammar()
-                .is_err()
-        );
+        let mut future_claude = claude.clone();
+        future_claude.provider.reasoning_effort = Some(ProviderReasoningEffortV1::Ultra);
+        future_claude.launch_argv[5] = "ultra".into();
+        future_claude.resume_argv[5] = "ultra".into();
+        future_claude
+            .validate_native_fresh_agent_grammar()
+            .expect("protected profile owns future provider grammar");
+
+        let mut qwen = codex.clone();
+        qwen.provider.provider = "qwen".into();
+        qwen.provider.reasoning_effort = None;
+        qwen.route_environment =
+            BTreeMap::from([("SUBROUTER_QWEN_ACCOUNT_ID".into(), "account-a".into())]);
+        qwen.launch_argv = vec![
+            "subrouter".into(),
+            "qwen".into(),
+            "--model".into(),
+            "model-x".into(),
+        ];
+        qwen.resume_argv = vec![
+            "subrouter".into(),
+            "qwen".into(),
+            "resume".into(),
+            "--model".into(),
+            "model-x".into(),
+            "session-7".into(),
+        ];
+        qwen.validate_native_fresh_agent_grammar()
+            .expect("registered provider grammar requires no lifecycle branch");
 
         let mut unrecognized_effort = codex.clone();
         unrecognized_effort.launch_argv[5] = "model_reasoning_effort=\"wrong\"".into();
@@ -875,8 +907,14 @@ mod tests {
             .as_object_mut()
             .expect("profile object")
             .remove("continuation_bootstrap");
+        value
+            .as_object_mut()
+            .expect("profile object")
+            .remove("route_environment");
         let mut decoded: LaunchProfileV1 = serde_json::from_value(value).expect("legacy decode");
         validate_launch_profile(&decoded).expect("legacy profile remains valid");
+        assert!(decoded.route_environment.is_empty());
+        assert!(decoded.validate_native_fresh_agent_grammar().is_err());
         assert!(!FreshAgentLaunchProfile::permits_fresh_agent(&decoded));
         decoded.recovery_policy = RecoveryPolicyV1::FreshCheckpointOnly;
         assert!(!FreshAgentLaunchProfile::permits_fresh_agent(&decoded));

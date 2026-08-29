@@ -135,8 +135,36 @@ pub(crate) struct ProviderWrapperRequestV1 {
     pub(crate) provider_id: String,
     pub(crate) adapter_id: String,
     pub(crate) delivery_fence: ProviderDeliveryFenceV1,
+    /// Exact terminal endpoint accepted by the one-shot delivery authority.
+    pub(crate) cmux_endpoint: CmuxEndpointV1,
+    /// Exact private Subrouter route decoded from the protected launch profile.
+    pub(crate) protected_route: ProtectedProviderRouteV1,
     pub(crate) resume_expectation: FreshResumeExpectationV1,
     pub(crate) launch_options: ProviderLaunchOptionsV1,
+}
+
+/// The exact cmux process/socket pair authorized for this delivery.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CmuxEndpointV1 {
+    pub(crate) executable_path: String,
+    pub(crate) socket_path: String,
+}
+
+/// Prompt-free provider route retained only inside protected execution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProtectedProviderRouteV1 {
+    /// Exact Subrouter resume argv. The adapter appends only Shipyard's prompt.
+    pub(crate) argv: Vec<String>,
+    /// Exact private routing headers/environment from the protected profile.
+    pub(crate) environment: BTreeMap<String, String>,
+    /// Selected Subrouter account, retained only inside the protected request.
+    pub(crate) account_id: Option<String>,
+    /// Native provider session that the exact resume argv must select.
+    pub(crate) native_session_id: String,
+    /// Digest of the protected profile from which this route was decoded.
+    pub(crate) profile_digest: String,
 }
 
 /// Narrow user intent that the digest-pinned provider adapter translates into
@@ -452,8 +480,169 @@ pub(crate) fn validate_request(
             "fresh-resume head must be an exact lowercase 40-hex commit",
         ));
     }
+    validate_cmux_endpoint(&request.cmux_endpoint)?;
+    validate_protected_route(request)?;
     validate_launch_options(&request.launch_options)?;
     Ok(())
+}
+
+fn validate_cmux_endpoint(endpoint: &CmuxEndpointV1) -> Result<(), ProviderWrapperRefusal> {
+    for value in [&endpoint.executable_path, &endpoint.socket_path] {
+        validate_value(value)?;
+        let path = Path::new(value);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(refusal(
+                "cmux endpoint must contain normalized absolute paths",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_protected_route(
+    request: &ProviderWrapperRequestV1,
+) -> Result<(), ProviderWrapperRefusal> {
+    const MAX_ROUTE_ITEMS: usize = 64;
+    const MAX_ROUTE_BYTES: usize = 16 * 1024;
+    const MAX_ROUTE_ENVIRONMENT: usize = 16;
+
+    let route = &request.protected_route;
+    validate_digest(&route.profile_digest)?;
+    if route.profile_digest != request.delivery_fence.payload_digest
+        || route.argv.len() < 3
+        || route.argv.len() > MAX_ROUTE_ITEMS
+        || route.argv.iter().map(String::len).sum::<usize>() > MAX_ROUTE_BYTES
+    {
+        return Err(refusal(
+            "protected provider route does not bind the exact profile",
+        ));
+    }
+    for value in &route.argv {
+        validate_value(value)?;
+    }
+    let executable = Path::new(&route.argv[0])
+        .file_name()
+        .and_then(|value| value.to_str());
+    if executable != Some("subrouter") || route.argv[1] != request.provider_id {
+        return Err(refusal(
+            "protected provider route is not the exact Subrouter provider",
+        ));
+    }
+    if route.argv[2..]
+        .iter()
+        .any(|value| value.chars().any(char::is_whitespace))
+    {
+        return Err(refusal("protected provider route must remain prompt-free"));
+    }
+    validate_value(&route.native_session_id)?;
+    if route.argv[2..]
+        .iter()
+        .filter(|value| *value == &route.native_session_id)
+        .count()
+        != 1
+        || request
+            .launch_options
+            .model_id
+            .as_ref()
+            .is_some_and(|model| {
+                route.argv[2..]
+                    .iter()
+                    .filter(|value| *value == model)
+                    .count()
+                    != 1
+            })
+        || request
+            .launch_options
+            .reasoning_effort
+            .is_some_and(|effort| {
+                let effort = provider_reasoning_effort_name(effort);
+                !route.argv[2..]
+                    .iter()
+                    .any(|value| value == effort || value.contains(&format!("=\"{effort}\"")))
+            })
+    {
+        return Err(refusal(
+            "protected provider route does not bind session or provider selection",
+        ));
+    }
+    validate_protected_route_environment(request, MAX_ROUTE_ENVIRONMENT)
+}
+
+fn validate_protected_route_environment(
+    request: &ProviderWrapperRequestV1,
+    max_environment: usize,
+) -> Result<(), ProviderWrapperRefusal> {
+    let route = &request.protected_route;
+    if route.environment.len() > max_environment {
+        return Err(refusal("protected provider route environment is too large"));
+    }
+    for (name, value) in &route.environment {
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || !name.starts_with("SUBROUTER_")
+        {
+            return Err(refusal(
+                "protected provider route environment key is invalid",
+            ));
+        }
+        validate_value(value)?;
+    }
+    let expected_account_key = subrouter_account_environment_key(&request.provider_id);
+    let account_entries = route
+        .environment
+        .iter()
+        .filter(|(name, _)| name.ends_with("_ACCOUNT_ID"))
+        .collect::<Vec<_>>();
+    match route.account_id.as_deref() {
+        Some(account)
+            if account_entries.len() == 1
+                && account_entries[0].0 == &expected_account_key
+                && account_entries[0].1 == account =>
+        {
+            validate_value(account)?;
+        }
+        None if account_entries.is_empty() => {}
+        _ => {
+            return Err(refusal(
+                "protected provider route account selection is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) const fn provider_reasoning_effort_name(
+    value: ProviderReasoningEffortV1,
+) -> &'static str {
+    match value {
+        ProviderReasoningEffortV1::Low => "low",
+        ProviderReasoningEffortV1::Medium => "medium",
+        ProviderReasoningEffortV1::High => "high",
+        ProviderReasoningEffortV1::Xhigh => "xhigh",
+        ProviderReasoningEffortV1::Max => "max",
+        ProviderReasoningEffortV1::Ultra => "ultra",
+    }
+}
+
+pub(crate) fn subrouter_account_environment_key(provider_id: &str) -> String {
+    format!(
+        "SUBROUTER_{}_ACCOUNT_ID",
+        provider_id
+            .chars()
+            .map(|character| if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    )
 }
 
 fn validate_launch_options(
@@ -1027,6 +1216,26 @@ mod tests {
             operation,
             provider_id: "codex".into(),
             adapter_id: "codex-wrapper-v1".into(),
+            cmux_endpoint: CmuxEndpointV1 {
+                executable_path: native_absolute_test_path("cmux"),
+                socket_path: native_absolute_test_path("cmux.sock"),
+            },
+            protected_route: ProtectedProviderRouteV1 {
+                argv: vec![
+                    "/opt/subrouter".into(),
+                    "codex".into(),
+                    "resume".into(),
+                    "--model".into(),
+                    "gpt-5.6-sol".into(),
+                    "-c".into(),
+                    "model_reasoning_effort=\"medium\"".into(),
+                    "session-1".into(),
+                ],
+                environment: BTreeMap::new(),
+                account_id: None,
+                native_session_id: "session-1".into(),
+                profile_digest: fence.payload_digest.clone(),
+            },
             delivery_fence: fence,
             resume_expectation: FreshResumeExpectationV1 {
                 workstream_handle: "GEN-43".into(),

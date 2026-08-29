@@ -5,9 +5,10 @@ use serde::Serialize;
 use super::dispatch::{FreshAgentLaunchProfile, WakeEnvelope, WakeProfileResolver};
 use super::registry::RouteRegistration;
 use super::route::{
-    AdapterAxis, AdapterBindingRecord, AgentRoute, AgentRouteRecord, LaunchProfileRecord,
-    NativeDeliveryAuthorityRecord, NativeSessionRoute, OpaqueRef, ProviderRoute,
-    ProviderRouteRecord, RouteProvenanceRecord, Sha256Digest, TerminalRoute, TerminalRouteRecord,
+    AdapterAxis, AdapterBindingRecord, AgentName, AgentRoute, AgentRouteRecord,
+    LaunchProfileRecord, NativeDeliveryAuthorityRecord, NativeSessionRoute, OpaqueRef,
+    ProviderRoute, ProviderRouteRecord, RouteProvenanceRecord, Sha256Digest, TerminalRoute,
+    TerminalRouteRecord,
 };
 use super::{
     ContinuationSet, ImportCandidate, LifecycleState, OptionalExtension, WorkLedger,
@@ -37,6 +38,7 @@ pub(crate) struct NativePublicationRequest {
     pub(crate) route_model: String,
     pub(crate) route_wrapper: String,
     pub(crate) native_resume_digest: String,
+    pub(crate) route_environment_digest: String,
     pub(crate) route_id: String,
     pub(crate) profile_generation: u64,
     pub(crate) profile_revision: u64,
@@ -590,7 +592,8 @@ fn validate_request(
         || request.profile_generation == 0
         || request.profile_revision == 0
         || request.profile_generation != request.owner_generation
-        || !matches!(request.agent_provider.as_str(), "codex" | "claude")
+        || (!matches!(request.agent_provider.as_str(), "codex" | "claude")
+            && AgentName::parse(request.agent_provider.clone()).is_err())
         || request.profile_provider != policy.provider_wrapper.provider_id
         || request.profile_digest != digest(&request.protected_profile_bytes)
         || request.protected_profile_bytes.is_empty()
@@ -632,6 +635,10 @@ fn validate_request(
     }
     validate_digest("native profile digest", &request.profile_digest)?;
     validate_digest("native resume digest", &request.native_resume_digest)?;
+    validate_digest(
+        "native route environment digest",
+        &request.route_environment_digest,
+    )?;
     validate_digest(
         "native success continuation digest",
         &request.success_continuation_digest,
@@ -693,19 +700,18 @@ fn native_route(
         wrapper_ref: provider_wrapper_ref.clone(),
         session_headers_ref: OpaqueRef::derive(
             "session-headers-and-routing-wrapper",
-            format!(
-                "{}\n{}",
-                request.route_wrapper, request.native_resume_digest
-            )
-            .as_bytes(),
+            request.route_environment_digest.as_bytes(),
         ),
-        session_headers_sha256: Sha256Digest::parse(request.native_resume_digest.clone())
+        session_headers_sha256: Sha256Digest::parse(request.route_environment_digest.clone())
             .map_err(route_error)?,
     };
     let agent_route = match request.agent_provider.as_str() {
         "codex" => AgentRoute::Codex { session },
         "claude" => AgentRoute::Claude { session },
-        _ => unreachable!("validated agent provider"),
+        provider => AgentRoute::Named {
+            name: AgentName::parse(provider.to_owned()).map_err(route_error)?,
+            session,
+        },
     };
     let provenance = RouteProvenanceRecord::new(
         TerminalRouteRecord::new(TerminalRoute::Registered {
@@ -945,6 +951,7 @@ mod tests {
             route_model: "model-a".into(),
             route_wrapper: "subrouter".into(),
             native_resume_digest: digest(b"subrouter resume session-43"),
+            route_environment_digest: digest(b"subrouter route environment"),
             route_id: "route-43".to_owned(),
             profile_generation: 1,
             profile_revision: 1,
@@ -1025,6 +1032,21 @@ mod tests {
                 .native_wake_consumer_owns(&planned.wake_id)
                 .expect("delivered")
         );
+    }
+
+    #[test]
+    fn configured_named_agent_uses_open_registry_without_lifecycle_changes() {
+        let temp = TempDir::new().expect("temp");
+        let mut request = request();
+        request.agent_provider = "qwen".into();
+        let TerminalCapabilityRequest::Cmux { provider_kind, .. } = &mut request.terminal_authority
+        else {
+            unreachable!()
+        };
+        *provider_kind = "qwen".into();
+        let policy = policy(vec![request.repository.clone()]);
+        WorkLedger::plan_or_apply_native_continuation(temp.path(), &request, &policy, true)
+            .expect("named provider publication");
     }
 
     fn planned_with_apply(mut report: NativePublicationReport) -> NativePublicationReport {

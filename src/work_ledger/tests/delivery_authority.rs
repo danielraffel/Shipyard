@@ -66,6 +66,10 @@ fn probe(now: DateTime<Utc>) -> Probe {
                 start_identity: "start-a".to_owned(),
             },
             native_session_id: "codex-session-a".to_owned(),
+            mutation_endpoint: TerminalMutationEndpoint::Cmux {
+                executable_path: "/test/cmux-a".to_owned(),
+                socket_path: "/test/cmux-a.sock".to_owned(),
+            },
             source_work_generation: 6,
             source_owner_generation: 2,
             target_work_generation: 6,

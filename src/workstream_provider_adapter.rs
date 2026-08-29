@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::process::run_output_until;
 use crate::provider_wrapper::{
-    NotAcceptedV1, ProviderAcceptanceV1, ProviderReasoningEffortV1, ProviderWrapperOperationV1,
+    CmuxEndpointV1, NotAcceptedV1, ProviderAcceptanceV1, ProviderWrapperOperationV1,
     ProviderWrapperOutcomeV1, ProviderWrapperRequestV1, ProviderWrapperResponseV1, UnknownV1,
     validate_request,
 };
@@ -37,11 +37,6 @@ use crate::workstream_continuation_config::ProviderWrapperConfig;
 const SCHEMA_VERSION: u32 = 1;
 const ADAPTER_ID: &str = "cmux-workstream-v1";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
-#[cfg(target_os = "macos")]
-const CMUX_APP: &str = "/Applications/cmux.app";
-const CMUX_CLI: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux";
-const CODEX_WRAPPER: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux-codex-wrapper";
-const CLAUDE_WRAPPER: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux-claude-wrapper";
 #[cfg(target_os = "macos")]
 const CODESIGN: &str = "/usr/bin/codesign";
 #[cfg(target_os = "macos")]
@@ -60,7 +55,7 @@ pub fn run_stdio() -> Result<(), String> {
     }
     let request: ProviderWrapperRequestV1 =
         serde_json::from_slice(&bytes).map_err(|_| "request is not strict v1 JSON".to_owned())?;
-    let response = handle_request(&request, &mut ProductionCmuxRunner);
+    let response = handle_request(&request, &mut ProductionCmuxRunner::default());
     let canonical =
         serde_json::to_vec(&response).map_err(|_| "response cannot be serialized".to_owned())?;
     let mut stdout = std::io::stdout().lock();
@@ -142,7 +137,7 @@ struct CommandResult {
 }
 
 trait CmuxRunner {
-    fn verify(&mut self) -> Result<(), RunnerFailure>;
+    fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure>;
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure>;
 }
 
@@ -153,16 +148,25 @@ enum RunnerFailure {
     Untrusted,
 }
 
-struct ProductionCmuxRunner;
+#[derive(Default)]
+struct ProductionCmuxRunner {
+    endpoint: Option<CmuxEndpointV1>,
+}
 
 impl CmuxRunner for ProductionCmuxRunner {
-    fn verify(&mut self) -> Result<(), RunnerFailure> {
-        verify_bundled_cmux()
+    fn bind(&mut self, endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
+        verify_authorized_cmux(endpoint)?;
+        self.endpoint = Some(endpoint.clone());
+        Ok(())
     }
 
     fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure> {
-        let mut command = Command::new(CMUX_CLI);
-        command.args(args).env_clear();
+        let endpoint = self.endpoint.as_ref().ok_or(RunnerFailure::Unavailable)?;
+        let mut command = Command::new(&endpoint.executable_path);
+        command
+            .args(["--socket", &endpoint.socket_path])
+            .args(args)
+            .env_clear();
         let output = run_output_until(
             &mut command,
             Instant::now() + COMMAND_DEADLINE,
@@ -177,37 +181,40 @@ impl CmuxRunner for ProductionCmuxRunner {
 }
 
 #[cfg(target_os = "macos")]
-fn verify_bundled_cmux() -> Result<(), RunnerFailure> {
-    let app = Path::new(CMUX_APP);
-    let cli = Path::new(CMUX_CLI);
-    let app_metadata = fs::metadata(app).map_err(|_| RunnerFailure::Unavailable)?;
+fn verify_authorized_cmux(endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let cli = Path::new(&endpoint.executable_path);
+    let socket = Path::new(&endpoint.socket_path);
     let cli_metadata = fs::metadata(cli).map_err(|_| RunnerFailure::Unavailable)?;
+    let socket_metadata = fs::symlink_metadata(socket).map_err(|_| RunnerFailure::Unavailable)?;
     let effective_uid = nix::unistd::Uid::effective().as_raw();
-    for metadata in [&app_metadata, &cli_metadata] {
-        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o022 != 0 {
-            return Err(RunnerFailure::Untrusted);
-        }
-    }
-    if !cli_metadata.is_file() || cli_metadata.permissions().mode() & 0o111 == 0 {
+    if !cli.is_absolute()
+        || !socket.is_absolute()
+        || !cli_metadata.is_file()
+        || (cli_metadata.uid() != 0 && cli_metadata.uid() != effective_uid)
+        || cli_metadata.permissions().mode() & 0o022 != 0
+        || cli_metadata.permissions().mode() & 0o111 == 0
+        || !socket_metadata.file_type().is_socket()
+        || (socket_metadata.uid() != 0 && socket_metadata.uid() != effective_uid)
+        || socket_metadata.permissions().mode() & 0o022 != 0
+    {
         return Err(RunnerFailure::Untrusted);
     }
-    for path in [app, cli] {
-        let requirement = format!(
-            "=anchor apple generic and certificate leaf[subject.OU] = \"{MANAFLOW_TEAM_ID}\""
-        );
-        let output = Command::new(CODESIGN)
-            .args([
-                OsStr::new("--verify"),
-                OsStr::new("--strict"),
-                OsStr::new("-R"),
-            ])
-            .arg(requirement)
-            .arg(path)
-            .output()
-            .map_err(|_| RunnerFailure::Unavailable)?;
-        if !output.status.success() {
-            return Err(RunnerFailure::Untrusted);
-        }
+    let requirement =
+        format!("=anchor apple generic and certificate leaf[subject.OU] = \"{MANAFLOW_TEAM_ID}\"");
+    let output = Command::new(CODESIGN)
+        .args([
+            OsStr::new("--verify"),
+            OsStr::new("--strict"),
+            OsStr::new("-R"),
+        ])
+        .arg(requirement)
+        .arg(cli)
+        .output()
+        .map_err(|_| RunnerFailure::Unavailable)?;
+    if !output.status.success() {
+        return Err(RunnerFailure::Untrusted);
     }
     // Darwin cannot execute a previously verified descriptor. The remaining
     // path race is inside Shipyard's explicit trusted-same-UID boundary, the
@@ -216,7 +223,7 @@ fn verify_bundled_cmux() -> Result<(), RunnerFailure> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn verify_bundled_cmux() -> Result<(), RunnerFailure> {
+fn verify_authorized_cmux(_endpoint: &CmuxEndpointV1) -> Result<(), RunnerFailure> {
     Err(RunnerFailure::Unavailable)
 }
 
@@ -231,7 +238,7 @@ fn handle_request(
         };
         return response(request, outcome);
     }
-    match runner.verify() {
+    match runner.bind(&request.cmux_endpoint) {
         #[cfg(any(target_os = "macos", test))]
         Err(RunnerFailure::Untrusted) => {
             let outcome = match request.operation {
@@ -324,9 +331,7 @@ fn reconcile_existing_workspace(
 }
 
 fn validate_adapter_request(request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
-    if request.adapter_id != ADAPTER_ID
-        || !matches!(request.provider_id.as_str(), "codex" | "claude")
-    {
+    if request.adapter_id != ADAPTER_ID {
         return Err("unsupported-provider-or-adapter");
     }
     let config = ProviderWrapperConfig {
@@ -339,11 +344,6 @@ fn validate_adapter_request(request: &ProviderWrapperRequestV1) -> Result<(), &'
         max_stderr_bytes: 1,
     };
     validate_request(&config, request).map_err(|_| "invalid-provider-request")?;
-    if request.provider_id == "claude"
-        && request.launch_options.reasoning_effort == Some(ProviderReasoningEffortV1::Ultra)
-    {
-        return Err("claude-ultra-effort-unsupported");
-    }
     Ok(())
 }
 
@@ -441,26 +441,21 @@ fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static
         request.delivery_fence.wake_id,
         request.delivery_fence.wake_id,
     );
-    let wrapper = match request.provider_id.as_str() {
-        "codex" => CODEX_WRAPPER,
-        "claude" => CLAUDE_WRAPPER,
-        _ => return Err("unsupported-provider"),
-    };
-    let mut words = vec![shell_word(wrapper)?];
-    if let Some(model) = &request.launch_options.model_id {
-        words.push("--model".to_owned());
-        words.push(shell_word(model)?);
-    }
-    if let Some(effort) = request.launch_options.reasoning_effort {
-        let effort = effort_name(effort);
-        if request.provider_id == "codex" {
-            words.push("-c".to_owned());
-            words.push(shell_word(&format!("model_reasoning_effort=\"{effort}\""))?);
-        } else {
-            words.push("--effort".to_owned());
-            words.push(effort.to_owned());
+    let mut words = Vec::new();
+    if !request.protected_route.environment.is_empty() {
+        words.push("'/usr/bin/env'".to_owned());
+        for (name, value) in &request.protected_route.environment {
+            words.push(shell_word(&format!("{name}={value}"))?);
         }
     }
+    words.extend(
+        request
+            .protected_route
+            .argv
+            .iter()
+            .map(|value| shell_word(value))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     words.push(shell_word(&prompt)?);
     Ok(words.join(" "))
 }
@@ -474,17 +469,6 @@ fn shell_word(value: &str) -> Result<String, &'static str> {
         return Err("launch-value-is-not-shell-safe");
     }
     Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
-}
-
-const fn effort_name(effort: ProviderReasoningEffortV1) -> &'static str {
-    match effort {
-        ProviderReasoningEffortV1::Low => "low",
-        ProviderReasoningEffortV1::Medium => "medium",
-        ProviderReasoningEffortV1::High => "high",
-        ProviderReasoningEffortV1::Xhigh => "xhigh",
-        ProviderReasoningEffortV1::Max => "max",
-        ProviderReasoningEffortV1::Ultra => "ultra",
-    }
 }
 
 #[derive(Deserialize)]

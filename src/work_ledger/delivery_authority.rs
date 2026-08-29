@@ -53,6 +53,8 @@ pub(crate) struct TerminalAuthorityObservation {
     pub(crate) actual_terminal_instance: String,
     pub(crate) process: ProcessIncarnation,
     pub(crate) native_session_id: String,
+    /// Exact endpoint on which the terminal evidence was observed.
+    pub(crate) mutation_endpoint: TerminalMutationEndpoint,
     pub(crate) source_work_generation: u64,
     pub(crate) source_owner_generation: u64,
     pub(crate) target_work_generation: u64,
@@ -60,6 +62,15 @@ pub(crate) struct TerminalAuthorityObservation {
     /// True only when the verifier observed a source+target generation CAS.
     pub(crate) transactionally_rebound: bool,
     pub(crate) observed_at: DateTime<Utc>,
+}
+
+/// Terminal-neutral mutation endpoint bound into the one-shot witness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalMutationEndpoint {
+    Cmux {
+        executable_path: String,
+        socket_path: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +152,7 @@ pub(crate) struct DeliveryAuthorization {
     terminal_instance: String,
     process: ProcessIncarnation,
     native_session_id: String,
+    mutation_endpoint: TerminalMutationEndpoint,
     source_work_generation: u64,
     source_owner_generation: u64,
     target_work_generation: u64,
@@ -156,6 +168,10 @@ impl DeliveryAuthorization {
         &self.terminal_instance
     }
 
+    pub(crate) fn into_mutation_endpoint(self) -> TerminalMutationEndpoint {
+        self.mutation_endpoint
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(work_generation: u64, owner_generation: u64) -> Self {
         Self {
@@ -167,6 +183,10 @@ impl DeliveryAuthorization {
                 start_identity: "test-start".to_owned(),
             },
             native_session_id: "test-session".to_owned(),
+            mutation_endpoint: TerminalMutationEndpoint::Cmux {
+                executable_path: "/test/cmux-a".to_owned(),
+                socket_path: "/test/cmux-a.sock".to_owned(),
+            },
             source_work_generation: work_generation,
             source_owner_generation: owner_generation,
             target_work_generation: work_generation,
@@ -286,6 +306,7 @@ fn verify_delivery_authority_inner<P: DeliveryAuthorityProbe>(
         terminal_instance: terminal.actual_terminal_instance,
         process: terminal.process,
         native_session_id: terminal.native_session_id,
+        mutation_endpoint: terminal.mutation_endpoint,
         source_work_generation: terminal.source_work_generation,
         source_owner_generation: terminal.source_owner_generation,
         target_work_generation: terminal.target_work_generation,
