@@ -170,6 +170,11 @@ fn handle_incoming_request_inner(
             if transfer.rebind_authority_digest != policy.authority_digest {
                 return Err("custody-transfer-authority-mismatch".to_owned());
             }
+            if transfer.target_route_ref != policy.local_route_ref
+                || transfer.terminal_adapter != policy.local_terminal_adapter
+            {
+                return Err("custody-transfer-endpoint-mismatch".to_owned());
+            }
             let authenticated = authenticate_custody_transfer(&mut authenticator, transfer)
                 .map_err(|_| "custody-transfer-authentication-refused".to_owned())?;
             let receipt = ledger
@@ -192,6 +197,8 @@ fn handle_incoming_request_inner(
             require_local_mutation_authority(policy)?;
             if rebind.new_authority_digest != policy.authority_digest
                 || rebind.successor_proof_digest != peer.successor_proof_digest
+                || rebind.new_target_route_ref != policy.local_route_ref
+                || rebind.terminal_adapter != policy.local_terminal_adapter
             {
                 return Err("custody-successor-authority-mismatch".to_owned());
             }
@@ -357,6 +364,7 @@ impl CustodyCarrier for SshCustodyCarrier {
 
 pub(crate) struct CustodyTransportRuntime {
     policy: Option<CustodyTransportPolicy>,
+    policy_refused: bool,
     state_dir: PathBuf,
     last_error: Option<String>,
     next_run_at: Instant,
@@ -368,6 +376,7 @@ impl CustodyTransportRuntime {
         match load_custody_transport_policy(mode, global_dir) {
             Ok(policy) => Self {
                 policy,
+                policy_refused: false,
                 state_dir,
                 last_error: None,
                 next_run_at: Instant::now(),
@@ -375,6 +384,7 @@ impl CustodyTransportRuntime {
             },
             Err(error) => Self {
                 policy: None,
+                policy_refused: true,
                 state_dir,
                 last_error: Some(error),
                 next_run_at: Instant::now() + Duration::from_secs(30),
@@ -385,6 +395,35 @@ impl CustodyTransportRuntime {
 
     pub(crate) fn diagnostic_error(&self) -> Option<String> {
         self.last_error.clone()
+    }
+
+    /// Synchronously stage local native obligations before the provider lane
+    /// can inspect them. Once cross-machine policy elects another machine,
+    /// this host must never race local delivery against custody transfer.
+    pub(crate) fn prepare_native_obligations(&mut self) {
+        let Some(policy) = self.policy.as_ref() else {
+            return;
+        };
+        if policy.local_machine_ref == policy.mutation_authority_machine_ref {
+            return;
+        }
+        let result = WorkLedger::open_existing(&self.state_dir)
+            .map_err(|_| "custody-ledger-unavailable".to_owned())
+            .and_then(|ledger| {
+                ledger.map_or(Ok(()), |ledger| stage_native_obligations(policy, &ledger))
+            });
+        if let Err(error) = result {
+            self.last_error = Some(error);
+        }
+    }
+
+    /// Enabled custody policy elects exactly one machine for provider-side
+    /// mutation. Omitted/default-off policy preserves the existing local lane.
+    pub(crate) fn permits_local_continuation(&self) -> bool {
+        !self.policy_refused
+            && self.policy.as_ref().is_none_or(|policy| {
+                policy.local_machine_ref == policy.mutation_authority_machine_ref
+            })
     }
 
     pub(crate) fn tick(&mut self) {
@@ -429,6 +468,9 @@ fn reconcile_once<C: CustodyCarrier>(
         return Ok(());
     };
     let mut first_error = None;
+    if let Err(error) = stage_native_obligations(policy, &ledger) {
+        first_error.get_or_insert(error);
+    }
     for rebind in ledger
         .pending_custody_successor_rebinds(MAX_BATCH)
         .map_err(map_ledger)?
@@ -534,6 +576,33 @@ fn reconcile_once<C: CustodyCarrier>(
             first_error.get_or_insert(error);
         }
     }
+    if policy.local_machine_ref == policy.mutation_authority_machine_ref {
+        for message_id in ledger
+            .native_custody_inbox_candidates(MAX_BATCH)
+            .map_err(map_ledger)?
+        {
+            let result = (|| {
+                let claim = ledger
+                    .claim_custody_inbox(
+                        &message_id,
+                        &policy.inbox_owner_ref,
+                        Utc::now() + ChronoDuration::seconds(policy.lease_seconds.cast_signed()),
+                    )
+                    .map_err(map_ledger)?;
+                ledger
+                    .apply_native_custody_obligation(
+                        &claim,
+                        &policy.local_incarnation_ref,
+                        &policy.authority_digest,
+                    )
+                    .map_err(map_ledger)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
     for (receipt, source_machine) in ledger
         .processed_custody_receipts(MAX_BATCH)
         .map_err(map_ledger)?
@@ -559,6 +628,40 @@ fn reconcile_once<C: CustodyCarrier>(
         })();
         if let Err(error) = result {
             first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn stage_native_obligations(
+    policy: &CustodyTransportPolicy,
+    ledger: &WorkLedger,
+) -> Result<(), String> {
+    if policy.local_machine_ref == policy.mutation_authority_machine_ref {
+        return Ok(());
+    }
+    ledger
+        .require_native_custody_cutover_ready()
+        .map_err(map_ledger)?;
+    let target = peer(policy, &policy.mutation_authority_machine_ref)?;
+    let candidates = ledger
+        .native_custody_stage_candidates(
+            &policy.local_machine_ref,
+            &policy.local_incarnation_ref,
+            MAX_BATCH,
+        )
+        .map_err(map_ledger)?;
+    let mut first_error = None;
+    for envelope in candidates {
+        if let Err(error) = ledger.stage_cross_machine_custody(
+            &envelope,
+            &target.machine_ref,
+            &target.incarnation_ref,
+            &target.route_ref,
+            &target.terminal_adapter,
+            &policy.authority_digest,
+        ) {
+            first_error.get_or_insert(map_ledger(error));
         }
     }
     first_error.map_or(Ok(()), Err)

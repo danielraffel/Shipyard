@@ -41,15 +41,21 @@ authority; labels such as hostnames are not trusted as identity.
 enabled = true
 local_machine_ref = "machine_<64 lowercase hex>"
 local_incarnation_ref = "incarnation_<64 lowercase hex>"
+local_route_ref = "route_<64 lowercase hex>"
+local_terminal_adapter = "cmux"
 mutation_authority_machine_ref = "machine_<64 lowercase hex>"
 authority_digest = "<64 lowercase hex>"
 sender_owner_ref = "owner_<64 lowercase hex>"
+inbox_owner_ref = "owner_<64 lowercase hex>"
 lease_seconds = 30
 deadline_seconds = 12
 max_output_bytes = 262144
 
 [[custody_transport.peers]]
 machine_ref = "machine_<64 lowercase hex>"
+incarnation_ref = "incarnation_<64 lowercase hex>"
+route_ref = "route_<64 lowercase hex>"
+terminal_adapter = "cmux"
 ssh_program = "/usr/bin/ssh"
 destination = "custody-peer"
 known_hosts_file = "/owner/private/shipyard/custody/known_hosts"
@@ -97,3 +103,15 @@ Routine reconciliation is a five-second, bounded, no-model daemon task. A
 missing peer, timeout, malformed response, or one repository's bad record is
 reported as a redacted daemon diagnostic and retried after restart or offline
 rejoin; it does not disable ordinary Shipyard stewardship.
+
+Native wakes are staged only on a non-authority host and are fenced out of its
+local provider consumer once staged. The elected authority marks a received
+obligation processed only after its disjoint local WAL contains the exact
+authenticated native publication, wake generations, protected payload digest,
+workstream handle, and revision. Custody never copies credentials or silently
+constructs missing publication authority; an absent or contradictory local
+publication remains received and retryable.
+
+Enablement is an explicit custody cutover. A non-authority host refuses to
+stage while any native wake is already `claimed` or `uncertain`; drain or
+reconcile that original local provider custody before enabling this carrier.

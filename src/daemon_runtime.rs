@@ -445,7 +445,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         if let Ok(mut published) = actionable_producer_status.lock() {
             *published = actionable_producer.status();
         }
-        continuation_runtime.tick();
+        custody_transport_runtime.prepare_native_obligations();
+        if custody_transport_runtime.permits_local_continuation() {
+            continuation_runtime.tick();
+        }
         transition_projection_runtime.tick();
         custody_transport_runtime.tick();
         if let Ok(mut published) = custody_transport_error.lock() {

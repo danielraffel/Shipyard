@@ -26,11 +26,17 @@ fn source_fixture(label: &str) -> Fixture {
     let ledger = WorkLedger::open(temp.path()).expect("ledger");
     ledger.import(&[sample_candidate()]).expect("import work");
     let connection = ledger.connect_read_only().expect("connection");
-    let (work_id, work_generation, owner_generation): (String, i64, i64) = connection
+    let (work_id, work_generation, owner_generation, work_authority_digest): (
+        String,
+        i64,
+        i64,
+        String,
+    ) = connection
         .query_row(
-            "SELECT id, work_generation, owner_generation FROM work_items LIMIT 1",
+            "SELECT id, work_generation, owner_generation, source_digest
+               FROM work_items LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("work identity");
     drop(connection);
@@ -62,6 +68,7 @@ fn source_fixture(label: &str) -> Fixture {
         u64::try_from(work_generation).expect("positive work generation"),
         u64::try_from(owner_generation).expect("positive owner generation"),
         content_digest,
+        work_authority_digest,
         "GEN-14".to_owned(),
         11,
         opaque_ref("machine", "m3"),
@@ -701,6 +708,7 @@ fn target_rebind_is_epoch_fenced_and_post_process_changes_are_new_messages() {
         source.envelope.work_generation,
         source.envelope.owner_generation,
         source.envelope.content_digest.clone(),
+        source.envelope.work_authority_digest.clone(),
         source.envelope.workstream_handle.clone(),
         source.envelope.workstream_revision + 1,
         source.envelope.source_machine_ref.clone(),

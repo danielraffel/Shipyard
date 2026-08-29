@@ -31,4 +31,5 @@ pub(super) fn validate_persisted_custody(connection: &Connection) -> WorkLedgerR
 mod rebind;
 mod receiver;
 use rebind::active_inbox_binding;
+mod native;
 mod sender;

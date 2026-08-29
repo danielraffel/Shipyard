@@ -1375,6 +1375,10 @@ impl WorkLedger {
              JOIN work_items work ON work.id = wake.work_item_id
              WHERE wake.state IN ('claimed', 'pending')
                AND work.phase = 'dispatching'
+               AND NOT EXISTS (
+                   SELECT 1 FROM custody_outbox custody
+                    WHERE custody.wake_id = wake.wake_id
+               )
                AND lower(work.repo) IN ({placeholders})
              ORDER BY CASE wake.state WHEN 'claimed' THEN 0 ELSE 1 END,
                       wake.created_at, wake.wake_id"
@@ -2104,6 +2108,16 @@ fn validate_claim_candidate(
     if !matches!(stored.0.as_str(), "pending" | "claimed") {
         return Err(WorkLedgerError::Refused(
             "wake is no longer dispatchable".to_owned(),
+        ));
+    }
+    let delegated: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM custody_outbox WHERE wake_id = ?1)",
+        [&wake.wake_id],
+        |row| row.get(0),
+    )?;
+    if delegated {
+        return Err(WorkLedgerError::Refused(
+            "wake has been delegated to cross-machine custody".to_owned(),
         ));
     }
     let route_generation = wake.work_generation.checked_sub(1).ok_or_else(|| {

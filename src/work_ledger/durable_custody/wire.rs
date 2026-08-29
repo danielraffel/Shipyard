@@ -32,7 +32,7 @@ use super::{
     validate_opaque_ref, validate_token, validate_transfer,
 };
 
-const CUSTODY_SCHEMA_VERSION: u32 = 1;
+const CUSTODY_SCHEMA_VERSION: u32 = 2;
 pub(super) const MAX_LEASE: ChronoDuration = ChronoDuration::minutes(5);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,6 +83,7 @@ pub(crate) struct CustodyEnvelope {
     pub(crate) work_generation: u64,
     pub(crate) owner_generation: u64,
     pub(crate) content_digest: String,
+    pub(crate) work_authority_digest: String,
     pub(crate) workstream_handle: String,
     pub(crate) workstream_revision: u64,
     pub(crate) source_machine_ref: String,
@@ -415,6 +416,7 @@ pub(super) struct EnvelopeIdentity<'a> {
     work_generation: u64,
     owner_generation: u64,
     content_digest: &'a str,
+    work_authority_digest: &'a str,
     workstream_handle: &'a str,
     workstream_revision: u64,
     source_machine_ref: &'a str,
@@ -430,6 +432,7 @@ impl CustodyEnvelope {
         work_generation: u64,
         owner_generation: u64,
         content_digest: String,
+        work_authority_digest: String,
         workstream_handle: String,
         workstream_revision: u64,
         source_machine_ref: String,
@@ -439,6 +442,7 @@ impl CustodyEnvelope {
         validate_opaque_ref("wake ID", &wake_id, "wake")?;
         validate_opaque_ref("work item ID", &work_item_id, "wi")?;
         validate_digest("custody content", &content_digest)?;
+        validate_digest("custody work authority", &work_authority_digest)?;
         validate_token("workstream handle", &workstream_handle)?;
         validate_opaque_ref("source machine", &source_machine_ref, "machine")?;
         validate_opaque_ref("source incarnation", &source_incarnation_ref, "incarnation")?;
@@ -465,6 +469,7 @@ impl CustodyEnvelope {
             work_generation,
             owner_generation,
             content_digest: &content_digest,
+            work_authority_digest: &work_authority_digest,
             workstream_handle: &workstream_handle,
             workstream_revision,
             source_machine_ref: &source_machine_ref,
@@ -484,6 +489,7 @@ impl CustodyEnvelope {
             work_generation,
             owner_generation,
             content_digest,
+            work_authority_digest,
             workstream_handle,
             workstream_revision,
             source_machine_ref,
@@ -500,6 +506,7 @@ impl CustodyEnvelope {
             self.work_generation,
             self.owner_generation,
             self.content_digest.clone(),
+            self.work_authority_digest.clone(),
             self.workstream_handle.clone(),
             self.workstream_revision,
             self.source_machine_ref.clone(),

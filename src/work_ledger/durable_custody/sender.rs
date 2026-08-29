@@ -163,12 +163,34 @@ impl WorkLedger {
                 "corrections and followups require a processed prior message".to_owned(),
             ));
         }
-        let wake: Option<(String, i64, i64, String)> = tx.query_row(
-            "SELECT work_item_id, work_generation, owner_generation, payload_digest FROM outbox WHERE wake_id = ?1",
-            [&envelope.wake_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ).optional()?;
-        let Some((work_id, work_generation, owner_generation, payload_digest)) = wake else {
+        let wake: Option<(String, i64, i64, String, String, String)> = tx
+            .query_row(
+                "SELECT wake.work_item_id, wake.work_generation, wake.owner_generation,
+                    wake.payload_digest, wake.state, work.source_digest
+               FROM outbox wake JOIN work_items work ON work.id = wake.work_item_id
+              WHERE wake.wake_id = ?1",
+                [&envelope.wake_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            work_id,
+            work_generation,
+            owner_generation,
+            payload_digest,
+            wake_state,
+            work_authority_digest,
+        )) = wake
+        else {
             return Err(WorkLedgerError::Refused(
                 "custody source wake is missing".to_owned(),
             ));
@@ -177,9 +199,15 @@ impl WorkLedger {
             || work_generation != sqlite_i64("work generation", envelope.work_generation)?
             || owner_generation != sqlite_i64("owner generation", envelope.owner_generation)?
             || payload_digest != envelope.content_digest
+            || work_authority_digest != envelope.work_authority_digest
         {
             return Err(WorkLedgerError::Refused(
                 "custody envelope does not match the durable source wake".to_owned(),
+            ));
+        }
+        if envelope.relation.kind == CustodyKind::Wake && wake_state != "pending" {
+            return Err(WorkLedgerError::Refused(
+                "native custody source wake is no longer pending".to_owned(),
             ));
         }
         let now = Utc::now().to_rfc3339();

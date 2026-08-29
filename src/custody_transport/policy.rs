@@ -20,9 +20,12 @@ struct RawPolicy {
     enabled: bool,
     local_machine_ref: Option<String>,
     local_incarnation_ref: Option<String>,
+    local_route_ref: Option<String>,
+    local_terminal_adapter: Option<String>,
     mutation_authority_machine_ref: Option<String>,
     authority_digest: Option<String>,
     sender_owner_ref: Option<String>,
+    inbox_owner_ref: Option<String>,
     lease_seconds: Option<u64>,
     deadline_seconds: Option<u64>,
     max_output_bytes: Option<u64>,
@@ -33,6 +36,9 @@ struct RawPolicy {
 #[serde(deny_unknown_fields)]
 struct RawPeer {
     machine_ref: String,
+    incarnation_ref: String,
+    route_ref: String,
+    terminal_adapter: String,
     ssh_program: String,
     destination: String,
     known_hosts_file: String,
@@ -47,9 +53,12 @@ struct RawPeer {
 pub(crate) struct CustodyTransportPolicy {
     pub(super) local_machine_ref: String,
     pub(super) local_incarnation_ref: String,
+    pub(super) local_route_ref: String,
+    pub(super) local_terminal_adapter: String,
     pub(super) mutation_authority_machine_ref: String,
     pub(super) authority_digest: String,
     pub(super) sender_owner_ref: String,
+    pub(super) inbox_owner_ref: String,
     pub(super) lease_seconds: u64,
     pub(super) deadline_seconds: u64,
     pub(super) max_output_bytes: u64,
@@ -60,6 +69,9 @@ pub(crate) struct CustodyTransportPolicy {
 #[derive(Clone, Debug)]
 pub(super) struct CustodyPeer {
     pub(super) machine_ref: String,
+    pub(super) incarnation_ref: String,
+    pub(super) route_ref: String,
+    pub(super) terminal_adapter: String,
     pub(super) ssh_program: PathBuf,
     pub(super) destination: String,
     pub(super) known_hosts_file: PathBuf,
@@ -68,6 +80,17 @@ pub(super) struct CustodyPeer {
     pub(super) remote_subsystem: String,
     pub(super) ssh_auth_key_sha256: String,
     pub(super) successor_proof_digest: String,
+}
+
+struct LocalCustodyPolicy {
+    machine_ref: String,
+    incarnation_ref: String,
+    route_ref: String,
+    terminal_adapter: String,
+    mutation_authority_machine_ref: String,
+    authority_digest: String,
+    sender_owner_ref: String,
+    inbox_owner_ref: String,
 }
 
 pub(crate) fn load_custody_transport_policy(
@@ -90,19 +113,7 @@ pub(crate) fn load_custody_transport_policy(
     if !raw.enabled {
         return Ok(None);
     }
-    let local_machine_ref = required(raw.local_machine_ref, "local-machine")?;
-    let local_incarnation_ref = required(raw.local_incarnation_ref, "local-incarnation")?;
-    let mutation_authority_machine_ref = required(
-        raw.mutation_authority_machine_ref,
-        "mutation-authority-machine",
-    )?;
-    let authority_digest = required(raw.authority_digest, "authority-digest")?;
-    let sender_owner_ref = required(raw.sender_owner_ref, "sender-owner")?;
-    validate_opaque(&local_machine_ref, "machine")?;
-    validate_opaque(&local_incarnation_ref, "incarnation")?;
-    validate_opaque(&mutation_authority_machine_ref, "machine")?;
-    validate_opaque(&sender_owner_ref, "owner")?;
-    validate_digest(&authority_digest)?;
+    let local = validate_local_policy(&raw)?;
     let lease_seconds = raw.lease_seconds.unwrap_or(30);
     let deadline_seconds = raw.deadline_seconds.unwrap_or(12);
     let max_output_bytes = raw.max_output_bytes.unwrap_or(256 * 1024);
@@ -122,12 +133,18 @@ pub(crate) fn load_custody_transport_policy(
     let mut peer_keys = BTreeSet::new();
     for peer in peers {
         validate_opaque(&peer.machine_ref, "machine")?;
+        validate_opaque(&peer.incarnation_ref, "incarnation")?;
+        validate_opaque(&peer.route_ref, "route")?;
         validate_digest(&peer.ssh_auth_key_sha256)?;
         validate_digest(&peer.successor_proof_digest)?;
         let ssh_program = absolute_path(&peer.ssh_program)?;
         let known_hosts_file = absolute_path(&peer.known_hosts_file)?;
         let identity_file = absolute_path(&peer.identity_file)?;
-        if peer.port == 0 || !safe_token(&peer.destination) || !safe_token(&peer.remote_subsystem) {
+        if peer.port == 0
+            || !safe_token(&peer.destination)
+            || !safe_token(&peer.remote_subsystem)
+            || !safe_token(&peer.terminal_adapter)
+        {
             return Err("custody-policy-peer-route-invalid".to_owned());
         }
         let machine = peer.machine_ref.clone();
@@ -139,6 +156,9 @@ pub(crate) fn load_custody_transport_policy(
                 machine,
                 CustodyPeer {
                     machine_ref: peer.machine_ref,
+                    incarnation_ref: peer.incarnation_ref,
+                    route_ref: peer.route_ref,
+                    terminal_adapter: peer.terminal_adapter,
                     ssh_program,
                     destination: peer.destination,
                     known_hosts_file,
@@ -154,21 +174,51 @@ pub(crate) fn load_custody_transport_policy(
             return Err("custody-policy-peer-duplicate".to_owned());
         }
     }
-    if mutation_authority_machine_ref != local_machine_ref
-        && !canonical.contains_key(&mutation_authority_machine_ref)
+    if local.mutation_authority_machine_ref != local.machine_ref
+        && !canonical.contains_key(&local.mutation_authority_machine_ref)
     {
         return Err("custody-policy-mutation-authority-unknown".to_owned());
     }
     Ok(Some(CustodyTransportPolicy {
-        local_machine_ref,
-        local_incarnation_ref,
-        mutation_authority_machine_ref,
-        authority_digest,
-        sender_owner_ref,
+        local_machine_ref: local.machine_ref,
+        local_incarnation_ref: local.incarnation_ref,
+        local_route_ref: local.route_ref,
+        local_terminal_adapter: local.terminal_adapter,
+        mutation_authority_machine_ref: local.mutation_authority_machine_ref,
+        authority_digest: local.authority_digest,
+        sender_owner_ref: local.sender_owner_ref,
+        inbox_owner_ref: local.inbox_owner_ref,
         lease_seconds,
         deadline_seconds,
         max_output_bytes,
         peers: canonical,
         policy_digest,
     }))
+}
+
+fn validate_local_policy(raw: &RawPolicy) -> Result<LocalCustodyPolicy, String> {
+    let local = LocalCustodyPolicy {
+        machine_ref: required(raw.local_machine_ref.clone(), "local-machine")?,
+        incarnation_ref: required(raw.local_incarnation_ref.clone(), "local-incarnation")?,
+        route_ref: required(raw.local_route_ref.clone(), "local-route")?,
+        terminal_adapter: required(raw.local_terminal_adapter.clone(), "local-terminal-adapter")?,
+        mutation_authority_machine_ref: required(
+            raw.mutation_authority_machine_ref.clone(),
+            "mutation-authority-machine",
+        )?,
+        authority_digest: required(raw.authority_digest.clone(), "authority-digest")?,
+        sender_owner_ref: required(raw.sender_owner_ref.clone(), "sender-owner")?,
+        inbox_owner_ref: required(raw.inbox_owner_ref.clone(), "inbox-owner")?,
+    };
+    validate_opaque(&local.machine_ref, "machine")?;
+    validate_opaque(&local.incarnation_ref, "incarnation")?;
+    validate_opaque(&local.route_ref, "route")?;
+    validate_opaque(&local.mutation_authority_machine_ref, "machine")?;
+    validate_opaque(&local.sender_owner_ref, "owner")?;
+    validate_opaque(&local.inbox_owner_ref, "owner")?;
+    validate_digest(&local.authority_digest)?;
+    if !safe_token(&local.terminal_adapter) {
+        return Err("custody-policy-local-terminal-adapter-invalid".to_owned());
+    }
+    Ok(local)
 }
