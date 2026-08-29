@@ -4,10 +4,7 @@ use crate::app::merge_steward_cmd::launch_profile::{
     RecoveryPolicyV1, SessionProvenanceV1, WorktreeProvenanceV1,
 };
 use crate::provider_wrapper::ProviderReasoningEffortV1;
-use crate::work_ledger::{
-    ExactProtectedProfileResolver, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
-    ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult,
-};
+use crate::work_ledger::WorkLedger;
 use crate::workstream_continuation_config::{ProviderWrapperConfig, WorkstreamContinuationConfig};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -217,68 +214,6 @@ fn continuation_activation() -> ReadyWorkstreamActivation {
     }
 }
 
-struct DeliveredAdapter;
-
-impl ProviderAdapter for DeliveredAdapter {
-    fn capability(&self, provider_id: &str) -> Option<ProviderCapability> {
-        (provider_id == "codex").then(|| ProviderCapability {
-            adapter_id: "cmux-workstream-v1".to_owned(),
-            fresh_agent_launch: true,
-            idempotent_launch: true,
-        })
-    }
-
-    fn authorize(
-        &mut self,
-        fence: &crate::work_ledger::DeliveryFence,
-        _operation: crate::work_ledger::ProviderAuthorizationOperation,
-    ) -> Result<crate::work_ledger::DeliveryAuthorization, ProviderOutcome> {
-        Ok(crate::work_ledger::DeliveryAuthorization::for_test(
-            fence.work_generation,
-            fence.owner_generation,
-        ))
-    }
-
-    fn authorize_reconciliation(
-        &mut self,
-        fence: &crate::work_ledger::DeliveryFence,
-    ) -> Result<crate::work_ledger::ReconciliationAuthorization, ProviderOutcome> {
-        Ok(crate::work_ledger::ReconciliationAuthorization::for_test(
-            crate::work_ledger::reconciliation_fence_digest(fence),
-        ))
-    }
-
-    fn launch(
-        &mut self,
-        _request: ProviderLaunchRequest<'_>,
-        _authority: crate::work_ledger::DeliveryAuthorization,
-    ) -> ProviderOutcome {
-        ProviderOutcome::Delivered {
-            receipt: b"provider accepted continuation".to_vec(),
-        }
-    }
-
-    fn reconcile(
-        &mut self,
-        _fence: &crate::work_ledger::DeliveryFence,
-        _authority: crate::work_ledger::DeliveryAuthorization,
-    ) -> ProviderOutcome {
-        ProviderOutcome::Delivered {
-            receipt: b"provider reconciled continuation".to_vec(),
-        }
-    }
-
-    fn reconcile_read_only(
-        &mut self,
-        _fence: &crate::work_ledger::DeliveryFence,
-        _authority: crate::work_ledger::ReconciliationAuthorization,
-    ) -> ProviderOutcome {
-        ProviderOutcome::Delivered {
-            receipt: b"provider reconciled continuation".to_vec(),
-        }
-    }
-}
-
 fn route(args: &StewardHandoffArgs) -> AgentRouteReference {
     route_at(args, "m3")
 }
@@ -482,7 +417,7 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
 }
 
 #[test]
-fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
+fn managed_handoff_publishes_inert_authority_without_creating_a_wake() {
     let temp = tempfile::tempdir().expect("temp");
     let paths = RuntimePaths::current_with_overrides(
         crate::identity::RuntimeMode::Isolated,
@@ -515,7 +450,7 @@ fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
     let managed = persist_handoff(&path, receipt, HandoffPhase::Managed).expect("managed");
     assert!(!managed.wake_consumer_available);
 
-    let interrupted = publish_managed_handoff_with_consumer(
+    let published = publish_managed_handoff_with_consumer(
         &paths,
         &actions,
         &path,
@@ -524,15 +459,9 @@ fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
         args.pr,
         &args.head,
         &continuation_activation(),
-        |_, _| {
-            Err(CliFailure::new(
-                1,
-                "simulated stop after durable publication",
-            ))
-        },
+        |_, _| panic!("ordinary handoff must not await a wake consumer"),
     )
-    .expect_err("interrupted acceptance remains pending");
-    assert!(interrupted.message.contains("simulated stop"));
+    .expect("inert publication");
     let pending = load_handoff(&path)
         .expect("reload pending receipt")
         .expect("pending receipt");
@@ -548,23 +477,8 @@ fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
 
     assert_pending_publication_fences_owner_replacement(&args, &pending);
 
-    assert_publication_without_consumer_is_not_transfer(&paths, &actions, &args);
-
-    deliver_pending_native_wake(&paths);
-
-    let published = publish_managed_handoff(
-        &paths,
-        &actions,
-        &path,
-        pending,
-        "owner/repo",
-        args.pr,
-        &args.head,
-        &continuation_activation(),
-    )
-    .expect("publication");
-    assert!(published.wake_consumer_available);
-    assert!(published.native_publication.is_some());
+    assert_eq!(published, pending);
+    assert!(!published.wake_consumer_available);
     validate_handoff_receipt_integrity(&published, "owner/repo", args.pr, &args.head)
         .expect("published receipt integrity");
     let first_revision = published.revision;
@@ -587,7 +501,7 @@ fn managed_handoff_atomically_publishes_once_before_reporting_transfer() {
         .status()
         .expect("status");
     assert_eq!(status.pending_wakes, 0);
-    assert_eq!(status.provider_deliveries, 1);
+    assert_eq!(status.provider_deliveries, 0);
 }
 
 fn assert_pending_publication_fences_owner_replacement(
@@ -620,45 +534,6 @@ fn assert_pending_publication_fences_owner_replacement(
     )
     .expect_err("pending publication fences owner replacement");
     assert!(transfer_error.message.contains("cannot be transferred"));
-}
-
-fn assert_publication_without_consumer_is_not_transfer(
-    paths: &RuntimePaths,
-    actions: &GitHubActions,
-    args: &StewardHandoffArgs,
-) {
-    let request = native_publication_request(paths, actions, "owner/repo", args.pr, &args.head)
-        .expect("native request");
-    let report = WorkLedger::plan_or_apply_native_continuation(
-        &paths.state_dir,
-        &request,
-        &continuation_activation().config,
-        true,
-    )
-    .expect("publish pending wake");
-    let unavailable = wait_for_native_consumer_ownership_for(paths, &report, Duration::ZERO)
-        .expect_err("publication without a daemon is not transfer");
-    assert!(unavailable.message.contains("did not accept"));
-}
-
-fn deliver_pending_native_wake(paths: &RuntimePaths) {
-    let ledger = WorkLedger::open_existing(&paths.state_dir)
-        .expect("open ledger")
-        .expect("published ledger");
-    let mut resolver =
-        ExactProtectedProfileResolver::new(&ledger, crate::app::decode_protected_launch_profile);
-    let delivered = ledger
-        .consume_one_wake(
-            WakeConsumerPolicy {
-                activation_enabled: true,
-                dispatch_enabled: true,
-                authorized_repositories: vec!["owner/repo".to_owned()],
-            },
-            &mut resolver,
-            &mut DeliveredAdapter,
-        )
-        .expect("consumer delivery");
-    assert_eq!(delivered, WakeDeliveryResult::Delivered);
 }
 
 #[test]

@@ -1374,6 +1374,7 @@ impl WorkLedger {
              FROM outbox wake
              JOIN work_items work ON work.id = wake.work_item_id
              WHERE wake.state IN ('claimed', 'pending')
+               AND work.phase = 'dispatching'
                AND lower(work.repo) IN ({placeholders})
              ORDER BY CASE wake.state WHEN 'claimed' THEN 0 ELSE 1 END,
                       wake.created_at, wake.wake_id"

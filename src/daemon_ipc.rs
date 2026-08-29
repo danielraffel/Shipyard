@@ -18,6 +18,8 @@ use std::thread;
 #[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
+use crate::actionable_wake_producer::ActionableWakeProducerStatus;
 use crate::workstream_continuation_runtime::ContinuationRuntimeStatus;
 use serde_json::Value;
 #[cfg(unix)]
@@ -104,6 +106,9 @@ pub struct IpcState {
     pub rate_limit: Option<Value>,
     /// Redacted durable-continuation lane state.
     pub workstream_continuation: ContinuationRuntimeStatus,
+    /// Redacted durable status of the exact-head actionable wake producer.
+    #[cfg(unix)]
+    pub(crate) actionable_wake_producer: ActionableWakeProducerStatus,
     /// Last recoverable daemon warning/error, if any. Doubles as the
     /// menu-bar app's pause-reason channel: an auth-degraded pause is encoded
     /// here via [`github_auth_degraded_message`].
@@ -442,6 +447,7 @@ fn status_frame(state: &IpcState) -> Value {
         "configured_repos": state.configured_repos,
         "rate_limit": state.rate_limit,
         "workstream_continuation": state.workstream_continuation,
+        "actionable_wake_producer": state.actionable_wake_producer,
         "last_error": state.last_error,
         "shipyard_version": env!("CARGO_PKG_VERSION"),
         "protocol": IPC_PROTOCOL_VERSION,
@@ -609,6 +615,8 @@ mod tests {
             rate_limit: None,
             workstream_continuation:
                 crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
+            actionable_wake_producer:
+                crate::actionable_wake_producer::ActionableWakeProducerStatus::default(),
             last_error: None,
         }
     }

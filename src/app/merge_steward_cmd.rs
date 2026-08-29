@@ -187,6 +187,54 @@ enum TerminalHandoffPhase {
     Resolved,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactStewardTransition {
+    None,
+    Actionable,
+    Terminal,
+}
+
+/// Read the merge steward's authenticated, exact-head transition ledger. An
+/// aggregate check-rollup failure is never itself agent-launch authority; only
+/// the steward path that evaluated required-check policy may record this fact.
+pub(crate) fn exact_steward_transition(
+    state_dir: &Path,
+    repo: &str,
+    pr: u64,
+    head_sha: &str,
+) -> Result<ExactStewardTransition, String> {
+    let path = state_dir.join("merge-steward.json");
+    let Some(ledger) = ledger::load_existing_ledger(&path).map_err(|error| error.message)? else {
+        return Ok(ExactStewardTransition::None);
+    };
+    let exact = ledger.terminal_handoffs.values().filter(|handoff| {
+        handoff.repo.eq_ignore_ascii_case(repo)
+            && handoff.pr_number == pr
+            && handoff.head_sha.eq_ignore_ascii_case(head_sha)
+    });
+    let mut saw_exact = false;
+    let mut all_resolved = true;
+    for handoff in exact {
+        saw_exact = true;
+        if handoff.outcome == TerminalHandoffOutcome::ActionableFailure
+            && handoff.phase == TerminalHandoffPhase::Recorded
+            && handoff.trigger == "actionable_terminal_failure"
+            && handoff.next_action == "wake_exact_owner_for_causal_repair"
+        {
+            return Ok(ExactStewardTransition::Actionable);
+        }
+        all_resolved &= matches!(
+            handoff.phase,
+            TerminalHandoffPhase::Applied | TerminalHandoffPhase::Resolved
+        );
+    }
+    Ok(if saw_exact && all_resolved {
+        ExactStewardTransition::Terminal
+    } else {
+        ExactStewardTransition::None
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum TerminalProvenanceKind {

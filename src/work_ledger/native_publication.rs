@@ -1,4 +1,9 @@
-//! Idempotent native publication of one exact fresh-agent continuation wake.
+//! Idempotent native publication of one exact continuation authority.
+//!
+//! Publication is deliberately inert: it records identity, checkpoint,
+//! route, profile, and continuation contracts, but it never creates a wake.
+//! The daemon's exact-head actionable producer is the sole bridge from a
+//! managed record to `dispatching` plus one transactional outbox row.
 
 use serde::Serialize;
 
@@ -107,6 +112,7 @@ impl WorkLedger {
     /// after the daemon has completed a fenced provider delivery. Merely
     /// claiming, retrying, or becoming uncertain is not enough to let the
     /// originating agent relinquish the final monitoring obligation.
+    #[cfg(test)]
     pub(crate) fn native_wake_consumer_owns(&self, wake_id: &str) -> WorkLedgerResult<bool> {
         let connection = self.connect_read_only()?;
         let observed: Option<(String, bool)> = connection
@@ -171,7 +177,7 @@ impl WorkLedger {
 
         self.ensure_native_work_item(request, &identities)?;
         self.ensure_continuations(request, &identities.work_id)?;
-        self.advance_to_actionable(&identities.work_id, request.owner_generation)?;
+        self.advance_to_managed(&identities.work_id, request.owner_generation)?;
 
         let (route, adapters) = native_route(request, policy, &identities)?;
         for adapter in &adapters {
@@ -186,28 +192,6 @@ impl WorkLedger {
             &request.protected_profile_bytes,
         )?;
 
-        let (phase, generation) = self.native_phase(&identities.work_id)?;
-        if phase == LifecycleState::Actionable.as_str() {
-            let wake = super::WakeIntent::new(
-                &identities.work_id,
-                generation + 1,
-                request.owner_generation,
-                identities.route_ref.clone(),
-                request.profile_digest.clone(),
-            )?;
-            if wake.wake_id != identities.wake_id {
-                return Err(WorkLedgerError::Refused(
-                    "native publication wake identity drifted".to_owned(),
-                ));
-            }
-            self.transition_with_wake(
-                &identities.work_id,
-                generation,
-                request.owner_generation,
-                LifecycleState::Dispatching,
-                Some(&wake),
-            )?;
-        }
         if !self.publication_is_exact(request, &identities)? {
             return Err(WorkLedgerError::Refused(
                 "native publication was not exact after apply".to_owned(),
@@ -325,15 +309,15 @@ impl WorkLedger {
         Ok(())
     }
 
-    fn advance_to_actionable(&self, work_id: &str, owner_generation: u64) -> WorkLedgerResult<()> {
+    fn advance_to_managed(&self, work_id: &str, owner_generation: u64) -> WorkLedgerResult<()> {
         loop {
             let (phase, generation) = self.native_phase(work_id)?;
             let next = match phase.as_str() {
                 "shadow_imported" => LifecycleState::Published,
                 "published" => LifecycleState::Ready,
                 "ready" => LifecycleState::Managed,
-                "managed" => LifecycleState::Actionable,
-                "actionable" | "dispatching" | "agent_owned_repair" | "returned" | "terminal" => {
+                "managed" | "waiting" | "actionable" | "dispatching" | "agent_owned_repair"
+                | "returned" | "terminal" => {
                     return Ok(());
                 }
                 _ => {
@@ -409,7 +393,7 @@ impl WorkLedger {
             )
             .optional()?;
         match existing {
-            None => self.register_route(route),
+            None => self.register_staged_route(route),
             Some(integrity) if integrity == route.envelope_integrity => Ok(()),
             Some(_) => Err(WorkLedgerError::Refused(
                 "native publication route identity collides".to_owned(),
@@ -463,32 +447,52 @@ impl WorkLedger {
         }
         if !matches!(
             phase.as_str(),
-            "dispatching" | "agent_owned_repair" | "returned" | "terminal"
+            "managed"
+                | "waiting"
+                | "actionable"
+                | "dispatching"
+                | "agent_owned_repair"
+                | "returned"
+                | "terminal"
         ) {
             return Ok(false);
         }
-        let exact_wake: Option<bool> = connection
+        let exact_route: Option<bool> = connection
             .query_row(
-                "SELECT work_item_id = ?2 AND route_ref = ?3 AND payload_digest = ?4
-                 FROM outbox WHERE wake_id = ?1",
+                "SELECT work_item_id = ?2 AND head_sha = ?3 AND owner_generation = ?4
+                 FROM route_records WHERE route_ref = ?1",
                 params![
-                    identities.wake_id,
-                    identities.work_id,
                     identities.route_ref,
-                    request.profile_digest,
+                    identities.work_id,
+                    request.head_sha,
+                    request.owner_generation,
                 ],
                 |row| row.get(0),
             )
             .optional()?;
-        if exact_wake == Some(true) {
-            Ok(true)
-        } else if exact_wake.is_none() {
-            Ok(false)
-        } else {
-            Err(WorkLedgerError::Refused(
-                "native publication wake identity collides".to_owned(),
-            ))
+        if exact_route != Some(true) {
+            return if exact_route.is_none() {
+                Ok(false)
+            } else {
+                Err(WorkLedgerError::Refused(
+                    "native publication route identity collides".to_owned(),
+                ))
+            };
         }
+        let exact_profile: bool = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM protected_objects
+                WHERE work_item_id = ?1 AND kind = 'launch_profile'
+                  AND profile_ref = ?2 AND content_digest = ?3
+             )",
+            params![
+                identities.work_id,
+                identities.profile_ref,
+                request.profile_digest
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(exact_profile)
     }
 }
 
@@ -786,9 +790,10 @@ fn route_error(error: impl std::fmt::Display) -> WorkLedgerError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::work_ledger::{
-        DeliveryAuthorization, ProviderAuthorizationOperation, ReconciliationAuthorization,
+        DeliveryAuthorization, NativeStewardDisposition, ProviderAuthorizationOperation,
+        ReconciliationAuthorization,
     };
     use std::path::PathBuf;
 
@@ -921,7 +926,7 @@ mod tests {
         }
     }
 
-    fn policy(repositories: Vec<String>) -> WorkstreamContinuationConfig {
+    pub(crate) fn policy(repositories: Vec<String>) -> WorkstreamContinuationConfig {
         WorkstreamContinuationConfig {
             origin_machine: "m5".to_owned(),
             repositories,
@@ -937,7 +942,7 @@ mod tests {
         }
     }
 
-    fn request() -> NativePublicationRequest {
+    pub(crate) fn request() -> NativePublicationRequest {
         let protected_profile_bytes =
             b"shipyard-launch-profile-v1\0{\"schema_version\":1}".to_vec();
         NativePublicationRequest {
@@ -1015,18 +1020,25 @@ mod tests {
         let ledger = WorkLedger::open_existing(temp.path())
             .expect("open")
             .expect("ledger");
-        let state: (String, String) = ledger
+        let state: (String, u64) = ledger
             .connect_read_only()
             .expect("connection")
             .query_row(
-                "SELECT work.phase, wake.state FROM work_items work
-                 JOIN outbox wake ON wake.work_item_id = work.id
-                 WHERE work.id = ?1",
+                "SELECT work.phase, (SELECT COUNT(*) FROM outbox)
+                   FROM work_items work WHERE work.id = ?1",
                 [&planned.work_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("native state");
-        assert_eq!(state, ("dispatching".to_owned(), "pending".to_owned()));
+        assert_eq!(state, ("managed".to_owned(), 0));
+        ledger
+            .apply_native_steward_disposition(
+                &request.repository,
+                request.pull_request,
+                &request.head_sha,
+                NativeStewardDisposition::Actionable,
+            )
+            .expect("exact actionable observation");
         assert!(
             !ledger
                 .native_wake_consumer_owns(&planned.wake_id)

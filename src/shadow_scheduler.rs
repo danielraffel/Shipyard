@@ -233,6 +233,7 @@ pub struct ShadowDaemonLane {
     budget_path: PathBuf,
     budget_entries: Vec<ShadowBudgetEntry>,
     reserved_requests: Option<usize>,
+    completed_observations: Vec<ShadowObservation>,
 }
 
 impl ShadowDaemonLane {
@@ -276,7 +277,16 @@ impl ShadowDaemonLane {
             budget_path,
             budget_entries,
             reserved_requests: None,
+            completed_observations: Vec::new(),
         }
+    }
+
+    /// Drain every successful exact observation, including first baselines and
+    /// unchanged catch-up snapshots. Active consumers must not depend on the
+    /// transition-only event stream, because a daemon restart intentionally
+    /// forgets its in-memory transition baseline.
+    pub(crate) fn take_completed_observations(&mut self) -> Vec<ShadowObservation> {
+        std::mem::take(&mut self.completed_observations)
     }
 
     /// Coalesce a relevant webhook independently of daemon IPC subscribers.
@@ -362,6 +372,8 @@ impl ShadowDaemonLane {
         report: &ShadowObservationReport,
         now: Instant,
     ) -> Vec<ShadowTransitionEvidence> {
+        self.completed_observations
+            .extend(report.observations.iter().cloned());
         let had_reservation = self.reserved_requests.take().is_some();
         if had_reservation {
             self.budget_entries.pop();
@@ -1713,5 +1725,29 @@ mod tests {
                 .sum::<usize>(),
             3
         );
+    }
+
+    #[test]
+    fn daemon_lane_exposes_baseline_and_unchanged_observations_to_active_consumers() {
+        let state = tempfile::tempdir().expect("state");
+        let now = Instant::now();
+        let mut lane = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            now,
+        );
+        let expected = target("generous-corp/shipyard", 43, 'a');
+        let report = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| Ok((expected.head_sha.clone(), Vec::new())),
+        );
+
+        assert!(lane.finish_report(&report, now).is_empty());
+        assert_eq!(lane.take_completed_observations(), report.observations);
+        assert!(lane.finish_report(&report, now).is_empty());
+        assert_eq!(lane.take_completed_observations(), report.observations);
     }
 }

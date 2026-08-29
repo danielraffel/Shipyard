@@ -169,6 +169,9 @@ pub(crate) struct ProviderWrapperRequestV1 {
     pub(crate) delivery_fence: ProviderDeliveryFenceV1,
     /// Exact terminal endpoint accepted by the one-shot delivery authority.
     pub(crate) cmux_endpoint: CmuxEndpointV1,
+    /// Whether this operation targets the proven live original session or a
+    /// separately-authorized checkpoint-only replacement.
+    pub(crate) delivery_target: ProviderDeliveryTargetV1,
     /// Exact private Subrouter route decoded from the protected launch profile.
     pub(crate) protected_route: ProtectedProviderRouteV1,
     pub(crate) resume_expectation: FreshResumeExpectationV1,
@@ -189,6 +192,8 @@ pub(crate) struct CmuxEndpointV1 {
 pub(crate) struct ProtectedProviderRouteV1 {
     /// Exact Subrouter resume argv. The adapter appends only Shipyard's prompt.
     pub(crate) argv: Vec<String>,
+    /// Exact no-session Subrouter argv used only for fresh checkpoint launch.
+    pub(crate) fresh_argv: Vec<String>,
     /// Digest of the exact Subrouter executable accepted by the profile.
     pub(crate) executable_sha256: String,
     /// Exact private routing headers/environment from the protected profile.
@@ -199,6 +204,14 @@ pub(crate) struct ProtectedProviderRouteV1 {
     pub(crate) native_session_id: String,
     /// Digest of the protected profile from which this route was decoded.
     pub(crate) profile_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ProviderDeliveryTargetV1 {
+    OriginalSession { surface_id: String },
+    FreshCheckpoint,
+    ReconcileOnly,
 }
 
 /// Narrow user intent that the digest-pinned provider adapter translates into
@@ -513,6 +526,9 @@ pub(crate) fn validate_request(
         ));
     }
     validate_cmux_endpoint(&request.cmux_endpoint)?;
+    if let ProviderDeliveryTargetV1::OriginalSession { surface_id } = &request.delivery_target {
+        validate_token(surface_id)?;
+    }
     validate_protected_route(request)?;
     validate_launch_options(&request.launch_options)?;
     Ok(())
@@ -548,13 +564,19 @@ fn validate_protected_route(
     if route.profile_digest != request.delivery_fence.payload_digest
         || route.argv.len() < 3
         || route.argv.len() > MAX_ROUTE_ITEMS
+        || route.fresh_argv.len() < 2
+        || route.fresh_argv.len() > MAX_ROUTE_ITEMS
         || route.argv.iter().map(String::len).sum::<usize>() > MAX_ROUTE_BYTES
+        || route.fresh_argv.iter().map(String::len).sum::<usize>() > MAX_ROUTE_BYTES
     {
         return Err(refusal(
             "protected provider route does not bind the exact profile",
         ));
     }
     for value in &route.argv {
+        validate_value(value)?;
+    }
+    for value in &route.fresh_argv {
         validate_value(value)?;
     }
     let executable_path = Path::new(&route.argv[0]);
@@ -566,6 +588,11 @@ fn validate_protected_route(
     {
         return Err(refusal(
             "protected provider route is not the exact Subrouter provider",
+        ));
+    }
+    if route.fresh_argv[0] != route.argv[0] || route.fresh_argv[1] != request.provider_id {
+        return Err(refusal(
+            "protected fresh provider route is not the exact Subrouter provider",
         ));
     }
     if route.argv[2..]
@@ -586,6 +613,19 @@ fn validate_protected_route(
     ) {
         return Err(refusal(
             "protected provider route does not bind session or provider selection",
+        ));
+    }
+    if !exact_provider_route(
+        &route.fresh_argv[2..],
+        request.launch_options.model_id.as_deref(),
+        request
+            .launch_options
+            .reasoning_effort
+            .map(provider_reasoning_effort_name),
+        None,
+    ) {
+        return Err(refusal(
+            "protected fresh provider route must use real no-session launch grammar",
         ));
     }
     validate_protected_route_environment(request, MAX_ROUTE_ENVIRONMENT)
@@ -1321,6 +1361,7 @@ mod tests {
         ProviderWrapperRequestV1 {
             schema_version: 1,
             operation,
+            delivery_target: ProviderDeliveryTargetV1::FreshCheckpoint,
             provider_id: "codex".into(),
             adapter_id: "codex-wrapper-v1".into(),
             cmux_endpoint: CmuxEndpointV1 {
@@ -1337,6 +1378,14 @@ mod tests {
                     "-c".into(),
                     "model_reasoning_effort=\"medium\"".into(),
                     "session-1".into(),
+                ],
+                fresh_argv: vec![
+                    "/opt/subrouter".into(),
+                    "codex".into(),
+                    "--model".into(),
+                    "gpt-5.6-sol".into(),
+                    "-c".into(),
+                    "model_reasoning_effort=\"medium\"".into(),
                 ],
                 executable_sha256: "9".repeat(64),
                 environment: BTreeMap::new(),

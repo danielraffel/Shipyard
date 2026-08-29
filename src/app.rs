@@ -36,7 +36,10 @@ mod init_cmd;
 mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
-pub(crate) use merge_steward_cmd::{LaunchProfileV1, decode_protected_launch_profile};
+pub(crate) use merge_steward_cmd::{
+    ExactStewardTransition, LaunchProfileV1, decode_protected_launch_profile,
+    exact_steward_transition,
+};
 mod metrics_cmd;
 mod parallel_proof_canary_cmd;
 mod paths_cmd;

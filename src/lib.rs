@@ -2,6 +2,8 @@
 
 //! Core library for Shipyard.
 
+#[cfg(unix)]
+mod actionable_wake_producer;
 /// CLI entrypoint and command dispatch.
 pub mod app;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.

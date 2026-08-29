@@ -136,14 +136,22 @@ struct GitHubReceiptPayload<'a> {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DeliveryAuthorization {
     github_receipt_digest: String,
-    terminal_instance: String,
-    process: ProcessIncarnation,
-    native_session_id: String,
+    target: DeliveryAuthorizationTarget,
     mutation_endpoint: TerminalMutationEndpoint,
     source_work_generation: u64,
     source_owner_generation: u64,
     target_work_generation: u64,
     target_owner_generation: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DeliveryAuthorizationTarget {
+    OriginalSession {
+        terminal_instance: String,
+        process: ProcessIncarnation,
+        native_session_id: String,
+    },
+    FreshCheckpoint,
 }
 
 /// Non-cloneable, read-only authority for inspecting one original provider
@@ -188,7 +196,16 @@ impl DeliveryAuthorization {
     }
 
     pub(crate) fn terminal_instance(&self) -> &str {
-        &self.terminal_instance
+        match &self.target {
+            DeliveryAuthorizationTarget::OriginalSession {
+                terminal_instance, ..
+            } => terminal_instance,
+            DeliveryAuthorizationTarget::FreshCheckpoint => "",
+        }
+    }
+
+    pub(crate) fn is_fresh_checkpoint(&self) -> bool {
+        matches!(self.target, DeliveryAuthorizationTarget::FreshCheckpoint)
     }
 
     pub(crate) fn into_mutation_endpoint_for(
@@ -210,13 +227,15 @@ impl DeliveryAuthorization {
     pub(crate) fn for_test(work_generation: u64, owner_generation: u64) -> Self {
         Self {
             github_receipt_digest: "0".repeat(64),
-            terminal_instance: "test:terminal".to_owned(),
-            process: ProcessIncarnation {
-                boot_id: "test-boot".to_owned(),
-                pid: 1,
-                start_identity: "test-start".to_owned(),
+            target: DeliveryAuthorizationTarget::OriginalSession {
+                terminal_instance: "test:terminal".to_owned(),
+                process: ProcessIncarnation {
+                    boot_id: "test-boot".to_owned(),
+                    pid: 1,
+                    start_identity: "test-start".to_owned(),
+                },
+                native_session_id: "test-session".to_owned(),
             },
-            native_session_id: "test-session".to_owned(),
             mutation_endpoint: TerminalMutationEndpoint::Cmux {
                 executable_path: "/test/cmux-a".to_owned(),
                 socket_path: "/test/cmux-a.sock".to_owned(),
@@ -247,13 +266,7 @@ pub(crate) fn verify_reconciliation_authority<P: DeliveryAuthorityProbe>(
     fence_digest: String,
 ) -> Result<ReconciliationAuthorization, DeliveryAuthorityRefusal> {
     let github_receipt_digest = verify_github_authority(probe, expected, None)?;
-    if fence_digest.len() != 64
-        || !fence_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(DeliveryAuthorityRefusal::TerminalAuthorityUnavailable);
-    }
+    validate_fence_digest(&fence_digest)?;
     Ok(ReconciliationAuthorization {
         github_receipt_digest,
         terminal_endpoint,
@@ -282,15 +295,76 @@ fn verify_delivery_authority_inner<P: DeliveryAuthorityProbe>(
 
     Ok(DeliveryAuthorization {
         github_receipt_digest,
-        terminal_instance: terminal.actual_terminal_instance,
-        process: terminal.process,
-        native_session_id: terminal.native_session_id,
+        target: DeliveryAuthorizationTarget::OriginalSession {
+            terminal_instance: terminal.actual_terminal_instance,
+            process: terminal.process,
+            native_session_id: terminal.native_session_id,
+        },
         mutation_endpoint: terminal.mutation_endpoint,
         source_work_generation: expected.source_work_generation,
         source_owner_generation: expected.source_owner_generation,
         target_work_generation: expected.target_work_generation,
         target_owner_generation: expected.target_owner_generation,
     })
+}
+
+/// Verify one exact delivery boundary and choose the only legal target. A live
+/// original receives an in-place wake. A fresh checkpoint owner is authorized
+/// only when the same one-shot terminal probe definitively proves that the
+/// original process is absent or has a different incarnation.
+pub(crate) fn verify_delivery_or_fresh_authority<P: DeliveryAuthorityProbe>(
+    probe: &mut P,
+    expected: &DeliveryAuthorityExpectation,
+    terminal_endpoint: TerminalMutationEndpoint,
+    fence_digest: &str,
+) -> Result<DeliveryAuthorization, DeliveryAuthorityRefusal> {
+    let github_receipt_digest = verify_github_authority(probe, expected, None)?;
+    match probe.verify_terminal_once(expected) {
+        Ok(terminal) => {
+            verify_terminal_authority(expected, &terminal, None)?;
+            Ok(DeliveryAuthorization {
+                github_receipt_digest,
+                target: DeliveryAuthorizationTarget::OriginalSession {
+                    terminal_instance: terminal.actual_terminal_instance,
+                    process: terminal.process,
+                    native_session_id: terminal.native_session_id,
+                },
+                mutation_endpoint: terminal.mutation_endpoint,
+                source_work_generation: expected.source_work_generation,
+                source_owner_generation: expected.source_owner_generation,
+                target_work_generation: expected.target_work_generation,
+                target_owner_generation: expected.target_owner_generation,
+            })
+        }
+        Err(
+            DeliveryAuthorityRefusal::NoTerminalMatch
+            | DeliveryAuthorityRefusal::ProcessIncarnationMismatch,
+        ) => {
+            validate_fence_digest(fence_digest)?;
+            Ok(DeliveryAuthorization {
+                github_receipt_digest,
+                target: DeliveryAuthorizationTarget::FreshCheckpoint,
+                mutation_endpoint: terminal_endpoint,
+                source_work_generation: expected.source_work_generation,
+                source_owner_generation: expected.source_owner_generation,
+                target_work_generation: expected.target_work_generation,
+                target_owner_generation: expected.target_owner_generation,
+            })
+        }
+        Err(refusal) => Err(refusal),
+    }
+}
+
+fn validate_fence_digest(fence_digest: &str) -> Result<(), DeliveryAuthorityRefusal> {
+    if fence_digest.len() == 64
+        && fence_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(DeliveryAuthorityRefusal::TerminalAuthorityUnavailable)
+    }
 }
 
 fn verify_github_authority<P: DeliveryAuthorityProbe>(

@@ -1433,6 +1433,98 @@ fn restart_reconciles_idempotent_claim_without_duplicate_launch() {
 }
 
 #[test]
+fn terminal_stewardship_cancels_prepared_work_before_provider_submit() {
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut interrupted = Adapter::successful(true);
+    interrupted.panic_during_submit_authorization = true;
+    let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ledger.consume_one_wake(active_policy(), &mut resolver, &mut interrupted);
+    }));
+    assert!(death.is_err());
+    assert_eq!(outbox_state(&ledger, &wake_id), "claimed");
+
+    assert!(
+        ledger
+            .transition_with_wake(&work_id, 6, 3, LifecycleState::Terminal, None)
+            .expect("terminal suppression")
+    );
+    assert_eq!(outbox_state(&ledger, &wake_id), "failed");
+    let states: (String, String, String) = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT attempt.state, delivery.state, activation.state
+               FROM wake_attempts attempt
+               JOIN provider_deliveries delivery
+                 ON delivery.wake_id = attempt.wake_id AND delivery.attempt = attempt.attempt
+               JOIN activation_epochs activation
+                 ON activation.activation_id = delivery.activation_id
+              WHERE attempt.wake_id = ?1",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("suppressed provider state");
+    assert_eq!(
+        states,
+        (
+            "failed".to_owned(),
+            "failed".to_owned(),
+            "released".to_owned()
+        )
+    );
+    assert_eq!(interrupted.launch_count, 0);
+}
+
+#[test]
+fn terminal_stewardship_defers_launched_claim_for_reconciliation_only() {
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let mut first_resolver = Resolver {
+        profile: profile.clone(),
+        calls: 0,
+    };
+    let mut interrupted = Adapter::successful(true);
+    interrupted.panic_after_claim = true;
+    let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ledger.consume_one_wake(active_policy(), &mut first_resolver, &mut interrupted);
+    }));
+    assert!(death.is_err());
+    assert_eq!(outbox_state(&ledger, &wake_id), "claimed");
+
+    assert!(
+        !ledger
+            .transition_with_wake(&work_id, 6, 3, LifecycleState::Terminal, None)
+            .expect("defer terminal while provider outcome is unknown")
+    );
+    let phase: String = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT phase FROM work_items WHERE id = ?1",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("phase");
+    assert_eq!(phase, "dispatching");
+
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut restarted = Adapter::successful(true);
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut restarted)
+            .expect("reconcile launched claim"),
+        WakeDeliveryResult::Delivered
+    );
+    assert_eq!(restarted.launch_count, 0);
+    assert_eq!(restarted.reconcile_fences.len(), 1);
+    assert!(
+        ledger
+            .transition_with_wake(&work_id, 6, 3, LifecycleState::Terminal, None)
+            .expect("terminal after reconciliation")
+    );
+}
+
+#[test]
 fn claimed_without_request_is_restart_completed_and_submitted_without_reconcile() {
     let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
     let profile_ref = profile.route_profile_ref().expect("profile ref");

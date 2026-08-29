@@ -26,9 +26,9 @@ use sha2::{Digest, Sha256};
 
 use crate::process::run_output_until;
 use crate::provider_wrapper::{
-    CmuxEndpointV1, NotAcceptedV1, ProviderAcceptanceV1, ProviderWrapperOperationV1,
-    ProviderWrapperOutcomeV1, ProviderWrapperRequestV1, ProviderWrapperResponseV1, UnknownV1,
-    validate_request,
+    CmuxEndpointV1, NotAcceptedV1, ProviderAcceptanceV1, ProviderDeliveryTargetV1,
+    ProviderWrapperOperationV1, ProviderWrapperOutcomeV1, ProviderWrapperRequestV1,
+    ProviderWrapperResponseV1, UnknownV1, validate_request,
 };
 use crate::workstream_continuation_config::ProviderWrapperConfig;
 
@@ -276,6 +276,12 @@ fn handle_request(
         }
         Ok(()) => {}
     }
+    if let ProviderDeliveryTargetV1::OriginalSession { surface_id } = &request.delivery_target {
+        return response(
+            request,
+            deliver_to_original_session(request, runner, surface_id),
+        );
+    }
     let description = format!(
         "shipyard-workstream-delivery:{}",
         request.delivery_fence.idempotency_key
@@ -300,8 +306,13 @@ fn handle_request(
         [] => {}
         _ => return response(request, uncertain("multiple-idempotency-workspaces")),
     }
-    if request.operation == ProviderWrapperOperationV1::Reconcile {
+    if request.operation == ProviderWrapperOperationV1::Reconcile
+        || request.delivery_target == ProviderDeliveryTargetV1::ReconcileOnly
+    {
         return response(request, uncertain("reconcile-visibility-not-yet-proven"));
+    }
+    if request.delivery_target != ProviderDeliveryTargetV1::FreshCheckpoint {
+        return response(request, rejected("unsupported-delivery-target"));
     }
 
     // Exact executable bytes are launch authority, not observation authority.
@@ -404,6 +415,69 @@ fn reconcile_existing_workspace(
         [binding] => delivered(request, workspace_id, description, binding),
         [] => uncertain("cmux-session-binding-not-yet-visible"),
         _ => uncertain("multiple-provider-session-bindings"),
+    }
+}
+
+fn deliver_to_original_session(
+    request: &ProviderWrapperRequestV1,
+    runner: &mut impl CmuxRunner,
+    surface_id: &str,
+) -> ProviderWrapperOutcomeV1 {
+    let Some(surface_id) = canonical_uuid(surface_id) else {
+        return rejected("original-surface-id-invalid");
+    };
+    let mut args = cmux_prefix(["surface", "resume", "show"]);
+    args.extend(["--surface".to_owned(), surface_id.clone()]);
+    let evidence = match runner.run(&args) {
+        Ok(result) if result.success => result,
+        Ok(_) | Err(_) => return retryable("original-session-unavailable-before-send"),
+    };
+    let Ok(evidence) = serde_json::from_slice::<SurfaceResumeEvidence>(&evidence.stdout) else {
+        return retryable("original-session-evidence-invalid");
+    };
+    let Some(mut binding) = evidence.resume_binding else {
+        return retryable("original-session-binding-absent");
+    };
+    let Some(workspace_id) = canonical_uuid(&evidence.workspace_id) else {
+        return retryable("original-workspace-id-invalid");
+    };
+    if canonical_uuid(&evidence.surface_id).as_deref() != Some(surface_id.as_str())
+        || binding.kind != request.provider_id
+        || binding.source != "agent-hook"
+        || binding.checkpoint_id != request.protected_route.native_session_id
+        || !binding.is_local()
+    {
+        return retryable("original-session-binding-changed");
+    }
+    binding.checkpoint_id = match canonical_uuid(&binding.checkpoint_id) {
+        Some(checkpoint) => checkpoint,
+        None => return retryable("original-session-checkpoint-invalid"),
+    };
+    let sent = runner.run(&[
+        "send".to_owned(),
+        "--surface".to_owned(),
+        surface_id.clone(),
+        delivery_prompt(request),
+    ]);
+    match sent {
+        Ok(result) if result.success => {}
+        Ok(_) => return retryable("original-session-send-refused"),
+        Err(_) => return uncertain("original-session-send-outcome-unknown"),
+    }
+    let entered = runner.run(&[
+        "send-key".to_owned(),
+        "--surface".to_owned(),
+        surface_id.clone(),
+        "enter".to_owned(),
+    ]);
+    match entered {
+        Ok(result) if result.success => delivered(
+            request,
+            &workspace_id,
+            &format!("in-place:{surface_id}"),
+            &binding,
+        ),
+        Ok(_) | Err(_) => uncertain("original-session-enter-outcome-unknown"),
     }
 }
 
@@ -553,12 +627,12 @@ fn launch_command(
     executable_path: &Path,
     wait_for_child_cleanup: bool,
 ) -> Result<String, &'static str> {
-    let prompt = format!(
-        "Resume tracked workstream {}. First run `shipyard --json work-ledger context-challenge --wake {}` and reconstruct that exact durable context. Write the matching receipt to a private file, then run `shipyard --json work-ledger acknowledge-context --wake {} --receipt <private-path>`. Complete the remaining work and keep Linear current. Before handoff, run `shipyard --json work-ledger return-challenge --ownership <ownership-id>`, write separate reviewed expectation and receipt files proving a newer checkpoint, evidence, and remote acknowledgement, then run `shipyard --json work-ledger return-ownership --ownership <ownership-id> --expectation <private-path> --receipt <private-path>`. Never put receipt JSON or secrets in argv.",
-        request.resume_expectation.workstream_handle,
-        request.delivery_fence.wake_id,
-        request.delivery_fence.wake_id,
-    );
+    let prompt = delivery_prompt(request);
+    let argv = if request.delivery_target == ProviderDeliveryTargetV1::FreshCheckpoint {
+        &request.protected_route.fresh_argv
+    } else {
+        &request.protected_route.argv
+    };
     let mut lines = request
         .protected_route
         .environment
@@ -573,7 +647,7 @@ fn launch_command(
             .ok_or("private-launch-path-invalid")?,
     )?];
     invocation.extend(
-        request.protected_route.argv[1..]
+        argv[1..]
             .iter()
             .map(|value| shell_word(value))
             .collect::<Result<Vec<_>, _>>()?,
@@ -592,6 +666,15 @@ fn launch_command(
         lines.push(format!("exec {}", invocation.join(" ")));
     }
     Ok(lines.join("\n"))
+}
+
+fn delivery_prompt(request: &ProviderWrapperRequestV1) -> String {
+    format!(
+        "Resume tracked workstream {}. First run `shipyard --json work-ledger context-challenge --wake {}` and reconstruct that exact durable context. Write the matching receipt to a private file, then run `shipyard --json work-ledger acknowledge-context --wake {} --receipt <private-path>`. Complete the remaining work and keep Linear current. Before handoff, run `shipyard --json work-ledger return-challenge --ownership <ownership-id>`, write separate reviewed expectation and receipt files proving a newer checkpoint, evidence, and remote acknowledgement, then run `shipyard --json work-ledger return-ownership --ownership <ownership-id> --expectation <private-path> --receipt <private-path>`. Never put receipt JSON or secrets in argv.",
+        request.resume_expectation.workstream_handle,
+        request.delivery_fence.wake_id,
+        request.delivery_fence.wake_id,
+    )
 }
 
 fn prepare_private_launch(
@@ -783,6 +866,19 @@ struct AgentSessionBinding {
     checkpoint_id: String,
     kind: String,
     source: String,
+    execution_location: Option<String>,
+    remote_pty_session_id: Option<String>,
+    remote_surface_id: Option<String>,
+    remote_workspace_id: Option<String>,
+}
+
+impl AgentSessionBinding {
+    fn is_local(&self) -> bool {
+        self.execution_location.as_deref() == Some("local")
+            && self.remote_pty_session_id.is_none()
+            && self.remote_surface_id.is_none()
+            && self.remote_workspace_id.is_none()
+    }
 }
 
 #[derive(Deserialize)]
@@ -860,7 +956,7 @@ fn session_binding_for_surface(
     let Some(mut binding) = evidence.resume_binding else {
         return Ok(None);
     };
-    if binding.kind != provider_id || binding.source != "agent-hook" {
+    if binding.kind != provider_id || binding.source != "agent-hook" || !binding.is_local() {
         return Err("cmux-session-evidence-provider-mismatch");
     }
     binding.checkpoint_id =

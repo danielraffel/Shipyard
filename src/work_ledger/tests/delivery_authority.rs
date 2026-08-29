@@ -109,6 +109,73 @@ fn dead_original_occupant_does_not_block_read_only_reconciliation_authority() {
 }
 
 #[test]
+fn live_original_stays_in_place_and_dead_original_alone_authorizes_fresh_checkpoint() {
+    let now = Utc::now();
+    let endpoint = TerminalMutationEndpoint::Cmux {
+        executable_path: "/Applications/cmux.app/Contents/MacOS/cmux".to_owned(),
+        socket_path: "/tmp/cmux.sock".to_owned(),
+    };
+    let mut live = probe(now);
+    let live_authority = verify_delivery_or_fresh_authority(
+        &mut live,
+        &expectation(),
+        endpoint.clone(),
+        &"f".repeat(64),
+    )
+    .expect("live original authority");
+    assert!(!live_authority.is_fresh_checkpoint());
+    assert_eq!(live_authority.terminal_instance(), "cmux:surface-a");
+
+    for refusal in [
+        DeliveryAuthorityRefusal::NoTerminalMatch,
+        DeliveryAuthorityRefusal::ProcessIncarnationMismatch,
+    ] {
+        let mut dead = probe(now);
+        dead.terminal = Err(refusal);
+        let fresh = verify_delivery_or_fresh_authority(
+            &mut dead,
+            &expectation(),
+            endpoint.clone(),
+            &"f".repeat(64),
+        )
+        .expect("definitively dead original authorizes fresh checkpoint");
+        assert!(fresh.is_fresh_checkpoint());
+        assert_eq!(dead.terminal_calls, 1);
+        assert_eq!(
+            fresh
+                .into_mutation_endpoint_for(6, 2)
+                .expect("exact generation"),
+            endpoint
+        );
+    }
+}
+
+#[test]
+fn ambiguous_or_unobservable_original_never_authorizes_fresh_checkpoint() {
+    let now = Utc::now();
+    for refusal in [
+        DeliveryAuthorityRefusal::TerminalAuthorityUnavailable,
+        DeliveryAuthorityRefusal::MultipleTerminalMatches,
+        DeliveryAuthorityRefusal::NativeSessionMismatch,
+    ] {
+        let mut ambiguous = probe(now);
+        ambiguous.terminal = Err(refusal);
+        assert_eq!(
+            verify_delivery_or_fresh_authority(
+                &mut ambiguous,
+                &expectation(),
+                TerminalMutationEndpoint::Cmux {
+                    executable_path: "/test/cmux".to_owned(),
+                    socket_path: "/test/cmux.sock".to_owned(),
+                },
+                &"f".repeat(64),
+            ),
+            Err(refusal)
+        );
+    }
+}
+
+#[test]
 fn authorization_cannot_be_reused_with_altered_ledger_generations() {
     let now = Utc::now();
     let mut second_probe = probe(now);

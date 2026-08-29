@@ -14,9 +14,10 @@ use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
 use crate::provider_wrapper::{
-    CmuxEndpointV1, FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderLaunchOptionsV1,
-    ProviderWrapperEnvironment, ProviderWrapperOperationV1, ProviderWrapperRequestV1,
-    ProviderWrapperRunResult, provider_wrapper_execution_supported, run_provider_wrapper,
+    CmuxEndpointV1, FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderDeliveryTargetV1,
+    ProviderLaunchOptionsV1, ProviderWrapperEnvironment, ProviderWrapperOperationV1,
+    ProviderWrapperRequestV1, ProviderWrapperRunResult, provider_wrapper_execution_supported,
+    run_provider_wrapper,
 };
 use crate::terminal_delivery_authority::{
     ProductionTerminalEvidenceAdapter, TerminalCapabilityRefusal, TerminalEvidenceAdapter,
@@ -28,7 +29,7 @@ use crate::work_ledger::{
     ProviderAuthorizationOperation, ProviderCapability, ProviderLaunchRequest, ProviderOutcome,
     ReconciliationAuthorization, StoredProviderRequest, TerminalAuthorityObservation,
     TerminalMutationEndpoint, WakeConsumerPolicy, WakeDeliveryResult, WorkLedger,
-    verify_delivery_authority, verify_reconciliation_authority,
+    verify_delivery_authority, verify_delivery_or_fresh_authority, verify_reconciliation_authority,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 use crate::workstream_continuation_config::WorkstreamContinuationConfig;
@@ -288,13 +289,37 @@ impl ProviderAdapter for WorkLedgerProviderAdapter<'_> {
                 )
             })?;
         let mut probe = ProductionDeliveryAuthorityProbe {
-            github: GitHubActions::from_loaded_config(cwd, &trusted_config)
+            github: GitHubActions::from_loaded_config(cwd.clone(), &trusted_config)
                 .with_repo_override(&request.expected.repository),
             terminal: Some(request.terminal),
             terminal_adapter: ProductionTerminalEvidenceAdapter,
         };
-        verify_delivery_authority(&mut probe, &request.expected)
-            .map_err(|refusal| authority_refusal(wrapper_operation, refusal))
+        let authority = if operation == ProviderAuthorizationOperation::Submit {
+            let fresh = self
+                .ledger
+                .current_reconciliation_authority_request(fence)
+                .map_err(|error| {
+                    authority_refusal(
+                        wrapper_operation,
+                        map_authority_request_error(&error.to_string()),
+                    )
+                })?;
+            if fresh.expected != request.expected {
+                return Err(authority_refusal(
+                    wrapper_operation,
+                    DeliveryAuthorityRefusal::GenerationMismatch,
+                ));
+            }
+            verify_delivery_or_fresh_authority(
+                &mut probe,
+                &request.expected,
+                fresh.terminal_endpoint,
+                &fresh.fence_digest,
+            )
+        } else {
+            verify_delivery_authority(&mut probe, &request.expected)
+        };
+        authority.map_err(|refusal| authority_refusal(wrapper_operation, refusal))
     }
 
     fn authorize_reconciliation(
@@ -515,12 +540,21 @@ impl WorkLedgerProviderAdapter<'_> {
         operation: ProviderWrapperOperationV1,
         authority: DeliveryAuthorization,
     ) -> ProviderOutcome {
+        let delivery_target = if authority.is_fresh_checkpoint() {
+            ProviderDeliveryTargetV1::FreshCheckpoint
+        } else {
+            ProviderDeliveryTargetV1::OriginalSession {
+                surface_id: authority.terminal_instance().to_owned(),
+            }
+        };
         let Ok(mutation_endpoint) =
             authority.into_mutation_endpoint_for(fence.work_generation, fence.owner_generation)
         else {
             return preflight_refusal(operation);
         };
-        let Ok(request) = self.wrapper_request(fence, operation, &mutation_endpoint) else {
+        let Ok(request) =
+            self.wrapper_request(fence, operation, &mutation_endpoint, delivery_target)
+        else {
             return preflight_refusal(operation);
         };
         match run_provider_wrapper(&self.config.provider_wrapper, &self.environment, &request) {
@@ -556,14 +590,19 @@ impl WorkLedgerProviderAdapter<'_> {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)] // Consumes the one-shot capability at provider I/O.
     fn run_reconciliation(
         &self,
         fence: &DeliveryFence,
         authority: &ReconciliationAuthorization,
     ) -> ProviderOutcome {
         let operation = ProviderWrapperOperationV1::Reconcile;
-        let Ok(request) = self.wrapper_request(fence, operation, authority.terminal_endpoint())
-        else {
+        let Ok(request) = self.wrapper_request(
+            fence,
+            operation,
+            authority.terminal_endpoint(),
+            ProviderDeliveryTargetV1::ReconcileOnly,
+        ) else {
             return preflight_refusal(operation);
         };
         match run_provider_wrapper(&self.config.provider_wrapper, &self.environment, &request) {
@@ -599,6 +638,7 @@ impl WorkLedgerProviderAdapter<'_> {
         fence: &DeliveryFence,
         operation: ProviderWrapperOperationV1,
         mutation_endpoint: &TerminalMutationEndpoint,
+        delivery_target: ProviderDeliveryTargetV1,
     ) -> Result<ProviderWrapperRequestV1, ()> {
         let (record, bytes) = self
             .ledger
@@ -661,6 +701,7 @@ impl WorkLedgerProviderAdapter<'_> {
             adapter_id: stored.adapter_id,
             delivery_fence,
             cmux_endpoint,
+            delivery_target,
             protected_route: profile.protected_resume_route(fence.payload_digest.clone()),
             resume_expectation: FreshResumeExpectationV1 {
                 workstream_handle: stored.resume.workstream_handle,

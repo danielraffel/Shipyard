@@ -134,6 +134,20 @@ impl WorkLedger {
     /// Register one complete route under exact work, owner, and revision fences.
     #[allow(dead_code)] // Native route writers are activated after shadow cutover.
     pub(super) fn register_route(&self, route: &RouteRegistration) -> WorkLedgerResult<()> {
+        self.register_route_inner(route, false)
+    }
+
+    /// Stage the immutable route for the next generation of a managed native
+    /// publication. Only the actionable producer may consume that generation.
+    pub(super) fn register_staged_route(&self, route: &RouteRegistration) -> WorkLedgerResult<()> {
+        self.register_route_inner(route, true)
+    }
+
+    fn register_route_inner(
+        &self,
+        route: &RouteRegistration,
+        permit_managed_next_generation: bool,
+    ) -> WorkLedgerResult<()> {
         route
             .provenance
             .validate()
@@ -152,20 +166,29 @@ impl WorkLedger {
         configure_durable(&connection)?;
         verify_supported_schema(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let matches: bool = transaction.query_row(
-            "SELECT head_sha = ?2 AND work_generation = ?3 AND owner_generation = ?4
-                    AND owner_id = ?5
+        let current: (String, u64, u64, Option<String>, String) = transaction.query_row(
+            "SELECT head_sha, work_generation, owner_generation, owner_id, phase
              FROM work_items WHERE id = ?1",
-            params![
-                route.work_id,
-                route.head_sha,
-                route.work_generation,
-                route.owner_generation,
-                route.owner_ref,
-            ],
-            |row| row.get(0),
+            params![route.work_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
-        if !matches {
+        let generation_matches = route.work_generation == current.1
+            || (permit_managed_next_generation
+                && current.4 == "managed"
+                && current.1.checked_add(1) == Some(route.work_generation));
+        if current.0 != route.head_sha
+            || !generation_matches
+            || current.2 != route.owner_generation
+            || current.3.as_deref() != Some(route.owner_ref.as_str())
+        {
             return Err(WorkLedgerError::Refused(
                 "route does not match current work provenance".to_owned(),
             ));

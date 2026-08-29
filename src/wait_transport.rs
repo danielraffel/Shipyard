@@ -1116,6 +1116,8 @@ mod tests {
             rate_limit: None,
             workstream_continuation:
                 crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
+            actionable_wake_producer:
+                crate::actionable_wake_producer::ActionableWakeProducerStatus::default(),
             last_error: None,
         }
     }

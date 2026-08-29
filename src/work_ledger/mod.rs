@@ -49,6 +49,7 @@ macro_rules! candidate_params {
     };
 }
 
+mod actionable_scheduler;
 #[allow(dead_code)] // Live cmux/HerdR proof remains default-off until upstream contracts ship.
 mod delivery_authority;
 #[allow(dead_code)] // Some ownership lifecycle operations remain future-facing.
@@ -65,7 +66,7 @@ pub(crate) use delivery_authority::{
     DeliveryAuthorityExpectation, DeliveryAuthorityProbe, DeliveryAuthorityRefusal,
     DeliveryAuthorization, GitHubAuthorityObservation, ProcessIncarnation,
     ReconciliationAuthorization, TerminalAuthorityObservation, TerminalMutationEndpoint,
-    verify_delivery_authority, verify_reconciliation_authority,
+    verify_delivery_authority, verify_delivery_or_fresh_authority, verify_reconciliation_authority,
 };
 #[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
 pub(crate) use delivery_ownership::{
@@ -93,6 +94,10 @@ pub(crate) use durable_custody::{
 };
 mod lifecycle;
 mod native_publication;
+#[cfg(test)]
+pub(crate) use native_publication::tests::{
+    policy as native_publication_test_policy, request as native_publication_test_request,
+};
 mod observation;
 mod persistence;
 mod policy;
@@ -102,6 +107,7 @@ mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.
 mod route;
 mod storage;
+pub(crate) use actionable_scheduler::{NativeStewardApplyReport, NativeStewardDisposition};
 use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};

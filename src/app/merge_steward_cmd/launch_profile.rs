@@ -74,6 +74,7 @@ impl LaunchProfileV1 {
     ) -> crate::provider_wrapper::ProtectedProviderRouteV1 {
         crate::provider_wrapper::ProtectedProviderRouteV1 {
             argv: self.resume_argv.clone(),
+            fresh_argv: self.launch_argv.clone(),
             executable_sha256: self.subrouter_executable_sha256.clone().unwrap_or_default(),
             environment: self.route_environment.clone(),
             account_id: self.provider.account.clone(),

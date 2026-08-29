@@ -173,6 +173,10 @@ fn session_evidence(provider: Option<&str>) -> Result<CommandResult, RunnerFailu
             "checkpoint_id": SESSION_UUID,
             "kind": kind,
             "source": "agent-hook",
+            "execution_location": "local",
+            "remote_pty_session_id": null,
+            "remote_surface_id": null,
+            "remote_workspace_id": null,
             "cwd": "/tmp/shipyard-gen43"
         }))
     }))
@@ -195,6 +199,7 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
     ProviderWrapperRequestV1 {
         schema_version: 1,
         operation,
+        delivery_target: ProviderDeliveryTargetV1::FreshCheckpoint,
         provider_id: provider.to_owned(),
         adapter_id: ADAPTER_ID.to_owned(),
         delivery_fence: fence,
@@ -212,6 +217,14 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
                 "-c".to_owned(),
                 "model_reasoning_effort=\"medium\"".to_owned(),
                 "native-session-a".to_owned(),
+            ],
+            fresh_argv: vec![
+                "/opt/subrouter".to_owned(),
+                provider.to_owned(),
+                "--model".to_owned(),
+                "gpt-5.6-sol".to_owned(),
+                "-c".to_owned(),
+                "model_reasoning_effort=\"medium\"".to_owned(),
             ],
             executable_sha256: "9".repeat(64),
             environment: std::collections::BTreeMap::from([
@@ -278,6 +291,93 @@ fn assert_delivered(response: &ProviderWrapperResponseV1, provider: &str) {
         &format!("session:{provider}:{}", SESSION_UUID.to_ascii_lowercase())
     );
     assert_eq!(receipt_digest.len(), 64);
+}
+
+#[test]
+fn live_original_session_is_woken_in_place_without_workspace_or_provider_creation() {
+    let mut request = request("codex", ProviderWrapperOperationV1::Submit);
+    request.delivery_target = ProviderDeliveryTargetV1::OriginalSession {
+        surface_id: SURFACE_UUID.to_owned(),
+    };
+    request.protected_route.native_session_id = SESSION_UUID.to_owned();
+    *request.protected_route.argv.last_mut().unwrap() = SESSION_UUID.to_owned();
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            session_evidence(Some("codex")),
+            successful_json(serde_json::json!({})),
+            successful_json(serde_json::json!({})),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_request(&request, &mut runner);
+
+    assert_delivered(&response, "codex");
+    assert_eq!(runner.calls.len(), 3);
+    assert_eq!(runner.calls[0][3..6], ["surface", "resume", "show"]);
+    assert_eq!(runner.calls[1][0], "send");
+    assert_eq!(runner.calls[2][0], "send-key");
+    assert!(runner.private_launches.is_empty());
+    assert!(runner.calls.iter().all(|call| {
+        call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+    }));
+}
+
+#[test]
+fn live_original_send_transport_ambiguity_never_becomes_redispatchable() {
+    let mut request = request("codex", ProviderWrapperOperationV1::Submit);
+    request.delivery_target = ProviderDeliveryTargetV1::OriginalSession {
+        surface_id: SURFACE_UUID.to_owned(),
+    };
+    request.protected_route.native_session_id = SESSION_UUID.to_owned();
+    *request.protected_route.argv.last_mut().unwrap() = SESSION_UUID.to_owned();
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            session_evidence(Some("codex")),
+            Err(RunnerFailure::Unavailable),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_request(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert!(runner.private_launches.is_empty());
+    assert_eq!(runner.calls.len(), 2);
+}
+
+#[test]
+fn live_original_refuses_remote_binding_at_final_pre_send_check() {
+    let mut request = request("codex", ProviderWrapperOperationV1::Submit);
+    request.delivery_target = ProviderDeliveryTargetV1::OriginalSession {
+        surface_id: SURFACE_UUID.to_owned(),
+    };
+    request.protected_route.native_session_id = SESSION_UUID.to_owned();
+    *request.protected_route.argv.last_mut().unwrap() = SESSION_UUID.to_owned();
+    let mut remote = session_evidence(Some("codex")).unwrap().stdout;
+    let mut value: serde_json::Value = serde_json::from_slice(&remote).unwrap();
+    value["resume_binding"]["execution_location"] = serde_json::json!("remote");
+    value["resume_binding"]["remote_surface_id"] = serde_json::json!(SURFACE_UUID);
+    remote = serde_json::to_vec(&value).unwrap();
+    let mut runner = FakeRunner {
+        results: VecDeque::from([Ok(CommandResult {
+            success: true,
+            stdout: remote,
+        })]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_request(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Retryable { .. }
+    ));
+    assert_eq!(runner.calls.len(), 1);
+    assert!(runner.private_launches.is_empty());
 }
 
 #[test]
@@ -535,8 +635,9 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     let codex = request("codex", ProviderWrapperOperationV1::Submit);
     let codex_body =
         launch_command(&codex, Path::new(&codex.protected_route.argv[0]), false).unwrap();
-    assert!(codex_body.starts_with("export 'SUBROUTER_CODEX_ACCOUNT_ID=account-a'\nexport 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test'\nexec '/opt/subrouter' 'codex' 'resume'"));
-    assert!(codex_body.contains("'native-session-a'"));
+    assert!(codex_body.starts_with("export 'SUBROUTER_CODEX_ACCOUNT_ID=account-a'\nexport 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test'\nexec '/opt/subrouter' 'codex' '--model'"));
+    assert!(!codex_body.contains("'resume'"));
+    assert!(!codex_body.contains("'native-session-a'"));
     assert!(!codex_body.contains("cmux-codex-wrapper"));
     let codex_launch = prepare_private_launch(&codex, false).unwrap();
     assert!(!codex_launch.command.contains("account-a"));
@@ -577,6 +678,14 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
         "high".into(),
         "--resume".into(),
         "native-session-a".into(),
+    ];
+    claude.protected_route.fresh_argv = vec![
+        "/opt/subrouter".into(),
+        "claude".into(),
+        "--model".into(),
+        "fable".into(),
+        "--effort".into(),
+        "high".into(),
     ];
     let claude_body =
         launch_command(&claude, Path::new(&claude.protected_route.argv[0]), false).unwrap();
@@ -629,8 +738,8 @@ fn private_launch_capsule_sets_route_environment_and_deletes_itself() {
     drop(private_launch);
     assert!(!launch_directory.exists());
     let observed = std::fs::read_to_string(output).unwrap();
-    assert!(observed.starts_with("account-a\nqwen\nresume\n"));
-    assert!(observed.contains("native-session-a"));
+    assert!(observed.starts_with("account-a\nqwen\n--model\n"));
+    assert!(!observed.contains("native-session-a"));
     assert!(observed.contains("Resume tracked workstream GEN-43"));
 }
 
@@ -1139,7 +1248,7 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
     };
     let report =
         WorkLedger::plan_or_apply_native_continuation(temp.path(), &publication, &policy, true)
-            .expect("publish wake");
+            .expect("publish managed handoff");
     let profile = LedgerProfile {
         digest: profile_digest,
         bytes: profile_bytes,
@@ -1149,6 +1258,15 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
     let ledger = WorkLedger::open_existing(temp.path())
         .expect("open ledger")
         .expect("ledger exists");
+    let scheduled = ledger
+        .apply_native_steward_disposition(
+            &publication.repository,
+            publication.pull_request,
+            &publication.head_sha,
+            crate::work_ledger::NativeStewardDisposition::Actionable,
+        )
+        .expect("schedule actionable wake");
+    assert!(scheduled.wake_enqueued);
     let consumer = WakeConsumerPolicy {
         activation_enabled: true,
         dispatch_enabled: true,

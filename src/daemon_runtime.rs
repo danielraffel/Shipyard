@@ -27,6 +27,7 @@ use serde_json::Value;
 #[cfg(unix)]
 use chrono::Utc;
 
+use crate::actionable_wake_producer::{ActionableWakeProducer, ActionableWakeProducerStatus};
 use crate::config::LoadedConfig;
 use crate::daemon_ipc::read_daemon_status;
 #[cfg(unix)]
@@ -196,6 +197,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let registration_error = Arc::new(Mutex::new(None::<String>));
     let execution_error = Arc::new(Mutex::new(None::<String>));
     let continuation_status = Arc::new(Mutex::new(ContinuationRuntimeStatus::default()));
+    let actionable_producer_status = Arc::new(Mutex::new(ActionableWakeProducerStatus::default()));
     let ship_dir = config.state_dir.join("ship");
     let ship_dir_for_list = ship_dir.clone();
 
@@ -205,6 +207,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         Arc::clone(&registration_error),
         Arc::clone(&execution_error),
         Arc::clone(&continuation_status),
+        Arc::clone(&actionable_producer_status),
         Arc::clone(&last_event_at),
         Arc::clone(&tunnel_runtime.snapshot),
     );
@@ -240,6 +243,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     );
     let mut continuation_runtime =
         WorkstreamContinuationRuntime::for_daemon(config.mode, config.state_dir.clone());
+    let mut actionable_producer = ActionableWakeProducer::new(config.state_dir.clone());
+    if let Ok(mut published) = actionable_producer_status.lock() {
+        *published = actionable_producer.status();
+    }
     while running.load(Ordering::Acquire) {
         let supervisor_error = execution_supervisor
             .tick()
@@ -247,10 +254,6 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             .map(|error| format!("execution_supervisor: {error}"));
         if let Ok(mut last_error) = execution_error.lock() {
             *last_error = supervisor_error;
-        }
-        continuation_runtime.tick();
-        if let Ok(mut published) = continuation_status.lock() {
-            *published = continuation_runtime.status();
         }
         drain_webhook_events(
             &webhook_rx,
@@ -276,8 +279,32 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             publish_abandon_events(&server, &last_event_at, &result.abandon);
         }
 
-        for evidence in shadow_lane.tick(Instant::now()) {
+        let shadow_transitions = shadow_lane.tick(Instant::now());
+        for observation in shadow_lane.take_completed_observations() {
+            let producer_status = actionable_producer.process_observation(&observation);
+            if let Ok(mut published) = actionable_producer_status.lock() {
+                *published = producer_status;
+            }
+        }
+        for evidence in shadow_transitions {
+            if evidence.transition.observation.is_none() {
+                let producer_status = actionable_producer.process(&evidence);
+                if let Ok(mut published) = actionable_producer_status.lock() {
+                    *published = producer_status;
+                }
+            }
             publish_shadow_transition(&server, &last_event_at, &evidence);
+        }
+        // Reconstruct durable terminal stewardship before the consumer may
+        // claim a persisted wake. This ordering is required on the very first
+        // post-restart loop as well as ordinary daemon cycles.
+        actionable_producer.reconcile_durable_terminals();
+        if let Ok(mut published) = actionable_producer_status.lock() {
+            *published = actionable_producer.status();
+        }
+        continuation_runtime.tick();
+        if let Ok(mut published) = continuation_status.lock() {
+            *published = continuation_runtime.status();
         }
 
         let now = Instant::now();
@@ -356,12 +383,14 @@ impl RegistrationState {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // Independent snapshots avoid status blocking on live I/O.
 fn daemon_status_provider(
     registration: Arc<RegistrationState>,
     configured_repos: Vec<String>,
     registration_error: Arc<Mutex<Option<String>>>,
     execution_error: Arc<Mutex<Option<String>>>,
     continuation_status: Arc<Mutex<ContinuationRuntimeStatus>>,
+    actionable_producer_status: Arc<Mutex<ActionableWakeProducerStatus>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
     tunnel_snapshot: Arc<Mutex<TunnelSnapshot>>,
 ) -> impl Fn() -> IpcState + Send + Sync + 'static {
@@ -380,6 +409,10 @@ fn daemon_status_provider(
             rate_limit: None,
             workstream_continuation: continuation_status.lock().map_or_else(
                 |_| ContinuationRuntimeStatus::default(),
+                |guard| guard.clone(),
+            ),
+            actionable_wake_producer: actionable_producer_status.lock().map_or_else(
+                |_| ActionableWakeProducerStatus::default(),
                 |guard| guard.clone(),
             ),
             last_error: registration_error
@@ -1904,6 +1937,9 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(
                 crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
+            )),
+            Arc::new(Mutex::new(
+                crate::actionable_wake_producer::ActionableWakeProducerStatus::default(),
             )),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(TunnelSnapshot::inactive())),

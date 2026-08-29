@@ -15,8 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::process::{Command, ExitCode};
-use std::thread;
-use std::time::{Duration, Instant};
 
 #[cfg(not(test))]
 use crate::config::LoadedConfig;
@@ -1951,7 +1949,7 @@ fn publish_managed_handoff(
         pr,
         head,
         ready,
-        wait_for_native_consumer_ownership,
+        |_paths, _report| Ok(()),
     )
 }
 
@@ -1965,7 +1963,7 @@ fn publish_managed_handoff_with_consumer<F>(
     pr: u64,
     head: &str,
     ready: &ReadyWorkstreamActivation,
-    await_consumer: F,
+    _await_consumer: F,
 ) -> Result<DurableStewardHandoff, CliFailure>
 where
     F: FnOnce(&RuntimePaths, &NativePublicationReport) -> Result<(), CliFailure>,
@@ -2002,8 +2000,11 @@ where
             "native continuation publication changed after durable intent",
         ));
     }
-    await_consumer(runtime_paths, &report)?;
-    bind_native_publication(path, receipt, &report)
+    // Managed publication is intentionally inert. The daemon's exact-head
+    // actionable producer later advances the native lifecycle and creates the
+    // sole wake transaction. Handoff therefore retains monitoring ownership
+    // and records only the deterministic future wake identity here.
+    bind_native_publication_pending(path, receipt, &report)
 }
 
 fn native_publication_receipt(
@@ -2047,77 +2048,6 @@ fn bind_native_publication_pending(
             persist_handoff(path, receipt, HandoffPhase::Managed)
         }
     }
-}
-
-fn wait_for_native_consumer_ownership(
-    runtime_paths: &RuntimePaths,
-    report: &NativePublicationReport,
-) -> Result<(), CliFailure> {
-    wait_for_native_consumer_ownership_for(runtime_paths, report, Duration::from_secs(5))
-}
-
-fn wait_for_native_consumer_ownership_for(
-    runtime_paths: &RuntimePaths,
-    report: &NativePublicationReport,
-    timeout: Duration,
-) -> Result<(), CliFailure> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let ledger = WorkLedger::open_existing(&runtime_paths.state_dir)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?
-            .ok_or_else(|| CliFailure::new(1, "native continuation ledger disappeared"))?;
-        if ledger
-            .native_wake_consumer_owns(&report.wake_id)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(CliFailure::new(
-                1,
-                "native continuation daemon did not accept the published wake; monitoring ownership was not transferred",
-            ));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn bind_native_publication(
-    path: &Path,
-    mut receipt: DurableStewardHandoff,
-    report: &NativePublicationReport,
-) -> Result<DurableStewardHandoff, CliFailure> {
-    let profile_digest = receipt
-        .launch_profile
-        .as_ref()
-        .map(|profile| profile.profile_digest.as_str())
-        .ok_or_else(|| CliFailure::new(1, "native publication lost its launch profile"))?;
-    if report.profile_digest != profile_digest {
-        return Err(CliFailure::new(
-            1,
-            "native publication receipt does not match the protected launch profile",
-        ));
-    }
-    let pending = native_publication_receipt(report, NativePublicationStateV1::Pending);
-    let publication = native_publication_receipt(report, NativePublicationStateV1::Accepted);
-    if receipt.wake_consumer_available {
-        if receipt.native_publication.as_ref() == Some(&publication) {
-            return Ok(receipt);
-        }
-        return Err(CliFailure::new(
-            1,
-            "native publication receipt changed for an existing exact-head handoff",
-        ));
-    }
-    if receipt.native_publication.as_ref() != Some(&pending) {
-        return Err(CliFailure::new(
-            1,
-            "native publication acceptance lacks its durable pending intent",
-        ));
-    }
-    receipt.wake_consumer_available = true;
-    receipt.native_publication = Some(publication);
-    persist_handoff(path, receipt, HandoffPhase::Managed)
 }
 
 fn prepare_launch_profile_candidate(
