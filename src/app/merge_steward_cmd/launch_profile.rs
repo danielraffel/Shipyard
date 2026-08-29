@@ -6,7 +6,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::provider_wrapper::{
-    ProviderReasoningEffortV1, provider_reasoning_effort_name, subrouter_account_environment_key,
+    ProviderReasoningEffortV1, exact_provider_selections, provider_reasoning_effort_name,
+    subrouter_account_environment_key,
 };
 
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
@@ -315,18 +316,14 @@ fn validate_native_argv(
             "native fresh-agent argv contains a prompt-bearing argument",
         ));
     }
-    if profile
-        .provider
-        .model
-        .as_deref()
-        .is_some_and(|model| matches_exact(model) != 1)
-        || profile.provider.reasoning_effort.is_some_and(|effort| {
-            let effort = provider_reasoning_effort_name(effort);
-            !tail
-                .iter()
-                .any(|value| value == effort || value.contains(&format!("=\"{effort}\"")))
-        })
-        || expected_session.is_some_and(|session| matches_exact(session) != usize::from(resume))
+    if !exact_provider_selections(
+        tail,
+        profile.provider.model.as_deref(),
+        profile
+            .provider
+            .reasoning_effort
+            .map(provider_reasoning_effort_name),
+    ) || expected_session.is_some_and(|session| matches_exact(session) != usize::from(resume))
         || (resume && expected_session.is_none())
     {
         return Err(CliFailure::new(
@@ -856,6 +853,50 @@ mod tests {
         assert!(codex.validate_native_fresh_agent_grammar().is_err());
         assert_eq!(codex.provider.model.as_deref(), Some("model-x"));
         assert!(Path::new(codex.worktree_path()).is_absolute());
+    }
+
+    #[test]
+    fn native_grammar_rejects_undeclared_or_duplicate_provider_selections() {
+        let mut qwen = profile();
+        qwen.provider.provider = "qwen".into();
+        qwen.provider.reasoning_effort = None;
+        qwen.route_environment =
+            BTreeMap::from([("SUBROUTER_QWEN_ACCOUNT_ID".into(), "account-a".into())]);
+        qwen.launch_argv = vec![
+            "subrouter".into(),
+            "qwen".into(),
+            "--model".into(),
+            "model-x".into(),
+        ];
+        qwen.resume_argv = vec![
+            "subrouter".into(),
+            "qwen".into(),
+            "resume".into(),
+            "--model".into(),
+            "model-x".into(),
+            "session-7".into(),
+        ];
+
+        let mut undeclared_model = qwen.clone();
+        undeclared_model.provider.model = None;
+        assert!(
+            undeclared_model
+                .validate_native_fresh_agent_grammar()
+                .is_err()
+        );
+
+        let mut duplicate_model = qwen.clone();
+        duplicate_model
+            .resume_argv
+            .extend(["--model".into(), "other-model".into()]);
+        assert!(
+            duplicate_model
+                .validate_native_fresh_agent_grammar()
+                .is_err()
+        );
+
+        qwen.launch_argv.extend(["--effort".into(), "high".into()]);
+        assert!(qwen.validate_native_fresh_agent_grammar().is_err());
     }
 
     #[test]

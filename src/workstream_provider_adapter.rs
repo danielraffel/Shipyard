@@ -284,8 +284,8 @@ fn handle_request(
         return response(request, uncertain("reconcile-visibility-not-yet-proven"));
     }
 
-    let args = match create_args(request, &description) {
-        Ok(args) => args,
+    let (args, _private_launch) = match create_args(request, &description) {
+        Ok(prepared) => prepared,
         Err(code) => return response(request, rejected(code)),
     };
     // cmux creates the workspace before it sends `--command` to the surface.
@@ -411,8 +411,8 @@ fn cmux_prefix<const N: usize>(tail: [&str; N]) -> Vec<String> {
 fn create_args(
     request: &ProviderWrapperRequestV1,
     description: &str,
-) -> Result<Vec<String>, &'static str> {
-    let command = prepare_private_launch(request)?;
+) -> Result<(Vec<String>, PrivateLaunch), &'static str> {
+    let private_launch = prepare_private_launch(request)?;
     let mut args = cmux_prefix(["workspace", "create"]);
     args.extend([
         "--name".to_owned(),
@@ -427,9 +427,27 @@ fn create_args(
         "--focus".to_owned(),
         "false".to_owned(),
         "--command".to_owned(),
-        command,
+        private_launch.command.clone(),
     ]);
-    Ok(args)
+    Ok((args, private_launch))
+}
+
+struct PrivateLaunch {
+    command: String,
+    route_path: PathBuf,
+}
+
+impl Drop for PrivateLaunch {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.route_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
+        if let Some(parent) = self.route_path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
 }
 
 fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static str> {
@@ -458,7 +476,9 @@ fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static
     Ok(lines.join("\n"))
 }
 
-fn prepare_private_launch(request: &ProviderWrapperRequestV1) -> Result<String, &'static str> {
+fn prepare_private_launch(
+    request: &ProviderWrapperRequestV1,
+) -> Result<PrivateLaunch, &'static str> {
     let body = launch_command(request)?;
     let directory = tempfile::Builder::new()
         .prefix(".shipyard-workstream-route-")
@@ -490,10 +510,13 @@ fn prepare_private_launch(request: &ProviderWrapperRequestV1) -> Result<String, 
     sync_directory(&directory_path)?;
     let directory_path = directory.keep();
     let route_path = directory_path.join("launch.sh");
-    Ok(format!(
-        "'/bin/sh' {}",
-        shell_word(route_path.to_str().ok_or("private-launch-path-invalid")?)?
-    ))
+    Ok(PrivateLaunch {
+        command: format!(
+            "'/bin/sh' {}",
+            shell_word(route_path.to_str().ok_or("private-launch-path-invalid")?)?
+        ),
+        route_path,
+    })
 }
 
 fn sync_directory(path: &Path) -> Result<(), &'static str> {

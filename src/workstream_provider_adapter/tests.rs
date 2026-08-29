@@ -60,8 +60,6 @@ impl CmuxRunner for FakeRunner {
         {
             self.private_launches
                 .push(std::fs::read_to_string(&path).unwrap());
-            std::fs::remove_file(&path).unwrap();
-            std::fs::remove_dir(path.parent().unwrap()).unwrap();
         }
         self.results
             .pop_front()
@@ -470,6 +468,7 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
     let command_index = create.iter().position(|arg| arg == "--command").unwrap();
     let command = &create[command_index + 1];
     let launch = &runner.private_launches[0];
+    assert!(!private_launch_path(command).unwrap().exists());
     assert!(!command.contains("private-secret"));
     assert!(!command.contains("context_url"));
     assert!(!command.contains("GEN-43"));
@@ -495,11 +494,11 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
     assert!(codex_body.starts_with("export 'SUBROUTER_CODEX_ACCOUNT_ID=account-a'\nexport 'SUBROUTER_CODEX_USER_EMAIL=agent@example.test'\nexec '/opt/subrouter' 'codex' 'resume'"));
     assert!(codex_body.contains("'native-session-a'"));
     assert!(!codex_body.contains("cmux-codex-wrapper"));
-    let codex_command = prepare_private_launch(&codex).unwrap();
-    assert!(!codex_command.contains("account-a"));
-    assert!(!codex_command.contains("agent@example.test"));
-    assert!(!codex_command.contains("native-session-a"));
-    let launch_path = private_launch_path(&codex_command).unwrap();
+    let codex_launch = prepare_private_launch(&codex).unwrap();
+    assert!(!codex_launch.command.contains("account-a"));
+    assert!(!codex_launch.command.contains("agent@example.test"));
+    assert!(!codex_launch.command.contains("native-session-a"));
+    let launch_path = private_launch_path(&codex_launch.command).unwrap();
     let metadata = std::fs::metadata(&launch_path).unwrap();
     #[cfg(unix)]
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
@@ -510,8 +509,8 @@ fn exact_protected_subrouter_route_is_executed_without_direct_fallback() {
             .last(),
         codex_body.lines().last()
     );
-    std::fs::remove_file(&launch_path).unwrap();
-    std::fs::remove_dir(launch_path.parent().unwrap()).unwrap();
+    drop(codex_launch);
+    assert!(!launch_path.exists());
     let public_response = serde_json::to_string(&response(&codex, rejected("test"))).unwrap();
     for private in [
         "account-a",
@@ -565,12 +564,12 @@ fn private_launch_capsule_sets_route_environment_and_deletes_itself() {
             output.to_string_lossy().into_owned(),
         ),
     ]);
-    let command = prepare_private_launch(&request).unwrap();
-    let launch_path = private_launch_path(&command).unwrap();
+    let private_launch = prepare_private_launch(&request).unwrap();
+    let launch_path = private_launch_path(&private_launch.command).unwrap();
     let launch_directory = launch_path.parent().unwrap().to_path_buf();
     assert!(
         std::process::Command::new("/bin/sh")
-            .args(["-c", &command])
+            .args(["-c", &private_launch.command])
             .status()
             .unwrap()
             .success()

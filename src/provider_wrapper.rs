@@ -544,32 +544,84 @@ fn validate_protected_route(
         .filter(|value| *value == &route.native_session_id)
         .count()
         != 1
-        || request
-            .launch_options
-            .model_id
-            .as_ref()
-            .is_some_and(|model| {
-                route.argv[2..]
-                    .iter()
-                    .filter(|value| *value == model)
-                    .count()
-                    != 1
-            })
-        || request
-            .launch_options
-            .reasoning_effort
-            .is_some_and(|effort| {
-                let effort = provider_reasoning_effort_name(effort);
-                !route.argv[2..]
-                    .iter()
-                    .any(|value| value == effort || value.contains(&format!("=\"{effort}\"")))
-            })
+        || !exact_provider_selections(
+            &route.argv[2..],
+            request.launch_options.model_id.as_deref(),
+            request
+                .launch_options
+                .reasoning_effort
+                .map(provider_reasoning_effort_name),
+        )
     {
         return Err(refusal(
             "protected provider route does not bind session or provider selection",
         ));
     }
     validate_protected_route_environment(request, MAX_ROUTE_ENVIRONMENT)
+}
+
+pub(crate) fn exact_provider_selections(
+    tail: &[String],
+    expected_model: Option<&str>,
+    expected_reasoning: Option<&str>,
+) -> bool {
+    let Some(models) = flag_values(tail, &["--model"], &["--model="]) else {
+        return false;
+    };
+    let Some(mut reasoning) = flag_values(
+        tail,
+        &["--effort", "--reasoning-effort"],
+        &["--effort=", "--reasoning-effort="],
+    ) else {
+        return false;
+    };
+    for value in tail {
+        if let Some(selected) = value.strip_prefix("model_reasoning_effort=") {
+            let selected = selected.trim_matches('"');
+            if selected.is_empty() {
+                return false;
+            }
+            reasoning.push(selected);
+        }
+    }
+    selections_match(&models, expected_model) && selections_match(&reasoning, expected_reasoning)
+}
+
+fn flag_values<'a>(
+    tail: &'a [String],
+    flags: &[&str],
+    assignments: &[&str],
+) -> Option<Vec<&'a str>> {
+    let mut selections = Vec::new();
+    let mut index = 0;
+    while index < tail.len() {
+        let value = tail[index].as_str();
+        if flags.contains(&value) {
+            index += 1;
+            let selected = tail.get(index)?.as_str();
+            if selected.is_empty() || selected.starts_with('-') {
+                return None;
+            }
+            selections.push(selected);
+        } else if let Some(selected) = assignments
+            .iter()
+            .find_map(|prefix| value.strip_prefix(prefix))
+        {
+            if selected.is_empty() {
+                return None;
+            }
+            selections.push(selected);
+        }
+        index += 1;
+    }
+    Some(selections)
+}
+
+fn selections_match(observed: &[&str], expected: Option<&str>) -> bool {
+    match expected {
+        Some(expected) => observed == [expected],
+        None => observed.is_empty(),
+    }
 }
 
 fn validate_protected_route_environment(
@@ -1842,5 +1894,28 @@ mod tests {
                 .is_err()
         );
         assert!(ProviderWrapperEnvironment::new([("HOME".into(), OsString::from("/tmp"))]).is_ok());
+    }
+
+    #[test]
+    fn provider_selections_are_symmetric_with_protected_metadata() {
+        let selected = vec![
+            "resume".to_owned(),
+            "--model".to_owned(),
+            "model-a".to_owned(),
+            "--effort=high".to_owned(),
+        ];
+        assert!(exact_provider_selections(
+            &selected,
+            Some("model-a"),
+            Some("high")
+        ));
+        assert!(!exact_provider_selections(&selected, None, Some("high")));
+        assert!(!exact_provider_selections(&selected, Some("model-a"), None));
+        let duplicated = [selected, vec!["--model".into(), "model-b".into()]].concat();
+        assert!(!exact_provider_selections(
+            &duplicated,
+            Some("model-a"),
+            Some("high")
+        ));
     }
 }
