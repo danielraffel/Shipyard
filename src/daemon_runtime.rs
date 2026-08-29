@@ -50,6 +50,8 @@ use crate::ship_state::ShipStateStore;
 #[cfg(unix)]
 use crate::ship_state::{DispatchedRun, ShipState};
 #[cfg(unix)]
+use crate::transition_projection_runner::TransitionProjectionRuntime;
+#[cfg(unix)]
 use crate::tunnel::{
     TailscaleFunnelBackend, TunnelSnapshot, TunnelSupervisorHooks, TunnelSupervisorPolicy,
     TunnelSupervisorState, supervise_tunnel,
@@ -196,6 +198,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let registration = Arc::new(RegistrationState::new(registrar));
     let registration_error = Arc::new(Mutex::new(None::<String>));
     let execution_error = Arc::new(Mutex::new(None::<String>));
+    let transition_projection_error = Arc::new(Mutex::new(None::<String>));
     let continuation_status = Arc::new(Mutex::new(ContinuationRuntimeStatus::default()));
     let actionable_producer_status = Arc::new(Mutex::new(ActionableWakeProducerStatus::default()));
     let ship_dir = config.state_dir.join("ship");
@@ -206,6 +209,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         repos.clone(),
         Arc::clone(&registration_error),
         Arc::clone(&execution_error),
+        Arc::clone(&transition_projection_error),
         Arc::clone(&continuation_status),
         Arc::clone(&actionable_producer_status),
         Arc::clone(&last_event_at),
@@ -244,6 +248,14 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut continuation_runtime =
         WorkstreamContinuationRuntime::for_daemon(config.mode, config.state_dir.clone());
     let mut actionable_producer = ActionableWakeProducer::new(config.state_dir.clone());
+    let mut transition_projection_runtime = TransitionProjectionRuntime::for_daemon(
+        config.mode,
+        config.global_dir.clone(),
+        config.state_dir.clone(),
+    );
+    if let Ok(mut published) = transition_projection_error.lock() {
+        *published = transition_projection_runtime.diagnostic_error();
+    }
     if let Ok(mut published) = actionable_producer_status.lock() {
         *published = actionable_producer.status();
     }
@@ -303,6 +315,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             *published = actionable_producer.status();
         }
         continuation_runtime.tick();
+        transition_projection_runtime.tick();
+        if let Ok(mut published) = transition_projection_error.lock() {
+            *published = transition_projection_runtime.diagnostic_error();
+        }
         if let Ok(mut published) = continuation_status.lock() {
             *published = continuation_runtime.status();
         }
@@ -389,6 +405,7 @@ fn daemon_status_provider(
     configured_repos: Vec<String>,
     registration_error: Arc<Mutex<Option<String>>>,
     execution_error: Arc<Mutex<Option<String>>>,
+    transition_projection_error: Arc<Mutex<Option<String>>>,
     continuation_status: Arc<Mutex<ContinuationRuntimeStatus>>,
     actionable_producer_status: Arc<Mutex<ActionableWakeProducerStatus>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
@@ -419,7 +436,13 @@ fn daemon_status_provider(
                 .lock()
                 .ok()
                 .and_then(|guard| guard.clone())
-                .or_else(|| execution_error.lock().ok().and_then(|guard| guard.clone())),
+                .or_else(|| execution_error.lock().ok().and_then(|guard| guard.clone()))
+                .or_else(|| {
+                    transition_projection_error
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                }),
         }
     }
 }
@@ -1933,6 +1956,7 @@ mod tests {
         let provider = daemon_status_provider(
             Arc::clone(&registration),
             vec!["owner/repo".to_owned(), "owner/pending".to_owned()],
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(

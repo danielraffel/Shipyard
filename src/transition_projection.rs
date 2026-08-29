@@ -212,7 +212,7 @@ pub enum EnqueueOutcome {
 }
 
 /// Adapter result from an idempotent submission.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SubmitReceipt {
     /// Adapter-specific stable object/comment/event identity.
     pub external_id: String,

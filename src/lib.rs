@@ -176,6 +176,7 @@ pub mod supervised;
 mod terminal_delivery_authority;
 /// Optional local outbox and adapter contract for external transition projection.
 pub mod transition_projection;
+pub(crate) mod transition_projection_runner;
 /// Working-tree drift detection shared by future `shipyard run` wiring.
 pub mod tree_drift;
 /// Tunnel readiness, Tailscale probe decoding, and supervisor retry policy.
