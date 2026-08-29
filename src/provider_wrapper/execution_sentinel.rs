@@ -23,13 +23,12 @@ pub(super) fn terminate_sentinel_processes(
     deadline: Instant,
     poll_interval: Duration,
 ) -> SentinelCleanup {
-    let mut known = BTreeSet::new();
-    let mut stable = 0_u8;
+    let mut residual_detected = false;
     while Instant::now() < deadline {
         let Some(observed) = sentinel_processes(path, deadline) else {
             return SentinelCleanup {
                 proven: false,
-                residual_detected: !known.is_empty(),
+                residual_detected,
             };
         };
         let observed = observed
@@ -39,45 +38,24 @@ pub(super) fn terminate_sentinel_processes(
         if observed.is_empty() {
             return SentinelCleanup {
                 proven: true,
-                residual_detected: !known.is_empty(),
+                residual_detected,
             };
         }
-        let before = known.len();
-        known.extend(observed);
-        for pid in &known {
-            let _ = signal(*pid, "-STOP");
-        }
-        if known.len() == before {
-            stable += 1;
-            if stable >= 2 {
-                break;
-            }
-        } else {
-            stable = 0;
-        }
-        std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())));
-    }
-    for pid in known.iter().rev() {
-        let _ = signal(*pid, "-KILL");
-    }
-    while Instant::now() < deadline {
-        let Some(remaining) = sentinel_processes(path, deadline) else {
-            return SentinelCleanup {
-                proven: false,
-                residual_detected: true,
-            };
-        };
-        if remaining.into_iter().all(|pid| pid == std::process::id()) {
-            return SentinelCleanup {
-                proven: true,
-                residual_detected: true,
-            };
+        residual_detected = true;
+        // Never leave a durable stopped process between discovery and
+        // termination. A supervisor abort in the former STOP-then-KILL gap
+        // orphaned wrappers under launchd indefinitely. Killing every exact
+        // sentinel holder immediately and rescanning still closes the fork
+        // race: any child created before its parent dies inherited this same
+        // private descriptor and appears on the next pass.
+        for pid in observed.iter().rev() {
+            let _ = signal(*pid, "-KILL");
         }
         std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())));
     }
     SentinelCleanup {
         proven: false,
-        residual_detected: true,
+        residual_detected,
     }
 }
 

@@ -1697,7 +1697,7 @@ mod tests {
         let source = directory.path().join("wrapper.c");
         let path = directory.path().join("wrapper");
         let contents = format!(
-            "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n#include <sys/wait.h>\nint main(void) {{ {source_body} }}\n"
+            "#include <errno.h>\n#include <signal.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n#include <sys/wait.h>\nint main(void) {{ {source_body} }}\n"
         );
         fs::write(&source, contents).unwrap();
         assert!(
@@ -1777,7 +1777,7 @@ mod tests {
             ProviderWrapperOperationV1::Reconcile => "reconcile",
         };
         format!(
-            "char input[65537] = {{0}}; size_t count = fread(input, 1, sizeof(input) - 1, stdin); if (count == 0 || strstr(input, \"\\\"operation\\\":\\\"{operation}\\\"\") == NULL || getenv(\"GITHUB_TOKEN\") != NULL) return 91; unsigned char output[] = {{{bytes}}}; return fwrite(output, 1, sizeof(output), stdout) == sizeof(output) ? 0 : 1;"
+            "char input[65537] = {{0}}; size_t count = 0; while (count < sizeof(input) - 1) {{ size_t room = sizeof(input) - 1 - count; size_t chunk = room < 7 ? room : 7; ssize_t got = read(STDIN_FILENO, input + count, chunk); if (got > 0) {{ count += (size_t)got; continue; }} if (got == 0) break; if (errno == EINTR) continue; return 90; }} if (count == 0 || strstr(input, \"\\\"operation\\\":\\\"{operation}\\\"\") == NULL || getenv(\"GITHUB_TOKEN\") != NULL) return 91; unsigned char output[] = {{{bytes}}}; size_t written = 0; while (written < sizeof(output)) {{ size_t remaining = sizeof(output) - written; size_t chunk = remaining < 7 ? remaining : 7; ssize_t sent = write(STDOUT_FILENO, output + written, chunk); if (sent > 0) {{ written += (size_t)sent; continue; }} if (sent < 0 && errno == EINTR) continue; return 92; }} return 0;"
         )
     }
 
@@ -2040,6 +2040,37 @@ mod tests {
         assert_pid_eventually_not_running(
             &child_pid,
             "setsid child survived successful wrapper-parent exit",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_parent_exit_with_stopped_setsid_child_leaves_no_orphan() {
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let directory = tempfile::tempdir().unwrap();
+        let detached_pid = directory.path().join("detached-stopped.pid");
+        let detached_pid_staging = directory.path().join("detached-stopped.pid.tmp");
+        let body = format!(
+            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); rename(\"{}\", \"{}\"); raise(SIGSTOP); return 0; }} \
+             for (int i = 0; i < 5000 && access(\"{}\", F_OK) != 0; ++i) usleep(1000); {}",
+            detached_pid_staging.display(),
+            detached_pid_staging.display(),
+            detached_pid.display(),
+            detached_pid.display(),
+            response_program(&request, "delivered"),
+        );
+        let (_wrapper_dir, path, sha) = wrapper_c(&body);
+        let result = run_provider_wrapper(
+            &config(&path, sha),
+            &ProviderWrapperEnvironment::default(),
+            &request,
+        )
+        .unwrap();
+        assert!(matches!(result, ProviderWrapperRunResult::Uncertain { .. }));
+        let child_pid = fs::read_to_string(&detached_pid).unwrap();
+        assert_pid_eventually_not_running(
+            &child_pid,
+            "stopped setsid child survived exact sentinel cleanup",
         );
     }
 
