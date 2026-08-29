@@ -6,30 +6,20 @@
 //! release workflows and installer still package only `shipyard`; a production
 //! follow-up must build, sign, install, and digest-pin this second executable.
 
-#[cfg(target_os = "macos")]
-use std::ffi::OsStr;
-#[cfg(target_os = "macos")]
-use std::fs;
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-#[cfg(target_os = "macos")]
-use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::process::run_output_until;
 use crate::provider_wrapper::{
-    CmuxEndpointV1, NotAcceptedV1, PROVIDER_WRAPPER_SCHEMA_VERSION, ProviderAcceptanceV1,
-    ProviderDeliveryTargetV1, ProviderWrapperOperationV1, ProviderWrapperOutcomeV1,
-    ProviderWrapperRequestV1, ProviderWrapperResponseV1, TerminalEndpointV1, UnknownV1,
-    validate_request,
+    NotAcceptedV1, PROVIDER_WRAPPER_SCHEMA_VERSION, ProviderAcceptanceV1, ProviderDeliveryTargetV1,
+    ProviderWrapperOperationV1, ProviderWrapperOutcomeV1, ProviderWrapperRequestV1,
+    ProviderWrapperResponseV1, TerminalEndpointV1, UnknownV1, validate_request,
 };
 use crate::workstream_continuation_config::{
     ProviderWrapperConfig, load_trusted_terminal_trust_config,
@@ -37,13 +27,6 @@ use crate::workstream_continuation_config::{
 
 const ADAPTER_ID: &str = "cmux-workstream-v1";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
-#[cfg(target_os = "macos")]
-const CODESIGN: &str = "/usr/bin/codesign";
-const COMMAND_DEADLINE: Duration = Duration::from_secs(15);
-#[cfg(not(test))]
-const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE: Duration = Duration::from_millis(50);
 
 /// Read one strict request from stdin and emit exactly one strict response.
 pub fn run_stdio() -> Result<(), String> {
@@ -59,10 +42,9 @@ pub fn run_stdio() -> Result<(), String> {
         serde_json::from_slice(&bytes).map_err(|_| "request is not strict v2 JSON".to_owned())?;
     let terminal_trust = load_trusted_terminal_trust_config()
         .map_err(|_| "trusted terminal policy is unavailable".to_owned())?;
-    let response = handle_request(
-        &request,
-        &mut ProductionCmuxRunner::new(terminal_trust.cmux_signing_team_id),
-    );
+    let mut terminal = ProductionCmuxTransport::new(terminal_trust.cmux_signing_team_id);
+    let mut provider = ProductionSubrouterLaunchAuthority;
+    let response = handle_request(&request, &mut terminal, &mut provider);
     let canonical =
         serde_json::to_vec(&response).map_err(|_| "response cannot be serialized".to_owned())?;
     let mut stdout = std::io::stdout().lock();
@@ -137,156 +119,23 @@ impl Write for HashWriter<'_> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CommandResult {
-    success: bool,
-    stdout: Vec<u8>,
-}
+mod provider_launch;
+mod terminal_transport;
 
-trait TerminalRunner {
-    fn verify_subrouter(&mut self, request: &ProviderWrapperRequestV1) -> Result<(), &'static str>;
-    fn prepare_private_launch(
-        &mut self,
-        request: &ProviderWrapperRequestV1,
-    ) -> Result<PrivateLaunch, &'static str>;
-    fn bind(&mut self, endpoint: &TerminalEndpointV1) -> Result<(), RunnerFailure>;
-    fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RunnerFailure {
-    Unavailable,
-    CapabilityUnproven,
-    #[cfg(any(target_os = "macos", test))]
-    Untrusted,
-}
-
-struct ProductionCmuxRunner {
-    endpoint: Option<CmuxEndpointV1>,
-    trusted_signing_team_id: String,
-}
-
-impl ProductionCmuxRunner {
-    fn new(trusted_signing_team_id: String) -> Self {
-        Self {
-            endpoint: None,
-            trusted_signing_team_id,
-        }
-    }
-}
-
-impl TerminalRunner for ProductionCmuxRunner {
-    fn verify_subrouter(&mut self, request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
-        verify_subrouter_executable(request)
-    }
-
-    fn prepare_private_launch(
-        &mut self,
-        request: &ProviderWrapperRequestV1,
-    ) -> Result<PrivateLaunch, &'static str> {
-        prepare_private_launch(request, true)
-    }
-
-    fn bind(&mut self, endpoint: &TerminalEndpointV1) -> Result<(), RunnerFailure> {
-        match endpoint {
-            TerminalEndpointV1::Cmux(endpoint) => {
-                verify_authorized_cmux(endpoint, &self.trusted_signing_team_id)?;
-                self.endpoint = Some(endpoint.clone());
-                Ok(())
-            }
-            TerminalEndpointV1::HerdR { .. } => Err(RunnerFailure::CapabilityUnproven),
-        }
-    }
-
-    fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure> {
-        let endpoint = self.endpoint.as_ref().ok_or(RunnerFailure::Unavailable)?;
-        let mut command = Command::new(&endpoint.executable_path);
-        command
-            .args(["--socket", &endpoint.socket_path])
-            .args(args)
-            .env_clear();
-        let output = run_output_until(
-            &mut command,
-            Instant::now() + COMMAND_DEADLINE,
-            "cmux workstream provider",
-        )
-        .map_err(|_| RunnerFailure::Unavailable)?;
-        Ok(CommandResult {
-            success: output.status.success(),
-            stdout: output.stdout,
-        })
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn verify_authorized_cmux(
-    endpoint: &CmuxEndpointV1,
-    trusted_signing_team_id: &str,
-) -> Result<(), RunnerFailure> {
-    use std::os::unix::fs::FileTypeExt;
-
-    verify_cmux_signing_policy(endpoint, trusted_signing_team_id)?;
-    let cli = Path::new(&endpoint.executable_path);
-    let socket = Path::new(&endpoint.socket_path);
-    let cli_metadata = fs::metadata(cli).map_err(|_| RunnerFailure::Unavailable)?;
-    let socket_metadata = fs::symlink_metadata(socket).map_err(|_| RunnerFailure::Unavailable)?;
-    let effective_uid = nix::unistd::Uid::effective().as_raw();
-    if !cli.is_absolute()
-        || !socket.is_absolute()
-        || !cli_metadata.is_file()
-        || (cli_metadata.uid() != 0 && cli_metadata.uid() != effective_uid)
-        || cli_metadata.permissions().mode() & 0o022 != 0
-        || cli_metadata.permissions().mode() & 0o111 == 0
-        || !socket_metadata.file_type().is_socket()
-        || (socket_metadata.uid() != 0 && socket_metadata.uid() != effective_uid)
-        || socket_metadata.permissions().mode() & 0o022 != 0
-    {
-        return Err(RunnerFailure::Untrusted);
-    }
-    let requirement = format!(
-        "=anchor apple generic and certificate leaf[subject.OU] = \"{trusted_signing_team_id}\""
-    );
-    let output = Command::new(CODESIGN)
-        .args([
-            OsStr::new("--verify"),
-            OsStr::new("--strict"),
-            OsStr::new("-R"),
-        ])
-        .arg(requirement)
-        .arg(cli)
-        .output()
-        .map_err(|_| RunnerFailure::Unavailable)?;
-    if !output.status.success() {
-        return Err(RunnerFailure::Untrusted);
-    }
-    // Darwin cannot execute a previously verified descriptor. The remaining
-    // path race is inside Shipyard's explicit trusted-same-UID boundary, the
-    // same authority that owns cmux.app and Shipyard's machine policy.
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn verify_authorized_cmux(
-    _endpoint: &CmuxEndpointV1,
-    _trusted_signing_team_id: &str,
-) -> Result<(), RunnerFailure> {
-    Err(RunnerFailure::Unavailable)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn verify_cmux_signing_policy(
-    endpoint: &CmuxEndpointV1,
-    trusted_signing_team_id: &str,
-) -> Result<(), RunnerFailure> {
-    if endpoint.signing_team_id != trusted_signing_team_id {
-        return Err(RunnerFailure::Untrusted);
-    }
-    Ok(())
-}
+use provider_launch::{
+    PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE, PrivateLaunch, ProductionSubrouterLaunchAuthority,
+    ProviderLaunchAuthority, delivery_prompt,
+};
+#[cfg(test)]
+use provider_launch::{launch_command, prepare_private_launch, verify_subrouter_executable};
+#[cfg(test)]
+use terminal_transport::verify_cmux_signing_policy;
+use terminal_transport::{ProductionCmuxTransport, RunnerFailure, TerminalTransport};
 
 fn handle_request(
     request: &ProviderWrapperRequestV1,
-    runner: &mut impl TerminalRunner,
+    terminal: &mut impl TerminalTransport,
+    provider: &mut impl ProviderLaunchAuthority,
 ) -> ProviderWrapperResponseV1 {
     if let Err(code) = validate_adapter_request(request) {
         let outcome = match request.operation {
@@ -298,20 +147,20 @@ fn handle_request(
     if let Some(outcome) = terminal_capability_refusal(request) {
         return response(request, outcome);
     }
-    if let Some(outcome) = bind_terminal(request, runner) {
+    if let Some(outcome) = bind_terminal(request, terminal) {
         return response(request, outcome);
     }
     if let ProviderDeliveryTargetV1::OriginalSession { surface_id } = &request.delivery_target {
         return response(
             request,
-            deliver_to_original_session(request, runner, surface_id),
+            deliver_to_original_session(request, terminal, surface_id),
         );
     }
     let description = format!(
         "shipyard-workstream-delivery:{}",
         request.delivery_fence.idempotency_key
     );
-    let listed = match list_matching_workspaces(runner, &description) {
+    let listed = match list_matching_workspaces(terminal, &description) {
         Ok(listed) => listed,
         Err(code) => {
             let outcome = match request.operation {
@@ -325,7 +174,7 @@ fn handle_request(
         [workspace_id] => {
             return response(
                 request,
-                reconcile_existing_workspace(request, runner, workspace_id, &description),
+                reconcile_existing_workspace(request, terminal, workspace_id, &description),
             );
         }
         [] => {}
@@ -340,21 +189,25 @@ fn handle_request(
         return response(request, rejected("unsupported-delivery-target"));
     }
 
+    // Terminal transport selection and provider launch authority are separate
+    // trust decisions. Only the typed, validated protected route may cross
+    // this boundary; a missing Subrouter is a refusal, never direct-provider
+    // fallback through the selected terminal.
     // Exact executable bytes are launch authority, not observation authority.
     // Reconciliation above must remain able to prove an already accepted
     // session after the configured Subrouter binary has moved or upgraded.
-    if let Err(code) = runner.verify_subrouter(request) {
+    if let Err(code) = provider.verify_route(request) {
         return response(request, rejected(code));
     }
 
-    let private_launch = match runner.prepare_private_launch(request) {
+    let private_launch = match provider.prepare_launch(request) {
         Ok(launch) => launch,
         Err(code) => return response(request, rejected(code)),
     };
     let (args, private_launch) = create_args(request, &description, private_launch);
     // cmux creates the workspace before it sends `--command` to the surface.
     // From this invocation onward every failure is an ambiguous acceptance.
-    let created_result = runner.run(&args);
+    let created_result = terminal.run(&args);
     if !private_launch.wait_until_consumed(PRIVATE_LAUNCH_ACCEPTANCE_DEADLINE) {
         return response(request, uncertain("cmux-private-launch-not-consumed"));
     }
@@ -368,7 +221,7 @@ fn handle_request(
     response(
         request,
         match session_binding_for_surface(
-            runner,
+            terminal,
             &created.workspace_id,
             &created.surface_id,
             &request.provider_id,
@@ -382,9 +235,9 @@ fn handle_request(
 
 fn bind_terminal(
     request: &ProviderWrapperRequestV1,
-    runner: &mut impl TerminalRunner,
+    terminal: &mut impl TerminalTransport,
 ) -> Option<ProviderWrapperOutcomeV1> {
-    match runner.bind(&request.terminal_endpoint) {
+    match terminal.bind(&request.terminal_endpoint) {
         Err(RunnerFailure::CapabilityUnproven) => {
             let outcome = match request.operation {
                 ProviderWrapperOperationV1::Submit => rejected("terminal-capability-unproven"),
@@ -424,62 +277,17 @@ fn terminal_capability_refusal(
     })
 }
 
-#[cfg(unix)]
-fn verify_subrouter_executable(request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
-    const MAX_SUBROUTER_BYTES: u64 = 128 * 1024 * 1024;
-    let path = Path::new(&request.protected_route.argv[0]);
-    let mut executable = OpenOptions::new()
-        .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
-        .open(path)
-        .map_err(|_| "subrouter-executable-unavailable")?;
-    let before = executable
-        .metadata()
-        .map_err(|_| "subrouter-executable-untrusted")?;
-    let effective_uid = nix::unistd::Uid::effective().as_raw();
-    if !before.is_file()
-        || (before.uid() != 0 && before.uid() != effective_uid)
-        || before.nlink() != 1
-        || before.len() == 0
-        || before.len() > MAX_SUBROUTER_BYTES
-        || before.mode() & 0o111 == 0
-        || before.mode() & 0o022 != 0
-    {
-        return Err("subrouter-executable-untrusted");
-    }
-    let mut hasher = Sha256::new();
-    let copied = std::io::copy(&mut executable, &mut HashWriter(&mut hasher))
-        .map_err(|_| "subrouter-executable-unreadable")?;
-    let after = executable
-        .metadata()
-        .map_err(|_| "subrouter-executable-untrusted")?;
-    if copied != before.len()
-        || before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || hex::encode(hasher.finalize()) != request.protected_route.executable_sha256
-    {
-        return Err("subrouter-executable-drift");
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn verify_subrouter_executable(_: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
-    Err("subrouter-executable-verification-unavailable")
-}
-
 fn reconcile_existing_workspace(
     request: &ProviderWrapperRequestV1,
-    runner: &mut impl TerminalRunner,
+    terminal: &mut impl TerminalTransport,
     workspace_id: &str,
     description: &str,
 ) -> ProviderWrapperOutcomeV1 {
-    let bindings = match session_bindings_for_workspace(runner, workspace_id, &request.provider_id)
-    {
-        Ok(bindings) => bindings,
-        Err(code) => return uncertain(code),
-    };
+    let bindings =
+        match session_bindings_for_workspace(terminal, workspace_id, &request.provider_id) {
+            Ok(bindings) => bindings,
+            Err(code) => return uncertain(code),
+        };
     match bindings.as_slice() {
         [binding] => delivered(request, workspace_id, description, binding),
         [] => uncertain("cmux-session-binding-not-yet-visible"),
@@ -489,7 +297,7 @@ fn reconcile_existing_workspace(
 
 fn deliver_to_original_session(
     request: &ProviderWrapperRequestV1,
-    runner: &mut impl TerminalRunner,
+    terminal: &mut impl TerminalTransport,
     surface_id: &str,
 ) -> ProviderWrapperOutcomeV1 {
     let Some(surface_id) = canonical_uuid(surface_id) else {
@@ -497,7 +305,7 @@ fn deliver_to_original_session(
     };
     let mut args = cmux_prefix(["surface", "resume", "show"]);
     args.extend(["--surface".to_owned(), surface_id.clone()]);
-    let evidence = match runner.run(&args) {
+    let evidence = match terminal.run(&args) {
         Ok(result) if result.success => result,
         Ok(_) | Err(_) => return retryable("original-session-unavailable-before-send"),
     };
@@ -522,7 +330,7 @@ fn deliver_to_original_session(
         Some(checkpoint) => checkpoint,
         None => return retryable("original-session-checkpoint-invalid"),
     };
-    let sent = runner.run(&[
+    let sent = terminal.run(&[
         "send".to_owned(),
         "--surface".to_owned(),
         surface_id.clone(),
@@ -533,7 +341,7 @@ fn deliver_to_original_session(
         Ok(_) => return retryable("original-session-send-refused"),
         Err(_) => return uncertain("original-session-send-outcome-unknown"),
     }
-    let entered = runner.run(&[
+    let entered = terminal.run(&[
         "send-key".to_owned(),
         "--surface".to_owned(),
         surface_id.clone(),
@@ -568,10 +376,10 @@ fn validate_adapter_request(request: &ProviderWrapperRequestV1) -> Result<(), &'
 }
 
 fn list_matching_workspaces(
-    runner: &mut impl TerminalRunner,
+    terminal: &mut impl TerminalTransport,
     description: &str,
 ) -> Result<Vec<String>, &'static str> {
-    let windows_result = runner
+    let windows_result = terminal
         .run(&cmux_prefix(["list-windows"]))
         .map_err(|_| "cmux-window-list-unavailable")?;
     if !windows_result.success {
@@ -595,7 +403,7 @@ fn list_matching_workspaces(
     for window_id in window_ids {
         let mut args = cmux_prefix(["workspace", "list"]);
         args.extend(["--window".to_owned(), window_id.clone()]);
-        let result = runner
+        let result = terminal
             .run(&args)
             .map_err(|_| "cmux-workspace-list-unavailable")?;
         if !result.success {
@@ -652,234 +460,6 @@ fn create_args(
         private_launch.command.clone(),
     ]);
     (args, private_launch)
-}
-
-struct PrivateLaunch {
-    command: String,
-    route_path: PathBuf,
-    executable_path: PathBuf,
-}
-
-impl Drop for PrivateLaunch {
-    fn drop(&mut self) {
-        match std::fs::remove_file(&self.route_path) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&self.executable_path);
-                if let Some(parent) = self.route_path.parent() {
-                    let _ = std::fs::remove_dir(parent);
-                }
-            }
-            // A consumed production launch opened the snapshot by descriptor and
-            // unlinked both capsule files before exec. Never race that descriptor.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {}
-        }
-    }
-}
-
-impl PrivateLaunch {
-    fn wait_until_consumed(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match std::fs::symlink_metadata(&self.route_path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
-                Err(_) => return false,
-                Ok(_) if Instant::now() >= deadline => return false,
-                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-    }
-}
-
-fn launch_command(
-    request: &ProviderWrapperRequestV1,
-    executable_path: &Path,
-    wait_for_child_cleanup: bool,
-) -> Result<String, &'static str> {
-    let prompt = delivery_prompt(request);
-    let argv = if request.delivery_target == ProviderDeliveryTargetV1::FreshCheckpoint {
-        &request.protected_route.fresh_argv
-    } else {
-        &request.protected_route.argv
-    };
-    let mut lines = request
-        .protected_route
-        .environment
-        .iter()
-        .map(|(name, value)| {
-            shell_word(&format!("{name}={value}")).map(|word| format!("export {word}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut invocation = vec![shell_word(
-        executable_path
-            .to_str()
-            .ok_or("private-launch-path-invalid")?,
-    )?];
-    invocation.extend(
-        argv[1..]
-            .iter()
-            .map(|value| shell_word(value))
-            .collect::<Result<Vec<_>, _>>()?,
-    );
-    invocation.push(shell_word(&prompt)?);
-    if wait_for_child_cleanup {
-        // The production snapshot must remain named while the provider is
-        // running. Keep this shell as its parent so the installed trap removes
-        // the snapshot and capsule directory after every normal/signal exit.
-        lines.push("set +e".to_owned());
-        lines.push(invocation.join(" "));
-        lines.push("provider_status=$?".to_owned());
-        lines.push("set -e".to_owned());
-        lines.push("exit \"$provider_status\"".to_owned());
-    } else {
-        lines.push(format!("exec {}", invocation.join(" ")));
-    }
-    Ok(lines.join("\n"))
-}
-
-fn delivery_prompt(request: &ProviderWrapperRequestV1) -> String {
-    format!(
-        "Resume tracked workstream {}. First run `shipyard --json work-ledger context-challenge --wake {}` and reconstruct that exact durable context. Write the matching receipt to a private file, then run `shipyard --json work-ledger acknowledge-context --wake {} --receipt <private-path>`. Complete the remaining work and keep Linear current. Before handoff, run `shipyard --json work-ledger return-challenge --ownership <ownership-id>`, write separate reviewed expectation and receipt files proving a newer checkpoint, evidence, and remote acknowledgement, then run `shipyard --json work-ledger return-ownership --ownership <ownership-id> --expectation <private-path> --receipt <private-path>`. Never put receipt JSON or secrets in argv.",
-        request.resume_expectation.workstream_handle,
-        request.delivery_fence.wake_id,
-        request.delivery_fence.wake_id,
-    )
-}
-
-fn prepare_private_launch(
-    request: &ProviderWrapperRequestV1,
-    snapshot_executable: bool,
-) -> Result<PrivateLaunch, &'static str> {
-    let directory = tempfile::Builder::new()
-        .prefix(".shipyard-workstream-route-")
-        .tempdir()
-        .map_err(|_| "private-launch-directory-unavailable")?;
-    let directory_path = directory.path().to_path_buf();
-    let executable_path = directory_path.join("subrouter");
-    let (launch_executable, prologue) = if snapshot_executable {
-        snapshot_subrouter(request, &executable_path)?;
-        let executable_word = shell_word(
-            executable_path
-                .to_str()
-                .ok_or("private-launch-path-invalid")?,
-        )?;
-        let directory_word = shell_word(
-            directory_path
-                .to_str()
-                .ok_or("private-launch-path-invalid")?,
-        )?;
-        (
-            executable_path.as_path(),
-            format!(
-                "#!/bin/sh\nset -eu\nrm -f -- \"$0\"\ncleanup() {{ rm -f -- {executable_word}; rmdir -- {directory_word} 2>/dev/null || :; }}\ntrap cleanup EXIT HUP INT TERM\n"
-            ),
-        )
-    } else {
-        (
-            Path::new(&request.protected_route.argv[0]),
-            "#!/bin/sh\nset -eu\nrm -f -- \"$0\"\n".to_owned(),
-        )
-    };
-    let body = launch_command(request, launch_executable, snapshot_executable)?;
-    let route_path = directory_path.join("launch.sh");
-    let mut route = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&route_path)
-        .map_err(|_| "private-launch-file-unavailable")?;
-    route
-        .write_all(prologue.as_bytes())
-        .and_then(|()| route.write_all(body.as_bytes()))
-        .and_then(|()| route.write_all(b"\n"))
-        .and_then(|()| route.sync_all())
-        .map_err(|_| "private-launch-file-unwritable")?;
-    drop(route);
-    sync_directory(&directory_path)?;
-    let directory_path = directory.keep();
-    let route_path = directory_path.join("launch.sh");
-    Ok(PrivateLaunch {
-        command: format!(
-            "'/bin/sh' {}",
-            shell_word(route_path.to_str().ok_or("private-launch-path-invalid")?)?
-        ),
-        route_path,
-        executable_path,
-    })
-}
-
-#[cfg(unix)]
-fn snapshot_subrouter(
-    request: &ProviderWrapperRequestV1,
-    destination: &Path,
-) -> Result<(), &'static str> {
-    let source_path = Path::new(&request.protected_route.argv[0]);
-    let mut source = OpenOptions::new()
-        .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
-        .open(source_path)
-        .map_err(|_| "subrouter-executable-unavailable")?;
-    let before = source
-        .metadata()
-        .map_err(|_| "subrouter-executable-untrusted")?;
-    let mut destination = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o500)
-        .open(destination)
-        .map_err(|_| "subrouter-snapshot-unavailable")?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    let mut copied = 0_u64;
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .map_err(|_| "subrouter-executable-unreadable")?;
-        if read == 0 {
-            break;
-        }
-        copied = copied.saturating_add(read as u64);
-        hasher.update(&buffer[..read]);
-        destination
-            .write_all(&buffer[..read])
-            .map_err(|_| "subrouter-snapshot-unwritable")?;
-    }
-    let after = source
-        .metadata()
-        .map_err(|_| "subrouter-executable-untrusted")?;
-    if copied != before.len()
-        || before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || hex::encode(hasher.finalize()) != request.protected_route.executable_sha256
-    {
-        return Err("subrouter-executable-drift");
-    }
-    destination
-        .sync_all()
-        .map_err(|_| "subrouter-snapshot-unwritable")
-}
-
-#[cfg(not(unix))]
-fn snapshot_subrouter(_: &ProviderWrapperRequestV1, _: &Path) -> Result<(), &'static str> {
-    Err("subrouter-executable-verification-unavailable")
-}
-
-fn sync_directory(path: &Path) -> Result<(), &'static str> {
-    std::fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| "private-launch-directory-unwritable")
-}
-
-fn shell_word(value: &str) -> Result<String, &'static str> {
-    if value.is_empty()
-        || value
-            .chars()
-            .any(|character| character == '\0' || character.is_control())
-    {
-        return Err("launch-value-is-not-shell-safe");
-    }
-    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
 }
 
 #[derive(Deserialize)]
@@ -958,13 +538,13 @@ struct SurfaceResumeEvidence {
 }
 
 fn session_bindings_for_workspace(
-    runner: &mut impl TerminalRunner,
+    terminal: &mut impl TerminalTransport,
     workspace_id: &str,
     provider_id: &str,
 ) -> Result<Vec<AgentSessionBinding>, &'static str> {
     let mut args = cmux_prefix(["surface-health"]);
     args.extend(["--workspace".to_owned(), workspace_id.to_owned()]);
-    let result = runner
+    let result = terminal
         .run(&args)
         .map_err(|_| "cmux-surface-list-unavailable")?;
     if !result.success {
@@ -988,7 +568,7 @@ fn session_bindings_for_workspace(
     let mut bindings = Vec::new();
     for surface_id in &surface_ids {
         if let Some(binding) =
-            session_binding_for_surface(runner, workspace_id, surface_id, provider_id)?
+            session_binding_for_surface(terminal, workspace_id, surface_id, provider_id)?
         {
             bindings.push(binding);
         }
@@ -997,7 +577,7 @@ fn session_bindings_for_workspace(
 }
 
 fn session_binding_for_surface(
-    runner: &mut impl TerminalRunner,
+    terminal: &mut impl TerminalTransport,
     workspace_id: &str,
     surface_id: &str,
     provider_id: &str,
@@ -1009,7 +589,7 @@ fn session_binding_for_surface(
         "--surface".to_owned(),
         surface_id.to_owned(),
     ]);
-    let result = runner
+    let result = terminal
         .run(&args)
         .map_err(|_| "cmux-session-evidence-unavailable")?;
     if !result.success {
