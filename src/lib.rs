@@ -198,6 +198,7 @@ pub mod watch;
 pub mod webhook;
 /// Shadow-only canonical work-item ledger and legacy-state importer.
 pub mod work_ledger;
+pub(crate) mod worker_process_custody;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;
 pub(crate) mod workstream_activation_loader;

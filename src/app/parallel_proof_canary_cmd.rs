@@ -50,7 +50,7 @@ pub(super) fn parallel_proof_canary_worker_command(
     config: &LoadedConfig,
     state_dir: &Path,
 ) -> Result<ExitCode, CliFailure> {
-    let process = crate::parallel_proof_canary_job_adapter::verify_worker_authority(
+    let process = crate::parallel_proof_canary_job_adapter::verify_canary_worker_authority(
         state_dir, job_id, generation,
     )
     .map_err(|error| CliFailure::new(3, error))?;

@@ -18,7 +18,6 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{Duration, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use wait_timeout::ChildExt;
 
 use crate::execution_termination::{TerminationAction, TerminationPhase, TerminationStore};
 use crate::host_pool::{HostPoolLeaseError, HostPoolLeaseStore, default_lease_path};
@@ -33,6 +32,9 @@ use crate::queue_request::{
 };
 use crate::queue_scheduler::{AlreadyMergedCancellation, AlreadyMergedObserver};
 use crate::ship::persist_terminal_outcome;
+use crate::worker_process_custody::{
+    ProcessLiveness, terminate_child_tree as terminate_owned_child_tree,
+};
 
 const MAX_WORKERS: usize = 1;
 const MAX_METADATA_CONTROLLERS: usize = 4;
@@ -40,20 +42,6 @@ const MAX_METADATA_CONTROLLERS: usize = 4;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkerObservation {
     Alive(WorkerReceipt),
-    Dead,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProcessLiveness {
-    #[cfg_attr(
-        windows,
-        expect(
-            dead_code,
-            reason = "Windows ownership probing is unsupported and therefore never proves a process alive"
-        )
-    )]
-    Alive,
     Dead,
     Unknown,
 }
@@ -881,7 +869,7 @@ impl ExecutionSupervisor {
                 self.children.insert(job.id.clone(), child);
                 return Ok(());
             }
-            if terminate_child_tree(&mut child)? {
+            if terminate_owned_child_tree(&mut child)? {
                 remove_if_present(&receipt_path)?;
                 return Err(error);
             }
@@ -1130,199 +1118,9 @@ fn request_error_is_job_local(error: &QueueRequestError) -> bool {
     )
 }
 
-fn signal_process_tree(pid: u32) -> io::Result<Vec<u32>> {
-    #[cfg(unix)]
-    {
-        // Stop the exact owner before snapshotting its descendants so it
-        // cannot launch more work while cancellation walks the tree.
-        let stopped = Command::new("/bin/kill")
-            .args(["-STOP", "--", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !stopped.success() {
-            return Err(io::Error::other("worker root could not be stopped"));
-        }
-        // Snapshot exact descendants after stopping the owner. Dispatchers
-        // may create their own process groups, so signalling only `-pid` can
-        // leave governed build/ctest grandchildren consuming capacity.
-        let descendants = descendant_processes(pid)?;
-        for descendant in descendants.iter().rev() {
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", "--", &descendant.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        let status = Command::new("/bin/kill")
-            .args(["-KILL", "--", &format!("-{pid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if !status?.success() {
-            return Err(io::Error::other("worker process group could not be killed"));
-        }
-        Ok(descendants)
-    }
-    #[cfg(windows)]
-    {
-        let status = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other("worker process tree could not be killed"));
-        }
-        Ok(Vec::new())
-    }
-}
-
 #[cfg(all(test, unix))]
 fn terminate_process_group(pid: u32) -> bool {
-    signal_process_tree(pid).is_ok()
-}
-
-fn terminate_child_tree(child: &mut Child) -> io::Result<bool> {
-    if child.try_wait()?.is_some() {
-        #[cfg(unix)]
-        return verify_exited_worker_group_dead(child.id());
-        #[cfg(windows)]
-        return Ok(false);
-    }
-    #[cfg_attr(
-        windows,
-        expect(
-            unused_variables,
-            reason = "Windows taskkill confirms the tree without exposing descendant PIDs"
-        )
-    )]
-    let Ok(descendants) = signal_process_tree(child.id()) else {
-        return Ok(false);
-    };
-    if child.wait_timeout(StdDuration::from_secs(5))?.is_some() {
-        #[cfg(unix)]
-        return Ok(descendants
-            .iter()
-            .all(|pid| process_id_liveness(*pid) == ProcessLiveness::Dead));
-        #[cfg(windows)]
-        return Ok(true);
-    }
-    // Platform fallback: never block the daemon on an unbounded wait. On
-    // Windows this directly terminates the root if taskkill was unavailable;
-    // on Unix it is a final exact-process escalation after the tree signal.
-    let _ = child.kill();
-    let root_dead = child.wait_timeout(StdDuration::from_secs(1))?.is_some();
-    #[cfg(unix)]
-    return Ok(root_dead
-        && descendants
-            .iter()
-            .all(|pid| process_id_liveness(*pid) == ProcessLiveness::Dead));
-    #[cfg(windows)]
-    Ok(root_dead)
-}
-
-/// Terminate a detached daemon-owned worker tree by exact root identity.
-/// This preserves the same stopped-root descendant snapshot used by queue
-/// workers, including descendants that created another process group.
-#[cfg(unix)]
-pub(crate) fn terminate_detached_worker_tree(pid: u32) -> io::Result<bool> {
-    let descendants = signal_process_tree(pid)?;
-    let group_dead = verify_exited_worker_group_dead(pid)?;
-    Ok(group_dead
-        && descendants
-            .iter()
-            .all(|descendant| process_id_liveness(*descendant) == ProcessLiveness::Dead))
-}
-
-#[cfg(unix)]
-fn verify_exited_worker_group_dead(process_group: u32) -> io::Result<bool> {
-    // Daemon workers are created as process-group leaders. If the root raced
-    // cancellation and has already exited, kill and inspect that retained
-    // execution boundary before releasing its claim.
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", "--", &format!("-{process_group}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let deadline = Instant::now() + StdDuration::from_secs(1);
-    loop {
-        let output = Command::new("/bin/ps")
-            .args(["-axo", "pgid=,stat="])
-            .output()?;
-        if !output.status.success() {
-            return Ok(false);
-        }
-        let live = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-            let mut fields = line.split_whitespace();
-            fields.next().and_then(|value| value.parse::<u32>().ok()) == Some(process_group)
-                && !fields.next().is_some_and(|state| state.starts_with('Z'))
-        });
-        if !live {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        thread::sleep(StdDuration::from_millis(10));
-    }
-}
-
-#[cfg(unix)]
-fn descendant_processes(root: u32) -> io::Result<Vec<u32>> {
-    let output = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid="])
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other("process-tree observation failed"));
-    }
-    let relations = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse::<u32>().ok()?;
-            let parent = fields.next()?.parse::<u32>().ok()?;
-            Some((pid, parent))
-        })
-        .collect::<Vec<_>>();
-    let mut descendants = Vec::new();
-    let mut parents = vec![root];
-    while let Some(parent) = parents.pop() {
-        for &(pid, observed_parent) in &relations {
-            if observed_parent == parent && !descendants.contains(&pid) {
-                descendants.push(pid);
-                parents.push(pid);
-            }
-        }
-    }
-    Ok(descendants)
-}
-
-#[cfg(unix)]
-fn process_id_liveness(pid: u32) -> ProcessLiveness {
-    let Ok(output) = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
-    else {
-        return ProcessLiveness::Unknown;
-    };
-    if output.status.success() {
-        let state = String::from_utf8_lossy(&output.stdout);
-        if state.trim_start().starts_with('Z') || state.trim().is_empty() {
-            ProcessLiveness::Dead
-        } else {
-            ProcessLiveness::Alive
-        }
-    } else if output.stderr.is_empty() {
-        ProcessLiveness::Dead
-    } else {
-        ProcessLiveness::Unknown
-    }
+    crate::worker_process_custody::terminate_detached_worker_tree(pid).is_ok()
 }
 
 #[cfg_attr(

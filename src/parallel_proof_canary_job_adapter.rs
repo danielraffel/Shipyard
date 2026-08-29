@@ -426,19 +426,8 @@ impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
         }
         let mut child = command.spawn().map_err(|error| error.to_string())?;
         let pid = child.id();
-        let os_start_identity_sha256 = match os_process_start_identity(pid) {
-            Ok(Some(identity)) => identity,
-            Ok(None) => {
-                let _ = terminate_process_group(pid, Duration::from_secs(1));
-                let _ = child.wait();
-                return Err("canary worker exited before start identity was captured".to_owned());
-            }
-            Err(error) => {
-                let _ = terminate_process_group(pid, Duration::from_secs(1));
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
+        let os_start_identity_sha256 =
+            capture_worker_start_identity(&mut child, os_process_start_identity)?;
         let process = CanaryProcessTreeIdentity {
             pid,
             tree_id: format!("pgrp-{pid}"),
@@ -515,6 +504,27 @@ impl CanaryProcessSupervisor for ShipyardCanaryProcessSupervisor {
     }
 }
 
+#[cfg(unix)]
+fn capture_worker_start_identity(
+    child: &mut Child,
+    probe: impl FnOnce(u32) -> Result<Option<Sha256Digest>, String>,
+) -> Result<Sha256Digest, String> {
+    let pid = child.id();
+    match probe(pid) {
+        Ok(Some(identity)) => Ok(identity),
+        Ok(None) => {
+            let _ = terminate_process_group(pid, Duration::from_secs(1));
+            let _ = child.wait();
+            Err("canary worker exited before start identity was captured".to_owned())
+        }
+        Err(error) => {
+            let _ = terminate_process_group(pid, Duration::from_secs(1));
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerLiveness {
     Alive,
@@ -566,25 +576,15 @@ fn worker_process_liveness(receipt: &CanarySupervisorReceipt) -> WorkerLiveness 
 
 #[cfg(unix)]
 fn os_process_start_identity(pid: u32) -> Result<Option<Sha256Digest>, String> {
-    let output = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| error.to_string())?;
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if output.status.success() && !value.is_empty() {
-        Ok(Some(Sha256Digest::of_bytes(value.as_bytes())))
-    } else if !output.status.success() && output.stderr.is_empty() {
-        Ok(None)
-    } else {
-        Err("canary worker OS start identity is unavailable".to_owned())
-    }
+    crate::worker_process_custody::process_start_identity(pid)
+        .map(|identity| identity.map(|bytes| Sha256Digest::of_bytes(&bytes)))
+        .map_err(|_| "canary worker OS start identity is unavailable".to_owned())
 }
 
 #[cfg(unix)]
 fn terminate_process_group(pid: u32, grace: Duration) -> Result<bool, String> {
     let _ = grace;
-    crate::execution_supervisor::terminate_detached_worker_tree(pid)
+    crate::worker_process_custody::terminate_detached_worker_tree(pid)
         .map_err(|error| error.to_string())
 }
 
@@ -597,7 +597,7 @@ fn controller_now_ms() -> Result<u64, String> {
     u64::try_from(Utc::now().timestamp_millis()).map_err(|_| "controller time overflow".to_owned())
 }
 
-pub(crate) fn verify_worker_authority(
+pub(crate) fn verify_canary_worker_authority(
     state_dir: &Path,
     job_id: &str,
     generation: &str,
@@ -1040,7 +1040,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cancellation_refuses_mismatched_os_start_identity_without_signalling() {
+    fn mismatched_canary_identity_cannot_kill_queue_worker() {
+        use std::os::unix::process::CommandExt as _;
+
         let _guard = crate::test_support::PROCESS_TREE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1049,7 +1051,11 @@ mod tests {
         let binary_sha256 = executable_digest(&binary).unwrap();
         let job = job(binary_sha256.clone());
         let nonce = digest("pid-reuse-negative-control");
-        let mut child = Command::new(&binary).arg("30").spawn().unwrap();
+        let mut child = Command::new(&binary)
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let process = CanaryProcessTreeIdentity {
             pid,
@@ -1083,6 +1089,64 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_reaping_is_disjoint_from_queue_worker_custody() {
+        use std::os::unix::process::CommandExt as _;
+
+        let _guard = crate::test_support::PROCESS_TREE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut queue_worker = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut canary_worker = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+
+        assert!(
+            crate::worker_process_custody::terminate_detached_worker_tree(canary_worker.id())
+                .unwrap()
+        );
+        canary_worker.wait().unwrap();
+        assert!(queue_worker.try_wait().unwrap().is_none());
+
+        queue_worker.kill().unwrap();
+        queue_worker.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_spawn_identity_capture_leaves_no_orphan() {
+        use std::os::unix::process::CommandExt as _;
+
+        let _guard = crate::test_support::PROCESS_TREE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let error = capture_worker_start_identity(&mut child, |_| {
+            Err("injected start identity failure".to_owned())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "injected start identity failure");
+        assert!(child.try_wait().unwrap().is_some());
+        assert_eq!(
+            crate::worker_process_custody::process_id_liveness(pid),
+            crate::worker_process_custody::ProcessLiveness::Dead
+        );
     }
 
     #[cfg(unix)]
