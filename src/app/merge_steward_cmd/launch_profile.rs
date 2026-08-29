@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::provider_wrapper::{
-    ProviderReasoningEffortV1, exact_provider_selections, provider_reasoning_effort_name,
+    ProviderReasoningEffortV1, exact_provider_route, provider_reasoning_effort_name,
     subrouter_account_environment_key,
 };
 
@@ -306,7 +306,6 @@ fn validate_native_argv(
         .as_ref()
         .map(|session| session.provider_session_id.as_str());
     let tail = &argv[2..];
-    let matches_exact = |needle: &str| tail.iter().filter(|value| value.as_str() == needle).count();
     if tail
         .iter()
         .any(|value| value.chars().any(char::is_whitespace))
@@ -316,15 +315,15 @@ fn validate_native_argv(
             "native fresh-agent argv contains a prompt-bearing argument",
         ));
     }
-    if !exact_provider_selections(
+    if !exact_provider_route(
         tail,
         profile.provider.model.as_deref(),
         profile
             .provider
             .reasoning_effort
             .map(provider_reasoning_effort_name),
-    ) || expected_session.is_some_and(|session| matches_exact(session) != usize::from(resume))
-        || (resume && expected_session.is_none())
+        expected_session.filter(|_| resume),
+    ) || (resume && expected_session.is_none())
     {
         return Err(CliFailure::new(
             1,

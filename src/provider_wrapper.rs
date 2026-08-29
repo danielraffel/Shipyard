@@ -539,20 +539,15 @@ fn validate_protected_route(
         return Err(refusal("protected provider route must remain prompt-free"));
     }
     validate_value(&route.native_session_id)?;
-    if route.argv[2..]
-        .iter()
-        .filter(|value| *value == &route.native_session_id)
-        .count()
-        != 1
-        || !exact_provider_selections(
-            &route.argv[2..],
-            request.launch_options.model_id.as_deref(),
-            request
-                .launch_options
-                .reasoning_effort
-                .map(provider_reasoning_effort_name),
-        )
-    {
+    if !exact_provider_route(
+        &route.argv[2..],
+        request.launch_options.model_id.as_deref(),
+        request
+            .launch_options
+            .reasoning_effort
+            .map(provider_reasoning_effort_name),
+        Some(&route.native_session_id),
+    ) {
         return Err(refusal(
             "protected provider route does not bind session or provider selection",
         ));
@@ -560,61 +555,84 @@ fn validate_protected_route(
     validate_protected_route_environment(request, MAX_ROUTE_ENVIRONMENT)
 }
 
-pub(crate) fn exact_provider_selections(
+pub(crate) fn exact_provider_route(
     tail: &[String],
     expected_model: Option<&str>,
     expected_reasoning: Option<&str>,
+    expected_session: Option<&str>,
 ) -> bool {
-    let Some(models) = flag_values(tail, &["--model"], &["--model="]) else {
-        return false;
-    };
-    let Some(mut reasoning) = flag_values(
-        tail,
-        &["--effort", "--reasoning-effort"],
-        &["--effort=", "--reasoning-effort="],
-    ) else {
-        return false;
-    };
-    for value in tail {
-        if let Some(selected) = value.strip_prefix("model_reasoning_effort=") {
-            let selected = selected.trim_matches('"');
-            if selected.is_empty() {
-                return false;
-            }
-            reasoning.push(selected);
-        }
-    }
-    selections_match(&models, expected_model) && selections_match(&reasoning, expected_reasoning)
-}
-
-fn flag_values<'a>(
-    tail: &'a [String],
-    flags: &[&str],
-    assignments: &[&str],
-) -> Option<Vec<&'a str>> {
-    let mut selections = Vec::new();
+    let mut models = Vec::new();
+    let mut reasoning = Vec::new();
+    let mut sessions = Vec::new();
+    let mut resume_markers = 0;
     let mut index = 0;
     while index < tail.len() {
         let value = tail[index].as_str();
-        if flags.contains(&value) {
-            index += 1;
-            let selected = tail.get(index)?.as_str();
-            if selected.is_empty() || selected.starts_with('-') {
-                return None;
+        match value {
+            "resume" => resume_markers += 1,
+            "--resume" => {
+                resume_markers += 1;
+                index += 1;
+                let Some(session) = tail.get(index).map(String::as_str) else {
+                    return false;
+                };
+                sessions.push(session);
             }
-            selections.push(selected);
-        } else if let Some(selected) = assignments
-            .iter()
-            .find_map(|prefix| value.strip_prefix(prefix))
-        {
-            if selected.is_empty() {
-                return None;
+            "--model" => {
+                index += 1;
+                let Some(model) = tail.get(index).map(String::as_str) else {
+                    return false;
+                };
+                models.push(model);
             }
-            selections.push(selected);
+            "--effort" | "--reasoning-effort" => {
+                index += 1;
+                let Some(effort) = tail.get(index).map(String::as_str) else {
+                    return false;
+                };
+                reasoning.push(effort);
+            }
+            "-c" => {
+                index += 1;
+                let Some(setting) = tail.get(index).map(String::as_str) else {
+                    return false;
+                };
+                let Some(effort) = setting.strip_prefix("model_reasoning_effort=") else {
+                    return false;
+                };
+                reasoning.push(effort.trim_matches('"'));
+            }
+            _ => {
+                if let Some(model) = value.strip_prefix("--model=") {
+                    models.push(model);
+                } else if let Some(effort) = value
+                    .strip_prefix("--effort=")
+                    .or_else(|| value.strip_prefix("--reasoning-effort="))
+                {
+                    reasoning.push(effort);
+                } else if expected_session == Some(value) {
+                    sessions.push(value);
+                } else {
+                    return false;
+                }
+            }
         }
         index += 1;
     }
-    Some(selections)
+    if models
+        .iter()
+        .chain(&reasoning)
+        .any(|value| value.is_empty())
+    {
+        return false;
+    }
+    let session_matches = match expected_session {
+        Some(expected) => sessions == [expected] && resume_markers == 1,
+        None => sessions.is_empty() && resume_markers == 0,
+    };
+    session_matches
+        && selections_match(&models, expected_model)
+        && selections_match(&reasoning, expected_reasoning)
 }
 
 fn selections_match(observed: &[&str], expected: Option<&str>) -> bool {
@@ -1903,19 +1921,39 @@ mod tests {
             "--model".to_owned(),
             "model-a".to_owned(),
             "--effort=high".to_owned(),
+            "session-a".to_owned(),
         ];
-        assert!(exact_provider_selections(
+        assert!(exact_provider_route(
             &selected,
             Some("model-a"),
-            Some("high")
+            Some("high"),
+            Some("session-a")
         ));
-        assert!(!exact_provider_selections(&selected, None, Some("high")));
-        assert!(!exact_provider_selections(&selected, Some("model-a"), None));
-        let duplicated = [selected, vec!["--model".into(), "model-b".into()]].concat();
-        assert!(!exact_provider_selections(
+        assert!(!exact_provider_route(
+            &selected,
+            None,
+            Some("high"),
+            Some("session-a")
+        ));
+        assert!(!exact_provider_route(
+            &selected,
+            Some("model-a"),
+            None,
+            Some("session-a")
+        ));
+        let duplicated = [selected.clone(), vec!["--model".into(), "model-b".into()]].concat();
+        assert!(!exact_provider_route(
             &duplicated,
             Some("model-a"),
-            Some("high")
+            Some("high"),
+            Some("session-a")
+        ));
+        let unsafe_flag = [selected, vec!["--dangerously-bypass-approvals".into()]].concat();
+        assert!(!exact_provider_route(
+            &unsafe_flag,
+            Some("model-a"),
+            Some("high"),
+            Some("session-a")
         ));
     }
 }
