@@ -17,7 +17,26 @@ fn test_schema_object_exists(connection: &Connection, object_type: &str, name: &
 fn strip_schema_identity(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TRIGGER ledger_schema_identity_no_second_insert;
+            "DROP TRIGGER IF EXISTS custody_event_no_delete;
+             DROP TRIGGER IF EXISTS custody_event_immutable;
+             DROP TRIGGER IF EXISTS custody_control_no_delete;
+             DROP TRIGGER IF EXISTS custody_control_identity_immutable;
+             DROP TRIGGER IF EXISTS custody_effect_no_delete;
+             DROP TRIGGER IF EXISTS custody_effect_immutable;
+             DROP TRIGGER IF EXISTS custody_inbox_processed_receipt_immutable;
+             DROP TRIGGER IF EXISTS custody_inbox_identity_immutable;
+             DROP TRIGGER IF EXISTS custody_rebind_no_delete;
+             DROP TRIGGER IF EXISTS custody_rebind_immutable;
+             DROP TRIGGER IF EXISTS custody_outbox_identity_immutable;
+             DROP TABLE IF EXISTS custody_events;
+             DROP TABLE IF EXISTS custody_controls;
+             DROP TABLE IF EXISTS custody_effects;
+             DROP TABLE IF EXISTS custody_inbox_claims;
+             DROP TABLE IF EXISTS custody_inbox;
+             DROP TABLE IF EXISTS custody_sender_claims;
+             DROP TABLE IF EXISTS custody_rebinds;
+             DROP TABLE IF EXISTS custody_outbox;
+             DROP TRIGGER ledger_schema_identity_no_second_insert;
              DROP TRIGGER ledger_schema_identity_immutable;
              DROP TRIGGER ledger_schema_identity_no_delete;
              DROP TABLE ledger_schema_identity;",

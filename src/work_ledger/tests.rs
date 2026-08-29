@@ -167,6 +167,7 @@ fn sample_route_labeled(
 }
 
 mod dispatch;
+mod durable_custody;
 mod importer;
 mod lifecycle;
 mod persistence;

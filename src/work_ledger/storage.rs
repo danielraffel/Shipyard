@@ -166,6 +166,10 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     if version == 6 {
         migrate_main_v6_to_v8(connection)?;
+        version = 8;
+    }
+    if version == 8 {
+        migrate_v8_to_v9(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
@@ -678,6 +682,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
          BEGIN SELECT RAISE(ABORT, 'provider delivery observation authority mismatch'); END;",
     )?;
     install_schema_identity(&transaction)?;
+    install_custody_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -725,6 +730,9 @@ pub(super) fn verify_open_lineage(connection: &Connection, version: i64) -> Work
         });
     }
     if version == SCHEMA_VERSION {
+        return verify_schema_identity(connection);
+    }
+    if version == 8 {
         return verify_schema_identity(connection);
     }
     if version == 7 {
@@ -838,10 +846,187 @@ fn migrate_main_v6_to_v8(connection: &mut Connection) -> WorkLedgerResult<()> {
     verify_open_lineage(&transaction, 6)?;
     validate_relational_integrity(&transaction)?;
     install_schema_identity(&transaction)?;
+    transaction.pragma_update(None, "user_version", 8)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v8_to_v9(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 8 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the custody migration fence".to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 8)?;
+    validate_relational_integrity(&transaction)?;
+    install_custody_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     verify_schema_identity(&transaction)?;
     validate_relational_integrity(&transaction)?;
     transaction.commit()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Keep one atomic, auditable schema installation transaction.
+fn install_custody_schema(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE custody_outbox (
+           message_id TEXT PRIMARY KEY
+             CHECK(length(message_id) = 67 AND substr(message_id, 1, 3) = 'wm_'
+                   AND substr(message_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           wake_id TEXT NOT NULL REFERENCES outbox(wake_id) ON DELETE RESTRICT,
+           identity_json BLOB NOT NULL,
+           identity_digest TEXT NOT NULL
+             CHECK(length(identity_digest) = 64 AND identity_digest NOT GLOB '*[^0-9a-f]*'),
+           state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'custody_accepted',
+                                               'processed', 'cancelled', 'superseded')),
+           active_rebind_epoch INTEGER NOT NULL CHECK(active_rebind_epoch > 0),
+           custody_receipt_digest TEXT,
+           custody_transfer_digest TEXT,
+           processed_receipt_digest TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           UNIQUE(wake_id, message_id)
+         );
+         CREATE TABLE custody_rebinds (
+           message_id TEXT NOT NULL REFERENCES custody_outbox(message_id) ON DELETE RESTRICT,
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           target_machine_ref TEXT NOT NULL,
+           target_incarnation_ref TEXT NOT NULL,
+           target_route_ref TEXT NOT NULL,
+           terminal_adapter TEXT NOT NULL,
+           authority_digest TEXT NOT NULL
+             CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^0-9a-f]*'),
+           created_at TEXT NOT NULL,
+           PRIMARY KEY(message_id, epoch)
+         );
+         CREATE TABLE custody_sender_claims (
+           message_id TEXT NOT NULL REFERENCES custody_outbox(message_id) ON DELETE RESTRICT,
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           owner_ref TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('active', 'released')),
+           acquired_at TEXT NOT NULL,
+           expires_at TEXT NOT NULL,
+           released_at TEXT,
+           PRIMARY KEY(message_id, epoch)
+         );
+         CREATE TABLE custody_inbox (
+           message_id TEXT PRIMARY KEY,
+           identity_json BLOB NOT NULL,
+           identity_digest TEXT NOT NULL,
+           rebind_epoch INTEGER NOT NULL CHECK(rebind_epoch > 0),
+           target_machine_ref TEXT NOT NULL,
+           target_incarnation_ref TEXT NOT NULL,
+           target_route_ref TEXT NOT NULL,
+           terminal_adapter TEXT NOT NULL,
+           authority_digest TEXT NOT NULL,
+           transfer_digest TEXT NOT NULL,
+           transport_auth_digest TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('received', 'processing', 'processed',
+                                               'cancelled', 'superseded')),
+           custody_receipt_digest TEXT NOT NULL,
+           effect_digest TEXT,
+           processed_receipt_digest TEXT,
+           processed_receipt_json BLOB,
+           received_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           processed_at TEXT,
+           CHECK(length(identity_digest) = 64 AND identity_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(length(transfer_digest) = 64 AND transfer_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(length(transport_auth_digest) = 64 AND transport_auth_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(length(custody_receipt_digest) = 64 AND custody_receipt_digest NOT GLOB '*[^0-9a-f]*'),
+           CHECK(effect_digest IS NULL OR
+                 (length(effect_digest) = 64 AND effect_digest NOT GLOB '*[^0-9a-f]*')),
+           CHECK(processed_receipt_digest IS NULL OR
+                 (length(processed_receipt_digest) = 64 AND
+                  processed_receipt_digest NOT GLOB '*[^0-9a-f]*')),
+           CHECK((state = 'processed' AND effect_digest IS NOT NULL AND
+                  processed_receipt_digest IS NOT NULL AND
+                  processed_receipt_json IS NOT NULL AND processed_at IS NOT NULL) OR
+                 (state != 'processed' AND effect_digest IS NULL AND
+                  processed_receipt_digest IS NULL AND
+                  processed_receipt_json IS NULL AND processed_at IS NULL))
+         );
+         CREATE TABLE custody_inbox_claims (
+           message_id TEXT NOT NULL REFERENCES custody_inbox(message_id) ON DELETE RESTRICT,
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           owner_ref TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('active', 'released')),
+           acquired_at TEXT NOT NULL,
+           expires_at TEXT NOT NULL,
+           released_at TEXT,
+           PRIMARY KEY(message_id, epoch)
+         );
+         CREATE TABLE custody_effects (
+           message_id TEXT PRIMARY KEY REFERENCES custody_inbox(message_id) ON DELETE RESTRICT,
+           effect_digest TEXT NOT NULL,
+           applied_at TEXT NOT NULL
+         );
+         CREATE TABLE custody_controls (
+           control_id TEXT PRIMARY KEY,
+           message_id TEXT NOT NULL,
+           identity_digest TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK(kind IN ('cancelled', 'superseded')),
+           successor_message_id TEXT,
+           expected_rebind_epoch INTEGER NOT NULL CHECK(expected_rebind_epoch > 0),
+           workstream_revision INTEGER NOT NULL CHECK(workstream_revision > 0),
+           authority_digest TEXT NOT NULL,
+           control_digest TEXT NOT NULL UNIQUE,
+           state TEXT NOT NULL CHECK(state IN ('pending', 'acknowledged')),
+           receipt_digest TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE custody_events (
+           event_id TEXT PRIMARY KEY,
+           message_id TEXT NOT NULL,
+           side TEXT NOT NULL CHECK(side IN ('sender', 'receiver')),
+           sequence INTEGER NOT NULL CHECK(sequence > 0),
+           kind TEXT NOT NULL,
+           evidence_digest TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           UNIQUE(message_id, side, sequence)
+         );
+         CREATE INDEX custody_outbox_state ON custody_outbox(state, updated_at, message_id);
+         CREATE INDEX custody_inbox_state ON custody_inbox(state, updated_at, message_id);
+         CREATE TRIGGER custody_outbox_identity_immutable
+         BEFORE UPDATE OF wake_id, identity_json, identity_digest ON custody_outbox
+         BEGIN SELECT RAISE(ABORT, 'custody outbox identity is immutable'); END;
+         CREATE TRIGGER custody_rebind_immutable BEFORE UPDATE ON custody_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody rebinds are immutable'); END;
+         CREATE TRIGGER custody_rebind_no_delete BEFORE DELETE ON custody_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody rebinds cannot be deleted'); END;
+         CREATE TRIGGER custody_inbox_identity_immutable
+         BEFORE UPDATE OF identity_json, identity_digest, rebind_epoch,
+                          target_machine_ref, target_incarnation_ref, target_route_ref,
+                          terminal_adapter, authority_digest, transfer_digest,
+                          transport_auth_digest, custody_receipt_digest ON custody_inbox
+         BEGIN SELECT RAISE(ABORT, 'custody inbox identity is immutable'); END;
+         CREATE TRIGGER custody_inbox_processed_receipt_immutable
+         BEFORE UPDATE OF effect_digest, processed_receipt_digest,
+                          processed_receipt_json, processed_at ON custody_inbox
+         WHEN OLD.processed_receipt_digest IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'custody processed receipt is immutable'); END;
+         CREATE TRIGGER custody_effect_immutable BEFORE UPDATE ON custody_effects
+         BEGIN SELECT RAISE(ABORT, 'custody effects are immutable'); END;
+         CREATE TRIGGER custody_effect_no_delete BEFORE DELETE ON custody_effects
+         BEGIN SELECT RAISE(ABORT, 'custody effects cannot be deleted'); END;
+         CREATE TRIGGER custody_control_identity_immutable
+         BEFORE UPDATE OF message_id, identity_digest, kind, successor_message_id,
+                          expected_rebind_epoch, workstream_revision, authority_digest,
+                          control_digest ON custody_controls
+         BEGIN SELECT RAISE(ABORT, 'custody controls are immutable'); END;
+         CREATE TRIGGER custody_control_no_delete BEFORE DELETE ON custody_controls
+         BEGIN SELECT RAISE(ABORT, 'custody controls cannot be deleted'); END;
+         CREATE TRIGGER custody_event_immutable BEFORE UPDATE ON custody_events
+         BEGIN SELECT RAISE(ABORT, 'custody events are immutable'); END;
+         CREATE TRIGGER custody_event_no_delete BEFORE DELETE ON custody_events
+         BEGIN SELECT RAISE(ABORT, 'custody events cannot be deleted'); END;",
+    )?;
     Ok(())
 }
 
@@ -1501,6 +1686,9 @@ fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()
     }
     if schema_version(connection)? < 5 {
         return Ok(());
+    }
+    if schema_version(connection)? >= 9 {
+        super::durable_custody::validate_persisted_custody(connection)?;
     }
     let invalid_object_names: i64 = connection.query_row(
         "SELECT COUNT(*) FROM protected_objects
