@@ -22,8 +22,7 @@ use crate::reconcile::{
     ProvenancedFetchError, ReconcileFetchError,
     fetch_head_and_provenanced_status_check_rollup_for_repo_with_client,
 };
-use crate::work_ledger::ShadowPrTarget;
-use crate::work_ledger::WorkLedger;
+use crate::work_ledger::{CompatibilityFailureClassification, ShadowPrTarget, WorkLedger};
 
 mod health;
 
@@ -70,6 +69,8 @@ struct ShadowBaselineEntry {
     snapshot_digest: Option<String>,
     failure_class: Option<String>,
     policy_revision: Option<u64>,
+    #[serde(default)]
+    compatibility_capture_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -80,6 +81,8 @@ struct ShadowObserverBaseline {
     snapshots: BTreeMap<(String, u64, String), String>,
     #[serde(skip)]
     failed_targets: BTreeMap<(String, u64, String), (String, u64)>,
+    #[serde(skip)]
+    compatibility_captures: BTreeMap<(String, u64, String), String>,
 }
 
 /// Why one bounded observation pass was scheduled.
@@ -135,6 +138,8 @@ pub struct ShadowObservation {
     pub compatibility_mode: String,
     /// Rule that alone permits cross-lane blocking in a later active phase.
     pub blocking_rule: String,
+    /// Failed compatibility platforms captured for asynchronous, non-rerunning work.
+    pub compatibility_failures: Vec<CompatibilityFailureClassification>,
 }
 
 /// Transition kind emitted by the read-only observer.
@@ -143,6 +148,8 @@ pub struct ShadowObservation {
 pub enum ShadowObservationTransitionKind {
     /// A previously observed exact snapshot changed.
     SnapshotChanged,
+    /// The initial exact baseline already contains compatibility failures.
+    CompatibilityFailureCaptured,
     /// One exact target changed from observable or unknown to fetch-failed.
     FetchFailed,
     /// A previously failed target became observable again.
@@ -238,6 +245,7 @@ pub struct ShadowScheduler {
     in_flight: bool,
     snapshots: BTreeMap<(String, u64, String), String>,
     failed_targets: BTreeMap<(String, u64, String), (String, u64)>,
+    compatibility_captures: BTreeMap<(String, u64, String), String>,
     target_cooldowns: BTreeMap<(String, u64, String), Instant>,
     api_window: VecDeque<(Instant, usize)>,
 }
@@ -309,6 +317,7 @@ impl ShadowDaemonLane {
             Ok(baseline) => {
                 scheduler.snapshots = baseline.snapshots;
                 scheduler.failed_targets = baseline.failed_targets;
+                scheduler.compatibility_captures = baseline.compatibility_captures;
                 None
             }
             Err(error) => {
@@ -516,14 +525,17 @@ impl ShadowDaemonLane {
         });
         let prior_snapshots = self.scheduler.snapshots.clone();
         let prior_failed_targets = self.scheduler.failed_targets.clone();
+        let prior_compatibility_captures = self.scheduler.compatibility_captures.clone();
         let transitions = self.scheduler.finish_pass_at(report, now);
         if let Err(error) = save_observer_baseline(
             &self.baseline_path,
             &self.scheduler.snapshots,
             &self.scheduler.failed_targets,
+            &self.scheduler.compatibility_captures,
         ) {
             self.scheduler.snapshots = prior_snapshots;
             self.scheduler.failed_targets = prior_failed_targets;
+            self.scheduler.compatibility_captures = prior_compatibility_captures;
             eprintln!("shipyard daemon: shadow baseline persistence failed: {error}");
             let failed_at = epoch_seconds();
             self.update_health(|health| {
@@ -668,6 +680,7 @@ impl ShadowScheduler {
             in_flight: false,
             snapshots: BTreeMap::new(),
             failed_targets: BTreeMap::new(),
+            compatibility_captures: BTreeMap::new(),
             target_cooldowns: BTreeMap::new(),
             api_window: VecDeque::new(),
         }
@@ -851,6 +864,8 @@ impl ShadowScheduler {
             .collect::<BTreeSet<_>>();
         self.snapshots.retain(|key, _| live.contains(key));
         self.failed_targets.retain(|key, _| live.contains(key));
+        self.compatibility_captures
+            .retain(|key, _| live.contains(key));
         self.target_cooldowns.retain(|key, _| live.contains(key));
     }
 
@@ -880,6 +895,27 @@ impl ShadowScheduler {
                 observation.expected_head_sha.clone(),
             );
             let recovered = self.failed_targets.remove(&key).is_some();
+            let new_compatibility_capture = if observation.compatibility_failures.is_empty() {
+                self.compatibility_captures.remove(&key);
+                false
+            } else {
+                let changed =
+                    self.compatibility_captures.get(&key) != Some(&observation.snapshot_digest);
+                self.compatibility_captures
+                    .insert(key.clone(), observation.snapshot_digest.clone());
+                changed
+            };
+            let compatibility_transition =
+                new_compatibility_capture.then(|| ShadowObservationTransition {
+                    kind: ShadowObservationTransitionKind::CompatibilityFailureCaptured,
+                    repo: key.0.clone(),
+                    pr: key.1,
+                    expected_head_sha: key.2.clone(),
+                    policy_revision: observation.policy_revision,
+                    observation: Some(observation.clone()),
+                    previous_snapshot_digest: None,
+                    failure_class: None,
+                });
             match self
                 .snapshots
                 .insert(key.clone(), observation.snapshot_digest.clone())
@@ -908,6 +944,9 @@ impl ShadowScheduler {
                 }
                 _ => {}
             }
+            if let Some(transition) = compatibility_transition {
+                transitions.push(transition);
+            }
         }
         for failure in &report.failures {
             let key = (
@@ -915,6 +954,7 @@ impl ShadowScheduler {
                 failure.pr,
                 failure.expected_head_sha.clone(),
             );
+            self.compatibility_captures.remove(&key);
             let class_changed = self
                 .failed_targets
                 .insert(
@@ -1263,10 +1303,22 @@ fn load_observer_baseline(path: &Path) -> Result<ShadowObserverBaseline, String>
             (Some(class), Some(revision)) => !class.is_empty() && revision > 0,
             _ => false,
         };
+        let valid_compatibility_capture =
+            entry
+                .compatibility_capture_digest
+                .as_ref()
+                .is_none_or(|digest| {
+                    Some(digest) == entry.snapshot_digest.as_ref()
+                        && digest.len() == 64
+                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
         if !valid_identity
             || !valid_snapshot
             || !valid_failure
-            || (entry.snapshot_digest.is_none() && entry.failure_class.is_none())
+            || !valid_compatibility_capture
+            || (entry.snapshot_digest.is_none()
+                && entry.failure_class.is_none()
+                && entry.compatibility_capture_digest.is_none())
             || !seen.insert(key.clone())
         {
             return Err("invalid shadow observer baseline entry".to_owned());
@@ -1277,7 +1329,10 @@ fn load_observer_baseline(path: &Path) -> Result<ShadowObserverBaseline, String>
         if let (Some(class), Some(revision)) = (&entry.failure_class, entry.policy_revision) {
             baseline
                 .failed_targets
-                .insert(key, (class.clone(), revision));
+                .insert(key.clone(), (class.clone(), revision));
+        }
+        if let Some(digest) = &entry.compatibility_capture_digest {
+            baseline.compatibility_captures.insert(key, digest.clone());
         }
     }
     Ok(baseline)
@@ -1287,10 +1342,12 @@ fn save_observer_baseline(
     path: &Path,
     snapshots: &BTreeMap<(String, u64, String), String>,
     failed_targets: &BTreeMap<(String, u64, String), (String, u64)>,
+    compatibility_captures: &BTreeMap<(String, u64, String), String>,
 ) -> Result<(), String> {
     let keys = snapshots
         .keys()
         .chain(failed_targets.keys())
+        .chain(compatibility_captures.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
     let entries = keys
@@ -1302,6 +1359,7 @@ fn save_observer_baseline(
             snapshot_digest: snapshots.get(&key).cloned(),
             failure_class: failed_targets.get(&key).map(|value| value.0.clone()),
             policy_revision: failed_targets.get(&key).map(|value| value.1),
+            compatibility_capture_digest: compatibility_captures.get(&key).cloned(),
         })
         .collect();
     let baseline = ShadowObserverBaseline {
@@ -1309,6 +1367,7 @@ fn save_observer_baseline(
         entries,
         snapshots: BTreeMap::new(),
         failed_targets: BTreeMap::new(),
+        compatibility_captures: BTreeMap::new(),
     };
     let parent = path
         .parent()
@@ -1399,6 +1458,11 @@ fn observation(
     normalized.sort_unstable();
     let (mut pending_checks, mut passed_checks, mut failed_checks) = check_counts(&normalized);
     let exact_head = observed_head_sha == target.head_sha;
+    let compatibility_failures = if exact_head {
+        classify_compatibility_failures(&target.policy, &normalized)
+    } else {
+        Vec::new()
+    };
     if !exact_head {
         pending_checks = 0;
         passed_checks = 0;
@@ -1458,6 +1522,56 @@ fn observation(
         primary_platform: target.policy.primary_platform.clone(),
         compatibility_mode: target.policy.compatibility_mode.clone(),
         blocking_rule: target.policy.blocking_rule.clone(),
+        compatibility_failures,
+    }
+}
+
+fn classify_compatibility_failures(
+    policy: &crate::work_ledger::RepoPolicy,
+    checks: &[(&str, &str, &str, &str, &str, String)],
+) -> Vec<CompatibilityFailureClassification> {
+    let mut failed_by_lane = BTreeMap::<&str, u64>::new();
+    for (_, name, status, conclusion, state, _) in checks {
+        let Some(lane) = check_platform(name) else {
+            continue;
+        };
+        if check_is_failed(status, conclusion, state)
+            && policy
+                .compatibility_lanes
+                .binary_search_by(|known| known.as_str().cmp(lane))
+                .is_ok()
+        {
+            *failed_by_lane.entry(lane).or_default() += 1;
+        }
+    }
+    failed_by_lane
+        .into_iter()
+        .filter_map(|(lane, failed_checks)| {
+            policy.capture_compatibility_failure(lane, failed_checks)
+        })
+        .collect()
+}
+
+fn check_platform(name: &str) -> Option<&'static str> {
+    let tokens = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>();
+    let linux = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "linux" | "ubuntu"));
+    let macos = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "macos" | "darwin"));
+    let windows = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "windows" | "win32" | "msvc"));
+    match (linux, macos, windows) {
+        (true, false, false) => Some("linux"),
+        (false, true, false) => Some("macos"),
+        (false, false, true) => Some("windows"),
+        _ => None,
     }
 }
 
@@ -1466,26 +1580,39 @@ fn check_counts(checks: &[(&str, &str, &str, &str, &str, String)]) -> (u64, u64,
     let mut passed = 0;
     let mut failed = 0;
     for (_, _, status, conclusion, state, _) in checks {
-        let status = status.to_ascii_uppercase();
-        let state = state.to_ascii_uppercase();
-        let conclusion = conclusion.to_ascii_uppercase();
-        if matches!(
-            status.as_str(),
-            "QUEUED" | "PENDING" | "IN_PROGRESS" | "REQUESTED" | "WAITING"
-        ) || matches!(
-            state.as_str(),
-            "EXPECTED" | "QUEUED" | "PENDING" | "IN_PROGRESS"
-        ) {
+        if check_is_pending(status, state) {
             pending += 1;
-        } else if matches!(conclusion.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED")
-            || state == "SUCCESS"
-        {
+        } else if check_is_passed(conclusion, state) {
             passed += 1;
-        } else if !conclusion.is_empty() || matches!(state.as_str(), "ERROR" | "FAILURE") {
+        } else if check_is_failed(status, conclusion, state) {
             failed += 1;
         }
     }
     (pending, passed, failed)
+}
+
+fn check_is_pending(status: &str, state: &str) -> bool {
+    matches!(
+        status.to_ascii_uppercase().as_str(),
+        "QUEUED" | "PENDING" | "IN_PROGRESS" | "REQUESTED" | "WAITING"
+    ) || matches!(
+        state.to_ascii_uppercase().as_str(),
+        "EXPECTED" | "QUEUED" | "PENDING" | "IN_PROGRESS"
+    )
+}
+
+fn check_is_passed(conclusion: &str, state: &str) -> bool {
+    matches!(
+        conclusion.to_ascii_uppercase().as_str(),
+        "SUCCESS" | "NEUTRAL" | "SKIPPED"
+    ) || state.eq_ignore_ascii_case("SUCCESS")
+}
+
+fn check_is_failed(status: &str, conclusion: &str, state: &str) -> bool {
+    !check_is_pending(status, state)
+        && !check_is_passed(conclusion, state)
+        && (!conclusion.is_empty()
+            || matches!(state.to_ascii_uppercase().as_str(), "ERROR" | "FAILURE"))
 }
 
 fn check_producer_identity(check: &Value) -> String {
@@ -1728,6 +1855,7 @@ mod tests {
             &path,
             &before_restart.snapshots,
             &before_restart.failed_targets,
+            &before_restart.compatibility_captures,
         )
         .expect("persist baseline");
 
@@ -1735,6 +1863,7 @@ mod tests {
         let mut after_restart = ShadowScheduler::new(Instant::now());
         after_restart.snapshots = restored.snapshots;
         after_restart.failed_targets = restored.failed_targets;
+        after_restart.compatibility_captures = restored.compatibility_captures;
         let changed = observe_targets_with(
             ShadowTrigger::PeriodicCatchUp,
             std::slice::from_ref(&expected),
@@ -1778,6 +1907,7 @@ mod tests {
             &path,
             &before_restart.snapshots,
             &before_restart.failed_targets,
+            &before_restart.compatibility_captures,
         )
         .expect("persist failed baseline");
 
@@ -1785,6 +1915,7 @@ mod tests {
         let mut after_restart = ShadowScheduler::new(Instant::now());
         after_restart.snapshots = restored.snapshots;
         after_restart.failed_targets = restored.failed_targets;
+        after_restart.compatibility_captures = restored.compatibility_captures;
         let recovered = observe_targets_with(
             ShadowTrigger::PeriodicCatchUp,
             std::slice::from_ref(&expected),
@@ -2030,6 +2161,259 @@ mod tests {
             initial.observations[0].snapshot_digest,
             swapped.observations[0].snapshot_digest
         );
+    }
+
+    #[test]
+    fn compatibility_failures_are_captured_without_blocking_rerun_or_model_authority() {
+        let expected = target("generous-corp/pulp", 102, 'a');
+        let report = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| {
+                Ok((
+                    expected.head_sha.clone(),
+                    vec![
+                        serde_json::json!({
+                            "__typename": "CheckRun",
+                            "name": "macOS (ARM64)",
+                            "status": "COMPLETED",
+                            "conclusion": "SUCCESS"
+                        }),
+                        serde_json::json!({
+                            "__typename": "CheckRun",
+                            "name": "Linux build",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE"
+                        }),
+                        serde_json::json!({
+                            "__typename": "StatusContext",
+                            "context": "windows-msvc",
+                            "state": "ERROR"
+                        }),
+                        serde_json::json!({
+                            "__typename": "CheckRun",
+                            "name": "Ubuntu queued",
+                            "status": "IN_PROGRESS"
+                        }),
+                        serde_json::json!({
+                            "__typename": "CheckRun",
+                            "name": "linux-windows aggregate",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE"
+                        }),
+                    ],
+                ))
+            },
+        );
+
+        let failures = &report.observations[0].compatibility_failures;
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].lane, "linux");
+        assert_eq!(failures[1].lane, "windows");
+        for failure in failures {
+            assert_eq!(
+                failure.disposition,
+                crate::work_ledger::CompatibilityFailureDisposition::CapturedAsynchronously
+            );
+            assert!(!failure.blocks_primary);
+            assert!(!failure.ci_rerun_allowed);
+            assert_eq!(failure.model_calls, 0);
+            assert_eq!(failure.escalation_kind, None);
+            assert_eq!(failure.escalation_evidence_digest, None);
+        }
+        let mut scheduler = ShadowScheduler::new(Instant::now());
+        let transitions = scheduler.finish_pass(&report);
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].kind,
+            ShadowObservationTransitionKind::CompatibilityFailureCaptured
+        );
+        assert!(scheduler.finish_pass(&report).is_empty());
+
+        let passing = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| {
+                Ok((
+                    expected.head_sha.clone(),
+                    vec![serde_json::json!({
+                        "name": "Linux build",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS"
+                    })],
+                ))
+            },
+        );
+        let mut changed_scheduler = ShadowScheduler::new(Instant::now());
+        assert!(changed_scheduler.finish_pass(&passing).is_empty());
+        let changed = changed_scheduler.finish_pass(&report);
+        assert_eq!(changed.len(), 2);
+        assert_eq!(
+            changed[0].kind,
+            ShadowObservationTransitionKind::SnapshotChanged
+        );
+        assert_eq!(
+            changed[1].kind,
+            ShadowObservationTransitionKind::CompatibilityFailureCaptured
+        );
+    }
+
+    #[test]
+    fn retained_pre_capture_baseline_emits_one_compatibility_transition_after_upgrade() {
+        let state = tempfile::tempdir().expect("state");
+        let path = state.path().join("shadow-observer-baseline.json");
+        let expected = target("generous-corp/pulp", 104, 'a');
+        let report = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| {
+                Ok((
+                    expected.head_sha.clone(),
+                    vec![serde_json::json!({
+                        "name": "Linux build",
+                        "status": "COMPLETED",
+                        "conclusion": "FAILURE"
+                    })],
+                ))
+            },
+        );
+        let key = (
+            expected.repo.clone(),
+            expected.pr,
+            expected.head_sha.clone(),
+        );
+        let snapshots = BTreeMap::from([(key, report.observations[0].snapshot_digest.clone())]);
+        save_observer_baseline(&path, &snapshots, &BTreeMap::new(), &BTreeMap::new())
+            .expect("persist pre-capture baseline");
+
+        let restored = load_observer_baseline(&path).expect("restore pre-capture baseline");
+        let mut scheduler = ShadowScheduler::new(Instant::now());
+        scheduler.snapshots = restored.snapshots;
+        scheduler.compatibility_captures = restored.compatibility_captures;
+        let transitions = scheduler.finish_pass(&report);
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].kind,
+            ShadowObservationTransitionKind::CompatibilityFailureCaptured
+        );
+
+        save_observer_baseline(
+            &path,
+            &scheduler.snapshots,
+            &scheduler.failed_targets,
+            &scheduler.compatibility_captures,
+        )
+        .expect("persist capture marker");
+        let restored = load_observer_baseline(&path).expect("restore capture marker");
+        let mut restarted = ShadowScheduler::new(Instant::now());
+        restarted.snapshots = restored.snapshots;
+        restarted.compatibility_captures = restored.compatibility_captures;
+        assert!(restarted.finish_pass(&report).is_empty());
+    }
+
+    #[test]
+    fn compatibility_capture_reemits_for_changed_snapshot_and_recovery() {
+        let expected = target("generous-corp/pulp", 105, 'a');
+        let report_for = |platform: &str| {
+            observe_targets_with(
+                ShadowTrigger::PeriodicCatchUp,
+                std::slice::from_ref(&expected),
+                |_| {
+                    Ok((
+                        expected.head_sha.clone(),
+                        vec![serde_json::json!({
+                            "name": format!("{platform} build"),
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE"
+                        })],
+                    ))
+                },
+            )
+        };
+        let linux = report_for("Linux");
+        let windows = report_for("Windows");
+        let mut scheduler = ShadowScheduler::new(Instant::now());
+        assert_eq!(scheduler.finish_pass(&linux).len(), 1);
+
+        let changed = scheduler.finish_pass(&windows);
+        assert_eq!(changed.len(), 2);
+        assert_eq!(
+            changed[0].kind,
+            ShadowObservationTransitionKind::SnapshotChanged
+        );
+        assert_eq!(
+            changed[1].kind,
+            ShadowObservationTransitionKind::CompatibilityFailureCaptured
+        );
+
+        let unavailable = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| Err(ReconcileFetchError::Timeout("offline".to_owned())),
+        );
+        assert_eq!(scheduler.finish_pass(&unavailable).len(), 1);
+        let recovered = scheduler.finish_pass(&windows);
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            recovered[0].kind,
+            ShadowObservationTransitionKind::FetchRecovered
+        );
+        assert_eq!(
+            recovered[1].kind,
+            ShadowObservationTransitionKind::CompatibilityFailureCaptured
+        );
+    }
+
+    #[test]
+    fn stale_head_never_classifies_compatibility_failures() {
+        let expected = target("generous-corp/vellum", 103, 'a');
+        let report = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| {
+                Ok((
+                    "b".repeat(40),
+                    vec![serde_json::json!({
+                        "__typename": "CheckRun",
+                        "name": "windows",
+                        "status": "COMPLETED",
+                        "conclusion": "FAILURE"
+                    })],
+                ))
+            },
+        );
+
+        assert!(!report.observations[0].exact_head);
+        assert!(report.observations[0].compatibility_failures.is_empty());
+    }
+
+    #[test]
+    fn explicit_linux_primary_policy_captures_macos_compatibility_failure() {
+        let mut expected = target("generous-corp/forge", 104, 'a');
+        expected.policy.primary_platform = "linux".to_owned();
+        expected.policy.compatibility_lanes = vec!["macos".to_owned(), "windows".to_owned()];
+        expected.policy.revision = 2;
+        let report = observe_targets_with(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&expected),
+            |_| {
+                Ok((
+                    expected.head_sha.clone(),
+                    vec![serde_json::json!({
+                        "__typename": "CheckRun",
+                        "name": "macOS (ARM64)",
+                        "status": "COMPLETED",
+                        "conclusion": "FAILURE"
+                    })],
+                ))
+            },
+        );
+
+        let failures = &report.observations[0].compatibility_failures;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].primary_platform, "linux");
+        assert_eq!(failures[0].lane, "macos");
+        assert!(!failures[0].blocks_primary);
     }
 
     #[test]

@@ -113,8 +113,8 @@ shipyard work-ledger status                         # inspect canonical shadow s
 shipyard work-ledger import                         # deterministic redacted legacy-import plan; no writes
 shipyard work-ledger import --apply                 # idempotently populate shadow storage; no activation/dispatch
 shipyard work-ledger policy list                    # list revision-fenced per-repository lane policy
-shipyard work-ledger policy set --repo generous-corp/forge --primary-platform macos --compatibility-lane linux --compatibility-lane windows
-shipyard work-ledger policy set --repo generous-corp/forge --primary-platform macos --compatibility-lane linux --declared-dependency-lane linux --expected-revision 0 --apply
+shipyard work-ledger policy set --repo generous-corp/forge --primary-platform macos --compatibility-lane linux --compatibility-lane windows --expected-revision 1
+shipyard work-ledger policy set --repo generous-corp/forge --primary-platform macos --compatibility-lane linux --declared-dependency-lane linux --expected-revision 1 --apply
 
 # On the protected base branch, make every `shipyard pr` submission durable
 # immediately after PR creation. A PR branch cannot opt itself in.
@@ -291,21 +291,24 @@ Legacy import is currently supported only on Unix hosts, where the configured
 state directory and every relative component are opened through pinned
 no-follow handles. Windows import is explicitly deferred and does not block
 the macOS stewardship rollout; status and policy surfaces remain available.
-Repository policy is independently revision-fenced. `policy set` requires an
-explicit primary lane (Pulp, Forge, and Vellum use `macos`), an explicit
-repeatable compatibility-lane inventory, and defaults to `independent`
-compatibility scheduling; Linux/Windows may
-block another lane only through the default
-`declared_dependency_or_shared_integrity` rule. Repeat
+Repository policy is independently revision-fenced. Pulp, Forge, and Vellum
+receive a built-in shadow default at revision 1 with primary `macos` and
+independent `linux` and `windows` compatibility lanes. The first explicit
+`policy set` override expects revision 1, becomes revision 2, and leaves the
+other defaults unchanged. Every other repository still begins at revision 0
+and requires explicit enrollment. Repeat
 `--declared-dependency-lane` only for a real artifact dependency; otherwise a
-compatibility lane can block only with evidenced shared-integrity failure.
+routine compatibility failure is captured asynchronously with no primary-lane
+block, CI rerun, or model call. Escalation requires a reviewed SHA-256-bound
+receipt typed as shared persisted-data, cross-platform compilation, or
+cross-platform correctness evidence. This classification is inert; no active
+escalation consumer exists.
 Dry-run is the default and an
 apply with a stale expected revision refuses rather than overwriting a newer
-decision. The shadow observer consumes the policy only as an explicit
-repository-enrollment and evidence seam; it does not make a blocking decision.
+decision. The shadow observer consumes policy as an evidence seam; it does not
+make a rerun or mutation decision.
 Pulp, Forge, and Vellum can revise their macOS-first and compatibility rules
-independently without enabling dispatch. A repository without a policy is not
-observed.
+independently without enabling dispatch.
 An apply-mode repository or GitHub preflight error remains pending without
 spending the attempt, but is durably moved behind untouched pending work so a
 persistently unavailable repository cannot block the machine-global queue.

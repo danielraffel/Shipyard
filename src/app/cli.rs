@@ -2254,6 +2254,8 @@ mod tests {
             "macos",
             "--compatibility-lane",
             "linux",
+            "--expected-revision",
+            "1",
         ])
         .expect("policy plan");
         assert!(matches!(
@@ -2264,7 +2266,7 @@ mod tests {
                         primary_platform,
                         compatibility_mode,
                         blocking_rule,
-                        expected_revision: 0,
+                        expected_revision: 1,
                         apply: false,
                         ..
                     }

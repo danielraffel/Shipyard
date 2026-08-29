@@ -24,10 +24,10 @@ pub struct ShadowPrTarget {
 impl WorkLedger {
     /// Enumerate policy-covered nonterminal PR heads without mutating storage.
     ///
-    /// A repository is deliberately invisible to the scheduler until it has
-    /// an explicit policy row. This keeps Pulp, Forge, and Vellum easy to
-    /// revise independently and prevents an imported repository from silently
-    /// inheriting another project's platform or blocking policy.
+    /// Pulp, Forge, and Vellum use the built-in macOS-first policy until an
+    /// explicit revision-fenced row overrides it. Every other repository is
+    /// deliberately invisible until it has an explicit policy, preventing an
+    /// imported repository from inheriting another project's priorities.
     pub fn shadow_pr_targets(&self) -> WorkLedgerResult<Vec<ShadowPrTarget>> {
         let connection = self.connect_read_only()?;
         verify_supported_schema(&connection)?;
@@ -35,17 +35,24 @@ impl WorkLedger {
 
         let mut statement = connection.prepare(
             "SELECT work_items.repo, work_items.pr, work_items.head_sha, COUNT(*),
-                    repo_policies.primary_platform, repo_policies.compatibility_mode,
-                    repo_policies.compatibility_lanes_json, repo_policies.blocking_rule,
-                    repo_policies.declared_dependency_lanes_json, repo_policies.revision
+                    COALESCE(repo_policies.primary_platform, 'macos'),
+                    COALESCE(repo_policies.compatibility_mode, 'independent'),
+                    COALESCE(repo_policies.compatibility_lanes_json, '[\"linux\",\"windows\"]'),
+                    COALESCE(repo_policies.blocking_rule,
+                             'declared_dependency_or_shared_integrity'),
+                    COALESCE(repo_policies.declared_dependency_lanes_json, '[]'),
+                    COALESCE(repo_policies.revision, 1)
              FROM work_items
-             JOIN repo_policies ON repo_policies.repo = work_items.repo
+             LEFT JOIN repo_policies ON repo_policies.repo = work_items.repo
              WHERE work_items.phase IN (
                        'published', 'ready', 'managed', 'waiting', 'actionable',
                        'dispatching', 'agent_owned_repair', 'returned'
                    )
                AND work_items.pr IS NOT NULL AND work_items.pr > 0
                AND work_items.head_sha IS NOT NULL
+               AND (repo_policies.repo IS NOT NULL OR work_items.repo IN (
+                       'generous-corp/forge', 'generous-corp/pulp', 'generous-corp/vellum'
+                   ))
              GROUP BY work_items.repo, work_items.pr, work_items.head_sha,
                       repo_policies.primary_platform, repo_policies.compatibility_mode,
                       repo_policies.compatibility_lanes_json, repo_policies.blocking_rule,
@@ -124,19 +131,11 @@ mod tests {
     }
 
     fn macos_policy(repo: &str) -> RepoPolicy {
-        RepoPolicy {
-            repo: repo.to_owned(),
-            primary_platform: "macos".to_owned(),
-            compatibility_mode: "independent".to_owned(),
-            compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
-            blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
-            declared_dependency_lanes: Vec::new(),
-            revision: 0,
-        }
+        RepoPolicy::macos_first_default(repo).expect("built-in policy")
     }
 
     #[test]
-    fn targets_are_exact_deduplicated_and_require_explicit_repo_policy() {
+    fn macos_first_defaults_are_exact_deduplicated_and_other_repos_require_policy() {
         let state = tempfile::tempdir().expect("state");
         let ledger = WorkLedger::open(state.path()).expect("ledger");
         let head = "a".repeat(40);
@@ -154,10 +153,6 @@ mod tests {
                 [],
             )
             .expect("native test phase");
-        ledger
-            .set_repo_policy(&macos_policy("generous-corp/pulp"), 0)
-            .expect("policy");
-
         let targets = ledger.shadow_pr_targets().expect("targets");
 
         assert_eq!(targets.len(), 1);
@@ -165,18 +160,17 @@ mod tests {
         assert_eq!(targets[0].pr, 42);
         assert_eq!(targets[0].head_sha, head);
         assert_eq!(targets[0].work_items, 2);
-        assert_eq!(targets[0].policy.primary_platform, "macos");
-        assert_eq!(targets[0].policy.compatibility_mode, "independent");
-        assert!(
-            !targets[0]
-                .policy
-                .compatibility_lane_may_block("linux", false)
+        assert_eq!(
+            targets[0].policy,
+            RepoPolicy::macos_first_default("generous-corp/pulp").expect("default policy")
         );
-        assert!(
-            targets[0]
-                .policy
-                .compatibility_lane_may_block("linux", true)
-        );
+        let failure = targets[0]
+            .policy
+            .classify_compatibility_failure("linux", 1, None)
+            .expect("routine compatibility failure");
+        assert!(!failure.blocks_primary);
+        assert!(!failure.ci_rerun_allowed);
+        assert_eq!(failure.model_calls, 0);
     }
 
     #[test]
@@ -191,9 +185,34 @@ mod tests {
                 "archived-import",
             )])
             .expect("import");
-        ledger
-            .set_repo_policy(&macos_policy("generous-corp/pulp"), 0)
-            .expect("policy");
         assert!(ledger.shadow_pr_targets().expect("targets").is_empty());
+    }
+
+    #[test]
+    fn explicit_policy_overrides_one_builtin_without_changing_the_others() {
+        let state = tempfile::tempdir().expect("state");
+        let ledger = WorkLedger::open(state.path()).expect("ledger");
+        let mut forge = macos_policy("generous-corp/forge");
+        forge.primary_platform = "linux".to_owned();
+        forge.compatibility_lanes = vec!["macos".to_owned(), "windows".to_owned()];
+        ledger.set_repo_policy(&forge, 1).expect("override");
+        ledger
+            .import(&[
+                candidate("generous-corp/forge", 1, &"a".repeat(40), "forge"),
+                candidate("generous-corp/vellum", 2, &"b".repeat(40), "vellum"),
+            ])
+            .expect("import");
+        let connection = ledger.connect_read_write().expect("test connection");
+        connection
+            .execute("UPDATE work_items SET phase = 'managed'", [])
+            .expect("native test phase");
+
+        let targets = ledger.shadow_pr_targets().expect("targets");
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].policy.primary_platform, "linux");
+        assert_eq!(targets[0].policy.revision, 2);
+        assert_eq!(targets[1].policy.primary_platform, "macos");
+        assert_eq!(targets[1].policy.revision, 1);
     }
 }

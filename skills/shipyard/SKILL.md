@@ -1367,17 +1367,20 @@ record with exact generation, revision, and implementation/configuration/
 capability digests. Imported records remain inert until both continuation outcomes exist
 and a legal typed transition records its audit event transactionally.
 Use `shipyard work-ledger policy set` to plan a per-repository platform policy;
-apply requires the exact current revision. The primary platform is explicit
-(use macOS for Pulp, Forge, and Vellum), with a complete repeatable
-`--compatibility-lane` inventory and independent compatibility scheduling.
+apply requires the exact current revision. Pulp, Forge, and Vellum have a
+built-in shadow default at revision 1 with primary macOS and independent Linux
+and Windows compatibility lanes; the first explicit override expects revision
+1, becomes revision 2, and affects only that repository. Other repositories
+remain unenrolled and begin at revision 0 when configured.
 Repeat `--declared-dependency-lane` only for an inventoried lane with a real
-artifact dependency; unknown lanes fail closed and other
-cross-lane blocking requires evidenced shared-integrity fault. A policy row
-enrolls that repository in shadow observation and is attached to evidence, but
-cannot influence GitHub or queue state in the current phase. Keep separate
-revision-fenced rows for `generous-corp/pulp`, `generous-corp/forge`, and
-`generous-corp/vellum`; change one row when a repository needs a different
-platform or dependency rule rather than changing a fleet-wide default.
+artifact dependency; unknown lanes fail closed. Routine Linux and Windows
+failures are typed asynchronous evidence with no primary-lane block, CI rerun,
+or model call. Cross-lane escalation requires a reviewed content-addressed
+receipt typed as shared persisted-data, cross-platform compilation, or
+cross-platform correctness evidence. This is an inert evidence shape; no active
+escalation consumer exists. Policy remains shadow-only and cannot
+influence GitHub or queue state in the current phase. Change one repository row
+when its priority differs rather than changing a fleet-wide default.
 
 The preferred unattended credential has Commit statuses and Issues read/write.
 A local read-oriented GitHub App that receives the exact integration-permission

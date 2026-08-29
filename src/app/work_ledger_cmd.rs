@@ -93,7 +93,10 @@ fn policy_command<W: Write>(
 fn policy_list<W: Write>(state_dir: &Path, json: bool, stdout: &mut W) -> Result<(), CliFailure> {
     let policies = WorkLedger::open_existing(state_dir)
         .map_err(failure)?
-        .map_or_else(|| Ok(Vec::new()), |ledger| ledger.repo_policies())
+        .map_or_else(
+            || Ok(crate::work_ledger::default_repo_policies()),
+            |ledger| ledger.repo_policies(),
+        )
         .map_err(failure)?;
     if json {
         write_pretty_json(
@@ -176,11 +179,13 @@ fn policy_set<W: Write>(
             .map_err(failure)?
             .map_or_else(
                 || {
-                    if *expected_revision != 0 {
+                    if *expected_revision
+                        != crate::work_ledger::absent_policy_revision(&planned.repo)
+                    {
                         return Err(failure("repository policy revision no longer matches"));
                     }
                     let mut next = planned.clone();
-                    next.revision = 1;
+                    next.revision = expected_revision + 1;
                     Ok(next)
                 },
                 |ledger| {
@@ -243,7 +248,7 @@ mod tests {
                 compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
                 blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
                 declared_dependency_lanes: Vec::new(),
-                expected_revision: 0,
+                expected_revision: 1,
                 apply: false,
             },
         ] {
@@ -254,5 +259,34 @@ mod tests {
             assert_eq!(value["activation_enabled"], false);
             assert_eq!(value["dispatch_enabled"], false);
         }
+    }
+
+    #[test]
+    fn policy_json_exposes_builtins_and_plans_first_override_as_revision_two() {
+        let temp = TempDir::new().expect("temp");
+        let mut output = Vec::new();
+        policy_list(temp.path(), true, &mut output).expect("policy list");
+        let listed: Value = serde_json::from_slice(&output).expect("valid list json");
+        assert_eq!(listed["policies"].as_array().map(Vec::len), Some(3));
+
+        output.clear();
+        policy_set(
+            &WorkLedgerPolicyCommand::Set {
+                repo: "generous-corp/forge".to_owned(),
+                primary_platform: "macos".to_owned(),
+                compatibility_mode: "independent".to_owned(),
+                compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                declared_dependency_lanes: Vec::new(),
+                expected_revision: 1,
+                apply: false,
+            },
+            temp.path(),
+            true,
+            &mut output,
+        )
+        .expect("policy plan");
+        let planned: Value = serde_json::from_slice(&output).expect("valid plan json");
+        assert_eq!(planned["policy"]["revision"], 2);
     }
 }

@@ -1097,46 +1097,94 @@ fn repository_policy_is_revision_fenced_and_configurable() {
         compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
         blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
         declared_dependency_lanes: vec!["linux".to_owned()],
-        revision: 0,
+        revision: 1,
     };
-    let first = ledger.set_repo_policy(&initial, 0).expect("first");
-    assert_eq!(first.revision, 1);
-    assert!(first.compatibility_lane_may_block("linux", false));
-    assert!(!first.compatibility_lane_may_block("windows", false));
-    assert!(first.compatibility_lane_may_block("windows", true));
-    assert!(!first.compatibility_lane_may_block("banana", true));
+    let first = ledger.set_repo_policy(&initial, 1).expect("first");
+    assert_eq!(first.revision, 2);
+    for lane in ["linux", "windows"] {
+        let routine = first
+            .classify_compatibility_failure(lane, 1, None)
+            .expect("routine classification");
+        assert_eq!(
+            routine.disposition,
+            CompatibilityFailureDisposition::CapturedAsynchronously
+        );
+        assert!(!routine.blocks_primary);
+        assert!(!routine.ci_rerun_allowed);
+        assert_eq!(routine.model_calls, 0);
+    }
+    let evidence = PlatformEscalationEvidence {
+        kind: PlatformEscalationKind::CrossPlatformCompilation,
+        evidence_digest: "a".repeat(64),
+    };
+    let escalated = first
+        .classify_compatibility_failure("windows", 2, Some(&evidence))
+        .expect("reviewed escalation");
+    assert_eq!(
+        escalated.disposition,
+        CompatibilityFailureDisposition::SharedEvidenceReviewRequired
+    );
+    assert!(!escalated.blocks_primary);
+    assert!(!escalated.ci_rerun_allowed);
+    assert_eq!(escalated.model_calls, 0);
+    assert!(
+        first
+            .classify_compatibility_failure("banana", 1, None)
+            .is_err()
+    );
+    assert!(
+        first
+            .classify_compatibility_failure("linux", 0, None)
+            .is_err()
+    );
+    let invalid_evidence = PlatformEscalationEvidence {
+        kind: PlatformEscalationKind::SharedPersistedData,
+        evidence_digest: "not-a-digest".to_owned(),
+    };
+    assert!(
+        first
+            .classify_compatibility_failure("linux", 1, Some(&invalid_evidence))
+            .is_err()
+    );
     let mut unknown_lane = initial.clone();
     unknown_lane.declared_dependency_lanes = vec!["banana".to_owned()];
-    assert!(validate_repo_policy(&unknown_lane, 0).is_err());
+    assert!(validate_repo_policy(&unknown_lane, 1).is_err());
     let mut unknown_compatibility = initial.clone();
     unknown_compatibility.compatibility_lanes = vec!["banana".to_owned()];
     unknown_compatibility.declared_dependency_lanes.clear();
-    assert!(validate_repo_policy(&unknown_compatibility, 0).is_err());
+    assert!(validate_repo_policy(&unknown_compatibility, 1).is_err());
     let mut unknown_primary = initial.clone();
     unknown_primary.primary_platform = "banana".to_owned();
-    assert!(validate_repo_policy(&unknown_primary, 0).is_err());
+    assert!(validate_repo_policy(&unknown_primary, 1).is_err());
     let mut whitespace_repo = initial.clone();
     whitespace_repo.repo = "owner/ repo".to_owned();
-    assert!(validate_repo_policy(&whitespace_repo, 0).is_err());
+    assert!(validate_repo_policy(&whitespace_repo, 1).is_err());
     assert!(ledger.plan_repo_policy(&initial, 0).is_err());
     let mut current = initial.clone();
-    current.revision = 1;
+    current.revision = 2;
     assert_eq!(
         ledger
-            .plan_repo_policy(&current, 1)
+            .plan_repo_policy(&current, 2)
             .expect("current plan")
             .revision,
-        2
+        3
     );
     assert!(ledger.set_repo_policy(&initial, 0).is_err());
 
     let changed = RepoPolicy {
         compatibility_mode: "blocking".to_owned(),
         blocking_rule: "all".to_owned(),
-        revision: 1,
+        revision: 2,
         ..first
     };
-    let second = ledger.set_repo_policy(&changed, 1).expect("second");
-    assert_eq!(second.revision, 2);
-    assert_eq!(ledger.repo_policies().expect("policies"), vec![second]);
+    let second = ledger.set_repo_policy(&changed, 2).expect("second");
+    assert_eq!(second.revision, 3);
+    assert_eq!(
+        ledger
+            .repo_policies()
+            .expect("policies")
+            .into_iter()
+            .find(|policy| policy.repo == "generous-corp/forge"),
+        Some(second)
+    );
 }

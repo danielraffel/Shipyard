@@ -7,6 +7,71 @@ use super::{
 };
 
 const SUPPORTED_POLICY_PLATFORMS: &[&str] = &["linux", "macos", "windows"];
+const MACOS_FIRST_REPOSITORIES: &[&str] = &[
+    "generous-corp/forge",
+    "generous-corp/pulp",
+    "generous-corp/vellum",
+];
+const BUILTIN_POLICY_REVISION: u64 = 1;
+
+/// Reviewed evidence that a compatibility failure also affects the primary lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformEscalationKind {
+    /// A shared persisted artifact or state format is invalid across lanes.
+    SharedPersistedData,
+    /// The same source fails to compile on more than one platform family.
+    CrossPlatformCompilation,
+    /// The same correctness invariant fails on more than one platform family.
+    CrossPlatformCorrectness,
+}
+
+/// Content-addressed evidence authorizing a cross-lane escalation review.
+#[allow(dead_code)] // Activated only after a protected receipt verifier lands.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PlatformEscalationEvidence {
+    /// Narrow reason that the compatibility failure is relevant to the primary lane.
+    pub(crate) kind: PlatformEscalationKind,
+    /// SHA-256 of the reviewed evidence receipt; raw logs are never embedded.
+    pub(crate) evidence_digest: String,
+}
+
+/// Zero-model disposition for one failed compatibility platform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityFailureDisposition {
+    /// Retain the failure for asynchronous repair without blocking the primary lane.
+    CapturedAsynchronously,
+    /// Surface claimed shared evidence for review without granting block authority.
+    SharedEvidenceReviewRequired,
+}
+
+/// Typed, non-executing classification of one compatibility-lane failure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CompatibilityFailureClassification {
+    /// Canonical repository whose policy produced the decision.
+    pub repo: String,
+    /// Exact repository-policy revision.
+    pub policy_revision: u64,
+    /// Primary platform protected from routine compatibility failures.
+    pub primary_platform: String,
+    /// Failed compatibility platform.
+    pub lane: String,
+    /// Number of failed checks represented by this classification.
+    pub failed_checks: u64,
+    /// Deterministic disposition.
+    pub disposition: CompatibilityFailureDisposition,
+    /// Always false until a later protected receipt verifier grants authority.
+    pub blocks_primary: bool,
+    /// Routine classification never authorizes a CI rerun.
+    pub ci_rerun_allowed: bool,
+    /// Routine classification never invokes a model.
+    pub model_calls: u64,
+    /// Reviewed escalation kind, absent on the routine asynchronous path.
+    pub escalation_kind: Option<PlatformEscalationKind>,
+    /// Digest of reviewed evidence, absent on the routine asynchronous path.
+    pub escalation_evidence_digest: Option<String>,
+}
 
 /// Revision-fenced repository scheduling policy stored in the shadow ledger.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -28,35 +93,101 @@ pub struct RepoPolicy {
 }
 
 impl RepoPolicy {
-    /// Evaluate whether one compatibility lane may block the primary lane.
+    /// Return the built-in macOS-first shadow policy for Pulp, Forge, or Vellum.
+    ///
+    /// An explicit revision-fenced policy row always overrides this default, so
+    /// each repository can change independently without changing fleet policy.
     #[must_use]
-    pub fn compatibility_lane_may_block(
+    pub fn macos_first_default(repo: &str) -> Option<Self> {
+        MACOS_FIRST_REPOSITORIES
+            .binary_search(&repo)
+            .ok()
+            .map(|_| Self {
+                repo: repo.to_owned(),
+                primary_platform: "macos".to_owned(),
+                compatibility_mode: "independent".to_owned(),
+                compatibility_lanes: vec!["linux".to_owned(), "windows".to_owned()],
+                blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                declared_dependency_lanes: Vec::new(),
+                revision: BUILTIN_POLICY_REVISION,
+            })
+    }
+
+    /// Classify one compatibility-platform failure without dispatching work.
+    ///
+    /// Missing evidence always takes the asynchronous path. The three typed
+    /// shared-evidence classes surface a review candidate, but remain
+    /// non-blocking until a later protected verifier authenticates the receipt.
+    #[allow(dead_code)] // Activated only after a protected receipt verifier lands.
+    pub(crate) fn classify_compatibility_failure(
         &self,
         lane: &str,
-        shared_integrity_evidence: bool,
-    ) -> bool {
-        if self
-            .compatibility_lanes
-            .binary_search_by(|known| known.as_str().cmp(lane))
-            .is_err()
+        failed_checks: u64,
+        escalation: Option<&PlatformEscalationEvidence>,
+    ) -> WorkLedgerResult<CompatibilityFailureClassification> {
+        let mut classification = self
+            .capture_compatibility_failure(lane, failed_checks)
+            .ok_or_else(|| {
+                WorkLedgerError::Refused(
+                    "compatibility failure requires a known lane and positive failed-check count"
+                        .to_owned(),
+                )
+            })?;
+        if let Some(evidence) = escalation {
+            validate_evidence_digest(&evidence.evidence_digest)?;
+            classification.disposition =
+                CompatibilityFailureDisposition::SharedEvidenceReviewRequired;
+            classification.escalation_kind = Some(evidence.kind);
+            classification.escalation_evidence_digest = Some(evidence.evidence_digest.clone());
+        }
+        Ok(classification)
+    }
+
+    pub(crate) fn capture_compatibility_failure(
+        &self,
+        lane: &str,
+        failed_checks: u64,
+    ) -> Option<CompatibilityFailureClassification> {
+        if failed_checks == 0
+            || self
+                .compatibility_lanes
+                .binary_search_by(|known| known.as_str().cmp(lane))
+                .is_err()
         {
-            return false;
+            return None;
         }
-        match self.blocking_rule.as_str() {
-            "all" => self.compatibility_mode == "blocking",
-            "declared_dependency_or_shared_integrity" => {
-                self.declared_dependency_lanes
-                    .iter()
-                    .any(|declared| declared == lane)
-                    || shared_integrity_evidence
-            }
-            _ => false,
-        }
+        Some(CompatibilityFailureClassification {
+            repo: self.repo.clone(),
+            policy_revision: self.revision,
+            primary_platform: self.primary_platform.clone(),
+            lane: lane.to_owned(),
+            failed_checks,
+            disposition: CompatibilityFailureDisposition::CapturedAsynchronously,
+            blocks_primary: false,
+            ci_rerun_allowed: false,
+            model_calls: 0,
+            escalation_kind: None,
+            escalation_evidence_digest: None,
+        })
     }
 }
 
+fn validate_evidence_digest(digest: &str) -> WorkLedgerResult<()> {
+    if digest.len() != 64
+        || digest != digest.to_ascii_lowercase()
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(WorkLedgerError::Refused(
+            "platform escalation evidence requires a lowercase SHA-256 digest".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 impl WorkLedger {
-    /// List repository policies in deterministic repository order.
+    /// List effective repository policies in deterministic repository order.
+    ///
+    /// Explicit rows override the built-in Pulp, Forge, and Vellum defaults.
     pub fn repo_policies(&self) -> WorkLedgerResult<Vec<RepoPolicy>> {
         let connection = self.connect_read_only()?;
         verify_supported_schema(&connection)?;
@@ -92,7 +223,14 @@ impl WorkLedger {
                 revision: row.get(6)?,
             })
         })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let mut policies = default_repo_policies()
+            .into_iter()
+            .map(|policy| (policy.repo.clone(), policy))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for policy in rows.collect::<Result<Vec<_>, _>>()? {
+            policies.insert(policy.repo.clone(), policy);
+        }
+        Ok(policies.into_values().collect())
     }
 
     /// Insert or revise one repository policy under an exact revision fence.
@@ -113,7 +251,21 @@ impl WorkLedger {
         verify_integrity(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let next_revision = expected_revision + 1;
-        let changed = if expected_revision == 0 {
+        let current: Option<u64> = transaction
+            .query_row(
+                "SELECT revision FROM repo_policies WHERE repo = ?1",
+                [&policy.repo],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let insert = current.is_none() && expected_revision == absent_policy_revision(&policy.repo);
+        let update = current == Some(expected_revision);
+        if !insert && !update {
+            return Err(WorkLedgerError::Refused(
+                "repository policy revision no longer matches".to_owned(),
+            ));
+        }
+        let changed = if insert {
             transaction.execute(
                 "INSERT OR IGNORE INTO repo_policies
                  (repo, primary_platform, compatibility_mode, compatibility_lanes_json,
@@ -193,10 +345,10 @@ impl WorkLedger {
                 |row| row.get(0),
             )
             .optional()?;
-        let matches = match current {
-            None => expected_revision == 0,
-            Some(revision) => revision == expected_revision && expected_revision != 0,
-        };
+        let matches = current.map_or_else(
+            || expected_revision == absent_policy_revision(&policy.repo),
+            |revision| revision == expected_revision,
+        );
         if !matches {
             return Err(WorkLedgerError::Refused(
                 "repository policy revision no longer matches".to_owned(),
@@ -206,6 +358,21 @@ impl WorkLedger {
         planned.revision = expected_revision + 1;
         Ok(planned)
     }
+}
+
+pub(crate) fn absent_policy_revision(repo: &str) -> u64 {
+    if RepoPolicy::macos_first_default(repo).is_some() {
+        BUILTIN_POLICY_REVISION
+    } else {
+        0
+    }
+}
+
+pub(crate) fn default_repo_policies() -> Vec<RepoPolicy> {
+    MACOS_FIRST_REPOSITORIES
+        .iter()
+        .filter_map(|repo| RepoPolicy::macos_first_default(repo))
+        .collect()
 }
 
 pub(crate) fn validate_repo_policy(
@@ -314,4 +481,46 @@ fn validate_sorted_policy_lanes(
         prior = Some(lane);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_pulp_forge_and_vellum_receive_macos_first_defaults() {
+        for repo in MACOS_FIRST_REPOSITORIES {
+            let policy = RepoPolicy::macos_first_default(repo).expect("default policy");
+            assert_eq!(policy.repo, *repo);
+            assert_eq!(policy.primary_platform, "macos");
+            assert_eq!(policy.compatibility_mode, "independent");
+            assert_eq!(policy.compatibility_lanes, ["linux", "windows"]);
+            assert!(policy.declared_dependency_lanes.is_empty());
+            assert_eq!(policy.revision, BUILTIN_POLICY_REVISION);
+        }
+        assert!(RepoPolicy::macos_first_default("other/repo").is_none());
+        assert!(RepoPolicy::macos_first_default("Generous-Corp/Pulp").is_none());
+    }
+
+    #[test]
+    fn every_reviewed_escalation_kind_is_explicit_and_non_rerunning() {
+        let policy = RepoPolicy::macos_first_default("generous-corp/pulp").expect("policy");
+        for kind in [
+            PlatformEscalationKind::SharedPersistedData,
+            PlatformEscalationKind::CrossPlatformCompilation,
+            PlatformEscalationKind::CrossPlatformCorrectness,
+        ] {
+            let evidence = PlatformEscalationEvidence {
+                kind,
+                evidence_digest: "b".repeat(64),
+            };
+            let classification = policy
+                .classify_compatibility_failure("linux", 3, Some(&evidence))
+                .expect("classification");
+            assert!(!classification.blocks_primary);
+            assert!(!classification.ci_rerun_allowed);
+            assert_eq!(classification.model_calls, 0);
+            assert_eq!(classification.escalation_kind, Some(kind));
+        }
+    }
 }
