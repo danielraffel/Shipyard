@@ -64,7 +64,7 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
     // suite while the 30-second fixture still proves bounded cancellation.
     let timeout = std::time::Duration::from_secs(10);
     let started = std::time::Instant::now();
-    let probes = probe_hosts_concurrently_with_timeout(&classes, timeout);
+    let mut probes = probe_hosts_concurrently_with_timeout(&classes, timeout);
 
     assert!(started.elapsed() < timeout + std::time::Duration::from_secs(5));
     assert_eq!(probes.len(), 2);
@@ -87,6 +87,14 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
         "healthy storage source: {}",
         probes[1].storage.source
     );
+
+    // The concurrency contract above must exercise the real storage probe, but
+    // the pure routability assertion below must not depend on how much disk or
+    // ccache space the CI host happens to have. Normalize only the already-read
+    // healthy observation after proving it completed within the shared bound.
+    probes[1].storage.disk_available_kibibyte = Some(DEFAULT_DISK_FLOOR_KIBIBYTE.saturating_mul(2));
+    probes[1].storage.ccache_size_kibibyte = Some(1);
+    probes[1].storage.ccache_max_kibibyte = Some(2);
 
     let hosts = probes
         .into_iter()

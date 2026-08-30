@@ -1018,6 +1018,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_refresh_executes_verified_binary_with_exact_runtime_context() {
+        let _process_fixture = crate::test_support::PROCESS_TREE_TEST_LOCK
+            .lock()
+            .expect("process fixture lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let binary = temp.path().join("shipyard");
         let args_capture = temp.path().join("args");
@@ -1061,6 +1064,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_refresh_fails_closed_without_exact_typed_receipt() {
+        let _process_fixture = crate::test_support::PROCESS_TREE_TEST_LOCK
+            .lock()
+            .expect("process fixture lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let binary = temp.path().join("shipyard");
         write_executable(
