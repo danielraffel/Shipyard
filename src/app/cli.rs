@@ -1603,6 +1603,16 @@ pub(super) enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum AuthCommand {
+    /// Resolve the release-matched ghapp helper credentials from machine policy.
+    #[command(name = "helper-argv", hide = true)]
+    HelperArgv {
+        /// Absolute path of the ghapp wrapper requesting credentials.
+        #[arg(long)]
+        wrapper: PathBuf,
+        /// Exact repository installation route.
+        #[arg(long)]
+        repo: String,
+    },
     /// Show the effective GitHub auth source Shipyard will use.
     Doctor,
     /// Export sanitized GitHub auth config without tokens or private keys.

@@ -59,7 +59,10 @@ pub(super) fn install_transaction(
     helper_source: &str,
     wrapper_source: &str,
     binary_install_command: &str,
+    mode: &str,
+    global_dir: &Path,
     state_dir: &Path,
+    probe_repo: &str,
     authority: &ReleaseAuthority,
     fail_after_helper_for_test: bool,
 ) -> String {
@@ -68,7 +71,18 @@ pub(super) fn install_transaction(
     let binary = shlex_quote(&binary.display().to_string());
     let companion = shlex_quote(&companion.display().to_string());
     let companion_required = if companion_required { "1" } else { "0" };
+    let context_json = shlex_quote(
+        &serde_json::json!({
+            "schema_version": 1,
+            "mode": mode,
+            "global_dir": global_dir.display().to_string(),
+        })
+        .to_string(),
+    );
+    let mode = shlex_quote(mode);
+    let global_dir = shlex_quote(&global_dir.display().to_string());
     let state_dir = shlex_quote(&state_dir.display().to_string());
+    let probe_repo = shlex_quote(probe_repo);
     let authority_id = shlex_quote(&authority.identity_sha256);
     let helper_digest = shlex_quote(&authority.auth_helper.sha256);
     let wrapper_digest = shlex_quote(&authority.auth_wrapper.sha256);
@@ -83,10 +97,15 @@ pub(super) fn install_transaction(
         r#"
 auth_helper={helper}
 auth_wrapper={wrapper}
+auth_context="$auth_wrapper.shipyard-context.json"
 auth_binary={binary}
 auth_companion={companion}
 auth_companion_required={companion_required}
+auth_mode={mode}
+auth_global_dir={global_dir}
 auth_state_dir={state_dir}
+auth_probe_repo={probe_repo}
+auth_context_json={context_json}
 auth_authority={authority_id}
 auth_helper_digest={helper_digest}
 auth_wrapper_digest={wrapper_digest}
@@ -122,10 +141,10 @@ auth_safe_target() {{
 
 auth_write_phase() {{
   auth_phase_tmp="$(/usr/bin/mktemp "$auth_state_dir/.fleet-auth-support.phase.XXXXXX")"
-  /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+  /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$1" "$auth_authority" "$auth_helper" "$auth_wrapper" "$auth_binary" \
-    "$auth_companion" "$auth_helper_digest" "$auth_wrapper_digest" \
-    "$auth_companion_required" > "$auth_phase_tmp"
+    "$auth_companion" "$auth_context" "$auth_helper_digest" "$auth_wrapper_digest" \
+    "$auth_context_digest" "$auth_companion_required" > "$auth_phase_tmp"
   /bin/chmod 600 "$auth_phase_tmp"
   /bin/mv -f "$auth_phase_tmp" "$auth_journal"
 }}
@@ -135,10 +154,12 @@ auth_cleanup_markers() {{
   auth_cleanup_wrapper="$2"
   auth_cleanup_binary="$3"
   auth_cleanup_companion="$4"
+  auth_cleanup_context="$5"
   /bin/rm -f "$auth_cleanup_helper.shipyard-rollback" "$auth_cleanup_helper.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_wrapper.shipyard-rollback" "$auth_cleanup_wrapper.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_binary.shipyard-rollback" "$auth_cleanup_binary.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_companion.shipyard-rollback" "$auth_cleanup_companion.shipyard-was-absent"
+  if [ -n "$auth_cleanup_context" ]; then /bin/rm -f "$auth_cleanup_context.shipyard-rollback" "$auth_cleanup_context.shipyard-was-absent"; fi
   /bin/rm -f "$auth_journal"
 }}
 
@@ -155,36 +176,53 @@ auth_restore_one() {{
 auth_recover() {{
   test -f "$auth_journal"
   test ! -L "$auth_journal"
-  test "$(/usr/bin/wc -l < "$auth_journal" | /usr/bin/tr -d ' ')" = 9
+  auth_journal_lines="$(/usr/bin/wc -l < "$auth_journal" | /usr/bin/tr -d ' ')"
+  case "$auth_journal_lines" in 9|11) ;; *) return 1 ;; esac
   auth_phase="$(/usr/bin/sed -n '1p' "$auth_journal")"
   auth_recovery_authority="$(/usr/bin/sed -n '2p' "$auth_journal")"
   auth_recovery_helper="$(/usr/bin/sed -n '3p' "$auth_journal")"
   auth_recovery_wrapper="$(/usr/bin/sed -n '4p' "$auth_journal")"
   auth_recovery_binary="$(/usr/bin/sed -n '5p' "$auth_journal")"
   auth_recovery_companion="$(/usr/bin/sed -n '6p' "$auth_journal")"
-  auth_recovery_helper_digest="$(/usr/bin/sed -n '7p' "$auth_journal")"
-  auth_recovery_wrapper_digest="$(/usr/bin/sed -n '8p' "$auth_journal")"
-  auth_recovery_companion_required="$(/usr/bin/sed -n '9p' "$auth_journal")"
+  if [ "$auth_journal_lines" = 11 ]; then
+    auth_recovery_context="$(/usr/bin/sed -n '7p' "$auth_journal")"
+    auth_recovery_helper_digest="$(/usr/bin/sed -n '8p' "$auth_journal")"
+    auth_recovery_wrapper_digest="$(/usr/bin/sed -n '9p' "$auth_journal")"
+    auth_recovery_context_digest="$(/usr/bin/sed -n '10p' "$auth_journal")"
+    auth_recovery_companion_required="$(/usr/bin/sed -n '11p' "$auth_journal")"
+  else
+    auth_recovery_context=
+    auth_recovery_context_digest=
+    auth_recovery_helper_digest="$(/usr/bin/sed -n '7p' "$auth_journal")"
+    auth_recovery_wrapper_digest="$(/usr/bin/sed -n '8p' "$auth_journal")"
+    auth_recovery_companion_required="$(/usr/bin/sed -n '9p' "$auth_journal")"
+  fi
   test -n "$auth_recovery_authority"
   test "$auth_recovery_helper" != "$auth_recovery_wrapper"
   auth_safe_target "$auth_recovery_helper"
   auth_safe_target "$auth_recovery_wrapper"
   auth_safe_target "$auth_recovery_binary"
   auth_safe_target "$auth_recovery_companion"
+  if [ -n "$auth_recovery_context" ]; then auth_safe_target "$auth_recovery_context"; fi
   case "$auth_recovery_companion_required" in 0|1) ;; *) return 1 ;; esac
   if [ "$auth_phase" = committed ]; then
     test "$(/usr/bin/shasum -a 256 "$auth_recovery_helper" | /usr/bin/awk '{{print $1}}')" = "$auth_recovery_helper_digest"
     test "$(/usr/bin/shasum -a 256 "$auth_recovery_wrapper" | /usr/bin/awk '{{print $1}}')" = "$auth_recovery_wrapper_digest"
     test -x "$auth_recovery_binary"
     if [ "$auth_recovery_companion_required" = 1 ]; then test -x "$auth_recovery_companion"; fi
+    if [ -n "$auth_recovery_context" ]; then
+      test "$(/usr/bin/shasum -a 256 "$auth_recovery_context" | /usr/bin/awk '{{print $1}}')" = "$auth_recovery_context_digest"
+      test "$(/usr/bin/stat -f '%Lp' "$auth_recovery_context")" = 600
+    fi
   else
-    case "$auth_phase" in preparing|prepared|helper-installed|auth-installed) ;; *) return 1 ;; esac
+    case "$auth_phase" in preparing|prepared|helper-installed|auth-installed|context-installed) ;; *) return 1 ;; esac
+    if [ -n "$auth_recovery_context" ]; then auth_restore_one "$auth_recovery_context"; fi
     auth_restore_one "$auth_recovery_companion"
     auth_restore_one "$auth_recovery_binary"
     auth_restore_one "$auth_recovery_wrapper"
     auth_restore_one "$auth_recovery_helper"
   fi
-  auth_cleanup_markers "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion"
+  auth_cleanup_markers "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context"
 }}
 
 test -d "$auth_state_dir"
@@ -218,18 +256,20 @@ if ! /bin/chmod 600 "$auth_lock/pid"; then
 fi
 auth_helper_tmp=
 auth_wrapper_tmp=
+auth_context_tmp=
 auth_release_lock() {{ /bin/rm -f "$auth_lock/pid"; /bin/rmdir "$auth_lock"; }}
-auth_release_on_error() {{ auth_status=$?; trap - ERR INT TERM; if [ -n "$auth_helper_tmp" ]; then /bin/rm -f "$auth_helper_tmp"; fi; if [ -n "$auth_wrapper_tmp" ]; then /bin/rm -f "$auth_wrapper_tmp"; fi; auth_release_lock; exit "$auth_status"; }}
+auth_release_on_error() {{ auth_status=$?; trap - ERR INT TERM; if [ -n "$auth_helper_tmp" ]; then /bin/rm -f "$auth_helper_tmp"; fi; if [ -n "$auth_wrapper_tmp" ]; then /bin/rm -f "$auth_wrapper_tmp"; fi; if [ -n "$auth_context_tmp" ]; then /bin/rm -f "$auth_context_tmp"; fi; auth_release_lock; exit "$auth_status"; }}
 trap auth_release_on_error ERR INT TERM
 
 auth_safe_target "$auth_helper"
 auth_safe_target "$auth_wrapper"
 auth_safe_target "$auth_binary"
 auth_safe_target "$auth_companion"
+auth_safe_target "$auth_context"
 auth_recovery_needed=0
 if [ -e "$auth_journal" ] || [ -L "$auth_journal" ]; then auth_recovery_needed=1; fi
 case "$auth_recovery_needed" in 1) auth_recover ;; esac
-for auth_target in "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion"; do
+for auth_target in "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"; do
   test ! -e "$auth_target.shipyard-rollback"
   test ! -L "$auth_target.shipyard-rollback"
   test ! -e "$auth_target.shipyard-was-absent"
@@ -238,9 +278,13 @@ done
 
 auth_helper_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_helper")/.shipyard-auth-helper.XXXXXX")"
 auth_wrapper_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_wrapper")/.shipyard-auth-wrapper.XXXXXX")"
+auth_context_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_context")/.shipyard-auth-context.XXXXXX")"
 /bin/cp "$auth_helper_source" "$auth_helper_tmp"
 /bin/cp "$auth_wrapper_source" "$auth_wrapper_tmp"
 /bin/chmod 700 "$auth_helper_tmp" "$auth_wrapper_tmp"
+/usr/bin/printf '%s\n' "$auth_context_json" > "$auth_context_tmp"
+/bin/chmod 600 "$auth_context_tmp"
+auth_context_digest="$(/usr/bin/shasum -a 256 "$auth_context_tmp" | /usr/bin/awk '{{print $1}}')"
 test "$(/usr/bin/shasum -a 256 "$auth_helper_tmp" | /usr/bin/awk '{{print $1}}')" = "$auth_helper_digest"
 test "$(/usr/bin/shasum -a 256 "$auth_wrapper_tmp" | /usr/bin/awk '{{print $1}}')" = "$auth_wrapper_digest"
 auth_write_phase preparing
@@ -248,12 +292,13 @@ auth_write_phase preparing
 auth_rollback_on_error() {{
   auth_status=$?
   trap - ERR INT TERM
-  auth_restore_one "$auth_wrapper"
-  auth_restore_one "$auth_helper"
+  auth_restore_one "$auth_context"
   auth_restore_one "$auth_companion"
   auth_restore_one "$auth_binary"
-  auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion"
-  /bin/rm -f "$auth_helper_tmp" "$auth_wrapper_tmp"
+  auth_restore_one "$auth_wrapper"
+  auth_restore_one "$auth_helper"
+  auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"
+  /bin/rm -f "$auth_helper_tmp" "$auth_wrapper_tmp" "$auth_context_tmp"
   auth_release_lock
   exit "$auth_status"
 }}
@@ -263,6 +308,7 @@ if [ -e "$auth_helper" ]; then /bin/mv "$auth_helper" "$auth_helper.shipyard-rol
 if [ -e "$auth_wrapper" ]; then /bin/mv "$auth_wrapper" "$auth_wrapper.shipyard-rollback"; else /usr/bin/touch "$auth_wrapper.shipyard-was-absent"; /bin/chmod 600 "$auth_wrapper.shipyard-was-absent"; fi
 if [ -e "$auth_binary" ]; then /bin/cp -p "$auth_binary" "$auth_binary.shipyard-rollback"; else /usr/bin/touch "$auth_binary.shipyard-was-absent"; /bin/chmod 600 "$auth_binary.shipyard-was-absent"; fi
 if [ -e "$auth_companion" ]; then /bin/cp -p "$auth_companion" "$auth_companion.shipyard-rollback"; else /usr/bin/touch "$auth_companion.shipyard-was-absent"; /bin/chmod 600 "$auth_companion.shipyard-was-absent"; fi
+if [ -e "$auth_context" ]; then /bin/mv "$auth_context" "$auth_context.shipyard-rollback"; else /usr/bin/touch "$auth_context.shipyard-was-absent"; /bin/chmod 600 "$auth_context.shipyard-was-absent"; fi
 auth_write_phase prepared
 /bin/mv "$auth_helper_tmp" "$auth_helper"
 auth_write_phase helper-installed
@@ -270,15 +316,20 @@ auth_write_phase helper-installed
 /bin/mv "$auth_wrapper_tmp" "$auth_wrapper"
 auth_write_phase auth-installed
 {binary_install_command}
+/bin/mv "$auth_context_tmp" "$auth_context"
+auth_write_phase context-installed
 test "$(/usr/bin/shasum -a 256 "$auth_helper" | /usr/bin/awk '{{print $1}}')" = "$auth_helper_digest"
 test "$(/usr/bin/shasum -a 256 "$auth_wrapper" | /usr/bin/awk '{{print $1}}')" = "$auth_wrapper_digest"
 test "$(/usr/bin/stat -f '%Lp' "$auth_helper")" = 700
 test "$(/usr/bin/stat -f '%Lp' "$auth_wrapper")" = 700
 test -x "$auth_binary"
 if [ "$auth_companion_required" = 1 ]; then test -x "$auth_companion"; fi
+test "$(/usr/bin/shasum -a 256 "$auth_context" | /usr/bin/awk '{{print $1}}')" = "$auth_context_digest"
+test "$(/usr/bin/stat -f '%Lp' "$auth_context")" = 600
+"$auth_binary" --mode "$auth_mode" --global-dir "$auth_global_dir" auth helper-argv --wrapper "$auth_wrapper" --repo "$auth_probe_repo" >/dev/null
 auth_write_phase committed
 trap - ERR INT TERM
-auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion"
+auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"
 auth_release_lock
 "#
     )
@@ -341,6 +392,29 @@ mod tests {
         authority: &ReleaseAuthority,
         fail_after_helper: bool,
     ) -> std::process::ExitStatus {
+        run_with_probe(
+            root,
+            helper,
+            wrapper,
+            helper_source,
+            wrapper_source,
+            authority,
+            fail_after_helper,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_probe(
+        root: &tempfile::TempDir,
+        helper: &Path,
+        wrapper: &Path,
+        helper_source: &Path,
+        wrapper_source: &Path,
+        authority: &ReleaseAuthority,
+        fail_after_helper: bool,
+        resolver_succeeds: bool,
+    ) -> std::process::ExitStatus {
         let state = root.path().join("Library/Application Support/shipyard");
         let binary = root.path().join(".local/bin/shipyard");
         let companion = root.path().join(".local/bin/shipyard-workstream-provider");
@@ -351,6 +425,12 @@ mod tests {
                     .expect("binary mode");
             }
         }
+        let installed_binary = format!(
+            "/usr/bin/printf '%s\\n' '#!/bin/sh' 'exit {}' > {}; /bin/chmod 700 {}",
+            if resolver_succeeds { 0 } else { 71 },
+            shlex_quote(&binary.display().to_string()),
+            shlex_quote(&binary.display().to_string()),
+        );
         let script = install_transaction(
             helper,
             wrapper,
@@ -359,8 +439,11 @@ mod tests {
             true,
             &shlex_quote(&helper_source.display().to_string()),
             &shlex_quote(&wrapper_source.display().to_string()),
-            ":",
+            &installed_binary,
+            "shipyard",
             &state,
+            &state,
+            "danielraffel/Shipyard",
             authority,
             fail_after_helper,
         );
@@ -393,6 +476,26 @@ mod tests {
         );
         assert_eq!(std::fs::read(&helper).expect("helper"), b"new helper\n");
         assert_eq!(std::fs::read(&wrapper).expect("wrapper"), b"new wrapper\n");
+        let context = wrapper.with_file_name("ghapp.shipyard-context.json");
+        let context_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&context).expect("resolver context"))
+                .expect("typed resolver context");
+        assert_eq!(
+            context_value,
+            serde_json::json!({
+                "schema_version": 1,
+                "mode": "shipyard",
+                "global_dir": root.path().join("Library/Application Support/shipyard"),
+            })
+        );
+        assert_eq!(
+            std::fs::metadata(&context)
+                .expect("context metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         assert_eq!(
             std::fs::metadata(&helper)
                 .expect("metadata")
@@ -436,6 +539,49 @@ mod tests {
         );
         assert_eq!(std::fs::read(&helper).expect("helper"), b"old helper\n");
         assert_eq!(std::fs::read(&wrapper).expect("wrapper"), b"old wrapper\n");
+    }
+
+    #[test]
+    fn post_install_resolver_failure_rolls_back_all_installed_artifacts() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+        let binary = root.path().join(".local/bin/shipyard");
+        let companion = root.path().join(".local/bin/shipyard-workstream-provider");
+        let context = wrapper.with_file_name("ghapp.shipyard-context.json");
+        for (path, contents) in [
+            (&helper, b"old helper\n".as_slice()),
+            (&wrapper, b"old wrapper\n".as_slice()),
+            (&binary, b"old binary\n".as_slice()),
+            (&companion, b"old companion\n".as_slice()),
+        ] {
+            std::fs::write(path, contents).expect("old artifact");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("old mode");
+        }
+        std::fs::write(&context, b"old context\n").expect("old context");
+        std::fs::set_permissions(&context, std::fs::Permissions::from_mode(0o600))
+            .expect("context mode");
+
+        assert!(
+            !run_with_probe(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+                false,
+            )
+            .success()
+        );
+        assert_eq!(std::fs::read(&helper).expect("helper"), b"old helper\n");
+        assert_eq!(std::fs::read(&wrapper).expect("wrapper"), b"old wrapper\n");
+        assert_eq!(std::fs::read(&binary).expect("binary"), b"old binary\n");
+        assert_eq!(std::fs::read(&context).expect("context"), b"old context\n");
+        assert_eq!(
+            std::fs::read(&companion).expect("companion"),
+            b"old companion\n"
+        );
     }
 
     #[test]
@@ -526,6 +672,94 @@ mod tests {
         );
         assert_eq!(std::fs::read(&helper).expect("helper"), b"new helper\n");
         assert_eq!(std::fs::read(&wrapper).expect("wrapper"), b"new wrapper\n");
+    }
+
+    #[test]
+    fn next_release_rolls_back_an_interrupted_context_install() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+        let state = root.path().join("Library/Application Support/shipyard");
+        let binary = root.path().join(".local/bin/shipyard");
+        let companion = root.path().join(".local/bin/shipyard-workstream-provider");
+        let context = wrapper.with_file_name("ghapp.shipyard-context.json");
+        for (path, current, old, mode) in [
+            (
+                &helper,
+                b"new helper\n".as_slice(),
+                b"old helper\n".as_slice(),
+                0o700,
+            ),
+            (
+                &wrapper,
+                b"new wrapper\n".as_slice(),
+                b"old wrapper\n".as_slice(),
+                0o700,
+            ),
+            (
+                &binary,
+                b"new binary\n".as_slice(),
+                b"old binary\n".as_slice(),
+                0o700,
+            ),
+            (
+                &companion,
+                b"new companion\n".as_slice(),
+                b"old companion\n".as_slice(),
+                0o700,
+            ),
+            (
+                &context,
+                b"new context\n".as_slice(),
+                b"old context\n".as_slice(),
+                0o600,
+            ),
+        ] {
+            std::fs::write(path, current).expect("interrupted artifact");
+            std::fs::write(
+                std::path::PathBuf::from(format!("{}.shipyard-rollback", path.display())),
+                old,
+            )
+            .expect("rollback artifact");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("artifact mode");
+        }
+        std::fs::write(
+            state.join("fleet-auth-support.transaction"),
+            format!(
+                "context-installed\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n1\n",
+                "f".repeat(64),
+                helper.display(),
+                wrapper.display(),
+                binary.display(),
+                companion.display(),
+                context.display(),
+                digest(b"new helper\n"),
+                digest(b"new wrapper\n"),
+                digest(b"new context\n"),
+            ),
+        )
+        .expect("current journal");
+
+        assert!(
+            !run(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                true,
+            )
+            .success()
+        );
+        for (path, expected) in [
+            (&helper, b"old helper\n".as_slice()),
+            (&wrapper, b"old wrapper\n".as_slice()),
+            (&binary, b"old binary\n".as_slice()),
+            (&companion, b"old companion\n".as_slice()),
+            (&context, b"old context\n".as_slice()),
+        ] {
+            assert_eq!(std::fs::read(path).expect("restored artifact"), expected);
+        }
     }
 
     #[test]

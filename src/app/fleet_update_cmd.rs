@@ -534,6 +534,15 @@ fn host_update_plan_with_authority(
             ),
         ));
     }
+    if !is_lexically_normal_absolute(&global_dir) || !is_lexically_normal_absolute(&state_dir) {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "host_class.{} daemon global/state directories must be normalized absolute paths",
+                class.class
+            ),
+        ));
+    }
     let auth_wrapper = class.github_cli.as_deref().map(PathBuf::from).ok_or_else(|| {
         CliFailure::new(
             2,
@@ -577,6 +586,17 @@ fn host_update_plan_with_authority(
             ),
         ));
     }
+    if auth_wrapper.parent() != binary.parent()
+        || auth_wrapper.file_name().and_then(|name| name.to_str()) != Some("ghapp")
+    {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "host_class.{} github_cli must be the ghapp sibling of shipyard_bin",
+                class.class
+            ),
+        ));
+    }
     if !is_lexically_normal_absolute(&auth_wrapper) || !is_lexically_normal_absolute(&auth_helper) {
         return Err(CliFailure::new(
             2,
@@ -588,9 +608,11 @@ fn host_update_plan_with_authority(
     }
     let auth_journal = state_dir.join("fleet-auth-support.transaction");
     let auth_lock = state_dir.join("fleet-auth-support.lock");
+    let auth_context = PathBuf::from(format!("{}.shipyard-context.json", auth_wrapper.display()));
     let managed_targets = [
         auth_helper.clone(),
         auth_wrapper.clone(),
+        auth_context,
         binary.clone(),
         companion_binary.clone(),
     ];
@@ -610,7 +632,7 @@ fn host_update_plan_with_authority(
         return Err(CliFailure::new(
             2,
             format!(
-                "host_class.{} auth helper and wrapper paths must not overlap managed binaries or transaction state",
+                "host_class.{} auth support paths must not overlap managed binaries or transaction state",
                 class.class
             ),
         ));

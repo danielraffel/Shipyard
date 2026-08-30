@@ -205,6 +205,24 @@ privileged_git_binary = "/absolute/trusted/path/to/git"
 Use the wrapper's absolute path. That keeps `shipyard auth export` explicit and
 preserves tartci's separately configured `ghapp` command name.
 
+For an installed `ghapp`, this exact eight-element command belongs in the
+machine-global config reported by `shipyard paths`; project and local overlays
+cannot supply or replace its credentials. Direct guarded `ghapp` commands first
+validate the command grammar and exact repository route, then call the
+release-matched sibling `shipyard auth helper-argv` resolver. The resolver
+accepts only the wrapper path shown in `token_command[0]`, `token`, one
+`--app-id` value, one absolute `--private-key` path, and the literal
+`--repo {repo_slug}` placeholder. It rejects `--api-url`, `--cache-dir`,
+`--installation-id`, duplicate, missing, foreign-wrapper, and unknown forms.
+The wrapper decodes the resolver's bounded typed JSON without shell evaluation
+and appends its own GitHub Cloud API, cache, and resolved repository arguments.
+`ghapp token ...` remains the recursion-free helper mode Shipyard invokes from
+that configured command. Fleet-managed wrappers also use the strict 0600
+`ghapp.shipyard-context.json` sibling to preserve the host class's exact runtime
+mode and global directory; a missing context retains the normal Shipyard
+defaults for non-fleet installations, while malformed, open-mode, oversized,
+or symlink contexts fail closed.
+
 The first `token_command` element may remain the fleet's configured `ghapp`
 wrapper path; tartci and host policy can continue referring to that same path.
 Update the wrapper in place on M1/M3/M5 so it forwards `--repo` to this helper
@@ -283,15 +301,20 @@ but `token_command[0]` must remain the host's configured `ghapp` wrapper path:
    native `gh`, keeping token material out of process argv.
    Governed `runner fleet-update` performs this sequence automatically when
    each host class declares absolute `github_cli` and `github_token_helper`
-   paths. The helper path must explicitly equal the frozen wrapper contract,
+   paths. `github_cli` must be named `ghapp` beside the configured `shipyard`
+   binary, and the helper path must explicitly equal the frozen wrapper contract,
    `$HOME/.config/shipyard/bin/shipyard-github-app-token`; fleet rollout checks
-   that before mutation. Its frozen release authority includes both exact source blobs; its
+   both before mutation. Its frozen release authority includes both exact source blobs; its
    private recovery journal rolls back an interrupted helper-first install on
-   the next attempt. It preserves the existing auth configuration and never
+   the next attempt. Before committing the five-artifact transaction, the new
+   binary must resolve the new wrapper against the host class's exact
+   `shipyard_mode` and `shipyard_global_dir`; probe failure restores the prior
+   helper, wrapper, resolver context, Shipyard binary, and companion. It preserves the existing auth configuration and never
    emits a token or private-key value in plan or result evidence.
 3. Remove the fixed installation id and old single cache file from the wrapper.
-   Configure `token_command = ["/absolute/path/to/ghapp", "token", "--repo",
-   "{repo_slug}"]`. Do not replace
+   Configure the exact machine-global shape shown above, including one
+   `--app-id`, one absolute `--private-key`, and literal `--repo
+   {repo_slug}`. Do not add API, cache, or installation-id arguments and do not replace
    `token_command[0]` with a PATH-discovered command.
 4. From a checkout of one repository in each installation, run `shipyard auth
    doctor` and `shipyard doctor --rate-limit`. This resolves the exact checkout

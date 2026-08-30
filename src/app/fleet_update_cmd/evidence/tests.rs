@@ -301,6 +301,7 @@ fn local_evidence_probes_share_the_host_attempt_deadline() {
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("executable");
     let mut class = host(None);
     class.shipyard_bin = Some(binary.display().to_string());
+    class.github_cli = Some(temp.path().join("ghapp").display().to_string());
     let plan = super::super::host_update_plan(&class, "v0.100.0").expect("plan");
     let started = Instant::now();
     assert!(matches!(

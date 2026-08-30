@@ -4,6 +4,12 @@ use std::process::Command;
 use super::*;
 
 fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
+    let github_cli = shipyard_bin
+        .and_then(|binary| Path::new(binary).parent())
+        .map_or_else(
+            || "/Users/ci/.local/bin/ghapp".to_owned(),
+            |parent| parent.join("ghapp").display().to_string(),
+        );
     HostClassConfig {
         class: "m5".to_owned(),
         ssh: ssh.map(str::to_owned),
@@ -14,7 +20,7 @@ fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
         shipyard_mode: Some("shipyard".to_owned()),
         shipyard_global_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
         shipyard_state_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
-        github_cli: Some("/Users/ci/.local/bin/ghapp".to_owned()),
+        github_cli: Some(github_cli),
         github_token_helper: Some(
             "/Users/ci/.config/shipyard/bin/shipyard-github-app-token".to_owned(),
         ),
@@ -91,6 +97,47 @@ fn remote_plan_uses_absolute_binary_and_minimal_canonical_path() {
     assert!(
         preflight < replacement,
         "governed config and helper must pass before binary replacement"
+    );
+}
+
+#[test]
+fn fleet_plan_requires_ghapp_and_shipyard_to_be_siblings() {
+    let mut class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
+    class.github_cli = Some("/Users/ci/bin/ghapp".to_owned());
+    let error = host_update_plan(&class, "v0.127.0").expect_err("foreign wrapper directory");
+    assert!(error.message.contains("ghapp sibling of shipyard_bin"));
+
+    class.github_cli = Some("/Users/ci/.local/bin/renamed-ghapp".to_owned());
+    let error = host_update_plan(&class, "v0.127.0").expect_err("foreign wrapper name");
+    assert!(error.message.contains("ghapp sibling of shipyard_bin"));
+}
+
+#[test]
+fn fleet_resolver_probe_uses_exact_global_dir_before_commit() {
+    let mut class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
+    class.shipyard_global_dir = Some("/Users/ci/governed global".to_owned());
+    class.shipyard_state_dir = Some("/Users/ci/governed state".to_owned());
+
+    let plan = host_update_plan(&class, "v0.127.0").expect("differing governed dirs");
+
+    assert!(plan.command.contains("/Users/ci/governed global"));
+    assert!(plan.command.contains("/Users/ci/governed state"));
+    assert!(plan.command.contains("$auth_wrapper.shipyard-context.json"));
+    assert!(
+        plan.command
+            .contains("--global-dir \"$auth_global_dir\" auth helper-argv")
+    );
+    let probe = plan
+        .command
+        .find("auth helper-argv")
+        .expect("resolver probe");
+    let committed = plan
+        .command
+        .find("auth_write_phase committed")
+        .expect("commit marker");
+    assert!(
+        probe < committed,
+        "resolver must pass before transaction commit"
     );
 }
 
@@ -251,6 +298,16 @@ fn auth_support_paths_reject_dot_and_parent_components() {
             .message
             .contains("must not contain dot or parent components")
     );
+}
+
+#[test]
+fn daemon_context_paths_reject_controls_dot_and_parent_components() {
+    for global_dir in ["/Users/ci/global/../foreign", "/Users/ci/global\nforeign"] {
+        let mut class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
+        class.shipyard_global_dir = Some(global_dir.to_owned());
+        let error = host_update_plan(&class, "v0.127.0").expect_err("unsafe global dir");
+        assert!(error.message.contains("normalized absolute paths"));
+    }
 }
 
 #[test]

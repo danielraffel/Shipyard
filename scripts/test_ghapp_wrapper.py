@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -101,11 +102,22 @@ class GhappWrapperTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.wrapper = self.bin / "ghapp"
+        self.wrapper.write_bytes(WRAPPER.read_bytes())
+        self.wrapper.chmod(0o755)
         self.helper = self.root / "helper"
         self.gh = self.root / "gh"
+        self.shipyard = self.bin / "shipyard"
         self.helper_log = self.root / "helper-args"
         self.gh_log = self.root / "gh-args"
         self.gh_env_log = self.root / "gh-env"
+        self.resolver_log = self.root / "resolver-args"
+        self.private_key = self.root / "github-app.pem"
+        self.resolver_context = self.wrapper.with_name(
+            f"{self.wrapper.name}.shipyard-context.json"
+        )
         self.helper.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
@@ -124,8 +136,29 @@ class GhappWrapperTests(unittest.TestCase):
             "printf 'ok\\n'\n",
             encoding="utf-8",
         )
+        self.shipyard.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "with open(os.environ['RESOLVER_LOG'], 'a', encoding='utf-8') as log:\n"
+            "    log.write(' '.join(sys.argv[1:]) + '\\n')\n"
+            "wrapper = sys.argv[sys.argv.index('--wrapper') + 1]\n"
+            "repo = sys.argv[sys.argv.index('--repo') + 1]\n"
+            "payload = {\n"
+            "    'schema_version': 1,\n"
+            "    'command': 'auth.helper-argv',\n"
+            "    'wrapper': wrapper,\n"
+            "    'repo': repo,\n"
+            "    'credential_argv': ['--app-id', '123456', '--private-key', os.environ['PRIVATE_KEY']],\n"
+            "}\n"
+            "mode = os.environ.get('RESOLVER_MODE')\n"
+            "if mode == 'extra-key': payload['unexpected'] = True\n"
+            "if mode == 'oversize': payload['credential_argv'][1] = '1' * 17000\n"
+            "print(json.dumps(payload, separators=(',', ':')))\n",
+            encoding="utf-8",
+        )
         self.helper.chmod(0o755)
         self.gh.chmod(0o755)
+        self.shipyard.chmod(0o755)
         self.environment = {
             **os.environ,
             "SHIPYARD_GITHUB_APP_TOKEN_HELPER": str(self.helper),
@@ -137,6 +170,8 @@ class GhappWrapperTests(unittest.TestCase):
             "GH_LOG": str(self.gh_log),
             "GH_ENV_LOG": str(self.gh_env_log),
             "GH_EXPECTED": str(self.gh),
+            "RESOLVER_LOG": str(self.resolver_log),
+            "PRIVATE_KEY": str(self.private_key),
         }
         self.environment.pop("GH_TOKEN", None)
         self.environment.pop("GITHUB_TOKEN", None)
@@ -147,13 +182,26 @@ class GhappWrapperTests(unittest.TestCase):
 
     def run_wrapper(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(WRAPPER), *args],
+            [str(self.wrapper), *args],
             cwd=self.root,
             env=self.environment,
             text=True,
             capture_output=True,
             check=False,
         )
+
+    def write_resolver_context(self, **overrides: object) -> None:
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "mode": "shipyard",
+            "global_dir": str(self.root / "governed global"),
+        }
+        payload.update(overrides)
+        self.resolver_context.write_text(
+            json.dumps(payload, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        self.resolver_context.chmod(0o600)
 
     def test_token_mode_preserves_json_helper_contract(self) -> None:
         result = self.run_wrapper("token", "--repo", "danielraffel/Shipyard")
@@ -162,6 +210,7 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertIn('"kind":"github-app-installation"', result.stdout)
         self.assertIn("--repo danielraffel/Shipyard", self.helper_log.read_text())
         self.assertIn("--api-url https://api.github.com", self.helper_log.read_text())
+        self.assertFalse(self.resolver_log.exists())
 
     def test_token_mode_preserves_explicit_no_disk_cache(self) -> None:
         self.environment["SHIPYARD_GITHUB_APP_CACHE_DIR"] = ""
@@ -234,11 +283,111 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertEqual(result.stdout, "ok\n")
         helper_args = self.helper_log.read_text()
         self.assertIn("--repo Generous-Corp/pulp", helper_args)
+        self.assertIn("--app-id 123456", helper_args)
+        self.assertIn(f"--private-key {self.private_key}", helper_args)
+        self.assertEqual(
+            self.resolver_log.read_text(),
+            f"auth helper-argv --wrapper {self.wrapper} --repo Generous-Corp/pulp\n",
+        )
         self.assertNotIn("ghs_private_fixture", helper_args)
         self.assertEqual(
             self.gh_log.read_text(),
             "api repos/Generous-Corp/pulp/hooks --jq length\n",
         )
+
+    def test_cli_mode_requires_release_matched_sibling_resolver(self) -> None:
+        self.shipyard.unlink()
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sibling shipyard resolver is unavailable", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_cli_mode_uses_exact_fleet_resolver_context(self) -> None:
+        self.write_resolver_context(
+            mode="isolated", global_dir=str(self.root / "governed global")
+        )
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.resolver_log.read_text(),
+            " ".join(
+                (
+                    "--mode isolated --global-dir",
+                    str(self.root / "governed global"),
+                    "auth helper-argv --wrapper",
+                    str(self.wrapper),
+                    "--repo Generous-Corp/pulp\n",
+                )
+            ),
+        )
+
+    def test_cli_mode_rejects_unsafe_context_file_before_resolver(self) -> None:
+        cases = {
+            "extra-key": {"unexpected": True},
+            "invalid-mode": {"mode": "foreign"},
+            "oversized-global-dir": {"global_dir": "/" + "a" * 4096},
+            "control-character": {"global_dir": "/tmp/bad\npath"},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name):
+                self.write_resolver_context(**overrides)
+                result = self.run_wrapper(
+                    "api", "repos/Generous-Corp/pulp/hooks"
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("resolver context is malformed or unsafe", result.stderr)
+                self.assertFalse(self.resolver_log.exists())
+                self.assertFalse(self.helper_log.exists())
+
+    def test_cli_mode_rejects_context_with_open_mode_before_resolver(self) -> None:
+        self.write_resolver_context()
+        self.resolver_context.chmod(0o644)
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resolver context is malformed or unsafe", result.stderr)
+        self.assertFalse(self.resolver_log.exists())
+
+    def test_cli_mode_rejects_symlink_context_before_resolver(self) -> None:
+        target = self.root / "context-target.json"
+        self.resolver_context = target
+        self.write_resolver_context()
+        self.resolver_context = self.wrapper.with_name(
+            f"{self.wrapper.name}.shipyard-context.json"
+        )
+        self.resolver_context.symlink_to(target)
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resolver context is malformed or unsafe", result.stderr)
+        self.assertFalse(self.resolver_log.exists())
+
+    def test_cli_mode_rejects_resolver_extra_keys_before_helper(self) -> None:
+        self.environment["RESOLVER_MODE"] = "extra-key"
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed JSON", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_cli_mode_rejects_oversized_resolver_output_before_helper(self) -> None:
+        self.environment["RESOLVER_MODE"] = "oversize"
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exceeds 16384 bytes", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
 
     def test_python_import_shadowing_cannot_capture_token_json(self) -> None:
         checkout_marker = self.root / "checkout-json-ran"

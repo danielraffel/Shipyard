@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 use toml::{Table, Value as TomlValue};
 
@@ -11,7 +13,7 @@ use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::doctor::{DoctorEntry, check_github_auth};
 use crate::gh::GhClient;
 use crate::identity::{ProductIdentity, RuntimeMode};
-use crate::output::write_json_envelope;
+use crate::output::{SCHEMA_VERSION, write_json_envelope, write_pretty_json};
 
 use super::{
     CliFailure,
@@ -27,6 +29,9 @@ pub(super) fn auth_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     match command {
+        AuthCommand::HelperArgv { wrapper, repo } => {
+            auth_helper_argv(global_dir, &wrapper, &repo, stdout)?;
+        }
         AuthCommand::Doctor => {
             auth_doctor(mode, cwd, json_mode, stdout)?;
         }
@@ -44,6 +49,146 @@ pub(super) fn auth_command<W: Write>(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct HelperArgvOutput {
+    schema_version: u32,
+    command: &'static str,
+    wrapper: String,
+    repo: String,
+    credential_argv: Vec<String>,
+}
+
+fn auth_helper_argv<W: Write>(
+    global_dir: &Path,
+    wrapper: &Path,
+    repo: &str,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let output = resolve_helper_argv(&config, wrapper, repo)?;
+    write_pretty_json(stdout, &output).map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+fn resolve_helper_argv(
+    config: &LoadedConfig,
+    wrapper: &Path,
+    repo: &str,
+) -> Result<HelperArgvOutput, CliFailure> {
+    let wrapper = exact_absolute_path(wrapper, "--wrapper")?;
+    if !is_exact_repo_slug(repo) {
+        return Err(CliFailure::new(
+            2,
+            "auth helper-argv --repo must be an exact OWNER/REPO slug",
+        ));
+    }
+    let auth = config
+        .get("github.auth")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "machine-global config is missing [github.auth] for ghapp resolver",
+            )
+        })?;
+    if auth.get("source").and_then(TomlValue::as_str) != Some("command") {
+        return Err(CliFailure::new(
+            1,
+            "machine-global github.auth.source must be \"command\" for ghapp resolver",
+        ));
+    }
+    let command = auth
+        .get("token_command")
+        .and_then(TomlValue::as_array)
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "machine-global github.auth.token_command is missing or is not an array",
+            )
+        })?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "machine-global github.auth.token_command must contain only strings",
+            )
+        })?;
+    if command.len() != 8
+        || command[0] != wrapper
+        || command[1] != "token"
+        || command[2] != "--app-id"
+        || command[4] != "--private-key"
+        || command[6] != "--repo"
+        || command[7] != "{repo_slug}"
+    {
+        return Err(CliFailure::new(
+            1,
+            "machine-global github.auth.token_command must exactly match [WRAPPER, \"token\", \"--app-id\", VALUE, \"--private-key\", ABSOLUTE_PATH, \"--repo\", \"{repo_slug}\"]",
+        ));
+    }
+    if command[3].is_empty() || command[3].len() > 256 || command[3].chars().any(char::is_control) {
+        return Err(CliFailure::new(
+            1,
+            "machine-global github.auth.token_command --app-id value is empty or malformed",
+        ));
+    }
+    exact_absolute_path(Path::new(&command[5]), "token_command --private-key")?;
+
+    Ok(HelperArgvOutput {
+        schema_version: SCHEMA_VERSION,
+        command: "auth.helper-argv",
+        wrapper,
+        repo: repo.to_owned(),
+        credential_argv: vec![
+            "--app-id".to_owned(),
+            command[3].clone(),
+            "--private-key".to_owned(),
+            command[5].clone(),
+        ],
+    })
+}
+
+fn exact_absolute_path(path: &Path, label: &str) -> Result<String, CliFailure> {
+    let raw = path.to_str().ok_or_else(|| {
+        CliFailure::new(2, format!("auth helper-argv {label} must be valid UTF-8"))
+    })?;
+    if !path.is_absolute()
+        || raw.len() > 4096
+        || raw.chars().any(char::is_control)
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(CliFailure::new(
+            2,
+            format!("auth helper-argv {label} must be a normalized absolute path"),
+        ));
+    }
+    Ok(raw.to_owned())
+}
+
+fn is_exact_repo_slug(repo: &str) -> bool {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return false;
+    };
+    !name.contains('/')
+        && (1..=39).contains(&owner.len())
+        && owner
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !matches!(name, "" | "." | "..")
+        && name.len() <= 255
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn auth_doctor<W: Write>(
@@ -369,6 +514,216 @@ mod tests {
             local_dir: Some(root.join(".shipyard.local")),
             local_overlay_source: LocalOverlaySource::Direct,
         }
+    }
+
+    fn command_config(root: &Path, command: &[&str]) -> LoadedConfig {
+        let mut auth = Table::new();
+        auth.insert("source".to_owned(), TomlValue::String("command".to_owned()));
+        auth.insert(
+            "token_command".to_owned(),
+            TomlValue::Array(
+                command
+                    .iter()
+                    .map(|argument| TomlValue::String((*argument).to_owned()))
+                    .collect(),
+            ),
+        );
+        let mut github = Table::new();
+        github.insert("auth".to_owned(), TomlValue::Table(auth));
+        let mut data = Table::new();
+        data.insert("github".to_owned(), TomlValue::Table(github));
+        LoadedConfig {
+            data,
+            global_dir: root.join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        }
+    }
+
+    #[test]
+    fn helper_argv_returns_only_typed_credential_arguments() {
+        let temp = TempDir::new().expect("tempdir");
+        let wrapper = "/Users/ci/.local/bin/ghapp";
+        let config = command_config(
+            temp.path(),
+            &[
+                wrapper,
+                "token",
+                "--app-id",
+                "123456",
+                "--private-key",
+                "/Users/ci/.config/shipyard/app.pem",
+                "--repo",
+                "{repo_slug}",
+            ],
+        );
+
+        let output = resolve_helper_argv(&config, Path::new(wrapper), "danielraffel/Shipyard")
+            .expect("canonical resolver output");
+
+        assert_eq!(output.schema_version, SCHEMA_VERSION);
+        assert_eq!(output.command, "auth.helper-argv");
+        assert_eq!(output.wrapper, wrapper);
+        assert_eq!(output.repo, "danielraffel/Shipyard");
+        assert_eq!(
+            output.credential_argv,
+            [
+                "--app-id",
+                "123456",
+                "--private-key",
+                "/Users/ci/.config/shipyard/app.pem",
+            ]
+        );
+    }
+
+    #[test]
+    fn helper_argv_rejects_every_noncanonical_token_command_shape() {
+        let temp = TempDir::new().expect("tempdir");
+        let wrapper = "/Users/ci/.local/bin/ghapp";
+        let canonical = [
+            wrapper,
+            "token",
+            "--app-id",
+            "123456",
+            "--private-key",
+            "/Users/ci/.config/shipyard/app.pem",
+            "--repo",
+            "{repo_slug}",
+        ];
+        let cases = [
+            (
+                "foreign wrapper",
+                [&["/tmp/foreign"][..], &canonical[1..]].concat(),
+            ),
+            ("missing argument", canonical[..7].to_vec()),
+            (
+                "duplicate argument",
+                [canonical.as_slice(), &["--app-id", "999"]].concat(),
+            ),
+            (
+                "api-url",
+                [
+                    canonical.as_slice(),
+                    &["--api-url", "https://api.github.com"],
+                ]
+                .concat(),
+            ),
+            (
+                "cache-dir",
+                [canonical.as_slice(), &["--cache-dir", "/tmp/cache"]].concat(),
+            ),
+            (
+                "installation-id",
+                [canonical.as_slice(), &["--installation-id", "42"]].concat(),
+            ),
+            (
+                "unknown",
+                [canonical.as_slice(), &["--unknown", "value"]].concat(),
+            ),
+            (
+                "non-placeholder repo",
+                [&canonical[..7], &["danielraffel/Shipyard"]].concat(),
+            ),
+        ];
+
+        for (name, command) in cases {
+            let config = command_config(temp.path(), &command);
+            let error = resolve_helper_argv(&config, Path::new(wrapper), "danielraffel/Shipyard")
+                .expect_err(name);
+            assert!(
+                error.message.contains("must exactly match"),
+                "{name}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn helper_argv_reads_only_machine_global_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let wrapper = "/Users/ci/.local/bin/ghapp";
+        let global = temp.path().join("global");
+        let project = temp.path().join(".shipyard");
+        fs::create_dir_all(&global).expect("global dir");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(
+            global.join("config.toml"),
+            format!(
+                r#"[github.auth]
+source = "command"
+token_command = ["{wrapper}", "token", "--app-id", "123456", "--private-key", "/Users/ci/app.pem", "--repo", "{{repo_slug}}"]
+"#
+            ),
+        )
+        .expect("global config");
+        fs::write(
+            project.join("config.toml"),
+            r#"[github.auth]
+source = "command"
+token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
+"#,
+        )
+        .expect("project config");
+        let mut stdout = Vec::new();
+
+        auth_command(
+            AuthCommand::HelperArgv {
+                wrapper: PathBuf::from(wrapper),
+                repo: "danielraffel/Shipyard".to_owned(),
+            },
+            RuntimeMode::Shipyard,
+            temp.path(),
+            &global,
+            false,
+            &mut stdout,
+        )
+        .expect("machine-global resolver");
+
+        let output: JsonValue = serde_json::from_slice(&stdout).expect("typed JSON");
+        assert_eq!(output["schema_version"], SCHEMA_VERSION);
+        assert_eq!(output["credential_argv"][1], "123456");
+    }
+
+    #[test]
+    fn helper_argv_rejects_malformed_routes_and_oversized_values() {
+        let temp = TempDir::new().expect("tempdir");
+        let wrapper = "/Users/ci/.local/bin/ghapp";
+        let canonical = [
+            wrapper,
+            "token",
+            "--app-id",
+            "123456",
+            "--private-key",
+            "/Users/ci/app.pem",
+            "--repo",
+            "{repo_slug}",
+        ];
+        let config = command_config(temp.path(), &canonical);
+        for repo in ["owner", "owner/repo/extra", "owner/..", "owner/repo name"] {
+            assert!(
+                resolve_helper_argv(&config, Path::new(wrapper), repo).is_err(),
+                "accepted {repo:?}"
+            );
+        }
+        let oversized_app_id = "1".repeat(257);
+        let oversized = [
+            wrapper,
+            "token",
+            "--app-id",
+            oversized_app_id.as_str(),
+            "--private-key",
+            "/Users/ci/app.pem",
+            "--repo",
+            "{repo_slug}",
+        ];
+        assert!(
+            resolve_helper_argv(
+                &command_config(temp.path(), &oversized),
+                Path::new(wrapper),
+                "owner/repo",
+            )
+            .is_err()
+        );
     }
 
     #[test]

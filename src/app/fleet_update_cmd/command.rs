@@ -51,7 +51,10 @@ pub(super) fn remote_update_command(
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,
+        mode,
+        global_dir,
         state_dir,
+        &authority.repository,
         authority,
         false,
     );
@@ -279,7 +282,10 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,
+        plan.runtime_mode.as_str(),
+        &plan.global_dir,
         &plan.state_dir,
+        &plan.release_authority.repository,
         &plan.release_authority,
         false,
     );

@@ -417,8 +417,12 @@ not resume until the incident owner has restored the intended queue order.
 Queue writes are serialized process-wide and recorded in machine-global
 `merge_queue/mutations.jsonl`.
 
-For release rollout, configure absolute `shipyard_bin` and `github_cli` paths
-plus explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir`
+For release rollout, configure absolute sibling `shipyard_bin` and `github_cli`
+paths named `shipyard` and `ghapp`. Machine-global command auth must be exactly
+wrapper + `token --app-id VALUE --private-key ABS --repo {repo_slug}`. Direct
+`ghapp` resolves only that shape through its sibling Shipyard after grammar and
+repo validation; the wrapper pins API, cache, and resolved repo arguments.
+Also configure explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir`
 on every remote `[host_class.<name>]`. Review `shipyard runner fleet-update
 --to vX.Y.Z --host-class <class>` and then use the same command with `--apply`;
 do not assemble per-host SSH/install pipelines. Repeat `--host-class` only for
@@ -453,7 +457,11 @@ must prove the companion absent. Fleet rollout requires a self-contained machine
 helper because inherited secrets are deliberately stripped. The updater stages
 the entire exact-tag installer before execution (including when the old remote
 binary predates fleet-update), refreshes daemons only after
-the staged binary passes its smoke, and terminates any host attempt that exceeds
+the staged binary passes its smoke, then runs the installed binary's resolver
+probe at the exact configured mode/global directory before transaction commit.
+The wrapper's strict 0600 non-symlink context preserves those runtime arguments
+for subsequent direct calls. Probe failure rolls back helper, wrapper, context,
+CLI, and companion. It terminates any host attempt that exceeds
 ten minutes. A minimal non-login PATH that hides
 Homebrew is launch-environment drift, not evidence that Tart or Shipyard is
 missing.

@@ -773,7 +773,125 @@ if [[ -z "$gh_binary" || "$gh_binary" != /* || ! -x "$gh_binary" ]]; then
     exit 1
 fi
 
-token_json="$(mint_token_json --api-url "$(api_url_for_host)" --repo "$repo")"
+wrapper_path="${BASH_SOURCE[0]}"
+if [[ "$wrapper_path" != /* ]]; then
+    echo "ghapp: wrapper must be invoked through an absolute installed path" >&2
+    exit 1
+fi
+shipyard_binary="${wrapper_path%/*}/shipyard"
+if [[ ! -f "$shipyard_binary" || -L "$shipyard_binary" || ! -x "$shipyard_binary" ]]; then
+    echo "ghapp: release-matched sibling shipyard resolver is unavailable" >&2
+    exit 1
+fi
+resolver_context="${wrapper_path}.shipyard-context.json"
+resolver_command=("$shipyard_binary")
+if [[ -e "$resolver_context" || -L "$resolver_context" ]]; then
+    resolver_context_argv=()
+    while IFS= read -r context_argument; do
+        resolver_context_argv+=("$context_argument")
+    done < <(env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+        "$python_binary" -I -c '
+import json, os, stat, sys
+path = sys.argv[1]
+descriptor = None
+try:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.getuid()
+        or metadata.st_size < 1
+        or metadata.st_size > 8192
+    ):
+        raise ValueError
+    raw = os.read(descriptor, 8193)
+    if len(raw) > 8192 or os.read(descriptor, 1):
+        raise ValueError
+    value = json.loads(raw.decode("utf-8"))
+except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit("ghapp: resolver context is malformed or unsafe")
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+required = {"schema_version", "mode", "global_dir"}
+mode = value.get("mode") if isinstance(value, dict) else None
+global_dir = value.get("global_dir") if isinstance(value, dict) else None
+if (
+    not isinstance(value, dict)
+    or set(value) != required
+    or value.get("schema_version") != 1
+    or mode not in {"shipyard", "isolated"}
+    or not isinstance(global_dir, str)
+    or not global_dir.startswith("/")
+    or len(global_dir) > 4096
+    or any(ord(ch) <= 31 or ord(ch) == 127 for ch in global_dir)
+    or os.path.normpath(global_dir) != global_dir
+):
+    raise SystemExit("ghapp: resolver context is malformed or unsafe")
+for item in ("--mode", mode, "--global-dir", global_dir):
+    sys.stdout.write(item + "\n")
+' "$resolver_context")
+    if [[ "${#resolver_context_argv[@]}" != 4 || \
+          "${resolver_context_argv[0]}" != "--mode" || \
+          ( "${resolver_context_argv[1]}" != "shipyard" && "${resolver_context_argv[1]}" != "isolated" ) || \
+          "${resolver_context_argv[2]}" != "--global-dir" || \
+          "${resolver_context_argv[3]}" != /* ]]; then
+        echo "ghapp: resolver context is malformed or unsafe" >&2
+        exit 1
+    fi
+    resolver_command+=("${resolver_context_argv[@]}")
+fi
+resolver_json="$(env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+    "${resolver_command[@]}" auth helper-argv --wrapper "$wrapper_path" --repo "$repo" | \
+    /usr/bin/head -c 16385)"
+unset resolver_command
+if [[ "${#resolver_json}" -gt 16384 ]]; then
+    echo "ghapp: shipyard helper-argv response exceeds 16384 bytes" >&2
+    exit 1
+fi
+credential_argv=()
+while IFS= read -r credential_argument; do
+    credential_argv+=("$credential_argument")
+done < <(env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+    "$python_binary" -I -c '
+import json, sys
+value = json.load(sys.stdin)
+required = {"schema_version", "command", "wrapper", "repo", "credential_argv"}
+if not isinstance(value, dict) or set(value) != required:
+    raise SystemExit("ghapp: shipyard helper-argv returned malformed JSON")
+argv = value.get("credential_argv")
+if (
+    value.get("schema_version") != 1
+    or value.get("command") != "auth.helper-argv"
+    or value.get("wrapper") != sys.argv[1]
+    or value.get("repo") != sys.argv[2]
+    or not isinstance(argv, list)
+    or len(argv) != 4
+    or argv[0] != "--app-id"
+    or argv[2] != "--private-key"
+    or len(argv[1]) > 256
+    or len(argv[3]) > 4096
+    or any(not isinstance(item, str) or not item or any(ord(ch) <= 31 or ord(ch) == 127 for ch in item) for item in argv)
+):
+    raise SystemExit("ghapp: shipyard helper-argv returned malformed JSON")
+for item in argv:
+    sys.stdout.write(item + "\n")
+' "$wrapper_path" "$repo" <<<"$resolver_json")
+unset resolver_json
+if [[ "${#credential_argv[@]}" != 4 || \
+      "${credential_argv[0]}" != "--app-id" || \
+      "${credential_argv[2]}" != "--private-key" || \
+      "${credential_argv[3]}" != /* ]]; then
+    echo "ghapp: shipyard helper-argv returned malformed JSON" >&2
+    exit 1
+fi
+
+token_json="$(mint_token_json "${credential_argv[@]}" --api-url "$(api_url_for_host)" --repo "$repo")"
+unset credential_argv
 token="$(env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" "$python_binary" -I -c '
 import json, sys
 value = json.load(sys.stdin)
