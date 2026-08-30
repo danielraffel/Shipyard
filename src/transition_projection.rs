@@ -617,10 +617,10 @@ impl Storage {
         operation: impl FnOnce(&mut File) -> Result<T, ProjectionError>,
     ) -> Result<T, ProjectionError> {
         ensure_private_directory(&self.root)?;
-        let lock = open_private_file(&self.lock_path, false)?;
+        let lock = open_private_file(&self.lock_path)?;
         lock.lock_exclusive()?;
         let result = (|| {
-            let mut log = open_private_file(&self.log_path, true)?;
+            let mut log = open_private_file(&self.log_path)?;
             #[cfg(unix)]
             File::open(&self.root)?.sync_all()?;
             repair_partial_tail(&mut log)?;
@@ -885,7 +885,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), ProjectionError> {
     Ok(())
 }
 
-fn open_private_file(path: &Path, append: bool) -> Result<File, ProjectionError> {
+fn open_private_file(path: &Path) -> Result<File, ProjectionError> {
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(ProjectionError::Storage(format!(
             "transition outbox file must not be a symlink: {}",
@@ -893,7 +893,7 @@ fn open_private_file(path: &Path, append: bool) -> Result<File, ProjectionError>
         )));
     }
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).append(append);
+    options.read(true).write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

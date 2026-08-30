@@ -1001,6 +1001,7 @@ fn handoff_path(directory: &Path, head: &str) -> std::path::PathBuf {
     directory.join(format!("{}.json", head.to_ascii_lowercase()))
 }
 
+#[cfg(unix)]
 pub(super) fn migrate_legacy_native_policy_authority(
     state_dir: &Path,
     repo: &str,
@@ -4463,6 +4464,6 @@ fn main() {{
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "handoff/launch_profile_tests.rs"]
 mod launch_profile_tests;

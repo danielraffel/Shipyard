@@ -20,17 +20,10 @@ pub(crate) enum ProcessLiveness {
         windows,
         expect(
             dead_code,
-            reason = "Windows process probing never proves a process alive"
+            reason = "Windows process custody refuses before live observation"
         )
     )]
     Alive,
-    #[cfg_attr(
-        windows,
-        expect(
-            dead_code,
-            reason = "Windows process probing never proves a process dead"
-        )
-    )]
     Dead,
     Unknown,
 }
@@ -261,5 +254,26 @@ pub(crate) fn process_id_liveness(pid: u32) -> ProcessLiveness {
         ProcessLiveness::Dead
     } else {
         ProcessLiveness::Unknown
+    }
+}
+
+/// Windows custody does not yet expose a PID birth-identity probe. Returning
+/// `Unknown` keeps durable reconciliation fail-closed instead of treating a
+/// possibly reused PID as either live or dead.
+#[cfg(windows)]
+pub(crate) fn process_id_liveness(_pid: u32) -> ProcessLiveness {
+    ProcessLiveness::Unknown
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn pid_liveness_without_birth_identity_is_unknown() {
+        assert_eq!(
+            process_id_liveness(std::process::id()),
+            ProcessLiveness::Unknown
+        );
     }
 }

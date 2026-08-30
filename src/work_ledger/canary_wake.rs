@@ -19,6 +19,13 @@ const BINDING_SCHEMA_VERSION: u32 = 1;
 
 /// Durable proof that one exact canary terminal receipt reached native custody.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "terminal wake publication is driven by the Unix daemon lane"
+    )
+)]
 pub(crate) struct CanaryNativeWakeDelivery {
     pub(crate) wake_id: String,
     pub(crate) receipt_sha256: Sha256Digest,
@@ -101,6 +108,13 @@ impl WorkLedger {
     /// after this method succeeds. A crash after the `SQLite` commit but before
     /// acknowledgement replays the same event and outbox row without dispatching
     /// a second wake.
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "terminal wake publication is driven by the Unix daemon lane"
+        )
+    )]
     pub(crate) fn deliver_canary_terminal_wake(
         &self,
         binding: &CanaryNativeContinuationBinding,
@@ -174,6 +188,13 @@ impl WorkLedger {
         })
     }
 
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "terminal wake publication is driven by the Unix daemon lane"
+        )
+    )]
     fn canary_native_work_state(
         &self,
         binding: &CanaryNativeContinuationBinding,
@@ -191,6 +212,13 @@ impl WorkLedger {
             })
     }
 
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "terminal wake publication is driven by the Unix daemon lane"
+        )
+    )]
     fn verify_canary_delivery_receipt(
         &self,
         binding: &CanaryNativeContinuationBinding,
@@ -298,7 +326,7 @@ fn verify_route_profile(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::work_ledger::{

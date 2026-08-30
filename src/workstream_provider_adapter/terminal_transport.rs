@@ -6,6 +6,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};

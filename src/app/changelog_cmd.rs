@@ -575,6 +575,16 @@ mod tests {
 
     #[test]
     fn changelog_init_force_strips_release_sections_and_backs_up_changelog() {
+        std::thread::Builder::new()
+            .name("changelog-init-force-test".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(changelog_init_force_strips_release_sections_and_backs_up_changelog_body)
+            .expect("spawn changelog init test")
+            .join()
+            .expect("changelog init test thread");
+    }
+
+    fn changelog_init_force_strips_release_sections_and_backs_up_changelog_body() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_dir = temp.path().join(".shipyard");
         std::fs::create_dir_all(&project_dir).expect("project dir");

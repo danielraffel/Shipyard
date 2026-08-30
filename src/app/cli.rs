@@ -37,6 +37,9 @@ pub(super) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum Command {
+    /// Internal one-shot Linux provider descendant supervisor.
+    #[command(name = "provider-sentinel-supervisor", hide = true)]
+    ProviderSentinelSupervisor,
     /// Internal external-writer lease guardian.
     #[command(name = "writer-domain-exec", hide = true)]
     WriterDomainExec {

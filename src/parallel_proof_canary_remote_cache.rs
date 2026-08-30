@@ -912,6 +912,8 @@ include!("parallel_proof_canary_remote_cache/runtime.rs");
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-pub(crate) use test_support::test_remote_authority_receipt;
+pub(crate) use test_support::{
+    synthetic_cache_generation_manifest, test_cache_root, test_remote_authority_receipt,
+};
 #[cfg(test)]
 mod tests;

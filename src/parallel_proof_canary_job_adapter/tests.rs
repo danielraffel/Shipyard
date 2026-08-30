@@ -1,9 +1,12 @@
+#[cfg(unix)]
 use std::process::{Child, Command};
 
 use super::*;
+#[cfg(unix)]
+use crate::parallel_proof_canary_job::launch_canary_job;
 use crate::parallel_proof_canary_job::{
     ApprovedCanaryOperation, CanaryCancellationPolicy, CanaryJobOwner, CanaryLogPolicy,
-    CanarySuccessPredicate, CanaryWakePredicate, launch_canary_job,
+    CanarySuccessPredicate, CanaryWakePredicate,
 };
 
 fn digest(value: &str) -> Sha256Digest {
@@ -179,6 +182,83 @@ fn capability_is_exact_and_default_off() {
     })));
 }
 
+#[cfg(windows)]
+#[test]
+fn production_supervisor_refuses_launch_without_unix_process_custody() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let binary = std::env::current_exe().unwrap();
+    let binary_sha256 = executable_digest(&binary).unwrap();
+    let job = job(binary_sha256.clone());
+    let request = CanarySupervisedLaunch {
+        job: job.clone(),
+        job_sha256: job.digest().unwrap(),
+        launch_nonce_sha256: digest("windows-refusal"),
+        claimed_at_ms: 2,
+    };
+    let mut supervisor = ShipyardCanaryProcessSupervisor::new(
+        binary,
+        RuntimeMode::Isolated,
+        temp.path().join("global"),
+        state_dir.clone(),
+    )
+    .unwrap();
+
+    let supervisor_root = state_dir.join("parallel-proof-canary/supervisor");
+    let immutable_path = |root: &std::path::Path, key: &str, extension: &str| {
+        root.join(format!(
+            "{}.{}",
+            Sha256Digest::of_bytes(key.as_bytes()).as_str(),
+            extension
+        ))
+    };
+    let receipt_key = format!("{}-receipt", job.job_id);
+    let completion_key = format!("{}-completion", job.job_id);
+    let jobs_root = state_dir.join("parallel-proof-canary/jobs");
+    let log_key = format!("job-{}-log-000", job.job_id);
+    let receipt_paths = [
+        immutable_path(&supervisor_root, &receipt_key, "json"),
+        immutable_path(&supervisor_root, &receipt_key, "lock"),
+    ];
+    let completion_paths = [
+        immutable_path(&supervisor_root, &completion_key, "json"),
+        immutable_path(&supervisor_root, &completion_key, "lock"),
+    ];
+    let log_paths = [
+        immutable_path(&jobs_root.join("logs"), &log_key, "json"),
+        immutable_path(&jobs_root.join("logs"), &log_key, "lock"),
+    ];
+    let entries = || {
+        let mut entries = std::fs::read_dir(&supervisor_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    };
+    let initial_entries = entries();
+    assert!(supervisor.children.is_empty());
+    assert_eq!(supervisor.store.receipt(&job.job_id).unwrap(), None);
+    assert_eq!(supervisor.store.completion(&job.job_id).unwrap(), None);
+    assert!(receipt_paths.iter().all(|path| !path.exists()));
+    assert!(completion_paths.iter().all(|path| !path.exists()));
+    assert!(log_paths.iter().all(|path| !path.exists()));
+
+    assert_eq!(
+        supervisor.launch_typed_worker(&request),
+        Err("canary worker custody requires Unix process birth and group identity".to_owned())
+    );
+
+    assert!(supervisor.children.is_empty());
+    assert_eq!(supervisor.store.receipt(&job.job_id).unwrap(), None);
+    assert_eq!(supervisor.store.completion(&job.job_id).unwrap(), None);
+    assert_eq!(entries(), initial_entries);
+    assert!(receipt_paths.iter().all(|path| !path.exists()));
+    assert!(completion_paths.iter().all(|path| !path.exists()));
+    assert!(log_paths.iter().all(|path| !path.exists()));
+}
+
+#[cfg(unix)]
 #[test]
 fn bounded_batches_rotate_fairly_across_backlog() {
     let jobs = (0..5)

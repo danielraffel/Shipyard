@@ -705,6 +705,8 @@ fn validate_request_file(
     path: &Path,
     file: &std::fs::File,
 ) -> Result<RequestFileIdentity, CliFailure> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt as _;
     let metadata = file

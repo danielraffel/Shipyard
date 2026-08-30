@@ -275,6 +275,7 @@ pub enum StewardDecision {
 /// shadow observer. This intentionally covers only lifecycle routing: normal
 /// merge mutations still use [`classify_pr`] with the complete PR policy.
 #[must_use]
+#[cfg(unix)]
 pub(crate) fn classify_shadow_summary(
     exact_head: bool,
     pending_checks: u64,

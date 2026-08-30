@@ -16,7 +16,7 @@ fn observation_command(
             validate_executable(&target.ssh_program)?;
             validate_regular_authority(&target.identity_file, "SSH identity")?;
             let authority = KnownHostsAuthority::open(&target.known_hosts_file)?;
-            let known_hosts_sha256 = authority.digest.clone();
+            let known_hosts_sha256 = authority.digest().clone();
             let mut command = Command::new(&target.ssh_program);
             command.args([
                 "-F",
@@ -176,6 +176,10 @@ impl KnownHostsAuthority {
         &self.contents
     }
 
+    fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+
     fn verify_unchanged(&mut self) -> Result<(), CanaryObserverError> {
         let length = self
             .file
@@ -205,6 +209,10 @@ impl KnownHostsAuthority {
     }
 
     fn contents(&self) -> &str {
+        unreachable!("unsupported controller")
+    }
+
+    fn digest(&self) -> &Sha256Digest {
         unreachable!("unsupported controller")
     }
 
@@ -392,7 +400,7 @@ fn safe_absolute_macos_path(path: &Path) -> bool {
     let Some(value) = path.to_str() else {
         return false;
     };
-    path.is_absolute()
+    value.starts_with('/')
         && value != "/"
         && !value.ends_with('/')
         && !value.chars().any(char::is_control)
@@ -439,4 +447,3 @@ fn bounded_stderr(bytes: &[u8]) -> String {
         .trim()
         .to_owned()
 }
-

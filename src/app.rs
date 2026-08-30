@@ -36,10 +36,9 @@ mod init_cmd;
 mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
-pub(crate) use merge_steward_cmd::{
-    ExactStewardTransition, LaunchProfileV1, decode_protected_launch_profile,
-    exact_steward_transition,
-};
+#[cfg(unix)]
+pub(crate) use merge_steward_cmd::{ExactStewardTransition, exact_steward_transition};
+pub(crate) use merge_steward_cmd::{LaunchProfileV1, decode_protected_launch_profile};
 
 #[cfg(unix)]
 pub(crate) fn daemon_steward_repository(
@@ -255,6 +254,11 @@ fn dispatch_with_cwd_provider<W: Write, E: Write, C>(
 where
     C: FnOnce() -> std::io::Result<PathBuf>,
 {
+    if let Command::ProviderSentinelSupervisor = &cli.command {
+        return crate::provider_wrapper::run_provider_sentinel_supervisor_command()
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|error| CliFailure::new(1, error));
+    }
     let runtime_paths = RuntimePaths::current_with_overrides(
         cli.mode.into(),
         cli.global_dir.clone(),
@@ -265,7 +269,8 @@ where
     // volume's cwd was temporarily unavailable.
     let cwd = if matches!(
         &cli.command,
-        Command::Daemon { .. }
+        Command::ProviderSentinelSupervisor
+            | Command::Daemon { .. }
             | Command::WriterDomainExec { .. }
             | Command::SandboxAuditExec { .. }
             | Command::ParallelProofCanary { .. }
@@ -277,6 +282,9 @@ where
     };
 
     match cli.command {
+        Command::ProviderSentinelSupervisor => {
+            unreachable!("handled before path resolution")
+        }
         Command::WriterDomainExec { path, command } => {
             let status = crate::writer_domain_lease::run_guarded_child(&path, &command).map_err(
                 |error| {
@@ -623,7 +631,8 @@ fn handle_operational_variant<W: Write>(
         Command::Runner { command } => {
             handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
         }
-        Command::WriterDomainExec { .. }
+        Command::ProviderSentinelSupervisor
+        | Command::WriterDomainExec { .. }
         | Command::SandboxAuditExec { .. }
         | Command::Paths
         | Command::ExecutionWorker { .. }
@@ -2258,6 +2267,19 @@ mod tests {
 
     #[test]
     fn cancel_json_requests_running_job_cancellation_without_freeing_capacity() {
+        // Rust's test harness uses a smaller worker stack than the CLI process.
+        // This path exercises the large top-level command enum plus a running
+        // job snapshot, so run it with the normal executable-sized stack.
+        std::thread::Builder::new()
+            .name("cancel-running-json".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(cancel_json_requests_running_job_cancellation_inner)
+            .expect("spawn cancellation test")
+            .join()
+            .expect("cancellation test panicked");
+    }
+
+    fn cancel_json_requests_running_job_cancellation_inner() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
@@ -2313,6 +2335,19 @@ mod tests {
 
     #[test]
     fn logs_prints_selected_target_log() {
+        // Rust's test harness uses a smaller worker stack than the CLI process.
+        // This path exercises the large top-level command enum plus a populated
+        // target result, so run it with the normal executable-sized stack.
+        std::thread::Builder::new()
+            .name("logs-selected-target".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(logs_prints_selected_target_log_inner)
+            .expect("spawn logs test")
+            .join()
+            .expect("logs test panicked");
+    }
+
+    fn logs_prints_selected_target_log_inner() {
         let temp = tempfile::tempdir().expect("tempdir");
         let log_path = temp.path().join("linux.log");
         std::fs::write(&log_path, "target log\n").expect("write log");

@@ -141,9 +141,12 @@ impl ImmutableByteStore {
             directory,
             max_record_bytes,
         };
-        if store.has_pending_records()? {
-            let _lease = crate::writer_domain_lease::acquire_for_protected_path(&store.root)?;
-            store.reconcile_pending_records()?;
+        #[cfg(unix)]
+        {
+            if store.has_pending_records()? {
+                let _lease = crate::writer_domain_lease::acquire_for_protected_path(&store.root)?;
+                store.reconcile_pending_records()?;
+            }
         }
         Ok(store)
     }

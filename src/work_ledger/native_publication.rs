@@ -7,7 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -134,7 +137,7 @@ impl WorkLedger {
     /// after the daemon has completed a fenced provider delivery. Merely
     /// claiming, retrying, or becoming uncertain is not enough to let the
     /// originating agent relinquish the final monitoring obligation.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn native_wake_consumer_owns(&self, wake_id: &str) -> WorkLedgerResult<bool> {
         let connection = self.connect_read_only()?;
         let observed: Option<(String, bool)> = connection
@@ -165,6 +168,11 @@ impl WorkLedger {
         // Authorization must precede even SQLite creation. A refused machine,
         // repository, or malformed profile is not a native ledger event.
         validate_request(request, policy)?;
+        if !cfg!(unix) {
+            return Err(WorkLedgerError::Refused(
+                "native publication requires Unix policy-binding verification".to_owned(),
+            ));
+        }
         let ledger = Self::open_existing(state_dir)?.ok_or_else(|| {
             WorkLedgerError::Refused("explicit repository policy is unavailable".to_owned())
         })?;
@@ -593,6 +601,7 @@ pub(crate) fn verify_native_policy_binding(
     Ok(())
 }
 
+#[cfg(unix)]
 pub(crate) fn bind_legacy_native_policy(
     state_dir: &Path,
     repository: &str,
@@ -713,6 +722,7 @@ fn persist_native_policy_binding_value(
     Ok(())
 }
 
+#[cfg(unix)]
 fn read_native_policy_binding(
     state_dir: &Path,
     repository: &str,
@@ -750,6 +760,18 @@ fn read_native_policy_binding(
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|_| WorkLedgerError::Refused("native policy binding is malformed".to_owned()))
+}
+
+#[cfg(not(unix))]
+fn read_native_policy_binding(
+    _state_dir: &Path,
+    _repository: &str,
+    _pull_request: u64,
+    _head_sha: &str,
+) -> WorkLedgerResult<Option<NativePolicyBindingV1>> {
+    Err(WorkLedgerError::Refused(
+        "native policy binding verification requires a Unix controller".to_owned(),
+    ))
 }
 
 struct PublicationIdentities {
@@ -1055,8 +1077,7 @@ fn route_error(error: impl std::fmt::Display) -> WorkLedgerError {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::work_ledger::{
-        DeliveryAuthorization, NativeStewardDisposition, ProviderAuthorizationOperation,
-        ReconciliationAuthorization,
+        DeliveryAuthorization, ProviderAuthorizationOperation, ReconciliationAuthorization,
     };
     use std::path::PathBuf;
 
@@ -1065,9 +1086,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::work_ledger::{
         DeliveryFence, FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability,
-        ProviderLaunchRequest, ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult,
-        WakeEnvelope, WakeProfileResolver,
+        ProviderLaunchRequest, ProviderOutcome, WakeEnvelope, WakeProfileResolver,
     };
+    #[cfg(unix)]
+    use crate::work_ledger::{NativeStewardDisposition, WakeConsumerPolicy, WakeDeliveryResult};
     use crate::workstream_continuation_config::ProviderWrapperConfig;
 
     #[derive(Clone)]
@@ -1261,6 +1283,24 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_before_creating_native_storage() {
+        let temp = TempDir::new().expect("temp");
+        let state_dir = temp.path().join("state");
+        let request = request();
+        let error = WorkLedger::plan_or_apply_native_continuation(
+            &state_dir,
+            &request,
+            &policy(vec![request.repository.clone()]),
+            true,
+        )
+        .expect_err("Windows native publication must fail closed");
+        assert!(error.to_string().contains("requires Unix"));
+        assert!(!state_dir.exists());
+    }
+
+    #[cfg(unix)]
     fn seed_repo_policy(state_dir: &std::path::Path, repository: &str) {
         let ledger = WorkLedger::open(state_dir).expect("ledger");
         ledger
@@ -1279,6 +1319,7 @@ pub(crate) mod tests {
             .expect("repo policy");
     }
 
+    #[cfg(unix)]
     #[test]
     fn dry_run_is_non_mutating_and_apply_replays_exactly() {
         let temp = TempDir::new().expect("temp");
@@ -1358,6 +1399,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn absent_or_drifted_repo_policy_refuses_native_publication() {
         let absent = TempDir::new().expect("temp");
@@ -1413,6 +1455,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn configured_named_agent_uses_open_registry_without_lifecycle_changes() {
         let temp = TempDir::new().expect("temp");
@@ -1429,11 +1472,13 @@ pub(crate) mod tests {
             .expect("named provider publication");
     }
 
+    #[cfg(unix)]
     fn planned_with_apply(mut report: NativePublicationReport) -> NativePublicationReport {
         report.applied = true;
         report
     }
 
+    #[cfg(unix)]
     #[test]
     fn repository_and_machine_authorization_fail_before_storage_creation() {
         for (policy, request) in [
@@ -1467,6 +1512,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn cross_provider_terminal_authority_fails_before_storage_creation() {
         let temp = TempDir::new().expect("temp");
@@ -1484,6 +1530,7 @@ pub(crate) mod tests {
         assert!(!WorkLedger::path_at(temp.path()).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn cross_session_terminal_authority_fails_before_storage_creation() {
         let temp = TempDir::new().expect("temp");
@@ -1503,6 +1550,7 @@ pub(crate) mod tests {
         assert!(!WorkLedger::path_at(temp.path()).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolver_returns_only_exact_protected_profile_bytes() {
         let temp = TempDir::new().expect("temp");
@@ -1541,6 +1589,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn changed_profile_cannot_duplicate_one_stable_work_identity() {
         let temp = TempDir::new().expect("temp");
@@ -1564,6 +1613,7 @@ pub(crate) mod tests {
         assert_eq!(first.work_id, planned_changed.work_id);
     }
 
+    #[cfg(unix)]
     #[test]
     fn apply_resumes_an_exact_partial_publication() {
         let temp = TempDir::new().expect("temp");

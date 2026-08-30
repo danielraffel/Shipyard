@@ -28,7 +28,7 @@ use crate::transition_projection::{
     ProjectionReadback, ReconcileOutcome, SubmitReceipt, TransitionDraft, TransitionOutbox,
     TransitionProjectionAdapter,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::work_ledger::WorkLedger;
 
 #[cfg(test)]

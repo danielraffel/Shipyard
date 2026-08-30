@@ -141,7 +141,7 @@ fn remote_evidence_is_typed_and_proves_repo_preservation() {
 
 #[test]
 fn evidence_rejects_version_repo_and_digest_drift() {
-    let plan = super::super::host_update_plan(&host(None), "v0.127.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.127.0").expect("plan");
     let mut observed = evidence("0.127.0");
     observed.daemon_version = "0.126.2".to_owned();
     assert!(validate_evidence(&plan, &observed).is_err());
@@ -163,7 +163,7 @@ fn evidence_rejects_version_repo_and_digest_drift() {
 
 #[test]
 fn auth_support_evidence_rejects_tamper_and_mixed_release_source() {
-    let plan = super::super::host_update_plan(&host(None), "v0.127.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.127.0").expect("plan");
     let mut observed = evidence("0.127.0");
     observed.auth_support_after.helper.sha256 = Some("f".repeat(64));
     assert!(validate_evidence(&plan, &observed).is_err());
@@ -179,7 +179,8 @@ fn auth_support_evidence_rejects_tamper_and_mixed_release_source() {
 
 #[test]
 fn evidence_never_accepts_mixed_pair_or_legacy_companion() {
-    let paired_plan = super::super::host_update_plan(&host(None), "v0.127.0").expect("paired plan");
+    let paired_plan =
+        super::super::host_update_plan(&host(Some("m5-lan")), "v0.127.0").expect("paired plan");
     let mut mixed = evidence("0.127.0");
     mixed
         .after_pair
@@ -193,7 +194,8 @@ fn evidence_never_accepts_mixed_pair_or_legacy_companion() {
     wrong_source.after_pair.primary.source_identity = Some("9".repeat(64));
     assert!(validate_evidence(&paired_plan, &wrong_source).is_err());
 
-    let legacy_plan = super::super::host_update_plan(&host(None), "v0.126.2").expect("legacy plan");
+    let legacy_plan =
+        super::super::host_update_plan(&host(Some("m5-lan")), "v0.126.2").expect("legacy plan");
     let mut legacy_mixed = evidence("0.126.2");
     legacy_mixed.after_pair.companion = Some(BinaryEvidence {
         path: legacy_plan.companion_binary.clone(),
@@ -207,7 +209,7 @@ fn evidence_never_accepts_mixed_pair_or_legacy_companion() {
 
 #[test]
 fn evidence_never_infers_preinstall_provenance_or_omits_postinstall_binding() {
-    let plan = super::super::host_update_plan(&host(None), "v0.127.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.127.0").expect("plan");
 
     let mut fabricated_before = evidence("0.127.0");
     fabricated_before.before_pair.primary.source_identity = Some(verified_source_identity());

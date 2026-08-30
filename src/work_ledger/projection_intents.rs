@@ -114,6 +114,7 @@ impl PendingProjectionIntent {
 }
 
 impl WorkLedger {
+    #[cfg(any(unix, test))]
     pub(super) fn stage_waiting_observation(
         &self,
         work_item_id: &str,
@@ -434,7 +435,7 @@ impl WorkLedger {
         self.update_projection_intent_state(intent_id, "projected", None, 0)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn projection_intent_state(
         &self,
         intent_id: &str,
@@ -446,7 +447,7 @@ impl WorkLedger {
         )?)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn corrupt_projection_receipt_for_test(
         &self,
         intent_id: &str,
@@ -523,11 +524,16 @@ use rusqlite::OptionalExtension;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::work_ledger::RepoPolicy;
+    #[cfg(unix)]
     use crate::work_ledger::actionable_scheduler::NativeStewardDisposition;
+    #[cfg(unix)]
     use crate::work_ledger::native_publication::tests::{policy, request};
+    #[cfg(unix)]
     use std::sync::{Arc, Barrier};
 
+    #[cfg(unix)]
     fn published() -> (
         tempfile::TempDir,
         WorkLedger,
@@ -603,6 +609,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn publication_binds_bootstrap_and_stages_managed_receipt_in_one_ledger() {
         let (_state, ledger, request) = published();
         let connection = ledger.connect_read_only().expect("connection");
@@ -648,6 +655,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn producer_sequence_is_strict_and_supersedes_prior_transition() {
         let (_state, ledger, request) = published();
         ledger
@@ -699,6 +707,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn merged_and_nonmerged_closure_remain_distinct() {
         for (disposition, expected_kind, expected_note) in [
             (NativeStewardDisposition::Merged, "merge", "merged"),
@@ -743,6 +752,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn waiting_observation_replay_is_idempotent() {
         let (_state, ledger, request) = published();
         for _ in 0..2 {
@@ -766,6 +776,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn concurrent_waiting_producers_allocate_one_next_sequence() {
         let (_state, ledger, request) = published();
         let barrier = Arc::new(Barrier::new(3));

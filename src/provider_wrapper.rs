@@ -16,23 +16,39 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+use std::process::Stdio;
 use std::time::Duration;
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use crate::process::ProcessTree;
 use crate::workstream_continuation_config::ProviderWrapperConfig;
 use crate::workstream_continuation_config::registered_provider_route_shape;
 
 #[cfg(unix)]
 mod execution_sentinel;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+mod linux_parent;
+#[cfg(target_os = "macos")]
 use execution_sentinel::terminate_sentinel_processes;
+#[cfg(target_os = "linux")]
+use execution_sentinel::{
+    LinuxSentinelSupervisorSpecV3, LinuxSupervisorCleanupV3, LinuxSupervisorProviderV3,
+    LinuxSupervisorResultV3, MAX_SPEC_BYTES, READY_FRAME, RESULT_FRAME_PREFIX,
+    SPEC_ADMISSION_BUDGET,
+};
+#[cfg(target_os = "linux")]
+use linux_parent::run_provider_wrapper_linux_supervised;
+#[cfg(all(test, target_os = "linux"))]
+use linux_parent::{
+    finish_linux_supervisor_result, send_linux_supervisor_admission, write_linux_supervisor_spec,
+};
 
 /// Wire version 2 introduces tagged terminal endpoints. It is deliberately
 /// incompatible with the cmux-only v1 request so mixed deployments refuse.
@@ -42,10 +58,7 @@ const MAX_WRAPPER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 4 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
-#[cfg(target_os = "macos")]
 const SENTINEL_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
-#[cfg(not(target_os = "macos"))]
-const SENTINEL_TEARDOWN_BUDGET: Duration = TEARDOWN_BUDGET;
 const EXECUTION_SENTINEL_FD_ENV: &str = "SHIPYARD_PROVIDER_SENTINEL_FD";
 #[cfg(test)]
 const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 4;
@@ -1046,114 +1059,244 @@ fn run_provider_wrapper_unix(
         return Ok(uncertain("platform-cannot-prove-exact-wrapper-execution"));
     };
 
-    let mut stdin = tempfile::tempfile()
-        .map_err(|_| refusal("provider wrapper input capture cannot be created"))?;
-    stdin
-        .write_all(request_bytes)
-        .and_then(|()| stdin.seek(SeekFrom::Start(0)).map(drop))
-        .map_err(|_| refusal("provider wrapper input cannot be prepared"))?;
-    let mut stdout = tempfile::tempfile()
-        .map_err(|_| refusal("provider wrapper stdout capture cannot be created"))?;
-    let stderr = tempfile::tempfile()
-        .map_err(|_| refusal("provider wrapper stderr capture cannot be created"))?;
-    let execution_scope = tempfile::tempdir()
-        .map_err(|_| refusal("provider wrapper execution scope cannot be created"))?;
-    let sentinel_path = execution_scope.path().join("execution.sentinel");
-    let sentinel = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(&sentinel_path)
-        .map_err(|_| refusal("provider wrapper execution sentinel cannot be created"))?;
-    drop(sentinel);
-    // Keep the parent descriptor table untouched. Clearing CLOEXEC in this
-    // multi-threaded process allowed an unrelated concurrent child to inherit
-    // another invocation's sentinel and be mistaken for its descendant. The
-    // fixed system shell opens only this invocation's private sentinel in the
-    // child immediately before replacing itself with the verified snapshot.
-    let mut command = Command::new("/bin/sh");
-    command.args([
-        "-c",
-        "exec 9<>\"$1\" || exit 126\nshift\nexec \"$@\"",
-        "shipyard-provider-sentinel",
-    ]);
-    command.arg(&sentinel_path).arg(&prepared.path);
-    command.env_clear().envs(environment.0.iter());
-    command.env(EXECUTION_SENTINEL_FD_ENV, "9");
-    command
-        .stdin(Stdio::from(stdin))
-        .stdout(Stdio::from(stdout.try_clone().map_err(|_| {
-            refusal("provider wrapper stdout capture cannot be cloned")
-        })?))
-        .stderr(Stdio::from(stderr.try_clone().map_err(|_| {
-            refusal("provider wrapper stderr capture cannot be cloned")
-        })?));
+    #[cfg(target_os = "linux")]
+    {
+        run_provider_wrapper_linux_supervised(
+            config,
+            environment,
+            request,
+            request_bytes,
+            &prepared,
+        )
+    }
 
-    let deadline = Instant::now() + Duration::from_secs(config.deadline_seconds);
-    let Ok(mut process) = ProcessTree::spawn(&mut command) else {
-        return Ok(uncertain("verified-wrapper-launch-outcome-unknown"));
-    };
-    let mut status = None;
-    let mut uncertain_reason = None;
-    loop {
+    #[cfg(target_os = "macos")]
+    {
+        let mut stdin = tempfile::tempfile()
+            .map_err(|_| refusal("provider wrapper input capture cannot be created"))?;
+        stdin
+            .write_all(request_bytes)
+            .and_then(|()| stdin.seek(SeekFrom::Start(0)).map(drop))
+            .map_err(|_| refusal("provider wrapper input cannot be prepared"))?;
+        let mut stdout = tempfile::tempfile()
+            .map_err(|_| refusal("provider wrapper stdout capture cannot be created"))?;
+        let stderr = tempfile::tempfile()
+            .map_err(|_| refusal("provider wrapper stderr capture cannot be created"))?;
+        let execution_scope = tempfile::tempdir()
+            .map_err(|_| refusal("provider wrapper execution scope cannot be created"))?;
+        let sentinel_path = execution_scope.path().join("execution.sentinel");
+        let sentinel = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&sentinel_path)
+            .map_err(|_| refusal("provider wrapper execution sentinel cannot be created"))?;
+        drop(sentinel);
+        // Keep the parent descriptor table untouched. Clearing CLOEXEC in this
+        // multi-threaded process allowed an unrelated concurrent child to inherit
+        // another invocation's sentinel and be mistaken for its descendant. The
+        // fixed system shell opens only this invocation's private sentinel in the
+        // child immediately before replacing itself with the verified snapshot.
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "exec 9<>\"$1\" || exit 126\nshift\nexec \"$@\"",
+            "shipyard-provider-sentinel",
+        ]);
+        command.arg(&sentinel_path).arg(&prepared.path);
+        command.env_clear().envs(environment.0.iter());
+        command.env(EXECUTION_SENTINEL_FD_ENV, "9");
+        command
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout.try_clone().map_err(|_| {
+                refusal("provider wrapper stdout capture cannot be cloned")
+            })?))
+            .stderr(Stdio::from(stderr.try_clone().map_err(|_| {
+                refusal("provider wrapper stderr capture cannot be cloned")
+            })?));
+
+        let deadline = Instant::now() + Duration::from_secs(config.deadline_seconds);
+        let Ok(mut process) = ProcessTree::spawn(&mut command) else {
+            return Ok(uncertain("verified-wrapper-launch-outcome-unknown"));
+        };
+        let mut status = None;
+        let mut uncertain_reason = None;
+        loop {
+            if capture_exceeds(&stdout, config.max_stdout_bytes)
+                || capture_exceeds(&stderr, config.max_stderr_bytes)
+            {
+                uncertain_reason = Some("provider-wrapper-output-limit");
+                break;
+            }
+            match process.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+                Ok(None) => {
+                    uncertain_reason = Some("provider-wrapper-timeout");
+                    break;
+                }
+                Err(_) => {
+                    uncertain_reason = Some("provider-wrapper-wait-outcome-unknown");
+                    break;
+                }
+            }
+        }
+        let tree_cleanup_deadline = Instant::now() + TEARDOWN_BUDGET;
+        process.terminate_until(tree_cleanup_deadline);
+        let sentinel_cleanup = terminate_sentinel_processes(
+            &sentinel_path,
+            Instant::now() + SENTINEL_TEARDOWN_BUDGET,
+            POLL_INTERVAL,
+        );
         if capture_exceeds(&stdout, config.max_stdout_bytes)
             || capture_exceeds(&stderr, config.max_stderr_bytes)
         {
-            uncertain_reason = Some("provider-wrapper-output-limit");
-            break;
+            return Ok(uncertain("provider-wrapper-output-limit"));
         }
-        match process.try_wait() {
-            Ok(Some(exit)) => {
-                status = Some(exit);
-                break;
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-            Ok(None) => {
-                uncertain_reason = Some("provider-wrapper-timeout");
-                break;
-            }
-            Err(_) => {
-                uncertain_reason = Some("provider-wrapper-wait-outcome-unknown");
-                break;
-            }
+        if !sentinel_cleanup.proven {
+            return Ok(uncertain("provider-wrapper-cleanup-unproven"));
         }
+        if sentinel_cleanup.residual_detected {
+            return Ok(uncertain("provider-wrapper-descendant-violation"));
+        }
+        if let Some(reason) = uncertain_reason {
+            return Ok(uncertain(reason));
+        }
+        let Some(status) = status else {
+            return Ok(uncertain("provider-wrapper-exit-outcome-unknown"));
+        };
+        if !status.success() {
+            return Ok(uncertain("provider-wrapper-nonzero-post-launch"));
+        }
+        let stdout_bytes = read_capture(&mut stdout, config.max_stdout_bytes)
+            .ok_or_else(|| refusal("provider wrapper stdout capture is unreadable"))?;
+        map_response(request, &stdout_bytes)
     }
-    let tree_cleanup_deadline = Instant::now() + TEARDOWN_BUDGET;
-    process.terminate_until(tree_cleanup_deadline);
-    let sentinel_cleanup = terminate_sentinel_processes(
-        &sentinel_path,
-        Instant::now() + SENTINEL_TEARDOWN_BUDGET,
-        POLL_INTERVAL,
-    );
-    if capture_exceeds(&stdout, config.max_stdout_bytes)
-        || capture_exceeds(&stderr, config.max_stderr_bytes)
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        return Ok(uncertain("provider-wrapper-output-limit"));
+        let _ = (config, environment, request, request_bytes, prepared);
+        Ok(uncertain("platform-cannot-prove-exact-wrapper-execution"))
     }
-    if !sentinel_cleanup.proven {
-        return Ok(uncertain("provider-wrapper-cleanup-unproven"));
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn linux_supervisor_command() -> Command {
+    // Bind the one-shot supervisor to the daemon's already-running image.
+    // Unlike current_exe's release pathname, /proc/self/exe survives atomic
+    // replacement and unlink during rolling deployment.
+    let mut command = Command::new("/proc/self/exe");
+    command.arg("provider-sentinel-supervisor");
+    command
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn linux_supervisor_command() -> Command {
+    let mut command = Command::new("/proc/self/exe");
+    command.args([
+        "--exact",
+        "provider_wrapper::tests::linux_sentinel_supervisor_subprocess_helper",
+        "--ignored",
+        "--nocapture",
+    ]);
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn drain_linux_supervisor_channel(
+    channel: &mut File,
+    frames: &mut Vec<u8>,
+    max_frames: usize,
+) -> bool {
+    let mut buffer = [0u8; 512];
+    loop {
+        match channel.read(&mut buffer) {
+            Ok(0) => return true,
+            Ok(count) => {
+                if frames.len().saturating_add(count) > max_frames {
+                    return false;
+                }
+                frames.extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
     }
-    if sentinel_cleanup.residual_detected {
-        return Ok(uncertain("provider-wrapper-descendant-violation"));
-    }
-    if let Some(reason) = uncertain_reason {
-        return Ok(uncertain(reason));
-    }
-    let Some(status) = status else {
-        return Ok(uncertain("provider-wrapper-exit-outcome-unknown"));
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_supervisor_frames(bytes: &[u8]) -> Option<(bool, LinuxSupervisorResultV3)> {
+    parse_linux_supervisor_frames_strict(linux_supervisor_protocol_slice(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_supervisor_frames_strict(bytes: &[u8]) -> Option<(bool, LinuxSupervisorResultV3)> {
+    let (startup, result_frame) = if let Some(rest) = bytes.strip_prefix(READY_FRAME) {
+        (true, rest)
+    } else {
+        (false, bytes)
     };
-    if !status.success() {
-        return Ok(uncertain("provider-wrapper-nonzero-post-launch"));
+    let json = result_frame
+        .strip_prefix(RESULT_FRAME_PREFIX)?
+        .strip_suffix(b"\n")?;
+    let result = serde_json::from_slice(json).ok()?;
+    Some((startup, result))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_supervisor_protocol_slice(bytes: &[u8]) -> &[u8] {
+    #[cfg(test)]
+    {
+        // The libtest subprocess helper shares stdout with the harness. Real
+        // production-binary integration tests exercise the strict no-noise
+        // branch below; unit tests isolate only the uniquely framed protocol.
+        let ready = bytes
+            .windows(READY_FRAME.len())
+            .position(|window| window == READY_FRAME);
+        let result = bytes
+            .windows(RESULT_FRAME_PREFIX.len())
+            .position(|window| window == RESULT_FRAME_PREFIX);
+        let start = match (ready, result) {
+            (Some(ready), Some(result)) => ready.min(result),
+            (Some(ready), None) => ready,
+            (None, Some(result)) => result,
+            (None, None) => return &[],
+        };
+        if let Some(result) = result {
+            let result_body = result + RESULT_FRAME_PREFIX.len();
+            if let Some(newline) = bytes[result_body..].iter().position(|byte| *byte == b'\n') {
+                return &bytes[start..=result_body + newline];
+            }
+        }
+        &bytes[start..]
     }
-    let stdout_bytes = read_capture(&mut stdout, config.max_stdout_bytes)
-        .ok_or_else(|| refusal("provider wrapper stdout capture is unreadable"))?;
-    map_response(request, &stdout_bytes)
+    #[cfg(not(test))]
+    {
+        bytes
+    }
+}
+
+/// Hidden CLI entry for the Linux-only one-shot sentinel supervisor.
+pub(crate) fn run_provider_sentinel_supervisor_command() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        execution_sentinel::run_linux_sentinel_supervisor()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("provider sentinel supervisor is supported only on Linux".into())
+    }
 }
 
 #[cfg(unix)]
 struct PreparedExecutable {
+    #[cfg(not(target_os = "linux"))]
     path: std::path::PathBuf,
-    _file: File,
+    file: File,
     _private_directory: Option<tempfile::TempDir>,
 }
 
@@ -1162,12 +1305,13 @@ fn prepare_platform_executable(
     mut executable: File,
     expected_sha256: &str,
 ) -> Result<Option<PreparedExecutable>, ProviderWrapperRefusal> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
 
     let descriptor = rustix::fs::memfd_create(
         "shipyard-provider-wrapper",
-        rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::EXEC,
+        rustix::fs::MemfdFlags::ALLOW_SEALING
+            | rustix::fs::MemfdFlags::CLOEXEC
+            | rustix::fs::MemfdFlags::EXEC,
     )
     .map_err(|_| refusal("platform cannot create a sealable wrapper snapshot"))?;
     let mut sealed = File::from(descriptor);
@@ -1198,16 +1342,8 @@ fn prepare_platform_executable(
         return Err(refusal("sealed wrapper snapshot digest changed"));
     }
 
-    rustix::io::fcntl_setfd(&sealed, rustix::io::FdFlags::empty()).map_err(|_| {
-        refusal("platform cannot preserve the verified wrapper descriptor across exec")
-    })?;
-    let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", sealed.as_raw_fd()));
-    if !path.exists() {
-        return Ok(None);
-    }
     Ok(Some(PreparedExecutable {
-        path,
-        _file: sealed,
+        file: sealed,
         _private_directory: None,
     }))
 }
@@ -1264,7 +1400,7 @@ fn prepare_platform_executable(
     }
     Ok(Some(PreparedExecutable {
         path,
-        _file: verified,
+        file: verified,
         _private_directory: Some(private_directory),
     }))
 }
@@ -1429,7 +1565,7 @@ mod tests {
             }),
             protected_route: ProtectedProviderRouteV1 {
                 argv: vec![
-                    "/opt/subrouter".into(),
+                    native_absolute_test_path("subrouter"),
                     "codex".into(),
                     "resume".into(),
                     "--model".into(),
@@ -1439,7 +1575,7 @@ mod tests {
                     "session-1".into(),
                 ],
                 fresh_argv: vec![
-                    "/opt/subrouter".into(),
+                    native_absolute_test_path("subrouter"),
                     "codex".into(),
                     "--model".into(),
                     "gpt-5.6-sol".into(),
@@ -1697,7 +1833,7 @@ mod tests {
         let source = directory.path().join("wrapper.c");
         let path = directory.path().join("wrapper");
         let contents = format!(
-            "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n#include <sys/wait.h>\nint main(void) {{ {source_body} }}\n"
+            "#include <dirent.h>\n#include <errno.h>\n#include <signal.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n#include <sys/wait.h>\n#ifdef __linux__\n#include <sys/prctl.h>\n#endif\nint main(void) {{ {source_body} }}\n"
         );
         fs::write(&source, contents).unwrap();
         assert!(
@@ -1777,7 +1913,7 @@ mod tests {
             ProviderWrapperOperationV1::Reconcile => "reconcile",
         };
         format!(
-            "char input[65537] = {{0}}; size_t count = fread(input, 1, sizeof(input) - 1, stdin); if (count == 0 || strstr(input, \"\\\"operation\\\":\\\"{operation}\\\"\") == NULL || getenv(\"GITHUB_TOKEN\") != NULL) return 91; unsigned char output[] = {{{bytes}}}; return fwrite(output, 1, sizeof(output), stdout) == sizeof(output) ? 0 : 1;"
+            "char input[65537] = {{0}}; size_t count = 0; while (count < sizeof(input) - 1) {{ size_t room = sizeof(input) - 1 - count; size_t chunk = room < 7 ? room : 7; ssize_t got = read(STDIN_FILENO, input + count, chunk); if (got > 0) {{ count += (size_t)got; continue; }} if (got == 0) break; if (errno == EINTR) continue; return 90; }} if (count == 0 || strstr(input, \"\\\"operation\\\":\\\"{operation}\\\"\") == NULL || getenv(\"GITHUB_TOKEN\") != NULL) return 91; unsigned char output[] = {{{bytes}}}; size_t written = 0; while (written < sizeof(output)) {{ size_t remaining = sizeof(output) - written; size_t chunk = remaining < 7 ? remaining : 7; ssize_t sent = write(STDOUT_FILENO, output + written, chunk); if (sent > 0) {{ written += (size_t)sent; continue; }} if (sent < 0 && errno == EINTR) continue; return 92; }} return 0;"
         )
     }
 
@@ -1946,7 +2082,10 @@ mod tests {
             "pid_t child = fork(); if (child == 0) { sleep(30); return 0; } const char *home = getenv(\"HOME\"); char path[4096]; snprintf(path, sizeof(path), \"%s/child.pid\", home); FILE *file = fopen(path, \"w\"); fprintf(file, \"%d\", child); fclose(file); waitpid(child, 0, 0); return 0;",
         );
         let mut timeout_config = config(&path, sha);
-        timeout_config.deadline_seconds = 5;
+        // The full macOS suite runs thousands of process fixtures in parallel.
+        // Keep this below the child's 30-second sleep while allowing the
+        // wrapper enough scheduler time to publish its descendant receipt.
+        timeout_config.deadline_seconds = 15;
         let environment = ProviderWrapperEnvironment::new([(
             "HOME".into(),
             directory.path().as_os_str().to_owned(),
@@ -1988,7 +2127,7 @@ mod tests {
             "pid_t child = fork(); if (child == 0) { setsid(); const char *home = getenv(\"HOME\"); char path[4096]; snprintf(path, sizeof(path), \"%s/detached.pid\", home); FILE *file = fopen(path, \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; } waitpid(child, 0, 0); return 0;",
         );
         let mut timeout_config = config(&path, sha);
-        timeout_config.deadline_seconds = 5;
+        timeout_config.deadline_seconds = 15;
         let environment = ProviderWrapperEnvironment::new([(
             "HOME".into(),
             directory.path().as_os_str().to_owned(),
@@ -2013,9 +2152,12 @@ mod tests {
         let request = request(ProviderWrapperOperationV1::Submit);
         let directory = tempfile::tempdir().unwrap();
         let detached_pid = directory.path().join("detached-success.pid");
+        let detached_pid_staging = directory.path().join("detached-success.pid.tmp");
         let body = format!(
-            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; }} \
+            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); rename(\"{}\", \"{}\"); sleep(30); return 0; }} \
              for (int i = 0; i < 5000 && access(\"{}\", F_OK) != 0; ++i) usleep(1000); {}",
+            detached_pid_staging.display(),
+            detached_pid_staging.display(),
             detached_pid.display(),
             detached_pid.display(),
             response_program(&request, "delivered"),
@@ -2035,6 +2177,597 @@ mod tests {
             &child_pid,
             "setsid child survived successful wrapper-parent exit",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_parent_exit_with_stopped_setsid_child_leaves_no_orphan() {
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let directory = tempfile::tempdir().unwrap();
+        let detached_pid = directory.path().join("detached-stopped.pid");
+        let detached_pid_staging = directory.path().join("detached-stopped.pid.tmp");
+        let body = format!(
+            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); rename(\"{}\", \"{}\"); raise(SIGSTOP); return 0; }} \
+             for (int i = 0; i < 5000 && access(\"{}\", F_OK) != 0; ++i) usleep(1000); {}",
+            detached_pid_staging.display(),
+            detached_pid_staging.display(),
+            detached_pid.display(),
+            detached_pid.display(),
+            response_program(&request, "delivered"),
+        );
+        let (_wrapper_dir, path, sha) = wrapper_c(&body);
+        let result = run_provider_wrapper(
+            &config(&path, sha),
+            &ProviderWrapperEnvironment::default(),
+            &request,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &result,
+                ProviderWrapperRunResult::Uncertain {
+                    evidence_digest,
+                    response_receipt: None,
+                } if *evidence_digest == digest("provider-wrapper-descendant-violation")
+            ),
+            "unexpected Linux subreaper result: {result:?}"
+        );
+        let child_pid = fs::read_to_string(&detached_pid).unwrap();
+        assert_pid_eventually_not_running(
+            &child_pid,
+            "stopped setsid child survived exact sentinel cleanup",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_supervisor_uses_the_running_image_across_release_replacement() {
+        let command = linux_supervisor_command();
+        assert_eq!(command.get_program(), "/proc/self/exe");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_running_image_survives_installed_path_replacement_and_unlink() {
+        use wait_timeout::ChildExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let installed = directory.path().join("shipyard-installed");
+        let retired = directory.path().join("shipyard-running-retired");
+        let ready = directory.path().join("ready");
+        let proceed = directory.path().join("proceed");
+        let outcome = directory.path().join("outcome");
+        fs::copy(std::env::current_exe().unwrap(), &installed).unwrap();
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = Command::new(&installed)
+            .args([
+                "--exact",
+                "provider_wrapper::tests::linux_release_replacement_subprocess_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SHIPYARD_TEST_RELEASE_READY", &ready)
+            .env("SHIPYARD_TEST_RELEASE_PROCEED", &proceed)
+            .env("SHIPYARD_TEST_RELEASE_OUTCOME", &outcome)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "release helper did not become ready"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        fs::rename(&installed, &retired).unwrap();
+        fs::write(&installed, b"replacement is intentionally not executable").unwrap();
+        fs::remove_file(&retired).unwrap();
+        fs::write(&proceed, b"go").unwrap();
+        let status = child
+            .wait_timeout(Duration::from_secs(20))
+            .unwrap()
+            .expect("release replacement helper timed out");
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(outcome).unwrap(), "delivered");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "subprocess entry for installed-path replacement proof"]
+    fn linux_release_replacement_subprocess_helper() {
+        let ready = PathBuf::from(std::env::var_os("SHIPYARD_TEST_RELEASE_READY").unwrap());
+        let proceed = PathBuf::from(std::env::var_os("SHIPYARD_TEST_RELEASE_PROCEED").unwrap());
+        let outcome = PathBuf::from(std::env::var_os("SHIPYARD_TEST_RELEASE_OUTCOME").unwrap());
+        fs::write(&ready, b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !proceed.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "release parent never continued helper"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let (_directory, wrapper, sha) = wrapper_c(&response_program(&request, "delivered"));
+        let result = run_provider_wrapper(
+            &config(&wrapper, sha),
+            &ProviderWrapperEnvironment::default(),
+            &request,
+        )
+        .unwrap();
+        assert!(matches!(result, ProviderWrapperRunResult::Delivered { .. }));
+        fs::write(outcome, b"delivered").unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_parent_refuses_crashed_supervisor_even_with_forged_success_frame() {
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let result = LinuxSupervisorResultV3 {
+            schema_version: 3,
+            provider: LinuxSupervisorProviderV3::Success,
+            cleanup: LinuxSupervisorCleanupV3::Clean,
+            stdout: b"forged delivered response".to_vec(),
+        };
+        let mut frames = READY_FRAME.to_vec();
+        frames.extend_from_slice(RESULT_FRAME_PREFIX);
+        frames.extend_from_slice(&serde_json::to_vec(&result).unwrap());
+        frames.push(b'\n');
+        assert!(matches!(
+            finish_linux_supervisor_result(&request, false, true, None, &frames).unwrap(),
+            ProviderWrapperRunResult::Uncertain {
+                evidence_digest,
+                response_receipt: None,
+            } if evidence_digest == digest("provider-wrapper-cleanup-unproven")
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_parent_parser_accepts_only_the_exact_production_frame_shape() {
+        let result = LinuxSupervisorResultV3 {
+            schema_version: 3,
+            provider: LinuxSupervisorProviderV3::Success,
+            cleanup: LinuxSupervisorCleanupV3::Clean,
+            stdout: Vec::new(),
+        };
+        let mut exact = READY_FRAME.to_vec();
+        exact.extend_from_slice(RESULT_FRAME_PREFIX);
+        exact.extend_from_slice(&serde_json::to_vec(&result).unwrap());
+        exact.push(b'\n');
+        assert!(parse_linux_supervisor_frames_strict(&exact).is_some());
+        for malformed in [
+            [&b"noise"[..], exact.as_slice()].concat(),
+            [exact.as_slice(), &b"noise"[..]].concat(),
+            exact[..exact.len() - 1].to_vec(),
+            [exact.as_slice(), exact.as_slice()].concat(),
+            [
+                RESULT_FRAME_PREFIX,
+                &serde_json::to_vec(&result).unwrap(),
+                b"\n",
+                READY_FRAME,
+            ]
+            .concat(),
+        ] {
+            assert!(
+                parse_linux_supervisor_frames_strict(&malformed).is_none(),
+                "accepted malformed supervisor frame: {malformed:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_subreaper_terminates_hidden_setsid_dumpable_zero_descendant() {
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let directory = tempfile::tempdir().unwrap();
+        let detached_pid = directory.path().join("linux-hidden.pid");
+        let detached_pid_staging = directory.path().join("linux-hidden.pid.tmp");
+        let body = format!(
+            "pid_t child = fork(); if (child == 0) {{ setsid(); prctl(PR_SET_DUMPABLE, 0, 0, 0, 0); signal(SIGTERM, SIG_IGN); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); rename(\"{}\", \"{}\"); sleep(30); return 0; }} \
+             for (int i = 0; i < 5000 && access(\"{}\", F_OK) != 0; ++i) usleep(1000); {}",
+            detached_pid_staging.display(),
+            detached_pid_staging.display(),
+            detached_pid.display(),
+            detached_pid.display(),
+            response_program(&request, "delivered"),
+        );
+        let (_wrapper_dir, path, sha) = wrapper_c(&body);
+        let result = run_provider_wrapper(
+            &config(&path, sha),
+            &ProviderWrapperEnvironment::default(),
+            &request,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &result,
+                ProviderWrapperRunResult::Uncertain {
+                    evidence_digest,
+                    response_receipt: None,
+                } if *evidence_digest == digest("provider-wrapper-descendant-violation")
+            ),
+            "unexpected Linux hidden-descendant result: {result:?}"
+        );
+        let child_pid = fs::read_to_string(&detached_pid).unwrap();
+        assert_pid_eventually_not_running(
+            &child_pid,
+            "dumpable-zero setsid child survived subreaper cleanup",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_subreaper_kills_descendant_that_closes_sentinel_fd() {
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let directory = tempfile::tempdir().unwrap();
+        let detached_pid = directory.path().join("linux-closed-fd.pid");
+        let detached_pid_staging = directory.path().join("linux-closed-fd.pid.tmp");
+        let body = format!(
+            "pid_t child = fork(); if (child == 0) {{ setsid(); close(9); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); rename(\"{}\", \"{}\"); sleep(30); return 0; }} \
+             for (int i = 0; i < 5000 && access(\"{}\", F_OK) != 0; ++i) usleep(1000); {}",
+            detached_pid_staging.display(),
+            detached_pid_staging.display(),
+            detached_pid.display(),
+            detached_pid.display(),
+            response_program(&request, "delivered"),
+        );
+        let (_wrapper_dir, path, sha) = wrapper_c(&body);
+        let result = run_provider_wrapper(
+            &config(&path, sha),
+            &ProviderWrapperEnvironment::default(),
+            &request,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &result,
+                ProviderWrapperRunResult::Uncertain {
+                    evidence_digest,
+                    response_receipt: None,
+                } if *evidence_digest == digest("provider-wrapper-descendant-violation")
+            ),
+            "unexpected Linux closed-fd result: {result:?}"
+        );
+        let child_pid = fs::read_to_string(&detached_pid).unwrap();
+        assert_pid_eventually_not_running(
+            &child_pid,
+            "closed-fd setsid child survived subreaper cleanup",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_dedicated_supervisor_never_kills_unrelated_nondumpable_process() {
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let (_unrelated_dir, unrelated_path, _sha) =
+            wrapper_c("prctl(PR_SET_DUMPABLE, 0, 0, 0, 0); sleep(30); return 0;");
+        let mut unrelated = Command::new(unrelated_path).spawn().unwrap();
+        let (_wrapper_dir, path, sha) = wrapper_c(&response_program(&request, "delivered"));
+        let result = run_provider_wrapper(
+            &config(&path, sha),
+            &ProviderWrapperEnvironment::default(),
+            &request,
+        )
+        .unwrap();
+        assert!(matches!(result, ProviderWrapperRunResult::Delivered { .. }));
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "dedicated supervisor crossed into an unrelated same-UID process"
+        );
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_control_eof_triggers_bounded_subreaper_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        use wait_timeout::ChildExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let descendant_pid = directory.path().join("abandoned.pid");
+        let body = format!(
+            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; }} waitpid(child, 0, 0); return 0;",
+            descendant_pid.display(),
+        );
+        let (_wrapper_dir, wrapper, sha) = wrapper_c(&body);
+        let spec = LinuxSentinelSupervisorSpecV3 {
+            schema_version: 3,
+            request_bytes: Vec::new(),
+            max_stdout_bytes: 1024,
+            max_stderr_bytes: 1024,
+            provider_deadline_millis: 10_000,
+        };
+        let spec_bytes = serde_json::to_vec(&spec).unwrap();
+        let mut framed_spec = Vec::with_capacity(spec_bytes.len() + 4);
+        framed_spec.extend_from_slice(&u32::try_from(spec_bytes.len()).unwrap().to_be_bytes());
+        framed_spec.extend_from_slice(&spec_bytes);
+        let executable = prepare_platform_executable(File::open(&wrapper).unwrap(), &sha)
+            .unwrap()
+            .unwrap();
+        let (parent_socket, child_socket) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+            None,
+        )
+        .unwrap();
+        let mut command = linux_supervisor_command();
+        command
+            .env_clear()
+            .env("HOME", directory.path())
+            .stdin(Stdio::from(child_socket))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut supervisor = command.spawn().unwrap();
+        let mut control = std::os::unix::net::UnixStream::from(parent_socket);
+        assert!(send_linux_supervisor_admission(
+            &mut control,
+            &executable.file,
+            &framed_spec,
+            Instant::now() + Duration::from_secs(2)
+        ));
+        let mut channel = supervisor.stdout.take().unwrap();
+        let mut frames = Vec::new();
+        let mut chunk = [0u8; 512];
+        while !linux_supervisor_protocol_slice(&frames).starts_with(READY_FRAME) {
+            let count = channel.read(&mut chunk).unwrap();
+            assert_ne!(count, 0, "supervisor exited before readiness frame");
+            frames.extend_from_slice(&chunk[..count]);
+        }
+        let pid_deadline = Instant::now() + Duration::from_secs(5);
+        while !descendant_pid.exists() {
+            assert!(
+                Instant::now() < pid_deadline,
+                "descendant PID was not published"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        drop(control);
+        let status = supervisor
+            .wait_timeout(Duration::from_secs(4))
+            .unwrap()
+            .expect("control EOF cleanup exceeded its bound");
+        assert!(status.success());
+        channel.read_to_end(&mut frames).unwrap();
+        let (_, result) = parse_linux_supervisor_frames(&frames).unwrap();
+        assert_eq!(result.provider, LinuxSupervisorProviderV3::ControlEof);
+        assert_eq!(result.cleanup, LinuxSupervisorCleanupV3::ResidualTerminated);
+        assert_pid_eventually_not_running(
+            &fs::read_to_string(&descendant_pid).unwrap(),
+            "control EOF left a live descendant",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_partial_spec_write_to_stopped_supervisor_is_deadline_bounded() {
+        let (parent, child_socket) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+            None,
+        )
+        .unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "kill -STOP $$; sleep 30"])
+            .stdin(Stdio::from(child_socket))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut control = std::os::unix::net::UnixStream::from(parent);
+        let bytes = vec![7u8; MAX_SPEC_BYTES];
+        let started = Instant::now();
+        assert!(!write_linux_supervisor_spec(
+            &mut control,
+            &bytes,
+            started + Duration::from_millis(50)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(control);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_parallel_supervisors_do_not_cross_kill() {
+        let clean_request = request(ProviderWrapperOperationV1::Submit);
+        let violating_request = clean_request.clone();
+        let clean_body = format!(
+            "usleep(250000); {}",
+            response_program(&clean_request, "delivered")
+        );
+        let (_clean_dir, clean_path, clean_sha) = wrapper_c(&clean_body);
+        let violation_dir = tempfile::tempdir().unwrap();
+        let child_pid = violation_dir.path().join("parallel-violation.pid");
+        let violating_body = format!(
+            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; }} {}",
+            child_pid.display(),
+            response_program(&violating_request, "delivered"),
+        );
+        let (_violating_dir, violating_path, violating_sha) = wrapper_c(&violating_body);
+        let clean = std::thread::spawn(move || {
+            run_provider_wrapper(
+                &config(&clean_path, clean_sha),
+                &ProviderWrapperEnvironment::default(),
+                &clean_request,
+            )
+            .unwrap()
+        });
+        let violating = std::thread::spawn(move || {
+            run_provider_wrapper(
+                &config(&violating_path, violating_sha),
+                &ProviderWrapperEnvironment::default(),
+                &violating_request,
+            )
+            .unwrap()
+        });
+        assert!(matches!(
+            clean.join().unwrap(),
+            ProviderWrapperRunResult::Delivered { .. }
+        ));
+        assert!(matches!(
+            violating.join().unwrap(),
+            ProviderWrapperRunResult::Uncertain {
+                evidence_digest,
+                response_receipt: None,
+            } if evidence_digest == digest("provider-wrapper-descendant-violation")
+        ));
+        let pid_deadline = Instant::now() + Duration::from_secs(5);
+        while !child_pid.exists() {
+            assert!(
+                Instant::now() < pid_deadline,
+                "parallel child PID was not published"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert_pid_eventually_not_running(
+            &fs::read_to_string(child_pid).unwrap(),
+            "parallel violating child survived isolated cleanup",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_parallel_supervisors_receive_only_their_exact_executable_fd() {
+        let delivered_request = request(ProviderWrapperOperationV1::Submit);
+        let retryable_request = delivered_request.clone();
+        let descriptor_count = "DIR *directory = opendir(\"/proc/self/fd\"); if (directory == NULL) return 93; struct dirent *entry; int memfds = 0; char path[512]; char target[512]; while ((entry = readdir(directory)) != NULL) { snprintf(path, sizeof(path), \"/proc/self/fd/%s\", entry->d_name); ssize_t length = readlink(path, target, sizeof(target) - 1); if (length < 0) continue; target[length] = '\\0'; if (strstr(target, \"memfd:shipyard-provider-wrapper\") != NULL) memfds++; } closedir(directory); if (memfds != 1) return 94; ";
+        let (_delivered_dir, delivered_path, delivered_sha) = wrapper_c(&format!(
+            "{descriptor_count}{}",
+            response_program(&delivered_request, "delivered")
+        ));
+        let (_retryable_dir, retryable_path, retryable_sha) = wrapper_c(&format!(
+            "{descriptor_count}{}",
+            response_program(&retryable_request, "retryable")
+        ));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let delivered_barrier = barrier.clone();
+        let delivered = std::thread::spawn(move || {
+            let prepared =
+                prepare_platform_executable(File::open(&delivered_path).unwrap(), &delivered_sha)
+                    .unwrap()
+                    .unwrap();
+            delivered_barrier.wait();
+            assert!(
+                Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "count=0; for fd in /proc/self/fd/*; do target=$(readlink \"$fd\" 2>/dev/null || true); case \"$target\" in *memfd:shipyard-provider-wrapper*) count=$((count + 1));; esac; done; test \"$count\" -eq 0",
+                    ])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "unrelated concurrent child inherited a wrapper capability"
+            );
+            run_provider_wrapper_linux_supervised(
+                &config(&delivered_path, delivered_sha),
+                &ProviderWrapperEnvironment::default(),
+                &delivered_request,
+                &serde_json::to_vec(&delivered_request).unwrap(),
+                &prepared,
+            )
+            .unwrap()
+        });
+        let retryable_barrier = barrier;
+        let retryable = std::thread::spawn(move || {
+            let prepared =
+                prepare_platform_executable(File::open(&retryable_path).unwrap(), &retryable_sha)
+                    .unwrap()
+                    .unwrap();
+            retryable_barrier.wait();
+            assert!(
+                Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "count=0; for fd in /proc/self/fd/*; do target=$(readlink \"$fd\" 2>/dev/null || true); case \"$target\" in *memfd:shipyard-provider-wrapper*) count=$((count + 1));; esac; done; test \"$count\" -eq 0",
+                    ])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "unrelated concurrent child inherited a wrapper capability"
+            );
+            run_provider_wrapper_linux_supervised(
+                &config(&retryable_path, retryable_sha),
+                &ProviderWrapperEnvironment::default(),
+                &retryable_request,
+                &serde_json::to_vec(&retryable_request).unwrap(),
+                &prepared,
+            )
+            .unwrap()
+        });
+        assert!(matches!(
+            delivered.join().unwrap(),
+            ProviderWrapperRunResult::Delivered { .. }
+        ));
+        assert!(matches!(
+            retryable.join().unwrap(),
+            ProviderWrapperRunResult::Retryable { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_production_executable_capability_can_start_at_fd9() {
+        let executable = std::env::current_exe().unwrap();
+        let status = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 3</dev/null; exec 4</dev/null; exec 5</dev/null; exec 6</dev/null; exec 7</dev/null; exec 8</dev/null; exec 9>&-; exec \"$@\"",
+                "shipyard-fd9-regression",
+            ])
+            .arg(executable)
+            .args([
+                "--exact",
+                "provider_wrapper::tests::linux_production_executable_fd9_subprocess_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "subprocess entry for exact production fd-9 capability proof"]
+    fn linux_production_executable_fd9_subprocess_helper() {
+        use std::os::fd::AsRawFd;
+
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let (_directory, path, sha) = wrapper_c(&response_program(&request, "delivered"));
+        let source_at_nine = File::open(&path).unwrap();
+        assert_eq!(source_at_nine.as_raw_fd(), 9);
+        let source = File::from(rustix::io::fcntl_dupfd_cloexec(&source_at_nine, 10).unwrap());
+        drop(source_at_nine);
+        let prepared = prepare_platform_executable(source, &sha).unwrap().unwrap();
+        assert_eq!(prepared.file.as_raw_fd(), 9);
+        assert!(
+            rustix::io::fcntl_getfd(&prepared.file)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+        let request_bytes = serde_json::to_vec(&request).unwrap();
+        let result = run_provider_wrapper_linux_supervised(
+            &config(&path, sha),
+            &ProviderWrapperEnvironment::default(),
+            &request,
+            &request_bytes,
+            &prepared,
+        )
+        .unwrap();
+        assert!(matches!(result, ProviderWrapperRunResult::Delivered { .. }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "subprocess entry for the production Linux sentinel supervisor"]
+    fn linux_sentinel_supervisor_subprocess_helper() {
+        run_provider_sentinel_supervisor_command().expect("production sentinel supervisor");
     }
 
     #[cfg(unix)]

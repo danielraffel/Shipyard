@@ -579,10 +579,11 @@ impl WorkLedgerProviderAdapter<'_> {
                 },
             },
             Ok(ProviderWrapperRunResult::Uncertain {
-                response_receipt, ..
+                evidence_digest,
+                response_receipt,
             }) => ProviderOutcome::Uncertain {
                 evidence: response_receipt.map_or_else(
-                    || b"provider-wrapper-uncertain-without-receipt".to_vec(),
+                    || provider_wrapper_uncertain_evidence(&evidence_digest),
                     |receipt| receipt.canonical_bytes,
                 ),
             },
@@ -622,10 +623,11 @@ impl WorkLedgerProviderAdapter<'_> {
                 evidence: response_receipt.canonical_bytes,
             },
             Ok(ProviderWrapperRunResult::Uncertain {
-                response_receipt, ..
+                evidence_digest,
+                response_receipt,
             }) => ProviderOutcome::Uncertain {
                 evidence: response_receipt.map_or_else(
-                    || b"provider-wrapper-uncertain-without-receipt".to_vec(),
+                    || provider_wrapper_uncertain_evidence(&evidence_digest),
                     |receipt| receipt.canonical_bytes,
                 ),
             },
@@ -728,6 +730,13 @@ impl WorkLedgerProviderAdapter<'_> {
             },
         })
     }
+}
+
+fn provider_wrapper_uncertain_evidence(evidence_digest: &str) -> Vec<u8> {
+    format!(
+        "{{\"schema_version\":1,\"kind\":\"provider_wrapper_uncertain\",\"evidence_digest\":\"{evidence_digest}\"}}"
+    )
+    .into_bytes()
 }
 
 fn preflight_refusal(operation: ProviderWrapperOperationV1) -> ProviderOutcome {

@@ -3,7 +3,9 @@
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use super::terminal_transport::CommandResult;
 use super::*;
@@ -11,6 +13,7 @@ use crate::provider_wrapper::{
     CmuxEndpointV1, FreshResumeExpectationV1, ProtectedProviderRouteV1, ProviderDeliveryFenceV1,
     ProviderLaunchOptionsV1, ProviderReasoningEffortV1, TerminalEndpointV1,
 };
+#[cfg(unix)]
 use crate::work_ledger::{
     DeliveryAuthorization, DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
     FreshAgentResumeExpectation, ProviderAdapter, ProviderAuthorizationOperation,
@@ -29,7 +32,7 @@ const SESSION_UUID: &str = "323E4567-E89B-12D3-A456-426614174000";
 
 fn native_absolute_test_path(leaf: &str) -> String {
     if cfg!(windows) {
-        format!(r"C:\Shipyard\{leaf}")
+        format!("C:/Shipyard/{leaf}")
     } else {
         format!("/tmp/shipyard/{leaf}")
     }
@@ -107,7 +110,14 @@ impl ProviderLaunchAuthority for FakeProviderLaunchAuthority {
         request: &ProviderWrapperRequestV1,
     ) -> Result<PrivateLaunch, &'static str> {
         self.prepare_calls += 1;
-        prepare_private_launch(request, false)
+        #[cfg(unix)]
+        {
+            prepare_private_launch(request, false)
+        }
+        #[cfg(not(unix))]
+        {
+            provider_launch::prepare_test_launch(request)
+        }
     }
 }
 
@@ -178,8 +188,8 @@ fn live_create_shape_accepts_additive_metadata_and_requires_uuid_ids() {
     .unwrap();
 
     let parsed = parse_created_workspace(&bytes).expect("live cmux create shape");
-    assert_eq!(parsed.workspace_id, UUID.to_ascii_lowercase());
-    assert_eq!(parsed.surface_id, SURFACE_UUID.to_ascii_lowercase());
+    assert_eq!(parsed.workspace, UUID.to_ascii_lowercase());
+    assert_eq!(parsed.surface, SURFACE_UUID.to_ascii_lowercase());
 
     let invalid = serde_json::to_vec(&serde_json::json!({
         "workspace_id": "workspace:1",
@@ -269,13 +279,13 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
         adapter_id: ADAPTER_ID.to_owned(),
         delivery_fence: fence,
         terminal_endpoint: TerminalEndpointV1::Cmux(CmuxEndpointV1 {
-            executable_path: "/test/cmux-a".to_owned(),
-            socket_path: "/test/cmux-a.sock".to_owned(),
+            executable_path: native_absolute_test_path("cmux-a"),
+            socket_path: native_absolute_test_path("cmux-a.sock"),
             signing_team_id: "7WLXT3NR37".to_owned(),
         }),
         protected_route: ProtectedProviderRouteV1 {
             argv: vec![
-                "/opt/subrouter".to_owned(),
+                native_absolute_test_path("subrouter"),
                 provider.to_owned(),
                 "resume".to_owned(),
                 "--model".to_owned(),
@@ -285,7 +295,7 @@ fn request(provider: &str, operation: ProviderWrapperOperationV1) -> ProviderWra
                 "native-session-a".to_owned(),
             ],
             fresh_argv: vec![
-                "/opt/subrouter".to_owned(),
+                native_absolute_test_path("subrouter"),
                 provider.to_owned(),
                 "--model".to_owned(),
                 "gpt-5.6-sol".to_owned(),

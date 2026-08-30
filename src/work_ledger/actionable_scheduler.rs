@@ -52,6 +52,7 @@ impl WorkLedger {
     /// Enumerate durable native handoffs that still require steward
     /// reconciliation. Unlike the GitHub shadow projection, this recovery
     /// inventory does not depend on repository polling policy being present.
+    #[cfg(unix)]
     pub(crate) fn native_steward_targets(&self) -> WorkLedgerResult<Vec<(String, u64, String)>> {
         let connection = self.connect_read_only()?;
         let mut statement = connection.prepare(
@@ -68,6 +69,7 @@ impl WorkLedger {
 
     /// Resolve the exact base ref bound into one native target. The daemon
     /// never guesses `main` when invoking repository stewardship.
+    #[cfg(unix)]
     pub(crate) fn native_steward_base_ref(
         &self,
         repo: &str,
@@ -315,7 +317,7 @@ fn validate_target(repo: &str, pr: u64, head_sha: &str) -> WorkLedgerResult<()> 
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 

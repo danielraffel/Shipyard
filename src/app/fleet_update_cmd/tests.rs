@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::process::Command;
 
 use super::*;
@@ -391,8 +392,8 @@ fn exact_release_tag_is_required() {
 }
 
 fn named_host(name: &str) -> HostClassConfig {
-    let mut class = host(None, Some("/Users/ci/.local/bin/shipyard"));
-    class.class = name.to_owned();
+    let mut class = host(Some(name), Some("/Users/ci/.local/bin/shipyard"));
+    name.clone_into(&mut class.class);
     class
 }
 

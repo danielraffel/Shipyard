@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use super::*;
+#[cfg(unix)]
 fn config(path: PathBuf, digest: Sha256Digest) -> ParallelProofCanaryAdapterConfig {
     ParallelProofCanaryAdapterConfig {
         executable_path: path,
@@ -185,6 +186,11 @@ fn response_authority_and_strict_shape_fail_closed() {
 
 #[test]
 fn trusted_config_is_absent_by_default_and_partial_activation_refuses() {
+    let executable = if cfg!(windows) {
+        "C:/Windows/System32/where.exe"
+    } else {
+        "/usr/bin/true"
+    };
     let global = tempfile::tempdir().unwrap();
     let loaded = LoadedConfig::load_machine_global_from_dir(global.path().to_path_buf()).unwrap();
     assert!(
@@ -207,7 +213,7 @@ fn trusted_config_is_absent_by_default_and_partial_activation_refuses() {
             "[parallel_proof_canary]\n\
              activation_enabled = true\n\
              apply_enabled = true\n\
-             executable_path = \"/usr/bin/true\"\n\
+             executable_path = \"{executable}\"\n\
              executable_sha256 = \"{}\"\n\
              deadline_seconds = 30\n\
              max_stdout_bytes = 4096\n\

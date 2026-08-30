@@ -244,7 +244,12 @@ fn safe_absolute_cache_root(path: &Path) -> bool {
     let Some(value) = path.to_str() else {
         return false;
     };
-    path.is_absolute()
+    // Cache receipts may describe a remote macOS host even when the
+    // controller is compiled on Windows. `Path::is_absolute` applies the
+    // controller's native path grammar, so also recognize a lexically
+    // absolute POSIX root. The remaining checks keep traversal, temporary
+    // roots, and malformed components fail closed.
+    (path.is_absolute() || value.starts_with('/'))
         && value != "/"
         && !value.ends_with('/')
         && !value.chars().any(char::is_control)
@@ -285,4 +290,3 @@ fn milliseconds_ceil(duration: Duration) -> Result<u64, CacheObserverError> {
     u64::try_from(millis)
         .map_err(|_| CacheObserverError::Invalid("cache observation duration overflow".to_owned()))
 }
-

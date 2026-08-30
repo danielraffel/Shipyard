@@ -4,6 +4,9 @@
 
 #[cfg(unix)]
 mod actionable_wake_producer;
+// Windows release builds retain selected Unix controller modules so their
+// explicit fail-closed stubs remain type-checked. Keep lint accommodations on
+// those modules instead of suppressing Windows diagnostics crate-wide.
 /// CLI entrypoint and command dispatch.
 pub mod app;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.
@@ -40,6 +43,7 @@ pub mod daemon_ipc;
 pub mod daemon_runtime;
 /// Shared daemon/CLI version comparison helpers.
 pub mod daemon_version;
+#[cfg_attr(windows, allow(dead_code, unused_imports))]
 pub(crate) mod daemon_worker_capacity;
 /// Typed dependency-channel policy and immutable consumer locks.
 pub mod dependency;
@@ -69,6 +73,15 @@ pub mod host_health;
 pub mod host_pool;
 /// Product naming and runtime-mode identity.
 pub mod identity;
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        unused_variables,
+        clippy::unnecessary_wraps,
+        clippy::unused_self
+    )
+)]
 pub(crate) mod immutable_store;
 /// Project initialization and ecosystem detection.
 pub mod init_config;
@@ -96,10 +109,15 @@ pub mod output;
 pub mod parallel_proof;
 /// Default-off admission policy for the first Pulp macOS sharding canary.
 pub mod parallel_proof_canary;
+#[cfg_attr(windows, allow(dead_code, unused_imports))]
 pub(crate) mod parallel_proof_canary_adapter;
 /// Default-off immutable cache-generation observation and evidence foundation.
 pub mod parallel_proof_canary_cache;
 /// Read-only physical-readiness observations for the Pulp macOS canary.
+#[cfg_attr(
+    windows,
+    allow(dead_code, unused_imports, unused_variables, clippy::unused_self)
+)]
 pub mod parallel_proof_canary_controller;
 /// Default-off controller driver for measured Pulp macOS shadow receipts.
 pub mod parallel_proof_canary_driver;
@@ -180,6 +198,7 @@ pub mod supervised;
 mod terminal_delivery_authority;
 /// Optional local outbox and adapter contract for external transition projection.
 pub mod transition_projection;
+#[cfg_attr(windows, allow(dead_code, unused_imports))]
 pub(crate) mod transition_projection_runner;
 /// Working-tree drift detection shared by future `shipyard run` wiring.
 pub mod tree_drift;

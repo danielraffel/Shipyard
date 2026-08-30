@@ -9,6 +9,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,30 @@ const POOL: &str = "shipyard-daemon-native-worker";
 const MEMBER: &str = "local-daemon";
 const LEASE_STALE_SECONDS: u64 = 30;
 const EXCLUSIVE_PROCESS_SCHEMA_VERSION: u32 = 1;
+const EXCLUSIVE_SANDBOX_DRAIN_WAIT: Duration = Duration::from_secs(3);
+const EXCLUSIVE_SANDBOX_DRAIN_RETRY: Duration = Duration::from_millis(25);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExclusiveSandboxAdmissionRefusal {
+    QueueDrainContended,
+    QueueNotIdle,
+    SharedCapacityBusy,
+}
+
+impl ExclusiveSandboxAdmissionRefusal {
+    pub(crate) const fn classification(self) -> &'static str {
+        match self {
+            Self::QueueDrainContended => "sandbox_queue_drain_contended",
+            Self::QueueNotIdle => "sandbox_queue_not_idle",
+            Self::SharedCapacityBusy => "sandbox_shared_capacity_busy",
+        }
+    }
+}
+
+pub(crate) enum ExclusiveSandboxAdmission {
+    Acquired(ExclusiveSandboxLease),
+    Refused(ExclusiveSandboxAdmissionRefusal),
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -318,13 +344,37 @@ impl DaemonWorkerCapacity {
         state_dir: &Path,
         work_id: &str,
         authority_sha: &str,
-    ) -> Result<Option<ExclusiveSandboxLease>, String> {
+    ) -> Result<ExclusiveSandboxAdmission, String> {
+        self.claim_exclusive_sandbox_until(
+            state_dir,
+            work_id,
+            authority_sha,
+            Instant::now() + EXCLUSIVE_SANDBOX_DRAIN_WAIT,
+        )
+    }
+
+    fn claim_exclusive_sandbox_until(
+        &self,
+        state_dir: &Path,
+        work_id: &str,
+        authority_sha: &str,
+        drain_deadline: Instant,
+    ) -> Result<ExclusiveSandboxAdmission, String> {
         let mut queue = Queue::new(state_dir).map_err(|error| error.to_string())?;
-        let Some(_drain_lock) = queue
-            .acquire_drain_lock()
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
+        let drain_lock = loop {
+            if let Some(lock) = queue
+                .acquire_drain_lock()
+                .map_err(|error| error.to_string())?
+            {
+                break lock;
+            }
+            let now = Instant::now();
+            if now >= drain_deadline {
+                return Ok(ExclusiveSandboxAdmission::Refused(
+                    ExclusiveSandboxAdmissionRefusal::QueueDrainContended,
+                ));
+            }
+            thread::sleep(EXCLUSIVE_SANDBOX_DRAIN_RETRY.min(drain_deadline - now));
         };
         if !queue
             .get_running()
@@ -335,17 +385,21 @@ impl DaemonWorkerCapacity {
                 .map_err(|error| error.to_string())?
                 .is_empty()
         {
-            return Ok(None);
+            return Ok(ExclusiveSandboxAdmission::Refused(
+                ExclusiveSandboxAdmissionRefusal::QueueNotIdle,
+            ));
         }
         let claim = DaemonWorkerClaim::exclusive_sandbox(work_id, authority_sha);
-        if self
+        let admission = if self
             .claim_or_heartbeat(&claim)
             .map_err(|error| error.to_string())?
         {
-            Ok(Some(ExclusiveSandboxLease::start(self.clone(), claim)))
+            ExclusiveSandboxAdmission::Acquired(ExclusiveSandboxLease::start(self.clone(), claim))
         } else {
-            Ok(None)
-        }
+            ExclusiveSandboxAdmission::Refused(ExclusiveSandboxAdmissionRefusal::SharedCapacityBusy)
+        };
+        drop(drain_lock);
+        Ok(admission)
     }
 
     fn control_lock_path(&self) -> PathBuf {
@@ -561,9 +615,87 @@ impl DaemonWorkerClaim {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::job::{Job, Priority, ValidationMode};
     use std::time::Duration;
+
+    use crate::job::{Job, Priority, ValidationMode};
+
+    use super::*;
+
+    fn acquired(admission: ExclusiveSandboxAdmission) -> ExclusiveSandboxLease {
+        match admission {
+            ExclusiveSandboxAdmission::Acquired(lease) => lease,
+            ExclusiveSandboxAdmission::Refused(reason) => {
+                panic!("exclusive sandbox admission refused: {reason:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn exclusive_sandbox_waits_for_a_transient_idle_drain_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = Queue::new(temp.path()).unwrap();
+        let drain_lock = queue.acquire_drain_lock().unwrap().unwrap();
+        let capacity = DaemonWorkerCapacity::new(temp.path());
+        let state_dir = temp.path().to_owned();
+        let waiter = std::thread::spawn(move || {
+            capacity
+                .claim_exclusive_sandbox_until(
+                    &state_dir,
+                    "audit",
+                    "authority",
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap()
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        drop(drain_lock);
+
+        let exclusive = acquired(waiter.join().unwrap());
+        drop(exclusive);
+    }
+
+    #[test]
+    fn exclusive_sandbox_reports_persistent_drain_contention_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = Queue::new(temp.path()).unwrap();
+        let _drain_lock = queue.acquire_drain_lock().unwrap().unwrap();
+
+        let admission = DaemonWorkerCapacity::new(temp.path())
+            .claim_exclusive_sandbox_until(
+                temp.path(),
+                "audit",
+                "authority",
+                Instant::now() + Duration::from_millis(30),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            admission,
+            ExclusiveSandboxAdmission::Refused(
+                ExclusiveSandboxAdmissionRefusal::QueueDrainContended
+            )
+        ));
+    }
+
+    #[test]
+    fn exclusive_sandbox_distinguishes_shared_capacity_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let capacity = DaemonWorkerCapacity::new(temp.path());
+        let queue_claim = DaemonWorkerClaim::queue("queue", "queue-authority");
+        assert!(capacity.claim_or_heartbeat(&queue_claim).unwrap());
+
+        let admission = capacity
+            .claim_exclusive_sandbox_if_queue_idle(temp.path(), "audit", "audit-authority")
+            .unwrap();
+
+        assert!(matches!(
+            admission,
+            ExclusiveSandboxAdmission::Refused(
+                ExclusiveSandboxAdmissionRefusal::SharedCapacityBusy
+            )
+        ));
+    }
 
     #[test]
     fn queue_canary_and_exclusive_sandbox_contend_without_cross_release() {
@@ -581,7 +713,7 @@ mod tests {
         assert!(capacity.release(&canary).unwrap());
         let exclusive = capacity
             .claim_exclusive_sandbox_if_queue_idle(temp.path(), "audit", "audit-authority")
-            .unwrap()
+            .map(acquired)
             .unwrap();
         assert!(!capacity.claim_or_heartbeat(&queue).unwrap());
         assert!(!capacity.claim_or_heartbeat(&canary).unwrap());
@@ -619,12 +751,12 @@ mod tests {
             ))
             .unwrap();
 
-        assert!(
+        assert!(matches!(
             DaemonWorkerCapacity::new(temp.path())
                 .claim_exclusive_sandbox_if_queue_idle(temp.path(), "audit", "audit-authority",)
-                .unwrap()
-                .is_none()
-        );
+                .unwrap(),
+            ExclusiveSandboxAdmission::Refused(ExclusiveSandboxAdmissionRefusal::QueueNotIdle)
+        ));
     }
 
     #[test]
@@ -636,7 +768,7 @@ mod tests {
         let capacity = DaemonWorkerCapacity::with_stale_seconds(temp.path(), 1);
         let exclusive = capacity
             .claim_exclusive_sandbox_if_queue_idle(temp.path(), "long-audit", "authority")
-            .unwrap()
+            .map(acquired)
             .unwrap();
         let mut command = std::process::Command::new("/bin/sleep");
         command.arg("30").process_group(0);
@@ -679,7 +811,7 @@ mod tests {
         let capacity = DaemonWorkerCapacity::with_stale_seconds(temp.path(), 1);
         let exclusive = capacity
             .claim_exclusive_sandbox_if_queue_idle(temp.path(), "crash-audit", "authority")
-            .unwrap()
+            .map(acquired)
             .unwrap();
         let mut command = std::process::Command::new("/bin/sh");
         command

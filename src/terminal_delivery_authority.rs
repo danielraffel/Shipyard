@@ -68,6 +68,13 @@ pub(crate) struct VerifiedTerminalEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(
+        dead_code,
+        reason = "non-macOS builds retain the refusal taxonomy while only Unsupported is reachable in the fail-closed adapter"
+    )
+)]
 pub(crate) enum TerminalCapabilityRefusal {
     Unsupported,
     Unobservable,
@@ -655,6 +662,13 @@ fn validate_cmux_inputs(
     Ok(())
 }
 
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(
+        dead_code,
+        reason = "UUID validation is consumed only by the macOS cmux evidence adapter"
+    )
+)]
 fn is_uuid(value: &str) -> bool {
     value.len() == 36
         && value.chars().enumerate().all(|(index, ch)| {

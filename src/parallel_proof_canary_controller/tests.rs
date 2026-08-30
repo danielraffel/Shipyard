@@ -9,10 +9,11 @@ use crate::parallel_proof_canary::PulpMacCanaryPolicy;
 use crate::parallel_proof_canary::{CanaryRoute, CanaryStagingClass};
 use crate::parallel_proof_canary_cache::{
     CACHE_GENERATION_OBSERVATION_SCHEMA, CacheGenerationObservationReceipt,
-    PULP_MAC_CACHE_EVIDENCE_SCHEMA, PulpMacCacheProbeEvidence, produce_cache_generation_manifest,
+    PULP_MAC_CACHE_EVIDENCE_SCHEMA, PulpMacCacheProbeEvidence,
 };
 use crate::parallel_proof_canary_remote_cache::{
-    RemoteM1CacheAuthority, test_remote_authority_receipt,
+    RemoteM1CacheAuthority, synthetic_cache_generation_manifest, test_cache_root,
+    test_remote_authority_receipt,
 };
 
 fn pulp_policy() -> PulpMacCanaryPolicy {
@@ -155,6 +156,7 @@ fn remote_cache_authority(
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn strict_ssh_observer_uses_only_explicit_read_only_authority() {
     let temp = TempDir::new().unwrap();
@@ -224,6 +226,32 @@ fn strict_ssh_observer_uses_only_explicit_read_only_authority() {
     assert!(!rendered.iter().any(|arg| arg == "--execute"));
 }
 
+#[cfg(not(unix))]
+#[test]
+fn strict_ssh_observer_refuses_without_unix_authority() {
+    let temp = TempDir::new().unwrap();
+    let known_hosts = temp.path().join("known_hosts");
+    let identity = temp.path().join("identity");
+    fs::write(&known_hosts, "m1-lan ssh-ed25519 AAAATEST\n").unwrap();
+    fs::write(&identity, "private-test-key").unwrap();
+    let target = StrictSshCanaryTarget::new(
+        std::env::current_exe().expect("current executable"),
+        "m1-lan",
+        &known_hosts,
+        &identity,
+        22,
+    )
+    .unwrap();
+    let result = target.prepare_remote_command("/usr/bin/true", &[]);
+    let Err(error) = result else {
+        panic!("non-Unix strict SSH authority must fail closed");
+    };
+    assert!(matches!(
+        error,
+        CanaryObserverError::InvalidConfiguration(_)
+    ));
+}
+
 #[test]
 fn identity_drift_and_symlinked_known_hosts_fail_closed() {
     let staging = "/Users/test/shipyard-canary";
@@ -241,12 +269,12 @@ fn identity_drift_and_symlinked_known_hosts_fail_closed() {
 
     let temp = TempDir::new().unwrap();
     let authority = temp.path().join("authority");
-    let link = temp.path().join("known_hosts");
     let identity = temp.path().join("identity");
     fs::write(&authority, "host ssh-ed25519 key\n").unwrap();
     fs::write(&identity, "private-test-key").unwrap();
     #[cfg(unix)]
     {
+        let link = temp.path().join("known_hosts");
         std::os::unix::fs::symlink(&authority, &link).unwrap();
         let target =
             StrictSshCanaryTarget::new("/usr/bin/ssh", "m1", &link, &identity, 22).unwrap();
@@ -338,12 +366,13 @@ fn dry_run_is_ineligible_and_never_synthesizes_missing_proofs() {
 
 #[test]
 fn exact_cache_evidence_closes_only_the_cache_gap() {
+    let current = std::env::current_dir().unwrap().canonicalize().unwrap();
     let cache_root = tempfile::Builder::new()
         .prefix(".shipyard-controller-cache-")
-        .tempdir_in(std::env::current_dir().unwrap())
+        .tempdir_in(current)
         .unwrap();
     fs::write(cache_root.path().join("object.bin"), b"cache-object").unwrap();
-    let manifest = produce_cache_generation_manifest(cache_root.path(), "skia", "m124").unwrap();
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
 
     let m3_staging = "/Users/test/m3-canary";
     let m1_staging = "/Users/test/m1-canary";
@@ -354,7 +383,7 @@ fn exact_cache_evidence_closes_only_the_cache_gap() {
         let remote_authority = (host_id == "m1").then(|| {
             remote_cache_authority(
                 host_observation_sha256.clone(),
-                cache_root.path(),
+                &test_cache_root(cache_root.path()),
                 &manifest,
                 m1_staging,
                 assessed_at_ms,
@@ -366,7 +395,10 @@ fn exact_cache_evidence_closes_only_the_cache_gap() {
             host_observation_sha256: host_observation_sha256.clone(),
             observed_at_ms: assessed_at_ms,
             probe_elapsed_ms: 1,
-            cache_root: cache_root.path().to_str().unwrap().to_owned(),
+            cache_root: test_cache_root(cache_root.path())
+                .to_str()
+                .unwrap()
+                .to_owned(),
             manifest_sha256: manifest.digest().unwrap(),
             manifest: manifest.clone(),
             remote_authority,

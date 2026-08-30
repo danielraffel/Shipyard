@@ -65,6 +65,13 @@ pub(crate) struct ReadyWorkstreamActivation {
 
 /// Activation state returned by the single daemon-facing loader API.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::large_enum_variant,
+        reason = "preserve the allocation-free activation contract across platforms"
+    )
+)]
 pub(crate) enum WorkstreamActivationState {
     Disabled,
     Ready(ReadyWorkstreamActivation),
@@ -72,6 +79,13 @@ pub(crate) enum WorkstreamActivationState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::large_enum_variant,
+        reason = "preserve the allocation-free activation contract across platforms"
+    )
+)]
 enum ActivationBaseline {
     Disabled,
     Ready(ReadyWorkstreamActivation),
