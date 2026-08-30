@@ -1051,6 +1051,9 @@ class Guardian:
         self.owner_start = _process_start(args.owner_pid)
         self.stop_requested = False
         self.lease_owned = False
+        self.lease_device: Optional[int] = None
+        self.lease_inode: Optional[int] = None
+        self.lease_ctime_ns: Optional[int] = None
         self.production_stop_requested = False
         self.production_quiesced = False
         self.production_restored = False
@@ -1127,7 +1130,12 @@ class Guardian:
             and receipt.get("transition_path") == CORRECTED_TRANSITION
             and isinstance(receipt.get("reconciled_prior_canary_root"), str)
         }
-        current_lease_inode = self.lease_dir.lstat().st_ino
+        current_lease = self.lease_dir.lstat()
+        current_lease_identity = (
+            current_lease.st_dev,
+            current_lease.st_ino,
+            current_lease.st_ctime_ns,
+        )
         prepared_intents: list[dict[str, object]] = []
         for root in roots:
             intent_path = root / "retained-reconciliation-intent.json"
@@ -1139,14 +1147,27 @@ class Guardian:
                 and intent.get("transition_path") == CORRECTED_TRANSITION
                 and intent.get("mutation_fence_proved") is True
                 and isinstance(intent.get("prior_canary_root"), str)
+                and isinstance(intent.get("lease_device"), int)
                 and isinstance(intent.get("lease_inode"), int)
-                and intent.get("lease_inode") != current_lease_inode
+                and isinstance(intent.get("lease_ctime_ns"), int)
+                and (
+                    intent.get("lease_device"),
+                    intent.get("lease_inode"),
+                    intent.get("lease_ctime_ns"),
+                )
+                != current_lease_identity
             ):
                 prepared_intents.append(intent)
         retained = [
             (root, receipt)
             for root, receipt in receipts
             if receipt.get("lease_retained") is True
+            and (
+                receipt.get("lease_device"),
+                receipt.get("lease_inode"),
+                receipt.get("lease_ctime_ns"),
+            )
+            == current_lease_identity
             and str(root) not in reconciled_roots
             and not any(
                 intent.get("prior_canary_root") == str(root)
@@ -1289,7 +1310,9 @@ class Guardian:
         reason: str,
         prior_root: Path,
         active_runs: tuple[str, ...],
+        lease_device: int,
         lease_inode: int,
+        lease_ctime_ns: int,
     ) -> None:
         snapshot = self.snapshot
         _durable_atomic_json(
@@ -1300,7 +1323,9 @@ class Guardian:
                 "guardian_pid": os.getpid(),
                 "guardian_start_time": _process_start(os.getpid()),
                 "lease_dir": str(self.lease_dir),
+                "lease_device": lease_device,
                 "lease_inode": lease_inode,
+                "lease_ctime_ns": lease_ctime_ns,
                 "prior_canary_root": str(prior_root),
                 "candidate_stopped": True,
                 "production_quiesced": False,
@@ -1396,7 +1421,9 @@ class Guardian:
                         reason=RETAINED_RECONCILIATION_REASON,
                         prior_root=prior_root,
                         active_runs=active_runs,
+                        lease_device=lease_stat.st_dev,
                         lease_inode=lease_stat.st_ino,
+                        lease_ctime_ns=lease_stat.st_ctime_ns,
                     )
                     pending_written = True
             else:
@@ -1424,7 +1451,9 @@ class Guardian:
                     "transition_path": CORRECTED_TRANSITION,
                     "mutation_fence_proved": True,
                     "prior_canary_root": str(prior_root),
+                    "lease_device": lease_stat.st_dev,
                     "lease_inode": lease_stat.st_ino,
+                    "lease_ctime_ns": lease_stat.st_ctime_ns,
                     "old_production_pid": self.snapshot.pid,
                     "old_production_start_time": self.snapshot.start_time,
                     "installed_sha256": self.installed_hash,
@@ -1457,8 +1486,15 @@ class Guardian:
             self.lease_owned = True
             try:
                 os.mkdir(self.lease_dir, 0o700)
+                lease_stat = _validate_private_directory(self.lease_dir)
+                self.lease_device = lease_stat.st_dev
+                self.lease_inode = lease_stat.st_ino
+                self.lease_ctime_ns = lease_stat.st_ctime_ns
             except Exception:
                 self.lease_owned = False
+                self.lease_device = None
+                self.lease_inode = None
+                self.lease_ctime_ns = None
                 raise
 
     def preflight_and_transition(self) -> None:
@@ -2159,6 +2195,13 @@ class Guardian:
                 "refusing to release host lease before production identity is verified"
             )
         if self.lease_owned:
+            lease_stat = _validate_private_directory(self.lease_dir)
+            if (lease_stat.st_dev, lease_stat.st_ino, lease_stat.st_ctime_ns) != (
+                self.lease_device,
+                self.lease_inode,
+                self.lease_ctime_ns,
+            ):
+                raise GuardianError("refusing to release a replaced host lease")
             os.rmdir(self.lease_dir)
             self.lease_owned = False
 
@@ -2249,6 +2292,9 @@ class Guardian:
                     "production_preserved": self.production_preserved,
                     "production_identity_verified": self.production_identity_verified,
                     "lease_retained": self.lease_owned,
+                    "lease_device": self.lease_device,
+                    "lease_inode": self.lease_inode,
+                    "lease_ctime_ns": self.lease_ctime_ns,
                     "transition_path": getattr(self, "transition_path", None),
                     "old_production_pid": self.snapshot.pid if self.snapshot else None,
                     "old_production_start_time": (

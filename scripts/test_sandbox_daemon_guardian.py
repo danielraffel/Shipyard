@@ -49,6 +49,10 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.acquire()
             self.assertTrue(active.lease_owned)
             self.assertTrue(active.lease_dir.is_dir())
+            lease_stat = active.lease_dir.stat()
+            self.assertEqual(active.lease_device, lease_stat.st_dev)
+            self.assertEqual(active.lease_inode, lease_stat.st_ino)
+            self.assertEqual(active.lease_ctime_ns, lease_stat.st_ctime_ns)
             active.release()
             self.assertFalse(active.lease_dir.exists())
 
@@ -279,6 +283,9 @@ class GuardianLifecycleTests(unittest.TestCase):
                 "old_production_start_time": "new",
                 "installed_sha256": "b" * 64,
                 "candidate_sha256": "c" * 64,
+                "lease_device": active.lease_dir.stat().st_dev,
+                "lease_inode": active.lease_dir.stat().st_ino,
+                "lease_ctime_ns": active.lease_dir.stat().st_ctime_ns,
             }
             ready = {
                 "transition_path": guardian.CORRECTED_TRANSITION,
@@ -302,7 +309,9 @@ class GuardianLifecycleTests(unittest.TestCase):
                 "transition_path": guardian.CORRECTED_TRANSITION,
                 "mutation_fence_proved": True,
                 "prior_canary_root": str(old),
+                "lease_device": active.lease_dir.stat().st_dev,
                 "lease_inode": active.lease_dir.stat().st_ino + 1,
+                "lease_ctime_ns": active.lease_dir.stat().st_ctime_ns,
                 "old_production_pid": 111,
                 "old_production_start_time": "old",
                 "installed_sha256": "a" * 64,
@@ -319,6 +328,37 @@ class GuardianLifecycleTests(unittest.TestCase):
             ), mock.patch.object(guardian, "_pid_alive", return_value=False):
                 selected, _, _ = active.retained_legacy_evidence()
             self.assertEqual(selected, new)
+
+    def test_stale_retained_receipt_cannot_authorize_new_lease_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.lease_dir = root / "shipyard-sandbox-m3-lease"
+            active.lease_dir.mkdir(mode=0o700)
+            current = active.lease_dir.stat()
+            prior = root / "shipyard-sandbox-m3-1-1"
+            prior.mkdir(mode=0o700)
+            receipt = prior / "guardian-receipt.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "lease_retained": True,
+                        "lease_device": current.st_dev,
+                        "lease_inode": current.st_ino,
+                        "lease_ctime_ns": current.st_ctime_ns + 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            receipt.chmod(0o600)
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "one unambiguous prior receipt"
+            ):
+                active.retained_legacy_evidence()
+            self.assertEqual(
+                (active.lease_dir.stat().st_dev, active.lease_dir.stat().st_ino),
+                (current.st_dev, current.st_ino),
+            )
 
     def test_retained_evidence_symlink_and_public_file_refuse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1872,8 +1912,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             active = self.make_guardian(Path(directory))
             active.transition_path = guardian.LEGACY_TRANSITION
             active.production_quiesced = True
-            active.lease_dir.mkdir()
-            active.lease_owned = True
+            active.acquire()
             with mock.patch.object(
                 guardian,
                 "run_lifecycle",
@@ -1894,6 +1933,9 @@ class GuardianLifecycleTests(unittest.TestCase):
             receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
             self.assertTrue(receipt["lease_retained"])
             self.assertFalse(receipt["lease_removed"])
+            self.assertEqual(receipt["lease_device"], active.lease_device)
+            self.assertEqual(receipt["lease_inode"], active.lease_inode)
+            self.assertEqual(receipt["lease_ctime_ns"], active.lease_ctime_ns)
             self.assertTrue(active.lease_dir.is_dir())
 
     def test_partial_quiesce_failure_cannot_release_host_lease(self) -> None:
@@ -2082,8 +2124,7 @@ class GuardianLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
             active.transition_path = guardian.CORRECTED_TRANSITION
-            active.lease_dir.mkdir()
-            active.lease_owned = True
+            active.acquire()
 
             def prove_untouched(*, require_mutation_fence: bool = True) -> None:
                 self.assertFalse(require_mutation_fence)

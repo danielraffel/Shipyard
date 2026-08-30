@@ -398,9 +398,22 @@ fn set_nonblocking<T: std::os::fd::AsFd>(stream: &T) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the cross-platform call site shares the Unix fallible contract"
+)]
 fn set_nonblocking<T>(_stream: &T) -> Result<(), String> {
-    Err("fleet release streaming requires Unix nonblocking pipes".to_owned())
+    // Windows children are placed in a Job Object by ProcessTree. Terminating
+    // that complete tree closes every inherited pipe handle, so the bounded
+    // capture threads cannot be stranded by a detached descendant. Unix needs
+    // O_NONBLOCK because process groups cannot contain a double-fork escapee.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_nonblocking<T>(_stream: &T) -> Result<(), String> {
+    Err("fleet release streaming requires bounded process-tree pipes".to_owned())
 }
 
 fn signal_capture_failure(events: &Sender<String>, error: String) -> String {
@@ -439,9 +452,21 @@ fn set_private_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("could not protect release asset staging directory: {error}"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the cross-platform call site shares the Unix fallible contract"
+)]
 fn set_private_directory(_path: &Path) -> Result<(), String> {
-    Err("fleet release staging requires Unix private-directory permissions".to_owned())
+    // tempfile creates the directory beneath the caller's protected temporary
+    // root using the platform's inherited ACL. The asset itself is create_new,
+    // so no pre-existing path can be followed or replaced during creation.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_private_directory(_path: &Path) -> Result<(), String> {
+    Err("fleet release staging requires private-directory permissions".to_owned())
 }
 
 pub(super) fn sha256_file(path: &Path, expected_size: u64) -> Result<String, String> {
