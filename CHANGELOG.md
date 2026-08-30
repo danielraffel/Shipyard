@@ -3,6 +3,21 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01280"></a>
+## [0.128.0] - 2026-08-30
+
+- fix/release followup 20260829 ([#500](https://github.com/danielraffel/Shipyard/pull/500))
+
+<a id="v01274"></a>
+## [0.127.4] - 2026-08-29
+
+- feat: complete durable stewardship and recovery hardening ([#499](https://github.com/danielraffel/Shipyard/pull/499))
+
+<a id="v01273"></a>
+## [0.127.3] - 2026-08-29
+
+- feat: land durable stewardship and resume ([#498](https://github.com/danielraffel/Shipyard/pull/498))
+
 <a id="v01272"></a>
 ## [0.127.2] - 2026-08-28
 
@@ -1134,6 +1149,9 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.128.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.128.0
+[0.127.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.127.4
+[0.127.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.127.3
 [0.127.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.127.2
 [0.126.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.126.2
 [0.126.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.126.1
