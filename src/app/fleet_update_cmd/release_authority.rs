@@ -12,6 +12,12 @@ use sha2::{Digest, Sha256};
 use crate::config::LoadedConfig;
 use crate::gh::{GhClient, GhSupervision};
 
+mod download;
+
+#[cfg(test)]
+use download::sha256_file;
+use download::{DownloadedAsset, download_asset_to_private_file};
+
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
 const PLATFORM_ASSET: &str = "shipyard-macos-arm64.dmg";
 const CHECKSUM_ASSET: &str = "checksums.sha256";
@@ -99,7 +105,7 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
             .map_err(|error| format!("GitHub release-authority response was invalid JSON: {error}"))
     }
 
-    fn download_asset(&self, asset: &ObservedAsset) -> Result<Vec<u8>, String> {
+    fn download_asset(&self, asset: &ObservedAsset) -> Result<DownloadedAsset, String> {
         let endpoint = format!(
             "repos/{}/releases/assets/{}",
             release_repository()?,
@@ -109,18 +115,7 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
         command
             .args(["api", &endpoint, "-H", "Accept: application/octet-stream"])
             .stdin(Stdio::null());
-        let output = run(
-            &mut command,
-            &format!("download release asset {}", asset.name),
-        )?;
-        let actual = sha256(&output.stdout);
-        if actual != asset.sha256 {
-            return Err(format!(
-                "release asset {} changed during authority resolution: metadata {}, downloaded {}",
-                asset.name, asset.sha256, actual
-            ));
-        }
-        Ok(output.stdout)
+        download_asset_to_private_file(&mut command, asset, COMMAND_TIMEOUT, None)
     }
 
     fn verify_attestation(
@@ -128,19 +123,14 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
         tag: &str,
         commit_oid: &str,
         asset: &ObservedAsset,
-        bytes: &[u8],
+        path: &Path,
     ) -> Result<String, String> {
         let repository = release_repository()?;
         let signer_workflow = format!("{repository}/{RELEASE_WORKFLOW}");
-        let temp = tempfile::tempdir()
-            .map_err(|error| format!("could not create attestation staging directory: {error}"))?;
-        let path = temp.path().join(&asset.name);
-        std::fs::write(&path, bytes)
-            .map_err(|error| format!("could not stage {} for attestation: {error}", asset.name))?;
         let mut command = self.command()?;
         command
             .args(["attestation", "verify"])
-            .arg(&path)
+            .arg(path)
             .args([
                 "--repo",
                 &repository,
@@ -291,11 +281,12 @@ impl ReleaseAuthorityVerifier for GitHubReleaseAuthorityVerifier<'_> {
         let assets = observed_assets(&release)?;
         let checksum = unique_asset(&assets, CHECKSUM_ASSET)?;
         let platform = unique_asset(&assets, PLATFORM_ASSET)?;
-        let checksum_bytes = self.download_asset(checksum)?;
-        let platform_bytes = self.download_asset(platform)?;
+        let checksum_download = self.download_asset(checksum)?;
+        let platform_download = self.download_asset(platform)?;
+        let checksum_bytes = checksum_download.read_all()?;
         verify_checksum_manifest(&checksum_bytes, platform)?;
         let platform_attestation =
-            self.verify_attestation(tag, commit_oid, platform, &platform_bytes)?;
+            self.verify_attestation(tag, commit_oid, platform, platform_download.path())?;
 
         let mut authority = ReleaseAuthority {
             repository,
@@ -324,6 +315,7 @@ struct ObservedAsset {
     id: u64,
     name: String,
     sha256: String,
+    size: u64,
 }
 
 impl ObservedAsset {
@@ -369,10 +361,16 @@ fn observed_assets(release: &Value) -> Result<Vec<ObservedAsset>, String> {
                 .and_then(|value| value.strip_prefix("sha256:"))
                 .ok_or_else(|| format!("release asset {name} omitted its GitHub SHA-256 digest"))?;
             validate_sha256(digest, &format!("release asset {name}"))?;
+            let size = value
+                .get("size")
+                .and_then(Value::as_u64)
+                .filter(|size| *size > 0)
+                .ok_or_else(|| format!("release asset {name} omitted a positive size"))?;
             Ok(ObservedAsset {
                 id,
                 name: name.to_owned(),
                 sha256: digest.to_owned(),
+                size,
             })
         })
         .collect()
@@ -589,7 +587,15 @@ mod tests {
             id: 7,
             name: name.to_owned(),
             sha256: digest.to_string().repeat(64),
+            size: 1,
         }
+    }
+
+    #[cfg(unix)]
+    fn cat_command(path: &Path) -> Command {
+        let mut command = Command::new("/bin/cat");
+        command.arg(path).env_clear();
+        command
     }
 
     fn verified_output(asset: &ObservedAsset, commit: &str, tag: &str) -> Vec<u8> {
@@ -679,9 +685,9 @@ mod tests {
     fn release_inventory_refuses_missing_digest_and_duplicate_required_asset() {
         let release = serde_json::json!({
             "assets": [
-                {"id": 1, "name": CHECKSUM_ASSET, "digest": format!("sha256:{}", "a".repeat(64))},
-                {"id": 2, "name": PLATFORM_ASSET, "digest": format!("sha256:{}", "b".repeat(64))},
-                {"id": 3, "name": PLATFORM_ASSET, "digest": format!("sha256:{}", "c".repeat(64))}
+                {"id": 1, "name": CHECKSUM_ASSET, "size": 1, "digest": format!("sha256:{}", "a".repeat(64))},
+                {"id": 2, "name": PLATFORM_ASSET, "size": 2, "digest": format!("sha256:{}", "b".repeat(64))},
+                {"id": 3, "name": PLATFORM_ASSET, "size": 3, "digest": format!("sha256:{}", "c".repeat(64))}
             ]
         });
         let assets = observed_assets(&release).expect("inventory");
@@ -694,9 +700,293 @@ mod tests {
             "../asset",
         ] {
             let hostile = serde_json::json!({
-                "assets": [{"id": 1, "name": hostile, "digest": format!("sha256:{}", "a".repeat(64))}]
+                "assets": [{"id": 1, "name": hostile, "size": 1, "digest": format!("sha256:{}", "a".repeat(64))}]
             });
             assert!(observed_assets(&hostile).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_asset_download_streams_more_than_generic_capture_limit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().expect("fixture");
+        let bytes = vec![0x5a; 8 * 1024 * 1024 + 4096];
+        let source = fixture.path().join("large.dmg");
+        std::fs::write(&source, &bytes).expect("large fixture");
+        let asset = ObservedAsset {
+            id: 42,
+            name: PLATFORM_ASSET.to_owned(),
+            sha256: sha256(&bytes),
+            size: bytes.len() as u64,
+        };
+        let staging = tempfile::tempdir().expect("staging parent");
+        let mut command = cat_command(&source);
+        let downloaded = download_asset_to_private_file(
+            &mut command,
+            &asset,
+            Duration::from_secs(10),
+            Some(staging.path()),
+        )
+        .expect("streamed download");
+
+        assert_eq!(
+            downloaded.path().metadata().expect("metadata").len(),
+            asset.size
+        );
+        assert_eq!(
+            downloaded
+                .path()
+                .parent()
+                .expect("private directory")
+                .metadata()
+                .expect("private metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            downloaded
+                .path()
+                .metadata()
+                .expect("asset metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            sha256_file(downloaded.path(), asset.size).expect("digest"),
+            asset.sha256
+        );
+        drop(downloaded);
+        assert_eq!(
+            std::fs::read_dir(staging.path())
+                .expect("staging listing")
+                .count(),
+            0,
+            "successful staging must be removed when authority resolution releases it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_asset_download_rejects_truncation_and_cleans_partial_file() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let source = fixture.path().join("truncated.dmg");
+        std::fs::write(&source, b"short").expect("fixture");
+        let asset = ObservedAsset {
+            id: 43,
+            name: PLATFORM_ASSET.to_owned(),
+            sha256: sha256(b"short plus expected bytes"),
+            size: b"short plus expected bytes".len() as u64,
+        };
+        let staging = tempfile::tempdir().expect("staging parent");
+        let error = download_asset_to_private_file(
+            &mut cat_command(&source),
+            &asset,
+            Duration::from_secs(5),
+            Some(staging.path()),
+        )
+        .expect_err("truncated download");
+
+        assert!(error.contains("was truncated"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(staging.path())
+                .expect("staging listing")
+                .count(),
+            0,
+            "failed staging must be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_asset_download_does_not_wait_for_escaped_pipe_holder() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let pid_file = fixture.path().join("escaped.pid");
+        let script = r#"
+use strict;
+use warnings;
+use POSIX qw(setsid);
+my $pid_file = shift @ARGV;
+my $pid = fork();
+die "fork failed: $!" unless defined $pid;
+if ($pid == 0) {
+    setsid() >= 0 or die "setsid failed: $!";
+    open my $handle, '>', $pid_file or die "pid file: $!";
+    print {$handle} "$$\n";
+    close $handle;
+    sleep 30;
+    exit 0;
+}
+select undef, undef, undef, 0.05;
+print "payload";
+exit 0;
+"#;
+        let mut command = Command::new("/usr/bin/perl");
+        command
+            .args(["-MPOSIX=setsid", "-e", script])
+            .arg(&pid_file)
+            .env_clear();
+        let asset = ObservedAsset {
+            id: 47,
+            name: PLATFORM_ASSET.to_owned(),
+            sha256: sha256(b"payload"),
+            size: b"payload".len() as u64,
+        };
+        let started = Instant::now();
+        let result = download_asset_to_private_file(
+            &mut command,
+            &asset,
+            Duration::from_secs(2),
+            Some(fixture.path()),
+        );
+        if let Ok(pid) = std::fs::read_to_string(&pid_file).map(|value| value.trim().to_owned()) {
+            let _ = Command::new("/bin/kill").args(["-KILL", &pid]).status();
+        }
+        result.expect("escaped pipe holder must not retain capture readers");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "capture readers exceeded the bounded cleanup interval"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_asset_download_deadline_survives_escaped_pipe_flood() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let pid_file = fixture.path().join("escaped-flood.pid");
+        let script = r#"
+use strict;
+use warnings;
+use POSIX qw(setsid);
+my $pid_file = shift @ARGV;
+my $pid = fork();
+die "fork failed: $!" unless defined $pid;
+if ($pid == 0) {
+    setsid() >= 0 or die "setsid failed: $!";
+    open my $handle, '>', $pid_file or die "pid file: $!";
+    print {$handle} "$$\n";
+    close $handle;
+    my $chunk = 'x' x 4096;
+    while (1) { print $chunk or last; }
+    exit 0;
+}
+select undef, undef, undef, 0.05;
+exit 0;
+"#;
+        let mut command = Command::new("/usr/bin/perl");
+        command
+            .args(["-MPOSIX=setsid", "-e", script])
+            .arg(&pid_file)
+            .env_clear();
+        let asset = ObservedAsset {
+            id: 48,
+            name: PLATFORM_ASSET.to_owned(),
+            sha256: "a".repeat(64),
+            size: 512 * 1024 * 1024,
+        };
+        let started = Instant::now();
+        let result = download_asset_to_private_file(
+            &mut command,
+            &asset,
+            Duration::from_secs(2),
+            Some(fixture.path()),
+        );
+        if let Ok(pid) = std::fs::read_to_string(&pid_file).map(|value| value.trim().to_owned()) {
+            let _ = Command::new("/bin/kill").args(["-KILL", &pid]).status();
+        }
+        let error = result.expect_err("escaped flood cannot satisfy exact asset authority");
+        assert!(error.contains("was truncated"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "continuous escaped output exceeded the bounded drain interval"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_asset_download_rejects_overflow_and_command_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().expect("fixture");
+        let should_not_run = fixture.path().join("oversize-command-ran");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", ": > \"$1\"", "sh"])
+            .arg(&should_not_run)
+            .env_clear();
+        let unsupported = ObservedAsset {
+            id: 46,
+            name: PLATFORM_ASSET.to_owned(),
+            sha256: "a".repeat(64),
+            size: 512 * 1024 * 1024 + 1,
+        };
+        let error = download_asset_to_private_file(
+            &mut command,
+            &unsupported,
+            Duration::from_secs(5),
+            Some(fixture.path()),
+        )
+        .expect_err("fixed upper bound");
+        assert!(error.contains("exceeded the supported range"), "{error}");
+        assert!(
+            !should_not_run.exists(),
+            "oversize response command must not spawn"
+        );
+
+        let source = fixture.path().join("overflow.dmg");
+        std::fs::write(&source, b"too many bytes").expect("fixture");
+        let staging = tempfile::tempdir().expect("staging parent");
+        let overflow = ObservedAsset {
+            id: 44,
+            name: PLATFORM_ASSET.to_owned(),
+            sha256: sha256(b"tiny"),
+            size: b"tiny".len() as u64,
+        };
+        let error = download_asset_to_private_file(
+            &mut cat_command(&source),
+            &overflow,
+            Duration::from_secs(5),
+            Some(staging.path()),
+        )
+        .expect_err("oversized response");
+        assert!(error.contains("exceeded its declared"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(staging.path()).expect("listing").count(),
+            0
+        );
+
+        let failing = fixture.path().join("failing-download");
+        std::fs::write(
+            &failing,
+            "#!/bin/sh\nprintf partial\nprintf download-failed >&2\nexit 17\n",
+        )
+        .expect("script");
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o700))
+            .expect("script mode");
+        let failed_asset = ObservedAsset {
+            id: 45,
+            name: PLATFORM_ASSET.to_owned(),
+            sha256: sha256(b"partial"),
+            size: b"partial".len() as u64,
+        };
+        let mut command = Command::new(&failing);
+        command.env_clear();
+        let error = download_asset_to_private_file(
+            &mut command,
+            &failed_asset,
+            Duration::from_secs(5),
+            Some(staging.path()),
+        )
+        .expect_err("nonzero download");
+        assert!(error.contains("download-failed"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(staging.path()).expect("listing").count(),
+            0
+        );
     }
 }
