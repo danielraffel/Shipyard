@@ -175,7 +175,11 @@ runner whose directory lingers).
 shipyard runner remove --name pulp-studio-03 --yes [--purge-dir]
 ```
 
-Stops the LaunchAgent, fetches a removal token, and runs `config.sh remove`.
+Uses the runner's compound `svc.sh uninstall` to stop the service and remove
+its LaunchAgent registration, then fetches a removal token and runs
+`config.sh remove`. A failed service uninstall fails closed before GitHub
+deregistration so a stale `runsvc.sh` Background Item is not silently left
+behind.
 `--purge-dir` also deletes `~/actions-runner-<name>`. Requires `--yes`.
 
 ## Adding a brand-new machine (e.g. an M5 laptop)
