@@ -9,7 +9,14 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     let mut permissions = fs::metadata(&path).expect("fake gh metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).expect("chmod fake gh");
-    GitHubActions::new(temp.path()).with_gh_binary_for_tests(path)
+    let config = crate::config::LoadedConfig {
+        data: toml::Table::new(),
+        global_dir: temp.path().join("global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: crate::config::LocalOverlaySource::None,
+    };
+    GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(path)
 }
 
 fn mutation_control(temp: &tempfile::TempDir, authority: &str, machine: &str) -> MutationControl {
