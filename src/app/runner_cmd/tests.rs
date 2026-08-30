@@ -219,6 +219,139 @@ fn config_with(body: &str) -> crate::config::LoadedConfig {
     .expect("load config")
 }
 
+#[cfg(unix)]
+fn write_test_executable(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, contents).expect("write executable");
+    let mut permissions = std::fs::metadata(path)
+        .expect("executable metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("chmod executable");
+}
+
+#[cfg(unix)]
+fn admission_token_config(temp: &tempfile::TempDir) -> (crate::config::LoadedConfig, PathBuf) {
+    use crate::config::{LoadedConfig, LocalOverlaySource};
+
+    let helper_log = temp.path().join("token-helper.log");
+    let helper = temp.path().join("token-helper");
+    write_test_executable(
+        &helper,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$1" >> '{}'
+printf '%s' '{{"token":"ghs_admission_token","kind":"github-app-installation","expires_at":"2099-01-01T00:00:00Z"}}'
+"#,
+            helper_log.display()
+        ),
+    );
+    let config_text = format!(
+        r#"
+[github.auth]
+source = "command"
+token_command = ["{}", "{{repo_slug}}"]
+cache_ttl_seconds = 300
+"#,
+        helper.display()
+    );
+    (
+        LoadedConfig {
+            data: config_text.parse().expect("parse config"),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        },
+        helper_log,
+    )
+}
+
+#[cfg(unix)]
+fn admission_fake_gh(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let gh_log = temp.path().join("gh.log");
+    let gh = temp.path().join("gh");
+    write_test_executable(
+        &gh,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+test "${{GH_TOKEN:-}}" = ghs_admission_token
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  "api repos/owner/repo")
+    printf '%s' '{{"full_name":"owner/repo","allow_auto_merge":true}}' ;;
+  *"repos/owner/repo/rules/branches/main"*)
+    printf '%s' '[[]]' ;;
+  *"repos/owner/repo/branches/main/protection/required_status_checks"*)
+    printf '%s' '{{"contexts":[],"checks":[]}}' ;;
+  "api graphql "*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  "pr list "*)
+    printf '%s' '[]' ;;
+  *"repos/owner/repo/actions/runs?status="*)
+    printf '%s' '{{"workflow_runs":[]}}' ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 2 ;;
+esac
+"#,
+            gh_log.display()
+        ),
+    );
+    (gh, gh_log)
+}
+
+#[cfg(unix)]
+#[test]
+fn admission_clean_scopes_token_helper_from_repo_less_cwd() {
+    use crate::platform::Platform;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("launchd-cwd");
+    std::fs::create_dir_all(&cwd).expect("repo-less cwd");
+    assert!(!cwd.join(".git").exists());
+    let (config, helper_log) = admission_token_config(&temp);
+    let (gh, gh_log) = admission_fake_gh(&temp);
+
+    let actions = GitHubActions::from_loaded_config(&cwd, &config).with_gh_binary_for_tests(&gh);
+    let runtime_paths = RuntimePaths::for_platform(
+        Platform::current(),
+        &temp.path().join("home"),
+        RuntimeMode::Shipyard,
+    );
+    let mut output = Vec::new();
+    let exit = runner_command_with_actions(
+        RunnerCommand::AdmissionClean {
+            repo: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            labels: vec!["self-hosted".to_owned()],
+            apply: false,
+        },
+        &config,
+        RuntimeMode::Shipyard,
+        &cwd,
+        &runtime_paths,
+        &actions,
+        true,
+        &mut output,
+    )
+    .expect("admission command");
+
+    assert_eq!(exit, ExitCode::SUCCESS);
+    let verdict: serde_json::Value = serde_json::from_slice(&output).expect("JSON verdict");
+    assert_eq!(verdict["verdict"], "admit");
+    assert_eq!(verdict["reason"], "clean");
+    assert_eq!(
+        std::fs::read_to_string(helper_log).expect("helper log"),
+        "owner/repo\n"
+    );
+    let gh_calls = std::fs::read_to_string(gh_log).expect("gh log");
+    assert!(gh_calls.contains("api repos/owner/repo"), "{gh_calls}");
+}
+
 #[test]
 fn reaper_thresholds_fall_back_to_built_in_defaults() {
     let config = config_with("[project]\nname = \"x\"\n");
