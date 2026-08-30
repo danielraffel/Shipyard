@@ -871,9 +871,18 @@ mod tests {
         let old = DaemonWorkerClaim::exclusive_sandbox("audit", "authority-old");
         assert!(capacity.claim_or_heartbeat(&old).unwrap());
         std::thread::sleep(Duration::from_millis(1_100));
+        let replacement_capacity = DaemonWorkerCapacity::new(temp.path());
         let replacement = DaemonWorkerClaim::exclusive_sandbox("audit", "authority-new");
-        assert!(capacity.claim_or_heartbeat(&replacement).unwrap());
+        assert!(
+            replacement_capacity
+                .claim_or_heartbeat(&replacement)
+                .unwrap()
+        );
         assert!(!capacity.release(&old).unwrap());
-        assert!(capacity.heartbeat_existing(&replacement).unwrap());
+        assert!(
+            replacement_capacity
+                .heartbeat_existing(&replacement)
+                .unwrap()
+        );
     }
 }

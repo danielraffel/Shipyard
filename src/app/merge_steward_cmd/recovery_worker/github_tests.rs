@@ -325,12 +325,25 @@ fn github_transport_does_not_wait_on_an_escaped_descendants_stdio() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = temp.path().join("gh");
     let pid_path = temp.path().join("gh.pid");
+    let ready_path = temp.path().join("gh.ready");
     fs::write(
         &binary,
         r#"#!/bin/sh
 set -eu
-python3 -c 'import os,sys,time; os.setsid(); f=open(sys.argv[1],"w"); f.write(str(os.getpid())); f.flush(); os.fsync(f.fileno()); time.sleep(30)' "$1" &
-while [ ! -s "$1" ]; do sleep 0.01; done
+mkfifo "$2"
+/usr/bin/perl -MPOSIX -e '
+    my $session = POSIX::setsid();
+    defined($session) && $session != -1 or die "setsid: $!";
+    open my $pid, ">", $ARGV[0] or die $!;
+    print {$pid} $$;
+    close $pid or die $!;
+    open my $ready, ">", $ARGV[1] or die $!;
+    print {$ready} "ready\n";
+    close $ready or die $!;
+    sleep 30;
+' "$1" "$2" &
+IFS= read -r signal < "$2"
+[ "$signal" = ready ]
 printf ready
 "#,
     )
@@ -345,7 +358,10 @@ printf ready
     // would remain blocked until that child exits; regular-file capture is
     // immediately readable and owns no detached helper threads.
     let result = actions.run_gh_with_timeout_bounded(
-        &[pid_path.to_string_lossy().into_owned()],
+        &[
+            pid_path.to_string_lossy().into_owned(),
+            ready_path.to_string_lossy().into_owned(),
+        ],
         Duration::from_secs(10),
         64,
         64,

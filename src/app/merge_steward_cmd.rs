@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use crate::cloud::GitHubActions;
@@ -428,6 +429,7 @@ struct CapacityApplyContext<'a> {
 
 const CANCEL_TERMINAL_WAIT: Duration = Duration::from_secs(15);
 const CANCEL_TERMINAL_POLL: Duration = Duration::from_secs(2);
+const ADMISSION_OBSERVATION_TIMEOUT: Duration = Duration::from_mins(2);
 const PREEMPT_AFTER_SECS: i64 = 900;
 pub(super) const HANDOFF_CONTEXT: &str = "shipyard/steward-handoff";
 pub(super) const MANAGED_LABEL: &str = "shipyard:managed";
@@ -485,8 +487,9 @@ fn emit_admission_verdict<W: Write>(
     base: &str,
     labels: &[String],
     blocker_run_ids: &[u64],
+    error_detail: Option<&str>,
 ) -> Result<ExitCode, CliFailure> {
-    let payload = json!({
+    let mut payload = json!({
         "schema_version": 1,
         "command": "runner:admission-clean",
         "verdict": verdict.label(),
@@ -497,6 +500,9 @@ fn emit_admission_verdict<W: Write>(
         "observed_at": Utc::now().to_rfc3339(),
         "blocker_run_ids": blocker_run_ids,
     });
+    if let Some(error) = error_detail {
+        payload["error"] = Value::String(bounded_admission_error(error));
+    }
     if json_output {
         serde_json::to_writer(&mut *stdout, &payload)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -504,12 +510,25 @@ fn emit_admission_verdict<W: Write>(
     } else {
         writeln!(stdout, "{}: {reason}", verdict.label())
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if let Some(error) = error_detail {
+            writeln!(stdout, "error: {}", bounded_admission_error(error))
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
         if !blocker_run_ids.is_empty() {
             writeln!(stdout, "blocker runs: {blocker_run_ids:?}")
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
     }
     Ok(verdict.exit_code())
+}
+
+fn bounded_admission_error(error: &str) -> String {
+    const MAX_BYTES: usize = 4 * 1024;
+    if error.len() <= MAX_BYTES {
+        return error.to_owned();
+    }
+    let prefix = &error[..error.floor_char_boundary(MAX_BYTES)];
+    format!("{prefix}...[truncated]")
 }
 
 fn normalize_admission_target(
@@ -578,31 +597,71 @@ fn job_can_claim_runner(job: &StewardJob, runner_labels: &BTreeSet<String>) -> b
         .all(|label| runner_labels.contains(&label.to_ascii_lowercase()))
 }
 
+fn try_acquire_admission_observation_lock(
+    state_dir: &Path,
+    repo: &str,
+    base: &str,
+    labels: &[String],
+) -> Result<Option<fs::File>, String> {
+    let directory = state_dir.join("runner-admission-observation");
+    crate::writer_domain_lease::ensure_protected_dir_all(&directory)
+        .map_err(|error| format!("could not create admission observation state: {error}"))?;
+    let key = serde_json::to_vec(&(repo.to_ascii_lowercase(), base, labels))
+        .map_err(|error| format!("could not encode admission observation key: {error}"))?;
+    let path = directory.join(format!("{:x}.lock", Sha256::digest(key)));
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)
+        .map_err(|error| format!("could not fence admission observation lock: {error}"))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    drop(writer_domain);
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if lock_is_contended(&error) => Ok(None),
+        Err(error) => Err(format!(
+            "could not lock admission observation state: {error}"
+        )),
+    }
+}
+
 fn admission_candidates(
     actions: &GitHubActions,
     observation: &RepoObservation,
     labels: &[String],
-) -> Result<Vec<RunCancellation>, String> {
-    let current_heads = current_pull_request_heads(&observation.prs);
-    let mut excluded = opted_out_pull_requests(&observation.prs, "shipyard:no-auto-merge");
-    excluded.extend(
-        observation
-            .prs
-            .iter()
-            .filter(|pr| !pull_request_is_managed(pr, MANAGED_LABEL, HANDOFF_CONTEXT))
-            .map(|pr| pr.fact.number),
-    );
-    let candidates = plan_run_coalescing(
+) -> Result<(Vec<RunCancellation>, Vec<u64>), String> {
+    let (current_heads, excluded) = admission_pr_authority(&observation.prs);
+    let cancellable = plan_run_coalescing(
         &observation.runs,
         &current_heads,
         &observation.merge_group_heads,
         &excluded,
     );
-    if candidates.len() > 50 {
+    let mut in_progress = observation
+        .runs
+        .iter()
+        .filter(|run| run.status.eq_ignore_ascii_case("in_progress"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for run in &mut in_progress {
+        "queued".clone_into(&mut run.status);
+    }
+    let blocking_only = plan_run_coalescing(
+        &in_progress,
+        &current_heads,
+        &observation.merge_group_heads,
+        &excluded,
+    );
+    if cancellable.len() + blocking_only.len() > 50 {
         return Err("more than 50 superseded runs require admission inspection".to_owned());
     }
     let runner_labels = labels.iter().cloned().collect::<BTreeSet<_>>();
     let mut compatible = Vec::new();
+    let mut blockers = Vec::new();
+    let mut candidates = cancellable;
+    candidates.extend(blocking_only);
     for candidate in candidates {
         let run = observation
             .runs
@@ -614,11 +673,26 @@ fn admission_candidates(
             .iter()
             .any(|job| job_can_claim_runner(job, &runner_labels))
         {
-            compatible.push(candidate);
+            if run.status.eq_ignore_ascii_case("queued") {
+                compatible.push(candidate);
+            } else {
+                blockers.push(candidate.run_id);
+            }
         }
     }
     compatible.sort_unstable_by_key(|candidate| candidate.run_id);
-    Ok(compatible)
+    Ok((compatible, blockers))
+}
+
+fn admission_pr_authority(prs: &[ObservedPr]) -> (BTreeMap<u64, String>, BTreeSet<u64>) {
+    let current_heads = current_pull_request_heads(prs);
+    let mut excluded = opted_out_pull_requests(prs, "shipyard:no-auto-merge");
+    excluded.extend(
+        prs.iter()
+            .filter(|pr| !pull_request_is_managed(pr, MANAGED_LABEL, HANDOFF_CONTEXT))
+            .map(|pr| pr.fact.number),
+    );
+    (current_heads, excluded)
 }
 
 fn observe_admission_candidates(
@@ -626,10 +700,50 @@ fn observe_admission_candidates(
     repo: &str,
     base: &str,
     labels: &[String],
-) -> Result<(RepoObservation, Vec<RunCancellation>), String> {
+) -> Result<(RepoObservation, Vec<RunCancellation>, Vec<u64>), String> {
     let observation = observe_repo(actions, repo, base, false)?;
-    let candidates = admission_candidates(actions, &observation, labels)?;
-    Ok((observation, candidates))
+    let (candidates, blocking_only) = admission_candidates(actions, &observation, labels)?;
+    fence_admission_authority(actions, &observation)?;
+    Ok((observation, candidates, blocking_only))
+}
+
+fn refreshed_admission_authority(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+) -> Result<(Vec<ObservedPr>, BTreeMap<u64, String>), String> {
+    let (_, positions, heads, _) =
+        merge_queue_snapshot(actions, &observation.repo, &observation.base)?;
+    let mut prs = pull_requests(actions, &observation.repo, &observation.base, &positions)?;
+    hydrate_required_check_identities(actions, &observation.repo, &[], &mut prs)?;
+    Ok((prs, heads))
+}
+
+fn fence_admission_authority(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+) -> Result<(), String> {
+    let (final_prs, final_merge_group_heads) = refreshed_admission_authority(actions, observation)?;
+    if admission_pr_authority(&observation.prs) != admission_pr_authority(&final_prs)
+        || observation.merge_group_heads != final_merge_group_heads
+    {
+        return Err("admission authority changed during active-run inspection".to_owned());
+    }
+    Ok(())
+}
+
+fn revalidate_active_admission_candidates(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    labels: &[String],
+) -> Result<(Vec<RunCancellation>, Vec<u64>), String> {
+    let mut refreshed = observation.clone();
+    let (prs, heads) = refreshed_admission_authority(actions, observation)?;
+    refreshed.prs = prs;
+    refreshed.merge_group_heads = heads;
+    refreshed.runs = active_runs(actions, &observation.repo)?;
+    let candidates = admission_candidates(actions, &refreshed, labels)?;
+    fence_admission_authority(actions, &refreshed)?;
+    Ok(candidates)
 }
 
 fn pending_admission_cancellations(
@@ -647,11 +761,13 @@ fn pending_admission_cancellations(
 
 fn admission_blocker_run_ids(
     candidates: &[RunCancellation],
+    blocking_only: &[u64],
     pending: &[(String, PendingCancellation)],
 ) -> Vec<u64> {
     let mut run_ids = candidates
         .iter()
         .map(|candidate| candidate.run_id)
+        .chain(blocking_only.iter().copied())
         .chain(pending.iter().map(|(_, cancellation)| cancellation.run_id))
         .collect::<Vec<_>>();
     run_ids.sort_unstable();
@@ -670,63 +786,118 @@ pub(super) fn admission_clean_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let (repo, base, labels) = normalize_admission_target(args)?;
-    let Ok((mut observation, mut candidates)) =
-        observe_admission_candidates(actions, &repo, &base, &labels)
-    else {
-        return emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Error,
-            "observation_failed",
-            &repo,
-            &base,
-            &labels,
-            &[],
-        );
+    macro_rules! return_verdict {
+        ($verdict:ident, $reason:expr, $repo:expr, $blockers:expr, $error:expr) => {
+            return emit_admission_verdict(
+                stdout,
+                json_output,
+                AdmissionVerdict::$verdict,
+                $reason,
+                $repo,
+                &base,
+                &labels,
+                $blockers,
+                $error,
+            )
+        };
+    }
+    let _observation_lock = match try_acquire_admission_observation_lock(
+        &runtime_paths.state_dir,
+        &repo,
+        &base,
+        &labels,
+    ) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return_verdict!(Defer, "observation_in_progress", &repo, &[], None),
+        Err(error) => return_verdict!(Error, "observation_failed", &repo, &[], Some(&error)),
     };
+    let admission_actions = actions
+        .clone()
+        .with_absolute_deadline(Instant::now() + ADMISSION_OBSERVATION_TIMEOUT);
+    let actions = &admission_actions;
+    let (mut observation, mut candidates, mut blocking_only) =
+        match observe_admission_candidates(actions, &repo, &base, &labels) {
+            Ok(observation) => observation,
+            Err(error) => return_verdict!(Error, "observation_failed", &repo, &[], Some(&error)),
+        };
     let canonical_repo = observation.repo.clone();
     let ledger_path = runtime_paths.state_dir.join("merge-steward.json");
+    macro_rules! acquire_admission_ledger_lock {
+        ($blockers:expr) => {
+            match try_acquire_ledger_lock(&ledger_path) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => return_verdict!(
+                    Defer,
+                    "stewardship_in_progress",
+                    &canonical_repo,
+                    $blockers,
+                    Some("another steward apply pass is already running")
+                ),
+                Err(error) => return_verdict!(
+                    Error,
+                    "mutation_failed",
+                    &canonical_repo,
+                    $blockers,
+                    Some(error.message())
+                ),
+            }
+        };
+    }
     let Ok(observed_ledger) = load_ledger(&ledger_path) else {
-        return emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Error,
-            "mutation_failed",
-            &canonical_repo,
-            &base,
-            &labels,
-            &[],
-        );
+        return_verdict!(Error, "mutation_failed", &canonical_repo, &[], None);
     };
     let observed_pending =
         pending_admission_cancellations(&observed_ledger, &canonical_repo, &base);
-    let mut blocker_run_ids = admission_blocker_run_ids(&candidates, &observed_pending);
-    if candidates.is_empty() && observed_pending.is_empty() {
-        return emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Admit,
-            "clean",
-            &canonical_repo,
-            &base,
-            &labels,
-            &[],
-        );
+    let mut blocker_run_ids =
+        admission_blocker_run_ids(&candidates, &blocking_only, &observed_pending);
+    if candidates.is_empty() && blocking_only.is_empty() && observed_pending.is_empty() {
+        let _ledger_lock = acquire_admission_ledger_lock!(&[]);
+        let ledger = load_ledger(&ledger_path)?;
+        let final_pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
+        if !final_pending.is_empty() {
+            let blockers = admission_blocker_run_ids(&[], &[], &final_pending);
+            return_verdict!(
+                Defer,
+                "cancellation_pending",
+                &canonical_repo,
+                &blockers,
+                None
+            );
+        }
+        let (final_candidates, final_blocking) =
+            match revalidate_active_admission_candidates(actions, &observation, &labels) {
+                Ok(candidates) => candidates,
+                Err(error) => return_verdict!(
+                    Error,
+                    "revalidation_failed",
+                    &canonical_repo,
+                    &[],
+                    Some(&error)
+                ),
+            };
+        if !final_candidates.is_empty() || !final_blocking.is_empty() {
+            let blockers = admission_blocker_run_ids(&final_candidates, &final_blocking, &[]);
+            return_verdict!(
+                Defer,
+                "stale_compatible_runs",
+                &canonical_repo,
+                &blockers,
+                None
+            );
+        }
+        return_verdict!(Admit, "clean", &canonical_repo, &[], None);
     }
     if !args.apply {
-        return emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Defer,
+        return_verdict!(
+            Defer,
             if observed_pending.is_empty() {
                 "stale_compatible_runs"
             } else {
                 "cancellation_pending"
             },
             &canonical_repo,
-            &base,
-            &labels,
             &blocker_run_ids,
+            None
         );
     }
     let Ok(authority) = authority_status(
@@ -735,46 +906,29 @@ pub(super) fn admission_clean_command<W: Write>(
         mode,
         &runtime_paths.global_dir,
     ) else {
-        return emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Error,
+        return_verdict!(
+            Error,
             "authority_failed",
             &canonical_repo,
-            &base,
-            &labels,
             &blocker_run_ids,
+            None
         );
     };
     if authority.get("authority_matches").and_then(Value::as_bool) != Some(true) {
-        return emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Defer,
+        return_verdict!(
+            Defer,
             "mutation_authority_required",
             &canonical_repo,
-            &base,
-            &labels,
             &blocker_run_ids,
+            None
         );
     }
 
-    let _ledger_lock = acquire_ledger_lock(&ledger_path)?;
+    let _ledger_lock = acquire_admission_ledger_lock!(&blocker_run_ids);
     let mut ledger = load_ledger(&ledger_path)?;
     let pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
-    blocker_run_ids = admission_blocker_run_ids(&candidates, &pending);
-    if candidates.is_empty() && pending.is_empty() {
-        return emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Admit,
-            "cleaned",
-            &canonical_repo,
-            &base,
-            &labels,
-            &[],
-        );
-    }
+    blocker_run_ids = admission_blocker_run_ids(&candidates, &blocking_only, &pending);
+    // Reobserve all pre-lock blockers before deciding whether to admit or defer.
     let mutation_control = MutationControl {
         store: ShipStateStore::new(runtime_paths.state_dir.join("ship")).map_err(|error| {
             CliFailure::new(
@@ -798,49 +952,43 @@ pub(super) fn admission_clean_command<W: Write>(
         )
         .is_err()
         {
-            return emit_admission_verdict(
-                stdout,
-                json_output,
-                AdmissionVerdict::Error,
+            return_verdict!(
+                Error,
                 "mutation_failed",
                 &canonical_repo,
-                &base,
-                &labels,
                 &blocker_run_ids,
+                None
             );
         }
     }
     match observe_admission_candidates(actions, &canonical_repo, &base, &labels) {
-        Ok((refreshed_observation, refreshed_candidates)) => {
+        Ok((refreshed_observation, refreshed_candidates, refreshed_blocking)) => {
             observation = refreshed_observation;
             candidates = refreshed_candidates;
+            blocking_only = refreshed_blocking;
             let remaining_pending =
                 pending_admission_cancellations(&ledger, &canonical_repo, &base);
-            blocker_run_ids = admission_blocker_run_ids(&candidates, &remaining_pending);
+            blocker_run_ids =
+                admission_blocker_run_ids(&candidates, &blocking_only, &remaining_pending);
         }
-        Err(_) => {
-            return emit_admission_verdict(
-                stdout,
-                json_output,
-                AdmissionVerdict::Error,
-                "revalidation_failed",
-                &canonical_repo,
-                &base,
-                &labels,
-                &blocker_run_ids,
-            );
-        }
+        Err(error) => return_verdict!(
+            Error,
+            "revalidation_failed",
+            &canonical_repo,
+            &blocker_run_ids,
+            Some(&error)
+        ),
+    }
+    if candidates.is_empty() && blocking_only.is_empty() {
+        return_verdict!(Admit, "cleaned", &canonical_repo, &[], None);
     }
     if candidates.is_empty() {
-        return emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Admit,
-            "cleaned",
+        return_verdict!(
+            Defer,
+            "stale_compatible_runs",
             &canonical_repo,
-            &base,
-            &labels,
-            &[],
+            &blocker_run_ids,
+            None
         );
     }
     for candidate in &candidates {
@@ -856,61 +1004,51 @@ pub(super) fn admission_clean_command<W: Write>(
             &mut ledger,
             &mutation_control,
         );
-        if error.is_some() {
+        if let Some(error) = error {
             let _ = save_ledger(&ledger_path, &ledger);
-            return emit_admission_verdict(
-                stdout,
-                json_output,
-                AdmissionVerdict::Error,
+            return_verdict!(
+                Error,
                 "mutation_failed",
                 &canonical_repo,
-                &base,
-                &labels,
                 &blocker_run_ids,
+                Some(&error)
             );
         }
     }
     save_ledger(&ledger_path, &ledger)?;
-    let Ok((_, remaining)) = observe_admission_candidates(actions, &canonical_repo, &base, &labels)
-    else {
-        return emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Error,
-            "revalidation_failed",
-            &canonical_repo,
-            &base,
-            &labels,
-            &blocker_run_ids,
-        );
-    };
-    if remaining.is_empty() {
-        emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Admit,
-            "cleaned",
-            &canonical_repo,
-            &base,
-            &labels,
-            &[],
-        )
-    } else {
-        let remaining = remaining
-            .into_iter()
-            .map(|candidate| candidate.run_id)
-            .collect::<Vec<_>>();
-        emit_admission_verdict(
-            stdout,
-            json_output,
-            AdmissionVerdict::Defer,
-            "cancellation_pending",
-            &canonical_repo,
-            &base,
-            &labels,
-            &remaining,
-        )
+    let (remaining, remaining_blocking) =
+        match observe_admission_candidates(actions, &canonical_repo, &base, &labels) {
+            Ok((_, candidates, blocking)) => (candidates, blocking),
+            Err(error) => return_verdict!(
+                Error,
+                "revalidation_failed",
+                &canonical_repo,
+                &blocker_run_ids,
+                Some(&error)
+            ),
+        };
+    if remaining.is_empty() && remaining_blocking.is_empty() {
+        return_verdict!(Admit, "cleaned", &canonical_repo, &[], None);
     }
+    let only_blocking = remaining.is_empty();
+    let mut remaining = remaining
+        .into_iter()
+        .map(|candidate| candidate.run_id)
+        .collect::<Vec<_>>();
+    remaining.extend(remaining_blocking);
+    remaining.sort_unstable();
+    remaining.dedup();
+    return_verdict!(
+        Defer,
+        if only_blocking {
+            "stale_compatible_runs"
+        } else {
+            "cancellation_pending"
+        },
+        &canonical_repo,
+        &remaining,
+        None
+    );
 }
 
 pub(super) fn steward_command<W: Write>(
@@ -1139,7 +1277,7 @@ fn persist_final_ledger(
     }
 }
 
-fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
+fn try_acquire_ledger_lock(path: &Path) -> Result<Option<fs::File>, CliFailure> {
     let lock_path = path.with_extension("json.lock");
     let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -1173,21 +1311,29 @@ fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
             )
         })?;
     drop(writer_domain);
-    file.try_lock_exclusive().map_err(|error| {
-        let reason = if lock_is_contended(&error) {
-            "another steward apply pass is already running".to_owned()
-        } else {
-            error.to_string()
-        };
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if lock_is_contended(&error) => Ok(None),
+        Err(error) => Err(CliFailure::new(
+            1,
+            format!(
+                "could not lock steward state {}: {error}",
+                lock_path.display()
+            ),
+        )),
+    }
+}
+
+fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
+    try_acquire_ledger_lock(path)?.ok_or_else(|| {
         CliFailure::new(
             1,
             format!(
-                "could not lock steward state {}: {reason}",
-                lock_path.display()
+                "could not lock steward state {}: another steward apply pass is already running",
+                path.with_extension("json.lock").display()
             ),
         )
-    })?;
-    Ok(file)
+    })
 }
 
 mod cancellation;

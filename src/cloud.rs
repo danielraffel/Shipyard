@@ -277,6 +277,7 @@ pub struct GitHubActions {
     cwd: PathBuf,
     gh: Result<GhClient, String>,
     gh_binary_override: Option<PathBuf>,
+    absolute_deadline: Option<Instant>,
 }
 
 impl PartialEq for GitHubActions {
@@ -304,6 +305,7 @@ impl GitHubActions {
             cwd,
             gh,
             gh_binary_override: None,
+            absolute_deadline: None,
         }
     }
 
@@ -317,6 +319,7 @@ impl GitHubActions {
             cwd,
             gh,
             gh_binary_override: None,
+            absolute_deadline: None,
         }
     }
 
@@ -350,6 +353,14 @@ impl GitHubActions {
     #[cfg(all(test, unix))]
     pub(crate) fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
         self.gh_binary_override = Some(gh_binary.into());
+        self
+    }
+
+    pub(crate) fn with_absolute_deadline(mut self, deadline: Instant) -> Self {
+        self.absolute_deadline = Some(
+            self.absolute_deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
         self
     }
 
@@ -752,6 +763,9 @@ impl GitHubActions {
     }
 
     pub(crate) fn run_gh(&self, args: &[String]) -> Result<String, GitHubError> {
+        if let Some(timeout) = self.remaining_deadline()? {
+            return self.run_gh_with_timeout(args, timeout);
+        }
         let output = self
             .prepare_gh_command()?
             .args(args)
@@ -818,9 +832,13 @@ impl GitHubActions {
         timeout: Duration,
         output_limits: Option<(usize, usize)>,
     ) -> Result<GitHubCommandOutput, GitHubError> {
+        let timeout = self
+            .remaining_deadline()?
+            .map_or(timeout, |remaining| timeout.min(remaining));
         let started = Instant::now();
+        let (deadline, execution_deadline) = gh_command_deadlines(started, timeout)?;
         let mut command = self.prepare_gh_command_with_timeout(timeout)?;
-        if started.elapsed() >= timeout {
+        if Instant::now() >= deadline {
             return Err(GitHubError::new(format!(
                 "gh {} timed out during credential preparation after {}ms",
                 args.join(" "),
@@ -872,9 +890,12 @@ impl GitHubActions {
             }
             match process_tree.try_wait() {
                 Ok(Some(status)) => break Some(status),
-                Ok(None) if started.elapsed() < timeout => {
+                Ok(None) if Instant::now() < execution_deadline => {
                     let poll = if output_limits.is_some() { 10 } else { 50 };
-                    std::thread::sleep(Duration::from_millis(poll));
+                    std::thread::sleep(
+                        Duration::from_millis(poll)
+                            .min(execution_deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 Ok(None) => {
                     terminal_error = Some(format!(
@@ -894,7 +915,7 @@ impl GitHubActions {
         // Reap the complete supervised tree even after the direct child exits.
         // A process that escaped the tree may retain the regular file, but it
         // cannot block capture reads or retain a detached Rust reader thread.
-        process_tree.terminate();
+        process_tree.terminate_until(deadline);
         let stdout = read_command_capture(stdout_capture.as_file_mut(), stdout_limit)
             .map_err(|error| GitHubError::new(format!("failed reading gh stdout: {error}")))?;
         let stderr = read_command_capture(stderr_capture.as_file_mut(), stderr_limit)
@@ -915,6 +936,19 @@ impl GitHubActions {
             stdout: stdout.bytes,
             stderr: stderr.bytes,
         })
+    }
+
+    fn remaining_deadline(&self) -> Result<Option<Duration>, GitHubError> {
+        let Some(deadline) = self.absolute_deadline else {
+            return Ok(None);
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(GitHubError::new(
+                "gh command exceeded its absolute deadline".to_owned(),
+            ));
+        }
+        Ok(Some(remaining))
     }
 
     fn prepare_gh_command(&self) -> Result<std::process::Command, GitHubError> {
@@ -950,6 +984,19 @@ impl GitHubActions {
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
+}
+
+fn gh_command_deadlines(
+    started: Instant,
+    timeout: Duration,
+) -> Result<(Instant, Instant), GitHubError> {
+    let deadline = started
+        .checked_add(timeout)
+        .ok_or_else(|| GitHubError::new("gh timeout exceeded Instant range".to_owned()))?;
+    let execution = deadline
+        .checked_sub(Duration::from_millis(500).min(timeout / 4))
+        .expect("teardown budget does not exceed timeout");
+    Ok((deadline, execution))
 }
 
 /// Discover workflow-dispatchable GitHub Actions workflows below `repo_root`.
