@@ -979,7 +979,11 @@ exit 0;
         let error = download_asset_to_private_file(
             &mut command,
             &failed_asset,
-            Duration::from_secs(5),
+            // The script exits immediately once scheduled. A saturated macOS
+            // runner can take more than the old 4.5-second execution slice to
+            // schedule it; keep the test bounded without misclassifying host
+            // contention as downloader behavior.
+            Duration::from_secs(15),
             Some(staging.path()),
         )
         .expect_err("nonzero download");

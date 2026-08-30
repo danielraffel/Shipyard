@@ -58,7 +58,10 @@ const MAX_WRAPPER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 4 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
-const SENTINEL_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
+// `lsof` can take multiple seconds to receive CPU on a saturated macOS build
+// host. Keep cleanup bounded, but leave enough time to prove and kill an
+// escaped setsid descendant instead of returning uncertain with it alive.
+const SENTINEL_TEARDOWN_BUDGET: Duration = Duration::from_secs(10);
 const EXECUTION_SENTINEL_FD_ENV: &str = "SHIPYARD_PROVIDER_SENTINEL_FD";
 #[cfg(test)]
 const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 4;
@@ -2139,7 +2142,7 @@ mod tests {
             ProviderWrapperRunResult::Uncertain { .. }
         ));
         assert!(
-            started.elapsed() < Duration::from_secs(30),
+            started.elapsed() < Duration::from_secs(45),
             "timeout cleanup plus serialized fixture admission wedged"
         );
         let child_pid = fs::read_to_string(directory.path().join("detached.pid")).unwrap();

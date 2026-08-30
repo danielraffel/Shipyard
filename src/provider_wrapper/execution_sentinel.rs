@@ -38,14 +38,57 @@ pub(super) fn terminate_sentinel_processes(
     deadline: Instant,
     poll_interval: Duration,
 ) -> SentinelCleanup {
+    terminate_sentinel_processes_with(
+        deadline,
+        poll_interval,
+        |scan_deadline| sentinel_processes(path, scan_deadline),
+        signal,
+        Instant::now,
+        std::thread::sleep,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_sentinel_processes_with<Scan, Kill, Now, Sleep>(
+    deadline: Instant,
+    poll_interval: Duration,
+    mut scan: Scan,
+    mut kill: Kill,
+    mut now: Now,
+    mut sleep: Sleep,
+) -> SentinelCleanup
+where
+    Scan: FnMut(Instant) -> Option<BTreeSet<u32>>,
+    Kill: FnMut(u32, &str, Instant) -> std::io::Result<()>,
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
+    let started = now();
+    let remaining = deadline.saturating_duration_since(started);
+    let discovery_deadline = started + remaining / 2;
+    let kill_deadline = started + (remaining / 4) * 3;
     let mut residual_detected = false;
-    while Instant::now() < deadline {
-        let Some(observed) = sentinel_processes(path, deadline) else {
-            return SentinelCleanup {
-                proven: false,
-                residual_detected,
-            };
+    let mut discovery_succeeded = false;
+    while now() < deadline {
+        let current = now();
+        let scan_deadline = if !discovery_succeeded {
+            discovery_deadline
+        } else if current < kill_deadline {
+            kill_deadline
+        } else {
+            deadline
         };
+        let Some(observed) = scan(scan_deadline) else {
+            if (!discovery_succeeded && now() >= discovery_deadline) || now() >= deadline {
+                return SentinelCleanup {
+                    proven: false,
+                    residual_detected,
+                };
+            }
+            sleep(poll_interval.min(deadline.saturating_duration_since(now())));
+            continue;
+        };
+        discovery_succeeded = true;
         let observed = observed
             .into_iter()
             .filter(|pid| *pid != std::process::id())
@@ -57,6 +100,12 @@ pub(super) fn terminate_sentinel_processes(
             };
         }
         residual_detected = true;
+        if now() >= kill_deadline {
+            return SentinelCleanup {
+                proven: false,
+                residual_detected,
+            };
+        }
         // Never leave a durable stopped process between discovery and
         // termination. A supervisor abort in the former STOP-then-KILL gap
         // orphaned wrappers under launchd indefinitely. Killing every exact
@@ -64,15 +113,15 @@ pub(super) fn terminate_sentinel_processes(
         // race: any child created before its parent dies inherited this same
         // private descriptor and appears on the next pass.
         for pid in observed.iter().rev() {
-            if Instant::now() >= deadline {
+            if now() >= kill_deadline {
                 return SentinelCleanup {
                     proven: false,
                     residual_detected,
                 };
             }
-            let _ = signal(*pid, "-KILL", deadline);
+            let _ = kill(*pid, "-KILL", kill_deadline);
         }
-        std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())));
+        sleep(poll_interval.min(deadline.saturating_duration_since(now())));
     }
     SentinelCleanup {
         proven: false,
@@ -100,7 +149,10 @@ fn signal(pid: u32, signal: &str, deadline: Instant) -> std::io::Result<()> {
 #[cfg(target_os = "macos")]
 fn sentinel_processes(path: &Path, deadline: Instant) -> Option<BTreeSet<u32>> {
     let mut command = Command::new("/usr/sbin/lsof");
-    command.args(["-t", "--"]).arg(path);
+    // The trusted launcher opens the private sentinel as descriptor 9 and its
+    // descendants must retain that descriptor. Intersecting the pathname and
+    // descriptor selections reduces work on build hosts with large FD tables.
+    command.args(["-a", "-d", "9", "-t", "--"]).arg(path);
     let output =
         crate::process::run_output_until(&mut command, deadline, "provider sentinel scan").ok()?;
     parse_lsof_output(output.status.code(), &output.stdout, &output.stderr)
@@ -137,7 +189,87 @@ fn parse_lsof_output(
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::parse_lsof_output;
+    use std::cell::Cell;
+    use std::collections::{BTreeSet, VecDeque};
+    use std::time::{Duration, Instant};
+
+    use super::{parse_lsof_output, terminate_sentinel_processes_with};
+
+    #[test]
+    fn transient_scan_failures_retry_across_kill_and_final_verification() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let discovery_deadline = started + Duration::from_millis(50);
+        let kill_deadline = started + Duration::from_millis(75);
+        let clock = Cell::new(started);
+        let mut scans = VecDeque::from([None, Some(BTreeSet::from([42])), None, None]);
+        let mut scan_deadlines = Vec::new();
+        let mut killed = Vec::new();
+        let cleanup = terminate_sentinel_processes_with(
+            deadline,
+            Duration::from_millis(10),
+            |scan_deadline| {
+                scan_deadlines.push(scan_deadline);
+                let result = scans.pop_front().unwrap_or_else(|| Some(BTreeSet::new()));
+                if scan_deadlines.len() == 2 {
+                    clock.set(started + Duration::from_millis(49));
+                } else if scan_deadlines.len() == 4 {
+                    clock.set(started + Duration::from_millis(76));
+                }
+                result
+            },
+            |pid, signal, signal_deadline| {
+                killed.push((pid, signal.to_owned(), signal_deadline));
+                Ok(())
+            },
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+        );
+
+        assert!(cleanup.proven);
+        assert!(cleanup.residual_detected);
+        assert_eq!(
+            scan_deadlines,
+            [
+                discovery_deadline,
+                discovery_deadline,
+                kill_deadline,
+                kill_deadline,
+                deadline,
+            ]
+        );
+        assert_eq!(killed, [(42, "-KILL".to_owned(), kill_deadline)]);
+    }
+
+    #[test]
+    fn discovery_exhaustion_refuses_without_kill() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let discovery_deadline = started + Duration::from_millis(50);
+        let clock = Cell::new(started);
+        let mut scan_deadlines = Vec::new();
+        let mut kills = 0;
+        let cleanup = terminate_sentinel_processes_with(
+            deadline,
+            Duration::from_millis(10),
+            |scan_deadline| {
+                scan_deadlines.push(scan_deadline);
+                clock.set(started + Duration::from_millis(51));
+                None
+            },
+            |_, _, _| {
+                kills += 1;
+                Ok(())
+            },
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+        );
+
+        assert!(!cleanup.proven);
+        assert!(!cleanup.residual_detected);
+        assert_eq!(scan_deadlines, [discovery_deadline]);
+        assert_eq!(kills, 0);
+    }
 
     #[test]
     fn lsof_output_accepts_only_exact_holder_or_no_match_shapes() {
