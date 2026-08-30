@@ -43,6 +43,21 @@ class GuardianLifecycleTests(unittest.TestCase):
             )
         )
 
+    def create_generation_lease(
+        self,
+        active: guardian.Guardian,
+        *,
+        phase: str = guardian.LEASE_PHASE_TRANSITIONING,
+    ) -> tuple[os.stat_result, str]:
+        metadata, generation = guardian._create_lease_generation(active.lease_dir)
+        if phase == guardian.LEASE_PHASE_TRANSITIONING:
+            metadata = guardian._advance_lease_generation(
+                active.lease_dir,
+                (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns),
+                generation,
+            )
+        return metadata, generation
+
     def test_guardian_owns_cleanup_at_successful_atomic_acquisition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
@@ -53,8 +68,153 @@ class GuardianLifecycleTests(unittest.TestCase):
             self.assertEqual(active.lease_device, lease_stat.st_dev)
             self.assertEqual(active.lease_inode, lease_stat.st_ino)
             self.assertEqual(active.lease_ctime_ns, lease_stat.st_ctime_ns)
+            _, observed_generation = guardian._validate_lease_generation(
+                active.lease_dir
+            )
+            self.assertEqual(active.lease_generation, observed_generation)
             active.release()
             self.assertFalse(active.lease_dir.exists())
+            self.assertFalse(
+                active.lease_dir.with_name(
+                    f".{active.lease_dir.name}.removed-{observed_generation}"
+                ).exists()
+            )
+
+    def test_release_refuses_preexisting_generation_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            active.production_preserved = True
+            active.production_identity_verified = True
+            active.acquire()
+            tombstone = active.lease_dir.with_name(
+                f".{active.lease_dir.name}.removed-{active.lease_generation}"
+            )
+            tombstone.mkdir(mode=0o700)
+
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "removal tombstone already exists"
+            ):
+                active.release()
+
+            self.assertTrue(active.lease_dir.is_dir())
+            self.assertTrue(active.lease_owned)
+
+    def test_release_refuses_substituted_detached_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.production_preserved = True
+            active.production_identity_verified = True
+            active.acquire()
+            generation = active.lease_generation
+            self.assertIsInstance(generation, str)
+            tombstone = active.lease_dir.with_name(
+                f".{active.lease_dir.name}.removed-{generation}"
+            )
+            preserved = root / "detached-original"
+            real_rename = os.rename
+
+            def substitute_after_detach(source: Path, destination: Path) -> None:
+                real_rename(source, destination)
+                real_rename(destination, preserved)
+                destination.mkdir(mode=0o700)
+                guardian._durable_atomic_json(
+                    destination / guardian.LEASE_GENERATION_MARKER,
+                    {
+                        "schema_version": 1,
+                        "generation": generation,
+                        "phase": guardian.LEASE_PHASE_ACQUIRING,
+                    },
+                )
+
+            with mock.patch.object(
+                guardian.os, "rename", side_effect=substitute_after_detach
+            ), self.assertRaisesRegex(
+                guardian.GuardianError, "detached host lease identity changed"
+            ):
+                active.release()
+
+            self.assertFalse(active.lease_dir.exists())
+            self.assertTrue(preserved.is_dir())
+            self.assertTrue(tombstone.is_dir())
+
+    def test_creation_failure_before_marker_never_exposes_canonical_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            with mock.patch.object(
+                guardian,
+                "_durable_atomic_json",
+                side_effect=OSError("marker publication failed"),
+            ), self.assertRaisesRegex(OSError, "marker publication failed"):
+                guardian._create_lease_generation(active.lease_dir)
+
+            self.assertFalse(active.lease_dir.exists())
+            self.assertEqual(
+                list(active.lease_dir.parent.glob(f".{active.lease_dir.name}.creating-*")),
+                [],
+            )
+
+    def test_creation_failure_before_rename_never_exposes_canonical_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            with mock.patch.object(
+                guardian.os,
+                "rename",
+                side_effect=OSError("rename refused"),
+            ), self.assertRaisesRegex(OSError, "rename refused"):
+                guardian._create_lease_generation(active.lease_dir)
+
+            self.assertFalse(active.lease_dir.exists())
+            self.assertEqual(
+                list(active.lease_dir.parent.glob(f".{active.lease_dir.name}.creating-*")),
+                [],
+            )
+
+    def test_creation_failure_after_rename_preserves_owned_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            real_fsync = os.fsync
+            calls = 0
+
+            def fail_parent_fsync(descriptor: int) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise OSError("parent fsync failed")
+                real_fsync(descriptor)
+
+            with mock.patch.object(
+                guardian.os, "fsync", side_effect=fail_parent_fsync
+            ), self.assertRaisesRegex(
+                guardian.LeaseCreationCommitted, "parent fsync failed"
+            ):
+                active.acquire()
+
+            self.assertTrue(active.lease_owned)
+            self.assertTrue(active.lease_dir.is_dir())
+            self.assertIsInstance(active.lease_generation, str)
+            active.production_preserved = True
+            active.production_identity_verified = True
+            active.release()
+            self.assertFalse(active.lease_dir.exists())
+
+    def test_abandoned_pretransition_generation_is_reaped_without_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _, abandoned_generation = self.create_generation_lease(
+                active, phase=guardian.LEASE_PHASE_ACQUIRING
+            )
+
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ):
+                active.acquire()
+
+            self.assertTrue(active.lease_owned)
+            self.assertNotEqual(active.lease_generation, abandoned_generation)
+            active.production_preserved = True
+            active.production_identity_verified = True
+            active.release()
 
     def test_reconciliation_lock_symlink_and_unsafe_mode_refuse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -82,7 +242,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             with mock.patch.object(
                 guardian, "_live_guardians_for_lease", return_value=()
             ), self.assertRaisesRegex(
-                guardian.GuardianError, "one unambiguous prior receipt"
+                guardian.GuardianError, "unexpected generation contents"
             ):
                 active.acquire()
             self.assertFalse(active.lease_owned)
@@ -94,7 +254,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             active = self.make_guardian(root)
             active.installed.write_bytes(b"installed")
             active.candidate.write_bytes(b"candidate")
-            active.lease_dir.mkdir(mode=0o700)
+            self.create_generation_lease(active)
             snapshot = guardian.ProcessSnapshot(
                 pid=4242,
                 executable=str(active.installed),
@@ -160,7 +320,7 @@ class GuardianLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             active = self.make_guardian(root)
-            active.lease_dir.mkdir(mode=0o700)
+            self.create_generation_lease(active)
             inode = active.lease_dir.stat().st_ino
             snapshot = mock.Mock(pid=4242)
             active.snapshot = snapshot
@@ -194,7 +354,7 @@ class GuardianLifecycleTests(unittest.TestCase):
     def test_retained_lease_with_live_guardian_refuses_without_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
-            active.lease_dir.mkdir(mode=0o700)
+            self.create_generation_lease(active)
             inode = active.lease_dir.stat().st_ino
             with mock.patch.object(
                 guardian, "_live_guardians_for_lease", return_value=(7331,)
@@ -227,7 +387,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             root = Path(directory)
             active = self.make_guardian(root)
             active.lease_dir = root / "shipyard-sandbox-m3-lease"
-            active.lease_dir.mkdir(mode=0o700)
+            self.create_generation_lease(active)
             for run in ("1-1", "2-1"):
                 prior = root / f"shipyard-sandbox-m3-{run}"
                 prior.mkdir()
@@ -247,7 +407,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             root = Path(directory)
             active = self.make_guardian(root)
             active.lease_dir = root / "shipyard-sandbox-m3-lease"
-            active.lease_dir.mkdir(mode=0o700)
+            _, generation = self.create_generation_lease(active)
             old = root / "shipyard-sandbox-m3-1-1"
             new = root / "shipyard-sandbox-m3-2-1"
             resolver = root / "shipyard-sandbox-m3-3-1"
@@ -286,6 +446,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                 "lease_device": active.lease_dir.stat().st_dev,
                 "lease_inode": active.lease_dir.stat().st_ino,
                 "lease_ctime_ns": active.lease_dir.stat().st_ctime_ns,
+                "lease_generation": generation,
             }
             ready = {
                 "transition_path": guardian.CORRECTED_TRANSITION,
@@ -312,11 +473,17 @@ class GuardianLifecycleTests(unittest.TestCase):
                 "lease_device": active.lease_dir.stat().st_dev,
                 "lease_inode": active.lease_dir.stat().st_ino + 1,
                 "lease_ctime_ns": active.lease_dir.stat().st_ctime_ns,
+                "lease_generation": "0" * 64,
                 "old_production_pid": 111,
                 "old_production_start_time": "old",
                 "installed_sha256": "a" * 64,
             }
             objects = {
+                active.lease_dir / guardian.LEASE_GENERATION_MARKER: {
+                    "schema_version": 1,
+                    "generation": generation,
+                    "phase": guardian.LEASE_PHASE_TRANSITIONING,
+                },
                 old / "guardian-receipt.json": old_receipt,
                 new / "guardian-receipt.json": new_receipt,
                 new / "ready.json": ready,
@@ -334,8 +501,9 @@ class GuardianLifecycleTests(unittest.TestCase):
             root = Path(directory)
             active = self.make_guardian(root)
             active.lease_dir = root / "shipyard-sandbox-m3-lease"
-            active.lease_dir.mkdir(mode=0o700)
+            _, generation = self.create_generation_lease(active)
             current = active.lease_dir.stat()
+            stale_generation = "0" * 64 if generation != "0" * 64 else "1" * 64
             prior = root / "shipyard-sandbox-m3-1-1"
             prior.mkdir(mode=0o700)
             receipt = prior / "guardian-receipt.json"
@@ -345,7 +513,8 @@ class GuardianLifecycleTests(unittest.TestCase):
                         "lease_retained": True,
                         "lease_device": current.st_dev,
                         "lease_inode": current.st_ino,
-                        "lease_ctime_ns": current.st_ctime_ns + 1,
+                        "lease_ctime_ns": current.st_ctime_ns,
+                        "lease_generation": stale_generation,
                     }
                 ),
                 encoding="utf-8",
@@ -389,7 +558,7 @@ class GuardianLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             active = self.make_guardian(root)
-            active.lease_dir.mkdir(mode=0o700)
+            self.create_generation_lease(active)
             inode = active.lease_dir.stat().st_ino
             with mock.patch.object(
                 guardian, "_live_guardians_for_lease", return_value=()
@@ -412,7 +581,7 @@ class GuardianLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             active = self.make_guardian(root)
-            active.lease_dir.mkdir(mode=0o700)
+            self.create_generation_lease(active)
             inode = active.lease_dir.stat().st_ino
             snapshot = mock.Mock(pid=4242)
             active.snapshot = snapshot
@@ -433,20 +602,21 @@ class GuardianLifecycleTests(unittest.TestCase):
                     active.acquire()
             self.assertEqual(active.lease_dir.stat().st_ino, inode)
 
-    def test_retained_lease_inode_replacement_refuses_new_owner(self) -> None:
+    def test_retained_lease_generation_replacement_refuses_new_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             active = self.make_guardian(root)
-            active.lease_dir.mkdir(mode=0o700)
-            old_inode = active.lease_dir.stat().st_ino
+            _, old_generation = self.create_generation_lease(active)
             snapshot = mock.Mock(pid=4242)
             active.snapshot = snapshot
             active.lock_path = root / "writer.lock"
 
             @contextlib.contextmanager
             def replace_lease():
+                (active.lease_dir / guardian.LEASE_GENERATION_MARKER).unlink()
                 active.lease_dir.rmdir()
-                active.lease_dir.mkdir(mode=0o700)
+                _, replacement_generation = self.create_generation_lease(active)
+                self.assertNotEqual(replacement_generation, old_generation)
                 yield mock.Mock()
 
             with mock.patch.object(
@@ -468,7 +638,10 @@ class GuardianLifecycleTests(unittest.TestCase):
             ), mock.patch.object(guardian.time, "sleep"):
                 with self.assertRaisesRegex(guardian.GuardianError, "identity changed"):
                     active.acquire()
-            self.assertNotEqual(active.lease_dir.stat().st_ino, old_inode)
+            _, observed_generation = guardian._validate_lease_generation(
+                active.lease_dir
+            )
+            self.assertNotEqual(observed_generation, old_generation)
             self.assertFalse(active.lease_owned)
 
     def test_lifetime_lock_proof_requires_real_lock_contention(self) -> None:
@@ -922,6 +1095,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.installed.write_bytes(b"installed")
             active.candidate.write_bytes(b"candidate")
             active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            active.acquire()
             snapshot = guardian.ProcessSnapshot(
                 pid=4242,
                 executable=str(active.installed),
@@ -985,6 +1159,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.installed.write_bytes(b"installed")
             active.candidate.write_bytes(b"candidate")
             active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            active.acquire()
             snapshot = guardian.ProcessSnapshot(
                 pid=4242,
                 executable=str(active.installed),
@@ -1049,6 +1224,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.installed.write_bytes(b"installed")
             active.candidate.write_bytes(b"candidate")
             active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            active.acquire()
             snapshot = guardian.ProcessSnapshot(
                 pid=4242,
                 executable=str(active.installed),
@@ -1178,6 +1354,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.installed.write_bytes(b"installed")
             active.candidate.write_bytes(b"candidate")
             active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            active.acquire()
             snapshot = guardian.ProcessSnapshot(
                 pid=4242,
                 executable=str(active.installed),

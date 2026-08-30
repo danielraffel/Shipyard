@@ -166,14 +166,16 @@ jobs:
             guardian_pid="$(jq -r .guardian_pid "$canary_root/admission-deferred.json.tmp")"
             retained_state_ok=false
             for _ in 1 2 3 4 5; do
-              if [ -d "$lease_dir" ] && \
-                [ "$(stat -f %i "$lease_dir")" = "$(jq -r .lease_inode "$canary_root/admission-deferred.json.tmp")" ] && \
+              if python3 "$GITHUB_WORKSPACE/scripts/sandbox_admission_deferral.py" \
+                --verify-live-marker "$canary_root/admission-deferred.json.tmp" \
+                --lease-dir "$lease_dir" >/dev/null 2>&1 && \
                 kill -0 "$guardian_pid" 2>/dev/null && \
                 [ "$(ps -p "$guardian_pid" -o lstart= | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')" = "$(jq -r .guardian_start_time "$canary_root/admission-deferred.json.tmp")" ] && \
                 ps -p "$guardian_pid" -o command= | grep -F -- "$guardian" >/dev/null && \
                 ps -p "$guardian_pid" -o command= | grep -F -- "--lease-dir $lease_dir" >/dev/null && \
-                [ -d "$lease_dir" ] && \
-                [ "$(stat -f %i "$lease_dir")" = "$(jq -r .lease_inode "$canary_root/admission-deferred.json.tmp")" ]; then
+                python3 "$GITHUB_WORKSPACE/scripts/sandbox_admission_deferral.py" \
+                  --verify-live-marker "$canary_root/admission-deferred.json.tmp" \
+                  --lease-dir "$lease_dir" >/dev/null 2>&1; then
                 retained_state_ok=true
                 break
               fi
@@ -335,13 +337,15 @@ jobs:
                 guardian_pid="$(jq -r .guardian_pid "$canary_root/admission-deferred.json")"
                 retained_state_ok=false
                 for _ in 1 2 3 4 5; do
-                  if [ -d "$lease_dir" ] && \
-                    [ "$(stat -f %i "$lease_dir")" = "$(jq -r .lease_inode "$canary_root/admission-deferred.json")" ] && \
+                  if python3 "$GITHUB_WORKSPACE/scripts/sandbox_admission_deferral.py" \
+                    --verify-live-marker "$canary_root/admission-deferred.json" \
+                    --lease-dir "$lease_dir" >/dev/null 2>&1 && \
                     kill -0 "$guardian_pid" 2>/dev/null && \
                     [ "$(ps -p "$guardian_pid" -o lstart= | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')" = "$(jq -r .guardian_start_time "$canary_root/admission-deferred.json")" ] && \
                     ps -p "$guardian_pid" -o command= | grep -F -- "$canary_root/sandbox-daemon-guardian.py" >/dev/null && \
-                    [ -d "$lease_dir" ] && \
-                    [ "$(stat -f %i "$lease_dir")" = "$(jq -r .lease_inode "$canary_root/admission-deferred.json")" ]; then
+                    python3 "$GITHUB_WORKSPACE/scripts/sandbox_admission_deferral.py" \
+                      --verify-live-marker "$canary_root/admission-deferred.json" \
+                      --lease-dir "$lease_dir" >/dev/null 2>&1; then
                     retained_state_ok=true
                     break
                   fi
