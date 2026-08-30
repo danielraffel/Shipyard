@@ -29,7 +29,7 @@ fn non_file_existing_lock_refuses_without_mutation_or_reclamation() {
                     .expect("state entry")
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(".fleet-auth-support.lock.")
+                    .starts_with(".fleet-auth-support-lock-stage.")
             })
     );
 }
@@ -166,17 +166,20 @@ fn crash_before_lock_publication_leaves_no_partial_legacy_lock() {
     assert!(!fixture.helper.exists());
     assert!(!fixture.wrapper.exists());
 
-    let staging = std::fs::read_dir(fixture.state())
+    let stage_parent = std::fs::read_dir(fixture.state())
         .expect("state entries")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .find(|path| {
             path.file_name().is_some_and(|name| {
                 name.to_string_lossy()
-                    .starts_with(".fleet-auth-support.lock.")
+                    .starts_with(".fleet-auth-support-lock-stage.")
             })
         })
-        .expect("private prepared lock");
+        .expect("private lock staging parent");
+    let staging = stage_parent.join("fleet-auth-support.lock");
+    assert!(stage_parent.is_dir());
+    assert!(!stage_parent.is_symlink());
     assert!(staging.is_dir());
     assert!(!staging.is_symlink());
     assert_eq!(
@@ -226,6 +229,16 @@ fn old_client_destination_race_refuses_without_deleting_foreign_lock() {
         1,
         "the new client's nested private staging directory must be removed"
     );
+    assert!(
+        !std::fs::read_dir(fixture.state())
+            .expect("state entries")
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fleet-auth-support-lock-stage.")),
+        "ordinary race refusal must clean only its private staging parent"
+    );
     assert!(!fixture.helper.exists());
     assert!(!fixture.wrapper.exists());
     assert!(
@@ -234,6 +247,48 @@ fn old_client_destination_race_refuses_without_deleting_foreign_lock() {
             .join("fleet-auth-support.transaction")
             .exists()
     );
+}
+
+#[test]
+fn crash_immediately_after_raced_move_never_nests_under_foreign_lock() {
+    let fixture = Fixture::new();
+    let lock = fixture.state().join("fleet-auth-support.lock");
+
+    assert!(
+        !fixture
+            .run(RunOptions {
+                lock_publish: LockPublishBehavior::RaceThenCrashAfterMove,
+                ..RunOptions::default()
+            })
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_dir(&lock)
+            .expect("foreign lock entries")
+            .count(),
+        1,
+        "process death after mv must not leave a nested staged lock"
+    );
+    assert_eq!(
+        std::fs::read_to_string(lock.join("pid")).expect("foreign pid"),
+        format!("{}\n", std::process::id())
+    );
+    std::fs::remove_file(lock.join("pid")).expect("remove foreign pid");
+    std::fs::remove_dir(&lock).expect("foreign old-client lock must remain removable");
+    assert!(!lock.exists());
+
+    let stage_parent = std::fs::read_dir(fixture.state())
+        .expect("state entries")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(".fleet-auth-support-lock-stage.")
+            })
+        })
+        .expect("private stage survives abrupt process death");
+    assert!(stage_parent.join("fleet-auth-support.lock/pid").is_file());
 }
 
 #[test]

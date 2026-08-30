@@ -24,11 +24,12 @@ enum LockPublishBehavior {
     Success,
     CrashBeforePublish,
     RaceWithLegacy,
+    RaceThenCrashAfterMove,
 }
 
 impl LockPublishBehavior {
     fn shell_prefix(self, state: &Path) -> String {
-        let publish_command = r#"/bin/mv -n "$auth_lock_staging" "$auth_lock""#;
+        let publish_command = r#"/bin/mv -n "$auth_lock_staging" "$auth_state_dir/""#;
         let trap_condition = format!("[ \"$BASH_COMMAND\" = {} ]", shlex_quote(publish_command));
         match self {
             Self::Success => String::new(),
@@ -36,10 +37,16 @@ impl LockPublishBehavior {
                 let trap_body = format!("if {trap_condition}; then trap - DEBUG; exit 90; fi");
                 format!("trap {} DEBUG\n", shlex_quote(&trap_body))
             }
-            Self::RaceWithLegacy => {
+            behavior @ (Self::RaceWithLegacy | Self::RaceThenCrashAfterMove) => {
                 let lock = state.join("fleet-auth-support.lock");
+                let crash = matches!(behavior, Self::RaceThenCrashAfterMove);
+                let after_race = if crash {
+                    format!("{publish_command}; exit 91")
+                } else {
+                    ":".to_owned()
+                };
                 let trap_body = format!(
-                    "if {trap_condition}; then trap - DEBUG; /bin/mkdir \"$test_auth_lock\"; /usr/bin/printf '%s\\n' \"$test_foreign_pid\" > \"$test_auth_lock/pid\"; /bin/chmod 600 \"$test_auth_lock/pid\"; fi"
+                    "if {trap_condition}; then trap - DEBUG; /bin/mkdir \"$test_auth_lock\"; /usr/bin/printf '%s\\n' \"$test_foreign_pid\" > \"$test_auth_lock/pid\"; /bin/chmod 600 \"$test_auth_lock/pid\"; {after_race}; fi"
                 );
                 format!(
                     "test_auth_lock={}\ntest_foreign_pid={}\ntrap {} DEBUG\n",

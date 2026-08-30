@@ -42,31 +42,36 @@ if [ -e "$auth_lock" ] || [ -L "$auth_lock" ]; then
   /bin/rm "$auth_legacy_pid_file"
   /bin/rmdir "$auth_lock"
 fi
-auth_lock_staging="$(/usr/bin/mktemp -d "$auth_state_dir/.fleet-auth-support.lock.XXXXXX")"
+auth_lock_stage_parent="$(/usr/bin/mktemp -d "$auth_state_dir/.fleet-auth-support-lock-stage.XXXXXX")"
+/bin/chmod 700 "$auth_lock_stage_parent"
+auth_lock_staging="$auth_lock_stage_parent/fleet-auth-support.lock"
+/bin/mkdir "$auth_lock_staging"
 /bin/chmod 700 "$auth_lock_staging"
 auth_lock_staging_pid="$auth_lock_staging/pid"
 if ! /usr/bin/printf '%s\n' "$$" > "$auth_lock_staging_pid"; then
   /bin/rm -f "$auth_lock_staging_pid"
   /bin/rmdir "$auth_lock_staging"
+  /bin/rmdir "$auth_lock_stage_parent"
   exec 9>&-
   exit 1
 fi
 if ! /bin/chmod 600 "$auth_lock_staging_pid"; then
   /bin/rm -f "$auth_lock_staging_pid"
   /bin/rmdir "$auth_lock_staging"
+  /bin/rmdir "$auth_lock_stage_parent"
   exec 9>&-
   exit 1
 fi
 auth_lock_staging_inode="$(/usr/bin/stat -f '%i' "$auth_lock_staging")"
-auth_lock_staging_name="${auth_lock_staging##*/}"
 # Pre-v0.129 clients do not acquire auth_guard and can still publish the legacy
 # directory concurrently. Verify that the final inode is ours; a destination
 # race must fail closed without deleting the old client's ownership.
-if ! /bin/mv -n "$auth_lock_staging" "$auth_lock"; then
+if ! /bin/mv -n "$auth_lock_staging" "$auth_state_dir/"; then
   if [ -d "$auth_lock_staging" ] && [ ! -L "$auth_lock_staging" ]; then
     /bin/rm -f "$auth_lock_staging_pid"
     /bin/rmdir "$auth_lock_staging"
   fi
+  /bin/rmdir "$auth_lock_stage_parent"
   exec 9>&-
   exit 1
 fi
@@ -75,25 +80,17 @@ if [ -e "$auth_lock_staging" ] || [ -L "$auth_lock_staging" ]; then
     /bin/rm -f "$auth_lock_staging_pid"
     /bin/rmdir "$auth_lock_staging"
   fi
+  /bin/rmdir "$auth_lock_stage_parent"
   exec 9>&-
   exit 1
 fi
+/bin/rmdir "$auth_lock_stage_parent"
 auth_published_lock_inode="$(/usr/bin/stat -f '%i' "$auth_lock")"
 if [ "$auth_published_lock_inode" != "$auth_lock_staging_inode" ]; then
-  auth_nested_staging="$auth_lock/$auth_lock_staging_name"
-  if [ -d "$auth_nested_staging" ] && [ ! -L "$auth_nested_staging" ] \
-    && [ "$(/usr/bin/stat -f '%u' "$auth_nested_staging")" = "$(/usr/bin/id -u)" ] \
-    && [ "$(/usr/bin/stat -f '%i' "$auth_nested_staging")" = "$auth_lock_staging_inode" ] \
-    && [ -f "$auth_nested_staging/pid" ] && [ ! -L "$auth_nested_staging/pid" ] \
-    && [ "$(/usr/bin/stat -f '%u' "$auth_nested_staging/pid")" = "$(/usr/bin/id -u)" ] \
-    && [ "$(/usr/bin/stat -f '%Lp' "$auth_nested_staging/pid")" = 600 ] \
-    && [ "$(/bin/cat "$auth_nested_staging/pid")" = "$$" ]; then
-    /bin/rm "$auth_nested_staging/pid"
-    /bin/rmdir "$auth_nested_staging"
-  fi
   exec 9>&-
   exit 1
 fi
+auth_lock_stage_parent=
 auth_lock_staging=
 "#;
 
