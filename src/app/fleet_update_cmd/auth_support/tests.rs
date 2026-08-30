@@ -1,5 +1,5 @@
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -16,7 +16,40 @@ enum RefreshBehavior {
     Fail,
     SpawnDetached,
     ReplaceLegacyPid,
+    ObservePublishedLock(PathBuf),
     Touch(PathBuf),
+}
+
+enum LockPublishBehavior {
+    Success,
+    CrashBeforePublish,
+    RaceWithLegacy,
+}
+
+impl LockPublishBehavior {
+    fn shell_prefix(self, state: &Path) -> String {
+        let publish_command = r#"/bin/mv -n "$auth_lock_staging" "$auth_lock""#;
+        let trap_condition = format!("[ \"$BASH_COMMAND\" = {} ]", shlex_quote(publish_command));
+        match self {
+            Self::Success => String::new(),
+            Self::CrashBeforePublish => {
+                let trap_body = format!("if {trap_condition}; then trap - DEBUG; exit 90; fi");
+                format!("trap {} DEBUG\n", shlex_quote(&trap_body))
+            }
+            Self::RaceWithLegacy => {
+                let lock = state.join("fleet-auth-support.lock");
+                let trap_body = format!(
+                    "if {trap_condition}; then trap - DEBUG; /bin/mkdir \"$test_auth_lock\"; /usr/bin/printf '%s\\n' \"$test_foreign_pid\" > \"$test_auth_lock/pid\"; /bin/chmod 600 \"$test_auth_lock/pid\"; fi"
+                );
+                format!(
+                    "test_auth_lock={}\ntest_foreign_pid={}\ntrap {} DEBUG\n",
+                    shlex_quote(&lock.display().to_string()),
+                    std::process::id(),
+                    shlex_quote(&trap_body)
+                )
+            }
+        }
+    }
 }
 
 struct RunOptions {
@@ -24,6 +57,7 @@ struct RunOptions {
     target: &'static str,
     resolver_succeeds: bool,
     refresh: RefreshBehavior,
+    lock_publish: LockPublishBehavior,
 }
 
 impl Default for RunOptions {
@@ -33,6 +67,7 @@ impl Default for RunOptions {
             target: "v0.129.0",
             resolver_succeeds: true,
             refresh: RefreshBehavior::Success,
+            lock_publish: LockPublishBehavior::Success,
         }
     }
 }
@@ -90,24 +125,15 @@ impl Fixture {
             .join(".local/bin/shipyard-workstream-provider")
     }
 
-    fn run(&self, options: RunOptions) -> std::process::ExitStatus {
-        let resolver_required =
-            crate::app::fleet_update_cmd::tag_supports_auth_resolver(options.target);
-        let state = self.state();
-        let binary = self.binary();
-        let companion = self.companion();
-        for path in [&binary, &companion] {
-            if !path.exists() {
-                std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("binary fixture");
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-                    .expect("binary mode");
-            }
-        }
-
+    fn installed_binary_command(
+        &self,
+        options: &RunOptions,
+        state: &Path,
+        binary: &Path,
+    ) -> String {
         let expected_global_dir = shlex_quote(&state.display().to_string());
         let expected_wrapper = shlex_quote(&self.wrapper.display().to_string());
-        let expected_state_dir = expected_global_dir.clone();
-        let mut installed_binary_lines = vec![
+        let mut lines = vec![
             "#!/bin/sh".to_owned(),
             "set -eu".to_owned(),
             "test \"$1\" = --mode".to_owned(),
@@ -125,47 +151,87 @@ impl Fixture {
             "fi".to_owned(),
             "test \"$#\" = 9".to_owned(),
             "test \"$5\" = --state-dir".to_owned(),
-            format!("test \"$6\" = {expected_state_dir}"),
+            format!("test \"$6\" = {expected_global_dir}"),
             "test \"$7\" = --json".to_owned(),
             "test \"$8\" = daemon".to_owned(),
             "test \"$9\" = refresh".to_owned(),
         ];
-        match options.refresh {
+        match &options.refresh {
             RefreshBehavior::Success => {}
-            RefreshBehavior::Fail => installed_binary_lines.push("exit 72".to_owned()),
+            RefreshBehavior::Fail => lines.push("exit 72".to_owned()),
             RefreshBehavior::SpawnDetached => {
-                installed_binary_lines.push("(/bin/sleep 2 >/dev/null 2>&1 &)".to_owned());
+                lines.push("(/bin/sleep 2 >/dev/null 2>&1 &)".to_owned());
             }
             RefreshBehavior::ReplaceLegacyPid => {
                 let pid = state.join("fleet-auth-support.lock/pid");
-                installed_binary_lines.push(format!(
-                    "/usr/bin/printf '%s\\n' 99999999 > {}",
-                    shlex_quote(&pid.display().to_string())
-                ));
-                installed_binary_lines.push(format!(
-                    "/bin/chmod 600 {}",
-                    shlex_quote(&pid.display().to_string())
-                ));
+                lines.extend([
+                    format!(
+                        "/usr/bin/printf '%s\\n' 99999999 > {}",
+                        shlex_quote(&pid.display().to_string())
+                    ),
+                    format!("/bin/chmod 600 {}", shlex_quote(&pid.display().to_string())),
+                ]);
             }
-            RefreshBehavior::Touch(path) => installed_binary_lines.push(format!(
+            RefreshBehavior::ObservePublishedLock(path) => {
+                let lock = state.join("fleet-auth-support.lock");
+                let pid = lock.join("pid");
+                lines.extend([
+                    format!("test -d {}", shlex_quote(&lock.display().to_string())),
+                    format!("test ! -L {}", shlex_quote(&lock.display().to_string())),
+                    format!("test -f {}", shlex_quote(&pid.display().to_string())),
+                    format!("test ! -L {}", shlex_quote(&pid.display().to_string())),
+                    format!(
+                        "test \"$(/usr/bin/stat -f '%Lp' {})\" = 600",
+                        shlex_quote(&pid.display().to_string())
+                    ),
+                    format!(
+                        "published_pid=\"$(/bin/cat {})\"",
+                        shlex_quote(&pid.display().to_string())
+                    ),
+                    "case \"$published_pid\" in ''|*[!0-9]*) exit 73 ;; esac".to_owned(),
+                    "/bin/kill -0 \"$published_pid\"".to_owned(),
+                    format!(
+                        "/usr/bin/touch {}",
+                        shlex_quote(&path.display().to_string())
+                    ),
+                ]);
+            }
+            RefreshBehavior::Touch(path) => lines.push(format!(
                 "/usr/bin/touch {}",
                 shlex_quote(&path.display().to_string())
             )),
         }
-        installed_binary_lines.push(
+        lines.push(
             "/usr/bin/printf '%s\\n' '{\"schema_version\":1,\"command\":\"daemon:refresh\",\"new_pid\":4242}'"
                 .to_owned(),
         );
-        let installed_binary_lines = installed_binary_lines
+        let quoted_lines = lines
             .iter()
             .map(|line| shlex_quote(line))
             .collect::<Vec<_>>()
             .join(" ");
-        let installed_binary = format!(
-            "/usr/bin/printf '%s\\n' {installed_binary_lines} > {}; /bin/chmod 700 {}",
+        format!(
+            "/usr/bin/printf '%s\\n' {quoted_lines} > {}; /bin/chmod 700 {}",
             shlex_quote(&binary.display().to_string()),
             shlex_quote(&binary.display().to_string()),
-        );
+        )
+    }
+
+    fn run(&self, options: RunOptions) -> std::process::ExitStatus {
+        let resolver_required =
+            crate::app::fleet_update_cmd::tag_supports_auth_resolver(options.target);
+        let state = self.state();
+        let binary = self.binary();
+        let companion = self.companion();
+        for path in [&binary, &companion] {
+            if !path.exists() {
+                std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("binary fixture");
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                    .expect("binary mode");
+            }
+        }
+
+        let installed_binary = self.installed_binary_command(&options, &state, &binary);
         let script = install_transaction(
             &self.helper,
             &self.wrapper,
@@ -183,13 +249,16 @@ impl Fixture {
             &self.authority,
             options.fail_after_helper,
         );
+        let shell_prefix = options.lock_publish.shell_prefix(&state);
         Command::new("/bin/bash")
-            .args(["-c", &format!("set -Eeuo pipefail\n{script}")])
+            .args(["-c", &format!("set -Eeuo pipefail\n{shell_prefix}{script}")])
             .env("HOME", self.root.path())
             .status()
             .expect("transaction")
     }
 }
+
+mod lock;
 
 #[test]
 fn legacy_pair_is_migrated_helper_first_to_exact_private_files() {
@@ -286,268 +355,6 @@ fn v0_128_target_retains_four_target_transaction_without_resolver_probe() {
             .exists()
     );
 }
-
-#[test]
-fn non_file_existing_lock_refuses_without_mutation_or_reclamation() {
-    let fixture = Fixture::new();
-    let state = fixture
-        .root
-        .path()
-        .join("Library/Application Support/shipyard");
-    let lock = state.join("fleet-auth-support.lock");
-    std::fs::create_dir(&lock).expect("non-file lock");
-
-    assert!(!fixture.run(RunOptions::default()).success());
-    assert!(lock.is_dir());
-    assert!(!fixture.helper.exists());
-    assert!(!fixture.wrapper.exists());
-    assert!(
-        !fixture
-            .wrapper
-            .with_file_name("ghapp.shipyard-context.json")
-            .exists()
-    );
-    assert!(!state.join("fleet-auth-support.transaction").exists());
-    assert!(
-        !std::fs::read_dir(&state)
-            .expect("state entries")
-            .any(|entry| {
-                entry
-                    .expect("state entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".fleet-auth-support.lock.")
-            })
-    );
-}
-
-#[test]
-fn malformed_symlinked_and_live_legacy_pid_locks_are_preserved() {
-    for scenario in ["malformed", "symlink", "live"] {
-        let fixture = Fixture::new();
-        let state = fixture
-            .root
-            .path()
-            .join("Library/Application Support/shipyard");
-        let lock = state.join("fleet-auth-support.lock");
-        let pid = lock.join("pid");
-        std::fs::create_dir(&lock).expect("legacy lock");
-        match scenario {
-            "malformed" => std::fs::write(&pid, b"not-a-pid\n").expect("malformed pid"),
-            "symlink" => {
-                let target = fixture.root.path().join("foreign-pid");
-                std::fs::write(&target, b"99999999\n").expect("foreign pid target");
-                symlink(&target, &pid).expect("pid symlink");
-            }
-            "live" => {
-                std::fs::write(&pid, format!("{}\n", std::process::id())).expect("live pid");
-            }
-            _ => unreachable!(),
-        }
-        if scenario != "symlink" {
-            std::fs::set_permissions(&pid, std::fs::Permissions::from_mode(0o600))
-                .expect("pid mode");
-        }
-
-        assert!(
-            !fixture.run(RunOptions::default()).success(),
-            "{scenario} legacy pid must refuse"
-        );
-        assert!(lock.is_dir(), "{scenario} lock must be preserved");
-        assert!(!fixture.helper.exists());
-        assert!(!fixture.wrapper.exists());
-    }
-}
-
-#[test]
-fn invalid_advisory_guard_types_and_mode_refuse_before_artifact_mutation() {
-    for scenario in ["directory", "symlink", "mode"] {
-        let fixture = Fixture::new();
-        let state = fixture
-            .root
-            .path()
-            .join("Library/Application Support/shipyard");
-        let guard = state.join("fleet-auth-support.guard");
-        match scenario {
-            "directory" => std::fs::create_dir(&guard).expect("guard directory"),
-            "symlink" => {
-                let target = fixture.root.path().join("foreign-guard");
-                std::fs::write(&target, b"").expect("foreign guard");
-                symlink(&target, &guard).expect("guard symlink");
-            }
-            "mode" => {
-                std::fs::write(&guard, b"").expect("guard file");
-                std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o644))
-                    .expect("guard mode");
-            }
-            _ => unreachable!(),
-        }
-
-        assert!(
-            !fixture.run(RunOptions::default()).success(),
-            "{scenario} guard must refuse"
-        );
-        assert!(!fixture.helper.exists());
-        assert!(!fixture.wrapper.exists());
-        assert!(!state.join("fleet-auth-support.lock").exists());
-    }
-}
-
-#[test]
-fn dead_legacy_directory_lock_is_reclaimed_under_advisory_guard() {
-    let fixture = Fixture::new();
-    let state = fixture
-        .root
-        .path()
-        .join("Library/Application Support/shipyard");
-    let lock = state.join("fleet-auth-support.lock");
-    let pid = lock.join("pid");
-    std::fs::create_dir(&lock).expect("legacy lock directory");
-    std::fs::write(&pid, b"99999999\n").expect("dead legacy pid");
-    std::fs::set_permissions(&pid, std::fs::Permissions::from_mode(0o600))
-        .expect("legacy pid mode");
-
-    assert!(fixture.run(RunOptions::default()).success());
-    assert!(!lock.exists());
-    let guard = state.join("fleet-auth-support.guard");
-    assert_eq!(
-        std::fs::metadata(&guard)
-            .expect("advisory lock carrier")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-}
-
-#[test]
-fn active_advisory_lock_refuses_concurrent_transaction_then_releases() {
-    let fixture = Fixture::new();
-    let state = fixture
-        .root
-        .path()
-        .join("Library/Application Support/shipyard");
-    let lock = state.join("fleet-auth-support.guard");
-    let acquired = fixture.root.path().join("lock-acquired");
-    std::fs::write(&lock, b"").expect("lock carrier");
-    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600))
-        .expect("lock carrier mode");
-    let mut holder = Command::new("/bin/bash")
-            .args([
-                "-c",
-                "exec 9<>\"$1\"; /usr/bin/lockf -s -t 0 9 || exit 1; /usr/bin/touch \"$2\"; exec /bin/sleep 30",
-                "holder",
-            ])
-            .arg(&lock)
-            .arg(&acquired)
-            .spawn()
-            .expect("lock holder");
-    for _ in 0..200 {
-        if acquired.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(acquired.exists(), "holder did not acquire lock");
-
-    assert!(!fixture.run(RunOptions::default()).success());
-    assert!(!fixture.helper.exists());
-    assert!(!fixture.wrapper.exists());
-    holder.kill().expect("stop holder");
-    holder.wait().expect("reap holder");
-
-    assert!(fixture.run(RunOptions::default()).success());
-}
-
-#[test]
-fn detached_post_commit_child_does_not_inherit_advisory_guard() {
-    let fixture = Fixture::new();
-    assert!(
-        fixture
-            .run(RunOptions {
-                refresh: RefreshBehavior::SpawnDetached,
-                ..RunOptions::default()
-            })
-            .success()
-    );
-    assert!(
-        fixture.run(RunOptions::default()).success(),
-        "a detached post-commit child must not retain the advisory guard"
-    );
-}
-
-#[test]
-fn foreign_replacement_of_legacy_pid_is_preserved_at_release() {
-    let fixture = Fixture::new();
-    assert!(
-        !fixture
-            .run(RunOptions {
-                refresh: RefreshBehavior::ReplaceLegacyPid,
-                ..RunOptions::default()
-            })
-            .success()
-    );
-    let pid = fixture
-        .root
-        .path()
-        .join("Library/Application Support/shipyard/fleet-auth-support.lock/pid");
-    assert_eq!(
-        std::fs::read_to_string(&pid).expect("foreign pid"),
-        "99999999\n"
-    );
-    assert_eq!(
-        std::fs::read(&fixture.helper).expect("committed helper"),
-        b"new helper\n"
-    );
-    assert_eq!(
-        std::fs::read(&fixture.wrapper).expect("committed wrapper"),
-        b"new wrapper\n"
-    );
-}
-
-#[test]
-fn resolver_failure_skips_refresh_and_refresh_failure_releases_both_lock_layers() {
-    let fixture = Fixture::new();
-    let refreshed = fixture.root.path().join("refresh-ran");
-    assert!(
-        !fixture
-            .run(RunOptions {
-                resolver_succeeds: false,
-                refresh: RefreshBehavior::Touch(refreshed.clone()),
-                ..RunOptions::default()
-            })
-            .success()
-    );
-    assert!(!refreshed.exists(), "failed resolver must not refresh");
-
-    assert!(
-        !fixture
-            .run(RunOptions {
-                refresh: RefreshBehavior::Fail,
-                ..RunOptions::default()
-            })
-            .success()
-    );
-    let state = fixture
-        .root
-        .path()
-        .join("Library/Application Support/shipyard");
-    assert!(!state.join("fleet-auth-support.lock").exists());
-    assert!(state.join("fleet-auth-support.guard").is_file());
-    assert_eq!(
-        std::fs::read(&fixture.helper).expect("committed helper"),
-        b"new helper\n"
-    );
-    assert_eq!(
-        std::fs::read(&fixture.wrapper).expect("committed wrapper"),
-        b"new wrapper\n"
-    );
-    assert!(
-        fixture.run(RunOptions::default()).success(),
-        "refresh failure must release the advisory guard"
-    );
-}
-
 #[test]
 fn v0_128_recovers_nine_line_journal_and_partial_atomic_backups() {
     let fixture = Fixture::new();
@@ -624,6 +431,69 @@ fn v0_128_recovers_nine_line_journal_and_partial_atomic_backups() {
     assert!(
         !std::path::Path::new(&format!("{}.shipyard-rollback.tmp", companion.display())).exists()
     );
+}
+
+#[test]
+fn v0_128_preparing_recovery_discards_partial_direct_backups() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let binary = fixture.binary();
+    let companion = fixture.companion();
+    for (path, contents) in [
+        (&binary, b"old binary\n".as_slice()),
+        (&companion, b"old companion\n".as_slice()),
+    ] {
+        std::fs::write(path, contents).expect("intact live binary");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("binary mode");
+        std::fs::write(
+            format!("{}.shipyard-rollback", path.display()),
+            b"partial direct backup",
+        )
+        .expect("legacy partial rollback");
+    }
+    for (path, contents) in [
+        (&fixture.helper, b"old helper\n".as_slice()),
+        (&fixture.wrapper, b"old wrapper\n".as_slice()),
+    ] {
+        std::fs::write(format!("{}.shipyard-rollback", path.display()), contents)
+            .expect("moved legacy auth artifact");
+    }
+    let journal = state.join("fleet-auth-support.transaction");
+    std::fs::write(
+        &journal,
+        format!(
+            "preparing\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n1\n",
+            "f".repeat(64),
+            fixture.helper.display(),
+            fixture.wrapper.display(),
+            binary.display(),
+            companion.display(),
+            digest(b"new helper\n"),
+            digest(b"new wrapper\n"),
+        ),
+    )
+    .expect("legacy preparing journal");
+
+    assert!(
+        !fixture
+            .run(RunOptions {
+                fail_after_helper: true,
+                target: "v0.128.9",
+                ..RunOptions::default()
+            })
+            .success()
+    );
+    for (path, expected) in [
+        (&fixture.helper, b"old helper\n".as_slice()),
+        (&fixture.wrapper, b"old wrapper\n".as_slice()),
+        (&binary, b"old binary\n".as_slice()),
+        (&companion, b"old companion\n".as_slice()),
+    ] {
+        assert_eq!(std::fs::read(path).expect("recovered artifact"), expected);
+        assert!(!std::path::Path::new(&format!("{}.shipyard-rollback", path.display())).exists());
+    }
+    assert!(!journal.exists());
 }
 
 #[test]

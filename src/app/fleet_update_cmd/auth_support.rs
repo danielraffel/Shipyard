@@ -14,6 +14,88 @@ pub(super) const AFTER_HELPER_MODE_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_HEL
 pub(super) const AFTER_WRAPPER_SHA_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_WRAPPER_SHA256=";
 pub(super) const AFTER_WRAPPER_MODE_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_WRAPPER_MODE=";
 const WRAPPER_DEFAULT_HELPER: &str = ".config/shipyard/bin/shipyard-github-app-token";
+const LOCK_ACQUISITION_SCRIPT: &str = r#"
+if [ ! -e "$auth_guard" ] && [ ! -L "$auth_guard" ]; then
+  auth_prior_umask="$(umask)"
+  umask 077
+  : >> "$auth_guard"
+  umask "$auth_prior_umask"
+fi
+test -f "$auth_guard"
+test ! -L "$auth_guard"
+test "$(/usr/bin/stat -f '%u' "$auth_guard")" = "$(/usr/bin/id -u)"
+test "$(/usr/bin/stat -f '%Lp' "$auth_guard")" = 600
+exec 9<>"$auth_guard"
+if ! /usr/bin/lockf -s -t 0 9; then exec 9>&-; exit 1; fi
+if [ -e "$auth_lock" ] || [ -L "$auth_lock" ]; then
+  test -d "$auth_lock"
+  test ! -L "$auth_lock"
+  test "$(/usr/bin/stat -f '%u' "$auth_lock")" = "$(/usr/bin/id -u)"
+  auth_legacy_pid_file="$auth_lock/pid"
+  test -f "$auth_legacy_pid_file"
+  test ! -L "$auth_legacy_pid_file"
+  test "$(/usr/bin/stat -f '%u' "$auth_legacy_pid_file")" = "$(/usr/bin/id -u)"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_legacy_pid_file")" = 600
+  auth_legacy_pid="$(/bin/cat "$auth_legacy_pid_file")"
+  case "$auth_legacy_pid" in ''|*[!0-9]*) exit 1 ;; esac
+  if /bin/kill -0 "$auth_legacy_pid" 2>/dev/null; then exit 1; fi
+  /bin/rm "$auth_legacy_pid_file"
+  /bin/rmdir "$auth_lock"
+fi
+auth_lock_staging="$(/usr/bin/mktemp -d "$auth_state_dir/.fleet-auth-support.lock.XXXXXX")"
+/bin/chmod 700 "$auth_lock_staging"
+auth_lock_staging_pid="$auth_lock_staging/pid"
+if ! /usr/bin/printf '%s\n' "$$" > "$auth_lock_staging_pid"; then
+  /bin/rm -f "$auth_lock_staging_pid"
+  /bin/rmdir "$auth_lock_staging"
+  exec 9>&-
+  exit 1
+fi
+if ! /bin/chmod 600 "$auth_lock_staging_pid"; then
+  /bin/rm -f "$auth_lock_staging_pid"
+  /bin/rmdir "$auth_lock_staging"
+  exec 9>&-
+  exit 1
+fi
+auth_lock_staging_inode="$(/usr/bin/stat -f '%i' "$auth_lock_staging")"
+auth_lock_staging_name="${auth_lock_staging##*/}"
+# Pre-v0.129 clients do not acquire auth_guard and can still publish the legacy
+# directory concurrently. Verify that the final inode is ours; a destination
+# race must fail closed without deleting the old client's ownership.
+if ! /bin/mv -n "$auth_lock_staging" "$auth_lock"; then
+  if [ -d "$auth_lock_staging" ] && [ ! -L "$auth_lock_staging" ]; then
+    /bin/rm -f "$auth_lock_staging_pid"
+    /bin/rmdir "$auth_lock_staging"
+  fi
+  exec 9>&-
+  exit 1
+fi
+if [ -e "$auth_lock_staging" ] || [ -L "$auth_lock_staging" ]; then
+  if [ -d "$auth_lock_staging" ] && [ ! -L "$auth_lock_staging" ]; then
+    /bin/rm -f "$auth_lock_staging_pid"
+    /bin/rmdir "$auth_lock_staging"
+  fi
+  exec 9>&-
+  exit 1
+fi
+auth_published_lock_inode="$(/usr/bin/stat -f '%i' "$auth_lock")"
+if [ "$auth_published_lock_inode" != "$auth_lock_staging_inode" ]; then
+  auth_nested_staging="$auth_lock/$auth_lock_staging_name"
+  if [ -d "$auth_nested_staging" ] && [ ! -L "$auth_nested_staging" ] \
+    && [ "$(/usr/bin/stat -f '%u' "$auth_nested_staging")" = "$(/usr/bin/id -u)" ] \
+    && [ "$(/usr/bin/stat -f '%i' "$auth_nested_staging")" = "$auth_lock_staging_inode" ] \
+    && [ -f "$auth_nested_staging/pid" ] && [ ! -L "$auth_nested_staging/pid" ] \
+    && [ "$(/usr/bin/stat -f '%u' "$auth_nested_staging/pid")" = "$(/usr/bin/id -u)" ] \
+    && [ "$(/usr/bin/stat -f '%Lp' "$auth_nested_staging/pid")" = 600 ] \
+    && [ "$(/bin/cat "$auth_nested_staging/pid")" = "$$" ]; then
+    /bin/rm "$auth_nested_staging/pid"
+    /bin/rmdir "$auth_nested_staging"
+  fi
+  exec 9>&-
+  exit 1
+fi
+auth_lock_staging=
+"#;
 
 pub(super) fn source_urls(authority: &ReleaseAuthority) -> (String, String) {
     let base = format!(
@@ -89,6 +171,7 @@ pub(super) fn install_transaction(
     let authority_id = shlex_quote(&authority.identity_sha256);
     let helper_digest = shlex_quote(&authority.auth_helper.sha256);
     let wrapper_digest = shlex_quote(&authority.auth_wrapper.sha256);
+    let lock_acquisition = LOCK_ACQUISITION_SCRIPT;
     // Source arguments are internally generated shell expressions, never
     // configuration or user input. External values are quoted before here.
     let injected_failure = if fail_after_helper_for_test {
@@ -229,9 +312,16 @@ auth_recover() {{
     fi
   else
     case "$auth_phase" in preparing|prepared|helper-installed|auth-installed|context-installed) ;; *) return 1 ;; esac
-    if [ -n "$auth_recovery_context" ]; then auth_restore_one "$auth_recovery_context"; fi
-    auth_restore_one "$auth_recovery_companion"
-    auth_restore_one "$auth_recovery_binary"
+    if [ "$auth_journal_lines" = 9 ] && [ "$auth_phase" = preparing ]; then
+      # Pre-v0.129 clients copied binary rollback files directly after writing
+      # `preparing`. A crash could leave partial copies while both live binaries
+      # were still intact, so only the already-moved helper pair is restored.
+      :
+    else
+      if [ -n "$auth_recovery_context" ]; then auth_restore_one "$auth_recovery_context"; fi
+      auth_restore_one "$auth_recovery_companion"
+      auth_restore_one "$auth_recovery_binary"
+    fi
     auth_restore_one "$auth_recovery_wrapper"
     auth_restore_one "$auth_recovery_helper"
   fi
@@ -243,45 +333,7 @@ test ! -L "$auth_state_dir"
 test "$(/usr/bin/stat -f '%u' "$auth_state_dir")" = "$(/usr/bin/id -u)"
 auth_state_mode="$(/usr/bin/stat -f '%Lp' "$auth_state_dir")"
 test $((8#$auth_state_mode & 8#22)) -eq 0
-if [ ! -e "$auth_guard" ] && [ ! -L "$auth_guard" ]; then
-  auth_prior_umask="$(umask)"
-  umask 077
-  : >> "$auth_guard"
-  umask "$auth_prior_umask"
-fi
-test -f "$auth_guard"
-test ! -L "$auth_guard"
-test "$(/usr/bin/stat -f '%u' "$auth_guard")" = "$(/usr/bin/id -u)"
-test "$(/usr/bin/stat -f '%Lp' "$auth_guard")" = 600
-exec 9<>"$auth_guard"
-if ! /usr/bin/lockf -s -t 0 9; then exec 9>&-; exit 1; fi
-if ! /bin/mkdir "$auth_lock" 2>/dev/null; then
-  test -d "$auth_lock"
-  test ! -L "$auth_lock"
-  test "$(/usr/bin/stat -f '%u' "$auth_lock")" = "$(/usr/bin/id -u)"
-  auth_legacy_pid_file="$auth_lock/pid"
-  test -f "$auth_legacy_pid_file"
-  test ! -L "$auth_legacy_pid_file"
-  test "$(/usr/bin/stat -f '%u' "$auth_legacy_pid_file")" = "$(/usr/bin/id -u)"
-  test "$(/usr/bin/stat -f '%Lp' "$auth_legacy_pid_file")" = 600
-  auth_legacy_pid="$(/bin/cat "$auth_legacy_pid_file")"
-  case "$auth_legacy_pid" in ''|*[!0-9]*) exit 1 ;; esac
-  if /bin/kill -0 "$auth_legacy_pid" 2>/dev/null; then exit 1; fi
-  /bin/rm "$auth_legacy_pid_file"
-  /bin/rmdir "$auth_lock"
-  /bin/mkdir "$auth_lock"
-fi
-if ! /usr/bin/printf '%s\n' "$$" > "$auth_lock/pid"; then
-  /bin/rmdir "$auth_lock"
-  exec 9>&-
-  exit 1
-fi
-if ! /bin/chmod 600 "$auth_lock/pid"; then
-  /bin/rm -f "$auth_lock/pid"
-  /bin/rmdir "$auth_lock"
-  exec 9>&-
-  exit 1
-fi
+{lock_acquisition}
 auth_helper_tmp=
 auth_wrapper_tmp=
 auth_context_tmp=
