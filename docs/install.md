@@ -271,6 +271,19 @@ Repeat `--host-class` for an intentionally ordered subset or use explicit
 `--all-hosts`. Omission, unknown names, and duplicates fail closed, and apply
 stops before every later host after the first failure.
 
+The configured `github_cli` must be the `ghapp` sibling of `shipyard_bin`.
+Its machine-global `[github.auth]` must use the exact eight-element wrapper
+command documented in [GitHub App quota and routing](github-app-quota.md): one
+wrapper, `token`, `--app-id VALUE`, `--private-key ABSOLUTE_PATH`, and literal
+`--repo {repo_slug}`. Direct `ghapp` commands resolve only that machine-global
+credential shape through the sibling Shipyard binary; repository overlays,
+fixed installation IDs, API/cache arguments, and foreign wrappers fail before
+the token helper runs. Direct mode requires a strict 0600 typed
+`ghapp.shipyard-context.json` sibling; fleet writes it for targets v0.131.0 and
+newer so subsequent direct wrapper calls retain the configured runtime mode and
+global directory. Manual/non-fleet installs must provision the same context
+beside `ghapp`; missing or unsafe context fails closed.
+
 The command uses a stripped remote environment deliberately, invokes the
 configured absolute binary, bounds each host attempt to ten minutes, and
 refreshes each host's daemon only after its update succeeds. Because inherited
@@ -278,8 +291,12 @@ secrets are intentionally stripped, fleet rollout requires a machine-global
 `github.auth.source = "command"` helper that can resolve credentials from its
 own durable configuration using only `HOME` and the canonical PATH. Remote
 classes also use their absolute `github_cli` helper to download and run the
-exact tagged installer directly, so the first rollout can bootstrap a host
-whose older Shipyard binary does not yet know the new rollout flags. The
+exact tagged installer directly. The one-time transition from v0.130.x or
+older to a resolver-capable v0.131.0-or-newer target first requires an ordinary
+`shipyard update --to vX.Y.Z --refresh-daemon` on each host using its existing
+machine credential, followed by migration to the exact wrapper command above.
+The governed fleet update then verifies and commits the complete paired state;
+without that predeployment it refuses before download or mutation. The
 explicit mode/config/state fields bind verification and refresh to the daemon
 the profile actually owns; direct
 `shipyard update` continues to support env auth. A missing absolute profile
@@ -288,6 +305,14 @@ environment drift, not as evidence that Homebrew, Tart, or Shipyard is
 uninstalled. Fleet rollout rejects targets older than v0.100.0 before mutation;
 use an older release's documented manual procedure when rollback crosses that
 bootstrap boundary.
+
+For targets v0.131.0 and newer, fleet installation commits its helper, wrapper,
+resolver context, Shipyard binary, and companion
+transaction only after the newly installed Shipyard resolves the installed
+wrapper using the host class's exact mode and global directory. A resolver
+failure restores all five prior artifacts before the host can report success.
+Targets v0.100.0 through v0.130.x preserve the legacy four-target transaction
+and nine-line recovery journal, with no resolver context or unsupported probe.
 
 Before any host can mutate, fleet rollout resolves the annotated release tag to
 its full tag-object, commit, and tree OIDs; binds the published release ID; and

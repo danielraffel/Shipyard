@@ -203,11 +203,7 @@ fn collect_local_evidence(
     let daemon_pid = serde_json::Deserializer::from_slice(update_stdout)
         .into_iter::<Value>()
         .filter_map(Result::ok)
-        .find_map(|value| {
-            (value.get("event").and_then(Value::as_str) == Some("daemon_refreshed"))
-                .then(|| value.get("daemon_pid").and_then(Value::as_u64))
-                .flatten()
-        })
+        .find_map(|value| local_refresh_daemon_pid(&value))
         .and_then(|pid| u32::try_from(pid).ok())
         .filter(|pid| *pid != 0)
         .ok_or_else(|| {
@@ -226,6 +222,15 @@ fn collect_local_evidence(
         plan.release_authority.identity_sha256.clone(),
         plan.release_authority.platform_asset.sha256.clone(),
     )
+}
+
+fn local_refresh_daemon_pid(value: &Value) -> Option<u64> {
+    if value.get("event").and_then(Value::as_str) == Some("daemon_refreshed") {
+        return value.get("daemon_pid").and_then(Value::as_u64);
+    }
+    (value.get("command").and_then(Value::as_str) == Some("daemon:refresh"))
+        .then(|| value.get("new_pid").and_then(Value::as_u64))
+        .flatten()
 }
 
 fn collect_local_auth_support(

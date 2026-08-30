@@ -2,10 +2,21 @@
 use std::process::Command;
 
 #[cfg(unix)]
-use super::command::auth_token_command;
+use super::command::{auth_token_command, resolver_auth_token_command};
 use super::*;
 
 fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
+    let github_cli = match (ssh, shipyard_bin) {
+        (Some(_), Some(binary)) => binary.rsplit_once('/').map_or_else(
+            || "ghapp".to_owned(),
+            |(parent, _)| format!("{parent}/ghapp"),
+        ),
+        (_, Some(binary)) => Path::new(binary).parent().map_or_else(
+            || "ghapp".to_owned(),
+            |parent| parent.join("ghapp").display().to_string(),
+        ),
+        _ => "/Users/ci/.local/bin/ghapp".to_owned(),
+    };
     HostClassConfig {
         class: "m5".to_owned(),
         ssh: ssh.map(str::to_owned),
@@ -16,7 +27,7 @@ fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
         shipyard_mode: Some("shipyard".to_owned()),
         shipyard_global_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
         shipyard_state_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
-        github_cli: Some("/Users/ci/.local/bin/ghapp".to_owned()),
+        github_cli: Some(github_cli),
         github_token_helper: Some(
             "/Users/ci/.config/shipyard/bin/shipyard-github-app-token".to_owned(),
         ),
@@ -100,6 +111,63 @@ fn remote_plan_uses_absolute_binary_and_minimal_canonical_path() {
     );
 }
 
+#[test]
+fn fleet_plan_requires_ghapp_and_shipyard_to_be_siblings() {
+    let mut class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
+    class.github_cli = Some("/Users/ci/bin/ghapp".to_owned());
+    let error = host_update_plan(&class, "v0.127.0").expect_err("foreign wrapper directory");
+    assert!(error.message.contains("ghapp sibling of shipyard_bin"));
+
+    class.github_cli = Some("/Users/ci/.local/bin/renamed-ghapp".to_owned());
+    let error = host_update_plan(&class, "v0.127.0").expect_err("foreign wrapper name");
+    assert!(error.message.contains("ghapp sibling of shipyard_bin"));
+}
+
+#[test]
+fn fleet_resolver_probe_uses_exact_global_dir_before_commit() {
+    let mut class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
+    class.shipyard_global_dir = Some("/Users/ci/governed global".to_owned());
+    class.shipyard_state_dir = Some("/Users/ci/governed state".to_owned());
+
+    let legacy = host_update_plan(&class, "v0.130.1").expect("legacy target");
+    assert!(legacy.command.contains("auth_resolver_required=0"));
+
+    let plan = host_update_plan(&class, "v0.131.0").expect("differing governed dirs");
+    assert!(plan.command.contains("auth_resolver_required=1"));
+    assert!(!plan.command.contains("ghapp auth token"));
+
+    assert!(plan.command.contains("/Users/ci/governed global"));
+    assert!(plan.command.contains("/Users/ci/governed state"));
+    assert!(plan.command.contains("$auth_wrapper.shipyard-context.json"));
+    assert!(
+        plan.command
+            .contains("--global-dir \"$auth_global_dir\" auth helper-argv")
+    );
+    assert_eq!(plan.command.matches("auth helper-argv").count(), 2);
+    let bootstrap_probe = plan
+        .command
+        .find("auth helper-argv")
+        .expect("bootstrap resolver probe");
+    let context_installed = plan
+        .command
+        .find("auth_write_phase context-installed")
+        .expect("context installation marker");
+    let post_install_probe = plan
+        .command
+        .rfind("auth helper-argv")
+        .expect("post-install resolver probe");
+    let committed = plan
+        .command
+        .find("auth_write_phase committed")
+        .expect("commit marker");
+    assert!(
+        bootstrap_probe < context_installed,
+        "bootstrap resolver must acquire auth before artifact installation"
+    );
+    assert!(context_installed < post_install_probe);
+    assert!(post_install_probe < committed);
+}
+
 #[cfg(unix)]
 #[test]
 fn auth_token_command_binds_verified_repo_in_a_scrubbed_non_checkout() {
@@ -132,6 +200,238 @@ fn auth_token_command_binds_verified_repo_in_a_scrubbed_non_checkout() {
         .status()
         .expect("scrubbed token probe");
     assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)] // One end-to-end fixture covers the complete fail-closed parser boundary.
+fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_environment() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = temp.path().join("shipyard");
+    let wrapper = temp.path().join("ghapp");
+    let global_dir = temp.path().join("global dir");
+    let private_key = temp.path().join("private-key.pem");
+    let wrapper_invoked = temp.path().join("wrapper-invoked");
+    std::fs::create_dir(&global_dir).expect("global dir");
+    std::fs::write(&private_key, "fixture-only").expect("private key fixture");
+
+    let resolver_payload = serde_json::json!({
+        "schema_version": 1,
+        "command": "auth.helper-argv",
+        "wrapper": wrapper.display().to_string(),
+        "repo": "danielraffel/Shipyard",
+        "credential_argv": [
+            "--app-id",
+            "000123456",
+            "--private-key",
+            private_key.display().to_string(),
+        ],
+    })
+    .to_string();
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\n\
+             test \"$1\" = --mode\n\
+             test \"$2\" = shipyard\n\
+             test \"$3\" = --global-dir\n\
+             test \"$4\" = '{}'\n\
+             test \"$5\" = auth\n\
+             test \"$6\" = helper-argv\n\
+             test \"$7\" = --wrapper\n\
+             test \"$8\" = '{}'\n\
+             test \"$9\" = --repo\n\
+             test \"${{10}}\" = danielraffel/Shipyard\n\
+             printf '%s\\n' '{}'\n",
+            global_dir.display(),
+            wrapper.display(),
+            resolver_payload,
+        ),
+    )
+    .expect("resolver fixture");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             /usr/bin/touch '{}'\n\
+             test \"$#\" -eq 7\n\
+             test \"$1\" = token\n\
+             test \"$2\" = --app-id\n\
+             test \"$3\" = 000123456\n\
+             test \"$4\" = --private-key\n\
+             test \"$5\" = '{}'\n\
+             test \"$6\" = --repo\n\
+             test \"$7\" = danielraffel/Shipyard\n\
+             test -z \"${{GH_REPO:-}}${{SHIPYARD_GHAPP_REPO:-}}${{SHIPYARD_GH_APP_REPO:-}}\"\n\
+             printf '%s\\n' '{{\"token\":\"exact-token\"}}'\n",
+            wrapper_invoked.display(),
+            private_key.display(),
+        ),
+    )
+    .expect("wrapper fixture");
+    for executable in [&binary, &wrapper] {
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture executable");
+    }
+
+    let token_command = resolver_auth_token_command(
+        &binary,
+        "shipyard",
+        &global_dir,
+        "v0.131.0",
+        "danielraffel/Shipyard",
+        &wrapper,
+    );
+    let probe = format!("token=\"$({token_command})\"; test \"$token\" = exact-token");
+    let status = Command::new("/bin/bash")
+        .args(["-c", &probe])
+        .current_dir(temp.path())
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .status()
+        .expect("scrubbed resolver probe");
+    assert!(status.success());
+    assert!(wrapper_invoked.exists());
+    std::fs::remove_file(&wrapper_invoked).expect("clear wrapper marker");
+
+    std::fs::write(&binary, "#!/bin/sh\nprintf '{'\n").expect("malformed resolver fixture");
+    let output = Command::new("/bin/bash")
+        .args(["-c", &token_command])
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("malformed resolver probe");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("shipyard fleet auth resolver returned malformed JSON")
+    );
+    assert!(!wrapper_invoked.exists());
+
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\nprintf '%s\\n' '{resolver_payload}'\nexit 2\n"),
+    )
+    .expect("failed resolver with plausible output fixture");
+    let output = Command::new("/bin/bash")
+        .args(["-o", "pipefail", "-c", &token_command])
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("failed resolver with plausible output probe");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "predeploy v0.131.0 with ordinary shipyard update and migrate machine-global"
+        )
+    );
+    assert!(!wrapper_invoked.exists());
+
+    let invalid_payloads = [
+        (
+            serde_json::json!({
+                "schema_version": true,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+            }),
+            "shipyard fleet auth resolver returned an unsupported contract",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+                "extra": "refuse",
+            }),
+            "shipyard fleet auth resolver returned an unsupported contract",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": "/foreign/ghapp",
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+            }),
+            "shipyard fleet auth resolver returned mismatched authority",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "Generous-Corp/pulp",
+                "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+            }),
+            "shipyard fleet auth resolver returned mismatched authority",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", format!("/{}", "x".repeat(4096))],
+            }),
+            "shipyard fleet auth resolver returned an invalid private-key path",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", "/private\nkey"],
+            }),
+            "shipyard fleet auth resolver returned an invalid private-key path",
+        ),
+    ];
+    for (payload, expected_error) in invalid_payloads {
+        std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{payload}'\n"))
+            .expect("invalid resolver fixture");
+        let output = Command::new("/bin/bash")
+            .args(["-o", "pipefail", "-c", &token_command])
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("invalid resolver probe");
+        assert!(!output.status.success(), "payload must refuse: {payload}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "unexpected refusal for payload {payload}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!wrapper_invoked.exists());
+    }
+
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\n/usr/bin/python3 -c 'print(\"x\" * 16385)'\n",
+    )
+    .expect("oversized resolver fixture");
+    let output = Command::new("/bin/bash")
+        .args(["-o", "pipefail", "-c", &token_command])
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("oversized resolver probe");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("shipyard fleet auth resolver response exceeds 16384 bytes")
+    );
+    assert!(!wrapper_invoked.exists());
 }
 
 #[cfg(target_os = "macos")]
@@ -212,7 +512,24 @@ fn local_plan_preserves_host_class_daemon_context() {
     assert!(command.contains("--mode isolated"));
     assert!(command.contains("--global-dir '/tmp/governed config'"));
     assert!(command.contains("--state-dir '/tmp/governed state'"));
-    assert!(command.contains("--refresh-daemon --unattended-fleet"));
+    assert!(command.contains("--unattended-fleet"));
+    assert!(!command.contains("--refresh-daemon"));
+    let resolver_probe = command
+        .find("auth helper-argv --wrapper")
+        .expect("resolver probe");
+    let committed = command
+        .find("auth_write_phase committed")
+        .expect("transaction commit");
+    let daemon_refresh = command
+        .find("--json daemon refresh")
+        .expect("daemon refresh");
+    let lock_release = command.rfind("auth_release_lock").expect("lock release");
+    assert_eq!(command.matches("--json daemon refresh").count(), 1);
+    assert!(command.contains("--json daemon refresh 9>&-"));
+    assert!(!command[..committed].contains("--json daemon refresh"));
+    assert!(resolver_probe < committed);
+    assert!(committed < daemon_refresh);
+    assert!(daemon_refresh < lock_release);
     assert!(command.contains("fleet-auth-support.transaction"));
 }
 
@@ -294,6 +611,16 @@ fn auth_support_paths_reject_dot_and_parent_components() {
 }
 
 #[test]
+fn daemon_context_paths_reject_controls_dot_and_parent_components() {
+    for global_dir in ["/Users/ci/global/../foreign", "/Users/ci/global\nforeign"] {
+        let mut class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
+        class.shipyard_global_dir = Some(global_dir.to_owned());
+        let error = host_update_plan(&class, "v0.127.0").expect_err("unsafe global dir");
+        assert!(error.message.contains("normalized absolute paths"));
+    }
+}
+
+#[test]
 fn auth_support_paths_reject_managed_binary_and_transaction_collisions() {
     let mut class = host(Some("m5"), Some("/Users/ci/.local/bin/shipyard"));
     class.github_token_helper = Some("/Users/ci/.local/bin/shipyard".to_owned());
@@ -307,11 +634,23 @@ fn auth_support_paths_reject_managed_binary_and_transaction_collisions() {
         .expect_err("companion binary collision must fail before rollout");
     assert!(error.message.contains("must not overlap managed binaries"));
 
+    class.github_token_helper =
+        Some("/Users/ci/.local/bin/shipyard.shipyard-rollback.tmp".to_owned());
+    let error = host_update_plan(&class, "v0.127.0")
+        .expect_err("atomic backup temp collision must fail before rollout");
+    assert!(error.message.contains("must not overlap managed binaries"));
+
     class.github_token_helper = Some(
         "/Users/ci/Library/Application Support/shipyard/fleet-auth-support.transaction".to_owned(),
     );
     let error = host_update_plan(&class, "v0.127.0")
         .expect_err("journal collision must fail before rollout");
+    assert!(error.message.contains("or transaction state"));
+
+    class.github_token_helper =
+        Some("/Users/ci/Library/Application Support/shipyard/fleet-auth-support.guard".to_owned());
+    let error = host_update_plan(&class, "v0.127.0")
+        .expect_err("advisory guard collision must fail before rollout");
     assert!(error.message.contains("or transaction state"));
 }
 
@@ -429,6 +768,11 @@ fn exact_release_tag_is_required() {
     assert!(normalize_exact_tag("v18446744073709551616.0.0").is_err());
     assert!(!tag_requires_companion("v0.126.2"));
     assert!(tag_requires_companion("v0.127.0"));
+    assert!(!tag_supports_auth_resolver("v0.128.9"));
+    assert!(!tag_supports_auth_resolver("v0.129.0"));
+    assert!(!tag_supports_auth_resolver("v0.130.0"));
+    assert!(!tag_supports_auth_resolver("v0.130.1"));
+    assert!(tag_supports_auth_resolver("v0.131.0"));
 }
 
 fn named_host(name: &str) -> HostClassConfig {

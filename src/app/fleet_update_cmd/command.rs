@@ -8,7 +8,7 @@ use super::{
     REMOTE_BEFORE_STATUS_PREFIX, REMOTE_MINIMAL_PATH, REMOTE_REFRESH_PREFIX,
     REMOTE_RELEASE_ASSET_SHA256_PREFIX, REMOTE_SUPERVISOR, REMOTE_UPDATE_TIMEOUT, ReleaseAuthority,
     Value, Write, auth_support, home_dir, shlex_quote, tag_requires_companion,
-    unattended_tool_path, write_json_envelope,
+    tag_supports_auth_resolver, unattended_tool_path, write_json_envelope,
 };
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -48,10 +48,14 @@ pub(super) fn remote_update_command(
         binary,
         companion_binary,
         tag_requires_companion(target),
+        tag_supports_auth_resolver(target),
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,
+        mode,
+        global_dir,
         state_dir,
+        &authority.repository,
         authority,
         false,
     );
@@ -64,7 +68,18 @@ pub(super) fn remote_update_command(
         tag_requires_companion(target),
     );
     let exact_asset_curl_shim = exact_asset_curl_shim(&authority.platform_asset.name);
-    let auth_token_command = auth_token_command(&authority.repository, auth_wrapper);
+    let auth_token_command = if tag_supports_auth_resolver(target) {
+        resolver_auth_token_command(
+            binary,
+            mode,
+            global_dir,
+            target,
+            &authority.repository,
+            auth_wrapper,
+        )
+    } else {
+        auth_token_command(&authority.repository, auth_wrapper)
+    };
     let script = format!(
         "set -euo pipefail\n{}\n{}\n{}\n\
          before_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
@@ -87,7 +102,6 @@ pub(super) fn remote_update_command(
          \"$staged_binary\" --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
          {}\nunset token\n{}\n{}\n\
          {} --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
-         refresh_receipt=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon refresh | /usr/bin/tr -d '\\n')\"\n\
          after_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
          printf '%s%s\\n' {} \"$before_primary_sha256\"; printf '%s%s\\n' {} \"$before_primary_version\"\n\
          printf '%s%s\\n' {} \"$before_companion_sha256\"; printf '%s%s\\n' {} \"$before_companion_version\"\n\
@@ -134,10 +148,6 @@ pub(super) fn remote_update_command(
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
         shlex_quote(&state_dir.display().to_string()),
-        shlex_quote(&binary.display().to_string()),
-        shlex_quote(mode),
-        shlex_quote(&global_dir.display().to_string()),
-        shlex_quote(&state_dir.display().to_string()),
         shlex_quote(REMOTE_BEFORE_PRIMARY_SHA256_PREFIX),
         shlex_quote(REMOTE_BEFORE_PRIMARY_VERSION_PREFIX),
         shlex_quote(REMOTE_BEFORE_COMPANION_SHA256_PREFIX),
@@ -175,6 +185,82 @@ pub(super) fn auth_token_command(repository: &str, auth_wrapper: &Path) -> Strin
         "GH_REPO={} {} auth token",
         shlex_quote(repository),
         shlex_quote(&auth_wrapper.display().to_string())
+    )
+}
+
+pub(super) fn resolver_auth_token_command(
+    binary: &Path,
+    mode: &str,
+    global_dir: &Path,
+    target: &str,
+    repository: &str,
+    auth_wrapper: &Path,
+) -> String {
+    let resolver = format!(
+        "{} --mode {} --global-dir {} auth helper-argv --wrapper {} --repo {}",
+        shlex_quote(&binary.display().to_string()),
+        shlex_quote(mode),
+        shlex_quote(&global_dir.display().to_string()),
+        shlex_quote(&auth_wrapper.display().to_string()),
+        shlex_quote(repository),
+    );
+    let parser = r#"import json, os, subprocess, sys, unicodedata
+def refuse(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    refuse("shipyard fleet auth resolver returned malformed JSON")
+expected_wrapper, expected_repo = sys.argv[1:3]
+required = {"schema_version", "command", "wrapper", "repo", "credential_argv"}
+if not isinstance(value, dict) or set(value) != required or type(value.get("schema_version")) is not int or value.get("schema_version") != 1 or value.get("command") != "auth.helper-argv":
+    refuse("shipyard fleet auth resolver returned an unsupported contract")
+if value.get("wrapper") != expected_wrapper or value.get("repo") != expected_repo:
+    refuse("shipyard fleet auth resolver returned mismatched authority")
+credential_argv = value.get("credential_argv")
+if not isinstance(credential_argv, list) or len(credential_argv) != 4 or not all(isinstance(item, str) for item in credential_argv):
+    refuse("shipyard fleet auth resolver returned malformed credential arguments")
+app_id = credential_argv[1]
+if credential_argv[0] != "--app-id" or not 1 <= len(app_id) <= 20 or not app_id.isascii() or not app_id.isdecimal() or not 0 < int(app_id) <= 18446744073709551615:
+    refuse("shipyard fleet auth resolver returned an invalid app id")
+private_key = credential_argv[3]
+def normalized_absolute_path(item):
+    return (
+        isinstance(item, str)
+        and 2 <= len(item) <= 4096
+        and item.startswith("/")
+        and all(part not in {"", ".", ".."} for part in item.split("/")[1:])
+        and not any(unicodedata.category(character) == "Cc" for character in item)
+    )
+if credential_argv[2] != "--private-key" or not normalized_absolute_path(private_key) or any(not item or any(unicodedata.category(character) == "Cc" for character in item) for item in credential_argv):
+    refuse("shipyard fleet auth resolver returned an invalid private-key path")
+environment = {"HOME": os.environ["HOME"], "PATH": os.environ["PATH"]}
+try:
+    completed = subprocess.run(
+        [expected_wrapper, "token", *credential_argv, "--repo", expected_repo],
+        check=False, capture_output=True, text=True, timeout=30, env=environment,
+    )
+except Exception:
+    refuse("shipyard fleet auth wrapper could not be executed")
+if completed.returncode != 0:
+    refuse("shipyard fleet auth wrapper refused the machine-global credential contract")
+try:
+    helper = json.loads(completed.stdout)
+except Exception:
+    refuse("shipyard fleet auth wrapper returned malformed JSON")
+token = helper.get("token") if isinstance(helper, dict) else None
+if not isinstance(token, str) or not token or any(ord(character) <= 32 or ord(character) == 127 for character in token):
+    refuse("shipyard fleet auth wrapper returned a malformed token")
+sys.stdout.write(token)"#;
+    format!(
+        "resolver_json=\"$({resolver} | /usr/bin/head -c 16385; resolver_status=${{PIPESTATUS[0]}}; exit \"$resolver_status\")\" || {{ /usr/bin/printf '%s\\n' {} >&2; exit 1; }}; if test \"${{#resolver_json}}\" -gt 16384; then /usr/bin/printf '%s\\n' 'shipyard fleet auth resolver response exceeds 16384 bytes' >&2; exit 1; fi; /usr/bin/printf '%s' \"$resolver_json\" | /usr/bin/python3 -I -c {} {} {}",
+        shlex_quote(&format!(
+            "shipyard fleet auth resolver unavailable; predeploy {target} with ordinary shipyard update and migrate machine-global github.auth.token_command to the exact ghapp token contract before fleet-update"
+        )),
+        shlex_quote(parser),
+        shlex_quote(&auth_wrapper.display().to_string()),
+        shlex_quote(repository),
     )
 }
 
@@ -270,7 +356,7 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
     let auth_contract = auth_support::wrapper_helper_contract_probe(&plan.auth_helper);
     let curl_shim = exact_asset_curl_shim(&plan.release_authority.platform_asset.name);
     let binary_install_command = format!(
-        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" /usr/bin/env -i HOME={} PATH={} SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" {} --mode {} --global-dir {} --state-dir {} --json update --to {} --install-script-url \"file://$installer\" --curl-bin \"$curl_shim\" --refresh-daemon --unattended-fleet",
+        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" /usr/bin/env -i HOME={} PATH={} SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" {} --mode {} --global-dir {} --state-dir {} --json update --to {} --install-script-url \"file://$installer\" --curl-bin \"$curl_shim\" --unattended-fleet",
         shlex_quote(&home_dir().display().to_string()),
         shlex_quote(&unattended_tool_path().to_string_lossy()),
         shlex_quote(&plan.binary.display().to_string()),
@@ -285,15 +371,19 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         &plan.binary,
         &plan.companion_binary,
         plan.companion_required,
+        tag_supports_auth_resolver(&plan.target),
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,
+        plan.runtime_mode.as_str(),
+        &plan.global_dir,
         &plan.state_dir,
+        &plan.release_authority.repository,
         &plan.release_authority,
         false,
     );
     format!(
-        "set -euo pipefail; {}; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; /usr/bin/curl -fsSL --output \"$installer\" {}; test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; test \"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL --output \"$auth_helper_source\" {}; /usr/bin/curl -fsSL --output \"$auth_wrapper_source\" {}; test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; {}",
+        "set -euo pipefail; {}; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; /usr/bin/curl -fsSL --output \"$installer\" {}; test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; test \"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL --output \"$auth_helper_source\" {}; /usr/bin/curl -fsSL --output \"$auth_wrapper_source\" {}; test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; {}; /usr/bin/printf '%s\\n' \"$refresh_receipt\"",
         auth_contract,
         shlex_quote(&installer_url),
         shlex_quote(&plan.release_authority.installer.sha256),

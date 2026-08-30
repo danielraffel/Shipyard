@@ -417,8 +417,12 @@ not resume until the incident owner has restored the intended queue order.
 Queue writes are serialized process-wide and recorded in machine-global
 `merge_queue/mutations.jsonl`.
 
-For release rollout, configure absolute `shipyard_bin` and `github_cli` paths
-plus explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir`
+For release rollout, configure absolute sibling `shipyard_bin` and `github_cli`
+paths named `shipyard` and `ghapp`. Machine-global command auth must be exactly
+wrapper + `token --app-id VALUE --private-key ABS --repo {repo_slug}`. Direct
+`ghapp` resolves only that shape through its sibling Shipyard after grammar and
+repo validation; the wrapper pins API, cache, and resolved repo arguments.
+Also configure explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir`
 on every remote `[host_class.<name>]`. Review `shipyard runner fleet-update
 --to vX.Y.Z --host-class <class>` and then use the same command with `--apply`;
 do not assemble per-host SSH/install pipelines. Repeat `--host-class` only for
@@ -451,9 +455,19 @@ post-install pair is bound to the verified authority digest. Releases from
 v0.127.0 require both pair members; older rollback tags at or above v0.100.0
 must prove the companion absent. Fleet rollout requires a self-contained machine-global command auth
 helper because inherited secrets are deliberately stripped. The updater stages
-the entire exact-tag installer before execution (including when the old remote
-binary predates fleet-update), refreshes daemons only after
-the staged binary passes its smoke, and terminates any host attempt that exceeds
+the entire exact-tag installer before execution. The first transition from
+v0.130.x or older to a resolver-capable target requires an ordinary exact-tag
+update on each host, then migration to the exact machine-global wrapper command;
+without that predeployment the governed fleet update refuses before download or
+mutation. It refreshes daemons only after
+the staged binary passes its smoke, then runs the installed binary's resolver
+probe at the exact configured mode/global directory before transaction commit.
+The wrapper's mandatory strict 0600 non-symlink context preserves those runtime
+arguments for direct calls; manual installs must provision the typed default
+context. Fleet creates and probes it for targets v0.131.0 and newer. Probe
+failure rolls back helper, wrapper, context, CLI, and companion. Targets
+v0.100.0-v0.130.x retain the compatible four-target transaction and nine-line
+journal without the unavailable probe. It terminates any host attempt that exceeds
 ten minutes. A minimal non-login PATH that hides
 Homebrew is launch-environment drift, not evidence that Tart or Shipyard is
 missing.
