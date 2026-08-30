@@ -195,8 +195,13 @@ if ! printf 'Authorization: Bearer %s\n' "$token" > "$auth_header"; then umask "
 umask "$auth_prior_umask"
 test -f "$auth_header"
 test ! -L "$auth_header"
-auth_header_uid="$(/usr/bin/stat -f '%u' "$auth_header" 2>/dev/null || /usr/bin/stat -c '%u' "$auth_header")"
-auth_header_mode="$(/usr/bin/stat -f '%Lp' "$auth_header" 2>/dev/null || /usr/bin/stat -c '%a' "$auth_header")"
+if /usr/bin/stat -f '%u' "$auth_header" >/dev/null 2>&1; then
+  auth_header_uid="$(/usr/bin/stat -f '%u' "$auth_header")"
+  auth_header_mode="$(/usr/bin/stat -f '%Lp' "$auth_header")"
+else
+  auth_header_uid="$(/usr/bin/stat -c '%u' "$auth_header")"
+  auth_header_mode="$(/usr/bin/stat -c '%a' "$auth_header")"
+fi
 test "$auth_header_uid" = "$(/usr/bin/id -u)"
 test "$auth_header_mode" = 600"#
 }
