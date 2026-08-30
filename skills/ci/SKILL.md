@@ -1800,3 +1800,18 @@ step. A stack overflow that moves between otherwise unrelated `Cli::parse_from`
 tests is a harness-policy failure: do not rerun it blindly or keep wrapping
 individual tests. Focused low-stack controls may still prove a particular test
 body, but they do not replace the shared CI worker-stack contract.
+
+**Fence local queue admission before a host-wide CI transition.** Use
+`shipyard queue-hold exec --host <id> --service <label> --repo <owner/repo>
+--runner <name> --generation <n> -- <transition-command>` so the child inherits
+the live `queue.lock` open-file description. The transition must call
+`shipyard queue-hold verify` under its own transition lock immediately before
+each exact service mutation and again before publishing terminal participation
+state. Exit `3` is a typed refusal, `124` means bounded lock timeout/no child,
+and `125` means setup or observation failure. A static ledger, PID, filename,
+or earlier verification is never authority; stale scope/generation, owner
+death, close/reopen of the same inode, or revocation must refuse. Revocation
+between service batches preserves already completed safe shutdown but forbids
+remaining mutations and terminal-state publication. This host-local hold does
+not prove GitHub persistent-runner drain, lease/VM idleness, or host capacity;
+those independent fail-closed gates remain required.

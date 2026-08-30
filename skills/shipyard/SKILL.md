@@ -2094,6 +2094,22 @@ controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an
 explicit operator fallback when fleet status says the local Macs are
 offline/unhealthy, or when the workflow intentionally asks for hosted coverage.
 
+For a host-wide CI transition, wrap the exact transition command with
+`shipyard queue-hold exec` and bind the normalized host, service, repository,
+runner, and positive monotonic generation. The live child inherits the held
+queue-lock open-file description; `queue-hold verify` accepts only that exact
+owner PID/start identity, FD, lock inode, scope digest, generation, ledger
+revision, non-revoked state, and independent contention proof. Re-verify under
+the downstream transition lock before every exact service mutation and before
+final participation-state publication. Never treat `queue-hold.json`, a PID,
+an inode name, or a prior successful read as authority. Exit `3` is refusal,
+`124` is bounded contention/no child, and `125` is setup/observation failure.
+If authority is revoked between batches, preserve completed safe shutdown,
+refuse the remaining services, and keep the transition nonterminal. The hold
+fences only Shipyard's local pending-to-running queue admission; it does not
+drain GitHub persistent runners, prove zero leases/VMs, or override the host
+resource governor.
+
 For the default-off Pulp M3/M1 performance canary, cache readiness requires an
 immutable content manifest produced by the read-only no-follow tree observer.
 Observe every required M3 generation before probing M1, preserve exact policy
