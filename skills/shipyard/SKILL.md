@@ -675,7 +675,11 @@ When debugging GitHub behavior:
 - Use `shipyard auth export` and `shipyard auth import --scope local` only for
   sanitized config movement. The bundle must not contain tokens, private keys,
   Keychain exports, 1Password sessions, queue state, daemon sockets, or token
-  caches.
+  caches. Export/import preserves the complete typed GitHub auth table,
+  including absolute `ambient_gh_binary`, `privileged_gh_binary`, and
+  `privileged_git_binary` authority. Import replaces that auth table while
+  preserving unrelated configuration, so review the bundle before applying it
+  at machine-global scope.
 
 ## Drift And Parity
 
