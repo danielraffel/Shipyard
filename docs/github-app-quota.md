@@ -220,7 +220,7 @@ and appends its own GitHub Cloud API, cache, and resolved repository arguments.
 that configured command. Direct mode requires a strict 0600
 `ghapp.shipyard-context.json` sibling containing exactly `schema_version: 1`,
 `mode`, and the absolute normalized `global_dir`; missing, malformed, open-mode,
-oversized, FIFO, or symlink contexts fail closed. Fleet targets v0.129.0 and
+oversized, FIFO, or symlink contexts fail closed. Fleet targets v0.131.0 and
 newer install it automatically. A manual or non-fleet installation must create
 the same typed context beside `ghapp`, using `shipyard` plus the default global
 directory reported by `shipyard paths` when no override is intended.
@@ -308,11 +308,15 @@ but `token_command[0]` must remain the host's configured `ghapp` wrapper path:
    `$HOME/.config/shipyard/bin/shipyard-github-app-token`; fleet rollout checks
    both before mutation. Its frozen release authority includes both exact source blobs; its
    private recovery journal rolls back an interrupted helper-first install on
-   the next attempt. For targets v0.129.0 and newer, before committing the five-artifact transaction, the new
+   the next attempt. The first transition from v0.130.x or older to a
+   resolver-capable target requires an ordinary exact-tag update on each host,
+   followed by migration to the exact wrapper command above; the governed fleet
+   update then verifies and commits the complete state. Without that predeployment
+   it refuses before download or mutation. For targets v0.131.0 and newer, before committing the five-artifact transaction, the new
    binary must resolve the new wrapper against the host class's exact
    `shipyard_mode` and `shipyard_global_dir`; probe failure restores the prior
    helper, wrapper, resolver context, Shipyard binary, and companion. Targets
-   v0.100.0 through v0.128.x retain the compatible four-target, nine-line-journal
+   v0.100.0 through v0.130.x retain the compatible four-target, nine-line-journal
    transaction without the unavailable resolver probe. It preserves the existing auth configuration and never
    emits a token or private-key value in plan or result evidence.
 3. Remove the fixed installation id and old single cache file from the wrapper.

@@ -71,7 +71,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             fail_after_helper: false,
-            target: "v0.129.0",
+            target: "v0.131.0",
             resolver_succeeds: true,
             refresh: RefreshBehavior::Success,
             lock_publish: LockPublishBehavior::Success,
@@ -334,14 +334,14 @@ fn legacy_pair_is_migrated_helper_first_to_exact_private_files() {
 }
 
 #[test]
-fn v0_128_target_retains_four_target_transaction_without_resolver_probe() {
+fn v0_130_target_retains_four_target_transaction_without_resolver_probe() {
     let fixture = Fixture::new();
 
     assert!(
         fixture
             .run(RunOptions {
                 fail_after_helper: false,
-                target: "v0.128.9",
+                target: "v0.130.0",
                 resolver_succeeds: false,
                 ..RunOptions::default()
             })
@@ -363,7 +363,7 @@ fn v0_128_target_retains_four_target_transaction_without_resolver_probe() {
     );
 }
 #[test]
-fn v0_128_recovers_nine_line_journal_and_partial_atomic_backups() {
+fn v0_131_recovers_v0_130_nine_line_journal_and_partial_atomic_backups() {
     let fixture = Fixture::new();
     let state = fixture
         .root
@@ -408,7 +408,7 @@ fn v0_128_recovers_nine_line_journal_and_partial_atomic_backups() {
         !fixture
             .run(RunOptions {
                 fail_after_helper: true,
-                target: "v0.128.9",
+                target: "v0.131.0",
                 resolver_succeeds: false,
                 ..RunOptions::default()
             })
@@ -441,7 +441,7 @@ fn v0_128_recovers_nine_line_journal_and_partial_atomic_backups() {
 }
 
 #[test]
-fn v0_128_preparing_recovery_discards_partial_direct_backups() {
+fn v0_131_preparing_recovery_discards_v0_130_partial_direct_backups() {
     let fixture = Fixture::new();
     let state = fixture.state();
     let binary = fixture.binary();
@@ -486,7 +486,7 @@ fn v0_128_preparing_recovery_discards_partial_direct_backups() {
         !fixture
             .run(RunOptions {
                 fail_after_helper: true,
-                target: "v0.128.9",
+                target: "v0.131.0",
                 ..RunOptions::default()
             })
             .success()
@@ -554,7 +554,7 @@ fn post_install_resolver_failure_rolls_back_all_installed_artifacts() {
         !fixture
             .run(RunOptions {
                 fail_after_helper: false,
-                target: "v0.129.0",
+                target: "v0.131.0",
                 resolver_succeeds: false,
                 ..RunOptions::default()
             })

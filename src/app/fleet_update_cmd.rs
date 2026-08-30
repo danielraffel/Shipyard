@@ -48,7 +48,7 @@ const HOST_UPDATE_TIMEOUT: Duration = Duration::from_mins(10);
 const REMOTE_UPDATE_TIMEOUT: Duration = Duration::from_mins(9);
 const MIN_FLEET_UPDATE_TARGET: [u64; 3] = [0, 100, 0];
 const MIN_PAIRED_BINARY_TARGET: [u64; 3] = [0, 127, 0];
-const MIN_AUTH_RESOLVER_TARGET: [u64; 3] = [0, 129, 0];
+const MIN_AUTH_RESOLVER_TARGET: [u64; 3] = [0, 131, 0];
 const COMPANION_BINARY_NAME: &str = "shipyard-workstream-provider";
 const REMOTE_BEFORE_PRIMARY_SHA256_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_PRIMARY_SHA256=";
 const REMOTE_BEFORE_PRIMARY_VERSION_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_PRIMARY_VERSION=";

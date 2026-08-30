@@ -2,7 +2,7 @@
 use std::process::Command;
 
 #[cfg(unix)]
-use super::command::auth_token_command;
+use super::command::{auth_token_command, resolver_auth_token_command};
 use super::*;
 
 fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
@@ -129,11 +129,12 @@ fn fleet_resolver_probe_uses_exact_global_dir_before_commit() {
     class.shipyard_global_dir = Some("/Users/ci/governed global".to_owned());
     class.shipyard_state_dir = Some("/Users/ci/governed state".to_owned());
 
-    let legacy = host_update_plan(&class, "v0.128.9").expect("legacy target");
+    let legacy = host_update_plan(&class, "v0.130.0").expect("legacy target");
     assert!(legacy.command.contains("auth_resolver_required=0"));
 
-    let plan = host_update_plan(&class, "v0.129.0").expect("differing governed dirs");
+    let plan = host_update_plan(&class, "v0.131.0").expect("differing governed dirs");
     assert!(plan.command.contains("auth_resolver_required=1"));
+    assert!(!plan.command.contains("ghapp auth token"));
 
     assert!(plan.command.contains("/Users/ci/governed global"));
     assert!(plan.command.contains("/Users/ci/governed state"));
@@ -188,6 +189,208 @@ fn auth_token_command_binds_verified_repo_in_a_scrubbed_non_checkout() {
         .status()
         .expect("scrubbed token probe");
     assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_environment() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = temp.path().join("shipyard");
+    let wrapper = temp.path().join("ghapp");
+    let global_dir = temp.path().join("global dir");
+    let private_key = temp.path().join("private-key.pem");
+    std::fs::create_dir(&global_dir).expect("global dir");
+    std::fs::write(&private_key, "fixture-only").expect("private key fixture");
+
+    let resolver_payload = serde_json::json!({
+        "schema_version": 1,
+        "command": "auth.helper-argv",
+        "wrapper": wrapper.display().to_string(),
+        "repo": "danielraffel/Shipyard",
+        "credential_argv": [
+            "--app-id",
+            "000123456",
+            "--private-key",
+            private_key.display().to_string(),
+        ],
+    })
+    .to_string();
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\n\
+             test \"$1\" = --mode\n\
+             test \"$2\" = shipyard\n\
+             test \"$3\" = --global-dir\n\
+             test \"$4\" = '{}'\n\
+             test \"$5\" = auth\n\
+             test \"$6\" = helper-argv\n\
+             test \"$7\" = --wrapper\n\
+             test \"$8\" = '{}'\n\
+             test \"$9\" = --repo\n\
+             test \"${{10}}\" = danielraffel/Shipyard\n\
+             printf '%s\\n' '{}'\n",
+            global_dir.display(),
+            wrapper.display(),
+            resolver_payload,
+        ),
+    )
+    .expect("resolver fixture");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             test \"$#\" -eq 7\n\
+             test \"$1\" = token\n\
+             test \"$2\" = --app-id\n\
+             test \"$3\" = 000123456\n\
+             test \"$4\" = --private-key\n\
+             test \"$5\" = '{}'\n\
+             test \"$6\" = --repo\n\
+             test \"$7\" = danielraffel/Shipyard\n\
+             test -z \"${{GH_REPO:-}}${{SHIPYARD_GHAPP_REPO:-}}${{SHIPYARD_GH_APP_REPO:-}}\"\n\
+             printf '%s\\n' '{{\"token\":\"exact-token\"}}'\n",
+            private_key.display(),
+        ),
+    )
+    .expect("wrapper fixture");
+    for executable in [&binary, &wrapper] {
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture executable");
+    }
+
+    let token_command = resolver_auth_token_command(
+        &binary,
+        "shipyard",
+        &global_dir,
+        "v0.131.0",
+        "danielraffel/Shipyard",
+        &wrapper,
+    );
+    let probe = format!("token=\"$({token_command})\"; test \"$token\" = exact-token");
+    let status = Command::new("/bin/bash")
+        .args(["-c", &probe])
+        .current_dir(temp.path())
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .status()
+        .expect("scrubbed resolver probe");
+    assert!(status.success());
+
+    std::fs::write(&binary, "#!/bin/sh\nprintf '{'\n").expect("malformed resolver fixture");
+    let output = Command::new("/bin/bash")
+        .args(["-c", &token_command])
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("malformed resolver probe");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("shipyard fleet auth resolver returned malformed JSON")
+    );
+
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\nprintf '%s\\n' '{}'\nexit 2\n", resolver_payload),
+    )
+    .expect("failed resolver with plausible output fixture");
+    let output = Command::new("/bin/bash")
+        .args(["-o", "pipefail", "-c", &token_command])
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("failed resolver with plausible output probe");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "predeploy v0.131.0 with ordinary shipyard update and migrate machine-global"
+        )
+    );
+
+    let invalid_payloads = [
+        serde_json::json!({
+            "schema_version": true,
+            "command": "auth.helper-argv",
+            "wrapper": wrapper.display().to_string(),
+            "repo": "danielraffel/Shipyard",
+            "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "auth.helper-argv",
+            "wrapper": wrapper.display().to_string(),
+            "repo": "danielraffel/Shipyard",
+            "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+            "extra": "refuse",
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "auth.helper-argv",
+            "wrapper": "/foreign/ghapp",
+            "repo": "danielraffel/Shipyard",
+            "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "auth.helper-argv",
+            "wrapper": wrapper.display().to_string(),
+            "repo": "Generous-Corp/pulp",
+            "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "auth.helper-argv",
+            "wrapper": wrapper.display().to_string(),
+            "repo": "danielraffel/Shipyard",
+            "credential_argv": ["--app-id", "123456", "--private-key", format!("/{}", "x".repeat(4096))],
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "auth.helper-argv",
+            "wrapper": wrapper.display().to_string(),
+            "repo": "danielraffel/Shipyard",
+            "credential_argv": ["--app-id", "123456", "--private-key", "/private\nkey"],
+        }),
+    ];
+    for payload in invalid_payloads {
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", payload),
+        )
+        .expect("invalid resolver fixture");
+        let output = Command::new("/bin/bash")
+            .args(["-o", "pipefail", "-c", &token_command])
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("invalid resolver probe");
+        assert!(!output.status.success(), "payload must refuse: {payload}");
+    }
+
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\n/usr/bin/python3 -c 'print(\"x\" * 16385)'\n",
+    )
+    .expect("oversized resolver fixture");
+    let output = Command::new("/bin/bash")
+        .args(["-o", "pipefail", "-c", &token_command])
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("oversized resolver probe");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("shipyard fleet auth resolver response exceeds 16384 bytes")
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -525,7 +728,9 @@ fn exact_release_tag_is_required() {
     assert!(!tag_requires_companion("v0.126.2"));
     assert!(tag_requires_companion("v0.127.0"));
     assert!(!tag_supports_auth_resolver("v0.128.9"));
-    assert!(tag_supports_auth_resolver("v0.129.0"));
+    assert!(!tag_supports_auth_resolver("v0.129.0"));
+    assert!(!tag_supports_auth_resolver("v0.130.0"));
+    assert!(tag_supports_auth_resolver("v0.131.0"));
 }
 
 fn named_host(name: &str) -> HostClassConfig {

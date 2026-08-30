@@ -63,7 +63,7 @@ if ! /bin/chmod 600 "$auth_lock_staging_pid"; then
   exit 1
 fi
 auth_lock_staging_inode="$(/usr/bin/stat -f '%i' "$auth_lock_staging")"
-# Pre-v0.129 clients do not acquire auth_guard and can still publish the legacy
+# Pre-v0.131 clients do not acquire auth_guard and can still publish the legacy
 # directory concurrently. Verify that the final inode is ours; a destination
 # race must fail closed without deleting the old client's ownership.
 if ! /bin/mv -n "$auth_lock_staging" "$auth_state_dir/"; then
@@ -310,7 +310,7 @@ auth_recover() {{
   else
     case "$auth_phase" in preparing|prepared|helper-installed|auth-installed|context-installed) ;; *) return 1 ;; esac
     if [ "$auth_journal_lines" = 9 ] && [ "$auth_phase" = preparing ]; then
-      # Pre-v0.129 clients copied binary rollback files directly after writing
+      # Pre-v0.131 clients copied binary rollback files directly after writing
       # `preparing`. A crash could leave partial copies while both live binaries
       # were still intact, so only the already-moved helper pair is restored.
       :

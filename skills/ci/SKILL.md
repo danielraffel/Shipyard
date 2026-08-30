@@ -77,10 +77,13 @@ resolves only that shape through the sibling Shipyard after grammar and repo
 validation; the wrapper pins API, cache, and resolved repo arguments. A
 strict 0600 non-symlink wrapper context is mandatory for direct mode and
 preserves the exact configured mode/global directory. Fleet creates it for
-targets v0.129.0 and newer; manual installs must provision the typed default
+targets v0.131.0 and newer; manual installs must provision the typed default
 context. A post-install resolver probe runs before transaction commit, and
-failure rolls back helper, wrapper, context, CLI, and companion. Targets
-v0.100.0-v0.128.x retain the compatible four-target transaction and nine-line
+failure rolls back helper, wrapper, context, CLI, and companion. The first
+transition from v0.130.x or older requires an ordinary exact-tag update on each
+host and migration to the exact machine-global wrapper command before the
+governed fleet pass; otherwise it refuses before download or mutation. Targets
+v0.100.0-v0.130.x retain the compatible four-target transaction and nine-line
 journal without that unavailable probe.
 
 Native delivery also requires fresh exact-head/base-SHA GitHub App installation
