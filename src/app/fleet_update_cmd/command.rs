@@ -64,10 +64,11 @@ pub(super) fn remote_update_command(
         tag_requires_companion(target),
     );
     let exact_asset_curl_shim = exact_asset_curl_shim(&authority.platform_asset.name);
+    let auth_token_command = auth_token_command(&authority.repository, auth_wrapper);
     let script = format!(
         "set -euo pipefail\n{}\n{}\n{}\n\
          before_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
-         token=\"$({} auth token)\"\n\
+         token=\"$({})\"\n\
          installer=\"$(/usr/bin/mktemp)\"; staging_dir=\"$(/usr/bin/mktemp -d)\"\n\
          trap '/bin/rm -f \"$installer\"; /bin/rm -rf \"$staging_dir\"' EXIT\n\
          /usr/bin/curl -fsSL --output \"$installer\" {}\n\
@@ -105,7 +106,7 @@ pub(super) fn remote_update_command(
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
         shlex_quote(&state_dir.display().to_string()),
-        shlex_quote(&auth_wrapper.display().to_string()),
+        auth_token_command,
         shlex_quote(&installer_url),
         shlex_quote(&authority.installer.sha256),
         shlex_quote(&release_asset_url),
@@ -166,6 +167,14 @@ pub(super) fn remote_update_command(
         shlex_quote(REMOTE_SUPERVISOR),
         REMOTE_UPDATE_TIMEOUT.as_secs(),
         shlex_quote(&script),
+    )
+}
+
+pub(super) fn auth_token_command(repository: &str, auth_wrapper: &Path) -> String {
+    format!(
+        "GH_REPO={} {} auth token",
+        shlex_quote(repository),
+        shlex_quote(&auth_wrapper.display().to_string())
     )
 }
 

@@ -216,6 +216,53 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.production_identity_verified = True
             active.release()
 
+    def test_reconciled_predecessor_fence_never_authorizes_fresh_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _, predecessor_generation = self.create_generation_lease(active)
+
+            def reconcile_predecessor() -> bool:
+                active.mutation_fence_proved = True
+                for child in active.lease_dir.iterdir():
+                    child.unlink()
+                active.lease_dir.rmdir()
+                return True
+
+            with mock.patch.object(
+                active,
+                "reconcile_retained_lease",
+                side_effect=reconcile_predecessor,
+            ):
+                active.acquire()
+
+            self.assertTrue(active.lease_owned)
+            self.assertNotEqual(active.lease_generation, predecessor_generation)
+            self.assertFalse(active.mutation_fence_proved)
+
+            active.transition_path = guardian.CORRECTED_TRANSITION
+            active.audit_ready_file.write_text("exclusive\n", encoding="utf-8")
+
+            def prove_successor() -> None:
+                self.assertFalse(active.mutation_fence_proved)
+                active.mutation_fence_proved = True
+                active.done_file.touch()
+
+            with mock.patch.object(
+                active,
+                "prove_corrected_mutation_fence",
+                side_effect=prove_successor,
+            ) as prove, mock.patch.object(
+                guardian, "_process_start", return_value=active.owner_start
+            ):
+                active.wait_for_owner()
+
+            prove.assert_called_once_with()
+            active.production_preserved = True
+            active.production_identity_verified = True
+            active.release()
+
     def test_reconciliation_lock_symlink_and_unsafe_mode_refuse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -438,7 +485,12 @@ class GuardianLifecycleTests(unittest.TestCase):
                 "mutation_fence_proved": True,
                 "old_lifetime_lock_owned": False,
                 "active_runs": [],
-                "failure": "active workers changed during idle wait; preserved active worker ownership differs",
+                "failure": (
+                    "GuardianError: OwnerEnded: Actions owner ended before canary "
+                    "completion; restore production: GuardianError: preserved active "
+                    "worker ownership differs; restore production: GuardianError: "
+                    "preserved active worker ownership differs"
+                ),
                 "old_production_pid": 222,
                 "old_production_start_time": "new",
                 "installed_sha256": "b" * 64,
@@ -495,6 +547,44 @@ class GuardianLifecycleTests(unittest.TestCase):
             ), mock.patch.object(guardian, "_pid_alive", return_value=False):
                 selected, _, _ = active.retained_legacy_evidence()
             self.assertEqual(selected, new)
+
+    def test_retained_worker_drift_failure_requires_exact_recovery_shape(self) -> None:
+        self.assertTrue(
+            guardian._is_reconcilable_worker_drift_failure(
+                "GuardianError: production active workers changed during idle wait; "
+                "restore production: GuardianError: preserved active worker ownership "
+                "differs"
+            )
+        )
+        self.assertTrue(
+            guardian._is_reconcilable_worker_drift_failure(
+                "GuardianError: OwnerEnded: Actions owner ended before canary "
+                "completion; restore production: GuardianError: preserved active "
+                "worker ownership differs; restore production: GuardianError: "
+                "preserved active worker ownership differs"
+            )
+        )
+        for failure in (
+            None,
+            "OwnerEnded: Actions owner ended before canary completion",
+            "OwnerEnded: guardian received termination signal; restore production: "
+            "GuardianError: preserved active worker ownership differs",
+            "OwnerEnded: Actions owner ended before canary completion; preserved "
+            "active worker ownership differs",
+            "restore production: GuardianError: preserved active worker ownership "
+            "differs",
+            "unrelated authority failure; GuardianError: production active workers "
+            "changed during idle wait; restore production: GuardianError: preserved "
+            "active worker ownership differs",
+            "GuardianError: OwnerEnded: Actions owner ended before canary completion; "
+            "restore production: GuardianError: preserved active worker ownership "
+            "differs; restore production: GuardianError: preserved active worker "
+            "ownership differs; unrelated cleanup failure",
+        ):
+            with self.subTest(failure=failure):
+                self.assertFalse(
+                    guardian._is_reconcilable_worker_drift_failure(failure)
+                )
 
     def test_stale_retained_receipt_cannot_authorize_new_lease_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2327,6 +2417,193 @@ class GuardianLifecycleTests(unittest.TestCase):
             receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
             self.assertFalse(receipt["lease_retained"])
             self.assertTrue(receipt["lease_removed"])
+
+    def test_preserved_production_allows_worker_turnover_after_capacity_release(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.installed_hash = guardian._sha256(active.installed)
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            active.snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 29 05:44:36 2026",
+            )
+            active.configured_repos = ()
+            active.worker_ids = ()
+            active.lock_path = root / "writer.lock"
+            active.mutation_fence_proved = True
+
+            def verify_during_wait(
+                path: Path,
+                production_pid: int,
+                *,
+                verify_production: object,
+                **kwargs: object,
+            ) -> None:
+                self.assertEqual(path, active.lock_path)
+                self.assertEqual(production_pid, active.snapshot.pid)
+                self.assertEqual(
+                    verify_production, active.verify_preserved_production_identity
+                )
+                verify_production(time.monotonic() + 5)  # type: ignore[operator]
+
+            with mock.patch.object(
+                guardian, "snapshot_process", return_value=active.snapshot
+            ), mock.patch.object(
+                guardian, "_configured_repos", return_value=()
+            ), mock.patch.object(
+                guardian, "_active_runs", return_value=("sy-new",)
+            ) as workers, mock.patch.object(
+                guardian,
+                "_wait_for_idle_writer_domain",
+                side_effect=verify_during_wait,
+            ) as wait:
+                active.verify_preserved_production()
+
+            workers.assert_called_once_with(
+                active.snapshot,
+                active.installed,
+                state_dir=active.production_state_dir,
+                diagnostic_root=active.root,
+            )
+            wait.assert_called_once_with(
+                active.lock_path,
+                active.snapshot.pid,
+                verify_production=active.verify_preserved_production_identity,
+                diagnostic_root=active.root,
+            )
+            self.assertTrue(active.production_preserved)
+            self.assertTrue(active.production_identity_verified)
+            self.assertEqual(active.restored_pid, active.snapshot.pid)
+            self.assertEqual(active.post_audit_active_runs, ("sy-new",))
+            self.assertTrue(active.worker_turnover_observed)
+            self.assertIsNone(active.worker_turnover_observation_error)
+
+    def test_preserved_production_still_refuses_daemon_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.installed_hash = guardian._sha256(active.installed)
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            active.snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 29 05:44:36 2026",
+            )
+            changed = guardian.ProcessSnapshot(
+                **{**active.snapshot.__dict__, "cwd": str(root / "changed")}
+            )
+            active.configured_repos = ()
+            active.lock_path = root / "writer.lock"
+            active.mutation_fence_proved = True
+
+            def verify_during_wait(
+                path: Path,
+                production_pid: int,
+                *,
+                verify_production: object,
+                **kwargs: object,
+            ) -> None:
+                self.assertEqual(path, active.lock_path)
+                self.assertEqual(production_pid, active.snapshot.pid)
+                verify_production(time.monotonic() + 5)  # type: ignore[operator]
+
+            with mock.patch.object(
+                guardian,
+                "snapshot_process",
+                side_effect=(active.snapshot, changed),
+            ), mock.patch.object(
+                guardian, "_configured_repos", return_value=()
+            ), mock.patch.object(
+                guardian,
+                "_wait_for_idle_writer_domain",
+                side_effect=verify_during_wait,
+            ), self.assertRaisesRegex(
+                guardian.GuardianError, "process identity differs"
+            ):
+                active.verify_preserved_production()
+
+    def test_preserved_production_rechecks_identity_after_worker_probe_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.installed_hash = guardian._sha256(active.installed)
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            active.snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 29 05:44:36 2026",
+            )
+            changed = guardian.ProcessSnapshot(
+                **{**active.snapshot.__dict__, "cwd": str(root / "changed")}
+            )
+            active.configured_repos = ()
+            active.worker_ids = ()
+            active.lock_path = root / "writer.lock"
+            active.mutation_fence_proved = True
+
+            def verify_during_wait(
+                _path: Path,
+                _production_pid: int,
+                *,
+                verify_production: object,
+                **_kwargs: object,
+            ) -> None:
+                verify_production(time.monotonic() + 5)  # type: ignore[operator]
+
+            with mock.patch.object(
+                guardian,
+                "snapshot_process",
+                side_effect=(
+                    active.snapshot,
+                    active.snapshot,
+                    active.snapshot,
+                    changed,
+                ),
+            ), mock.patch.object(
+                guardian, "_configured_repos", return_value=()
+            ), mock.patch.object(
+                guardian, "_active_runs", side_effect=guardian.GuardianError("lost")
+            ), mock.patch.object(
+                guardian,
+                "_wait_for_idle_writer_domain",
+                side_effect=verify_during_wait,
+            ), self.assertRaisesRegex(
+                guardian.GuardianError, "process identity differs"
+            ):
+                active.verify_preserved_production()
+
+            self.assertFalse(active.production_preserved)
+            self.assertFalse(active.production_identity_verified)
+            self.assertEqual(
+                active.worker_turnover_observation_error, "GuardianError: lost"
+            )
 
     def test_repo_and_mode_authority_come_from_exact_argv(self) -> None:
         argv = (

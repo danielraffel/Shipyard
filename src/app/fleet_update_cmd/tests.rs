@@ -1,6 +1,8 @@
 #[cfg(unix)]
 use std::process::Command;
 
+#[cfg(unix)]
+use super::command::auth_token_command;
 use super::*;
 
 fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
@@ -42,6 +44,10 @@ fn remote_plan_uses_absolute_binary_and_minimal_canonical_path() {
     )));
     assert!(plan.command.contains("/Users/ci/.local/bin/shipyard"));
     assert!(plan.command.contains("/Users/ci/.local/bin/ghapp"));
+    assert!(
+        plan.command
+            .contains("GH_REPO=danielraffel/Shipyard /Users/ci/.local/bin/ghapp auth token")
+    );
     assert!(plan.command.contains(
         "test /Users/ci/.config/shipyard/bin/shipyard-github-app-token = \"$HOME/.config/shipyard/bin/shipyard-github-app-token\""
     ));
@@ -92,6 +98,40 @@ fn remote_plan_uses_absolute_binary_and_minimal_canonical_path() {
         preflight < replacement,
         "governed config and helper must pass before binary replacement"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_token_command_binds_verified_repo_in_a_scrubbed_non_checkout() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let wrapper = temp.path().join("auth wrapper");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\n\
+         test \"$#\" -eq 2\n\
+         test \"$1\" = auth\n\
+         test \"$2\" = token\n\
+         test \"$GH_REPO\" = danielraffel/Shipyard\n\
+         test -z \"${SHIPYARD_GHAPP_REPO:-}${SHIPYARD_GH_APP_REPO:-}\"\n\
+         printf '%s\\n' exact-token\n",
+    )
+    .expect("wrapper fixture");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("wrapper executable");
+
+    let token_command = auth_token_command("danielraffel/Shipyard", &wrapper);
+    let probe = format!(
+        "token=\"$({token_command})\"; test \"$token\" = exact-token; test -z \"${{GH_REPO:-}}\""
+    );
+    let status = Command::new("/bin/bash")
+        .args(["-c", &probe])
+        .current_dir(temp.path())
+        .env_clear()
+        .status()
+        .expect("scrubbed token probe");
+    assert!(status.success());
 }
 
 #[cfg(target_os = "macos")]

@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -308,69 +309,145 @@ def test_guarded_external_writer_retains_lease_after_parent_death(
     protected.parent.mkdir(parents=True)
     ready = tmp_path / f"{surface}.ready"
     go = tmp_path / f"{surface}.go"
+    completed = tmp_path / f"{surface}.completed"
+    child_pid = tmp_path / f"{surface}.child-pid"
     guardian_pid = tmp_path / f"{surface}.guardian-pid"
-    child = tmp_path / f"{surface}-child.sh"
-    child.write_text(
-        "#!/bin/sh\n"
-        "set -eu\n"
-        "ready=$1; go=$2; output=$3\n"
-        ": > \"$ready\"\n"
-        "while [ ! -e \"$go\" ]; do sleep 0.01; done\n"
-        "printf guarded > \"$output\"\n",
-        encoding="utf-8",
-    )
-    child.chmod(0o755)
-    parent_script = tmp_path / f"{surface}-parent.sh"
-    parent_script.write_text(
-        "#!/bin/sh\n"
-        "set -eu\n"
-        '"$1" writer-domain-exec --path "$2" -- "$3" "$4" "$5" "$2" &\n'
-        "guardian=$!\n"
-        'printf "%s" "$guardian" > "$6"\n'
-        'wait "$guardian"\n',
-        encoding="utf-8",
-    )
-    parent_script.chmod(0o755)
     env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
-    parent = subprocess.Popen(
-        [
-            str(parent_script),
-            str(shipyard_binary),
-            str(protected),
-            str(child),
-            str(ready),
-            str(go),
-            str(guardian_pid),
-        ],
-        env=env,
-    )
-    deadline = time.monotonic() + 5
-    while not ready.exists() and time.monotonic() < deadline:
-        assert parent.poll() is None
-        time.sleep(0.01)
-    assert ready.exists()
-    guardian = int(guardian_pid.read_text(encoding="utf-8"))
-
-    parent.terminate()
-    parent.wait(timeout=5)
-    os.kill(guardian, 0)
-    audit = WriterDomainLease(production_writer_domain_lock_path(home), exclusive=True)
-    with pytest.raises(WriterDomainOverlap):
-        audit.acquire(timeout=0.1)
-    assert not protected.exists()
-
-    go.touch()
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
+    parent = os.fork()
+    if parent == 0:
         try:
-            audit.acquire(timeout=0.05)
-            break
-        except WriterDomainOverlap:
+            guardian_process = subprocess.Popen(
+                [
+                    str(shipyard_binary),
+                    "writer-domain-exec",
+                    "--path",
+                    str(protected),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,pathlib,sys,time\n"
+                        "ready,go,completed,output,child_pid=map(pathlib.Path,sys.argv[1:])\n"
+                        "child_pid.write_text(str(os.getpid()),encoding='utf-8')\n"
+                        "ready.touch()\n"
+                        "while not go.exists():\n"
+                        "    time.sleep(0.01)\n"
+                        "output.write_text('guarded',encoding='utf-8')\n"
+                        "completed.touch()\n"
+                    ),
+                    str(ready),
+                    str(go),
+                    str(completed),
+                    str(protected),
+                    str(child_pid),
+                ],
+                env=env,
+                start_new_session=True,
+            )
+            guardian_pid.write_text(str(guardian_process.pid), encoding="utf-8")
+            return_code = guardian_process.wait()
+        except BaseException:
+            return_code = 1
+        os._exit(return_code)
+
+    guardian: int | None = None
+    lease_observed = False
+    audit_acquired = False
+    normal_complete = False
+    audit = WriterDomainLease(production_writer_domain_lock_path(home), exclusive=True)
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            waited, _ = os.waitpid(parent, os.WNOHANG)
+            assert waited == 0
+            if guardian_pid.exists():
+                guardian = int(guardian_pid.read_text(encoding="utf-8"))
+                os.kill(guardian, 0)
+                try:
+                    audit.acquire(timeout=0.05)
+                except WriterDomainOverlap:
+                    lease_observed = True
+                    if ready.exists():
+                        break
+                else:
+                    audit.release()
             time.sleep(0.01)
-    else:
-        pytest.fail("writer-domain guardian did not release after child completion")
-    assert protected.read_text(encoding="utf-8") == "guarded"
-    audit.release()
+        assert lease_observed
+        assert ready.exists()
+
+        try:
+            os.kill(parent, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        os.waitpid(parent, 0)
+        parent = 0
+
+        assert guardian is not None
+        os.kill(guardian, 0)
+        with pytest.raises(WriterDomainOverlap):
+            audit.acquire(timeout=0.1)
+        assert not completed.exists()
+        assert not protected.exists()
+
+        go.touch()
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if completed.exists():
+                try:
+                    audit.acquire(timeout=0.05)
+                except WriterDomainOverlap:
+                    pass
+                else:
+                    audit_acquired = True
+                    break
+            time.sleep(0.01)
+        else:
+            pytest.fail("writer-domain guardian did not release after child completion")
+        assert completed.exists()
+        assert protected.read_text(encoding="utf-8") == "guarded"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(guardian, 0)
+            except ProcessLookupError:
+                guardian = None
+                normal_complete = True
+                break
+            time.sleep(0.01)
+    finally:
+        if audit_acquired:
+            audit.release()
+        if parent:
+            try:
+                os.kill(parent, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(parent, 0)
+            except ChildProcessError:
+                pass
+        if guardian is not None and not normal_complete:
+            try:
+                os.killpg(guardian, signal.SIGTERM)
+            except (PermissionError, ProcessLookupError):
+                pass
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                try:
+                    if child_pid.exists():
+                        child = int(child_pid.read_text(encoding="utf-8"))
+                        if os.getpgid(child) != guardian:
+                            break
+                    else:
+                        os.killpg(guardian, 0)
+                except (PermissionError, ProcessLookupError, ValueError):
+                    break
+                time.sleep(0.01)
+            else:
+                try:
+                    os.killpg(guardian, signal.SIGKILL)
+                except (PermissionError, ProcessLookupError):
+                    pass
 
 
 def test_protected_write_is_never_allowlisted_by_filename(tmp_path: Path) -> None:
