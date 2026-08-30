@@ -129,7 +129,7 @@ fn fleet_resolver_probe_uses_exact_global_dir_before_commit() {
     class.shipyard_global_dir = Some("/Users/ci/governed global".to_owned());
     class.shipyard_state_dir = Some("/Users/ci/governed state".to_owned());
 
-    let legacy = host_update_plan(&class, "v0.130.0").expect("legacy target");
+    let legacy = host_update_plan(&class, "v0.130.1").expect("legacy target");
     assert!(legacy.command.contains("auth_resolver_required=0"));
 
     let plan = host_update_plan(&class, "v0.131.0").expect("differing governed dirs");
@@ -143,18 +143,29 @@ fn fleet_resolver_probe_uses_exact_global_dir_before_commit() {
         plan.command
             .contains("--global-dir \"$auth_global_dir\" auth helper-argv")
     );
-    let probe = plan
+    assert_eq!(plan.command.matches("auth helper-argv").count(), 2);
+    let bootstrap_probe = plan
         .command
         .find("auth helper-argv")
-        .expect("resolver probe");
+        .expect("bootstrap resolver probe");
+    let context_installed = plan
+        .command
+        .find("auth_write_phase context-installed")
+        .expect("context installation marker");
+    let post_install_probe = plan
+        .command
+        .rfind("auth helper-argv")
+        .expect("post-install resolver probe");
     let committed = plan
         .command
         .find("auth_write_phase committed")
         .expect("commit marker");
     assert!(
-        probe < committed,
-        "resolver must pass before transaction commit"
+        bootstrap_probe < context_installed,
+        "bootstrap resolver must acquire auth before artifact installation"
     );
+    assert!(context_installed < post_install_probe);
+    assert!(post_install_probe < committed);
 }
 
 #[cfg(unix)]
@@ -201,6 +212,7 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
     let wrapper = temp.path().join("ghapp");
     let global_dir = temp.path().join("global dir");
     let private_key = temp.path().join("private-key.pem");
+    let wrapper_invoked = temp.path().join("wrapper-invoked");
     std::fs::create_dir(&global_dir).expect("global dir");
     std::fs::write(&private_key, "fixture-only").expect("private key fixture");
 
@@ -242,6 +254,7 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
         &wrapper,
         format!(
             "#!/bin/sh\n\
+             /usr/bin/touch '{}'\n\
              test \"$#\" -eq 7\n\
              test \"$1\" = token\n\
              test \"$2\" = --app-id\n\
@@ -252,6 +265,7 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
              test \"$7\" = danielraffel/Shipyard\n\
              test -z \"${{GH_REPO:-}}${{SHIPYARD_GHAPP_REPO:-}}${{SHIPYARD_GH_APP_REPO:-}}\"\n\
              printf '%s\\n' '{{\"token\":\"exact-token\"}}'\n",
+            wrapper_invoked.display(),
             private_key.display(),
         ),
     )
@@ -279,6 +293,8 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
         .status()
         .expect("scrubbed resolver probe");
     assert!(status.success());
+    assert!(wrapper_invoked.exists());
+    std::fs::remove_file(&wrapper_invoked).expect("clear wrapper marker");
 
     std::fs::write(&binary, "#!/bin/sh\nprintf '{'\n").expect("malformed resolver fixture");
     let output = Command::new("/bin/bash")
@@ -293,6 +309,7 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
         String::from_utf8_lossy(&output.stderr)
             .contains("shipyard fleet auth resolver returned malformed JSON")
     );
+    assert!(!wrapper_invoked.exists());
 
     std::fs::write(
         &binary,
@@ -312,53 +329,72 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
             "predeploy v0.131.0 with ordinary shipyard update and migrate machine-global"
         )
     );
+    assert!(!wrapper_invoked.exists());
 
     let invalid_payloads = [
-        serde_json::json!({
-            "schema_version": true,
-            "command": "auth.helper-argv",
-            "wrapper": wrapper.display().to_string(),
-            "repo": "danielraffel/Shipyard",
-            "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
-        }),
-        serde_json::json!({
-            "schema_version": 1,
-            "command": "auth.helper-argv",
-            "wrapper": wrapper.display().to_string(),
-            "repo": "danielraffel/Shipyard",
-            "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
-            "extra": "refuse",
-        }),
-        serde_json::json!({
-            "schema_version": 1,
-            "command": "auth.helper-argv",
-            "wrapper": "/foreign/ghapp",
-            "repo": "danielraffel/Shipyard",
-            "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
-        }),
-        serde_json::json!({
-            "schema_version": 1,
-            "command": "auth.helper-argv",
-            "wrapper": wrapper.display().to_string(),
-            "repo": "Generous-Corp/pulp",
-            "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
-        }),
-        serde_json::json!({
-            "schema_version": 1,
-            "command": "auth.helper-argv",
-            "wrapper": wrapper.display().to_string(),
-            "repo": "danielraffel/Shipyard",
-            "credential_argv": ["--app-id", "123456", "--private-key", format!("/{}", "x".repeat(4096))],
-        }),
-        serde_json::json!({
-            "schema_version": 1,
-            "command": "auth.helper-argv",
-            "wrapper": wrapper.display().to_string(),
-            "repo": "danielraffel/Shipyard",
-            "credential_argv": ["--app-id", "123456", "--private-key", "/private\nkey"],
-        }),
+        (
+            serde_json::json!({
+                "schema_version": true,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+            }),
+            "shipyard fleet auth resolver returned an unsupported contract",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+                "extra": "refuse",
+            }),
+            "shipyard fleet auth resolver returned an unsupported contract",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": "/foreign/ghapp",
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+            }),
+            "shipyard fleet auth resolver returned mismatched authority",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "Generous-Corp/pulp",
+                "credential_argv": ["--app-id", "123456", "--private-key", private_key.display().to_string()],
+            }),
+            "shipyard fleet auth resolver returned mismatched authority",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", format!("/{}", "x".repeat(4096))],
+            }),
+            "shipyard fleet auth resolver returned an invalid private-key path",
+        ),
+        (
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "auth.helper-argv",
+                "wrapper": wrapper.display().to_string(),
+                "repo": "danielraffel/Shipyard",
+                "credential_argv": ["--app-id", "123456", "--private-key", "/private\nkey"],
+            }),
+            "shipyard fleet auth resolver returned an invalid private-key path",
+        ),
     ];
-    for payload in invalid_payloads {
+    for (payload, expected_error) in invalid_payloads {
         std::fs::write(
             &binary,
             format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", payload),
@@ -372,6 +408,12 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
             .output()
             .expect("invalid resolver probe");
         assert!(!output.status.success(), "payload must refuse: {payload}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "unexpected refusal for payload {payload}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!wrapper_invoked.exists());
     }
 
     std::fs::write(
@@ -391,6 +433,7 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
         String::from_utf8_lossy(&output.stderr)
             .contains("shipyard fleet auth resolver response exceeds 16384 bytes")
     );
+    assert!(!wrapper_invoked.exists());
 }
 
 #[cfg(target_os = "macos")]
@@ -730,6 +773,7 @@ fn exact_release_tag_is_required() {
     assert!(!tag_supports_auth_resolver("v0.128.9"));
     assert!(!tag_supports_auth_resolver("v0.129.0"));
     assert!(!tag_supports_auth_resolver("v0.130.0"));
+    assert!(!tag_supports_auth_resolver("v0.130.1"));
     assert!(tag_supports_auth_resolver("v0.131.0"));
 }
 

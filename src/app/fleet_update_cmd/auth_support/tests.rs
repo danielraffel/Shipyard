@@ -341,7 +341,7 @@ fn v0_130_target_retains_four_target_transaction_without_resolver_probe() {
         fixture
             .run(RunOptions {
                 fail_after_helper: false,
-                target: "v0.130.0",
+                target: "v0.130.1",
                 resolver_succeeds: false,
                 ..RunOptions::default()
             })
