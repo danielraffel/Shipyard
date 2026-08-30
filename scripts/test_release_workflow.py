@@ -3,9 +3,15 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import package_release  # noqa: E402
+
+
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 AUTO_RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "auto-release.yml"
 
@@ -71,6 +77,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_release_workflow_attests_every_executable_release_asset(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        dist_dir = package_release.DEFAULT_DIST_DIR.relative_to(ROOT).as_posix()
         self.assertIn("attestations: write", text)
         self.assertIn("id-token: write", text)
         self.assertEqual(text.count("uses: actions/attest@v4"), 2)
@@ -79,7 +86,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("release/shipyard-workstream-provider-linux-*", text)
         self.assertIn("release/shipyard-workstream-provider-windows-*.exe", text)
         self.assertIn(
-            "dist/${{ github.ref_name }}/shipyard-macos-arm64.dmg",
+            f"{dist_dir}/${{{{ github.ref_name }}}}/shipyard-macos-arm64.dmg",
             text,
         )
 

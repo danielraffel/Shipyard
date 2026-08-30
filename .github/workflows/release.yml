@@ -256,7 +256,7 @@ jobs:
       - name: Attest signed and notarized macOS release asset
         uses: actions/attest@v4
         with:
-          subject-path: dist/${{ github.ref_name }}/shipyard-macos-arm64.dmg
+          subject-path: dist/release/${{ github.ref_name }}/shipyard-macos-arm64.dmg
 
       - name: Restore user keychains and delete ephemeral signing keychain
         if: always()
