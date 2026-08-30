@@ -42,13 +42,6 @@ pub(super) fn remote_update_command(
         shlex_quote(version),
         shlex_quote(&install_dir.display().to_string())
     );
-    let daemon_refresh_command = format!(
-        "refresh_receipt=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon refresh 9>&- | /usr/bin/tr -d '\\n')\"",
-        shlex_quote(&binary.display().to_string()),
-        shlex_quote(mode),
-        shlex_quote(&global_dir.display().to_string()),
-        shlex_quote(&state_dir.display().to_string()),
-    );
     let auth_transaction = auth_support::install_transaction(
         auth_helper,
         auth_wrapper,
@@ -59,7 +52,6 @@ pub(super) fn remote_update_command(
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,
-        &daemon_refresh_command,
         mode,
         global_dir,
         state_dir,
@@ -277,13 +269,6 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         shlex_quote(&plan.state_dir.display().to_string()),
         shlex_quote(&plan.target),
     );
-    let daemon_refresh_command = format!(
-        "{} --mode {} --global-dir {} --state-dir {} --json daemon refresh 9>&-",
-        shlex_quote(&plan.binary.display().to_string()),
-        plan.runtime_mode.as_str(),
-        shlex_quote(&plan.global_dir.display().to_string()),
-        shlex_quote(&plan.state_dir.display().to_string()),
-    );
     let auth_transaction = auth_support::install_transaction(
         &plan.auth_helper,
         &plan.auth_wrapper,
@@ -294,7 +279,6 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,
-        &daemon_refresh_command,
         plan.runtime_mode.as_str(),
         &plan.global_dir,
         &plan.state_dir,
@@ -303,7 +287,7 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         false,
     );
     format!(
-        "set -euo pipefail; {}; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; /usr/bin/curl -fsSL --output \"$installer\" {}; test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; test \"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL --output \"$auth_helper_source\" {}; /usr/bin/curl -fsSL --output \"$auth_wrapper_source\" {}; test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; {}",
+        "set -euo pipefail; {}; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; /usr/bin/curl -fsSL --output \"$installer\" {}; test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; test \"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL --output \"$auth_helper_source\" {}; /usr/bin/curl -fsSL --output \"$auth_wrapper_source\" {}; test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; {}; /usr/bin/printf '%s\\n' \"$refresh_receipt\"",
         auth_contract,
         shlex_quote(&installer_url),
         shlex_quote(&plan.release_authority.installer.sha256),
