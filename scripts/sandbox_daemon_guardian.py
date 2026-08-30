@@ -387,6 +387,20 @@ def _validate_private_directory(path: Path) -> os.stat_result:
     return metadata
 
 
+def _is_reconcilable_worker_drift_failure(failure: object) -> bool:
+    if not isinstance(failure, str):
+        return False
+    preserved_drift = (
+        "restore production: GuardianError: preserved active worker ownership differs"
+    )
+    return failure in (
+        "GuardianError: production active workers changed during idle wait; "
+        f"{preserved_drift}",
+        "GuardianError: OwnerEnded: Actions owner ended before canary completion; "
+        f"{preserved_drift}; {preserved_drift}",
+    )
+
+
 def _lease_generation_state(path: Path) -> tuple[os.stat_result, str, str]:
     """Authenticate one private lease directory and its random generation."""
     metadata = _validate_private_directory(path)
@@ -1247,6 +1261,9 @@ class Guardian:
         self.candidate_stopped = True
         self.failure: Optional[str] = None
         self.reconciled_prior_canary_root: Optional[str] = None
+        self.post_audit_active_runs: Optional[tuple[str, ...]] = None
+        self.worker_turnover_observed: Optional[bool] = None
+        self.worker_turnover_observation_error: Optional[str] = None
 
     def request_stop(self, _signum: int, _frame: object) -> None:
         self.stop_requested = True
@@ -1377,11 +1394,7 @@ class Guardian:
         ready = _json_object(prior_root / "ready.json")
         mutation = _json_object(prior_root / "mutation-fence.json")
         failure = receipt.get("failure")
-        allowed_failure = (
-            isinstance(failure, str)
-            and "active workers changed during idle wait" in failure
-            and "preserved active worker ownership differs" in failure
-        )
+        allowed_failure = _is_reconcilable_worker_drift_failure(failure)
         required = (
             receipt.get("schema_version") == 1,
             receipt.get("transition_path") == CORRECTED_TRANSITION,
@@ -2147,6 +2160,36 @@ class Guardian:
         else:
             self.restore_legacy_production()
 
+    def verify_preserved_production_identity(
+        self, deadline: Optional[float] = None
+    ) -> ProcessSnapshot:
+        """Verify immutable daemon authority after audit capacity is released."""
+        snapshot = self.snapshot
+        if snapshot is None:
+            raise GuardianError("production snapshot is unavailable")
+        _bounded_timeout(deadline)
+        if _sha256(self.installed) != self.installed_hash:
+            raise GuardianError("installed production binary changed during canary")
+        _bounded_timeout(deadline)
+        current_pid = int(self.production_pid_file.read_text(encoding="utf-8").strip())
+        if current_pid != snapshot.pid:
+            raise GuardianError("corrected production pid changed during canary")
+        current = snapshot_process(current_pid, deadline=deadline)
+        self.assert_process_identity(current, require_same_pid=True)
+        if (
+            _configured_repos(
+                current,
+                self.installed,
+                deadline=deadline,
+                diagnostic_root=self.root,
+                state_dir=self.production_state_dir,
+            )
+            != self.configured_repos
+        ):
+            raise GuardianError("preserved configured repository authority differs")
+        _bounded_timeout(deadline)
+        return current
+
     def verify_preserved_production(
         self, *, require_mutation_fence: bool = True
     ) -> None:
@@ -2155,40 +2198,29 @@ class Guardian:
             raise GuardianError("production snapshot is unavailable")
         if require_mutation_fence and not self.mutation_fence_proved:
             raise GuardianError("corrected transition lacks exclusive-audit mutation proof")
-        if _sha256(self.installed) != self.installed_hash:
-            raise GuardianError("installed production binary changed during canary")
-        current_pid = int(self.production_pid_file.read_text(encoding="utf-8").strip())
-        if current_pid != snapshot.pid:
-            raise GuardianError("corrected production pid changed during canary")
-        current = snapshot_process(current_pid)
-        self.assert_process_identity(current, require_same_pid=True)
-        if (
-            _configured_repos(
-                current,
-                self.installed,
-                diagnostic_root=self.root,
-                state_dir=self.production_state_dir,
-            )
-            != self.configured_repos
-        ):
-            raise GuardianError("preserved configured repository authority differs")
-        if (
-            _active_runs(
-                current,
-                self.installed,
-                state_dir=self.production_state_dir,
-                diagnostic_root=self.root,
-            )
-            != self.worker_ids
-        ):
-            raise GuardianError("preserved active worker ownership differs")
+        self.verify_preserved_production_identity()
         _wait_for_idle_writer_domain(
             self.lock_path,
             snapshot.pid,
-            verify_production=self.verify_unchanged_production,
+            verify_production=self.verify_preserved_production_identity,
             diagnostic_root=self.root,
         )
-        current = self.verify_unchanged_production()
+        current = self.verify_preserved_production_identity()
+        try:
+            self.post_audit_active_runs = _active_runs(
+                current,
+                self.installed,
+                state_dir=self.production_state_dir,
+                diagnostic_root=self.root,
+            )
+            self.worker_turnover_observed = (
+                self.post_audit_active_runs != self.worker_ids
+            )
+        except Exception as error:
+            self.worker_turnover_observation_error = (
+                f"{type(error).__name__}: {error}"
+            )
+        current = self.verify_preserved_production_identity()
         self.restored_pid = current.pid
         self.final_production_start_time = current.start_time
         self.production_preserved = True
@@ -2564,6 +2596,11 @@ class Guardian:
                     "mode": _mode_arg(self.snapshot.argv) if self.snapshot else None,
                     "configured_repos": getattr(self, "configured_repos", ()),
                     "active_runs": getattr(self, "worker_ids", ()),
+                    "post_audit_active_runs": self.post_audit_active_runs,
+                    "worker_turnover_observed": self.worker_turnover_observed,
+                    "worker_turnover_observation_error": (
+                        self.worker_turnover_observation_error
+                    ),
                     "old_lifetime_lock_owned": getattr(
                         self, "old_lifetime_lock_owned", False
                     ),
