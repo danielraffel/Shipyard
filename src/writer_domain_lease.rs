@@ -302,28 +302,47 @@ fn canonicalize_with_missing_suffix_from(path: &Path, current_dir: &Path) -> io:
             Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
             Component::Normal(name) => {
                 let candidate = resolved.join(name);
-                match fs::canonicalize(&candidate) {
-                    Ok(canonical) => resolved = canonical,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        // A dangling symlink/reparse point is ambiguous: treating it
-                        // as an ordinary missing path could let a later target swap
-                        // cross the protected-root boundary.
-                        match fs::symlink_metadata(&candidate) {
-                            Ok(_) => return Err(error),
-                            Err(metadata_error)
-                                if metadata_error.kind() == io::ErrorKind::NotFound =>
-                            {
-                                resolved.push(name);
-                            }
-                            Err(metadata_error) => return Err(metadata_error),
-                        }
-                    }
-                    Err(error) => return Err(error),
+                match canonicalize_component_with(
+                    &candidate,
+                    |path| fs::canonicalize(path),
+                    |path| fs::symlink_metadata(path),
+                )? {
+                    Some(canonical) => resolved = canonical,
+                    None => resolved.push(name),
                 }
             }
         }
     }
     Ok(resolved)
+}
+
+fn canonicalize_component_with<C, M>(
+    candidate: &Path,
+    mut canonicalize: C,
+    symlink_metadata: M,
+) -> io::Result<Option<PathBuf>>
+where
+    C: FnMut(&Path) -> io::Result<PathBuf>,
+    M: FnOnce(&Path) -> io::Result<fs::Metadata>,
+{
+    match canonicalize(candidate) {
+        Ok(canonical) => Ok(Some(canonical)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match symlink_metadata(candidate) {
+                // A dangling symlink/reparse point is ambiguous: treating it as an
+                // ordinary missing path could let a later target swap cross the
+                // protected-root boundary.
+                Ok(metadata) if metadata.file_type().is_symlink() => Err(error),
+                // A regular entry can appear between canonicalize and metadata
+                // when two processes create the same coordination file. Retry the
+                // authoritative resolution instead of returning the stale ENOENT.
+                Ok(_) => canonicalize(candidate).map(Some),
+                Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(metadata_error) => Err(metadata_error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(windows)]
@@ -468,6 +487,54 @@ mod tests {
             .expect("unrelated acquisition");
         assert!(lease.is_none());
         assert!(!temp.path().join(WRITER_DOMAIN_LOCK_NAME).exists());
+    }
+
+    #[test]
+    fn concurrent_regular_creation_retries_canonicalization() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let candidate = temp.path().join("queue.lock");
+        let mut attempts = 0;
+
+        let resolved = canonicalize_component_with(
+            &candidate,
+            |path| {
+                attempts += 1;
+                if attempts == 1 {
+                    File::create(path).expect("concurrent regular creation");
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "synthetic first lookup race",
+                    ));
+                }
+                fs::canonicalize(path)
+            },
+            |path| fs::symlink_metadata(path),
+        )
+        .expect("retry concurrent regular creation")
+        .expect("regular entry must resolve");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&candidate).expect("canonical lock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_remains_fail_closed_during_canonicalization() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let candidate = temp.path().join("queue.lock");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &candidate)
+            .expect("dangling symlink");
+
+        let error = canonicalize_component_with(
+            &candidate,
+            |path| fs::canonicalize(path),
+            |path| fs::symlink_metadata(path),
+        )
+        .expect_err("dangling symlink must refuse");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
