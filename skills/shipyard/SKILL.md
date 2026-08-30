@@ -1139,6 +1139,12 @@ shipyard runner list --repo Generous-Corp/pulp   # live pool, grouped by machine
 shipyard runner remove --name pulp-studio-03 --yes [--purge-dir]
 ```
 
+Removal uses the runner's compound `svc.sh uninstall` before GitHub
+deregistration. Do not replace it with `svc.sh stop`: stopping alone preserves
+the LaunchAgent plist and leaves a stale `runsvc.sh` Background Item after the
+runner directory disappears. If uninstall fails, removal fails closed before
+requesting or consuming a GitHub removal token.
+
 `list` aggregates across machines straight from GitHub (no controller needed)
 and reconciles local `~/actions-runner-*` dirs against GitHub to flag orphans.
 

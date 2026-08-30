@@ -1785,6 +1785,10 @@ pub(super) fn audit_command<W: Write>(
 
 // ---------- remove ----------
 
+fn uninstall_runner_service(dir: &Path) -> Result<(), CliFailure> {
+    run_in(dir, "./svc.sh", &["uninstall"], "uninstall runner service")
+}
+
 /// `shipyard runner remove`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn remove_command<W: Write>(
@@ -1825,11 +1829,11 @@ pub(super) fn remove_command<W: Write>(
         .trim()
         .to_owned();
 
-    // Stop the service first; ignore failure (it may already be stopped).
-    let _ = Command::new("./svc.sh")
-        .current_dir(&dir)
-        .arg("stop")
-        .status();
+    // The Actions runner's compound uninstall removes both the loaded service
+    // and its LaunchAgent registration.  Merely stopping it leaves the plist
+    // behind, which produces stale `runsvc.sh` Background Items after the
+    // runner directory is later removed.
+    uninstall_runner_service(&dir)?;
     run_in(
         &dir,
         "./config.sh",
@@ -1926,6 +1930,9 @@ fn envelope<W: Write>(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     fn api_runner(name: &str, status: &str, busy: bool) -> ApiRunner {
         ApiRunner {
             name: name.to_owned(),
@@ -1933,6 +1940,31 @@ mod tests {
             busy,
             labels: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_removal_uses_compound_service_uninstall() {
+        let temp = tempfile::tempdir().expect("temp");
+        let script = temp.path().join("svc.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > service-command\n",
+        )
+        .expect("write svc.sh");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("svc.sh metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make svc.sh executable");
+
+        uninstall_runner_service(temp.path()).expect("service uninstall");
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("service-command"))
+                .expect("service command receipt"),
+            "uninstall\n"
+        );
     }
 
     #[test]
