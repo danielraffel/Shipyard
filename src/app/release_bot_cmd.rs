@@ -91,9 +91,7 @@ fn release_bot_command_with<W: Write>(
                 config,
                 cwd,
                 tag_pattern.as_deref().unwrap_or("v*"),
-                shipyard_version
-                    .as_deref()
-                    .unwrap_or(env!("CARGO_PKG_VERSION")),
+                shipyard_version.as_deref(),
                 json_mode,
                 gh_command,
             ),
@@ -337,10 +335,23 @@ fn hook_install<W: Write>(
     config: &LoadedConfig,
     cwd: &Path,
     tag_pattern: &str,
-    shipyard_version: &str,
+    shipyard_version: Option<&str>,
     json_mode: bool,
     gh_command: Option<&Path>,
 ) -> Result<ExitCode, CliFailure> {
+    let hook_config = load_hook_config(config);
+    let shipyard_version = if let Some(shipyard_version) = shipyard_version {
+        shipyard_version
+    } else {
+        hook_config
+            .workflow_shipyard_version
+            .as_ref()
+            .map_err(|error| CliFailure::new(1, error.clone()))?
+            .as_deref()
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+    };
+    validate_workflow_shipyard_version(shipyard_version)
+        .map_err(|error| CliFailure::new(1, error))?;
     let workflows_dir = cwd.join(".github").join("workflows");
     fs::create_dir_all(&workflows_dir).map_err(|error| {
         CliFailure::new(
@@ -350,7 +361,6 @@ fn hook_install<W: Write>(
     })?;
     let target = workflows_dir.join(POST_TAG_WORKFLOW);
     let overwrote = target.exists();
-    let hook_config = load_hook_config(config);
     let signing_setup_script = hook_config
         .ssh_signing_setup_script
         .as_deref()
@@ -648,6 +658,30 @@ fn validate_workflow_script_path(path: &str) -> Result<&str, String> {
     Ok(path)
 }
 
+fn validate_workflow_shipyard_version(value: &str) -> Result<&str, String> {
+    let stable = value.strip_prefix('v').unwrap_or(value);
+    let mut components = stable.split('.');
+    let valid_component = |component: Option<&str>| {
+        component.is_some_and(|component| {
+            !component.is_empty()
+                && component.bytes().all(|byte| byte.is_ascii_digit())
+                && (component == "0" || !component.starts_with('0'))
+        })
+    };
+    if value == "latest"
+        || (value == value.trim()
+            && valid_component(components.next())
+            && valid_component(components.next())
+            && valid_component(components.next())
+            && components.next().is_none())
+    {
+        return Ok(value);
+    }
+    Err(format!(
+        "release.post_tag_hook workflow shipyard version must be `latest` or an exact stable semantic version, got {value:?}"
+    ))
+}
+
 fn render_workflow(
     tag_pattern: &str,
     shipyard_version: &str,
@@ -732,6 +766,7 @@ struct HookConfig {
     remote: String,
     branch: String,
     ssh_signing_setup_script: Option<String>,
+    workflow_shipyard_version: Result<Option<String>, String>,
     // How the bot commit lands on `branch`:
     //   "direct" (default) — push --ff-only straight to `branch` (today's
     //     behavior). Incompatible with a GitHub "Require merge queue" rule,
@@ -758,6 +793,7 @@ impl Default for HookConfig {
             remote: String::from("origin"),
             branch: String::from("main"),
             ssh_signing_setup_script: None,
+            workflow_shipyard_version: Ok(None),
             push_mode: String::from("direct"),
             pr_branch_prefix: String::from("release/post-tag-sync"),
         }
@@ -819,6 +855,15 @@ fn load_hook_config(config: &LoadedConfig) -> HookConfig {
             .get("ssh_signing_setup_script")
             .and_then(toml::Value::as_str)
             .map(str::to_owned),
+        workflow_shipyard_version: match section.get("workflow_shipyard_version") {
+            None => Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(|value| Some(value.to_owned()))
+                .ok_or_else(|| {
+                    "release.post_tag_hook.workflow_shipyard_version must be a string".to_owned()
+                }),
+        },
         push_mode: section
             .get("push_mode")
             .and_then(toml::Value::as_str)
@@ -2086,7 +2131,7 @@ fn main() {
             &empty_config(),
             temp.path(),
             "shipyard-v*",
-            "v0.50.0",
+            Some("v0.50.0"),
             true,
             None,
         )
@@ -2107,6 +2152,172 @@ fn main() {
         assert_eq!(envelope["overwrote"], false);
         assert_eq!(envelope["shipyard_version"], "v0.50.0");
         assert_eq!(envelope["tag_pattern"], "shipyard-v*");
+    }
+
+    #[test]
+    fn hook_install_version_precedence_preserves_the_consumer_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workflow = temp
+            .path()
+            .join(".github")
+            .join("workflows")
+            .join(POST_TAG_WORKFLOW);
+        let configured = config_from_toml(
+            r#"
+[release.post_tag_hook]
+workflow_shipyard_version = "latest"
+"#,
+        );
+
+        hook_install(
+            &mut Vec::new(),
+            &empty_config(),
+            temp.path(),
+            "v*",
+            None,
+            false,
+            None,
+        )
+        .expect("default install");
+        assert!(
+            fs::read_to_string(&workflow)
+                .expect("default workflow")
+                .contains(&format!(
+                    r#"SHIPYARD_VERSION: "{}""#,
+                    env!("CARGO_PKG_VERSION")
+                ))
+        );
+
+        hook_install(
+            &mut Vec::new(),
+            &configured,
+            temp.path(),
+            "v*",
+            None,
+            false,
+            None,
+        )
+        .expect("configured install");
+        assert!(
+            fs::read_to_string(&workflow)
+                .expect("configured workflow")
+                .contains(r#"SHIPYARD_VERSION: "latest""#)
+        );
+
+        hook_install(
+            &mut Vec::new(),
+            &configured,
+            temp.path(),
+            "v*",
+            Some("v1.2.3"),
+            false,
+            None,
+        )
+        .expect("explicit install");
+        assert!(
+            fs::read_to_string(&workflow)
+                .expect("explicit workflow")
+                .contains(r#"SHIPYARD_VERSION: "v1.2.3""#)
+        );
+
+        let invalid_lower_precedence =
+            config_from_toml("[release.post_tag_hook]\nworkflow_shipyard_version = 'invalid'\n");
+        hook_install(
+            &mut Vec::new(),
+            &invalid_lower_precedence,
+            temp.path(),
+            "v*",
+            Some("2.3.4"),
+            false,
+            None,
+        )
+        .expect("explicit version overrides invalid lower-precedence config");
+        assert!(
+            fs::read_to_string(&workflow)
+                .expect("override workflow")
+                .contains(r#"SHIPYARD_VERSION: "2.3.4""#)
+        );
+    }
+
+    #[test]
+    fn hook_install_refuses_invalid_versions_before_writing() {
+        for invalid in [
+            "",
+            " latest",
+            "v1.2",
+            "v1.2.3-rc.1",
+            "v01.2.3",
+            "v1.2.3\nrun: arbitrary",
+            r#"v1.2.3\""#,
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let error = hook_install(
+                &mut Vec::new(),
+                &empty_config(),
+                temp.path(),
+                "v*",
+                Some(invalid),
+                false,
+                None,
+            )
+            .expect_err("invalid version");
+            assert!(error.message().contains("exact stable semantic version"));
+            assert!(!temp.path().join(".github").exists());
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let configured = config_from_toml(
+            "[release.post_tag_hook]\nworkflow_shipyard_version = 'v1.2.3-rc.1'\n",
+        );
+        hook_install(
+            &mut Vec::new(),
+            &configured,
+            temp.path(),
+            "v*",
+            None,
+            false,
+            None,
+        )
+        .expect_err("invalid configured version");
+        assert!(!temp.path().join(".github").exists());
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wrong_type =
+            config_from_toml("[release.post_tag_hook]\nworkflow_shipyard_version = 123\n");
+        let error = hook_install(
+            &mut Vec::new(),
+            &wrong_type,
+            temp.path(),
+            "v*",
+            None,
+            false,
+            None,
+        )
+        .expect_err("non-string configured version");
+        assert!(error.message().contains("must be a string"));
+        assert!(!temp.path().join(".github").exists());
+    }
+
+    #[test]
+    fn dogfood_workflow_is_the_exact_latest_renderer() {
+        let config = config_from_toml(include_str!("../../.shipyard/config.toml"));
+        let hook = load_hook_config(&config);
+        let configured = hook
+            .workflow_shipyard_version
+            .as_ref()
+            .expect("valid dogfood workflow version")
+            .as_deref()
+            .expect("dogfood workflow version");
+        assert_eq!(configured, "latest");
+        assert_eq!(
+            include_str!("../../.github/workflows/post-tag-sync.yml"),
+            render_workflow(
+                &hook.only_for_tag_pattern,
+                configured,
+                "ubuntu-latest",
+                hook.ssh_signing_setup_script.as_deref(),
+            )
+        );
     }
 
     #[test]
@@ -2186,7 +2397,7 @@ fn main() {
             &config,
             temp.path(),
             "v*",
-            "v0.79.0",
+            Some("v0.79.0"),
             true,
             Some(&gh),
         )
@@ -2214,6 +2425,7 @@ max_push_attempts = 2
 remote = "upstream"
 branch = "stable"
 ssh_signing_setup_script = "tools/configure-signing.sh"
+workflow_shipyard_version = "latest"
 
 [release.post_tag_hook.bot_identity]
 name = "release bot"
@@ -2243,6 +2455,14 @@ email = "bot@example.com"
         assert_eq!(
             parsed.ssh_signing_setup_script.as_deref(),
             Some("tools/configure-signing.sh")
+        );
+        assert_eq!(
+            parsed
+                .workflow_shipyard_version
+                .as_ref()
+                .expect("valid configured workflow version")
+                .as_deref(),
+            Some("latest")
         );
         assert_eq!(parsed.bot_name, "release bot");
         assert_eq!(parsed.bot_email, "bot@example.com");
