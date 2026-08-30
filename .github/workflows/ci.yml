@@ -84,10 +84,13 @@ jobs:
 
       - name: Run tests
         env:
+          # Never let a self-hosted runner's production Shipyard config alter
+          # unit-test routing, auth, or mutation authority.
+          SHIPYARD_TEST_HOME: ${{ runner.temp }}
           # The CLI dispatch enum is sized for the executable's normal stack.
           # Rust test-harness worker threads default smaller on Linux/Windows.
           RUST_MIN_STACK: 8388608
-        run: cargo test --all-targets --locked
+        run: cargo test --all-targets --locked --features ci-test-home
 
       - name: Run clippy
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -112,9 +115,12 @@ jobs:
 
       - name: Run coverage gate
         env:
+          # Coverage executes the same tests and must have the same clean
+          # machine-global Shipyard boundary on self-hosted runners.
+          SHIPYARD_TEST_HOME: ${{ runner.temp }}
           # Keep coverage's test workers identical to the ordinary test gate.
           RUST_MIN_STACK: 8388608
-        run: cargo llvm-cov --locked --summary-only --fail-under-lines 75
+        run: cargo llvm-cov --locked --features ci-test-home --summary-only --fail-under-lines 75
 
   packaging-helper:
     needs: resolve-runners

@@ -354,7 +354,9 @@ fn global_model_lease_path_ignores_cli_state_and_runtime_mode_overrides() {
             .join("merge-steward/recovery/global-model.lock")
     );
     assert_ne!(canonical, overridden.state_dir.join("global-model.lock"));
-    let normal_runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
+    let stable_home = stable_account_home().expect("stable account home");
+    let normal_runtime_paths =
+        RuntimePaths::for_platform(Platform::current(), &stable_home, RuntimeMode::Shipyard);
     assert_eq!(normal_runtime_paths.global_dir, canonical_paths.global_dir);
     assert_eq!(normal_runtime_paths.state_dir, canonical_paths.state_dir);
     ensure_canonical_recovery_paths(&canonical_paths.global_dir, &canonical_paths.state_dir)
@@ -423,6 +425,7 @@ fn canonical_recovery_authority_ignores_home_and_working_directory() {
             .env(PROBE_ENV, "1")
             .env(EXPECTED_GLOBAL_ENV, &canonical.global_dir)
             .env(EXPECTED_STATE_ENV, &canonical.state_dir)
+            .env_remove("SHIPYARD_TEST_HOME")
             .env_remove("USERPROFILE");
         if let Some(home) = home {
             command.env("HOME", home);

@@ -59,6 +59,9 @@ trailers = [
 ]
 only_for_tag_pattern = "v*"
 max_push_attempts    = 5
+# Optional: exact stable version or `latest`. When omitted, hook install
+# pins the version of the CLI doing the rendering.
+# workflow_shipyard_version = "v0.127.2"
 
 [release.post_tag_hook.bot_identity]
 name  = "shipyard-release-bot"
@@ -68,6 +71,12 @@ email = "shipyard-release-bot@users.noreply.github.com"
 ## The installed workflow
 
 `shipyard release-bot hook install` drops `.github/workflows/post-tag-sync.yml`. Shipyard owns this file — re-running install overwrites it in place; removing the hook is a plain `rm`. No YAML surgery on your existing `auto-release.yml`.
+
+The CLI flag `--shipyard-version` takes precedence over
+`release.post_tag_hook.workflow_shipyard_version`; when neither is set, the
+workflow pins the generating CLI version. `latest` is an explicit opt-in for a
+repository whose tag workflow runs before its own release artifacts publish.
+Consumer repositories should normally retain the exact-version default.
 
 The workflow:
 

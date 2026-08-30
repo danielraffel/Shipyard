@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +11,9 @@ use crate::writer_domain_lease::{
 };
 
 use super::CliFailure;
+
+const PROCESS_GROUP_NOT_ALIVE_ERROR: &str =
+    "host-pool lease I/O failed: exclusive sandbox process group is not alive";
 
 pub(super) fn sandbox_audit_exec_command(
     state_dir: &Path,
@@ -105,37 +108,8 @@ fn run_admitted_audit(
             ),
         ));
     }
-    let status = loop {
-        match worker.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if let Err(error) =
-                    capacity.verify_exclusive_process(work_id, authority_sha, &generation, pid)
-                {
-                    let _ = crate::worker_process_custody::terminate_child_tree(&mut worker);
-                    let _ = worker.wait();
-                    let _ = capacity.clear_exclusive_process(work_id, authority_sha, &generation);
-                    return Err(CliFailure::new(
-                        WRITER_DOMAIN_OVERLAP_EXIT_CODE,
-                        format!(
-                            "{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: sandbox process custody was lost: {error}"
-                        ),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => {
-                let _ = crate::worker_process_custody::terminate_child_tree(&mut worker);
-                let _ = worker.wait();
-                return Err(CliFailure::new(
-                    WRITER_DOMAIN_OVERLAP_EXIT_CODE,
-                    format!(
-                        "{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: could not observe sandbox audit worker: {error}"
-                    ),
-                ));
-            }
-        }
-    };
+    let status =
+        wait_for_admitted_worker(capacity, work_id, authority_sha, &generation, &mut worker)?;
     capacity
         .clear_exclusive_process(work_id, authority_sha, &generation)
         .map_err(|error| {
@@ -147,6 +121,80 @@ fn run_admitted_audit(
             )
         })?;
     Ok(exit_code(status.code(), status.success()))
+}
+
+fn wait_for_admitted_worker(
+    capacity: &DaemonWorkerCapacity,
+    work_id: &str,
+    authority_sha: &str,
+    generation: &str,
+    worker: &mut Child,
+) -> Result<ExitStatus, CliFailure> {
+    wait_for_admitted_worker_with_hook(capacity, work_id, authority_sha, generation, worker, || {})
+}
+
+fn wait_for_admitted_worker_with_hook(
+    capacity: &DaemonWorkerCapacity,
+    work_id: &str,
+    authority_sha: &str,
+    generation: &str,
+    worker: &mut Child,
+    mut after_running_observed: impl FnMut(),
+) -> Result<ExitStatus, CliFailure> {
+    loop {
+        match worker.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                after_running_observed();
+                if let Err(error) = capacity.verify_exclusive_process(
+                    work_id,
+                    authority_sha,
+                    generation,
+                    worker.id(),
+                ) {
+                    if error == PROCESS_GROUP_NOT_ALIVE_ERROR {
+                        // The worker may exit normally between the first try_wait and
+                        // the process-group probe. Only that exact terminal observation
+                        // is ambiguous; authority and birth-identity failures stay fatal.
+                        match worker.try_wait() {
+                            Ok(Some(status)) => return Ok(status),
+                            Ok(None) => {}
+                            Err(observe_error) => {
+                                let _ = crate::worker_process_custody::terminate_child_tree(worker);
+                                let _ = worker.wait();
+                                return Err(CliFailure::new(
+                                    WRITER_DOMAIN_OVERLAP_EXIT_CODE,
+                                    format!(
+                                        "{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: could not observe sandbox audit worker after its process group exited: {observe_error}"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    let _ = crate::worker_process_custody::terminate_child_tree(worker);
+                    let _ = worker.wait();
+                    let _ = capacity.clear_exclusive_process(work_id, authority_sha, generation);
+                    return Err(CliFailure::new(
+                        WRITER_DOMAIN_OVERLAP_EXIT_CODE,
+                        format!(
+                            "{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: sandbox process custody was lost: {error}"
+                        ),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                let _ = crate::worker_process_custody::terminate_child_tree(worker);
+                let _ = worker.wait();
+                return Err(CliFailure::new(
+                    WRITER_DOMAIN_OVERLAP_EXIT_CODE,
+                    format!(
+                        "{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: could not observe sandbox audit worker: {error}"
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 pub(super) fn sandbox_audit_worker_command(
@@ -293,5 +341,109 @@ mod tests {
         assert!(error.message.contains(WRITER_DOMAIN_OVERLAP_CLASSIFICATION));
         assert!(error.message.contains("sandbox_queue_not_idle"));
         assert!(!invoked.exists(), "refused audit must not start its child");
+    }
+
+    #[test]
+    fn worker_exit_between_running_observation_and_group_verification_is_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let capacity = DaemonWorkerCapacity::new(temp.path());
+        let exclusive = capacity
+            .claim_exclusive_sandbox_if_queue_idle(temp.path(), "audit-race", "authority")
+            .expect("admission");
+        let ExclusiveSandboxAdmission::Acquired(exclusive) = exclusive else {
+            panic!("exclusive sandbox admission");
+        };
+        let release = temp.path().join("release-worker");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "while [ ! -e \"$1\" ]; do sleep 0.01; done",
+                "shipyard-sandbox-race",
+            ])
+            .arg(&release)
+            .process_group(0);
+        let mut worker = command.spawn().expect("worker");
+        let pid = worker.id();
+        let identity = capture_process_start_identity(pid).expect("birth identity");
+        capacity
+            .bind_exclusive_process("audit-race", "authority", "generation-race", pid, identity)
+            .expect("bind process");
+
+        let mut released = false;
+        let status = wait_for_admitted_worker_with_hook(
+            &capacity,
+            "audit-race",
+            "authority",
+            "generation-race",
+            &mut worker,
+            || {
+                assert!(
+                    !released,
+                    "worker must exit after the first running observation"
+                );
+                released = true;
+                std::fs::write(&release, b"release\n").expect("release worker");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while crate::worker_process_custody::process_group_liveness(pid)
+                    .expect("process-group liveness")
+                    != crate::worker_process_custody::ProcessLiveness::Dead
+                {
+                    assert!(Instant::now() < deadline, "worker process group must exit");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            },
+        )
+        .expect("normal completion after process-group disappearance");
+
+        assert!(released);
+        assert!(status.success());
+        capacity
+            .clear_exclusive_process("audit-race", "authority", "generation-race")
+            .expect("clear process");
+        drop(exclusive);
+        assert!(
+            capacity
+                .claim_or_heartbeat(&DaemonWorkerClaim::queue("queue-after-race", "sha"))
+                .expect("capacity released")
+        );
+    }
+
+    #[test]
+    fn worker_authority_mismatch_remains_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let capacity = DaemonWorkerCapacity::new(temp.path());
+        let exclusive = capacity
+            .claim_exclusive_sandbox_if_queue_idle(temp.path(), "audit-authority", "authority")
+            .expect("admission");
+        let ExclusiveSandboxAdmission::Acquired(_exclusive) = exclusive else {
+            panic!("exclusive sandbox admission");
+        };
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let mut worker = command.spawn().expect("worker");
+        let identity = capture_process_start_identity(worker.id()).expect("birth identity");
+        capacity
+            .bind_exclusive_process(
+                "audit-authority",
+                "authority",
+                "generation-authority",
+                worker.id(),
+                identity,
+            )
+            .expect("bind process");
+
+        let error = wait_for_admitted_worker_with_hook(
+            &capacity,
+            "audit-authority",
+            "wrong-authority",
+            "generation-authority",
+            &mut worker,
+            || {},
+        )
+        .expect_err("authority mismatch must fail closed");
+
+        assert_eq!(error.code, WRITER_DOMAIN_OVERLAP_EXIT_CODE);
+        assert!(error.message.contains("receipt authority mismatch"));
     }
 }

@@ -121,6 +121,15 @@ locks from before snapshotting through the final contamination assertion. Do
 not add filename-, PID-, queue-ID-, log-, or evidence-path exemptions: a
 protected write is either fenced by the lease or it remains contamination.
 
+The standalone `scripts/shipyard-github-app-token` helper participates in this
+same domain when its optional disk cache is under a real Shipyard protected
+root. Cache reads and GitHub requests remain outside the lease; cache directory
+creation and the atomic token replacement acquire the fair turnstile and shared
+domain lease on Unix/macOS. Contention keeps the cache untouched and exits `75`
+with `sandbox_writer_domain_overlap`. Windows disk caching remains fail-closed
+until private ACL validation and an equivalent writer-domain implementation
+exist.
+
 The audit waits up to five seconds for an active mutation. A production
 mutation arriving during an audit waits up to 30 seconds, then propagates exit
 `75` with the stable `sandbox_writer_domain_overlap` classification. That result
@@ -419,11 +428,15 @@ first failure.
 
 Before any host can mutate, Shipyard resolves the exact annotated tag object,
 commit, tree, release ID, checksum-manifest asset, and macOS DMG asset. It
-downloads both assets by ID, verifies their GitHub SHA-256 values and exact
-manifest entry, and requires DMG `gh attestation verify` proof from
+streams both assets by immutable ID into owner-private hard-capped staging,
+verifies the exact declared byte count, GitHub SHA-256 values, and manifest
+entry, and requires DMG `gh attestation verify` proof from
 `danielraffel/Shipyard/.github/workflows/release.yml` at the exact tag ref and
 source commit. A tag string or locally asserted receipt is never source
 authority. A missing DMG attestation keeps the release ineligible. Shipyard
+uses one process-tree deadline for the producer and bounded nonblocking capture
+so overflow, partial files, noisy diagnostics, or escaped pipe holders cannot
+grow disk use or wedge cleanup. Shipyard
 closes the authority-mint window by re-reading the tag, release ID, and asset
 inventory, then freezes that exact authority for the rollout. Each host must
 return the frozen authority and platform-asset digests; Shipyard never remints
@@ -454,6 +467,12 @@ first attach the deterministic local PR branch and then use Shipyard's
 supervised push with the fully qualified `HEAD:refs/heads/<branch>` refspec.
 The full refspec alone is insufficient in repositories whose pre-push hook
 rejects detached HEAD or requires `SHIPYARD_PR_RUNNING=1`.
+Generated consumer workflows install the exact generating CLI by default. A
+repository whose post-tag hook runs while its own new release is still draft
+may explicitly set `release.post_tag_hook.workflow_shipyard_version =
+"latest"` to use the latest already-published CLI. Only exact stable
+optional-`v` semver or `latest` is valid; invalid configuration must refuse
+before overwriting the workflow, and an explicit CLI override has precedence.
 Repositories that require signed bot commits should set
 `release.post_tag_hook.ssh_signing_setup_script` to a safe repository-relative
 helper path. Hook installation then regenerates the required secret-backed SSH

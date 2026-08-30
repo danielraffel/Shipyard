@@ -115,6 +115,10 @@ impl RuntimePaths {
 }
 
 pub(crate) fn home_dir() -> PathBuf {
+    #[cfg(any(test, feature = "ci-test-home"))]
+    if let Some(test_home) = env::var_os("SHIPYARD_TEST_HOME") {
+        return PathBuf::from(test_home);
+    }
     env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))

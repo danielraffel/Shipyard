@@ -59,6 +59,7 @@ Exit codes: `0` clean, `1` drift, `2` config missing / tag missing.
 | `trailers` | Commit trailers appended to the docs-sync commit. | three `*: skip` trailers |
 | `only_for_tag_pattern` | Glob restricting which tags trigger sync. | `v*` |
 | `max_push_attempts` | Rebase-retry attempts before giving up. | `5` |
+| `workflow_shipyard_version` | Exact stable Shipyard version installed by the generated workflow, or explicit `latest`. CLI `--shipyard-version` overrides it. | generating CLI version |
 | `bot_identity.name` / `bot_identity.email` | git committer identity for the bot commit. | `shipyard-release-bot` |
 
 ## Two capabilities, separately usable
@@ -68,7 +69,7 @@ Exit codes: `0` clean, `1` drift, `2` config missing / tag missing.
 
 ## Workflow-file upgrades are explicit
 
-The shipped `.github/workflows/post-tag-sync.yml` pins `SHIPYARD_VERSION` to whatever shipyard rendered it. Re-run `shipyard release-bot hook install` after upgrading the local CLI to refresh the pin — otherwise the workflow keeps installing the older version even after you upgrade. Pinning is intentional (consumer protection from drift); explicit re-install is the upgrade path.
+The shipped `.github/workflows/post-tag-sync.yml` pins `SHIPYARD_VERSION` to whatever shipyard rendered it. Re-run `shipyard release-bot hook install` after upgrading the local CLI to refresh the pin — otherwise the workflow keeps installing the older version even after you upgrade. Pinning is intentional (consumer protection from drift); explicit re-install is the upgrade path. Repositories whose tag workflow races publication of their own Shipyard artifacts may explicitly set `workflow_shipyard_version = "latest"`; ordinary consumers should keep the exact-version default.
 
 The install step pipes to `bash`, not `sh` — `dash` (Ubuntu's `/bin/sh`) rejects `set -o pipefail` used by the install script. Tests guard this.
 

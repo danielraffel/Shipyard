@@ -9,14 +9,17 @@ production daemon process even when the launching shell disappears.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import ctypes.util
 import fcntl
 import hashlib
 import json
 import os
+import secrets
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -53,12 +56,33 @@ class OwnerEnded(RuntimeError):
     """The Actions owner exited or was cancelled before writing done."""
 
 
+class ReconciledAfterOwnerEnded(RuntimeError):
+    """A retained lease was repaired after its new Actions owner departed."""
+
+
+class LeaseCreationCommitted(GuardianError):
+    """Lease rename committed, but its parent durability check failed."""
+
+    def __init__(
+        self, message: str, metadata: os.stat_result, generation: str
+    ) -> None:
+        super().__init__(message)
+        self.metadata = metadata
+        self.generation = generation
+
+
 LEGACY_TRANSITION = "legacy-lifetime-lock-quiesce-restore"
 CORRECTED_TRANSITION = "corrected-idle-preserve-fence"
 WRITER_DOMAIN_OVERLAP_EXIT_CODE = 75
 WRITER_DOMAIN_OVERLAP_CLASSIFICATION = "sandbox_writer_domain_overlap"
 PROTECTED_STDIO_PATH_ENV = "SHIPYARD_PROTECTED_STDIO_PATH"
 LEGACY_LIFETIME_LOCK_VERSION = "0.108.1"
+RETAINED_RECONCILIATION_REASON = "retained-lease-awaiting-idle"
+RETAINED_RECONCILED_REASON = "retained-lease-reconciled"
+RETAINED_RECONCILIATION_MAX_SECONDS = 6 * 60 * 60
+LEASE_GENERATION_MARKER = ".shipyard-lease-generation.json"
+LEASE_PHASE_ACQUIRING = "acquiring"
+LEASE_PHASE_TRANSITIONING = "transitioning"
 
 
 @dataclass(frozen=True)
@@ -92,6 +116,35 @@ def _atomic_json(path: Path, payload: dict[str, object]) -> None:
     temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     temporary.chmod(0o600)
     os.replace(temporary, path)
+
+
+def _durable_atomic_json(path: Path, payload: dict[str, object]) -> None:
+    """Atomically publish recovery authority and fsync bytes plus directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _sha256(path: Path) -> str:
@@ -291,6 +344,291 @@ def _pid_alive(pid: int) -> bool:
         return True
     except ProcessLookupError:
         return False
+
+
+def _json_object(path: Path) -> dict[str, object]:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+    ):
+        raise GuardianError(f"retained-lease evidence has unsafe metadata: {path}")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise GuardianError(
+                    f"retained-lease evidence changed while opening: {path}"
+                )
+            payload = handle.read(1024 * 1024 + 1)
+        if len(payload) > 1024 * 1024:
+            raise GuardianError(f"retained-lease evidence is oversized: {path}")
+        value = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as error:
+        raise GuardianError(f"could not read retained-lease evidence {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise GuardianError(f"retained-lease evidence is not an object: {path}")
+    return value
+
+
+def _validate_private_directory(path: Path) -> os.stat_result:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != os.getuid()
+    ):
+        raise GuardianError(f"retained-lease directory has unsafe metadata: {path}")
+    return metadata
+
+
+def _lease_generation_state(path: Path) -> tuple[os.stat_result, str, str]:
+    """Authenticate one private lease directory and its random generation."""
+    metadata = _validate_private_directory(path)
+    entries = tuple(path.iterdir())
+    marker = path / LEASE_GENERATION_MARKER
+    if entries != (marker,):
+        raise GuardianError("retained lease has unexpected generation contents")
+    payload = _json_object(marker)
+    generation = payload.get("generation")
+    phase = payload.get("phase")
+    if (
+        payload.get("schema_version") != 1
+        or not isinstance(generation, str)
+        or len(generation) != 64
+        or any(character not in "0123456789abcdef" for character in generation)
+        or phase not in (LEASE_PHASE_ACQUIRING, LEASE_PHASE_TRANSITIONING)
+    ):
+        raise GuardianError("retained lease generation marker is invalid")
+    return metadata, generation, phase
+
+
+def _validate_lease_generation(path: Path) -> tuple[os.stat_result, str]:
+    metadata, generation, _ = _lease_generation_state(path)
+    return metadata, generation
+
+
+def _create_lease_generation(path: Path) -> tuple[os.stat_result, str]:
+    generation = secrets.token_hex(32)
+    staging = path.with_name(f".{path.name}.creating-{generation}")
+    if staging.exists() or staging.is_symlink():
+        raise GuardianError("lease generation staging path already exists")
+    os.mkdir(staging, 0o700)
+    committed = False
+    staged_metadata = _validate_private_directory(staging)
+    try:
+        _durable_atomic_json(
+            staging / LEASE_GENERATION_MARKER,
+            {
+                "schema_version": 1,
+                "generation": generation,
+                "phase": LEASE_PHASE_ACQUIRING,
+            },
+        )
+        staged_metadata, observed, phase = _lease_generation_state(staging)
+        if observed != generation or phase != LEASE_PHASE_ACQUIRING:
+            raise GuardianError("new lease generation marker changed during creation")
+        if path.exists() or path.is_symlink():
+            raise GuardianError("host lease appeared during generation preparation")
+        os.rename(staging, path)
+        committed = True
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+        metadata, observed, phase = _lease_generation_state(path)
+        if (
+            (metadata.st_dev, metadata.st_ino)
+            != (staged_metadata.st_dev, staged_metadata.st_ino)
+            or observed != generation
+            or phase != LEASE_PHASE_ACQUIRING
+        ):
+            raise GuardianError("committed lease generation changed during creation")
+        return metadata, generation
+    except Exception as error:
+        if committed:
+            try:
+                metadata, observed, _ = _lease_generation_state(path)
+            except Exception:
+                raise
+            if (
+                (metadata.st_dev, metadata.st_ino)
+                != (staged_metadata.st_dev, staged_metadata.st_ino)
+                or observed != generation
+            ):
+                raise GuardianError(
+                    "committed lease identity changed after creation failure"
+                ) from error
+            raise LeaseCreationCommitted(
+                f"lease creation committed before durability failure: {error}",
+                metadata,
+                generation,
+            ) from error
+        metadata = _validate_private_directory(staging)
+        if (metadata.st_dev, metadata.st_ino) != (
+            staged_metadata.st_dev,
+            staged_metadata.st_ino,
+        ):
+            raise GuardianError("uncommitted lease staging identity changed") from error
+        entries = tuple(staging.iterdir())
+        marker = staging / LEASE_GENERATION_MARKER
+        if entries == (marker,):
+            _, observed = _validate_lease_generation(staging)
+            if observed != generation:
+                raise GuardianError("uncommitted lease staging generation changed") from error
+            marker.unlink()
+        elif entries:
+            raise GuardianError("uncommitted lease staging contents changed") from error
+        os.rmdir(staging)
+        raise
+
+
+def _advance_lease_generation(
+    path: Path,
+    expected_identity: tuple[int, int, int],
+    expected_generation: str,
+) -> os.stat_result:
+    metadata, generation, phase = _lease_generation_state(path)
+    if (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns) != expected_identity:
+        raise GuardianError("lease identity changed before transition")
+    if generation != expected_generation or phase != LEASE_PHASE_ACQUIRING:
+        raise GuardianError("lease generation cannot enter transition")
+    _durable_atomic_json(
+        path / LEASE_GENERATION_MARKER,
+        {
+            "schema_version": 1,
+            "generation": generation,
+            "phase": LEASE_PHASE_TRANSITIONING,
+        },
+    )
+    advanced, observed, observed_phase = _lease_generation_state(path)
+    if (
+        (advanced.st_dev, advanced.st_ino) != (metadata.st_dev, metadata.st_ino)
+        or observed != generation
+        or observed_phase != LEASE_PHASE_TRANSITIONING
+    ):
+        raise GuardianError("lease generation changed while entering transition")
+    return advanced
+
+
+def _remove_generation_bound_lease(
+    path: Path,
+    expected_identity: tuple[int, int, int],
+    expected_generation: str,
+) -> None:
+    """Atomically detach a generation before deleting its private marker."""
+    metadata, generation = _validate_lease_generation(path)
+    if (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns) != expected_identity:
+        raise GuardianError("refusing to release a replaced host lease")
+    if generation != expected_generation:
+        raise GuardianError("refusing to release a different host lease generation")
+    tombstone = path.with_name(f".{path.name}.removed-{generation}")
+    if tombstone.exists() or tombstone.is_symlink():
+        raise GuardianError("host lease removal tombstone already exists")
+    os.rename(path, tombstone)
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    marker = tombstone / LEASE_GENERATION_MARKER
+    moved_metadata, moved_generation = _validate_lease_generation(tombstone)
+    # The rename itself changes directory ctime on supported hosts.  Device and
+    # inode must survive the detach; the random generation authenticates that
+    # it is the same lease rather than an inode-reuse collision.
+    if (moved_metadata.st_dev, moved_metadata.st_ino) != expected_identity[:2]:
+        raise GuardianError("detached host lease identity changed")
+    if moved_generation != expected_generation:
+        raise GuardianError("detached host lease generation changed")
+    marker.unlink()
+    os.rmdir(tombstone)
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+def _open_verified_private_lock(path: Path):
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as error:
+        raise GuardianError(f"could not safely open lock {path}: {error}") from error
+    handle = os.fdopen(descriptor, "a+b")
+    metadata = os.fstat(handle.fileno())
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+    ):
+        handle.close()
+        raise GuardianError(f"lock metadata is unsafe: {path}")
+    _validate_open_lock_path(path, metadata)
+    return handle
+
+
+def _validate_open_lock_path(path: Path, opened: os.stat_result) -> None:
+    current = path.lstat()
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        raise GuardianError(f"lock identity changed: {path}")
+
+
+def _argument_value(argv: tuple[str, ...], name: str) -> Optional[str]:
+    for index, argument in enumerate(argv[:-1]):
+        if argument == name:
+            return argv[index + 1]
+    return None
+
+
+def _is_guardian_argv_for_lease(argv: tuple[str, ...], lease_dir: Path) -> bool:
+    script_positions = argv[:2]
+    return (
+        any(Path(argument).name == "sandbox-daemon-guardian.py" for argument in script_positions)
+        and _argument_value(argv, "--lease-dir") == str(lease_dir)
+    )
+
+
+def _live_guardians_for_lease(lease_dir: Path) -> tuple[int, ...]:
+    """Return exact live guardian argv owners, excluding this process."""
+    result = subprocess.run(
+        ["/usr/bin/pgrep", "-f", "sandbox-daemon-guardian.py"],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+    if result.returncode not in (0, 1) or result.stderr.strip():
+        raise GuardianError(
+            "could not inspect retained-lease guardians: "
+            f"returncode={result.returncode}, stderr={result.stderr.strip()!r}"
+        )
+    owners: list[int] = []
+    for line in result.stdout.splitlines():
+        if not line.isdigit():
+            raise GuardianError(f"invalid guardian pid result: {line!r}")
+        pid = int(line)
+        if pid == os.getpid():
+            continue
+        try:
+            _, argv, _ = _darwin_argv_environment(pid)
+        except (OSError, GuardianError):
+            if _pid_alive(pid):
+                raise GuardianError(f"could not authenticate possible guardian pid {pid}")
+            continue
+        if _is_guardian_argv_for_lease(argv, lease_dir):
+            owners.append(pid)
+    return tuple(sorted(owners))
 
 
 def _bounded_timeout(deadline: Optional[float], default: float = 15.0) -> float:
@@ -874,6 +1212,11 @@ class Guardian:
         self.ready_receipt = Path(args.ready_receipt)
         self.final_receipt = Path(args.final_receipt)
         self.lease_dir = Path(args.lease_dir)
+        self.reconciliation_receipt = self.root / "retained-reconciliation.json"
+        self.reconciliation_intent = self.root / "retained-reconciliation-intent.json"
+        self.reconciliation_lock = self.lease_dir.with_name(
+            f".{self.lease_dir.name}.reconcile.lock"
+        )
         self.production_pid_file = Path(args.production_pid_file)
         self.production_state_dir = self.production_pid_file.parent.parent
         self.audit_ready_file = self.root / "exclusive-audit-ready"
@@ -891,6 +1234,10 @@ class Guardian:
         self.owner_start = _process_start(args.owner_pid)
         self.stop_requested = False
         self.lease_owned = False
+        self.lease_device: Optional[int] = None
+        self.lease_inode: Optional[int] = None
+        self.lease_ctime_ns: Optional[int] = None
+        self.lease_generation: Optional[str] = None
         self.production_stop_requested = False
         self.production_quiesced = False
         self.production_restored = False
@@ -899,20 +1246,473 @@ class Guardian:
         self.mutation_fence_proved = False
         self.candidate_stopped = True
         self.failure: Optional[str] = None
+        self.reconciled_prior_canary_root: Optional[str] = None
 
     def request_stop(self, _signum: int, _frame: object) -> None:
         self.stop_requested = True
+
+    @contextlib.contextmanager
+    def retained_reconciliation_lock(self):
+        self.reconciliation_lock.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(
+                self.reconciliation_lock,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError as error:
+            raise GuardianError(
+                f"could not safely open retained reconciliation lock: {error}"
+            ) from error
+        with os.fdopen(descriptor, "a+b") as handle:
+            metadata = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+            ):
+                raise GuardianError("retained reconciliation lock metadata is unsafe")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                path_metadata = self.reconciliation_lock.lstat()
+                if (path_metadata.st_dev, path_metadata.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    raise GuardianError(
+                        "retained reconciliation lock identity changed"
+                    )
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def retained_legacy_evidence(self) -> tuple[Path, dict[str, object], dict[str, object]]:
+        """Authenticate the one prior corrected guardian that retained this lease."""
+        prefix = self.lease_dir.name
+        if prefix.endswith("-lease"):
+            prefix = prefix[: -len("-lease")]
+        roots: list[Path] = []
+        receipts: list[tuple[Path, dict[str, object]]] = []
+        for root in sorted(self.lease_dir.parent.glob(f"{prefix}-[0-9]*-[0-9]*")):
+            _validate_private_directory(root)
+            roots.append(root)
+            receipt_path = root / "guardian-receipt.json"
+            if not receipt_path.is_file():
+                continue
+            receipt = _json_object(receipt_path)
+            receipts.append((root, receipt))
+        reconciled_roots = {
+            receipt.get("reconciled_prior_canary_root")
+            for _, receipt in receipts
+            if receipt.get("reason") in ("completed", RETAINED_RECONCILED_REASON)
+            and receipt.get("failure") is None
+            and receipt.get("candidate_stopped") is True
+            and receipt.get("production_identity_verified") is True
+            and receipt.get("production_preserved") is True
+            and receipt.get("lease_removed") is True
+            and receipt.get("transition_path") == CORRECTED_TRANSITION
+            and isinstance(receipt.get("reconciled_prior_canary_root"), str)
+        }
+        current_lease, current_generation = _validate_lease_generation(self.lease_dir)
+        current_lease_identity = (
+            current_lease.st_dev,
+            current_lease.st_ino,
+            current_lease.st_ctime_ns,
+            current_generation,
+        )
+        prepared_intents: list[dict[str, object]] = []
+        for root in roots:
+            intent_path = root / "retained-reconciliation-intent.json"
+            if not intent_path.is_file():
+                continue
+            intent = _json_object(intent_path)
+            if (
+                intent.get("schema_version") == 1
+                and intent.get("transition_path") == CORRECTED_TRANSITION
+                and intent.get("mutation_fence_proved") is True
+                and isinstance(intent.get("prior_canary_root"), str)
+                and isinstance(intent.get("lease_device"), int)
+                and isinstance(intent.get("lease_inode"), int)
+                and isinstance(intent.get("lease_ctime_ns"), int)
+                and isinstance(intent.get("lease_generation"), str)
+                and (
+                    intent.get("lease_device"),
+                    intent.get("lease_inode"),
+                    intent.get("lease_ctime_ns"),
+                    intent.get("lease_generation"),
+                )
+                != current_lease_identity
+            ):
+                prepared_intents.append(intent)
+        retained = [
+            (root, receipt)
+            for root, receipt in receipts
+            if receipt.get("lease_retained") is True
+            and (
+                receipt.get("lease_device"),
+                receipt.get("lease_inode"),
+                receipt.get("lease_ctime_ns"),
+                receipt.get("lease_generation"),
+            )
+            == current_lease_identity
+            and str(root) not in reconciled_roots
+            and not any(
+                intent.get("prior_canary_root") == str(root)
+                and intent.get("old_production_pid")
+                == receipt.get("old_production_pid")
+                and intent.get("old_production_start_time")
+                == receipt.get("old_production_start_time")
+                and intent.get("installed_sha256")
+                == receipt.get("installed_sha256")
+                for intent in prepared_intents
+            )
+        ]
+        if len(retained) != 1:
+            raise GuardianError(
+                "empty retained lease lacks one unambiguous prior receipt: "
+                f"found={len(retained)}"
+            )
+        prior_root, receipt = retained[0]
+        ready = _json_object(prior_root / "ready.json")
+        mutation = _json_object(prior_root / "mutation-fence.json")
+        failure = receipt.get("failure")
+        allowed_failure = (
+            isinstance(failure, str)
+            and "active workers changed during idle wait" in failure
+            and "preserved active worker ownership differs" in failure
+        )
+        required = (
+            receipt.get("schema_version") == 1,
+            receipt.get("transition_path") == CORRECTED_TRANSITION,
+            receipt.get("candidate_stopped") is True,
+            receipt.get("production_quiesced") is False,
+            receipt.get("production_restored") is False,
+            receipt.get("mutation_fence_proved") is True,
+            receipt.get("old_lifetime_lock_owned") is False,
+            receipt.get("lease_removed") is False,
+            receipt.get("active_runs") == [],
+            ready.get("transition_path") == CORRECTED_TRANSITION,
+            mutation.get("transition_path") == CORRECTED_TRANSITION,
+            mutation.get("returncode") == WRITER_DOMAIN_OVERLAP_EXIT_CODE,
+            mutation.get("overlap_classification")
+            == WRITER_DOMAIN_OVERLAP_CLASSIFICATION,
+            mutation.get("mutation_absent") is True,
+            mutation.get("selected_path_absent") is True,
+            allowed_failure,
+        )
+        if not all(required):
+            raise GuardianError("prior retained-lease receipt is not safely reconcilable")
+        candidate_pid = ready.get("candidate_pid")
+        if not isinstance(candidate_pid, int) or isinstance(candidate_pid, bool):
+            raise GuardianError("prior retained-lease candidate pid is invalid")
+        if _pid_alive(candidate_pid):
+            raise GuardianError(f"prior candidate pid {candidate_pid} is still alive")
+        for field in (
+            "installed_sha256",
+            "production_pid",
+            "production_start_time",
+        ):
+            receipt_field = "old_production_pid" if field == "production_pid" else (
+                "old_production_start_time" if field == "production_start_time" else field
+            )
+            if ready.get(field) != receipt.get(receipt_field):
+                raise GuardianError(f"prior retained-lease {field} evidence disagrees")
+        if ready.get("candidate_sha256") != receipt.get("candidate_sha256"):
+            raise GuardianError("prior retained-lease candidate hash disagrees")
+        if mutation.get("production_pid") != receipt.get("old_production_pid") or mutation.get(
+            "production_start_time"
+        ) != receipt.get("old_production_start_time"):
+            raise GuardianError("prior retained-lease mutation identity disagrees")
+        return prior_root, receipt, ready
+
+    def snapshot_reconciliation_production(
+        self, prior: dict[str, object]
+    ) -> tuple[ProcessSnapshot, tuple[str, ...]]:
+        pid_text = self.production_pid_file.read_text(encoding="utf-8").strip()
+        snapshot = snapshot_process(int(pid_text))
+        installed_hash = _sha256(self.installed)
+        configured_repos = _configured_repos(
+            snapshot,
+            self.installed,
+            diagnostic_root=self.root,
+            state_dir=self.production_state_dir,
+        )
+        expected = {
+            "old_production_pid": snapshot.pid,
+            "old_production_start_time": snapshot.start_time,
+            "installed_sha256": installed_hash,
+            "argv_sha256": snapshot.argv_sha256,
+            "environment_sha256": snapshot.environment_sha256,
+            "cwd": snapshot.cwd,
+            "mode": _mode_arg(snapshot.argv),
+            "configured_repos": list(configured_repos),
+        }
+        for field, value in expected.items():
+            if prior.get(field) != value:
+                raise GuardianError(f"retained-lease production authority changed: {field}")
+        if Path(snapshot.executable).resolve() != self.installed.resolve():
+            raise GuardianError("retained-lease daemon executable changed")
+        if configured_repos != _repo_args(snapshot.argv):
+            raise GuardianError("retained-lease repository authority disagrees with argv")
+        self.snapshot = snapshot
+        self.installed_hash = installed_hash
+        self.candidate_hash = _sha256(self.candidate)
+        self.configured_repos = configured_repos
+        self.worker_ids = ()
+        self.lock_path = self.production_state_dir / ".sandbox-writer-domain.lock"
+        self.transition_path = CORRECTED_TRANSITION
+        self.old_lifetime_lock_owned = False
+        self.mutation_fence_proved = True
+        return snapshot, configured_repos
+
+    def verify_reconciliation_production(self) -> tuple[str, ...]:
+        snapshot = self.snapshot
+        if snapshot is None:
+            raise GuardianError("retained-lease production snapshot is unavailable")
+        if _sha256(self.installed) != self.installed_hash:
+            raise GuardianError("installed production binary changed during reconciliation")
+        current_pid = int(self.production_pid_file.read_text(encoding="utf-8").strip())
+        if current_pid != snapshot.pid:
+            raise GuardianError("production daemon pid changed during reconciliation")
+        current = snapshot_process(current_pid)
+        self.assert_process_identity(current, require_same_pid=True)
+        repos = _configured_repos(
+            current,
+            self.installed,
+            diagnostic_root=self.root,
+            state_dir=self.production_state_dir,
+        )
+        if repos != self.configured_repos:
+            raise GuardianError("configured repositories changed during reconciliation")
+        return _active_runs(
+            current,
+            self.installed,
+            state_dir=self.production_state_dir,
+            diagnostic_root=self.root,
+        )
+
+    def write_reconciliation_receipt(
+        self,
+        *,
+        reason: str,
+        prior_root: Path,
+        active_runs: tuple[str, ...],
+        lease_device: int,
+        lease_inode: int,
+        lease_ctime_ns: int,
+        lease_generation: str,
+    ) -> None:
+        snapshot = self.snapshot
+        _durable_atomic_json(
+            self.reconciliation_receipt,
+            {
+                "schema_version": 1,
+                "reason": reason,
+                "guardian_pid": os.getpid(),
+                "guardian_start_time": _process_start(os.getpid()),
+                "lease_dir": str(self.lease_dir),
+                "lease_device": lease_device,
+                "lease_inode": lease_inode,
+                "lease_ctime_ns": lease_ctime_ns,
+                "lease_generation": lease_generation,
+                "prior_canary_root": str(prior_root),
+                "candidate_stopped": True,
+                "production_quiesced": False,
+                "production_restored": False,
+                "transition_path": CORRECTED_TRANSITION,
+                "mutation_fence_proved": True,
+                "old_production_pid": snapshot.pid if snapshot else None,
+                "old_production_start_time": snapshot.start_time if snapshot else None,
+                "installed_sha256": getattr(self, "installed_hash", None),
+                "configured_repos": list(getattr(self, "configured_repos", ())),
+                "active_runs": list(active_runs),
+                "lease_removed": not self.lease_dir.exists(),
+            },
+        )
+
+    @contextlib.contextmanager
+    def final_reconciliation_writer_fence(self):
+        """Exclude new production writers across final verification/removal."""
+        turnstile_path = self.lock_path.with_name(
+            ".sandbox-writer-domain.turnstile.lock"
+        )
+        deadline = time.monotonic() + 30.0
+        with _open_verified_private_lock(turnstile_path) as turnstile, _open_verified_private_lock(
+            self.lock_path
+        ) as writer_domain:
+            turnstile_stat = os.fstat(turnstile.fileno())
+            writer_stat = os.fstat(writer_domain.fileno())
+            while True:
+                self.verify_reconciliation_production()
+                try:
+                    fcntl.flock(turnstile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise GuardianError(
+                            "timed out acquiring retained reconciliation turnstile"
+                        )
+                    time.sleep(0.05)
+            try:
+                while True:
+                    self.verify_reconciliation_production()
+                    try:
+                        fcntl.flock(
+                            writer_domain.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise GuardianError(
+                                "timed out acquiring retained reconciliation writer domain"
+                            )
+                        time.sleep(0.05)
+                try:
+                    def validate_paths() -> None:
+                        _validate_open_lock_path(turnstile_path, turnstile_stat)
+                        _validate_open_lock_path(self.lock_path, writer_stat)
+
+                    validate_paths()
+                    yield validate_paths
+                finally:
+                    fcntl.flock(writer_domain.fileno(), fcntl.LOCK_UN)
+            finally:
+                fcntl.flock(turnstile.fileno(), fcntl.LOCK_UN)
+
+    def reconcile_retained_lease(self) -> bool:
+        """Reap one authenticated corrected-path lease after stable queue idle.
+
+        Returns true when the current Actions owner is still alive and the
+        caller should acquire a fresh lease for the canary.  A detached
+        launchd guardian raises after terminal reconciliation instead.
+        """
+        lease_stat, lease_generation, lease_phase = _lease_generation_state(
+            self.lease_dir
+        )
+        owners = _live_guardians_for_lease(self.lease_dir)
+        if owners:
+            raise GuardianError(f"retained lease still has a live guardian: {owners!r}")
+        if lease_phase == LEASE_PHASE_ACQUIRING:
+            _remove_generation_bound_lease(
+                self.lease_dir,
+                (lease_stat.st_dev, lease_stat.st_ino, lease_stat.st_ctime_ns),
+                lease_generation,
+            )
+            return True
+        prior_root, prior, _ = self.retained_legacy_evidence()
+        self.reconciled_prior_canary_root = str(prior_root)
+        self.snapshot_reconciliation_production(prior)
+        deadline = time.monotonic() + RETAINED_RECONCILIATION_MAX_SECONDS
+        delay = 1.0
+        stable_idle = 0
+        pending_written = False
+        while time.monotonic() < deadline:
+            if self.stop_requested:
+                raise GuardianError("retained-lease reconciliation was interrupted")
+            active_runs = self.verify_reconciliation_production()
+            if active_runs:
+                stable_idle = 0
+                if not pending_written:
+                    self.write_reconciliation_receipt(
+                        reason=RETAINED_RECONCILIATION_REASON,
+                        prior_root=prior_root,
+                        active_runs=active_runs,
+                        lease_device=lease_stat.st_dev,
+                        lease_inode=lease_stat.st_ino,
+                        lease_ctime_ns=lease_stat.st_ctime_ns,
+                        lease_generation=lease_generation,
+                    )
+                    pending_written = True
+            else:
+                stable_idle += 1
+                if stable_idle >= 3:
+                    break
+            time.sleep(delay)
+            delay = min(delay * 2.0, 30.0)
+        else:
+            raise GuardianError("retained-lease production queue did not become idle")
+
+        with self.final_reconciliation_writer_fence() as validate_lock_paths:
+            if self.verify_reconciliation_production():
+                raise GuardianError("production workers reappeared before lease removal")
+            current_stat, current_generation = _validate_lease_generation(
+                self.lease_dir
+            )
+            if (
+                current_stat.st_dev,
+                current_stat.st_ino,
+                current_stat.st_ctime_ns,
+                current_generation,
+            ) != (
+                lease_stat.st_dev,
+                lease_stat.st_ino,
+                lease_stat.st_ctime_ns,
+                lease_generation,
+            ):
+                raise GuardianError("retained lease identity changed before removal")
+            _durable_atomic_json(
+                self.reconciliation_intent,
+                {
+                    "schema_version": 1,
+                    "transition_path": CORRECTED_TRANSITION,
+                    "mutation_fence_proved": True,
+                    "prior_canary_root": str(prior_root),
+                    "lease_device": lease_stat.st_dev,
+                    "lease_inode": lease_stat.st_ino,
+                    "lease_ctime_ns": lease_stat.st_ctime_ns,
+                    "lease_generation": lease_generation,
+                    "lease_tombstone": str(
+                        self.lease_dir.with_name(
+                            f".{self.lease_dir.name}.removed-{lease_generation}"
+                        )
+                    ),
+                    "old_production_pid": self.snapshot.pid,
+                    "old_production_start_time": self.snapshot.start_time,
+                    "installed_sha256": self.installed_hash,
+                },
+            )
+            validate_lock_paths()
+            _remove_generation_bound_lease(
+                self.lease_dir,
+                (lease_stat.st_dev, lease_stat.st_ino, lease_stat.st_ctime_ns),
+                lease_generation,
+            )
+        if pending_written:
+            raise ReconciledAfterOwnerEnded(
+                "retained lease reconciled after durable deferral"
+            )
+        if _process_start(self.args.owner_pid) != self.owner_start:
+            raise ReconciledAfterOwnerEnded("retained lease reconciled after owner exit")
+        return True
 
     def acquire(self) -> None:
         # Arm cleanup before the atomic mkdir.  Python signal handlers run only
         # between bytecodes, so after mkdir succeeds there is no bytecode where
         # the host lease exists but the guardian does not own its cleanup.
-        self.lease_owned = True
-        try:
-            os.mkdir(self.lease_dir, 0o700)
-        except Exception:
-            self.lease_owned = False
-            raise
+        with self.retained_reconciliation_lock():
+            if self.lease_dir.exists():
+                self.reconcile_retained_lease()
+            self.lease_owned = True
+            try:
+                lease_stat, lease_generation = _create_lease_generation(self.lease_dir)
+                self.lease_device = lease_stat.st_dev
+                self.lease_inode = lease_stat.st_ino
+                self.lease_ctime_ns = lease_stat.st_ctime_ns
+                self.lease_generation = lease_generation
+            except LeaseCreationCommitted as error:
+                self.lease_device = error.metadata.st_dev
+                self.lease_inode = error.metadata.st_ino
+                self.lease_ctime_ns = error.metadata.st_ctime_ns
+                self.lease_generation = error.generation
+                raise
+            except Exception:
+                self.lease_owned = False
+                self.lease_device = None
+                self.lease_inode = None
+                self.lease_ctime_ns = None
+                self.lease_generation = None
+                raise
 
     def preflight_and_transition(self) -> None:
         if self.owner_start is None:
@@ -965,6 +1765,31 @@ class Guardian:
             ),
             diagnostic_root=self.root,
         )
+        if None in (
+            self.lease_device,
+            self.lease_inode,
+            self.lease_ctime_ns,
+            self.lease_generation,
+        ):
+            raise GuardianError("lease generation identity is unavailable at transition")
+        try:
+            advanced_lease = _advance_lease_generation(
+                self.lease_dir,
+                (self.lease_device, self.lease_inode, self.lease_ctime_ns),
+                self.lease_generation,
+            )
+        except Exception:
+            current_lease, current_generation = _validate_lease_generation(
+                self.lease_dir
+            )
+            if (
+                (current_lease.st_dev, current_lease.st_ino)
+                == (self.lease_device, self.lease_inode)
+                and current_generation == self.lease_generation
+            ):
+                self.lease_ctime_ns = current_lease.st_ctime_ns
+            raise
+        self.lease_ctime_ns = advanced_lease.st_ctime_ns
         self.old_lifetime_lock_owned = self.transition_path == LEGACY_TRANSITION
         if self.transition_path == CORRECTED_TRANSITION:
             return
@@ -1612,7 +2437,22 @@ class Guardian:
                 "refusing to release host lease before production identity is verified"
             )
         if self.lease_owned:
-            os.rmdir(self.lease_dir)
+            if None in (
+                self.lease_device,
+                self.lease_inode,
+                self.lease_ctime_ns,
+                self.lease_generation,
+            ):
+                raise GuardianError("host lease generation identity is unavailable")
+            _remove_generation_bound_lease(
+                self.lease_dir,
+                (
+                    self.lease_device,
+                    self.lease_inode,
+                    self.lease_ctime_ns,
+                ),
+                self.lease_generation,
+            )
             self.lease_owned = False
 
     def restoration_outstanding(self) -> bool:
@@ -1640,6 +2480,13 @@ class Guardian:
                 self.finalize_production,
                 self.release,
             )
+        except ReconciledAfterOwnerEnded:
+            reason = RETAINED_RECONCILED_REASON
+            self.production_preserved = True
+            self.production_identity_verified = True
+            assert self.snapshot is not None
+            self.restored_pid = self.snapshot.pid
+            self.final_production_start_time = self.snapshot.start_time
         except OwnerEnded as error:
             reason = "owner-ended"
             self.failure = str(error)
@@ -1685,9 +2532,7 @@ class Guardian:
             if cleanup_failures:
                 prefix = f"{self.failure}; " if self.failure else ""
                 self.failure = prefix + "; ".join(cleanup_failures)
-            _atomic_json(
-                self.final_receipt,
-                {
+            final_payload = {
                     "schema_version": 1,
                     "reason": reason,
                     "failure": self.failure,
@@ -1697,6 +2542,10 @@ class Guardian:
                     "production_preserved": self.production_preserved,
                     "production_identity_verified": self.production_identity_verified,
                     "lease_retained": self.lease_owned,
+                    "lease_device": self.lease_device,
+                    "lease_inode": self.lease_inode,
+                    "lease_ctime_ns": self.lease_ctime_ns,
+                    "lease_generation": self.lease_generation,
                     "transition_path": getattr(self, "transition_path", None),
                     "old_production_pid": self.snapshot.pid if self.snapshot else None,
                     "old_production_start_time": (
@@ -1722,8 +2571,12 @@ class Guardian:
                     "mutation_guard_path": str(self.mutation_guard_path),
                     "mutation_probe_output": str(self.mutation_probe_output),
                     "lease_removed": not self.lease_dir.exists(),
-                },
-            )
+                    "reconciled_prior_canary_root": self.reconciled_prior_canary_root,
+                }
+            if reason == RETAINED_RECONCILED_REASON:
+                _durable_atomic_json(self.final_receipt, final_payload)
+            else:
+                _atomic_json(self.final_receipt, final_payload)
         production_ready = self.production_restored or self.production_preserved
         return 0 if production_ready and self.candidate_stopped and not self.failure else 1
 
