@@ -16,14 +16,14 @@ use std::process::{Command, ExitCode, Stdio};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::CliFailure;
 use super::runner_cmd::{parse_github_repo_slug, resolve_repo_slug};
+use super::CliFailure;
 use crate::cloud::GitHubActions;
 use crate::output::write_json_envelope;
 use crate::runner_provision::{
-    ApiRunner, AuditFinding, AuditIssue, PoolRow, audit_runners, default_labels,
-    format_audit_table, format_pool_table, next_index, orphan_local_runners, pool_rows,
-    runner_name, short_repo, validate_machine_tag,
+    audit_runners, default_labels, format_audit_table, format_pool_table, next_index,
+    orphan_local_runners, pool_rows, runner_name, short_repo, validate_machine_tag, ApiRunner,
+    AuditFinding, AuditIssue, PoolRow,
 };
 
 /// Fetch every self-hosted runner for a repo across **all** pages. GitHub caps
@@ -1786,12 +1786,7 @@ pub(super) fn audit_command<W: Write>(
 // ---------- remove ----------
 
 fn uninstall_runner_service(dir: &Path) -> Result<(), CliFailure> {
-    run_in(
-        dir,
-        "./svc.sh",
-        &["uninstall"],
-        "uninstall runner service",
-    )
+    run_in(dir, "./svc.sh", &["uninstall"], "uninstall runner service")
 }
 
 /// `shipyard runner remove`.
@@ -2022,11 +2017,9 @@ mod tests {
         std::fs::create_dir(&runner).expect("runner dir");
         std::fs::write(runner.join(".runner"), "not json\n").expect("identity");
 
-        assert!(
-            scan_local_runners_in(temp.path(), false)
-                .expect("best effort")
-                .is_empty()
-        );
+        assert!(scan_local_runners_in(temp.path(), false)
+            .expect("best effort")
+            .is_empty());
         let error = scan_local_runners_in(temp.path(), true).expect_err("strict failure");
         assert!(error.message().contains("identity is malformed"));
     }
@@ -2343,12 +2336,10 @@ mod tests {
             "install\nstart\nuninstall\n"
         );
         assert!(!temp.path().join("replacement-running").exists());
-        assert!(
-            !temp
-                .path()
-                .join(".actions-runner-pulp-m5-01.shipyard-backup")
-                .exists()
-        );
+        assert!(!temp
+            .path()
+            .join(".actions-runner-pulp-m5-01.shipyard-backup")
+            .exists());
     }
 
     #[cfg(unix)]
@@ -2405,12 +2396,10 @@ mod tests {
             Some("2.334.0")
         );
         assert!(!temp.path().join("service-invocation").exists());
-        assert!(
-            !temp
-                .path()
-                .join(".actions-runner-pulp-m5-01.shipyard-stage")
-                .exists()
-        );
+        assert!(!temp
+            .path()
+            .join(".actions-runner-pulp-m5-01.shipyard-stage")
+            .exists());
     }
 
     #[test]
@@ -2710,9 +2699,7 @@ mod tests {
         assert!(
             env.contains("RUSTUP_HOME=/Users/me/actions-runner-pulp-studio-01/_toolcache/rustup")
         );
-        assert!(
-            env.contains("CARGO_HOME=/Users/me/actions-runner-pulp-studio-01/_toolcache/cargo")
-        );
+        assert!(env.contains("CARGO_HOME=/Users/me/actions-runner-pulp-studio-01/_toolcache/cargo"));
     }
 
     #[cfg(unix)]
@@ -2744,9 +2731,8 @@ mod tests {
         };
         let args = runner_config_args("danielraffel/Shipyard", "secret", &entry, "local-mac");
         assert!(args.iter().any(|arg| arg == "--disableupdate"));
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--name", "Shipyard-studio-02"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--name", "Shipyard-studio-02"]));
     }
 }
