@@ -223,7 +223,24 @@ fn local_plan_preserves_host_class_daemon_context() {
     assert!(command.contains("--mode isolated"));
     assert!(command.contains("--global-dir '/tmp/governed config'"));
     assert!(command.contains("--state-dir '/tmp/governed state'"));
-    assert!(command.contains("--refresh-daemon --unattended-fleet"));
+    assert!(command.contains("--unattended-fleet"));
+    assert!(!command.contains("--refresh-daemon"));
+    let resolver_probe = command
+        .find("auth helper-argv --wrapper")
+        .expect("resolver probe");
+    let committed = command
+        .find("auth_write_phase committed")
+        .expect("transaction commit");
+    let daemon_refresh = command
+        .find("--json daemon refresh")
+        .expect("daemon refresh");
+    let lock_release = command.rfind("auth_release_lock").expect("lock release");
+    assert_eq!(command.matches("--json daemon refresh").count(), 1);
+    assert!(command.contains("--json daemon refresh 9>&-"));
+    assert!(!command[..committed].contains("--json daemon refresh"));
+    assert!(resolver_probe < committed);
+    assert!(committed < daemon_refresh);
+    assert!(daemon_refresh < lock_release);
     assert!(command.contains("fleet-auth-support.transaction"));
 }
 
@@ -339,6 +356,12 @@ fn auth_support_paths_reject_managed_binary_and_transaction_collisions() {
     );
     let error = host_update_plan(&class, "v0.127.0")
         .expect_err("journal collision must fail before rollout");
+    assert!(error.message.contains("or transaction state"));
+
+    class.github_token_helper =
+        Some("/Users/ci/Library/Application Support/shipyard/fleet-auth-support.guard".to_owned());
+    let error = host_update_plan(&class, "v0.127.0")
+        .expect_err("advisory guard collision must fail before rollout");
     assert!(error.message.contains("or transaction state"));
 }
 

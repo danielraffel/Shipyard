@@ -617,6 +617,7 @@ fn host_update_plan_with_authority(
     }
     let auth_journal = state_dir.join("fleet-auth-support.transaction");
     let auth_lock = state_dir.join("fleet-auth-support.lock");
+    let auth_guard = state_dir.join("fleet-auth-support.guard");
     let auth_context = PathBuf::from(format!("{}.shipyard-context.json", auth_wrapper.display()));
     let mut managed_targets = vec![
         auth_helper.clone(),
@@ -636,9 +637,9 @@ fn host_update_plan_with_authority(
     if transaction_paths
         .iter()
         .any(|path| !unique_paths.insert(path.clone()))
-        || transaction_paths
-            .iter()
-            .any(|path| path == &auth_journal || path.starts_with(&auth_lock))
+        || transaction_paths.iter().any(|path| {
+            path == &auth_journal || path.starts_with(&auth_lock) || path.starts_with(&auth_guard)
+        })
     {
         return Err(CliFailure::new(
             2,

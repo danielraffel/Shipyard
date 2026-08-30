@@ -4,6 +4,27 @@ use std::process::Stdio;
 use super::*;
 use crate::capacity::HostClassConfig;
 
+#[test]
+fn local_refresh_pid_accepts_current_and_legacy_typed_receipts_only() {
+    assert_eq!(
+        local_refresh_daemon_pid(&serde_json::json!({
+            "command": "daemon:refresh",
+            "new_pid": 42
+        })),
+        Some(42)
+    );
+    assert_eq!(
+        local_refresh_daemon_pid(
+            &serde_json::json!({"event": "daemon_refreshed", "daemon_pid": 41})
+        ),
+        Some(41)
+    );
+    assert_eq!(
+        local_refresh_daemon_pid(&serde_json::json!({"command": "other", "new_pid": 42})),
+        None
+    );
+}
+
 fn verified_source_identity() -> String {
     "8".repeat(64)
 }
@@ -295,7 +316,7 @@ fn local_evidence_probes_share_the_host_attempt_deadline() {
     let binary = temp.path().join("shipyard");
     std::fs::write(
         &binary,
-        "#!/bin/sh\ncase \"$*\" in *\"daemon status\"*) printf '%s\\n' '{\"command\":\"daemon:status\",\"running\":false}' ;; *\"--version\"*) sleep 60 ;; *) printf '%s\\n' '{\"event\":\"daemon_refreshed\",\"daemon_pid\":42}' ;; esac\n",
+        "#!/bin/sh\ncase \"$*\" in *\"daemon status\"*) printf '%s\\n' '{\"command\":\"daemon:status\",\"running\":false}' ;; *\"--version\"*) sleep 60 ;; *) printf '%s\\n' '{\"command\":\"daemon:refresh\",\"new_pid\":42}' ;; esac\n",
     )
     .expect("fixture");
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("executable");

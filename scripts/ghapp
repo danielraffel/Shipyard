@@ -795,7 +795,7 @@ if [[ -e "$resolver_context" || -L "$resolver_context" ]]; then
         resolver_context_argv+=("$context_argument")
     done < <(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
         "$python_binary" -I -c '
-import json, os, stat, sys
+import json, os, stat, sys, unicodedata
 def load_private_json(path, maximum):
     descriptor = None
     try:
@@ -831,12 +831,13 @@ global_dir = value.get("global_dir") if isinstance(value, dict) else None
 if (
     not isinstance(value, dict)
     or set(value) != required
+    or type(value.get("schema_version")) is not int
     or value.get("schema_version") != 1
     or mode not in {"shipyard", "isolated"}
     or not isinstance(global_dir, str)
     or not global_dir.startswith("/")
     or not 2 <= len(global_dir) <= 4096
-    or any(ord(ch) <= 31 or ord(ch) == 127 for ch in global_dir)
+    or any(unicodedata.category(ch) == "Cc" for ch in global_dir)
     or any(part in {"", ".", ".."} for part in global_dir.split("/")[1:])
 ):
     raise SystemExit("ghapp: resolver context is malformed or unsafe")
@@ -866,7 +867,7 @@ while IFS= read -r credential_argument; do
     credential_argv+=("$credential_argument")
 done < <(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
     "$python_binary" -I -c '
-import json, sys
+import json, sys, unicodedata
 value = json.load(sys.stdin)
 required = {"schema_version", "command", "wrapper", "repo", "credential_argv"}
 if not isinstance(value, dict) or set(value) != required:
@@ -878,10 +879,11 @@ def normalized_absolute_path(item):
         and 2 <= len(item) <= 4096
         and item.startswith("/")
         and all(part not in {"", ".", ".."} for part in item.split("/")[1:])
-        and not any(ord(ch) <= 31 or ord(ch) == 127 for ch in item)
+        and not any(unicodedata.category(ch) == "Cc" for ch in item)
     )
 if (
-    value.get("schema_version") != 1
+    type(value.get("schema_version")) is not int
+    or value.get("schema_version") != 1
     or value.get("command") != "auth.helper-argv"
     or value.get("wrapper") != sys.argv[1]
     or value.get("repo") != sys.argv[2]
@@ -894,7 +896,7 @@ if (
     or not 1 <= len(argv[1]) <= 20
     or not 1 <= int(argv[1]) <= 2**64 - 1
     or not normalized_absolute_path(argv[3])
-    or any(not isinstance(item, str) or not item or any(ord(ch) <= 31 or ord(ch) == 127 for ch in item) for item in argv)
+    or any(not isinstance(item, str) or not item or any(unicodedata.category(ch) == "Cc" for ch in item) for item in argv)
 ):
     raise SystemExit("ghapp: shipyard helper-argv returned malformed JSON")
 for item in argv:

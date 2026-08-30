@@ -152,6 +152,7 @@ class GhappWrapperTests(unittest.TestCase):
             "}\n"
             "mode = os.environ.get('RESOLVER_MODE')\n"
             "if mode == 'extra-key': payload['unexpected'] = True\n"
+            "if mode == 'schema-bool': payload['schema_version'] = True\n"
             "if mode == 'oversize': payload['credential_argv'][1] = '1' * 17000\n"
             "if mode and mode.startswith('app-id:'): payload['credential_argv'][1] = mode.split(':', 1)[1]\n"
             "if mode and mode.startswith('private-key:'): payload['credential_argv'][3] = mode.split(':', 1)[1]\n"
@@ -334,10 +335,12 @@ class GhappWrapperTests(unittest.TestCase):
 
     def test_cli_mode_rejects_unsafe_context_file_before_resolver(self) -> None:
         cases = {
+            "boolean-schema": {"schema_version": True},
             "extra-key": {"unexpected": True},
             "invalid-mode": {"mode": "foreign"},
             "oversized-global-dir": {"global_dir": "/" + "a" * 4096},
             "control-character": {"global_dir": "/tmp/bad\npath"},
+            "c1-control-character": {"global_dir": "/tmp/bad\u0085path"},
             "duplicate-separator": {"global_dir": "/tmp//global"},
             "dot-component": {"global_dir": "/tmp/./global"},
         }
@@ -456,6 +459,16 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertFalse(self.helper_log.exists())
         self.assertFalse(self.gh_log.exists())
 
+    def test_cli_mode_rejects_boolean_resolver_schema_before_helper(self) -> None:
+        self.environment["RESOLVER_MODE"] = "schema-bool"
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed JSON", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
     def test_cli_mode_rejects_non_decimal_or_zero_resolver_app_ids(self) -> None:
         for app_id in (
             "0",
@@ -476,7 +489,11 @@ class GhappWrapperTests(unittest.TestCase):
                 self.assertFalse(self.gh_log.exists())
 
     def test_cli_mode_rejects_non_normalized_resolver_private_key(self) -> None:
-        for private_key in ("/Users/ci//app.pem", "/Users/ci/./app.pem"):
+        for private_key in (
+            "/Users/ci//app.pem",
+            "/Users/ci/./app.pem",
+            "/Users/ci/bad\u0085key.pem",
+        ):
             with self.subTest(private_key=private_key):
                 self.environment["RESOLVER_MODE"] = f"private-key:{private_key}"
                 result = self.run_wrapper(

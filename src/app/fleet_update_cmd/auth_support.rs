@@ -61,6 +61,7 @@ pub(super) fn install_transaction(
     helper_source: &str,
     wrapper_source: &str,
     binary_install_command: &str,
+    post_commit_command: &str,
     mode: &str,
     global_dir: &Path,
     state_dir: &Path,
@@ -89,6 +90,11 @@ pub(super) fn install_transaction(
     let authority_id = shlex_quote(&authority.identity_sha256);
     let helper_digest = shlex_quote(&authority.auth_helper.sha256);
     let wrapper_digest = shlex_quote(&authority.auth_wrapper.sha256);
+    let post_commit_command = if post_commit_command.trim().is_empty() {
+        ":"
+    } else {
+        post_commit_command
+    };
     // Source arguments are internally generated shell expressions, never
     // configuration or user input. External values are quoted before here.
     let injected_failure = if fail_after_helper_for_test {
@@ -117,6 +123,7 @@ auth_helper_source={helper_source}
 auth_wrapper_source={wrapper_source}
 auth_journal="$auth_state_dir/fleet-auth-support.transaction"
 auth_lock="$auth_state_dir/fleet-auth-support.lock"
+auth_guard="$auth_state_dir/fleet-auth-support.guard"
 
 auth_safe_target() {{
   auth_target="$1"
@@ -242,34 +249,59 @@ test ! -L "$auth_state_dir"
 test "$(/usr/bin/stat -f '%u' "$auth_state_dir")" = "$(/usr/bin/id -u)"
 auth_state_mode="$(/usr/bin/stat -f '%Lp' "$auth_state_dir")"
 test $((8#$auth_state_mode & 8#22)) -eq 0
+if [ ! -e "$auth_guard" ] && [ ! -L "$auth_guard" ]; then
+  auth_prior_umask="$(umask)"
+  umask 077
+  : >> "$auth_guard"
+  umask "$auth_prior_umask"
+fi
+test -f "$auth_guard"
+test ! -L "$auth_guard"
+test "$(/usr/bin/stat -f '%u' "$auth_guard")" = "$(/usr/bin/id -u)"
+test "$(/usr/bin/stat -f '%Lp' "$auth_guard")" = 600
+exec 9<>"$auth_guard"
+if ! /usr/bin/lockf -s -t 0 9; then exec 9>&-; exit 1; fi
 if ! /bin/mkdir "$auth_lock" 2>/dev/null; then
   test -d "$auth_lock"
   test ! -L "$auth_lock"
   test "$(/usr/bin/stat -f '%u' "$auth_lock")" = "$(/usr/bin/id -u)"
-  if [ -e "$auth_lock/pid" ] || [ -L "$auth_lock/pid" ]; then
-    test -f "$auth_lock/pid"
-    test ! -L "$auth_lock/pid"
-    auth_lock_pid="$(/bin/cat "$auth_lock/pid")"
-    case "$auth_lock_pid" in ''|*[!0-9]*) exit 1 ;; esac
-    if /bin/kill -0 "$auth_lock_pid" 2>/dev/null; then exit 1; fi
-    /bin/rm "$auth_lock/pid"
-  fi
+  auth_legacy_pid_file="$auth_lock/pid"
+  test -f "$auth_legacy_pid_file"
+  test ! -L "$auth_legacy_pid_file"
+  test "$(/usr/bin/stat -f '%u' "$auth_legacy_pid_file")" = "$(/usr/bin/id -u)"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_legacy_pid_file")" = 600
+  auth_legacy_pid="$(/bin/cat "$auth_legacy_pid_file")"
+  case "$auth_legacy_pid" in ''|*[!0-9]*) exit 1 ;; esac
+  if /bin/kill -0 "$auth_legacy_pid" 2>/dev/null; then exit 1; fi
+  /bin/rm "$auth_legacy_pid_file"
   /bin/rmdir "$auth_lock"
   /bin/mkdir "$auth_lock"
 fi
 if ! /usr/bin/printf '%s\n' "$$" > "$auth_lock/pid"; then
   /bin/rmdir "$auth_lock"
+  exec 9>&-
   exit 1
 fi
 if ! /bin/chmod 600 "$auth_lock/pid"; then
   /bin/rm -f "$auth_lock/pid"
   /bin/rmdir "$auth_lock"
+  exec 9>&-
   exit 1
 fi
 auth_helper_tmp=
 auth_wrapper_tmp=
 auth_context_tmp=
-auth_release_lock() {{ /bin/rm -f "$auth_lock/pid"; /bin/rmdir "$auth_lock"; }}
+auth_release_lock() {{
+  auth_release_pid="$auth_lock/pid"
+  test -f "$auth_release_pid"
+  test ! -L "$auth_release_pid"
+  test "$(/usr/bin/stat -f '%u' "$auth_release_pid")" = "$(/usr/bin/id -u)"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_release_pid")" = 600
+  test "$(/bin/cat "$auth_release_pid")" = "$$"
+  /bin/rm "$auth_release_pid"
+  /bin/rmdir "$auth_lock"
+  exec 9>&-
+}}
 auth_release_on_error() {{ auth_status=$?; trap - ERR INT TERM; if [ -n "$auth_helper_tmp" ]; then /bin/rm -f "$auth_helper_tmp"; fi; if [ -n "$auth_wrapper_tmp" ]; then /bin/rm -f "$auth_wrapper_tmp"; fi; if [ -n "$auth_context_tmp" ]; then /bin/rm -f "$auth_context_tmp"; fi; auth_release_lock; exit "$auth_status"; }}
 trap auth_release_on_error ERR INT TERM
 
@@ -362,6 +394,10 @@ fi
 auth_write_phase committed
 trap - ERR INT TERM
 auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"
+auth_post_commit_on_error() {{ auth_status=$?; trap - ERR INT TERM; auth_release_lock; exit "$auth_status"; }}
+trap auth_post_commit_on_error ERR INT TERM
+{post_commit_command}
+trap - ERR INT TERM
 auth_release_lock
 "#
     )
@@ -449,6 +485,33 @@ mod tests {
         target: &str,
         resolver_succeeds: bool,
     ) -> std::process::ExitStatus {
+        run_with_probe_and_post_commit(
+            root,
+            helper,
+            wrapper,
+            helper_source,
+            wrapper_source,
+            authority,
+            fail_after_helper,
+            target,
+            resolver_succeeds,
+            ":",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_probe_and_post_commit(
+        root: &tempfile::TempDir,
+        helper: &Path,
+        wrapper: &Path,
+        helper_source: &Path,
+        wrapper_source: &Path,
+        authority: &ReleaseAuthority,
+        fail_after_helper: bool,
+        target: &str,
+        resolver_succeeds: bool,
+        post_commit_command: &str,
+    ) -> std::process::ExitStatus {
         let resolver_required = crate::app::fleet_update_cmd::tag_supports_auth_resolver(target);
         let state = root.path().join("Library/Application Support/shipyard");
         let binary = root.path().join(".local/bin/shipyard");
@@ -501,6 +564,7 @@ mod tests {
             &shlex_quote(&helper_source.display().to_string()),
             &shlex_quote(&wrapper_source.display().to_string()),
             &installed_binary,
+            post_commit_command,
             "shipyard",
             &state,
             &state,
@@ -614,6 +678,358 @@ mod tests {
     }
 
     #[test]
+    fn non_file_existing_lock_refuses_without_mutation_or_reclamation() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+        let state = root.path().join("Library/Application Support/shipyard");
+        let lock = state.join("fleet-auth-support.lock");
+        std::fs::create_dir(&lock).expect("non-file lock");
+
+        assert!(
+            !run(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+            )
+            .success()
+        );
+        assert!(lock.is_dir());
+        assert!(!helper.exists());
+        assert!(!wrapper.exists());
+        assert!(
+            !wrapper
+                .with_file_name("ghapp.shipyard-context.json")
+                .exists()
+        );
+        assert!(!state.join("fleet-auth-support.transaction").exists());
+        assert!(
+            !std::fs::read_dir(&state)
+                .expect("state entries")
+                .any(|entry| {
+                    entry
+                        .expect("state entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".fleet-auth-support.lock.")
+                })
+        );
+    }
+
+    #[test]
+    fn malformed_symlinked_and_live_legacy_pid_locks_are_preserved() {
+        for scenario in ["malformed", "symlink", "live"] {
+            let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+            let state = root.path().join("Library/Application Support/shipyard");
+            let lock = state.join("fleet-auth-support.lock");
+            let pid = lock.join("pid");
+            std::fs::create_dir(&lock).expect("legacy lock");
+            match scenario {
+                "malformed" => std::fs::write(&pid, b"not-a-pid\n").expect("malformed pid"),
+                "symlink" => {
+                    let target = root.path().join("foreign-pid");
+                    std::fs::write(&target, b"99999999\n").expect("foreign pid target");
+                    symlink(&target, &pid).expect("pid symlink");
+                }
+                "live" => {
+                    std::fs::write(&pid, format!("{}\n", std::process::id())).expect("live pid");
+                }
+                _ => unreachable!(),
+            }
+            if scenario != "symlink" {
+                std::fs::set_permissions(&pid, std::fs::Permissions::from_mode(0o600))
+                    .expect("pid mode");
+            }
+
+            assert!(
+                !run(
+                    &root,
+                    &helper,
+                    &wrapper,
+                    &helper_source,
+                    &wrapper_source,
+                    &authority,
+                    false,
+                )
+                .success(),
+                "{scenario} legacy pid must refuse"
+            );
+            assert!(lock.is_dir(), "{scenario} lock must be preserved");
+            assert!(!helper.exists());
+            assert!(!wrapper.exists());
+        }
+    }
+
+    #[test]
+    fn invalid_advisory_guard_types_and_mode_refuse_before_artifact_mutation() {
+        for scenario in ["directory", "symlink", "mode"] {
+            let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+            let state = root.path().join("Library/Application Support/shipyard");
+            let guard = state.join("fleet-auth-support.guard");
+            match scenario {
+                "directory" => std::fs::create_dir(&guard).expect("guard directory"),
+                "symlink" => {
+                    let target = root.path().join("foreign-guard");
+                    std::fs::write(&target, b"").expect("foreign guard");
+                    symlink(&target, &guard).expect("guard symlink");
+                }
+                "mode" => {
+                    std::fs::write(&guard, b"").expect("guard file");
+                    std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o644))
+                        .expect("guard mode");
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(
+                !run(
+                    &root,
+                    &helper,
+                    &wrapper,
+                    &helper_source,
+                    &wrapper_source,
+                    &authority,
+                    false,
+                )
+                .success(),
+                "{scenario} guard must refuse"
+            );
+            assert!(!helper.exists());
+            assert!(!wrapper.exists());
+            assert!(!state.join("fleet-auth-support.lock").exists());
+        }
+    }
+
+    #[test]
+    fn dead_legacy_directory_lock_is_reclaimed_under_advisory_guard() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+        let state = root.path().join("Library/Application Support/shipyard");
+        let lock = state.join("fleet-auth-support.lock");
+        let pid = lock.join("pid");
+        std::fs::create_dir(&lock).expect("legacy lock directory");
+        std::fs::write(&pid, b"99999999\n").expect("dead legacy pid");
+        std::fs::set_permissions(&pid, std::fs::Permissions::from_mode(0o600))
+            .expect("legacy pid mode");
+
+        assert!(
+            run(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+            )
+            .success()
+        );
+        assert!(!lock.exists());
+        let guard = state.join("fleet-auth-support.guard");
+        assert_eq!(
+            std::fs::metadata(&guard)
+                .expect("advisory lock carrier")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn active_advisory_lock_refuses_concurrent_transaction_then_releases() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+        let state = root.path().join("Library/Application Support/shipyard");
+        let lock = state.join("fleet-auth-support.guard");
+        let acquired = root.path().join("lock-acquired");
+        std::fs::write(&lock, b"").expect("lock carrier");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600))
+            .expect("lock carrier mode");
+        let mut holder = Command::new("/bin/bash")
+            .args([
+                "-c",
+                "exec 9<>\"$1\"; /usr/bin/lockf -s -t 0 9 || exit 1; /usr/bin/touch \"$2\"; exec /bin/sleep 30",
+                "holder",
+            ])
+            .arg(&lock)
+            .arg(&acquired)
+            .spawn()
+            .expect("lock holder");
+        for _ in 0..200 {
+            if acquired.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(acquired.exists(), "holder did not acquire lock");
+
+        assert!(
+            !run(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+            )
+            .success()
+        );
+        assert!(!helper.exists());
+        assert!(!wrapper.exists());
+        holder.kill().expect("stop holder");
+        holder.wait().expect("reap holder");
+
+        assert!(
+            run(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+            )
+            .success()
+        );
+    }
+
+    #[test]
+    fn detached_post_commit_child_does_not_inherit_advisory_guard() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+        assert!(
+            run_with_probe_and_post_commit(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+                "v0.129.0",
+                true,
+                "/bin/sh -c '/bin/sleep 2 &' 9>&-",
+            )
+            .success()
+        );
+        assert!(
+            run(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+            )
+            .success(),
+            "a detached post-commit child must not retain the advisory guard"
+        );
+    }
+
+    #[test]
+    fn foreign_replacement_of_legacy_pid_is_preserved_at_release() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+        assert!(
+            !run_with_probe_and_post_commit(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+                "v0.129.0",
+                true,
+                "/usr/bin/printf '%s\\n' 99999999 > \"$auth_lock/pid\"; /bin/chmod 600 \"$auth_lock/pid\"",
+            )
+            .success()
+        );
+        let pid = root
+            .path()
+            .join("Library/Application Support/shipyard/fleet-auth-support.lock/pid");
+        assert_eq!(
+            std::fs::read_to_string(&pid).expect("foreign pid"),
+            "99999999\n"
+        );
+        assert_eq!(
+            std::fs::read(&helper).expect("committed helper"),
+            b"new helper\n"
+        );
+        assert_eq!(
+            std::fs::read(&wrapper).expect("committed wrapper"),
+            b"new wrapper\n"
+        );
+    }
+
+    #[test]
+    fn resolver_failure_skips_refresh_and_refresh_failure_releases_both_lock_layers() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+        let refreshed = root.path().join("refresh-ran");
+        let touch_refresh = format!(
+            "/usr/bin/touch {}",
+            shlex_quote(&refreshed.display().to_string())
+        );
+        assert!(
+            !run_with_probe_and_post_commit(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+                "v0.129.0",
+                false,
+                &touch_refresh,
+            )
+            .success()
+        );
+        assert!(!refreshed.exists(), "failed resolver must not refresh");
+
+        assert!(
+            !run_with_probe_and_post_commit(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+                "v0.129.0",
+                true,
+                "/usr/bin/false",
+            )
+            .success()
+        );
+        let state = root.path().join("Library/Application Support/shipyard");
+        assert!(!state.join("fleet-auth-support.lock").exists());
+        assert!(state.join("fleet-auth-support.guard").is_file());
+        assert_eq!(
+            std::fs::read(&helper).expect("committed helper"),
+            b"new helper\n"
+        );
+        assert_eq!(
+            std::fs::read(&wrapper).expect("committed wrapper"),
+            b"new wrapper\n"
+        );
+        assert!(
+            run(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+            )
+            .success(),
+            "refresh failure must release the advisory guard"
+        );
+    }
+
+    #[test]
     fn v0_128_recovers_nine_line_journal_and_partial_atomic_backups() {
         let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
         let state = root.path().join("Library/Application Support/shipyard");
@@ -674,6 +1090,16 @@ mod tests {
         }
         assert!(!journal.exists());
         assert!(!state.join("fleet-auth-support.lock").exists());
+        let lock = state.join("fleet-auth-support.guard");
+        assert!(lock.is_file());
+        assert_eq!(
+            std::fs::metadata(&lock)
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         assert!(
             !std::path::Path::new(&format!("{}.shipyard-rollback.tmp", binary.display())).exists()
         );
@@ -798,8 +1224,10 @@ mod tests {
         )
         .expect("prior journal");
         let lock = state.join("fleet-auth-support.lock");
-        std::fs::create_dir(&lock).expect("stale lock");
-        std::fs::write(lock.join("pid"), b"99999999\n").expect("stale pid");
+        std::fs::create_dir(&lock).expect("stale legacy lock");
+        std::fs::write(lock.join("pid"), b"99999999\n").expect("stale legacy pid");
+        std::fs::set_permissions(lock.join("pid"), std::fs::Permissions::from_mode(0o600))
+            .expect("stale pid mode");
 
         assert!(
             !run(

@@ -42,6 +42,13 @@ pub(super) fn remote_update_command(
         shlex_quote(version),
         shlex_quote(&install_dir.display().to_string())
     );
+    let daemon_refresh_command = format!(
+        "refresh_receipt=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon refresh 9>&- | /usr/bin/tr -d '\\n')\"",
+        shlex_quote(&binary.display().to_string()),
+        shlex_quote(mode),
+        shlex_quote(&global_dir.display().to_string()),
+        shlex_quote(&state_dir.display().to_string()),
+    );
     let auth_transaction = auth_support::install_transaction(
         auth_helper,
         auth_wrapper,
@@ -52,6 +59,7 @@ pub(super) fn remote_update_command(
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,
+        &daemon_refresh_command,
         mode,
         global_dir,
         state_dir,
@@ -90,7 +98,6 @@ pub(super) fn remote_update_command(
          \"$staged_binary\" --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
          {}\nunset token\n{}\n{}\n\
          {} --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
-         refresh_receipt=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon refresh | /usr/bin/tr -d '\\n')\"\n\
          after_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
          printf '%s%s\\n' {} \"$before_primary_sha256\"; printf '%s%s\\n' {} \"$before_primary_version\"\n\
          printf '%s%s\\n' {} \"$before_companion_sha256\"; printf '%s%s\\n' {} \"$before_companion_version\"\n\
@@ -133,10 +140,6 @@ pub(super) fn remote_update_command(
         shlex_quote(&global_dir.display().to_string()),
         shlex_quote(&state_dir.display().to_string()),
         shlex_quote(target),
-        shlex_quote(&binary.display().to_string()),
-        shlex_quote(mode),
-        shlex_quote(&global_dir.display().to_string()),
-        shlex_quote(&state_dir.display().to_string()),
         shlex_quote(&binary.display().to_string()),
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
@@ -265,7 +268,7 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
     let auth_contract = auth_support::wrapper_helper_contract_probe(&plan.auth_helper);
     let curl_shim = exact_asset_curl_shim(&plan.release_authority.platform_asset.name);
     let binary_install_command = format!(
-        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" /usr/bin/env -i HOME={} PATH={} SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" {} --mode {} --global-dir {} --state-dir {} --json update --to {} --install-script-url \"file://$installer\" --curl-bin \"$curl_shim\" --refresh-daemon --unattended-fleet",
+        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" /usr/bin/env -i HOME={} PATH={} SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" {} --mode {} --global-dir {} --state-dir {} --json update --to {} --install-script-url \"file://$installer\" --curl-bin \"$curl_shim\" --unattended-fleet",
         shlex_quote(&home_dir().display().to_string()),
         shlex_quote(&unattended_tool_path().to_string_lossy()),
         shlex_quote(&plan.binary.display().to_string()),
@@ -273,6 +276,13 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         shlex_quote(&plan.global_dir.display().to_string()),
         shlex_quote(&plan.state_dir.display().to_string()),
         shlex_quote(&plan.target),
+    );
+    let daemon_refresh_command = format!(
+        "{} --mode {} --global-dir {} --state-dir {} --json daemon refresh 9>&-",
+        shlex_quote(&plan.binary.display().to_string()),
+        plan.runtime_mode.as_str(),
+        shlex_quote(&plan.global_dir.display().to_string()),
+        shlex_quote(&plan.state_dir.display().to_string()),
     );
     let auth_transaction = auth_support::install_transaction(
         &plan.auth_helper,
@@ -284,6 +294,7 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,
+        &daemon_refresh_command,
         plan.runtime_mode.as_str(),
         &plan.global_dir,
         &plan.state_dir,
