@@ -204,6 +204,7 @@ fn auth_token_command_binds_verified_repo_in_a_scrubbed_non_checkout() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)] // One end-to-end fixture covers the complete fail-closed parser boundary.
 fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_environment() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -313,7 +314,7 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
 
     std::fs::write(
         &binary,
-        format!("#!/bin/sh\nprintf '%s\\n' '{}'\nexit 2\n", resolver_payload),
+        format!("#!/bin/sh\nprintf '%s\\n' '{resolver_payload}'\nexit 2\n"),
     )
     .expect("failed resolver with plausible output fixture");
     let output = Command::new("/bin/bash")
@@ -395,11 +396,8 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
         ),
     ];
     for (payload, expected_error) in invalid_payloads {
-        std::fs::write(
-            &binary,
-            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", payload),
-        )
-        .expect("invalid resolver fixture");
+        std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{payload}'\n"))
+            .expect("invalid resolver fixture");
         let output = Command::new("/bin/bash")
             .args(["-o", "pipefail", "-c", &token_command])
             .env_clear()
