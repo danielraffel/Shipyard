@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01310"></a>
+## [0.131.0] - 2026-08-30
+
+- fix: harden fleet auth crash recovery ([#504](https://github.com/danielraffel/Shipyard/pull/504))
+
 <a id="v01301"></a>
 ## [0.130.1] - 2026-08-30
 
@@ -1164,6 +1169,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.131.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.131.0
 [0.130.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.130.1
 [0.130.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.130.0
 [0.129.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.129.0
