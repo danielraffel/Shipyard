@@ -58,6 +58,104 @@ class GuardianLifecycleTests(unittest.TestCase):
             )
         return metadata, generation
 
+    def write_retained_owner_ended_evidence(
+        self,
+        active: guardian.Guardian,
+        *,
+        failure: str = guardian.RETAINED_OWNER_ENDED_FAILURE,
+    ) -> tuple[
+        Path,
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        os.stat_result,
+        str,
+    ]:
+        active.lease_dir = active.root / "shipyard-sandbox-m3-lease"
+        metadata, generation = self.create_generation_lease(active)
+        prior = active.root / "shipyard-sandbox-m3-1-1"
+        prior.mkdir(mode=0o700)
+        installed_sha256 = "a" * 64
+        candidate_sha256 = "b" * 64
+        argv_sha256 = "c" * 64
+        environment_sha256 = "d" * 64
+        production_pid = 4242
+        production_start_time = "Sat Aug 29 05:44:36 2026"
+        candidate_pid = 7331
+        receipt = {
+            "schema_version": 1,
+            "reason": "failed",
+            "failure": failure,
+            "candidate_stopped": True,
+            "production_quiesced": False,
+            "production_restored": False,
+            "production_preserved": False,
+            "production_identity_verified": False,
+            "lease_retained": True,
+            "lease_device": metadata.st_dev,
+            "lease_inode": metadata.st_ino,
+            "lease_ctime_ns": metadata.st_ctime_ns,
+            "lease_generation": generation,
+            "transition_path": guardian.CORRECTED_TRANSITION,
+            "old_production_pid": production_pid,
+            "old_production_start_time": production_start_time,
+            "restored_production_pid": None,
+            "final_production_pid": None,
+            "final_production_start_time": None,
+            "installed_sha256": installed_sha256,
+            "candidate_sha256": candidate_sha256,
+            "argv_sha256": argv_sha256,
+            "environment_sha256": environment_sha256,
+            "cwd": str(active.root),
+            "mode": "shipyard",
+            "configured_repos": ["owner/repo"],
+            "active_runs": [],
+            "old_lifetime_lock_owned": False,
+            "mutation_fence_proved": True,
+            "mutation_guard_path": str(active.mutation_guard_path),
+            "mutation_probe_output": str(active.mutation_probe_output),
+            "lease_removed": False,
+            "reconciled_prior_canary_root": None,
+        }
+        ready = {
+            "schema_version": 1,
+            "phase": "ready",
+            "candidate_pid": candidate_pid,
+            "candidate_sha256": candidate_sha256,
+            "installed_sha256": installed_sha256,
+            "production_pid": production_pid,
+            "production_start_time": production_start_time,
+            "transition_path": guardian.CORRECTED_TRANSITION,
+            "production_executable": str(active.installed),
+            "production_argv_sha256": argv_sha256,
+            "production_environment_sha256": environment_sha256,
+            "production_cwd": str(active.root),
+            "mutation_guard_path": str(active.mutation_guard_path),
+            "configured_repos": ["owner/repo"],
+            "active_runs": [],
+        }
+        mutation = {
+            "schema_version": 1,
+            "transition_path": guardian.CORRECTED_TRANSITION,
+            "selected_protected_path": str(active.mutation_guard_path),
+            "probe_output": str(active.mutation_probe_output),
+            "production_pid": production_pid,
+            "production_start_time": production_start_time,
+            "installed_sha256": installed_sha256,
+            "argv_sha256": argv_sha256,
+            "environment_sha256": environment_sha256,
+            "cwd": str(active.root),
+            "returncode": guardian.WRITER_DOMAIN_OVERLAP_EXIT_CODE,
+            "overlap_classification": guardian.WRITER_DOMAIN_OVERLAP_CLASSIFICATION,
+            "mutation_absent": True,
+            "selected_path_absent": True,
+            "production_identity_preserved": True,
+        }
+        guardian._atomic_json(prior / "guardian-receipt.json", receipt)
+        guardian._atomic_json(prior / "ready.json", ready)
+        guardian._atomic_json(prior / "mutation-fence.json", mutation)
+        return prior, receipt, ready, mutation, metadata, generation
+
     def test_guardian_owns_cleanup_at_successful_atomic_acquisition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
@@ -247,6 +345,241 @@ class GuardianLifecycleTests(unittest.TestCase):
                 active.acquire()
             self.assertFalse(active.lease_owned)
             self.assertTrue(active.lease_dir.is_dir())
+
+    def test_owner_ended_cleanup_emits_exact_retained_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            active.transition_path = guardian.CORRECTED_TRANSITION
+            active.mutation_fence_proved = True
+            owner_ended = guardian.OwnerEnded(
+                guardian.OWNER_ENDED_BEFORE_COMPLETION
+            )
+            restore_failure = guardian.GuardianError(
+                guardian.PRESERVED_WORKER_OWNERSHIP_FAILURE
+            )
+            with mock.patch.object(active, "acquire"), mock.patch.object(
+                active, "preflight_and_transition"
+            ), mock.patch.object(active, "start_candidate"), mock.patch.object(
+                active, "wait_for_owner", side_effect=owner_ended
+            ), mock.patch.object(active, "stop_candidate"), mock.patch.object(
+                active, "finalize_production", side_effect=restore_failure
+            ) as restore, mock.patch.object(
+                active, "restoration_outstanding", return_value=True
+            ), mock.patch.object(guardian.signal, "signal"):
+                self.assertEqual(active.run(), 1)
+
+            receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
+            self.assertEqual(
+                receipt["failure"], guardian.RETAINED_OWNER_ENDED_FAILURE
+            )
+            self.assertEqual(restore.call_count, 2)
+
+    def test_exact_owner_ended_receipt_reconciles_stable_idle_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            prior, receipt, _, _, metadata, generation = (
+                self.write_retained_owner_ended_evidence(active)
+            )
+            snapshot = guardian.ProcessSnapshot(
+                pid=receipt["old_production_pid"],
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": str(active.root)},
+                cwd=str(active.root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time=receipt["old_production_start_time"],
+            )
+
+            def bind_production(prior_receipt: dict[str, object]):
+                self.assertEqual(prior_receipt, receipt)
+                active.snapshot = snapshot
+                active.installed_hash = receipt["installed_sha256"]
+                active.candidate_hash = receipt["candidate_sha256"]
+                active.configured_repos = ("owner/repo",)
+                active.worker_ids = ()
+                active.lock_path = active.root / "writer.lock"
+                active.transition_path = guardian.CORRECTED_TRANSITION
+                active.old_lifetime_lock_owned = False
+                active.mutation_fence_proved = True
+                return snapshot, active.configured_repos
+
+            validate_lock_paths = mock.Mock()
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                guardian, "_pid_alive", return_value=False
+            ), mock.patch.object(
+                active,
+                "snapshot_reconciliation_production",
+                side_effect=bind_production,
+            ), mock.patch.object(
+                active, "verify_reconciliation_production", return_value=()
+            ) as verify, mock.patch.object(
+                active,
+                "final_reconciliation_writer_fence",
+                return_value=contextlib.nullcontext(validate_lock_paths),
+            ), mock.patch.object(guardian.time, "sleep"), mock.patch.object(
+                guardian, "_process_start", return_value=active.owner_start
+            ):
+                self.assertTrue(active.reconcile_retained_lease())
+
+            self.assertEqual(verify.call_count, 4)
+            validate_lock_paths.assert_called_once()
+            self.assertFalse(active.lease_dir.exists())
+            self.assertFalse(
+                active.lease_dir.with_name(
+                    f".{active.lease_dir.name}.removed-{generation}"
+                ).exists()
+            )
+            intent = json.loads(
+                active.reconciliation_intent.read_text(encoding="utf-8")
+            )
+            self.assertEqual(intent["prior_canary_root"], str(prior))
+            self.assertEqual(intent["lease_device"], metadata.st_dev)
+            self.assertEqual(intent["lease_inode"], metadata.st_ino)
+            self.assertEqual(intent["lease_ctime_ns"], metadata.st_ctime_ns)
+            self.assertEqual(intent["lease_generation"], generation)
+            self.assertTrue(intent["mutation_fence_proved"])
+            self.assertFalse(active.reconciliation_receipt.exists())
+
+    def test_owner_ended_retained_failure_grammar_is_exact(self) -> None:
+        missing_owner_ended = guardian.RETAINED_OWNER_ENDED_FAILURE.replace(
+            f"OwnerEnded: {guardian.OWNER_ENDED_BEFORE_COMPLETION}; ", "", 1
+        )
+        extra_component = (
+            f"{guardian.RETAINED_OWNER_ENDED_FAILURE}; "
+            "release lease: GuardianError: unrecognized cleanup"
+        )
+        for name, failure in (
+            ("missing OwnerEnded", missing_owner_ended),
+            ("extra component", extra_component),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                active = self.make_guardian(Path(directory))
+                _, _, _, _, metadata, generation = (
+                    self.write_retained_owner_ended_evidence(
+                        active, failure=failure
+                    )
+                )
+                with mock.patch.object(guardian, "_pid_alive", return_value=False):
+                    with self.assertRaisesRegex(
+                        guardian.GuardianError, "not safely reconcilable"
+                    ):
+                        active.retained_legacy_evidence()
+                current, observed_generation = guardian._validate_lease_generation(
+                    active.lease_dir
+                )
+                self.assertEqual(
+                    (current.st_dev, current.st_ino, current.st_ctime_ns),
+                    (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns),
+                )
+                self.assertEqual(observed_generation, generation)
+
+    def test_owner_ended_retained_receipt_fences_remain_required(self) -> None:
+        for drift in (
+            "missing mutation proof",
+            "generation",
+            "production identity",
+            "completed reason",
+            "production preserved",
+            "production identity verified",
+        ):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
+                active = self.make_guardian(Path(directory))
+                prior, receipt, ready, _, metadata, generation = (
+                    self.write_retained_owner_ended_evidence(active)
+                )
+                if drift == "missing mutation proof":
+                    receipt["mutation_fence_proved"] = False
+                    guardian._atomic_json(prior / "guardian-receipt.json", receipt)
+                elif drift == "generation":
+                    receipt["lease_generation"] = (
+                        "0" * 64 if generation != "0" * 64 else "1" * 64
+                    )
+                    guardian._atomic_json(prior / "guardian-receipt.json", receipt)
+                elif drift == "production identity":
+                    ready["production_pid"] = 4243
+                    guardian._atomic_json(prior / "ready.json", ready)
+                elif drift == "completed reason":
+                    receipt["reason"] = "completed"
+                    guardian._atomic_json(prior / "guardian-receipt.json", receipt)
+                elif drift == "production preserved":
+                    receipt["production_preserved"] = True
+                    guardian._atomic_json(prior / "guardian-receipt.json", receipt)
+                else:
+                    receipt["production_identity_verified"] = True
+                    guardian._atomic_json(prior / "guardian-receipt.json", receipt)
+
+                with mock.patch.object(guardian, "_pid_alive", return_value=False):
+                    with self.assertRaises(guardian.GuardianError):
+                        active.retained_legacy_evidence()
+                current, observed_generation = guardian._validate_lease_generation(
+                    active.lease_dir
+                )
+                self.assertEqual(
+                    (current.st_dev, current.st_ino, current.st_ctime_ns),
+                    (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns),
+                )
+                self.assertEqual(observed_generation, generation)
+
+    def test_owner_ended_retained_live_candidate_refuses_without_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _, _, _, _, metadata, generation = (
+                self.write_retained_owner_ended_evidence(active)
+            )
+            with mock.patch.object(guardian, "_pid_alive", return_value=True):
+                with self.assertRaisesRegex(guardian.GuardianError, "still alive"):
+                    active.retained_legacy_evidence()
+            current, observed_generation = guardian._validate_lease_generation(
+                active.lease_dir
+            )
+            self.assertEqual(current.st_ino, metadata.st_ino)
+            self.assertEqual(observed_generation, generation)
+
+    def test_owner_ended_retained_live_guardian_refuses_without_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _, _, _, _, metadata, generation = (
+                self.write_retained_owner_ended_evidence(active)
+            )
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=(8442,)
+            ):
+                with self.assertRaisesRegex(guardian.GuardianError, "live guardian"):
+                    active.acquire()
+            current, observed_generation = guardian._validate_lease_generation(
+                active.lease_dir
+            )
+            self.assertEqual(current.st_ino, metadata.st_ino)
+            self.assertEqual(observed_generation, generation)
+
+    def test_owner_ended_retained_production_drift_refuses_without_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _, _, _, _, metadata, generation = (
+                self.write_retained_owner_ended_evidence(active)
+            )
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                guardian, "_pid_alive", return_value=False
+            ), mock.patch.object(
+                active,
+                "snapshot_reconciliation_production",
+                side_effect=guardian.GuardianError(
+                    "retained-lease production authority changed: installed_sha256"
+                ),
+            ):
+                with self.assertRaisesRegex(guardian.GuardianError, "authority changed"):
+                    active.acquire()
+            current, observed_generation = guardian._validate_lease_generation(
+                active.lease_dir
+            )
+            self.assertEqual(current.st_ino, metadata.st_ino)
+            self.assertEqual(observed_generation, generation)
 
     def test_empty_legacy_retained_lease_waits_for_stable_idle_then_reaps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

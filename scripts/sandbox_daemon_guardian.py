@@ -80,6 +80,13 @@ LEGACY_LIFETIME_LOCK_VERSION = "0.108.1"
 RETAINED_RECONCILIATION_REASON = "retained-lease-awaiting-idle"
 RETAINED_RECONCILED_REASON = "retained-lease-reconciled"
 RETAINED_RECONCILIATION_MAX_SECONDS = 6 * 60 * 60
+OWNER_ENDED_BEFORE_COMPLETION = "Actions owner ended before canary completion"
+PRESERVED_WORKER_OWNERSHIP_FAILURE = "preserved active worker ownership differs"
+RETAINED_OWNER_ENDED_FAILURE = (
+    f"GuardianError: OwnerEnded: {OWNER_ENDED_BEFORE_COMPLETION}; "
+    f"restore production: GuardianError: {PRESERVED_WORKER_OWNERSHIP_FAILURE}; "
+    f"restore production: GuardianError: {PRESERVED_WORKER_OWNERSHIP_FAILURE}"
+)
 LEASE_GENERATION_MARKER = ".shipyard-lease-generation.json"
 LEASE_PHASE_ACQUIRING = "acquiring"
 LEASE_PHASE_TRANSITIONING = "transitioning"
@@ -1377,11 +1384,18 @@ class Guardian:
         ready = _json_object(prior_root / "ready.json")
         mutation = _json_object(prior_root / "mutation-fence.json")
         failure = receipt.get("failure")
-        allowed_failure = (
+        allowed_worker_change_failure = (
             isinstance(failure, str)
             and "active workers changed during idle wait" in failure
-            and "preserved active worker ownership differs" in failure
+            and PRESERVED_WORKER_OWNERSHIP_FAILURE in failure
         )
+        allowed_owner_ended_failure = (
+            failure == RETAINED_OWNER_ENDED_FAILURE
+            and receipt.get("reason") == "failed"
+            and receipt.get("production_preserved") is False
+            and receipt.get("production_identity_verified") is False
+        )
+        allowed_failure = allowed_worker_change_failure or allowed_owner_ended_failure
         required = (
             receipt.get("schema_version") == 1,
             receipt.get("transition_path") == CORRECTED_TRANSITION,
@@ -1922,7 +1936,7 @@ class Guardian:
             if self.stop_requested:
                 raise OwnerEnded("guardian received termination signal")
             if _process_start(self.args.owner_pid) != self.owner_start:
-                raise OwnerEnded("Actions owner ended before canary completion")
+                raise OwnerEnded(OWNER_ENDED_BEFORE_COMPLETION)
             if (
                 self.transition_path == CORRECTED_TRANSITION
                 and self.audit_ready_file.exists()
@@ -2181,7 +2195,7 @@ class Guardian:
             )
             != self.worker_ids
         ):
-            raise GuardianError("preserved active worker ownership differs")
+            raise GuardianError(PRESERVED_WORKER_OWNERSHIP_FAILURE)
         _wait_for_idle_writer_domain(
             self.lock_path,
             snapshot.pid,
