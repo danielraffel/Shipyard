@@ -95,6 +95,20 @@ fn ready() -> WorkstreamActivationState {
     })
 }
 
+#[test]
+fn receiptless_wrapper_uncertainty_preserves_its_exact_custody_digest() {
+    use sha2::{Digest, Sha256};
+
+    let evidence_digest = hex::encode(Sha256::digest(b"provider-wrapper-cleanup-unproven"));
+    assert_eq!(
+        provider_wrapper_uncertain_evidence(&evidence_digest),
+        format!(
+            "{{\"schema_version\":1,\"kind\":\"provider_wrapper_uncertain\",\"evidence_digest\":\"{evidence_digest}\"}}"
+        )
+        .into_bytes()
+    );
+}
+
 #[allow(clippy::type_complexity)]
 fn runtime(
     states: Vec<WorkstreamActivationState>,

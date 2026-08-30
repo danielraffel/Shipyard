@@ -254,6 +254,11 @@ fn dispatch_with_cwd_provider<W: Write, E: Write, C>(
 where
     C: FnOnce() -> std::io::Result<PathBuf>,
 {
+    if let Command::ProviderSentinelSupervisor = &cli.command {
+        return crate::provider_wrapper::run_provider_sentinel_supervisor_command()
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|error| CliFailure::new(1, error));
+    }
     let runtime_paths = RuntimePaths::current_with_overrides(
         cli.mode.into(),
         cli.global_dir.clone(),
@@ -264,7 +269,8 @@ where
     // volume's cwd was temporarily unavailable.
     let cwd = if matches!(
         &cli.command,
-        Command::Daemon { .. }
+        Command::ProviderSentinelSupervisor
+            | Command::Daemon { .. }
             | Command::WriterDomainExec { .. }
             | Command::SandboxAuditExec { .. }
             | Command::ParallelProofCanary { .. }
@@ -276,6 +282,9 @@ where
     };
 
     match cli.command {
+        Command::ProviderSentinelSupervisor => {
+            unreachable!("handled before path resolution")
+        }
         Command::WriterDomainExec { path, command } => {
             let status = crate::writer_domain_lease::run_guarded_child(&path, &command).map_err(
                 |error| {
@@ -622,7 +631,8 @@ fn handle_operational_variant<W: Write>(
         Command::Runner { command } => {
             handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
         }
-        Command::WriterDomainExec { .. }
+        Command::ProviderSentinelSupervisor
+        | Command::WriterDomainExec { .. }
         | Command::SandboxAuditExec { .. }
         | Command::Paths
         | Command::ExecutionWorker { .. }

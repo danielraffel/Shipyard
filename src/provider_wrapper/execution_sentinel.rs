@@ -1,11 +1,25 @@
 //! Cross-session cleanup proof for one provider-wrapper invocation.
 
+#[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
+#[cfg(target_os = "macos")]
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{
+    LinuxSentinelSupervisorSpecV3, LinuxSupervisorCleanupV3, LinuxSupervisorProviderV3,
+    LinuxSupervisorResultV3, MAX_SPEC_BYTES, READY_FRAME, RESULT_FRAME_PREFIX,
+    SPEC_ADMISSION_BUDGET, run_linux_sentinel_supervisor,
+};
+
 /// Result of proving that no process still holds the invocation sentinel.
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SentinelCleanup {
     pub(super) proven: bool,
@@ -18,6 +32,7 @@ pub(super) struct SentinelCleanup {
 /// and exec. The exact trusted wrapper contract forbids closing it or clearing
 /// it in descendants. This lets Shipyard find a child even after the wrapper
 /// parent exited and it was reparented by the OS.
+#[cfg(target_os = "macos")]
 pub(super) fn terminate_sentinel_processes(
     path: &Path,
     deadline: Instant,
@@ -65,6 +80,7 @@ pub(super) fn terminate_sentinel_processes(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn signal(pid: u32, signal: &str, deadline: Instant) -> std::io::Result<()> {
     let mut command = Command::new("/bin/kill");
     command
@@ -79,62 +95,6 @@ fn signal(pid: u32, signal: &str, deadline: Instant) -> std::io::Result<()> {
         .success()
         .then_some(())
         .ok_or_else(|| std::io::Error::other(format!("could not signal process {pid}")))
-}
-
-#[cfg(target_os = "linux")]
-fn sentinel_processes(path: &Path, deadline: Instant) -> Option<BTreeSet<u32>> {
-    use std::os::unix::fs::MetadataExt;
-
-    if Instant::now() >= deadline {
-        return None;
-    }
-    let expected = path.canonicalize().ok()?;
-    let current_uid = std::fs::metadata("/proc/self").ok()?.uid();
-    let mut pids = BTreeSet::new();
-    for entry in std::fs::read_dir("/proc").ok()? {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        let entry = entry.ok()?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|value| value.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let process_uid = match entry.metadata() {
-            Ok(metadata) => metadata.uid(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return None,
-        };
-        let same_uid = process_uid == current_uid;
-        let descriptors = match std::fs::read_dir(entry.path().join("fd")) {
-            Ok(descriptors) => descriptors,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound || !same_uid => continue,
-            Err(_) => return None,
-        };
-        for descriptor in descriptors {
-            if Instant::now() >= deadline {
-                return None;
-            }
-            let descriptor = match descriptor {
-                Ok(descriptor) => descriptor,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound || !same_uid => continue,
-                Err(_) => return None,
-            };
-            match std::fs::read_link(descriptor.path()) {
-                Ok(target) if target == expected => {
-                    pids.insert(pid);
-                    break;
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound || !same_uid => {}
-                Err(_) => return None,
-            }
-        }
-    }
-    (Instant::now() < deadline).then_some(pids)
 }
 
 #[cfg(target_os = "macos")]
@@ -173,11 +133,6 @@ fn parse_lsof_output(
         }
     }
     Some(pids)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn sentinel_processes(_path: &Path, _deadline: Instant) -> Option<BTreeSet<u32>> {
-    None
 }
 
 #[cfg(all(test, target_os = "macos"))]
