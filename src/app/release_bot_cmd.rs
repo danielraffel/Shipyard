@@ -2310,7 +2310,7 @@ workflow_shipyard_version = "latest"
             .expect("dogfood workflow version");
         assert_eq!(configured, "latest");
         assert_eq!(
-            include_str!("../../.github/workflows/post-tag-sync.yml"),
+            include_str!("../../.github/workflows/post-tag-sync.yml").replace("\r\n", "\n"),
             render_workflow(
                 &hook.only_for_tag_pattern,
                 configured,
