@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use std::process::Command;
 
+#[cfg(unix)]
 use super::command::auth_token_command;
 use super::*;
 
