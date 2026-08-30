@@ -46,6 +46,10 @@ const QUEUED_RUNS_LIMIT: u32 = 100;
 /// per status.
 const REAP_RUNS_MAX_PAGES: u32 = 5;
 
+fn actions_for_explicit_repo(actions: &GitHubActions, repo: &str) -> GitHubActions {
+    actions.clone().with_repo_override(repo)
+}
+
 /// Entry point dispatched from `src/app.rs`.
 #[allow(clippy::too_many_lines)]
 pub(super) fn runner_command<W: Write>(
@@ -57,8 +61,31 @@ pub(super) fn runner_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let state_dir = &runtime_paths.state_dir;
     let actions = GitHubActions::from_loaded_config(cwd, config);
+    runner_command_with_actions(
+        command,
+        config,
+        mode,
+        cwd,
+        runtime_paths,
+        &actions,
+        json,
+        stdout,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn runner_command_with_actions<W: Write>(
+    command: RunnerCommand,
+    config: &LoadedConfig,
+    mode: RuntimeMode,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let state_dir = &runtime_paths.state_dir;
     match command {
         RunnerCommand::RecoveryWorker { once, drain, apply } => {
             super::merge_steward_cmd::recovery_worker::recovery_worker_command(
@@ -82,7 +109,7 @@ pub(super) fn runner_command<W: Write>(
         } => status_command(
             config,
             cwd,
-            &actions,
+            actions,
             runner_id,
             repo,
             runner_dir,
@@ -101,7 +128,7 @@ pub(super) fn runner_command<W: Write>(
         } => cleanup_command(
             config,
             cwd,
-            &actions,
+            actions,
             dry_run,
             fix,
             stale_hours,
@@ -112,7 +139,7 @@ pub(super) fn runner_command<W: Write>(
             stdout,
         ),
         command @ RunnerCommand::Watch { .. } => {
-            dispatch_watch(command, config, cwd, state_dir, &actions, json, stdout)
+            dispatch_watch(command, config, cwd, state_dir, actions, json, stdout)
         }
         RunnerCommand::Kill {
             pid,
@@ -132,7 +159,7 @@ pub(super) fn runner_command<W: Write>(
             super::runner_kill_cmd::KillCommandArgs {
                 config,
                 cwd,
-                actions: &actions,
+                actions,
                 pid,
                 reason,
                 retrigger,
@@ -164,7 +191,7 @@ pub(super) fn runner_command<W: Write>(
             super::runner_provision_cmd::RegisterArgs {
                 cwd,
                 state_dir,
-                actions: &actions,
+                actions,
                 repo,
                 count,
                 machine_tag,
@@ -176,10 +203,10 @@ pub(super) fn runner_command<W: Write>(
             stdout,
         ),
         RunnerCommand::List { repo, all_repos } => {
-            super::runner_provision_cmd::list_command(cwd, &actions, &repo, all_repos, json, stdout)
+            super::runner_provision_cmd::list_command(cwd, actions, &repo, all_repos, json, stdout)
         }
         RunnerCommand::Audit { repo } => {
-            super::runner_provision_cmd::audit_command(cwd, &actions, &repo, json, stdout)
+            super::runner_provision_cmd::audit_command(cwd, actions, &repo, json, stdout)
         }
         RunnerCommand::Capacity => super::capacity_cmd::capacity_command(config, json, stdout),
         RunnerCommand::FleetStatus {
@@ -203,7 +230,7 @@ pub(super) fn runner_command<W: Write>(
             config,
             cwd,
             state_dir,
-            &actions,
+            actions,
             json,
             stdout,
         ),
@@ -248,7 +275,7 @@ pub(super) fn runner_command<W: Write>(
                 max_ticks,
             },
             cwd,
-            &actions,
+            actions,
             json,
             stdout,
         ),
@@ -257,20 +284,27 @@ pub(super) fn runner_command<W: Write>(
             base,
             labels,
             apply,
-        } => super::merge_steward_cmd::admission_clean_command(
-            &super::merge_steward_cmd::AdmissionCleanArgs {
-                repo,
-                base,
-                labels,
-                apply,
-            },
-            cwd,
-            mode,
-            runtime_paths,
-            &actions,
-            json,
-            stdout,
-        ),
+        } => {
+            // TartCI invokes this explicit-repository gate from launchd's
+            // repo-less working directory. Scope auth before any observation
+            // so configured token helpers can expand `{repo_slug}` from the
+            // command target instead of trying to discover a Git remote.
+            let actions = actions_for_explicit_repo(actions, &repo);
+            super::merge_steward_cmd::admission_clean_command(
+                &super::merge_steward_cmd::AdmissionCleanArgs {
+                    repo,
+                    base,
+                    labels,
+                    apply,
+                },
+                cwd,
+                mode,
+                runtime_paths,
+                &actions,
+                json,
+                stdout,
+            )
+        }
         RunnerCommand::StewardHandoff {
             repo,
             pr,
@@ -307,7 +341,7 @@ pub(super) fn runner_command<W: Write>(
             },
             cwd,
             runtime_paths,
-            &actions,
+            actions,
             json,
             stdout,
         ),
@@ -342,7 +376,7 @@ pub(super) fn runner_command<W: Write>(
             cwd,
             mode,
             runtime_paths,
-            &actions,
+            actions,
             json,
             stdout,
         ),
@@ -366,7 +400,7 @@ pub(super) fn runner_command<W: Write>(
             },
             config,
             cwd,
-            &actions,
+            actions,
             json,
             stdout,
         ),
@@ -376,7 +410,7 @@ pub(super) fn runner_command<W: Write>(
             purge_dir,
             yes,
         } => super::runner_provision_cmd::remove_command(
-            cwd, &actions, name, repo, purge_dir, yes, json, stdout,
+            cwd, actions, name, repo, purge_dir, yes, json, stdout,
         ),
     }
 }
