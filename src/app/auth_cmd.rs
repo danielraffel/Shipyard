@@ -961,6 +961,93 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
         assert!(text.contains("token_env = \"SHIPYARD_GITHUB_TOKEN\""));
     }
 
+    fn assert_machine_auth_bundle_round_trip(
+        root: &Path,
+        machine: &str,
+        binary_authority: &str,
+        stale_key: &str,
+        stale_setting: &str,
+    ) {
+        let source = loaded_config(
+            root,
+            &format!(
+                r#"
+                [github.auth]
+                source = "command"
+                token_command = ["{TEST_WRAPPER}", "token", "--app-id", "123456", "--private-key", "{TEST_PRIVATE_KEY}", "--repo", "{{repo_slug}}"]
+                refresh_skew_seconds = 60
+                {binary_authority}
+                "#,
+            ),
+        );
+        let bundle = export_bundle(&source);
+        let input = root.join(format!("{machine}-auth.toml"));
+        fs::write(&input, format!("{bundle}\n")).expect("bundle");
+        let global_dir = root.join(format!("{machine}-global"));
+        fs::create_dir_all(&global_dir).expect("global dir");
+        fs::write(
+            global_dir.join("config.toml"),
+            format!(
+                r#"
+                [rollout_audit]
+                machine = "{machine}"
+
+                [github.auth]
+                source = "command"
+                token_command = ["{TEST_WRAPPER}"]
+                {stale_setting}
+                "#,
+            ),
+        )
+        .expect("preexisting global config");
+        let mut output = Vec::new();
+
+        auth_import(
+            RuntimeMode::Shipyard,
+            root,
+            &global_dir,
+            &source,
+            &input,
+            AuthConfigScope::Global,
+            false,
+            &mut output,
+        )
+        .unwrap_or_else(|error| panic!("{machine} import failed: {}", error.message));
+
+        let imported = fs::read_to_string(global_dir.join("config.toml"))
+            .expect("imported global config")
+            .parse::<Table>()
+            .expect("imported TOML");
+        let imported_auth = imported
+            .get("github")
+            .and_then(TomlValue::as_table)
+            .and_then(|github| github.get("auth"))
+            .and_then(TomlValue::as_table);
+        let bundled_auth = bundle
+            .get("github")
+            .and_then(TomlValue::as_table)
+            .and_then(|github| github.get("auth"))
+            .and_then(TomlValue::as_table);
+        assert_eq!(
+            imported_auth, bundled_auth,
+            "{machine} auth changed during export/import",
+        );
+        assert_eq!(
+            imported_auth.and_then(|auth| auth.get(stale_key)),
+            None,
+            "{machine} retained stale auth key {stale_key}",
+        );
+        assert_eq!(
+            imported
+                .get("rollout_audit")
+                .and_then(TomlValue::as_table)
+                .and_then(|audit| audit.get("machine"))
+                .and_then(TomlValue::as_str),
+            Some(machine),
+            "{machine} import changed unrelated global config",
+        );
+    }
+
     #[test]
     fn exported_machine_auth_bundles_round_trip_privileged_binary_authority() {
         let temp = TempDir::new().expect("tempdir");
@@ -1011,87 +1098,12 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
         ];
 
         for (machine, binary_authority, stale_key, stale_setting) in cases {
-            let source = loaded_config(
+            assert_machine_auth_bundle_round_trip(
                 temp.path(),
-                &format!(
-                    r#"
-                    [github.auth]
-                    source = "command"
-                    token_command = ["{TEST_WRAPPER}", "token", "--app-id", "123456", "--private-key", "{TEST_PRIVATE_KEY}", "--repo", "{{repo_slug}}"]
-                    refresh_skew_seconds = 60
-                    {binary_authority}
-                    "#,
-                ),
-            );
-            let bundle = export_bundle(&source);
-            let input = temp.path().join(format!("{machine}-auth.toml"));
-            fs::write(&input, format!("{bundle}\n")).expect("bundle");
-            let global_dir = temp.path().join(format!("{machine}-global"));
-            fs::create_dir_all(&global_dir).expect("global dir");
-            fs::write(
-                global_dir.join("config.toml"),
-                format!(
-                    r#"
-                    [rollout_audit]
-                    machine = "{machine}"
-
-                    [github.auth]
-                    source = "command"
-                    token_command = ["{TEST_WRAPPER}"]
-                    {stale_setting}
-                    "#,
-                ),
-            )
-            .expect("preexisting global config");
-            let mut output = Vec::new();
-
-            auth_import(
-                RuntimeMode::Shipyard,
-                temp.path(),
-                &global_dir,
-                &source,
-                &input,
-                AuthConfigScope::Global,
-                false,
-                &mut output,
-            )
-            .unwrap_or_else(|error| panic!("{machine} import failed: {}", error.message));
-
-            let imported = fs::read_to_string(global_dir.join("config.toml"))
-                .expect("imported global config")
-                .parse::<Table>()
-                .expect("imported TOML");
-            assert_eq!(
-                imported
-                    .get("github")
-                    .and_then(TomlValue::as_table)
-                    .and_then(|github| github.get("auth"))
-                    .and_then(TomlValue::as_table),
-                bundle
-                    .get("github")
-                    .and_then(TomlValue::as_table)
-                    .and_then(|github| github.get("auth"))
-                    .and_then(TomlValue::as_table),
-                "{machine} auth changed during export/import",
-            );
-            assert_eq!(
-                imported
-                    .get("github")
-                    .and_then(TomlValue::as_table)
-                    .and_then(|github| github.get("auth"))
-                    .and_then(TomlValue::as_table)
-                    .and_then(|auth| auth.get(stale_key)),
-                None,
-                "{machine} retained stale auth key {stale_key}",
-            );
-            assert_eq!(
-                imported
-                    .get("rollout_audit")
-                    .and_then(TomlValue::as_table)
-                    .and_then(|audit| audit.get("machine"))
-                    .and_then(TomlValue::as_str),
-                Some(machine),
-                "{machine} import changed unrelated global config",
+                machine,
+                &binary_authority,
+                stale_key,
+                &stale_setting,
             );
         }
     }
