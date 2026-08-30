@@ -405,6 +405,8 @@ fn reject_unknown_auth_keys(auth: &Table) -> Result<(), CliFailure> {
         "cache_ttl_seconds",
         "refresh_skew_seconds",
         "ambient_gh_binary",
+        "privileged_gh_binary",
+        "privileged_git_binary",
     ];
     if let Some(key) = auth.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(CliFailure::new(
@@ -957,6 +959,153 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
             fs::read_to_string(temp.path().join(".shipyard.local/config.toml")).expect("config");
         assert!(text.contains("[github.auth]"));
         assert!(text.contains("token_env = \"SHIPYARD_GITHUB_TOKEN\""));
+    }
+
+    fn assert_machine_auth_bundle_round_trip(
+        root: &Path,
+        machine: &str,
+        binary_authority: &str,
+        stale_key: &str,
+        stale_setting: &str,
+    ) {
+        let source = loaded_config(
+            root,
+            &format!(
+                r#"
+                [github.auth]
+                source = "command"
+                token_command = ["{TEST_WRAPPER}", "token", "--app-id", "123456", "--private-key", "{TEST_PRIVATE_KEY}", "--repo", "{{repo_slug}}"]
+                refresh_skew_seconds = 60
+                {binary_authority}
+                "#,
+            ),
+        );
+        let bundle = export_bundle(&source);
+        let input = root.join(format!("{machine}-auth.toml"));
+        fs::write(&input, format!("{bundle}\n")).expect("bundle");
+        let global_dir = root.join(format!("{machine}-global"));
+        fs::create_dir_all(&global_dir).expect("global dir");
+        fs::write(
+            global_dir.join("config.toml"),
+            format!(
+                r#"
+                [rollout_audit]
+                machine = "{machine}"
+
+                [github.auth]
+                source = "command"
+                token_command = ["{TEST_WRAPPER}"]
+                {stale_setting}
+                "#,
+            ),
+        )
+        .expect("preexisting global config");
+        let mut output = Vec::new();
+
+        auth_import(
+            RuntimeMode::Shipyard,
+            root,
+            &global_dir,
+            &source,
+            &input,
+            AuthConfigScope::Global,
+            false,
+            &mut output,
+        )
+        .unwrap_or_else(|error| panic!("{machine} import failed: {}", error.message));
+
+        let imported = fs::read_to_string(global_dir.join("config.toml"))
+            .expect("imported global config")
+            .parse::<Table>()
+            .expect("imported TOML");
+        let imported_auth = imported
+            .get("github")
+            .and_then(TomlValue::as_table)
+            .and_then(|github| github.get("auth"))
+            .and_then(TomlValue::as_table);
+        let bundled_auth = bundle
+            .get("github")
+            .and_then(TomlValue::as_table)
+            .and_then(|github| github.get("auth"))
+            .and_then(TomlValue::as_table);
+        assert_eq!(
+            imported_auth, bundled_auth,
+            "{machine} auth changed during export/import",
+        );
+        assert_eq!(
+            imported_auth.and_then(|auth| auth.get(stale_key)),
+            None,
+            "{machine} retained stale auth key {stale_key}",
+        );
+        assert_eq!(
+            imported
+                .get("rollout_audit")
+                .and_then(TomlValue::as_table)
+                .and_then(|audit| audit.get("machine"))
+                .and_then(TomlValue::as_str),
+            Some(machine),
+            "{machine} import changed unrelated global config",
+        );
+    }
+
+    #[test]
+    fn exported_machine_auth_bundles_round_trip_privileged_binary_authority() {
+        let temp = TempDir::new().expect("tempdir");
+        let gh = if cfg!(windows) {
+            "C:/Program Files/GitHub CLI/gh.exe"
+        } else {
+            "/opt/homebrew/bin/gh"
+        };
+        let git = if cfg!(windows) {
+            "C:/Program Files/Git/cmd/git.exe"
+        } else {
+            "/usr/bin/git"
+        };
+        let cases = [
+            (
+                "m5",
+                format!(
+                    r#"
+                    ambient_gh_binary = "{gh}"
+                    privileged_gh_binary = "{gh}"
+                    privileged_git_binary = "{git}"
+                    "#,
+                ),
+                "cache_ttl_seconds",
+                "cache_ttl_seconds = 300".to_owned(),
+            ),
+            (
+                "m1",
+                format!(
+                    r#"
+                    privileged_git_binary = "{git}"
+                    "#,
+                ),
+                "ambient_gh_binary",
+                format!("ambient_gh_binary = \"{gh}\""),
+            ),
+            (
+                "m3",
+                format!(
+                    r#"
+                    privileged_gh_binary = "{gh}"
+                    privileged_git_binary = "{git}"
+                    "#,
+                ),
+                "ambient_gh_binary",
+                format!("ambient_gh_binary = \"{gh}\""),
+            ),
+        ];
+
+        for (machine, binary_authority, stale_key, stale_setting) in cases {
+            assert_machine_auth_bundle_round_trip(
+                temp.path(),
+                machine,
+                &binary_authority,
+                stale_key,
+                &stale_setting,
+            );
+        }
     }
 
     #[test]
