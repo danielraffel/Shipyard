@@ -512,6 +512,17 @@ mod tests {
 
     use super::*;
 
+    const TEST_WRAPPER: &str = if cfg!(windows) {
+        "C:/Users/ci/.local/bin/ghapp"
+    } else {
+        "/Users/ci/.local/bin/ghapp"
+    };
+    const TEST_PRIVATE_KEY: &str = if cfg!(windows) {
+        "C:/Users/ci/.config/shipyard/app.pem"
+    } else {
+        "/Users/ci/.config/shipyard/app.pem"
+    };
+
     fn loaded_config(root: &Path, contents: &str) -> LoadedConfig {
         LoadedConfig {
             data: contents.parse::<Table>().expect("config TOML"),
@@ -550,7 +561,7 @@ mod tests {
     #[test]
     fn helper_argv_returns_only_typed_credential_arguments() {
         let temp = TempDir::new().expect("tempdir");
-        let wrapper = "/Users/ci/.local/bin/ghapp";
+        let wrapper = TEST_WRAPPER;
         let config = command_config(
             temp.path(),
             &[
@@ -559,7 +570,7 @@ mod tests {
                 "--app-id",
                 "123456",
                 "--private-key",
-                "/Users/ci/.config/shipyard/app.pem",
+                TEST_PRIVATE_KEY,
                 "--repo",
                 "{repo_slug}",
             ],
@@ -574,26 +585,21 @@ mod tests {
         assert_eq!(output.repo, "danielraffel/Shipyard");
         assert_eq!(
             output.credential_argv,
-            [
-                "--app-id",
-                "123456",
-                "--private-key",
-                "/Users/ci/.config/shipyard/app.pem",
-            ]
+            ["--app-id", "123456", "--private-key", TEST_PRIVATE_KEY,]
         );
     }
 
     #[test]
     fn helper_argv_rejects_every_noncanonical_token_command_shape() {
         let temp = TempDir::new().expect("tempdir");
-        let wrapper = "/Users/ci/.local/bin/ghapp";
+        let wrapper = TEST_WRAPPER;
         let canonical = [
             wrapper,
             "token",
             "--app-id",
             "123456",
             "--private-key",
-            "/Users/ci/.config/shipyard/app.pem",
+            TEST_PRIVATE_KEY,
             "--repo",
             "{repo_slug}",
         ];
@@ -647,7 +653,7 @@ mod tests {
     #[test]
     fn helper_argv_reads_only_machine_global_config() {
         let temp = TempDir::new().expect("tempdir");
-        let wrapper = "/Users/ci/.local/bin/ghapp";
+        let wrapper = TEST_WRAPPER;
         let global = temp.path().join("global");
         let project = temp.path().join(".shipyard");
         fs::create_dir_all(&global).expect("global dir");
@@ -657,7 +663,7 @@ mod tests {
             format!(
                 r#"[github.auth]
 source = "command"
-token_command = ["{wrapper}", "token", "--app-id", "123456", "--private-key", "/Users/ci/app.pem", "--repo", "{{repo_slug}}"]
+token_command = ["{wrapper}", "token", "--app-id", "123456", "--private-key", "{TEST_PRIVATE_KEY}", "--repo", "{{repo_slug}}"]
 "#
             ),
         )
@@ -693,14 +699,14 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
     #[test]
     fn helper_argv_rejects_malformed_routes() {
         let temp = TempDir::new().expect("tempdir");
-        let wrapper = "/Users/ci/.local/bin/ghapp";
+        let wrapper = TEST_WRAPPER;
         let canonical = [
             wrapper,
             "token",
             "--app-id",
             "123456",
             "--private-key",
-            "/Users/ci/app.pem",
+            TEST_PRIVATE_KEY,
             "--repo",
             "{repo_slug}",
         ];
@@ -716,7 +722,7 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
     #[test]
     fn helper_argv_rejects_invalid_app_ids() {
         let temp = TempDir::new().expect("tempdir");
-        let wrapper = "/Users/ci/.local/bin/ghapp";
+        let wrapper = TEST_WRAPPER;
         let oversized_app_id = "1".repeat(257);
         let oversized = [
             wrapper,
@@ -724,7 +730,7 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
             "--app-id",
             oversized_app_id.as_str(),
             "--private-key",
-            "/Users/ci/app.pem",
+            TEST_PRIVATE_KEY,
             "--repo",
             "{repo_slug}",
         ];
@@ -750,7 +756,7 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
                 "--app-id",
                 app_id,
                 "--private-key",
-                "/Users/ci/app.pem",
+                TEST_PRIVATE_KEY,
                 "--repo",
                 "{repo_slug}",
             ];
@@ -767,18 +773,28 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
     #[test]
     fn helper_argv_requires_raw_normalized_paths() {
         let temp = TempDir::new().expect("tempdir");
-        let wrapper = "/Users/ci/.local/bin/ghapp";
-        for malformed_wrapper in [
-            "/Users/ci//.local/bin/ghapp",
-            "/Users/ci/./.local/bin/ghapp",
-        ] {
+        let wrapper = TEST_WRAPPER;
+        let malformed_wrappers = if cfg!(windows) {
+            [
+                "C:/Users/ci//.local/bin/ghapp",
+                "C:/Users/ci/./.local/bin/ghapp",
+                "C:/Users/ci/../.local/bin/ghapp",
+            ]
+        } else {
+            [
+                "/Users/ci//.local/bin/ghapp",
+                "/Users/ci/./.local/bin/ghapp",
+                "/Users/ci/../.local/bin/ghapp",
+            ]
+        };
+        for malformed_wrapper in malformed_wrappers {
             let malformed = [
                 malformed_wrapper,
                 "token",
                 "--app-id",
                 "123456",
                 "--private-key",
-                "/Users/ci/app.pem",
+                TEST_PRIVATE_KEY,
                 "--repo",
                 "{repo_slug}",
             ];
@@ -791,7 +807,20 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
                 .is_err()
             );
         }
-        for private_key in ["/Users/ci//app.pem", "/Users/ci/./app.pem"] {
+        let malformed_private_keys = if cfg!(windows) {
+            [
+                "C:/Users/ci//app.pem",
+                "C:/Users/ci/./app.pem",
+                "C:/Users/ci/../app.pem",
+            ]
+        } else {
+            [
+                "/Users/ci//app.pem",
+                "/Users/ci/./app.pem",
+                "/Users/ci/../app.pem",
+            ]
+        };
+        for private_key in malformed_private_keys {
             let malformed = [
                 wrapper,
                 "token",

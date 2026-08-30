@@ -4,12 +4,17 @@ use std::process::Command;
 use super::*;
 
 fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
-    let github_cli = shipyard_bin
-        .and_then(|binary| Path::new(binary).parent())
-        .map_or_else(
-            || "/Users/ci/.local/bin/ghapp".to_owned(),
+    let github_cli = match (ssh, shipyard_bin) {
+        (Some(_), Some(binary)) => binary.rsplit_once('/').map_or_else(
+            || "ghapp".to_owned(),
+            |(parent, _)| format!("{parent}/ghapp"),
+        ),
+        (_, Some(binary)) => Path::new(binary).parent().map_or_else(
+            || "ghapp".to_owned(),
             |parent| parent.join("ghapp").display().to_string(),
-        );
+        ),
+        _ => "/Users/ci/.local/bin/ghapp".to_owned(),
+    };
     HostClassConfig {
         class: "m5".to_owned(),
         ssh: ssh.map(str::to_owned),
