@@ -549,11 +549,12 @@ fn local_plan_preserves_host_class_daemon_context() {
 
 #[test]
 fn rendered_plans_contain_only_the_token_resolver_not_token_material() {
-    let plan = host_update_plan(
-        &host(None, Some("/Users/ci/.local/bin/shipyard")),
-        "v0.131.1",
-    )
-    .expect("plan");
+    let shipyard_bin = if cfg!(windows) {
+        r"C:\Users\ci\.local\bin\shipyard.exe"
+    } else {
+        "/Users/ci/.local/bin/shipyard"
+    };
+    let plan = host_update_plan(&host(None, Some(shipyard_bin)), "v0.131.1").expect("plan");
     let mut json = Vec::new();
     render_plan(&mut json, true, "v0.131.1", &[plan], false).expect("rendered plan");
     let rendered = String::from_utf8(json).expect("UTF-8 plan");

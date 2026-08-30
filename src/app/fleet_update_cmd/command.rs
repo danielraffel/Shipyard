@@ -195,8 +195,10 @@ if ! printf 'Authorization: Bearer %s\n' "$token" > "$auth_header"; then umask "
 umask "$auth_prior_umask"
 test -f "$auth_header"
 test ! -L "$auth_header"
-test "$(/usr/bin/stat -f '%u' "$auth_header")" = "$(/usr/bin/id -u)"
-test "$(/usr/bin/stat -f '%Lp' "$auth_header")" = 600"#
+auth_header_uid="$(/usr/bin/stat -f '%u' "$auth_header" 2>/dev/null || /usr/bin/stat -c '%u' "$auth_header")"
+auth_header_mode="$(/usr/bin/stat -f '%Lp' "$auth_header" 2>/dev/null || /usr/bin/stat -c '%a' "$auth_header")"
+test "$auth_header_uid" = "$(/usr/bin/id -u)"
+test "$auth_header_mode" = 600"#
 }
 
 pub(super) fn auth_token_command(repository: &str, auth_wrapper: &Path) -> String {
