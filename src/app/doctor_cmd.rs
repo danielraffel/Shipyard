@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use crate::config::LoadedConfig;
 use crate::doctor::{
-    DoctorReport, SystemCommandProbe, check_github_auth, check_release_chain_with_mode,
-    collect_report, collect_runner_checks, runner_config_error_checks,
+    DoctorReport, SystemCommandProbe, check_github_auth_for_repo, check_release_chain_with_mode,
+    collect_report_for_repo, collect_runner_checks, runner_config_error_checks,
 };
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
@@ -19,12 +19,16 @@ pub(super) fn doctor<W: Write>(
     mode: RuntimeMode,
     cwd: &Path,
     state_dir: &Path,
+    repo: Option<&str>,
     release_chain: bool,
     runners: bool,
     rate_limit: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut report = collect_report(&SystemCommandProbe, mode, cwd, state_dir);
+    if let Some(repo) = repo {
+        crate::gh::validate_repo_slug(repo)?;
+    }
+    let mut report = collect_report_for_repo(&SystemCommandProbe, mode, cwd, state_dir, repo);
     if release_chain && let Some(entry) = check_release_chain_with_mode(mode, cwd) {
         report
             .checks
@@ -42,7 +46,7 @@ pub(super) fn doctor<W: Write>(
         }
     }
     if rate_limit {
-        let entries = collect_rate_limit_section(mode, cwd);
+        let entries = collect_rate_limit_section(mode, cwd, repo);
         report
             .checks
             .insert("GitHub rate limits".to_owned(), entries);
@@ -101,12 +105,22 @@ fn write_human_report<W: Write>(stdout: &mut W, report: DoctorReport) -> std::io
 fn collect_rate_limit_section(
     mode: RuntimeMode,
     cwd: &Path,
+    repo: Option<&str>,
 ) -> BTreeMap<String, crate::doctor::DoctorEntry> {
     let mut entries: BTreeMap<String, crate::doctor::DoctorEntry> = BTreeMap::new();
-    entries.insert("auth".to_owned(), check_github_auth(mode, cwd));
+    entries.insert(
+        "auth".to_owned(),
+        check_github_auth_for_repo(mode, cwd, repo),
+    );
 
     let raw = (|| {
         let client = GhClient::from_cwd(mode, cwd).map_err(|error| error.to_string())?;
+        let client = match repo {
+            Some(repo) => client
+                .with_repo_override(repo)
+                .map_err(|error| error.to_string())?,
+            None => client,
+        };
         client
             .prepare_command(
                 cwd,

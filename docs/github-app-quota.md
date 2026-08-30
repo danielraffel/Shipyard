@@ -439,6 +439,11 @@ shipyard auth doctor
 shipyard doctor --rate-limit
 ```
 
+In a checkout with multiple GitHub remotes, add `--repo OWNER/REPO` to either
+doctor command. This explicit diagnostic override is passed to
+`{repo_slug}`/`{repo_owner}`/`{repo_name}` expansion exactly; malformed slugs
+are rejected, and omitting the option preserves Shipyard's ambiguity refusal.
+
 The export contains the `[github.auth]` command configuration. It does not
 include GitHub tokens, token caches, private keys, Keychain items, or
 1Password sessions.
