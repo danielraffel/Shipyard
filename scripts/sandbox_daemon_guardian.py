@@ -1706,6 +1706,9 @@ class Guardian:
         with self.retained_reconciliation_lock():
             if self.lease_dir.exists():
                 self.reconcile_retained_lease()
+                # An authenticated predecessor generation's mutation proof
+                # cannot authorize the fresh generation created below.
+                self.mutation_fence_proved = False
             self.lease_owned = True
             try:
                 lease_stat, lease_generation = _create_lease_generation(self.lease_dir)

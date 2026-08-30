@@ -216,6 +216,53 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.production_identity_verified = True
             active.release()
 
+    def test_reconciled_predecessor_fence_never_authorizes_fresh_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _, predecessor_generation = self.create_generation_lease(active)
+
+            def reconcile_predecessor() -> bool:
+                active.mutation_fence_proved = True
+                for child in active.lease_dir.iterdir():
+                    child.unlink()
+                active.lease_dir.rmdir()
+                return True
+
+            with mock.patch.object(
+                active,
+                "reconcile_retained_lease",
+                side_effect=reconcile_predecessor,
+            ):
+                active.acquire()
+
+            self.assertTrue(active.lease_owned)
+            self.assertNotEqual(active.lease_generation, predecessor_generation)
+            self.assertFalse(active.mutation_fence_proved)
+
+            active.transition_path = guardian.CORRECTED_TRANSITION
+            active.audit_ready_file.write_text("exclusive\n", encoding="utf-8")
+
+            def prove_successor() -> None:
+                self.assertFalse(active.mutation_fence_proved)
+                active.mutation_fence_proved = True
+                active.done_file.touch()
+
+            with mock.patch.object(
+                active,
+                "prove_corrected_mutation_fence",
+                side_effect=prove_successor,
+            ) as prove, mock.patch.object(
+                guardian, "_process_start", return_value=active.owner_start
+            ):
+                active.wait_for_owner()
+
+            prove.assert_called_once_with()
+            active.production_preserved = True
+            active.production_identity_verified = True
+            active.release()
+
     def test_reconciliation_lock_symlink_and_unsafe_mode_refuse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
