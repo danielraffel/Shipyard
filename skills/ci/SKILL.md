@@ -1679,6 +1679,13 @@ A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever the ma
 
 **Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `scripts/ci_matrix.py`, release packaging scripts, or `src/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.
 
+Self-hosted CI must not inherit the host's production Shipyard configuration.
+Run Rust tests and coverage with `HOME: ${{ runner.temp }}` while leaving the
+runner-managed Cargo/Rustup paths intact. Golden tests for generated text
+compare logical LF content after normalizing checkout-only CRLF; do not weaken
+any other byte or semantic assertion merely to accommodate Windows checkout
+policy.
+
 **Durable resume projections are two-dimensional and inert until activation.**
 Keep terminal runtime (`cmux` or optional HerdR) separate from agent/provider
 transport (native Codex/Claude plus any launch-profile router such as
