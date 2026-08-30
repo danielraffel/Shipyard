@@ -80,20 +80,22 @@ pub(super) fn remote_update_command(
     } else {
         auth_token_command(&authority.repository, auth_wrapper)
     };
+    let auth_header_setup = github_api_auth_header_setup();
     let script = format!(
         "set -euo pipefail\n{}\n{}\n{}\n\
          before_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
-         token=\"$({})\"\n\
          installer=\"$(/usr/bin/mktemp)\"; staging_dir=\"$(/usr/bin/mktemp -d)\"\n\
          trap '/bin/rm -f \"$installer\"; /bin/rm -rf \"$staging_dir\"' EXIT\n\
+         token=\"$({})\"\n\
+         {}\n\
          /usr/bin/curl -fsSL --output \"$installer\" {}\n\
          test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}\n\
          release_asset=\"$staging_dir/release-asset\"\n\
-         /usr/bin/printf 'Authorization: Bearer %s\\n' \"$token\" | /usr/bin/curl -fsSL -H @- -H 'Accept: application/octet-stream' --output \"$release_asset\" {}\n\
+         /usr/bin/curl -fsSL -H \"@$auth_header\" -H 'Accept: application/octet-stream' --output \"$release_asset\" {}\n\
          release_asset_sha256=\"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\"; test \"$release_asset_sha256\" = {}\n\
          auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"\n\
-         /usr/bin/printf 'Authorization: Bearer %s\\n' \"$token\" | /usr/bin/curl -fsSL -H @- --output \"$auth_helper_source\" {}\n\
-         /usr/bin/printf 'Authorization: Bearer %s\\n' \"$token\" | /usr/bin/curl -fsSL -H @- --output \"$auth_wrapper_source\" {}\n\
+         /usr/bin/curl -fsSL -H \"@$auth_header\" --output \"$auth_helper_source\" {}\n\
+         /usr/bin/curl -fsSL -H \"@$auth_header\" --output \"$auth_wrapper_source\" {}\n\
          test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}\n\
          test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}\n\
          curl_shim=\"$staging_dir/curl-exact-asset\"; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"\n\
@@ -121,6 +123,7 @@ pub(super) fn remote_update_command(
         shlex_quote(&global_dir.display().to_string()),
         shlex_quote(&state_dir.display().to_string()),
         auth_token_command,
+        auth_header_setup,
         shlex_quote(&installer_url),
         shlex_quote(&authority.installer.sha256),
         shlex_quote(&release_asset_url),
@@ -178,6 +181,22 @@ pub(super) fn remote_update_command(
         REMOTE_UPDATE_TIMEOUT.as_secs(),
         shlex_quote(&script),
     )
+}
+
+/// Materialize a GitHub API authorization header without ever putting the
+/// token in a child process argv. The staging directory is private and removed
+/// by the caller's trap; curl sees only this file's path.
+pub(super) fn github_api_auth_header_setup() -> &'static str {
+    r#"case "$token" in ''|*[![:graph:]]*) exit 1 ;; esac
+auth_header="$staging_dir/github-api-header"
+auth_prior_umask="$(umask)"
+umask 077
+if ! printf 'Authorization: Bearer %s\n' "$token" > "$auth_header"; then umask "$auth_prior_umask"; exit 1; fi
+umask "$auth_prior_umask"
+test -f "$auth_header"
+test ! -L "$auth_header"
+test "$(/usr/bin/stat -f '%u' "$auth_header")" = "$(/usr/bin/id -u)"
+test "$(/usr/bin/stat -f '%Lp' "$auth_header")" = 600"#
 }
 
 pub(super) fn auth_token_command(repository: &str, auth_wrapper: &Path) -> String {
@@ -355,6 +374,19 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
     let (auth_helper_url, auth_wrapper_url) = auth_support::source_urls(&plan.release_authority);
     let auth_contract = auth_support::wrapper_helper_contract_probe(&plan.auth_helper);
     let curl_shim = exact_asset_curl_shim(&plan.release_authority.platform_asset.name);
+    let auth_token_command = if tag_supports_auth_resolver(&plan.target) {
+        resolver_auth_token_command(
+            &plan.binary,
+            plan.runtime_mode.as_str(),
+            &plan.global_dir,
+            &plan.target,
+            &plan.release_authority.repository,
+            &plan.auth_wrapper,
+        )
+    } else {
+        auth_token_command(&plan.release_authority.repository, &plan.auth_wrapper)
+    };
+    let auth_header_setup = github_api_auth_header_setup();
     let binary_install_command = format!(
         "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" /usr/bin/env -i HOME={} PATH={} SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" {} --mode {} --global-dir {} --state-dir {} --json update --to {} --install-script-url \"file://$installer\" --curl-bin \"$curl_shim\" --unattended-fleet",
         shlex_quote(&home_dir().display().to_string()),
@@ -383,8 +415,10 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         false,
     );
     format!(
-        "set -euo pipefail; {}; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; /usr/bin/curl -fsSL --output \"$installer\" {}; test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; test \"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL --output \"$auth_helper_source\" {}; /usr/bin/curl -fsSL --output \"$auth_wrapper_source\" {}; test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; {}; /usr/bin/printf '%s\\n' \"$refresh_receipt\"",
+        "set -euo pipefail; {}; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; token=\"$({})\"; {}; /usr/bin/curl -fsSL --output \"$installer\" {}; test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H \"@$auth_header\" -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; test \"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H \"@$auth_header\" --output \"$auth_helper_source\" {}; /usr/bin/curl -fsSL -H \"@$auth_header\" --output \"$auth_wrapper_source\" {}; unset token; test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; {}; /usr/bin/printf '%s\\n' \"$refresh_receipt\"",
         auth_contract,
+        auth_token_command,
+        auth_header_setup,
         shlex_quote(&installer_url),
         shlex_quote(&plan.release_authority.installer.sha256),
         shlex_quote(&release_asset_url),

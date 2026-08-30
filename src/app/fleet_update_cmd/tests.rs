@@ -2,7 +2,9 @@
 use std::process::Command;
 
 #[cfg(unix)]
-use super::command::{auth_token_command, resolver_auth_token_command};
+use super::command::{
+    auth_token_command, github_api_auth_header_setup, resolver_auth_token_command,
+};
 use super::*;
 
 fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
@@ -67,6 +69,11 @@ fn remote_plan_uses_absolute_binary_and_minimal_canonical_path() {
             .contains(&format!("Shipyard/{}/install.sh", "2".repeat(40)))
     );
     assert!(plan.command.contains("releases/assets/11"));
+    assert!(plan.command.contains("@$auth_header"));
+    assert!(plan.command.contains("application/octet-stream"));
+    assert!(!plan.command.contains("/releases/download/"));
+    assert!(!plan.command.contains("-H @-"));
+    assert!(!plan.command.contains("/usr/bin/printf 'Authorization:"));
     assert!(plan.command.contains(&"a".repeat(64)));
     assert!(plan.command.contains(&"6".repeat(64)));
     assert!(plan.command.contains("--mode shipyard"));
@@ -531,6 +538,80 @@ fn local_plan_preserves_host_class_daemon_context() {
     assert!(committed < daemon_refresh);
     assert!(daemon_refresh < lock_release);
     assert!(command.contains("fleet-auth-support.transaction"));
+    assert!(command.contains("-H \"@$auth_header\" -H 'Accept: application/octet-stream'"));
+    assert!(
+        command.contains("https://api.github.com/repos/danielraffel/Shipyard/releases/assets/11")
+    );
+    assert!(!command.contains("/releases/download/"));
+    assert!(!command.contains("-H @-"));
+    assert!(!command.contains("/usr/bin/printf 'Authorization:"));
+}
+
+#[test]
+fn rendered_plans_contain_only_the_token_resolver_not_token_material() {
+    let plan = host_update_plan(
+        &host(None, Some("/Users/ci/.local/bin/shipyard")),
+        "v0.131.1",
+    )
+    .expect("plan");
+    let mut json = Vec::new();
+    render_plan(&mut json, true, "v0.131.1", &[plan], false).expect("rendered plan");
+    let rendered = String::from_utf8(json).expect("UTF-8 plan");
+
+    assert!(rendered.contains("auth helper-argv"));
+    assert!(rendered.contains("releases/assets/11"));
+    assert!(!rendered.contains("ghs_top_secret_fixture"));
+    assert!(!rendered.contains("Authorization: Bearer ghs_"));
+    assert!(!rendered.contains("/releases/download/"));
+}
+
+#[cfg(unix)]
+#[test]
+fn github_api_header_is_private_and_token_never_reaches_output() {
+    let temp = tempfile::tempdir().expect("temp");
+    let script = format!(
+        "set -euo pipefail; staging_dir={}; token=\"$SECRET_FIXTURE\"; {}; test \"$(/bin/cat \"$auth_header\")\" = \"Authorization: Bearer $SECRET_FIXTURE\"; printf '%s\\n' safe-output",
+        shlex_quote(&temp.path().display().to_string()),
+        github_api_auth_header_setup(),
+    );
+    let output = Command::new("/bin/bash")
+        .args(["-c", &script])
+        .env("SECRET_FIXTURE", "ghs_top_secret_fixture")
+        .output()
+        .expect("header setup");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "safe-output\n");
+    assert!(output.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("ghs_top_secret_fixture"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("ghs_top_secret_fixture"));
+
+    let setup = github_api_auth_header_setup();
+    assert!(setup.contains("printf 'Authorization: Bearer %s\\n' \"$token\""));
+    assert!(!setup.contains("/usr/bin/printf"));
+    assert!(!setup.contains("curl"));
+}
+
+#[cfg(unix)]
+#[test]
+fn github_api_header_rejects_missing_or_malformed_tokens_before_download() {
+    let temp = tempfile::tempdir().expect("temp");
+    for token_assignment in ["token=''", "token='token with space'"] {
+        let script = format!(
+            "set -euo pipefail; staging_dir={}; {token_assignment}; {}; touch {}/unexpected-download",
+            shlex_quote(&temp.path().display().to_string()),
+            github_api_auth_header_setup(),
+            shlex_quote(&temp.path().display().to_string()),
+        );
+        let output = Command::new("/bin/bash")
+            .args(["-c", &script])
+            .output()
+            .expect("rejected token");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert!(!temp.path().join("unexpected-download").exists());
+        assert!(!temp.path().join("github-api-header").exists());
+    }
 }
 
 #[cfg(unix)]
