@@ -403,6 +403,38 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertFalse(self.resolver_log.exists())
         self.assertFalse(self.helper_log.exists())
 
+    def test_cli_mode_refuses_context_disappearance_after_shell_precheck(self) -> None:
+        raced_context = self.root / "context-raced-away.json"
+        race_hook = self.root / "remove-resolver-context.py"
+        race_hook.write_text(
+            "import os\n"
+            "os.replace(os.environ['RACE_CONTEXT'], os.environ['RACE_DEST'])\n",
+            encoding="utf-8",
+        )
+        wrapper_source = self.wrapper.read_text(encoding="utf-8")
+        parser_boundary = "fi\nresolver_context_argv=()\n"
+        self.assertEqual(wrapper_source.count(parser_boundary), 1)
+        self.wrapper.write_text(
+            wrapper_source.replace(
+                parser_boundary,
+                f'fi\n"$python_binary" -I "{race_hook}"\nresolver_context_argv=()\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        self.environment["RACE_CONTEXT"] = str(self.resolver_context)
+        self.environment["RACE_DEST"] = str(raced_context)
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resolver context is malformed or unsafe", result.stderr)
+        self.assertFalse(self.resolver_context.exists())
+        self.assertTrue(raced_context.is_file())
+        self.assertFalse(self.resolver_log.exists())
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
     def test_absolute_shell_env_and_git_ignore_hostile_resolution(self) -> None:
         hostile = self.root / "hostile-path"
         hostile.mkdir()

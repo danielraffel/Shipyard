@@ -789,11 +789,10 @@ if [[ ! -e "$resolver_context" && ! -L "$resolver_context" ]]; then
     echo "ghapp: resolver context is required for direct mode" >&2
     exit 1
 fi
-if [[ -e "$resolver_context" || -L "$resolver_context" ]]; then
-    resolver_context_argv=()
-    while IFS= read -r context_argument; do
-        resolver_context_argv+=("$context_argument")
-    done < <(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+resolver_context_argv=()
+while IFS= read -r context_argument; do
+    resolver_context_argv+=("$context_argument")
+done < <(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
         "$python_binary" -I -c '
 import json, os, stat, sys, unicodedata
 def load_private_json(path, maximum):
@@ -844,16 +843,15 @@ if (
 for item in ("--mode", mode, "--global-dir", global_dir):
     sys.stdout.write(item + "\n")
 ' "$resolver_context")
-    if [[ "${#resolver_context_argv[@]}" != 4 || \
-          "${resolver_context_argv[0]}" != "--mode" || \
-          ( "${resolver_context_argv[1]}" != "shipyard" && "${resolver_context_argv[1]}" != "isolated" ) || \
-          "${resolver_context_argv[2]}" != "--global-dir" || \
-          "${resolver_context_argv[3]}" != /* ]]; then
-        echo "ghapp: resolver context is malformed or unsafe" >&2
-        exit 1
-    fi
-    resolver_command+=("${resolver_context_argv[@]}")
+if [[ "${#resolver_context_argv[@]}" != 4 || \
+      "${resolver_context_argv[0]}" != "--mode" || \
+      ( "${resolver_context_argv[1]}" != "shipyard" && "${resolver_context_argv[1]}" != "isolated" ) || \
+      "${resolver_context_argv[2]}" != "--global-dir" || \
+      "${resolver_context_argv[3]}" != /* ]]; then
+    echo "ghapp: resolver context is malformed or unsafe" >&2
+    exit 1
 fi
+resolver_command+=("${resolver_context_argv[@]}")
 resolver_json="$(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
     "${resolver_command[@]}" auth helper-argv --wrapper "$wrapper_path" --repo "$repo" | \
     /usr/bin/head -c 16385)"
