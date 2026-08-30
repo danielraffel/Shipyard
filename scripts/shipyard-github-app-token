@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -23,8 +24,14 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows keeps disk caching disabled.
+    fcntl = None
 
 
 DEFAULT_API_URL = "https://api.github.com"
@@ -45,6 +52,12 @@ REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 INSTALLATION_ID_RE = re.compile(r"^[1-9][0-9]*$")
 RETRYABLE_HTTP_STATUS = frozenset({429, 502, 503, 504})
 API_RETRY_DELAYS_SECONDS = (1, 2, 3)
+WRITER_DOMAIN_LOCK_NAME = ".sandbox-writer-domain.lock"
+WRITER_DOMAIN_TURNSTILE_NAME = ".sandbox-writer-domain.turnstile.lock"
+WRITER_DOMAIN_OVERLAP_CLASSIFICATION = "sandbox_writer_domain_overlap"
+WRITER_DOMAIN_OVERLAP_EXIT_CODE = 75
+WRITER_DOMAIN_ACQUIRE_TIMEOUT_SECONDS = 30.0
+WRITER_DOMAIN_POLL_INTERVAL_SECONDS = 0.01
 
 
 class HelperError(Exception):
@@ -122,6 +135,8 @@ def main() -> int:
         return 0
     except HelperError as error:
         print(f"shipyard-github-app-token: {error}", file=sys.stderr)
+        if str(error).startswith(f"{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}:"):
+            return WRITER_DOMAIN_OVERLAP_EXIT_CODE
         return 1
 
 
@@ -348,10 +363,12 @@ def cache_file(cache_dir: Path, api_url: str, app_id: str, route: str) -> Path:
     return cache_dir / f"installation-token-{digest}.json"
 
 
-def ensure_private_cache_dir(cache_dir: Path) -> None:
+def ensure_private_cache_dir(cache_dir: Path, *, create: bool = True) -> bool:
     if cache_dir.exists():
         if cache_dir.is_symlink() or not cache_dir.is_dir():
             raise HelperError("token cache path must be a private directory")
+    elif not create:
+        return False
     else:
         try:
             cache_dir.mkdir(parents=True, mode=0o700)
@@ -372,6 +389,109 @@ def ensure_private_cache_dir(cache_dir: Path) -> None:
         raise HelperError("token cache directory must have mode 0700 or stricter")
     if os.name != "nt" and cache_dir.stat().st_uid != os.getuid():
         raise HelperError("token cache directory must be owned by the current user")
+    return True
+
+
+def runtime_home() -> Path:
+    configured = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    return Path(configured) if configured else Path(".")
+
+
+def writer_domain_state_dir(path: Path, platform: str) -> Path | None:
+    """Return the Rust writer-domain root for a real protected Shipyard path."""
+    if platform == "win32":
+        return None
+    home = runtime_home().resolve(strict=False)
+    candidate = path.resolve(strict=False)
+    if platform == "darwin":
+        state_dir = home / "Library" / "Application Support" / "shipyard"
+    else:
+        state_dir = home / ".local" / "state" / "shipyard"
+    protected_roots = (
+        home / "Library" / "Application Support" / "shipyard",
+        home / "Library" / "Application Support" / "shipyard-dev",
+        home / ".config" / "shipyard",
+        home / ".config" / "shipyard-dev",
+        home / ".local" / "state" / "shipyard",
+        home / ".local" / "state" / "shipyard-dev",
+        home / ".local" / "bin",
+        home / ".shipyard",
+        home / ".shipyard-dev",
+        home / ".cache" / "shipyard",
+        home / ".cache" / "shipyard-dev",
+    )
+    if any(candidate == root or root in candidate.parents for root in protected_roots):
+        return state_dir
+    return None
+
+
+def open_writer_domain_lock(path: Path) -> int:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(
+            path,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        return descriptor
+    except OSError as error:
+        raise HelperError("writer-domain lock is unavailable") from error
+
+
+def acquire_writer_domain_lock(
+    descriptor: int,
+    operation: int,
+    deadline: float,
+    path: Path,
+) -> None:
+    if fcntl is None:
+        raise HelperError("writer-domain locking is unavailable on this platform")
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            return
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise HelperError("writer-domain lock is unavailable") from error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HelperError(
+                    f"{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: "
+                    f"exclusive sandbox audit owns {path}"
+                ) from error
+            time.sleep(min(remaining, WRITER_DOMAIN_POLL_INTERVAL_SECONDS))
+
+
+@contextmanager
+def protected_cache_writer_lease(path: Path) -> Iterator[None]:
+    """Fence one protected cache mutation against the Sandbox E2E audit."""
+    state_dir = writer_domain_state_dir(path, sys.platform)
+    if state_dir is None:
+        yield
+        return
+    if fcntl is None:
+        raise HelperError("writer-domain locking is unavailable on this platform")
+
+    deadline = time.monotonic() + WRITER_DOMAIN_ACQUIRE_TIMEOUT_SECONDS
+    turnstile_path = state_dir / WRITER_DOMAIN_TURNSTILE_NAME
+    domain_path = state_dir / WRITER_DOMAIN_LOCK_NAME
+    turnstile = open_writer_domain_lock(turnstile_path)
+    domain = -1
+    try:
+        acquire_writer_domain_lock(turnstile, fcntl.LOCK_EX, deadline, turnstile_path)
+        domain = open_writer_domain_lock(domain_path)
+        try:
+            acquire_writer_domain_lock(domain, fcntl.LOCK_SH, deadline, domain_path)
+        finally:
+            fcntl.flock(turnstile, fcntl.LOCK_UN)
+        yield
+    finally:
+        if domain >= 0:
+            try:
+                fcntl.flock(domain, fcntl.LOCK_UN)
+            finally:
+                os.close(domain)
+        os.close(turnstile)
 
 
 def load_cached_token(
@@ -389,7 +509,8 @@ def load_cached_token(
         explicit_installation_id,
         environment_installation_id,
     )
-    ensure_private_cache_dir(cache_dir)
+    if not ensure_private_cache_dir(cache_dir, create=False):
+        return None
     path = cache_file(cache_dir, api_url, app_id, route)
     try:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -463,23 +584,24 @@ def store_cached_token(
     if cache_dir is None:
         return
     route, _ = cache_route(repo, installation_id if repo is None else None, None)
-    ensure_private_cache_dir(cache_dir)
-    destination = cache_file(cache_dir, api_url, app_id, route)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".token-", dir=cache_dir)
-    temporary = Path(temporary_name)
-    try:
-        if os.name != "nt":
-            os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        if os.name != "nt":
-            destination.chmod(0o600)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
+    with protected_cache_writer_lease(cache_dir):
+        ensure_private_cache_dir(cache_dir)
+        destination = cache_file(cache_dir, api_url, app_id, route)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".token-", dir=cache_dir)
+        temporary = Path(temporary_name)
+        try:
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            if os.name != "nt":
+                destination.chmod(0o600)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
 
 
 def public_token_payload(payload: dict[str, Any]) -> dict[str, Any]:

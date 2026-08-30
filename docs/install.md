@@ -356,6 +356,11 @@ atomically, and refuses entries that are malformed, aliased, owned by another
 account, or provenance-mismatched. The App key likewise must be a current-user
 owned `0600` regular file inside a current-user owned `0700` directory. Leave
 the disk cache unset when Shipyard's own in-memory cache is sufficient.
+On Unix/macOS, a cache under a real Shipyard protected root joins the same fair
+writer domain as the Rust CLI. Reads and GitHub requests remain outside the
+lease; directory creation and atomic replacement wait up to 30 seconds for a
+Sandbox E2E exclusive audit, then fail without writing using exit `75` and the
+stable `sandbox_writer_domain_overlap` classification.
 On Windows, disk caching currently fails closed because this helper does not yet
 prove private Windows ACLs; leave `--cache-dir` and its environment variable
 unset there. Non-cache token minting remains available. This is a bounded

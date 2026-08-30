@@ -121,6 +121,15 @@ locks from before snapshotting through the final contamination assertion. Do
 not add filename-, PID-, queue-ID-, log-, or evidence-path exemptions: a
 protected write is either fenced by the lease or it remains contamination.
 
+The standalone `scripts/shipyard-github-app-token` helper participates in this
+same domain when its optional disk cache is under a real Shipyard protected
+root. Cache reads and GitHub requests remain outside the lease; cache directory
+creation and the atomic token replacement acquire the fair turnstile and shared
+domain lease on Unix/macOS. Contention keeps the cache untouched and exits `75`
+with `sandbox_writer_domain_overlap`. Windows disk caching remains fail-closed
+until private ACL validation and an equivalent writer-domain implementation
+exist.
+
 The audit waits up to five seconds for an active mutation. A production
 mutation arriving during an audit waits up to 30 seconds, then propagates exit
 `75` with the stable `sandbox_writer_domain_overlap` classification. That result

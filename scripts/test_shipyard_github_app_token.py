@@ -6,9 +6,13 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -22,7 +26,88 @@ shipyard_github_app_token = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(shipyard_github_app_token)
 
 
+@contextmanager
+def exclusive_writer_domain_audit(state_dir: Path):
+    with tempfile.TemporaryDirectory() as control_temp:
+        control = Path(control_temp)
+        ready = control / "ready"
+        release = control / "release"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                """
+import fcntl
+import os
+import pathlib
+import sys
+import time
+
+state_dir = pathlib.Path(sys.argv[1])
+ready = pathlib.Path(sys.argv[2])
+release = pathlib.Path(sys.argv[3])
+state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+turnstile = os.open(state_dir / '.sandbox-writer-domain.turnstile.lock', os.O_CREAT | os.O_RDWR, 0o600)
+domain = os.open(state_dir / '.sandbox-writer-domain.lock', os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(turnstile, fcntl.LOCK_EX)
+fcntl.flock(domain, fcntl.LOCK_EX)
+ready.write_text('ready', encoding='utf-8')
+while not release.exists():
+    time.sleep(0.01)
+fcntl.flock(domain, fcntl.LOCK_UN)
+fcntl.flock(turnstile, fcntl.LOCK_UN)
+os.close(domain)
+os.close(turnstile)
+""",
+                str(state_dir),
+                str(ready),
+                str(release),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists():
+            if holder.poll() is not None:
+                stdout, stderr = holder.communicate()
+                raise AssertionError(
+                    f"exclusive audit exited before ready: {stdout=} {stderr=}"
+                )
+            if time.monotonic() >= deadline:
+                holder.terminate()
+                holder.wait(timeout=5)
+                raise AssertionError("timed out waiting for exclusive audit")
+            time.sleep(0.01)
+        try:
+            yield release
+        finally:
+            release.touch()
+            stdout, stderr = holder.communicate(timeout=5)
+            if holder.returncode != 0:
+                raise AssertionError(
+                    f"exclusive audit failed: {stdout=} {stderr=}"
+                )
+
+
 class GitHubAppTokenHelperTests(unittest.TestCase):
+    def cache_payload(self) -> dict[str, str]:
+        expires = (
+            shipyard_github_app_token.datetime.datetime.now(
+                shipyard_github_app_token.datetime.timezone.utc
+            )
+            + shipyard_github_app_token.datetime.timedelta(minutes=30)
+        ).isoformat().replace("+00:00", "Z")
+        return {
+            "token": "ghs_personal",
+            "kind": "github-app-installation",
+            "expires_at": expires,
+            "api_url": "https://api.github.com",
+            "app_id": "3878000",
+            "installation_id": "135929628",
+            "repository": "danielraffel/Shipyard",
+        }
+
     def test_public_payload_includes_non_secret_installation_identity(self) -> None:
         public = shipyard_github_app_token.public_token_payload(
             {
@@ -294,6 +379,97 @@ class GitHubAppTokenHelperTests(unittest.TestCase):
             if os.name != "nt":
                 self.assertEqual(cache_dir.stat().st_mode & 0o777, 0o700)
 
+    def test_cache_miss_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_dir = Path(temp) / "missing-cache"
+            cached = shipyard_github_app_token.load_cached_token(
+                cache_dir,
+                "https://api.github.com",
+                "3878000",
+                "danielraffel/Shipyard",
+                None,
+                None,
+            )
+
+            self.assertIsNone(cached)
+            self.assertFalse(cache_dir.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX writer-domain invariant")
+    def test_protected_cache_write_refuses_after_bounded_audit_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            cache_dir = home / ".config" / "shipyard" / "token-cache"
+            state_dir = (
+                home / "Library" / "Application Support" / "shipyard"
+                if sys.platform == "darwin"
+                else home / ".local" / "state" / "shipyard"
+            )
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                with exclusive_writer_domain_audit(state_dir), mock.patch.object(
+                    shipyard_github_app_token,
+                    "WRITER_DOMAIN_ACQUIRE_TIMEOUT_SECONDS",
+                    0.05,
+                ):
+                    started = time.monotonic()
+                    with self.assertRaises(shipyard_github_app_token.HelperError) as ctx:
+                        shipyard_github_app_token.store_cached_token(
+                            cache_dir,
+                            "https://api.github.com",
+                            "3878000",
+                            "danielraffel/Shipyard",
+                            "135929628",
+                            self.cache_payload(),
+                        )
+                    elapsed = time.monotonic() - started
+
+            self.assertGreaterEqual(elapsed, 0.04)
+            self.assertTrue(
+                str(ctx.exception).startswith("sandbox_writer_domain_overlap:")
+            )
+            self.assertFalse(cache_dir.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX writer-domain invariant")
+    def test_protected_cache_write_waits_then_succeeds_after_audit_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            cache_dir = home / ".config" / "shipyard" / "token-cache"
+            state_dir = (
+                home / "Library" / "Application Support" / "shipyard"
+                if sys.platform == "darwin"
+                else home / ".local" / "state" / "shipyard"
+            )
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                with exclusive_writer_domain_audit(state_dir) as release:
+                    releaser = threading.Timer(
+                        0.1,
+                        release.touch,
+                    )
+                    releaser.start()
+                    started = time.monotonic()
+                    try:
+                        shipyard_github_app_token.store_cached_token(
+                            cache_dir,
+                            "https://api.github.com",
+                            "3878000",
+                            "danielraffel/Shipyard",
+                            "135929628",
+                            self.cache_payload(),
+                        )
+                    finally:
+                        releaser.join(timeout=2)
+                    elapsed = time.monotonic() - started
+
+            destination = shipyard_github_app_token.cache_file(
+                cache_dir,
+                "https://api.github.com",
+                "3878000",
+                "repo:danielraffel/Shipyard",
+            )
+            self.assertGreaterEqual(elapsed, 0.08)
+            self.assertEqual(json.loads(destination.read_text())["token"], "ghs_personal")
+
     def test_platform_ca_fallback_augments_default_context(self) -> None:
         context = mock.Mock()
         with tempfile.TemporaryDirectory() as temp:
@@ -548,6 +724,47 @@ class GitHubAppTokenHelperTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertNotIn("ghs_secret", stdout.getvalue() + stderr.getvalue())
+
+    def test_main_preserves_stable_writer_domain_overlap_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            key_path = Path(temp) / "app.pem"
+            key_path.write_text("fake-key", encoding="utf-8")
+            if os.name != "nt":
+                key_path.chmod(0o600)
+            argv = [
+                "shipyard-github-app-token",
+                "--app-id",
+                "123",
+                "--installation-id",
+                "456",
+                "--private-key",
+                str(key_path),
+                "--cache-dir",
+                str(Path(temp) / "cache"),
+            ]
+            stderr = StringIO()
+            with mock.patch("sys.argv", argv), mock.patch.object(
+                shipyard_github_app_token,
+                "build_jwt",
+                return_value="jwt",
+            ), mock.patch.object(
+                shipyard_github_app_token,
+                "create_installation_token",
+                return_value={
+                    "token": "ghs_test",
+                    "expires_at": "2026-05-27T20:12:00Z",
+                },
+            ), mock.patch.object(
+                shipyard_github_app_token,
+                "store_cached_token",
+                side_effect=shipyard_github_app_token.HelperError(
+                    "sandbox_writer_domain_overlap: exclusive sandbox audit owns lock"
+                ),
+            ), redirect_stderr(stderr):
+                code = shipyard_github_app_token.main()
+
+        self.assertEqual(code, 75)
+        self.assertIn("sandbox_writer_domain_overlap:", stderr.getvalue())
 
 
 if __name__ == "__main__":
