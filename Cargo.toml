@@ -18,6 +18,11 @@ path = "src/main.rs"
 name = "shipyard-workstream-provider"
 path = "src/bin/shipyard-workstream-provider.rs"
 
+[features]
+# CI-only path isolation for production-shaped integration-test binaries.
+# Official release builds never enable this feature.
+ci-test-home = []
+
 [dependencies]
 base64 = "0.22.1"
 clap = { version = "4.5.38", features = ["derive"] }

@@ -1680,8 +1680,11 @@ A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever the ma
 **Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `scripts/ci_matrix.py`, release packaging scripts, or `src/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.
 
 Self-hosted CI must not inherit the host's production Shipyard configuration.
-Run Rust tests and coverage with `HOME: ${{ runner.temp }}` while leaving the
-runner-managed Cargo/Rustup paths intact. Golden tests for generated text
+Run Rust tests and coverage with `SHIPYARD_TEST_HOME: ${{ runner.temp }}`; this
+override is enabled by the CI-only `ci-test-home` Cargo feature for unit tests
+and production-shaped integration binaries, while official release builds
+omit the feature. It leaves the runner-managed HOME, Cargo, and Rustup paths
+intact. Golden tests for generated text
 compare logical LF content after normalizing checkout-only CRLF; do not weaken
 any other byte or semantic assertion merely to accommodate Windows checkout
 policy.
