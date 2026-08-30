@@ -36,8 +36,7 @@ fn production_supervisor_control_eof_reaps_adopted_descendant() {
             String::from_utf8_lossy(&ready)
         );
     }
-    wait_until(Duration::from_secs(5), || descendant_pid.exists());
-    let pid = fs::read_to_string(&descendant_pid).unwrap();
+    let descendant = wait_for_published_process(&descendant_pid, Duration::from_secs(5));
 
     drop(control);
     let status = supervisor
@@ -50,9 +49,7 @@ fn production_supervisor_control_eof_reaps_adopted_descendant() {
     assert_eq!(result["provider"], "control_eof");
     assert_eq!(result["cleanup"], "residual_terminated");
     assert_eq!(result["stdout"], json!([]));
-    wait_until(Duration::from_secs(2), || {
-        !Path::new(&format!("/proc/{pid}")).exists()
-    });
+    wait_until(Duration::from_secs(2), || !descendant.is_still_running());
 }
 
 #[test]
@@ -189,8 +186,7 @@ return 0;"#,
     let mut ready = vec![0; READY.len()];
     channel.read_exact(&mut ready).unwrap();
     assert_eq!(ready, READY);
-    wait_until(Duration::from_secs(5), || provider_pid.exists());
-    let pid = fs::read_to_string(&provider_pid).unwrap();
+    let provider = wait_for_published_process(&provider_pid, Duration::from_secs(5));
 
     supervisor.kill().unwrap();
     let status = supervisor.wait().unwrap();
@@ -198,11 +194,9 @@ return 0;"#,
     drop(control);
     let mut remainder = Vec::new();
     channel.read_to_end(&mut remainder).unwrap();
-    let residual_was_live = Path::new(&format!("/proc/{pid}")).exists();
-    let _ = Command::new("/bin/kill").args(["-KILL", &pid]).status();
-    wait_until(Duration::from_secs(2), || {
-        !Path::new(&format!("/proc/{pid}")).exists()
-    });
+    let residual_was_live = provider.is_still_running();
+    provider.kill();
+    wait_until(Duration::from_secs(2), || !provider.is_still_running());
 
     assert!(
         remainder.is_empty(),
@@ -461,4 +455,56 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "condition exceeded {timeout:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+struct LinuxProcessIdentity {
+    pid: u32,
+    start_time: String,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl LinuxProcessIdentity {
+    fn is_still_running(&self) -> bool {
+        process_start_time(self.pid).as_deref() == Some(self.start_time.as_str())
+    }
+
+    fn kill(&self) {
+        match rustix::process::pidfd_send_signal(&self.pidfd, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => panic!("captured provider cannot be killed through its pidfd: {error}"),
+        }
+    }
+}
+
+fn wait_for_published_process(path: &Path, timeout: Duration) -> LinuxProcessIdentity {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = fs::read_to_string(path)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+            && pid != 0
+            && let Some(start_time) = process_start_time(pid)
+            && let Ok(raw_pid) = i32::try_from(pid)
+            && let Some(raw_pid) = rustix::process::Pid::from_raw(raw_pid)
+            && let Ok(pidfd) =
+                rustix::process::pidfd_open(raw_pid, rustix::process::PidfdFlags::empty())
+            && process_start_time(pid).as_deref() == Some(start_time.as_str())
+        {
+            return LinuxProcessIdentity {
+                pid,
+                start_time,
+                pidfd,
+            };
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process identity was not published within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn process_start_time(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.split_ascii_whitespace().nth(19).map(str::to_owned)
 }
