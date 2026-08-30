@@ -5,7 +5,8 @@ use tempfile::TempDir;
 use super::*;
 use crate::parallel_proof_canary::{CanaryRoute, CanaryStagingClass};
 use crate::parallel_proof_canary_remote_cache::{
-    RemoteM1CacheAuthority, synthetic_cache_generation_manifest, test_remote_authority_receipt,
+    RemoteM1CacheAuthority, synthetic_cache_generation_manifest, test_cache_root,
+    test_remote_authority_receipt,
 };
 
 fn persistent_temp() -> TempDir {
@@ -72,7 +73,7 @@ fn receipt(
     manifest: CacheGenerationManifest,
     observed_at_ms: u64,
 ) -> CacheGenerationObservationReceipt {
-    let cache_root = root.to_str().unwrap().to_owned();
+    let cache_root = test_cache_root(root).to_str().unwrap().to_owned();
     let remote_authority = (host_id == "m1").then(|| {
         test_remote_authority_receipt(
             remote_authority(observed_at_ms),
@@ -213,6 +214,32 @@ fn local_observer_refuses_a_different_host_before_platform_packing() {
     ));
 }
 
+#[test]
+fn portable_macos_cache_root_is_valid_but_relative_and_temporary_roots_refuse() {
+    let manifest = synthetic_cache_generation_manifest("skia", "m124");
+    assert!(
+        CacheGenerationProbeSpec::new(
+            "m1",
+            host_digest("m1"),
+            "/Users/test/shipyard-cache",
+            manifest.clone(),
+        )
+        .is_ok()
+    );
+    assert!(
+        CacheGenerationProbeSpec::new(
+            "m1",
+            host_digest("m1"),
+            "Users/test/shipyard-cache",
+            manifest.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        CacheGenerationProbeSpec::new("m1", host_digest("m1"), "/tmp/cache", manifest).is_err()
+    );
+}
+
 #[cfg(not(unix))]
 #[test]
 fn local_observer_refuses_matching_host_without_no_follow_directory_handles() {
@@ -275,7 +302,7 @@ fn probe_is_m3_first_crash_durable_and_exactly_replayable() {
             CacheGenerationProbeSpec::new(
                 "m3",
                 host_digest("m3"),
-                builder_root.path(),
+                test_cache_root(builder_root.path()),
                 manifest.clone(),
             )
             .unwrap(),
@@ -284,7 +311,7 @@ fn probe_is_m3_first_crash_durable_and_exactly_replayable() {
             CacheGenerationProbeSpec::new(
                 "m1",
                 host_digest("m1"),
-                worker_root.path(),
+                test_cache_root(worker_root.path()),
                 manifest.clone(),
             )
             .unwrap(),
@@ -390,7 +417,7 @@ fn persisted_remote_authority_refuses_a_different_builder_source() {
     authority.source_host_id = "other-builder".to_owned();
     worker.remote_authority = Some(test_remote_authority_receipt(
         authority,
-        root.path().to_str().unwrap(),
+        test_cache_root(root.path()).to_str().unwrap(),
         &manifest,
         995,
         1,
@@ -445,7 +472,7 @@ fn tailnet_cache_measurement_does_not_mint_lan_worker_authority() {
     let mut worker = receipt("m1", root.path(), manifest.clone(), 995);
     worker.remote_authority = Some(test_remote_authority_receipt(
         authority,
-        root.path().to_str().unwrap(),
+        test_cache_root(root.path()).to_str().unwrap(),
         &manifest,
         995,
         1,
@@ -481,12 +508,22 @@ fn failed_builder_proof_never_observes_worker() {
         enabled: true,
         correlation_id: "builder-failed".to_owned(),
         builder: vec![
-            CacheGenerationProbeSpec::new("m3", host_digest("m3"), root.path(), manifest.clone())
-                .unwrap(),
+            CacheGenerationProbeSpec::new(
+                "m3",
+                host_digest("m3"),
+                test_cache_root(root.path()),
+                manifest.clone(),
+            )
+            .unwrap(),
         ],
         worker: vec![
-            CacheGenerationProbeSpec::new("m1", host_digest("m1"), root.path(), manifest.clone())
-                .unwrap(),
+            CacheGenerationProbeSpec::new(
+                "m1",
+                host_digest("m1"),
+                test_cache_root(root.path()),
+                manifest.clone(),
+            )
+            .unwrap(),
         ],
     };
     let mut observer = FakeObserver {
@@ -513,12 +550,22 @@ fn stale_builder_proof_never_observes_worker() {
         enabled: true,
         correlation_id: "builder-stale".to_owned(),
         builder: vec![
-            CacheGenerationProbeSpec::new("m3", host_digest("m3"), root.path(), manifest.clone())
-                .unwrap(),
+            CacheGenerationProbeSpec::new(
+                "m3",
+                host_digest("m3"),
+                test_cache_root(root.path()),
+                manifest.clone(),
+            )
+            .unwrap(),
         ],
         worker: vec![
-            CacheGenerationProbeSpec::new("m1", host_digest("m1"), root.path(), manifest.clone())
-                .unwrap(),
+            CacheGenerationProbeSpec::new(
+                "m1",
+                host_digest("m1"),
+                test_cache_root(root.path()),
+                manifest.clone(),
+            )
+            .unwrap(),
         ],
     };
     let mut observer = FakeObserver {

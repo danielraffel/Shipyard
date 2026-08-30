@@ -12,7 +12,8 @@ use crate::parallel_proof_canary_cache::{
     PULP_MAC_CACHE_EVIDENCE_SCHEMA, PulpMacCacheProbeEvidence,
 };
 use crate::parallel_proof_canary_remote_cache::{
-    RemoteM1CacheAuthority, synthetic_cache_generation_manifest, test_remote_authority_receipt,
+    RemoteM1CacheAuthority, synthetic_cache_generation_manifest, test_cache_root,
+    test_remote_authority_receipt,
 };
 
 fn pulp_policy() -> PulpMacCanaryPolicy {
@@ -382,7 +383,7 @@ fn exact_cache_evidence_closes_only_the_cache_gap() {
         let remote_authority = (host_id == "m1").then(|| {
             remote_cache_authority(
                 host_observation_sha256.clone(),
-                cache_root.path(),
+                &test_cache_root(cache_root.path()),
                 &manifest,
                 m1_staging,
                 assessed_at_ms,
@@ -394,7 +395,10 @@ fn exact_cache_evidence_closes_only_the_cache_gap() {
             host_observation_sha256: host_observation_sha256.clone(),
             observed_at_ms: assessed_at_ms,
             probe_elapsed_ms: 1,
-            cache_root: cache_root.path().to_str().unwrap().to_owned(),
+            cache_root: test_cache_root(cache_root.path())
+                .to_str()
+                .unwrap()
+                .to_owned(),
             manifest_sha256: manifest.digest().unwrap(),
             manifest: manifest.clone(),
             remote_authority,

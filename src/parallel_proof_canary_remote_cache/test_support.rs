@@ -5,6 +5,25 @@ use super::{
 };
 use crate::parallel_proof_canary::CanaryCacheGeneration;
 use crate::parallel_proof_canary_cache::{CACHE_GENERATION_MANIFEST_SCHEMA, CacheGenerationEntry};
+use std::path::{Path, PathBuf};
+
+/// A persistent macOS cache root for portable controller/receipt tests.
+///
+/// Unix tests retain their real fixture so filesystem proofs remain real.
+/// Non-Unix tests exercise the portable record and remote protocol with the
+/// kind of POSIX path the M1 companion actually owns, rather than incorrectly
+/// serializing the Windows controller's local `TempDir` path as an M1 path.
+pub(crate) fn test_cache_root(local_root: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        local_root.to_owned()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = local_root;
+        PathBuf::from("/Users/test/shipyard-cache")
+    }
+}
 
 pub(crate) fn synthetic_cache_generation_manifest(
     name: &str,

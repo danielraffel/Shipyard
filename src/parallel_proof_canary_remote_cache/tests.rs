@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +41,10 @@ fn cache_manifest(root: &Path, name: &str, generation: &str) -> CacheGenerationM
         let _ = root;
         synthetic_cache_generation_manifest(name, generation)
     }
+}
+
+fn remote_cache_root(root: &TempDir) -> PathBuf {
+    test_cache_root(root.path())
 }
 
 fn digest(label: &str) -> Sha256Digest {
@@ -232,9 +237,13 @@ fn remote_observer_binds_every_authority_and_transport_counter() {
     let root = cache_tree();
     let manifest = cache_manifest(root.path(), "skia", "m124");
     let host_digest = digest("authenticated-m1-host-observation");
-    let spec =
-        CacheGenerationProbeSpec::new("m1", host_digest.clone(), root.path(), manifest.clone())
-            .unwrap();
+    let spec = CacheGenerationProbeSpec::new(
+        "m1",
+        host_digest.clone(),
+        remote_cache_root(&root),
+        manifest.clone(),
+    )
+    .unwrap();
     let transport = FakeTransport {
         authorities: VecDeque::from([authority(host_digest.clone())]),
         calls: Vec::new(),
@@ -274,9 +283,13 @@ fn remote_observer_uses_explicit_non_pulp_host_pair() {
     let root = cache_tree();
     let manifest = cache_manifest(root.path(), "skia", "m124");
     let host_digest = digest("worker-b-observation");
-    let spec =
-        CacheGenerationProbeSpec::new("worker-b", host_digest.clone(), root.path(), manifest)
-            .unwrap();
+    let spec = CacheGenerationProbeSpec::new(
+        "worker-b",
+        host_digest.clone(),
+        remote_cache_root(&root),
+        manifest,
+    )
+    .unwrap();
     let mut observed_authority = authority(host_digest);
     observed_authority.source_host_id = "builder-a".to_owned();
     observed_authority.host_id = "worker-b".to_owned();
@@ -329,8 +342,13 @@ fn remote_wall_clock_is_authenticated_but_never_used_for_controller_freshness() 
     let root = cache_tree();
     let manifest = cache_manifest(root.path(), "skia", "m124");
     let host_digest = digest("authenticated-m1-host-observation");
-    let spec =
-        CacheGenerationProbeSpec::new("m1", host_digest.clone(), root.path(), manifest).unwrap();
+    let spec = CacheGenerationProbeSpec::new(
+        "m1",
+        host_digest.clone(),
+        remote_cache_root(&root),
+        manifest,
+    )
+    .unwrap();
     let authority = authority(host_digest);
     let authority_time = authority.observed_at_ms;
     let remote_clock_ms = u64::MAX - 1;
@@ -367,8 +385,9 @@ fn companion_digest_is_verified_before_cache_observation() {
     let root = cache_tree();
     let manifest = cache_manifest(root.path(), "skia", "m124");
     let authority = authority(digest("authenticated-m1-host-observation"));
+    let cache_root = remote_cache_root(&root);
     let request =
-        RemoteM1CacheRequest::from_parts(root.path().to_str().unwrap(), &manifest, &authority)
+        RemoteM1CacheRequest::from_parts(cache_root.to_str().unwrap(), &manifest, &authority)
             .unwrap();
     fs::remove_file(root.path().join("objects/cache.bin")).unwrap();
 
@@ -382,9 +401,13 @@ fn companion_digest_is_verified_before_cache_observation() {
 fn detached_authority_and_tampered_transport_fail_closed() {
     let root = cache_tree();
     let manifest = cache_manifest(root.path(), "skia", "m124");
-    let spec =
-        CacheGenerationProbeSpec::new("m1", digest("expected-host"), root.path(), manifest.clone())
-            .unwrap();
+    let spec = CacheGenerationProbeSpec::new(
+        "m1",
+        digest("expected-host"),
+        remote_cache_root(&root),
+        manifest.clone(),
+    )
+    .unwrap();
     let detached = FakeTransport {
         authorities: VecDeque::from([authority(digest("other-host"))]),
         calls: Vec::new(),
@@ -425,8 +448,13 @@ fn non_lan_or_insufficient_reserve_authority_is_refused_before_invocation() {
     let root = cache_tree();
     let manifest = cache_manifest(root.path(), "skia", "m124");
     let host_digest = digest("expected-host");
-    let spec =
-        CacheGenerationProbeSpec::new("m1", host_digest.clone(), root.path(), manifest).unwrap();
+    let spec = CacheGenerationProbeSpec::new(
+        "m1",
+        host_digest.clone(),
+        remote_cache_root(&root),
+        manifest,
+    )
+    .unwrap();
     let mut invalid = authority(host_digest);
     invalid.route = CanaryRoute::Tailnet;
     invalid.free_bytes = 1;
