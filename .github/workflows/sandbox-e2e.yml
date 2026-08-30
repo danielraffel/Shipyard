@@ -155,7 +155,40 @@ jobs:
           plutil -lint "$guardian_plist"
           launchctl bootstrap "gui/$(id -u)" "$guardian_plist"
           deadline=$((SECONDS + 30))
-          while [ ! -s "$canary_root/ready.json" ] && [ ! -s "$canary_root/guardian-receipt.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+          while [ ! -s "$canary_root/ready.json" ] && [ ! -s "$canary_root/guardian-receipt.json" ] && [ ! -s "$canary_root/retained-reconciliation.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+          if [ -s "$canary_root/retained-reconciliation.json" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/sandbox_admission_deferral.py" \
+              --receipt "$canary_root/retained-reconciliation.json" \
+              --installed-sha256 "$installed_hash" \
+              --canary-root "$canary_root" \
+              --lease-dir "$lease_dir" \
+              > "$canary_root/admission-deferred.json.tmp"
+            guardian_pid="$(jq -r .guardian_pid "$canary_root/admission-deferred.json.tmp")"
+            retained_state_ok=false
+            for _ in 1 2 3 4 5; do
+              if [ -d "$lease_dir" ] && \
+                [ "$(stat -f %i "$lease_dir")" = "$(jq -r .lease_inode "$canary_root/admission-deferred.json.tmp")" ] && \
+                kill -0 "$guardian_pid" 2>/dev/null && \
+                [ "$(ps -p "$guardian_pid" -o lstart= | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')" = "$(jq -r .guardian_start_time "$canary_root/admission-deferred.json.tmp")" ] && \
+                ps -p "$guardian_pid" -o command= | grep -F -- "$guardian" >/dev/null && \
+                ps -p "$guardian_pid" -o command= | grep -F -- "--lease-dir $lease_dir" >/dev/null && \
+                [ -d "$lease_dir" ] && \
+                [ "$(stat -f %i "$lease_dir")" = "$(jq -r .lease_inode "$canary_root/admission-deferred.json.tmp")" ]; then
+                retained_state_ok=true
+                break
+              fi
+              if [ ! -e "$lease_dir" ] && jq -e '.reason == "retained-lease-reconciled" and .production_identity_verified == true and .lease_removed == true and .failure == null' "$canary_root/guardian-receipt.json" >/dev/null 2>&1; then
+                retained_state_ok=true
+                break
+              fi
+              sleep 1
+            done
+            test "$retained_state_ok" = true
+            mv "$canary_root/admission-deferred.json.tmp" "$canary_root/admission-deferred.json"
+            echo "::warning::Sandbox E2E is INFRA/retryable and deferred while the host guardian reconciles an authenticated retained lease; this is not physical-canary or release acceptance"
+            echo "Retained-lease reconciliation is pending. This green deferral is not release acceptance; after terminal lease removal rerun only the targeted macOS Sandbox job." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ -s "$canary_root/guardian-receipt.json" ]; then
             if python3 "$GITHUB_WORKSPACE/scripts/sandbox_admission_deferral.py" \
                 --receipt "$canary_root/guardian-receipt.json" \
@@ -277,23 +310,51 @@ jobs:
           canary_root="/tmp/shipyard-sandbox-m3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           lease_dir="/tmp/shipyard-sandbox-m3-lease"
           deadline=$((SECONDS + 45))
-          while [ ! -s "$canary_root/guardian-receipt.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+          while [ ! -s "$canary_root/guardian-receipt.json" ] && [ ! -s "$canary_root/admission-deferred.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
           if [ -s "$canary_root/admission-deferred.json" ]; then
-            jq -e '.schema_version == 1 and .reason == "production-queue-active" and (.active_runs | type == "array" and length > 0)' \
+            reason="$(jq -r .reason "$canary_root/admission-deferred.json")"
+            jq -e '.schema_version == 1 and (.active_runs | type == "array" and length > 0)' \
               "$canary_root/admission-deferred.json"
-            jq -e '.candidate_stopped == true and .lease_removed == true and .production_quiesced == false and .production_restored == false' \
-              "$canary_root/guardian-receipt.json"
-            test ! -e "$lease_dir"
             production_pid="$(tr -d '[:space:]' < "$HOME/Library/Application Support/shipyard/daemon/daemon.pid")"
             test "$production_pid" = "$(jq -r .old_production_pid "$canary_root/admission-deferred.json")"
             production_start_time="$(ps -p "$production_pid" -o lstart= | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
             test "$production_start_time" = "$(jq -r .old_production_start_time "$canary_root/admission-deferred.json")"
             test "$(shasum -a 256 "$installed" | awk '{print $1}')" = "$(jq -r .installed_sha256 "$canary_root/admission-deferred.json")"
-            test ! -e "$(jq -r .mutation_probe_output "$canary_root/admission-deferred.json")"
             ps -p "$production_pid" -o command= | grep -F -- "$installed"
             ps -p "$production_pid" -o command= | grep -F -- "--mode shipyard"
             ps -p "$production_pid" -o command= | grep -F -- "daemon run"
-            launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+            case "$reason" in
+              production-queue-active)
+                jq -e '.candidate_stopped == true and .lease_removed == true and .production_quiesced == false and .production_restored == false' \
+                  "$canary_root/guardian-receipt.json"
+                test ! -e "$lease_dir"
+                test ! -e "$(jq -r .mutation_probe_output "$canary_root/admission-deferred.json")"
+                launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+                ;;
+              retained-lease-awaiting-idle)
+                guardian_pid="$(jq -r .guardian_pid "$canary_root/admission-deferred.json")"
+                retained_state_ok=false
+                for _ in 1 2 3 4 5; do
+                  if [ -d "$lease_dir" ] && \
+                    [ "$(stat -f %i "$lease_dir")" = "$(jq -r .lease_inode "$canary_root/admission-deferred.json")" ] && \
+                    kill -0 "$guardian_pid" 2>/dev/null && \
+                    [ "$(ps -p "$guardian_pid" -o lstart= | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')" = "$(jq -r .guardian_start_time "$canary_root/admission-deferred.json")" ] && \
+                    ps -p "$guardian_pid" -o command= | grep -F -- "$canary_root/sandbox-daemon-guardian.py" >/dev/null && \
+                    [ -d "$lease_dir" ] && \
+                    [ "$(stat -f %i "$lease_dir")" = "$(jq -r .lease_inode "$canary_root/admission-deferred.json")" ]; then
+                    retained_state_ok=true
+                    break
+                  fi
+                  if [ ! -e "$lease_dir" ] && jq -e '.reason == "retained-lease-reconciled" and .candidate_stopped == true and .production_identity_verified == true and .production_preserved == true and .lease_removed == true and .failure == null' "$canary_root/guardian-receipt.json" >/dev/null 2>&1; then
+                    retained_state_ok=true
+                    break
+                  fi
+                  sleep 1
+                done
+                test "$retained_state_ok" = true
+                ;;
+              *) exit 1 ;;
+            esac
             exit 0
           fi
           jq -e '.candidate_stopped == true and .production_identity_verified == true and .lease_removed == true and .mode == "shipyard" and (.active_runs == []) and .failure == null' "$canary_root/guardian-receipt.json"

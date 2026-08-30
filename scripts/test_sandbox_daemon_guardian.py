@@ -52,14 +52,384 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.release()
             self.assertFalse(active.lease_dir.exists())
 
-    def test_contended_acquisition_never_claims_or_removes_foreign_lease(self) -> None:
+    def test_reconciliation_lock_symlink_and_unsafe_mode_refuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            target = root / "target"
+            target.write_bytes(b"")
+            active.reconciliation_lock.symlink_to(target)
+            with self.assertRaisesRegex(guardian.GuardianError, "safely open"):
+                active.acquire()
+            self.assertFalse(active.lease_dir.exists())
+
+            active.reconciliation_lock.unlink()
+            active.reconciliation_lock.write_bytes(b"")
+            active.reconciliation_lock.chmod(0o644)
+            with self.assertRaisesRegex(guardian.GuardianError, "metadata is unsafe"):
+                active.acquire()
+            self.assertFalse(active.lease_dir.exists())
+
+    def test_unproven_legacy_lease_is_never_claimed_or_removed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
             active.lease_dir.mkdir()
-            with self.assertRaises(FileExistsError):
+            active.lease_dir.chmod(0o700)
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), self.assertRaisesRegex(
+                guardian.GuardianError, "one unambiguous prior receipt"
+            ):
                 active.acquire()
             self.assertFalse(active.lease_owned)
             self.assertTrue(active.lease_dir.is_dir())
+
+    def test_empty_legacy_retained_lease_waits_for_stable_idle_then_reaps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.candidate.write_bytes(b"candidate")
+            active.lease_dir.mkdir(mode=0o700)
+            snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 29 05:44:36 2026",
+            )
+            prior_root = root / "shipyard-sandbox-m3-1-1"
+            prior = {"old_production_pid": snapshot.pid}
+
+            def bind_snapshot(_prior: dict[str, object]):
+                active.snapshot = snapshot
+                active.installed_hash = guardian._sha256(active.installed)
+                active.candidate_hash = guardian._sha256(active.candidate)
+                active.configured_repos = ()
+                active.worker_ids = ()
+                active.lock_path = root / "writer.lock"
+                active.transition_path = guardian.CORRECTED_TRANSITION
+                active.old_lifetime_lock_owned = False
+                active.mutation_fence_proved = True
+                return snapshot, ()
+
+            workers = iter([("sy-live",), (), (), (), ()])
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                active,
+                "retained_legacy_evidence",
+                return_value=(prior_root, prior, {}),
+            ), mock.patch.object(
+                active, "snapshot_reconciliation_production", side_effect=bind_snapshot
+            ), mock.patch.object(
+                active,
+                "verify_reconciliation_production",
+                side_effect=lambda: next(workers),
+            ) as verify, mock.patch.object(
+                active,
+                "final_reconciliation_writer_fence",
+                return_value=contextlib.nullcontext(mock.Mock()),
+            ) as fence, mock.patch.object(
+                guardian.time, "sleep"
+            ), mock.patch.object(
+                guardian, "_process_start", return_value=active.owner_start
+            ):
+                with self.assertRaises(guardian.ReconciledAfterOwnerEnded):
+                    active.acquire()
+
+            self.assertFalse(active.lease_owned)
+            self.assertFalse(active.lease_dir.exists())
+            self.assertEqual(verify.call_count, 5)
+            fence.assert_called_once()
+            receipt = json.loads(
+                active.reconciliation_receipt.read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["reason"], guardian.RETAINED_RECONCILIATION_REASON)
+            self.assertFalse(receipt["lease_removed"])
+
+    def test_retained_lease_worker_reappearance_refuses_without_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.lease_dir.mkdir(mode=0o700)
+            inode = active.lease_dir.stat().st_ino
+            snapshot = mock.Mock(pid=4242)
+            active.snapshot = snapshot
+            active.lock_path = root / "writer.lock"
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                active,
+                "retained_legacy_evidence",
+                return_value=(root / "prior", {}, {}),
+            ), mock.patch.object(
+                active,
+                "snapshot_reconciliation_production",
+                return_value=(snapshot, ()),
+            ), mock.patch.object(
+                active,
+                "verify_reconciliation_production",
+                side_effect=[(), (), (), ("sy-new",)],
+            ), mock.patch.object(
+                active,
+                "final_reconciliation_writer_fence",
+                return_value=contextlib.nullcontext(mock.Mock()),
+            ), mock.patch.object(guardian.time, "sleep"):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "workers reappeared"
+                ):
+                    active.acquire()
+            self.assertEqual(active.lease_dir.stat().st_ino, inode)
+            self.assertFalse(active.lease_owned)
+
+    def test_retained_lease_with_live_guardian_refuses_without_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            active.lease_dir.mkdir(mode=0o700)
+            inode = active.lease_dir.stat().st_ino
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=(7331,)
+            ), self.assertRaisesRegex(guardian.GuardianError, "live guardian"):
+                active.acquire()
+            self.assertEqual(active.lease_dir.stat().st_ino, inode)
+
+    def test_guardian_owner_recognizes_interpreter_and_direct_shebang_argv(self) -> None:
+        lease = Path("/tmp/shipyard-sandbox-m3-lease")
+        suffix = ("--lease-dir", str(lease), "--owner-pid", "42")
+        self.assertTrue(
+            guardian._is_guardian_argv_for_lease(
+                ("/usr/bin/python3", "/tmp/canary/sandbox-daemon-guardian.py", *suffix),
+                lease,
+            )
+        )
+        self.assertTrue(
+            guardian._is_guardian_argv_for_lease(
+                ("/tmp/canary/sandbox-daemon-guardian.py", *suffix), lease
+            )
+        )
+        self.assertFalse(
+            guardian._is_guardian_argv_for_lease(
+                ("/tmp/canary/not-the-guardian.py", *suffix), lease
+            )
+        )
+
+    def test_two_retained_legacy_receipts_refuse_as_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.lease_dir = root / "shipyard-sandbox-m3-lease"
+            active.lease_dir.mkdir(mode=0o700)
+            for run in ("1-1", "2-1"):
+                prior = root / f"shipyard-sandbox-m3-{run}"
+                prior.mkdir()
+                prior.chmod(0o700)
+                receipt = prior / "guardian-receipt.json"
+                receipt.write_text(
+                    json.dumps({"lease_retained": True}), encoding="utf-8"
+                )
+                receipt.chmod(0o600)
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "one unambiguous prior receipt"
+            ):
+                active.retained_legacy_evidence()
+
+    def test_crash_intent_without_final_receipt_resolves_only_old_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.lease_dir = root / "shipyard-sandbox-m3-lease"
+            active.lease_dir.mkdir(mode=0o700)
+            old = root / "shipyard-sandbox-m3-1-1"
+            new = root / "shipyard-sandbox-m3-2-1"
+            resolver = root / "shipyard-sandbox-m3-3-1"
+            for path in (old, new, resolver):
+                path.mkdir(mode=0o700)
+            for path in (
+                old / "guardian-receipt.json",
+                new / "guardian-receipt.json",
+                new / "ready.json",
+                new / "mutation-fence.json",
+                resolver / "retained-reconciliation-intent.json",
+            ):
+                path.write_text("{}", encoding="utf-8")
+            old_receipt = {
+                "lease_retained": True,
+                "old_production_pid": 111,
+                "old_production_start_time": "old",
+                "installed_sha256": "a" * 64,
+            }
+            new_receipt = {
+                "schema_version": 1,
+                "lease_retained": True,
+                "lease_removed": False,
+                "transition_path": guardian.CORRECTED_TRANSITION,
+                "candidate_stopped": True,
+                "production_quiesced": False,
+                "production_restored": False,
+                "mutation_fence_proved": True,
+                "old_lifetime_lock_owned": False,
+                "active_runs": [],
+                "failure": "active workers changed during idle wait; preserved active worker ownership differs",
+                "old_production_pid": 222,
+                "old_production_start_time": "new",
+                "installed_sha256": "b" * 64,
+                "candidate_sha256": "c" * 64,
+            }
+            ready = {
+                "transition_path": guardian.CORRECTED_TRANSITION,
+                "candidate_pid": 333,
+                "candidate_sha256": "c" * 64,
+                "installed_sha256": "b" * 64,
+                "production_pid": 222,
+                "production_start_time": "new",
+            }
+            mutation = {
+                "transition_path": guardian.CORRECTED_TRANSITION,
+                "returncode": 75,
+                "overlap_classification": guardian.WRITER_DOMAIN_OVERLAP_CLASSIFICATION,
+                "mutation_absent": True,
+                "selected_path_absent": True,
+                "production_pid": 222,
+                "production_start_time": "new",
+            }
+            intent = {
+                "schema_version": 1,
+                "transition_path": guardian.CORRECTED_TRANSITION,
+                "mutation_fence_proved": True,
+                "prior_canary_root": str(old),
+                "lease_inode": active.lease_dir.stat().st_ino + 1,
+                "old_production_pid": 111,
+                "old_production_start_time": "old",
+                "installed_sha256": "a" * 64,
+            }
+            objects = {
+                old / "guardian-receipt.json": old_receipt,
+                new / "guardian-receipt.json": new_receipt,
+                new / "ready.json": ready,
+                new / "mutation-fence.json": mutation,
+                resolver / "retained-reconciliation-intent.json": intent,
+            }
+            with mock.patch.object(
+                guardian, "_json_object", side_effect=lambda path: objects[path]
+            ), mock.patch.object(guardian, "_pid_alive", return_value=False):
+                selected, _, _ = active.retained_legacy_evidence()
+            self.assertEqual(selected, new)
+
+    def test_retained_evidence_symlink_and_public_file_refuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "real.json"
+            real.write_text("{}", encoding="utf-8")
+            real.chmod(0o600)
+            linked = root / "linked.json"
+            linked.symlink_to(real)
+            with self.assertRaisesRegex(guardian.GuardianError, "unsafe metadata"):
+                guardian._json_object(linked)
+            real.chmod(0o644)
+            with self.assertRaisesRegex(guardian.GuardianError, "unsafe metadata"):
+                guardian._json_object(real)
+
+    def test_writer_fence_lock_symlink_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "real.lock"
+            real.write_bytes(b"")
+            real.chmod(0o600)
+            linked = root / "linked.lock"
+            linked.symlink_to(real)
+            with self.assertRaisesRegex(guardian.GuardianError, "safely open lock"):
+                guardian._open_verified_private_lock(linked)
+
+    def test_retained_lease_authority_drift_refuses_without_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.lease_dir.mkdir(mode=0o700)
+            inode = active.lease_dir.stat().st_ino
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                active,
+                "retained_legacy_evidence",
+                return_value=(root / "prior", {}, {}),
+            ), mock.patch.object(
+                active,
+                "snapshot_reconciliation_production",
+                side_effect=guardian.GuardianError(
+                    "retained-lease production authority changed: installed_sha256"
+                ),
+            ):
+                with self.assertRaisesRegex(guardian.GuardianError, "authority changed"):
+                    active.acquire()
+            self.assertEqual(active.lease_dir.stat().st_ino, inode)
+
+    def test_retained_lease_active_timeout_refuses_without_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.lease_dir.mkdir(mode=0o700)
+            inode = active.lease_dir.stat().st_ino
+            snapshot = mock.Mock(pid=4242)
+            active.snapshot = snapshot
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                active,
+                "retained_legacy_evidence",
+                return_value=(root / "prior", {}, {}),
+            ), mock.patch.object(
+                active,
+                "snapshot_reconciliation_production",
+                return_value=(snapshot, ()),
+            ), mock.patch.object(
+                guardian, "RETAINED_RECONCILIATION_MAX_SECONDS", 0
+            ):
+                with self.assertRaisesRegex(guardian.GuardianError, "did not become idle"):
+                    active.acquire()
+            self.assertEqual(active.lease_dir.stat().st_ino, inode)
+
+    def test_retained_lease_inode_replacement_refuses_new_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.lease_dir.mkdir(mode=0o700)
+            old_inode = active.lease_dir.stat().st_ino
+            snapshot = mock.Mock(pid=4242)
+            active.snapshot = snapshot
+            active.lock_path = root / "writer.lock"
+
+            @contextlib.contextmanager
+            def replace_lease():
+                active.lease_dir.rmdir()
+                active.lease_dir.mkdir(mode=0o700)
+                yield mock.Mock()
+
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                active,
+                "retained_legacy_evidence",
+                return_value=(root / "prior", {}, {}),
+            ), mock.patch.object(
+                active,
+                "snapshot_reconciliation_production",
+                return_value=(snapshot, ()),
+            ), mock.patch.object(
+                active, "verify_reconciliation_production", return_value=()
+            ), mock.patch.object(
+                active,
+                "final_reconciliation_writer_fence",
+                side_effect=replace_lease,
+            ), mock.patch.object(guardian.time, "sleep"):
+                with self.assertRaisesRegex(guardian.GuardianError, "identity changed"):
+                    active.acquire()
+            self.assertNotEqual(active.lease_dir.stat().st_ino, old_inode)
+            self.assertFalse(active.lease_owned)
 
     def test_lifetime_lock_proof_requires_real_lock_contention(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
