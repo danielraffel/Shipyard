@@ -314,6 +314,9 @@ pub(super) enum Command {
     },
     /// Check environment, dependencies, targets, and effective GitHub auth.
     Doctor {
+        /// Exact OWNER/REPO used to resolve configured auth token placeholders.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
         /// Additionally dispatch auto-release.yml to verify the release-bot chain.
         #[arg(long = "release-chain")]
         release_chain: bool,
@@ -1614,7 +1617,11 @@ pub(super) enum AuthCommand {
         repo: String,
     },
     /// Show the effective GitHub auth source Shipyard will use.
-    Doctor,
+    Doctor {
+        /// Exact OWNER/REPO used to resolve configured auth token placeholders.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
     /// Export sanitized GitHub auth config without tokens or private keys.
     Export {
         /// Write the bundle to a file instead of stdout.
@@ -2266,9 +2273,39 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Command, DependencyCommand, PulpDependencyCommand, RunnerCommand, WorkLedgerCommand,
-        WorkLedgerPolicyCommand,
+        AuthCommand, Cli, Command, DependencyCommand, PulpDependencyCommand, RunnerCommand,
+        WorkLedgerCommand, WorkLedgerPolicyCommand,
     };
+
+    #[test]
+    fn doctor_repo_overrides_are_available_on_both_auth_surfaces() {
+        let doctor = Cli::try_parse_from([
+            "shipyard",
+            "doctor",
+            "--rate-limit",
+            "--repo",
+            "Generous-Corp/pulp",
+        ])
+        .expect("doctor repo override");
+        assert!(matches!(
+            doctor.command,
+            Command::Doctor {
+                repo: Some(repo),
+                rate_limit: true,
+                ..
+            } if repo == "Generous-Corp/pulp"
+        ));
+
+        let auth =
+            Cli::try_parse_from(["shipyard", "auth", "doctor", "--repo", "Generous-Corp/pulp"])
+                .expect("auth doctor repo override");
+        assert!(matches!(
+            auth.command,
+            Command::Auth {
+                command: AuthCommand::Doctor { repo: Some(repo) }
+            } if repo == "Generous-Corp/pulp"
+        ));
+    }
 
     #[test]
     fn sandbox_audit_exec_requires_explicit_authority_and_child() {

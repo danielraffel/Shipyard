@@ -6,6 +6,8 @@ shipyard init                  # configure project
 shipyard doctor                # check environment + suggest fixes
 shipyard doctor --rate-limit   # show effective GitHub auth + REST/GraphQL buckets
 shipyard auth doctor           # show Shipyard's configured GitHub auth source
+shipyard doctor --rate-limit --repo OWNER/REPO  # resolve auth for an exact repo
+shipyard auth doctor --repo OWNER/REPO          # same override, auth-only
 shipyard auth export --output shipyard-auth.toml        # export non-secret auth config
 shipyard auth import shipyard-auth.toml --scope local   # import auth config locally
 shipyard targets               # show targets + reachability
@@ -434,3 +436,9 @@ probe GitHub quota. Use `shipyard doctor --rate-limit` when you need to confirm
 whether Shipyard is using ambient `gh`, an env token, or a command helper such
 as a GitHub App installation token, and to see the current REST and GraphQL
 rate-limit buckets.
+
+If a checkout has multiple GitHub remotes and no `gh` default remote,
+Shipyard refuses to guess which installation a `{repo_slug}` token helper
+should use. Pass `--repo OWNER/REPO` to either doctor surface to select the
+exact repository for that diagnostic. The value must be a canonical slug;
+invalid values fail closed. Without `--repo`, ambiguity remains an error.

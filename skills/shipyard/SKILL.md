@@ -635,6 +635,10 @@ When debugging GitHub behavior:
 - Run `shipyard doctor --rate-limit --json` to see the effective auth source
   and REST/GraphQL buckets. This actively resolves configured auth, so command
   helpers may run and GitHub App helpers may mint installation tokens.
+- When checkout remotes are ambiguous, pass `--repo OWNER/REPO` to
+  `shipyard doctor --rate-limit` or `shipyard auth doctor`. The canonical slug
+  is an exact token-helper repository override; malformed slugs fail closed,
+  and omitting it preserves the default ambiguity refusal.
 - Optional-provider rows stay green when unused: `nsc` reads "not configured
   (optional)" unless a Namespace provider is configured, and a `{repo_slug}`
   `token_command` that can't resolve in a repo-less context (doctor) is

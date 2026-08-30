@@ -9,7 +9,7 @@ use serde_json::{Value as JsonValue, json};
 use toml::{Table, Value as TomlValue};
 
 use crate::config::{LoadedConfig, LocalOverlaySource};
-use crate::doctor::{DoctorEntry, check_github_auth};
+use crate::doctor::DoctorEntry;
 use crate::gh::GhClient;
 use crate::identity::{ProductIdentity, RuntimeMode};
 use crate::output::{SCHEMA_VERSION, write_json_envelope, write_pretty_json};
@@ -31,8 +31,8 @@ pub(super) fn auth_command<W: Write>(
         AuthCommand::HelperArgv { wrapper, repo } => {
             auth_helper_argv(global_dir, &wrapper, &repo, stdout)?;
         }
-        AuthCommand::Doctor => {
-            auth_doctor(mode, cwd, json_mode, stdout)?;
+        AuthCommand::Doctor { repo } => {
+            auth_doctor(mode, cwd, repo.as_deref(), json_mode, stdout)?;
         }
         AuthCommand::Export { output } => {
             let config = LoadedConfig::load_from_cwd(mode, cwd)
@@ -200,10 +200,15 @@ fn is_exact_repo_slug(repo: &str) -> bool {
 fn auth_doctor<W: Write>(
     mode: RuntimeMode,
     cwd: &Path,
+    repo: Option<&str>,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    let entry = check_github_auth(mode, cwd);
+    if let Some(repo) = repo {
+        crate::gh::validate_repo_slug(repo)
+            .map_err(|error| CliFailure::new(2, error.to_string()))?;
+    }
+    let entry = crate::doctor::check_github_auth_for_repo(mode, cwd, repo);
     if json_mode {
         let mut data = BTreeMap::new();
         data.insert(

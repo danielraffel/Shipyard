@@ -84,12 +84,11 @@ impl GhClient {
 
     /// Force token-command repository placeholders to use an explicit target.
     pub fn with_repo_override(mut self, slug: &str) -> Result<Self, GhPrepareError> {
-        self.repo_override =
-            Some(
-                RepoIdentity::from_slug(slug).ok_or_else(|| GhPrepareError::InvalidRepoSlug {
-                    slug: slug.to_owned(),
-                })?,
-            );
+        self.repo_override = Some(RepoIdentity::from_exact_slug(slug).ok_or_else(|| {
+            GhPrepareError::InvalidRepoSlug {
+                slug: slug.to_owned(),
+            }
+        })?);
         self.pinned_token = None;
         Ok(self)
     }
@@ -564,6 +563,15 @@ impl GhClient {
     }
 }
 
+/// Validate an explicit GitHub repository identity without consulting remotes.
+pub fn validate_repo_slug(slug: &str) -> Result<(), GhPrepareError> {
+    RepoIdentity::from_exact_slug(slug)
+        .map(|_| ())
+        .ok_or_else(|| GhPrepareError::InvalidRepoSlug {
+            slug: slug.to_owned(),
+        })
+}
+
 fn resolve_ambient_gh_from_path(path: Option<&std::ffi::OsStr>) -> Result<PathBuf, GhPrepareError> {
     resolve_native_gh_from_path(path).ok_or(GhPrepareError::AmbientGhBinaryNotFound)
 }
@@ -934,6 +942,38 @@ impl RepoIdentity {
         let slug = slug.trim();
         let (owner, name) = slug.split_once('/')?;
         if owner.is_empty() || name.is_empty() || name.contains('/') {
+            return None;
+        }
+        Some(Self {
+            slug: slug.to_owned(),
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+        })
+    }
+
+    /// Build from a canonical CLI `OWNER/REPO` value. Unlike remote parsing,
+    /// this rejects whitespace and URL/ref-like punctuation rather than
+    /// normalizing user input.
+    fn from_exact_slug(slug: &str) -> Option<Self> {
+        if slug != slug.trim() {
+            return None;
+        }
+        let (owner, name) = slug.split_once('/')?;
+        if name.contains('/')
+            || !(1..=39).contains(&owner.len())
+            || !owner
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            || !owner
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || matches!(name, "" | "." | "..")
+            || name.len() > 255
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
             return None;
         }
         Some(Self {

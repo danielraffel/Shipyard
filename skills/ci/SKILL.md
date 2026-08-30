@@ -138,8 +138,8 @@ identity; static labels and HerdR environment metadata do not grant authority.
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
 | Probe SSH runner reachability | `shipyard doctor --runners --json` |
-| Inspect GitHub REST + GraphQL rate-limit buckets (both separately) | `shipyard doctor --rate-limit --json` |
-| Inspect effective GitHub auth only | `shipyard auth doctor --json` |
+| Inspect GitHub REST + GraphQL rate-limit buckets (both separately) | `shipyard doctor --rate-limit --json` (`--repo OWNER/REPO` when remotes are ambiguous) |
+| Inspect effective GitHub auth only | `shipyard auth doctor --json` (`--repo OWNER/REPO` when remotes are ambiguous) |
 | Export/import GitHub auth config only | `shipyard auth export --output shipyard-auth.toml` / `shipyard auth import shipyard-auth.toml --scope local` (preserves typed ambient/privileged binary authority; import replaces only the auth table) |
 | Explain log/artifact retention without mutation | `shipyard cleanup` (dry-run default; includes action reasons, protected evidence, and byte watermarks) |
 | Apply bounded terminal-log retention | `shipyard cleanup --apply` (gzip closed logs; pressure-deletes successful terminal jobs only; honors `.shipyard-retain`) |

@@ -436,6 +436,7 @@ where
             return quarantine_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Doctor {
+            repo,
             release_chain,
             runners,
             rate_limit,
@@ -445,6 +446,7 @@ where
                 cli.mode.into(),
                 &cwd,
                 &runtime_paths.state_dir,
+                repo.as_deref(),
                 release_chain,
                 runners,
                 rate_limit,
@@ -802,6 +804,7 @@ fn handle_doctor_command<W: Write>(
     mode: RuntimeMode,
     cwd: &Path,
     state_dir: &Path,
+    repo: Option<&str>,
     release_chain: bool,
     runners: bool,
     rate_limit: bool,
@@ -812,6 +815,7 @@ fn handle_doctor_command<W: Write>(
         mode,
         cwd,
         state_dir,
+        repo,
         release_chain,
         runners,
         rate_limit,

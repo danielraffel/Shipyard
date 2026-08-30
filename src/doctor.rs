@@ -125,7 +125,25 @@ pub fn collect_report(
     cwd: &Path,
     state_dir: &Path,
 ) -> DoctorReport {
-    collect_report_with_github_auth(probe, mode, cwd, state_dir, &github_auth_summary(mode, cwd))
+    collect_report_for_repo(probe, mode, cwd, state_dir, None)
+}
+
+/// Collect the doctor report with an explicit repository for auth placeholders.
+#[must_use]
+pub fn collect_report_for_repo(
+    probe: &impl CommandProbe,
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    repo: Option<&str>,
+) -> DoctorReport {
+    collect_report_with_github_auth(
+        probe,
+        mode,
+        cwd,
+        state_dir,
+        &github_auth_summary(mode, cwd, repo),
+    )
 }
 
 fn collect_report_with_github_auth(
@@ -705,7 +723,17 @@ fn release_chain_entry(
 /// calls.
 #[must_use]
 pub fn check_github_auth(mode: RuntimeMode, cwd: &Path) -> DoctorEntry {
-    let result = github_auth_summary(mode, cwd);
+    check_github_auth_for_repo(mode, cwd, None)
+}
+
+/// Summarize GitHub auth using an exact repository override when supplied.
+#[must_use]
+pub fn check_github_auth_for_repo(
+    mode: RuntimeMode,
+    cwd: &Path,
+    repo: Option<&str>,
+) -> DoctorEntry {
+    let result = github_auth_summary(mode, cwd, repo);
     let ambient_gh_auth = probe_ambient_gh_cli_auth(&SystemCommandProbe);
     github_auth_entry_result(&result, &ambient_gh_auth)
 }
@@ -729,9 +757,19 @@ impl GhAuthCheckError {
     }
 }
 
-fn github_auth_summary(mode: RuntimeMode, cwd: &Path) -> Result<GhAuthSummary, GhAuthCheckError> {
+fn github_auth_summary(
+    mode: RuntimeMode,
+    cwd: &Path,
+    repo: Option<&str>,
+) -> Result<GhAuthSummary, GhAuthCheckError> {
     let client = GhClient::from_cwd(mode, cwd)
         .map_err(|error| GhAuthCheckError::Client(error.to_string()))?;
+    let client = match repo {
+        Some(repo) => client
+            .with_repo_override(repo)
+            .map_err(GhAuthCheckError::Prepare)?,
+        None => client,
+    };
     client
         .auth_summary(cwd, GhAuthPolicy::Default)
         .map_err(GhAuthCheckError::Prepare)

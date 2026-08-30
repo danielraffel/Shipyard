@@ -899,16 +899,83 @@ fn command_token_cache_is_partitioned_by_expanded_repository() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn explicit_repo_override_rejects_malformed_instead_of_falling_back() {
-    let error = GhClient::ambient()
-        .with_repo_override("owner/repo/extra")
-        .expect_err("invalid explicit slug");
+fn explicit_repo_override_resolves_ambiguous_checkout_without_exposing_token() {
+    let repo = TempDir::new().expect("tempdir");
+    git(repo.path(), &["init", "--quiet", "--initial-branch=main"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "git@github.com:me/pulp.git"],
+    );
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:Generous-Corp/pulp.git",
+        ],
+    );
+
+    let helper = repo.path().join("repo-token-helper");
+    let captured = repo.path().join("captured-repo");
+    let secret = "ghs_doctor_secret_must_not_leak";
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\nprintf '{{\"token\":\"{}\",\"kind\":\"github-app-installation\",\"expires_at\":\"2099-01-01T00:00:00Z\"}}\\n'\n",
+            captured.display(),
+            secret,
+        ),
+    );
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}", "{{repo_slug}}"]
+            "#,
+        helper.display()
+    ));
+    let client = GhClient::from_loaded_config(&config).expect("client");
 
     assert!(matches!(
-        error,
-        GhPrepareError::InvalidRepoSlug { slug } if slug == "owner/repo/extra"
+        client.auth_summary(repo.path(), GhAuthPolicy::Default),
+        Err(GhPrepareError::RepoRemoteAmbiguous)
     ));
+
+    let summary = client
+        .with_repo_override("Generous-Corp/pulp")
+        .expect("canonical override")
+        .auth_summary(repo.path(), GhAuthPolicy::Default)
+        .expect("explicit org repository resolves");
+    assert_eq!(
+        std::fs::read_to_string(captured).expect("captured repo"),
+        "Generous-Corp/pulp"
+    );
+    let rendered = format!("{summary:?}");
+    assert!(!rendered.contains(secret));
+    assert!(rendered.contains("github-app-installation"));
+}
+
+#[test]
+fn explicit_repo_override_rejects_malformed_instead_of_falling_back() {
+    for slug in [
+        "owner/repo/extra",
+        " owner/repo",
+        "owner/repo ",
+        "owner/repo@main",
+        "owner/repo name",
+        "owner_only",
+    ] {
+        let error = GhClient::ambient()
+            .with_repo_override(slug)
+            .expect_err("invalid explicit slug");
+        assert!(matches!(
+            error,
+            GhPrepareError::InvalidRepoSlug { slug: rejected } if rejected == slug
+        ));
+    }
 }
 
 #[test]
