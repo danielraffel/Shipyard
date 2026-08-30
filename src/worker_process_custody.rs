@@ -235,6 +235,16 @@ fn descendant_processes(root: u32) -> io::Result<Vec<u32>> {
     Ok(descendants)
 }
 
+/// Prove that `candidate` is currently in the exact owner's descendant tree.
+///
+/// Queue-hold verification runs in a short-lived child of the process that
+/// owns the inherited lock descriptor. A fresh process with copied arguments
+/// is not authority unless it is also in that live process tree.
+#[cfg(unix)]
+pub(crate) fn process_is_descendant(root: u32, candidate: u32) -> io::Result<bool> {
+    descendant_processes(root).map(|descendants| descendants.contains(&candidate))
+}
+
 #[cfg(unix)]
 pub(crate) fn process_id_liveness(pid: u32) -> ProcessLiveness {
     let Ok(output) = Command::new("/bin/ps")

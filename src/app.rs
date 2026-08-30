@@ -89,6 +89,7 @@ mod pr_cmd;
 mod profile_apply_cmd;
 mod quarantine_cmd;
 mod queue_cmd;
+mod queue_hold_cmd;
 mod queue_observer_cmd;
 mod release_bot_cmd;
 mod reroute_cmd;
@@ -143,6 +144,7 @@ use self::queue_cmd::{
     bump_command, cancel_command, evidence_command, logs_command, queue_command,
     reconcile_orphan_command, status_command,
 };
+use self::queue_hold_cmd::queue_hold_command;
 use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
 use self::release_bot_cmd::release_bot_command;
 use self::rescue_cmd::rescue_command;
@@ -273,6 +275,7 @@ where
             | Command::Daemon { .. }
             | Command::WriterDomainExec { .. }
             | Command::SandboxAuditExec { .. }
+            | Command::QueueHold { .. }
             | Command::ParallelProofCanary { .. }
             | Command::ParallelProofCanaryWorker { .. }
     ) {
@@ -475,6 +478,9 @@ where
                 stdout,
             );
         }
+        Command::QueueHold { command } => {
+            return queue_hold_command(command, &runtime_paths.state_dir, cli.json, stdout);
+        }
         Command::QueueObserve {
             repo,
             base,
@@ -657,6 +663,7 @@ fn handle_operational_variant<W: Write>(
         | Command::QueueReconcileOrphan { .. }
         | Command::Bump { .. }
         | Command::Queue
+        | Command::QueueHold { .. }
         | Command::QueueObserve { .. }
         | Command::ChangedSurfacePlan { .. }
         | Command::ChangedSurfaceTrialStatus { .. }
