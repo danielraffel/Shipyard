@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01290"></a>
+## [0.129.0] - 2026-08-30
+
+- fix: bind fleet auth to release repository ([#501](https://github.com/danielraffel/Shipyard/pull/501))
+
 <a id="v01280"></a>
 ## [0.128.0] - 2026-08-30
 
@@ -1149,6 +1154,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.129.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.129.0
 [0.128.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.128.0
 [0.127.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.127.4
 [0.127.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.127.3
