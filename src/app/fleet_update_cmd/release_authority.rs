@@ -14,7 +14,7 @@ use crate::gh::{GhClient, GhSupervision};
 
 mod download;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use download::sha256_file;
 use download::{DownloadedAsset, download_asset_to_private_file};
 

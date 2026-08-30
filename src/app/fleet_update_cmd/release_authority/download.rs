@@ -432,17 +432,16 @@ fn open_private_asset(path: &Path) -> Result<File, String> {
         .map_err(|error| format!("could not create private release asset staging file: {error}"))
 }
 
+#[cfg(unix)]
 fn set_private_directory(path: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
-            |error| format!("could not protect release asset staging directory: {error}"),
-        )?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("could not protect release asset staging directory: {error}"))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_path: &Path) -> Result<(), String> {
+    Err("fleet release staging requires Unix private-directory permissions".to_owned())
 }
 
 pub(super) fn sha256_file(path: &Path, expected_size: u64) -> Result<String, String> {
