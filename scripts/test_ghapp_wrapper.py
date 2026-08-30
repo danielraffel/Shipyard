@@ -153,6 +153,8 @@ class GhappWrapperTests(unittest.TestCase):
             "mode = os.environ.get('RESOLVER_MODE')\n"
             "if mode == 'extra-key': payload['unexpected'] = True\n"
             "if mode == 'oversize': payload['credential_argv'][1] = '1' * 17000\n"
+            "if mode and mode.startswith('app-id:'): payload['credential_argv'][1] = mode.split(':', 1)[1]\n"
+            "if mode and mode.startswith('private-key:'): payload['credential_argv'][3] = mode.split(':', 1)[1]\n"
             "print(json.dumps(payload, separators=(',', ':')))\n",
             encoding="utf-8",
         )
@@ -176,11 +178,14 @@ class GhappWrapperTests(unittest.TestCase):
         self.environment.pop("GH_TOKEN", None)
         self.environment.pop("GITHUB_TOKEN", None)
         self.environment.pop("GH_HOST", None)
+        self.write_resolver_context()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def run_wrapper(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def run_wrapper(
+        self, *args: str, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(self.wrapper), *args],
             cwd=self.root,
@@ -188,6 +193,7 @@ class GhappWrapperTests(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
+            timeout=timeout,
         )
 
     def write_resolver_context(self, **overrides: object) -> None:
@@ -287,7 +293,7 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertIn(f"--private-key {self.private_key}", helper_args)
         self.assertEqual(
             self.resolver_log.read_text(),
-            f"auth helper-argv --wrapper {self.wrapper} --repo Generous-Corp/pulp\n",
+            f"--mode shipyard --global-dir {self.root / 'governed global'} auth helper-argv --wrapper {self.wrapper} --repo Generous-Corp/pulp\n",
         )
         self.assertNotIn("ghs_private_fixture", helper_args)
         self.assertEqual(
@@ -332,6 +338,8 @@ class GhappWrapperTests(unittest.TestCase):
             "invalid-mode": {"mode": "foreign"},
             "oversized-global-dir": {"global_dir": "/" + "a" * 4096},
             "control-character": {"global_dir": "/tmp/bad\npath"},
+            "duplicate-separator": {"global_dir": "/tmp//global"},
+            "dot-component": {"global_dir": "/tmp/./global"},
         }
         for name, overrides in cases.items():
             with self.subTest(name=name):
@@ -361,6 +369,7 @@ class GhappWrapperTests(unittest.TestCase):
         self.resolver_context = self.wrapper.with_name(
             f"{self.wrapper.name}.shipyard-context.json"
         )
+        self.resolver_context.unlink()
         self.resolver_context.symlink_to(target)
 
         result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
@@ -369,6 +378,69 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertIn("resolver context is malformed or unsafe", result.stderr)
         self.assertFalse(self.resolver_log.exists())
 
+    def test_cli_mode_rejects_fifo_context_without_blocking(self) -> None:
+        self.resolver_context.unlink()
+        os.mkfifo(self.resolver_context, mode=0o600)
+
+        result = self.run_wrapper(
+            "api", "repos/Generous-Corp/pulp/hooks", timeout=2.0
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resolver context is malformed or unsafe", result.stderr)
+        self.assertFalse(self.resolver_log.exists())
+
+    def test_cli_mode_requires_context_for_manual_or_fleet_install(self) -> None:
+        self.resolver_context.unlink()
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resolver context is required for direct mode", result.stderr)
+        self.assertFalse(self.resolver_log.exists())
+        self.assertFalse(self.helper_log.exists())
+
+    def test_absolute_shell_env_and_git_ignore_hostile_resolution(self) -> None:
+        hostile = self.root / "hostile-path"
+        hostile.mkdir()
+        path_marker = self.root / "hostile-path-ran"
+        function_marker = self.root / "hostile-function-ran"
+        for name in ("bash", "env", "git"):
+            executable = hostile / name
+            executable.write_text(
+                "#!/bin/sh\n/usr/bin/touch \"$HOSTILE_PATH_MARKER\"\nexit 97\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+        subprocess.run(
+            ["/usr/bin/git", "init", "-q"], cwd=self.root, check=True
+        )
+        subprocess.run(
+            [
+                "/usr/bin/git",
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:Generous-Corp/pulp.git",
+            ],
+            cwd=self.root,
+            check=True,
+        )
+        self.environment["PATH"] = f"{hostile}:{self.environment.get('PATH', '')}"
+        self.environment["HOSTILE_PATH_MARKER"] = str(path_marker)
+        self.environment["HOSTILE_FUNCTION_MARKER"] = str(function_marker)
+        for name in ("env", "git"):
+            self.environment[f"BASH_FUNC_{name}%%"] = (
+                "() { /usr/bin/touch \"$HOSTILE_FUNCTION_MARKER\"; return 96; }"
+            )
+
+        result = self.run_wrapper("pr", "view", "7")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(path_marker.exists())
+        self.assertFalse(function_marker.exists())
+        self.assertIn("--repo Generous-Corp/pulp", self.helper_log.read_text())
+
     def test_cli_mode_rejects_resolver_extra_keys_before_helper(self) -> None:
         self.environment["RESOLVER_MODE"] = "extra-key"
 
@@ -376,8 +448,44 @@ class GhappWrapperTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("malformed JSON", result.stderr)
+        self.assertEqual(
+            result.stderr.count("malformed JSON"),
+            2,
+            "decoder failure must be caught again by final argv cardinality",
+        )
         self.assertFalse(self.helper_log.exists())
         self.assertFalse(self.gh_log.exists())
+
+    def test_cli_mode_rejects_non_decimal_or_zero_resolver_app_ids(self) -> None:
+        for app_id in (
+            "0",
+            "000",
+            "not-numeric",
+            "12x34",
+            "１２３",
+            "18446744073709551616",
+        ):
+            with self.subTest(app_id=app_id):
+                self.environment["RESOLVER_MODE"] = f"app-id:{app_id}"
+                result = self.run_wrapper(
+                    "api", "repos/Generous-Corp/pulp/hooks"
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("malformed JSON", result.stderr)
+                self.assertFalse(self.helper_log.exists())
+                self.assertFalse(self.gh_log.exists())
+
+    def test_cli_mode_rejects_non_normalized_resolver_private_key(self) -> None:
+        for private_key in ("/Users/ci//app.pem", "/Users/ci/./app.pem"):
+            with self.subTest(private_key=private_key):
+                self.environment["RESOLVER_MODE"] = f"private-key:{private_key}"
+                result = self.run_wrapper(
+                    "api", "repos/Generous-Corp/pulp/hooks"
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("malformed JSON", result.stderr)
+                self.assertFalse(self.helper_log.exists())
+                self.assertFalse(self.gh_log.exists())
 
     def test_cli_mode_rejects_oversized_resolver_output_before_helper(self) -> None:
         self.environment["RESOLVER_MODE"] = "oversize"

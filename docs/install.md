@@ -278,9 +278,11 @@ wrapper, `token`, `--app-id VALUE`, `--private-key ABSOLUTE_PATH`, and literal
 `--repo {repo_slug}`. Direct `ghapp` commands resolve only that machine-global
 credential shape through the sibling Shipyard binary; repository overlays,
 fixed installation IDs, API/cache arguments, and foreign wrappers fail before
-the token helper runs. Fleet writes a strict 0600
-`ghapp.shipyard-context.json` sibling so subsequent direct wrapper calls retain
-the configured runtime mode and global directory.
+the token helper runs. Direct mode requires a strict 0600 typed
+`ghapp.shipyard-context.json` sibling; fleet writes it for targets v0.129.0 and
+newer so subsequent direct wrapper calls retain the configured runtime mode and
+global directory. Manual/non-fleet installs must provision the same context
+beside `ghapp`; missing or unsafe context fails closed.
 
 The command uses a stripped remote environment deliberately, invokes the
 configured absolute binary, bounds each host attempt to ten minutes, and
@@ -300,11 +302,13 @@ uninstalled. Fleet rollout rejects targets older than v0.100.0 before mutation;
 use an older release's documented manual procedure when rollback crosses that
 bootstrap boundary.
 
-Fleet installation commits its helper, wrapper, resolver context, Shipyard
-binary, and companion
+For targets v0.129.0 and newer, fleet installation commits its helper, wrapper,
+resolver context, Shipyard binary, and companion
 transaction only after the newly installed Shipyard resolves the installed
 wrapper using the host class's exact mode and global directory. A resolver
 failure restores all five prior artifacts before the host can report success.
+Targets v0.100.0 through v0.128.x preserve the legacy four-target transaction
+and nine-line recovery journal, with no resolver context or unsupported probe.
 
 Before any host can mutate, fleet rollout resolves the annotated release tag to
 its full tag-object, commit, and tree OIDs; binds the published release ID; and

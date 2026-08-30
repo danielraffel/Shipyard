@@ -47,8 +47,9 @@ pub(super) fn probe(helper: &Path, wrapper: &Path, phase: &str) -> String {
 
 /// Generate the macOS transaction. Both source files must already exist in a
 /// private staging directory and have been checked against the frozen release
-/// authority. The journal makes the two-rename transaction recoverable after
-/// abrupt process death; ordinary errors roll back before returning.
+/// authority. The journal makes the four- or five-target transaction
+/// recoverable after abrupt process death; ordinary errors roll back before
+/// returning.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn install_transaction(
     helper: &Path,
@@ -56,6 +57,7 @@ pub(super) fn install_transaction(
     binary: &Path,
     companion: &Path,
     companion_required: bool,
+    resolver_required: bool,
     helper_source: &str,
     wrapper_source: &str,
     binary_install_command: &str,
@@ -71,6 +73,7 @@ pub(super) fn install_transaction(
     let binary = shlex_quote(&binary.display().to_string());
     let companion = shlex_quote(&companion.display().to_string());
     let companion_required = if companion_required { "1" } else { "0" };
+    let resolver_required = if resolver_required { "1" } else { "0" };
     let context_json = shlex_quote(
         &serde_json::json!({
             "schema_version": 1,
@@ -97,10 +100,11 @@ pub(super) fn install_transaction(
         r#"
 auth_helper={helper}
 auth_wrapper={wrapper}
-auth_context="$auth_wrapper.shipyard-context.json"
 auth_binary={binary}
 auth_companion={companion}
 auth_companion_required={companion_required}
+auth_resolver_required={resolver_required}
+if [ "$auth_resolver_required" = 1 ]; then auth_context="$auth_wrapper.shipyard-context.json"; else auth_context=; fi
 auth_mode={mode}
 auth_global_dir={global_dir}
 auth_state_dir={state_dir}
@@ -123,8 +127,8 @@ auth_safe_target() {{
     test -d "$auth_cursor"
     test ! -L "$auth_cursor"
     test "$(/usr/bin/stat -f '%u' "$auth_cursor")" = "$(/usr/bin/id -u)"
-    auth_mode="$(/usr/bin/stat -f '%Lp' "$auth_cursor")"
-    test $((8#$auth_mode & 8#22)) -eq 0
+    auth_permissions="$(/usr/bin/stat -f '%Lp' "$auth_cursor")"
+    test $((8#$auth_permissions & 8#22)) -eq 0
     auth_next="$(/usr/bin/dirname "$auth_cursor")"
     test "$auth_next" != "$auth_cursor"
     auth_cursor="$auth_next"
@@ -141,10 +145,17 @@ auth_safe_target() {{
 
 auth_write_phase() {{
   auth_phase_tmp="$(/usr/bin/mktemp "$auth_state_dir/.fleet-auth-support.phase.XXXXXX")"
-  /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-    "$1" "$auth_authority" "$auth_helper" "$auth_wrapper" "$auth_binary" \
-    "$auth_companion" "$auth_context" "$auth_helper_digest" "$auth_wrapper_digest" \
-    "$auth_context_digest" "$auth_companion_required" > "$auth_phase_tmp"
+  if [ "$auth_resolver_required" = 1 ]; then
+    /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+      "$1" "$auth_authority" "$auth_helper" "$auth_wrapper" "$auth_binary" \
+      "$auth_companion" "$auth_context" "$auth_helper_digest" "$auth_wrapper_digest" \
+      "$auth_context_digest" "$auth_companion_required" > "$auth_phase_tmp"
+  else
+    /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+      "$1" "$auth_authority" "$auth_helper" "$auth_wrapper" "$auth_binary" \
+      "$auth_companion" "$auth_helper_digest" "$auth_wrapper_digest" \
+      "$auth_companion_required" > "$auth_phase_tmp"
+  fi
   /bin/chmod 600 "$auth_phase_tmp"
   /bin/mv -f "$auth_phase_tmp" "$auth_journal"
 }}
@@ -159,6 +170,7 @@ auth_cleanup_markers() {{
   /bin/rm -f "$auth_cleanup_wrapper.shipyard-rollback" "$auth_cleanup_wrapper.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_binary.shipyard-rollback" "$auth_cleanup_binary.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_companion.shipyard-rollback" "$auth_cleanup_companion.shipyard-was-absent"
+  /bin/rm -f "$auth_cleanup_binary.shipyard-rollback.tmp" "$auth_cleanup_companion.shipyard-rollback.tmp"
   if [ -n "$auth_cleanup_context" ]; then /bin/rm -f "$auth_cleanup_context.shipyard-rollback" "$auth_cleanup_context.shipyard-was-absent"; fi
   /bin/rm -f "$auth_journal"
 }}
@@ -265,26 +277,40 @@ auth_safe_target "$auth_helper"
 auth_safe_target "$auth_wrapper"
 auth_safe_target "$auth_binary"
 auth_safe_target "$auth_companion"
-auth_safe_target "$auth_context"
+if [ "$auth_resolver_required" = 1 ]; then auth_safe_target "$auth_context"; fi
 auth_recovery_needed=0
 if [ -e "$auth_journal" ] || [ -L "$auth_journal" ]; then auth_recovery_needed=1; fi
 case "$auth_recovery_needed" in 1) auth_recover ;; esac
-for auth_target in "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"; do
+for auth_target in "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion"; do
   test ! -e "$auth_target.shipyard-rollback"
   test ! -L "$auth_target.shipyard-rollback"
   test ! -e "$auth_target.shipyard-was-absent"
   test ! -L "$auth_target.shipyard-was-absent"
 done
+test ! -e "$auth_binary.shipyard-rollback.tmp"
+test ! -L "$auth_binary.shipyard-rollback.tmp"
+test ! -e "$auth_companion.shipyard-rollback.tmp"
+test ! -L "$auth_companion.shipyard-rollback.tmp"
+if [ "$auth_resolver_required" = 1 ]; then
+  test ! -e "$auth_context.shipyard-rollback"
+  test ! -L "$auth_context.shipyard-rollback"
+  test ! -e "$auth_context.shipyard-was-absent"
+  test ! -L "$auth_context.shipyard-was-absent"
+fi
 
 auth_helper_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_helper")/.shipyard-auth-helper.XXXXXX")"
 auth_wrapper_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_wrapper")/.shipyard-auth-wrapper.XXXXXX")"
-auth_context_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_context")/.shipyard-auth-context.XXXXXX")"
 /bin/cp "$auth_helper_source" "$auth_helper_tmp"
 /bin/cp "$auth_wrapper_source" "$auth_wrapper_tmp"
 /bin/chmod 700 "$auth_helper_tmp" "$auth_wrapper_tmp"
-/usr/bin/printf '%s\n' "$auth_context_json" > "$auth_context_tmp"
-/bin/chmod 600 "$auth_context_tmp"
-auth_context_digest="$(/usr/bin/shasum -a 256 "$auth_context_tmp" | /usr/bin/awk '{{print $1}}')"
+auth_context_digest=
+auth_context_tmp=
+if [ "$auth_resolver_required" = 1 ]; then
+  auth_context_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_context")/.shipyard-auth-context.XXXXXX")"
+  /usr/bin/printf '%s\n' "$auth_context_json" > "$auth_context_tmp"
+  /bin/chmod 600 "$auth_context_tmp"
+  auth_context_digest="$(/usr/bin/shasum -a 256 "$auth_context_tmp" | /usr/bin/awk '{{print $1}}')"
+fi
 test "$(/usr/bin/shasum -a 256 "$auth_helper_tmp" | /usr/bin/awk '{{print $1}}')" = "$auth_helper_digest"
 test "$(/usr/bin/shasum -a 256 "$auth_wrapper_tmp" | /usr/bin/awk '{{print $1}}')" = "$auth_wrapper_digest"
 auth_write_phase preparing
@@ -292,7 +318,7 @@ auth_write_phase preparing
 auth_rollback_on_error() {{
   auth_status=$?
   trap - ERR INT TERM
-  auth_restore_one "$auth_context"
+  if [ "$auth_resolver_required" = 1 ]; then auth_restore_one "$auth_context"; fi
   auth_restore_one "$auth_companion"
   auth_restore_one "$auth_binary"
   auth_restore_one "$auth_wrapper"
@@ -306,9 +332,11 @@ trap auth_rollback_on_error ERR INT TERM
 
 if [ -e "$auth_helper" ]; then /bin/mv "$auth_helper" "$auth_helper.shipyard-rollback"; else /usr/bin/touch "$auth_helper.shipyard-was-absent"; /bin/chmod 600 "$auth_helper.shipyard-was-absent"; fi
 if [ -e "$auth_wrapper" ]; then /bin/mv "$auth_wrapper" "$auth_wrapper.shipyard-rollback"; else /usr/bin/touch "$auth_wrapper.shipyard-was-absent"; /bin/chmod 600 "$auth_wrapper.shipyard-was-absent"; fi
-if [ -e "$auth_binary" ]; then /bin/cp -p "$auth_binary" "$auth_binary.shipyard-rollback"; else /usr/bin/touch "$auth_binary.shipyard-was-absent"; /bin/chmod 600 "$auth_binary.shipyard-was-absent"; fi
-if [ -e "$auth_companion" ]; then /bin/cp -p "$auth_companion" "$auth_companion.shipyard-rollback"; else /usr/bin/touch "$auth_companion.shipyard-was-absent"; /bin/chmod 600 "$auth_companion.shipyard-was-absent"; fi
-if [ -e "$auth_context" ]; then /bin/mv "$auth_context" "$auth_context.shipyard-rollback"; else /usr/bin/touch "$auth_context.shipyard-was-absent"; /bin/chmod 600 "$auth_context.shipyard-was-absent"; fi
+if [ -e "$auth_binary" ]; then /bin/cp -p "$auth_binary" "$auth_binary.shipyard-rollback.tmp"; /bin/mv "$auth_binary.shipyard-rollback.tmp" "$auth_binary.shipyard-rollback"; else /usr/bin/touch "$auth_binary.shipyard-was-absent"; /bin/chmod 600 "$auth_binary.shipyard-was-absent"; fi
+if [ -e "$auth_companion" ]; then /bin/cp -p "$auth_companion" "$auth_companion.shipyard-rollback.tmp"; /bin/mv "$auth_companion.shipyard-rollback.tmp" "$auth_companion.shipyard-rollback"; else /usr/bin/touch "$auth_companion.shipyard-was-absent"; /bin/chmod 600 "$auth_companion.shipyard-was-absent"; fi
+if [ "$auth_resolver_required" = 1 ]; then
+  if [ -e "$auth_context" ]; then /bin/mv "$auth_context" "$auth_context.shipyard-rollback"; else /usr/bin/touch "$auth_context.shipyard-was-absent"; /bin/chmod 600 "$auth_context.shipyard-was-absent"; fi
+fi
 auth_write_phase prepared
 /bin/mv "$auth_helper_tmp" "$auth_helper"
 auth_write_phase helper-installed
@@ -316,17 +344,21 @@ auth_write_phase helper-installed
 /bin/mv "$auth_wrapper_tmp" "$auth_wrapper"
 auth_write_phase auth-installed
 {binary_install_command}
-/bin/mv "$auth_context_tmp" "$auth_context"
-auth_write_phase context-installed
+if [ "$auth_resolver_required" = 1 ]; then
+  /bin/mv "$auth_context_tmp" "$auth_context"
+  auth_write_phase context-installed
+fi
 test "$(/usr/bin/shasum -a 256 "$auth_helper" | /usr/bin/awk '{{print $1}}')" = "$auth_helper_digest"
 test "$(/usr/bin/shasum -a 256 "$auth_wrapper" | /usr/bin/awk '{{print $1}}')" = "$auth_wrapper_digest"
 test "$(/usr/bin/stat -f '%Lp' "$auth_helper")" = 700
 test "$(/usr/bin/stat -f '%Lp' "$auth_wrapper")" = 700
 test -x "$auth_binary"
 if [ "$auth_companion_required" = 1 ]; then test -x "$auth_companion"; fi
-test "$(/usr/bin/shasum -a 256 "$auth_context" | /usr/bin/awk '{{print $1}}')" = "$auth_context_digest"
-test "$(/usr/bin/stat -f '%Lp' "$auth_context")" = 600
-"$auth_binary" --mode "$auth_mode" --global-dir "$auth_global_dir" auth helper-argv --wrapper "$auth_wrapper" --repo "$auth_probe_repo" >/dev/null
+if [ "$auth_resolver_required" = 1 ]; then
+  test "$(/usr/bin/shasum -a 256 "$auth_context" | /usr/bin/awk '{{print $1}}')" = "$auth_context_digest"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_context")" = 600
+  "$auth_binary" --mode "$auth_mode" --global-dir "$auth_global_dir" auth helper-argv --wrapper "$auth_wrapper" --repo "$auth_probe_repo" >/dev/null
+fi
 auth_write_phase committed
 trap - ERR INT TERM
 auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"
@@ -400,6 +432,7 @@ mod tests {
             wrapper_source,
             authority,
             fail_after_helper,
+            "v0.129.0",
             true,
         )
     }
@@ -413,8 +446,10 @@ mod tests {
         wrapper_source: &Path,
         authority: &ReleaseAuthority,
         fail_after_helper: bool,
+        target: &str,
         resolver_succeeds: bool,
     ) -> std::process::ExitStatus {
+        let resolver_required = crate::app::fleet_update_cmd::tag_supports_auth_resolver(target);
         let state = root.path().join("Library/Application Support/shipyard");
         let binary = root.path().join(".local/bin/shipyard");
         let companion = root.path().join(".local/bin/shipyard-workstream-provider");
@@ -425,9 +460,34 @@ mod tests {
                     .expect("binary mode");
             }
         }
+        let expected_global_dir = shlex_quote(&state.display().to_string());
+        let expected_wrapper = shlex_quote(&wrapper.display().to_string());
+        let installed_binary_lines = if resolver_required {
+            vec![
+                "#!/bin/sh".to_owned(),
+                "test \"$#\" = 10".to_owned(),
+                "test \"$1\" = --mode".to_owned(),
+                "test \"$2\" = shipyard".to_owned(),
+                "test \"$3\" = --global-dir".to_owned(),
+                format!("test \"$4\" = {expected_global_dir}"),
+                "test \"$5\" = auth".to_owned(),
+                "test \"$6\" = helper-argv".to_owned(),
+                "test \"$7\" = --wrapper".to_owned(),
+                format!("test \"$8\" = {expected_wrapper}"),
+                "test \"$9\" = --repo".to_owned(),
+                "test \"${10}\" = danielraffel/Shipyard".to_owned(),
+                format!("exit {}", if resolver_succeeds { 0 } else { 71 }),
+            ]
+        } else {
+            vec!["#!/bin/sh".to_owned(), "exit 86".to_owned()]
+        };
+        let installed_binary_lines = installed_binary_lines
+            .iter()
+            .map(|line| shlex_quote(line))
+            .collect::<Vec<_>>()
+            .join(" ");
         let installed_binary = format!(
-            "/usr/bin/printf '%s\\n' '#!/bin/sh' 'exit {}' > {}; /bin/chmod 700 {}",
-            if resolver_succeeds { 0 } else { 71 },
+            "/usr/bin/printf '%s\\n' {installed_binary_lines} > {}; /bin/chmod 700 {}",
             shlex_quote(&binary.display().to_string()),
             shlex_quote(&binary.display().to_string()),
         );
@@ -437,6 +497,7 @@ mod tests {
             &binary,
             &companion,
             true,
+            resolver_required,
             &shlex_quote(&helper_source.display().to_string()),
             &shlex_quote(&wrapper_source.display().to_string()),
             &installed_binary,
@@ -521,6 +582,108 @@ mod tests {
     }
 
     #[test]
+    fn v0_128_target_retains_four_target_transaction_without_resolver_probe() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+
+        assert!(
+            run_with_probe(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                false,
+                "v0.128.9",
+                false,
+            )
+            .success(),
+            "legacy target must not execute the installed binary's failing resolver path",
+        );
+        assert!(
+            !wrapper
+                .with_file_name("ghapp.shipyard-context.json")
+                .exists()
+        );
+        assert!(
+            !root
+                .path()
+                .join("Library/Application Support/shipyard/fleet-auth-support.transaction")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn v0_128_recovers_nine_line_journal_and_partial_atomic_backups() {
+        let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
+        let state = root.path().join("Library/Application Support/shipyard");
+        let binary = root.path().join(".local/bin/shipyard");
+        let companion = root.path().join(".local/bin/shipyard-workstream-provider");
+        for (path, contents) in [
+            (&helper, b"old helper\n".as_slice()),
+            (&wrapper, b"old wrapper\n".as_slice()),
+            (&binary, b"old binary\n".as_slice()),
+            (&companion, b"old companion\n".as_slice()),
+        ] {
+            std::fs::write(path, contents).expect("old artifact");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("old mode");
+        }
+        for path in [&binary, &companion] {
+            std::fs::write(
+                format!("{}.shipyard-rollback.tmp", path.display()),
+                b"partial backup",
+            )
+            .expect("interrupted backup");
+        }
+        let journal = state.join("fleet-auth-support.transaction");
+        let journal_contents = format!(
+            "preparing\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n1\n",
+            "f".repeat(64),
+            helper.display(),
+            wrapper.display(),
+            binary.display(),
+            companion.display(),
+            digest(b"old helper\n"),
+            digest(b"old wrapper\n"),
+        );
+        assert_eq!(journal_contents.lines().count(), 9);
+        std::fs::write(&journal, journal_contents).expect("legacy journal");
+
+        assert!(
+            !run_with_probe(
+                &root,
+                &helper,
+                &wrapper,
+                &helper_source,
+                &wrapper_source,
+                &authority,
+                true,
+                "v0.128.9",
+                false,
+            )
+            .success()
+        );
+        for (path, expected) in [
+            (&helper, b"old helper\n".as_slice()),
+            (&wrapper, b"old wrapper\n".as_slice()),
+            (&binary, b"old binary\n".as_slice()),
+            (&companion, b"old companion\n".as_slice()),
+        ] {
+            assert_eq!(std::fs::read(path).expect("restored artifact"), expected);
+        }
+        assert!(!journal.exists());
+        assert!(!state.join("fleet-auth-support.lock").exists());
+        assert!(
+            !std::path::Path::new(&format!("{}.shipyard-rollback.tmp", binary.display())).exists()
+        );
+        assert!(
+            !std::path::Path::new(&format!("{}.shipyard-rollback.tmp", companion.display()))
+                .exists()
+        );
+    }
+
+    #[test]
     fn partial_install_failure_rolls_back_both_legacy_files() {
         let (root, helper, wrapper, helper_source, wrapper_source, authority) = fixture();
         std::fs::write(&helper, b"old helper\n").expect("old helper");
@@ -570,6 +733,7 @@ mod tests {
                 &wrapper_source,
                 &authority,
                 false,
+                "v0.129.0",
                 false,
             )
             .success()

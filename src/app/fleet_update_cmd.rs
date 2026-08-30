@@ -48,6 +48,7 @@ const HOST_UPDATE_TIMEOUT: Duration = Duration::from_mins(10);
 const REMOTE_UPDATE_TIMEOUT: Duration = Duration::from_mins(9);
 const MIN_FLEET_UPDATE_TARGET: [u64; 3] = [0, 100, 0];
 const MIN_PAIRED_BINARY_TARGET: [u64; 3] = [0, 127, 0];
+const MIN_AUTH_RESOLVER_TARGET: [u64; 3] = [0, 129, 0];
 const COMPANION_BINARY_NAME: &str = "shipyard-workstream-provider";
 const REMOTE_BEFORE_PRIMARY_SHA256_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_PRIMARY_SHA256=";
 const REMOTE_BEFORE_PRIMARY_VERSION_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_PRIMARY_VERSION=";
@@ -379,12 +380,20 @@ fn normalize_exact_tag(raw: &str) -> Result<String, CliFailure> {
 }
 
 fn tag_requires_companion(tag: &str) -> bool {
+    tag_at_least(tag, MIN_PAIRED_BINARY_TARGET)
+}
+
+fn tag_supports_auth_resolver(tag: &str) -> bool {
+    tag_at_least(tag, MIN_AUTH_RESOLVER_TARGET)
+}
+
+fn tag_at_least(tag: &str, minimum: [u64; 3]) -> bool {
     let parsed = tag
         .trim_start_matches('v')
         .split('.')
         .map(str::parse::<u64>)
         .collect::<Result<Vec<_>, _>>();
-    parsed.is_ok_and(|parts| parts.as_slice() >= MIN_PAIRED_BINARY_TARGET.as_slice())
+    parsed.is_ok_and(|parts| parts.as_slice() >= minimum.as_slice())
 }
 
 #[allow(clippy::too_many_lines)] // One fail-closed validation boundary for the complete host profile.
@@ -609,14 +618,16 @@ fn host_update_plan_with_authority(
     let auth_journal = state_dir.join("fleet-auth-support.transaction");
     let auth_lock = state_dir.join("fleet-auth-support.lock");
     let auth_context = PathBuf::from(format!("{}.shipyard-context.json", auth_wrapper.display()));
-    let managed_targets = [
+    let mut managed_targets = vec![
         auth_helper.clone(),
         auth_wrapper.clone(),
-        auth_context,
         binary.clone(),
         companion_binary.clone(),
     ];
-    let mut transaction_paths = Vec::with_capacity(managed_targets.len() * 3);
+    if tag_supports_auth_resolver(target) {
+        managed_targets.push(auth_context);
+    }
+    let mut transaction_paths = Vec::with_capacity(managed_targets.len() * 4);
     for target in managed_targets {
         transaction_paths.push(target.clone());
         transaction_paths.extend(transaction_marker_paths(&target));
@@ -686,13 +697,17 @@ fn is_lexically_normal_absolute(path: &Path) -> bool {
     })
 }
 
-fn transaction_marker_paths(path: &Path) -> [PathBuf; 2] {
+fn transaction_marker_paths(path: &Path) -> [PathBuf; 3] {
     let marker = |suffix: &str| {
         let mut value = path.as_os_str().to_os_string();
         value.push(suffix);
         PathBuf::from(value)
     };
-    [marker(".shipyard-rollback"), marker(".shipyard-was-absent")]
+    [
+        marker(".shipyard-rollback"),
+        marker(".shipyard-rollback.tmp"),
+        marker(".shipyard-was-absent"),
+    ]
 }
 
 #[cfg(test)]

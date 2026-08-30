@@ -75,10 +75,13 @@ sibling of `shipyard_bin`. Machine-global command auth must be exactly wrapper
 + `token --app-id VALUE --private-key ABS --repo {repo_slug}`. Direct `ghapp`
 resolves only that shape through the sibling Shipyard after grammar and repo
 validation; the wrapper pins API, cache, and resolved repo arguments. A
-strict 0600 non-symlink wrapper context preserves the fleet's exact configured
-mode/global directory for subsequent direct calls. A post-install resolver
-probe runs before transaction commit, and failure rolls back helper, wrapper,
-context, CLI, and companion.
+strict 0600 non-symlink wrapper context is mandatory for direct mode and
+preserves the exact configured mode/global directory. Fleet creates it for
+targets v0.129.0 and newer; manual installs must provision the typed default
+context. A post-install resolver probe runs before transaction commit, and
+failure rolls back helper, wrapper, context, CLI, and companion. Targets
+v0.100.0-v0.128.x retain the compatible four-target transaction and nine-line
+journal without that unavailable probe.
 
 Native delivery also requires fresh exact-head/base-SHA GitHub App installation
 authority and a live terminal checkpoint. cmux workspace moves preserve surface

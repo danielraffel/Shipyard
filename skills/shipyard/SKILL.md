@@ -459,9 +459,12 @@ the entire exact-tag installer before execution (including when the old remote
 binary predates fleet-update), refreshes daemons only after
 the staged binary passes its smoke, then runs the installed binary's resolver
 probe at the exact configured mode/global directory before transaction commit.
-The wrapper's strict 0600 non-symlink context preserves those runtime arguments
-for subsequent direct calls. Probe failure rolls back helper, wrapper, context,
-CLI, and companion. It terminates any host attempt that exceeds
+The wrapper's mandatory strict 0600 non-symlink context preserves those runtime
+arguments for direct calls; manual installs must provision the typed default
+context. Fleet creates and probes it for targets v0.129.0 and newer. Probe
+failure rolls back helper, wrapper, context, CLI, and companion. Targets
+v0.100.0-v0.128.x retain the compatible four-target transaction and nine-line
+journal without the unavailable probe. It terminates any host attempt that exceeds
 ten minutes. A minimal non-login PATH that hides
 Homebrew is launch-environment drift, not evidence that Tart or Shipyard is
 missing.

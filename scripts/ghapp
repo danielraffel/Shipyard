@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Dual-mode GitHub App wrapper: an audited privileged gh command surface plus
 # a JSON-emitting `token` mode for Shipyard's token_command.
 set -euo pipefail
@@ -29,10 +29,10 @@ fi
 
 mint_token_json() {
     if [[ -n "$cache_dir" ]]; then
-        env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+        /usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
             "$python_binary" -I "$helper" --cache-dir "$cache_dir" "$@"
     else
-        env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+        /usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
             "$python_binary" -I "$helper" "$@"
     fi
 }
@@ -107,11 +107,11 @@ checkout_repo_target() {
             remotes+=("$remote_name")
             remote_count=$((remote_count + 1))
         fi
-    done < <(PATH="$trusted_path" git remote 2>/dev/null || true)
+    done < <(PATH="$trusted_path" /usr/bin/git remote 2>/dev/null || true)
 
     if [[ "$remote_count" -gt 0 ]]; then
         for remote_name in "${remotes[@]}"; do
-            if [[ "$(PATH="$trusted_path" git config --get "remote.$remote_name.gh-resolved" 2>/dev/null || true)" == "base" ]]; then
+            if [[ "$(PATH="$trusted_path" /usr/bin/git config --get "remote.$remote_name.gh-resolved" 2>/dev/null || true)" == "base" ]]; then
                 if [[ -n "$resolved_remote" ]]; then
                     echo "ghapp: checkout has multiple gh default remotes; use --repo OWNER/REPO" >&2
                     exit 1
@@ -121,9 +121,9 @@ checkout_repo_target() {
         done
     fi
     if [[ -n "$resolved_remote" ]]; then
-        remote_url="$(PATH="$trusted_path" git config --get "remote.$resolved_remote.url" 2>/dev/null || true)"
+        remote_url="$(PATH="$trusted_path" /usr/bin/git config --get "remote.$resolved_remote.url" 2>/dev/null || true)"
     elif [[ "$remote_count" == 1 ]]; then
-        remote_url="$(PATH="$trusted_path" git config --get "remote.${remotes[0]}.url" 2>/dev/null || true)"
+        remote_url="$(PATH="$trusted_path" /usr/bin/git config --get "remote.${remotes[0]}.url" 2>/dev/null || true)"
     elif [[ "$remote_count" -gt 1 ]]; then
         echo "ghapp: checkout repository is ambiguous across remotes; use --repo OWNER/REPO or gh repo set-default" >&2
         exit 1
@@ -384,11 +384,11 @@ if [[ "${1:-}" == "token" ]]; then
         exit 1
     fi
     if [[ -n "$cache_dir" ]]; then
-        exec env -u GITHUB_API_URL -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+        exec /usr/bin/env -u GITHUB_API_URL -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
             "$python_binary" -I "$helper" --api-url https://api.github.com \
             --cache-dir "$cache_dir" "$@"
     else
-        exec env -u GITHUB_API_URL -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+        exec /usr/bin/env -u GITHUB_API_URL -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
             "$python_binary" -I "$helper" --api-url https://api.github.com "$@"
     fi
 fi
@@ -785,38 +785,46 @@ if [[ ! -f "$shipyard_binary" || -L "$shipyard_binary" || ! -x "$shipyard_binary
 fi
 resolver_context="${wrapper_path}.shipyard-context.json"
 resolver_command=("$shipyard_binary")
+if [[ ! -e "$resolver_context" && ! -L "$resolver_context" ]]; then
+    echo "ghapp: resolver context is required for direct mode" >&2
+    exit 1
+fi
 if [[ -e "$resolver_context" || -L "$resolver_context" ]]; then
     resolver_context_argv=()
     while IFS= read -r context_argument; do
         resolver_context_argv+=("$context_argument")
-    done < <(env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+    done < <(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
         "$python_binary" -I -c '
 import json, os, stat, sys
-path = sys.argv[1]
-descriptor = None
-try:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-    )
-    metadata = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or metadata.st_uid != os.getuid()
-        or metadata.st_size < 1
-        or metadata.st_size > 8192
-    ):
-        raise ValueError
-    raw = os.read(descriptor, 8193)
-    if len(raw) > 8192 or os.read(descriptor, 1):
-        raise ValueError
-    value = json.loads(raw.decode("utf-8"))
-except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-    raise SystemExit("ghapp: resolver context is malformed or unsafe")
-finally:
-    if descriptor is not None:
-        os.close(descriptor)
+def load_private_json(path, maximum):
+    descriptor = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size < 1
+            or metadata.st_size > maximum
+        ):
+            raise ValueError
+        raw = os.read(descriptor, maximum + 1)
+        if len(raw) > maximum or os.read(descriptor, 1):
+            raise ValueError
+        return json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        raise SystemExit("ghapp: resolver context is malformed or unsafe")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+value = load_private_json(sys.argv[1], 8192)
 required = {"schema_version", "mode", "global_dir"}
 mode = value.get("mode") if isinstance(value, dict) else None
 global_dir = value.get("global_dir") if isinstance(value, dict) else None
@@ -827,9 +835,9 @@ if (
     or mode not in {"shipyard", "isolated"}
     or not isinstance(global_dir, str)
     or not global_dir.startswith("/")
-    or len(global_dir) > 4096
+    or not 2 <= len(global_dir) <= 4096
     or any(ord(ch) <= 31 or ord(ch) == 127 for ch in global_dir)
-    or os.path.normpath(global_dir) != global_dir
+    or any(part in {"", ".", ".."} for part in global_dir.split("/")[1:])
 ):
     raise SystemExit("ghapp: resolver context is malformed or unsafe")
 for item in ("--mode", mode, "--global-dir", global_dir):
@@ -845,7 +853,7 @@ for item in ("--mode", mode, "--global-dir", global_dir):
     fi
     resolver_command+=("${resolver_context_argv[@]}")
 fi
-resolver_json="$(env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+resolver_json="$(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
     "${resolver_command[@]}" auth helper-argv --wrapper "$wrapper_path" --repo "$repo" | \
     /usr/bin/head -c 16385)"
 unset resolver_command
@@ -856,7 +864,7 @@ fi
 credential_argv=()
 while IFS= read -r credential_argument; do
     credential_argv+=("$credential_argument")
-done < <(env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+done < <(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
     "$python_binary" -I -c '
 import json, sys
 value = json.load(sys.stdin)
@@ -864,6 +872,14 @@ required = {"schema_version", "command", "wrapper", "repo", "credential_argv"}
 if not isinstance(value, dict) or set(value) != required:
     raise SystemExit("ghapp: shipyard helper-argv returned malformed JSON")
 argv = value.get("credential_argv")
+def normalized_absolute_path(item):
+    return (
+        isinstance(item, str)
+        and 2 <= len(item) <= 4096
+        and item.startswith("/")
+        and all(part not in {"", ".", ".."} for part in item.split("/")[1:])
+        and not any(ord(ch) <= 31 or ord(ch) == 127 for ch in item)
+    )
 if (
     value.get("schema_version") != 1
     or value.get("command") != "auth.helper-argv"
@@ -873,8 +889,11 @@ if (
     or len(argv) != 4
     or argv[0] != "--app-id"
     or argv[2] != "--private-key"
-    or len(argv[1]) > 256
-    or len(argv[3]) > 4096
+    or not argv[1].isascii()
+    or not argv[1].isdigit()
+    or not 1 <= len(argv[1]) <= 20
+    or not 1 <= int(argv[1]) <= 2**64 - 1
+    or not normalized_absolute_path(argv[3])
     or any(not isinstance(item, str) or not item or any(ord(ch) <= 31 or ord(ch) == 127 for ch in item) for item in argv)
 ):
     raise SystemExit("ghapp: shipyard helper-argv returned malformed JSON")
@@ -892,7 +911,7 @@ fi
 
 token_json="$(mint_token_json "${credential_argv[@]}" --api-url "$(api_url_for_host)" --repo "$repo")"
 unset credential_argv
-token="$(env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" "$python_binary" -I -c '
+token="$(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" "$python_binary" -I -c '
 import json, sys
 value = json.load(sys.stdin)
 token = value.get("token") if isinstance(value, dict) else None

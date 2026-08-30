@@ -8,7 +8,7 @@ use super::{
     REMOTE_BEFORE_STATUS_PREFIX, REMOTE_MINIMAL_PATH, REMOTE_REFRESH_PREFIX,
     REMOTE_RELEASE_ASSET_SHA256_PREFIX, REMOTE_SUPERVISOR, REMOTE_UPDATE_TIMEOUT, ReleaseAuthority,
     Value, Write, auth_support, home_dir, shlex_quote, tag_requires_companion,
-    unattended_tool_path, write_json_envelope,
+    tag_supports_auth_resolver, unattended_tool_path, write_json_envelope,
 };
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -48,6 +48,7 @@ pub(super) fn remote_update_command(
         binary,
         companion_binary,
         tag_requires_companion(target),
+        tag_supports_auth_resolver(target),
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,
@@ -279,6 +280,7 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         &plan.binary,
         &plan.companion_binary,
         plan.companion_required,
+        tag_supports_auth_resolver(&plan.target),
         "\"$auth_helper_source\"",
         "\"$auth_wrapper_source\"",
         &binary_install_command,

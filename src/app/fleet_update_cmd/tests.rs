@@ -118,7 +118,11 @@ fn fleet_resolver_probe_uses_exact_global_dir_before_commit() {
     class.shipyard_global_dir = Some("/Users/ci/governed global".to_owned());
     class.shipyard_state_dir = Some("/Users/ci/governed state".to_owned());
 
-    let plan = host_update_plan(&class, "v0.127.0").expect("differing governed dirs");
+    let legacy = host_update_plan(&class, "v0.128.9").expect("legacy target");
+    assert!(legacy.command.contains("auth_resolver_required=0"));
+
+    let plan = host_update_plan(&class, "v0.129.0").expect("differing governed dirs");
+    assert!(plan.command.contains("auth_resolver_required=1"));
 
     assert!(plan.command.contains("/Users/ci/governed global"));
     assert!(plan.command.contains("/Users/ci/governed state"));
@@ -324,6 +328,12 @@ fn auth_support_paths_reject_managed_binary_and_transaction_collisions() {
         .expect_err("companion binary collision must fail before rollout");
     assert!(error.message.contains("must not overlap managed binaries"));
 
+    class.github_token_helper =
+        Some("/Users/ci/.local/bin/shipyard.shipyard-rollback.tmp".to_owned());
+    let error = host_update_plan(&class, "v0.127.0")
+        .expect_err("atomic backup temp collision must fail before rollout");
+    assert!(error.message.contains("must not overlap managed binaries"));
+
     class.github_token_helper = Some(
         "/Users/ci/Library/Application Support/shipyard/fleet-auth-support.transaction".to_owned(),
     );
@@ -446,6 +456,8 @@ fn exact_release_tag_is_required() {
     assert!(normalize_exact_tag("v18446744073709551616.0.0").is_err());
     assert!(!tag_requires_companion("v0.126.2"));
     assert!(tag_requires_companion("v0.127.0"));
+    assert!(!tag_supports_auth_resolver("v0.128.9"));
+    assert!(tag_supports_auth_resolver("v0.129.0"));
 }
 
 fn named_host(name: &str) -> HostClassConfig {

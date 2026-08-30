@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -130,10 +129,10 @@ fn resolve_helper_argv(
             "machine-global github.auth.token_command must exactly match [WRAPPER, \"token\", \"--app-id\", VALUE, \"--private-key\", ABSOLUTE_PATH, \"--repo\", \"{repo_slug}\"]",
         ));
     }
-    if command[3].is_empty() || command[3].len() > 256 || command[3].chars().any(char::is_control) {
+    if !is_nonzero_ascii_decimal(&command[3]) {
         return Err(CliFailure::new(
             1,
-            "machine-global github.auth.token_command --app-id value is empty or malformed",
+            "machine-global github.auth.token_command --app-id must be a nonzero ASCII decimal",
         ));
     }
     exact_absolute_path(Path::new(&command[5]), "token_command --private-key")?;
@@ -152,16 +151,23 @@ fn resolve_helper_argv(
     })
 }
 
+fn is_nonzero_ascii_decimal(value: &str) -> bool {
+    (1..=20).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|number| number != 0)
+}
+
 fn exact_absolute_path(path: &Path, label: &str) -> Result<String, CliFailure> {
     let raw = path.to_str().ok_or_else(|| {
         CliFailure::new(2, format!("auth helper-argv {label} must be valid UTF-8"))
     })?;
     if !path.is_absolute()
-        || raw.len() > 4096
+        || !(2..=4096).contains(&raw.len())
         || raw.chars().any(char::is_control)
-        || path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || raw
+            .split('/')
+            .skip(1)
+            .any(|component| matches!(component, "" | "." | ".."))
     {
         return Err(CliFailure::new(
             2,
@@ -685,7 +691,7 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
     }
 
     #[test]
-    fn helper_argv_rejects_malformed_routes_and_oversized_values() {
+    fn helper_argv_rejects_malformed_routes() {
         let temp = TempDir::new().expect("tempdir");
         let wrapper = "/Users/ci/.local/bin/ghapp";
         let canonical = [
@@ -705,6 +711,12 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
                 "accepted {repo:?}"
             );
         }
+    }
+
+    #[test]
+    fn helper_argv_rejects_invalid_app_ids() {
+        let temp = TempDir::new().expect("tempdir");
+        let wrapper = "/Users/ci/.local/bin/ghapp";
         let oversized_app_id = "1".repeat(257);
         let oversized = [
             wrapper,
@@ -724,6 +736,81 @@ token_command = ["/tmp/foreign", "token", "--repo", "owner/foreign"]
             )
             .is_err()
         );
+        for app_id in [
+            "0",
+            "000",
+            "not-numeric",
+            "12x34",
+            "１２３",
+            "18446744073709551616",
+        ] {
+            let malformed = [
+                wrapper,
+                "token",
+                "--app-id",
+                app_id,
+                "--private-key",
+                "/Users/ci/app.pem",
+                "--repo",
+                "{repo_slug}",
+            ];
+            let error = resolve_helper_argv(
+                &command_config(temp.path(), &malformed),
+                Path::new(wrapper),
+                "owner/repo",
+            )
+            .expect_err(app_id);
+            assert!(error.message.contains("nonzero ASCII decimal"));
+        }
+    }
+
+    #[test]
+    fn helper_argv_requires_raw_normalized_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let wrapper = "/Users/ci/.local/bin/ghapp";
+        for malformed_wrapper in [
+            "/Users/ci//.local/bin/ghapp",
+            "/Users/ci/./.local/bin/ghapp",
+        ] {
+            let malformed = [
+                malformed_wrapper,
+                "token",
+                "--app-id",
+                "123456",
+                "--private-key",
+                "/Users/ci/app.pem",
+                "--repo",
+                "{repo_slug}",
+            ];
+            assert!(
+                resolve_helper_argv(
+                    &command_config(temp.path(), &malformed),
+                    Path::new(malformed_wrapper),
+                    "owner/repo",
+                )
+                .is_err()
+            );
+        }
+        for private_key in ["/Users/ci//app.pem", "/Users/ci/./app.pem"] {
+            let malformed = [
+                wrapper,
+                "token",
+                "--app-id",
+                "123456",
+                "--private-key",
+                private_key,
+                "--repo",
+                "{repo_slug}",
+            ];
+            assert!(
+                resolve_helper_argv(
+                    &command_config(temp.path(), &malformed),
+                    Path::new(wrapper),
+                    "owner/repo",
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
