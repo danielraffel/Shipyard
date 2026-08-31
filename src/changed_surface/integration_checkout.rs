@@ -5,16 +5,20 @@
 //! identity recorded by a stale-base shadow receipt.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
+use super::trial::{ReceiptFile, TrialIdentity, TrialState, evaluate_stale_base_execution};
 use super::{StaleBaseShadowReceipt, stale_base_context_digest};
 
 const CLEANUP_RECEIPT_NAME: &str = "stale-cleanup-shadow_compare.json";
+const CLEANUP_PENDING_NAME: &str = ".stale-cleanup-shadow_compare.pending";
+const ACTIVATION_RECEIPT_NAME: &str = "stale-activation-shadow_compare.json";
+const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -174,19 +178,200 @@ pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
         if !status.success() || checkout.path.exists() {
             return Err("remove integration checkout: exact worktree remains".to_owned());
         }
-    } else {
+    } else if marker_path(&checkout.path).exists() {
         verify_marker(&checkout.path, &checkout.marker)?;
+    } else if !checkout.evidence_dir.join(CLEANUP_PENDING_NAME).exists()
+        && !checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).exists()
+    {
+        return Err("absent integration checkout has no resumable cleanup evidence".to_owned());
     }
+    persist_cleanup_pending(checkout)?;
     let marker_path = marker_path(&checkout.path);
-    fs::remove_file(&marker_path)
-        .map_err(|error| format!("remove completed integration marker: {error}"))?;
-    sync_directory(
-        marker_path
-            .parent()
-            .ok_or_else(|| "integration marker has no parent directory".to_owned())?,
-    )?;
-    persist_cleanup_receipt(checkout)?;
+    if marker_path.exists() {
+        fs::remove_file(&marker_path)
+            .map_err(|error| format!("remove completed integration marker: {error}"))?;
+        sync_directory(
+            marker_path
+                .parent()
+                .ok_or_else(|| "integration marker has no parent directory".to_owned())?,
+        )?;
+    }
+    publish_cleanup_receipt(checkout)?;
     Ok(())
+}
+
+/// Finish a crash-interrupted cleanup transaction without recreating or
+/// re-running an already removed integration checkout.
+pub(crate) fn reconcile_pending_cleanup(
+    source_repo: &Path,
+    checkout_parent: &Path,
+    receipt: &StaleBaseShadowReceipt,
+) -> Result<bool, String> {
+    let evidence_dir = checkout_parent
+        .parent()
+        .ok_or_else(|| "integration checkout root has no evidence parent".to_owned())?;
+    if !evidence_dir.join(CLEANUP_PENDING_NAME).exists() {
+        return Ok(false);
+    }
+    let integration_commit = receipt
+        .integration_commit_sha
+        .as_deref()
+        .ok_or_else(|| "stale shadow receipt has no integration commit".to_owned())?;
+    let integration_tree = receipt
+        .integration_tree_sha
+        .as_deref()
+        .ok_or_else(|| "stale shadow receipt has no integration tree".to_owned())?;
+    let context_digest = stale_base_context_digest(receipt);
+    let source_repo = source_repo
+        .canonicalize()
+        .map_err(|error| format!("canonicalize integration source: {error}"))?;
+    let source_common_dir = git_path(&source_repo, &["rev-parse", "--git-common-dir"])?;
+    let source_common_dir = canonical_git_path(&source_repo, &source_common_dir)?;
+    let path = checkout_parent.join(format!("shadow-{context_digest}"));
+    if path.exists() {
+        return Ok(false);
+    }
+    let checkout = IntegrationCheckout {
+        path,
+        source_repo,
+        evidence_dir: evidence_dir.to_path_buf(),
+        lock_path: checkout_parent.join(format!("shadow-{context_digest}.lock")),
+        marker: CheckoutMarker {
+            schema_version: 1,
+            source_git_common_dir: source_common_dir.to_string_lossy().into_owned(),
+            repository: receipt.repository.clone(),
+            pull_request: receipt.pull_request,
+            target: receipt.target.clone(),
+            stale_head_sha: receipt.head_sha.clone(),
+            live_base_sha: receipt.live_protected_base_sha.clone(),
+            integration_commit_sha: integration_commit.to_owned(),
+            integration_tree_sha: integration_tree.to_owned(),
+            context_digest,
+        },
+    };
+    let _guard = acquire_fence(&checkout.lock_path)?;
+    cleanup(&checkout)?;
+    Ok(true)
+}
+
+/// Prove that the repository adapter emitted one exact-bound selected/full
+/// comparison before its exit status may satisfy the ordinary target gate.
+pub(crate) fn verify_completed_execution(checkout: &IntegrationCheckout) -> Result<(), String> {
+    if checkout.path.exists() || marker_path(&checkout.path).exists() {
+        return Err("integration checkout cleanup is not durably complete".to_owned());
+    }
+    let stale = read_single_prefixed_receipt(&checkout.evidence_dir, "stale-base-shadow-")?;
+    let activation = read_regular_receipt(&checkout.evidence_dir.join(ACTIVATION_RECEIPT_NAME))?;
+    let cleanup = read_regular_receipt(&checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME))?;
+    let result = read_single_prefixed_receipt(&checkout.evidence_dir, "result-")?;
+    let status = evaluate_stale_base_execution(
+        &TrialIdentity {
+            repository: checkout.marker.repository.clone(),
+            pull_request: checkout.marker.pull_request,
+            target: checkout.marker.target.clone(),
+            head_sha: checkout.marker.stale_head_sha.clone(),
+        },
+        ReceiptFile {
+            name: &stale.0,
+            bytes: &stale.1,
+        },
+        ReceiptFile {
+            name: ACTIVATION_RECEIPT_NAME,
+            bytes: &activation,
+        },
+        ReceiptFile {
+            name: CLEANUP_RECEIPT_NAME,
+            bytes: &cleanup,
+        },
+        &[ReceiptFile {
+            name: &result.0,
+            bytes: &result.1,
+        }],
+    );
+    if status.state == TrialState::Terminal
+        && matches!(
+            status.shadow_disposition,
+            Some(
+                super::StaleBaseShadowDisposition::Recomputed
+                    | super::StaleBaseShadowDisposition::Reused
+            )
+        )
+        && status.reason.ends_with("_selected_pass")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "stale integration comparison evidence refused: {}",
+            status.reason
+        ))
+    }
+}
+
+fn read_single_prefixed_receipt(
+    directory: &Path,
+    prefix: &str,
+) -> Result<(String, Vec<u8>), String> {
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(directory)
+        .map_err(|error| format!("read integration evidence directory: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("read integration evidence entry: {error}"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "integration evidence name is not UTF-8".to_owned())?;
+        if name.starts_with(prefix) && name.as_bytes().ends_with(b".json") {
+            matches.push((name, entry.path()));
+        }
+    }
+    if matches.len() != 1 {
+        return Err(format!(
+            "expected one {prefix} integration receipt, observed {}",
+            matches.len()
+        ));
+    }
+    let (name, path) = matches.pop().expect("checked one receipt");
+    Ok((name, read_regular_receipt(&path)?))
+}
+
+fn read_regular_receipt(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect integration receipt: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_RECEIPT_BYTES
+    {
+        return Err("integration receipt is not a bounded regular file".to_owned());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("open integration receipt: {error}"))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("inspect opened integration receipt: {error}"))?;
+    if !opened.is_file() || opened.len() > MAX_RECEIPT_BYTES {
+        return Err("opened integration receipt is not a bounded regular file".to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read integration receipt: {error}"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECEIPT_BYTES {
+        return Err("integration receipt exceeds size limit".to_owned());
+    }
+    Ok(bytes)
 }
 
 fn ensure_real_directory(path: &Path) -> Result<(), String> {
@@ -377,7 +562,7 @@ fn marker_path(checkout: &Path) -> PathBuf {
     checkout.with_file_name(format!(".{name}.json"))
 }
 
-fn persist_cleanup_receipt(checkout: &IntegrationCheckout) -> Result<(), String> {
+fn cleanup_payload(checkout: &IntegrationCheckout) -> Result<Vec<u8>, String> {
     let receipt = CleanupReceipt {
         schema_version: 1,
         context_digest: &checkout.marker.context_digest,
@@ -388,7 +573,12 @@ fn persist_cleanup_receipt(checkout: &IntegrationCheckout) -> Result<(), String>
     let mut payload = serde_json::to_vec_pretty(&receipt)
         .map_err(|error| format!("serialize integration cleanup receipt: {error}"))?;
     payload.push(b'\n');
-    let destination = checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME);
+    Ok(payload)
+}
+
+fn persist_cleanup_pending(checkout: &IntegrationCheckout) -> Result<(), String> {
+    let payload = cleanup_payload(checkout)?;
+    let destination = checkout.evidence_dir.join(CLEANUP_PENDING_NAME);
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -399,17 +589,36 @@ fn persist_cleanup_receipt(checkout: &IntegrationCheckout) -> Result<(), String>
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("write integration cleanup receipt: {error}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if fs::read(&destination)
-                .map_err(|error| format!("read integration cleanup receipt: {error}"))?
-                != payload
-            {
-                return Err("integration cleanup receipt disagrees with exact checkout".to_owned());
+            if read_regular_receipt(&destination)? != payload {
+                return Err(
+                    "pending integration cleanup receipt disagrees with exact checkout".to_owned(),
+                );
             }
         }
-        Err(error) => return Err(format!("create integration cleanup receipt: {error}")),
+        Err(error) => return Err(format!("create pending cleanup receipt: {error}")),
     }
     sync_directory(&checkout.evidence_dir)?;
     Ok(())
+}
+
+fn publish_cleanup_receipt(checkout: &IntegrationCheckout) -> Result<(), String> {
+    let payload = cleanup_payload(checkout)?;
+    let pending = checkout.evidence_dir.join(CLEANUP_PENDING_NAME);
+    let destination = checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME);
+    if destination.exists() {
+        if read_regular_receipt(&destination)? != payload {
+            return Err("integration cleanup receipt disagrees with exact checkout".to_owned());
+        }
+        if pending.exists() {
+            fs::remove_file(&pending)
+                .map_err(|error| format!("remove completed cleanup pending receipt: {error}"))?;
+            sync_directory(&checkout.evidence_dir)?;
+        }
+        return Ok(());
+    }
+    fs::rename(&pending, &destination)
+        .map_err(|error| format!("publish integration cleanup receipt: {error}"))?;
+    sync_directory(&checkout.evidence_dir)
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
@@ -602,5 +811,26 @@ mod tests {
         assert!(!checkout.path.join("untracked.txt").exists());
         drop(guard);
         cleanup(&checkout).unwrap();
+    }
+
+    #[test]
+    fn restart_finishes_cleanup_after_marker_removal_before_receipt_publish() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        let status = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&checkout.path)
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        persist_cleanup_pending(&checkout).unwrap();
+        fs::remove_file(marker_path(&checkout.path)).unwrap();
+        sync_directory(&parent).unwrap();
+
+        assert!(reconcile_pending_cleanup(repo.path(), &parent, &receipt).unwrap());
+        assert!(checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).is_file());
+        assert!(!checkout.evidence_dir.join(CLEANUP_PENDING_NAME).exists());
     }
 }

@@ -466,6 +466,7 @@ pub(super) fn apply_changed_surface_execution(
             let evidence_dir = evidence_root
                 .join("stale-generations")
                 .join(&context_digest);
+            let checkout_parent = evidence_dir.join("integration-checkouts");
             // Persist the shadow-only authority fence before any isolated
             // execution. If planning, persistence, or materialization cannot
             // prove the exact integration identity, ordinary full validation
@@ -489,7 +490,14 @@ pub(super) fn apply_changed_surface_execution(
                         Ok(digest)
                     })
                     .ok();
+            let cleanup_reconciliation =
+                crate::changed_surface::integration_checkout::reconcile_pending_cleanup(
+                    cwd,
+                    &checkout_parent,
+                    &assessment.receipt,
+                );
             if let Some(stale_receipt_sha256) = shadow_receipt_digest
+                && cleanup_reconciliation.is_ok()
                 && !stale_generation_has_execution_evidence(&evidence_dir)
                 && let (Some(integration_input), Ok(policy), Some(selection)) = (
                     assessment.integration_input.as_ref(),
@@ -516,7 +524,7 @@ pub(super) fn apply_changed_surface_execution(
             {
                 match crate::changed_surface::integration_checkout::materialize(
                     cwd,
-                    &evidence_dir.join("integration-checkouts"),
+                    &checkout_parent,
                     &assessment.receipt,
                 ) {
                     Ok(checkout) => {

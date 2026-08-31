@@ -345,11 +345,16 @@ impl LocalExecutor {
         if let Some(cleanup) = request.validation.integration_cleanup.as_deref() {
             let cleanup_result =
                 crate::changed_surface::integration_checkout::verify_after_execution(cleanup)
-                    .and_then(|()| crate::changed_surface::integration_checkout::cleanup(cleanup));
+                    .and_then(|()| crate::changed_surface::integration_checkout::cleanup(cleanup))
+                    .and_then(|()| {
+                        crate::changed_surface::integration_checkout::verify_completed_execution(
+                            cleanup,
+                        )
+                    });
             if let Err(error) = cleanup_result {
                 result.status = TargetStatus::Error;
                 result.error_message = Some(format!(
-                    "integration checkout cleanup uncertain; preserved for reconciliation: {error}"
+                    "integration comparison or cleanup uncertain; preserved for reconciliation: {error}"
                 ));
                 result.failure_class = Some(FailureClass::Unknown.as_str().to_owned());
             }
