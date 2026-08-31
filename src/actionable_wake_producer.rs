@@ -1702,6 +1702,34 @@ impl ActionableWakeProducer {
         due
     }
 
+    pub(crate) fn dispatch_second_read_due_at_for_repository(
+        &self,
+        repository_provider: &str,
+        repository_id: &str,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+    ) -> Option<chrono::DateTime<Utc>> {
+        let key = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
+        self.status
+            .dispatch_targets
+            .get(&key)?
+            .observations
+            .values()
+            .filter_map(|checkpoint| {
+                chrono::DateTime::parse_from_rfc3339(&checkpoint.not_before)
+                    .ok()
+                    .map(|due| due.with_timezone(&Utc))
+            })
+            .min()
+    }
+
     pub(crate) fn retain_dispatch_targets(
         &mut self,
         active: &std::collections::BTreeSet<DispatchTargetInventoryIdentity>,

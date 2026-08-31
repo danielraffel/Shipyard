@@ -1338,9 +1338,18 @@ fn schedule_dispatch_followup(
     }
     let now = Utc::now();
     let due_at = match status.reason_code.as_deref() {
+        Some("matching_second_read_required") => producer
+            .dispatch_second_read_due_at_for_repository(
+                repository_provider,
+                repository_id,
+                repository,
+                pull_request,
+                head_sha,
+            )
+            .map(|due| due.max(now + chrono::Duration::seconds(1)))
+            .or_else(|| Some(now + chrono::Duration::seconds(20))),
         Some(
-            "matching_second_read_required"
-            | "dispatch_wedge_checkpoint_failed"
+            "dispatch_wedge_checkpoint_failed"
             | "dispatch_wedge_cleanup_failed"
             | "dispatch_wedge_pending_publication_failed"
             | "dispatch_wedge_pending_publication_mismatch"
@@ -2852,6 +2861,87 @@ mod tests {
                 .filter(|target| target.schedule.is_some())
                 .count(),
             1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matching_second_read_sleeps_until_durable_checkpoint_deadline() {
+        use crate::dispatch_wedge::{
+            DispatchJobAuthority, DispatchRunnerObservation, DispatchWedgeObservation,
+        };
+
+        let state = tempfile::tempdir().expect("state");
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        let observation = DispatchWedgeObservation {
+            authority: DispatchJobAuthority {
+                repository: "owner/repo".to_owned(),
+                base_ref: "main".to_owned(),
+                pull_request: 42,
+                pull_request_head: "a".repeat(40),
+                queue_position: 1,
+                merge_group_head: "b".repeat(40),
+                workflow_run_id: 101,
+                workflow_id: 202,
+                run_attempt: 1,
+                run_event: "merge_group".to_owned(),
+                run_head: "b".repeat(40),
+                job_id: 303,
+                job_name: "macos".to_owned(),
+                job_status: "queued".to_owned(),
+                job_conclusion: None,
+                runner_name: None,
+                labels: vec!["self-hosted".to_owned(), "macos".to_owned()],
+                queued_at: (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339(),
+                required_context: "macos".to_owned(),
+                required_app_id: Some(42),
+                producer_app_id: Some(42),
+            },
+            runners: vec![DispatchRunnerObservation {
+                runner_id: 404,
+                name: "compatible-idle".to_owned(),
+                status: "online".to_owned(),
+                busy: false,
+                labels: vec!["self-hosted".to_owned(), "macos".to_owned()],
+            }],
+            observation_complete: true,
+        };
+        let status = producer.process_dispatch_wedge_observation(&observation, 300);
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some("matching_second_read_required")
+        );
+        let expected = producer
+            .dispatch_second_read_due_at_for_repository(
+                "github.com",
+                "R_test_repository",
+                "owner/repo",
+                42,
+                &"a".repeat(40),
+            )
+            .expect("durable checkpoint deadline");
+        schedule_dispatch_followup(
+            &mut producer,
+            "github.com",
+            "R_test_repository",
+            "owner/repo",
+            42,
+            &"a".repeat(40),
+            std::slice::from_ref(&observation),
+            &status,
+        );
+        let current = producer.status();
+        let scheduled = current
+            .dispatch_targets
+            .values()
+            .next()
+            .and_then(|target| target.schedule.as_ref())
+            .expect("scheduled second read");
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&scheduled.due_at)
+                .unwrap()
+                .with_timezone(&Utc),
+            expected
         );
     }
 
