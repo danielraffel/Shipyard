@@ -341,7 +341,20 @@ where
             Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated);
         return Some(status);
     }
-    let (name, bytes) = stale.first()?;
+    let Some((name, bytes)) = stale.first() else {
+        if inputs.expected_live_base_sha.is_some()
+            || inputs.expected_context_digest.is_some()
+            || inputs.expected_receipt_sha256.is_some()
+        {
+            let mut status =
+                rejected_trial(identity, None, 0, None, "stale_generation_receipt_missing");
+            status.state = TrialState::Terminal;
+            status.shadow_disposition =
+                Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated);
+            return Some(status);
+        }
+        return None;
+    };
     if let (Some(expected_live_base), Some(expected_context)) = (
         inputs.expected_live_base_sha,
         inputs.expected_context_digest,
@@ -981,6 +994,44 @@ mod tests {
             Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated)
         );
         assert_eq!(status.reason, "stale_generation_receipt_digest_mismatch");
+    }
+
+    #[test]
+    fn current_generation_with_missing_receipt_is_terminally_invalidated() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let identity = TrialIdentity {
+            repository: "owner/repo".to_owned(),
+            pull_request: 42,
+            target: "mac".to_owned(),
+            head_sha: SHA_A.to_owned(),
+        };
+        let result_root = result_directory(temp.path(), &identity);
+        let context = "d".repeat(64);
+        fs::create_dir_all(result_root.join("stale-generations").join(&context))
+            .expect("generation");
+        fs::write(
+            result_root.join(STALE_CURRENT_RECEIPT),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "pull_request": 42,
+                "target": "mac",
+                "head_sha": SHA_A,
+                "live_base_sha": SHA_B,
+                "context_digest": context,
+                "stale_receipt_sha256": DIGEST_C
+            }))
+            .expect("generation pointer"),
+        )
+        .expect("write generation pointer");
+
+        let status = read_trial(&identity, &result_root);
+        assert_eq!(status.state, TrialState::Terminal);
+        assert_eq!(
+            status.shadow_disposition,
+            Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated)
+        );
+        assert_eq!(status.reason, "stale_generation_receipt_missing");
     }
 
     #[test]

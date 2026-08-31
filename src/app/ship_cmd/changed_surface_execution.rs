@@ -4,6 +4,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -278,6 +279,7 @@ pub(super) fn apply_changed_surface_execution(
     state_dir: &Path,
     repo: &str,
     pr: Option<u64>,
+    head_sha: &str,
     resume_from: Option<&str>,
     targets: &mut [ResolvedTarget],
 ) -> Result<(), CliFailure> {
@@ -362,6 +364,32 @@ pub(super) fn apply_changed_surface_execution(
         }
         let Some(contract_digest) = validation_contract_digest(target) else {
             continue;
+        };
+        // Fence the current generation before observing the protected base.
+        // A snapshot taken afterwards could let an older observation treat a
+        // newer pointer as permission to publish the older generation.
+        let stale_pointer_snapshot = if machine.mode == MachineMode::ShadowCompare {
+            let evidence_root = result_dir(state_dir, repo, pr, head_sha, &target.name);
+            match read_current_stale_generation(&evidence_root) {
+                Ok(pointer) => Some(pointer),
+                Err(error) => {
+                    persist_fallback_diagnostic(
+                        &evidence_root,
+                        &FallbackDiagnostic {
+                            schema_version: 1,
+                            repository: repo,
+                            pull_request: pr,
+                            target: &target.name,
+                            machine_mode: machine.mode,
+                            category: "stale_generation_pointer_unreadable",
+                            diagnostic: bounded_diagnostic(&error.message),
+                        },
+                    )?;
+                    continue;
+                }
+            }
+        } else {
+            None
         };
         let observation = match observe_changed_surface_plan(
             &ChangedSurfacePlanArgs {
@@ -453,14 +481,11 @@ pub(super) fn apply_changed_surface_execution(
             && observation.receipt.fallback_reason == Some(FallbackReason::StaleBase)
             && matches!(disposition, ExecutionDisposition::Full { .. })
         {
+            let evidence_root = result_dir(state_dir, repo, pr, head_sha, &target.name);
+            let pointer_before = stale_pointer_snapshot
+                .as_ref()
+                .expect("shadow comparison snapshots before observation");
             let assessment = observe_stale_base_shadow(&observation, cwd, &contract_digest)?;
-            let evidence_root = result_dir(
-                state_dir,
-                repo,
-                pr,
-                &observation.receipt.head_sha,
-                &target.name,
-            );
             let context_digest =
                 crate::changed_surface::stale_base_context_digest(&assessment.receipt);
             let evidence_dir = evidence_root
@@ -476,6 +501,7 @@ pub(super) fn apply_changed_surface_execution(
                     .and_then(|digest| {
                         publish_current_stale_generation(
                             &evidence_root,
+                            pointer_before.as_deref(),
                             &CurrentStaleGeneration {
                                 schema_version: 1,
                                 repository: repo,
@@ -737,6 +763,17 @@ pub(super) fn apply_changed_surface_execution(
     Ok(())
 }
 
+fn read_current_stale_generation(path: &Path) -> Result<Option<Vec<u8>>, CliFailure> {
+    match fs::read(path.join("stale-current.json")) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CliFailure::new(
+            1,
+            format!("read current stale generation: {error}"),
+        )),
+    }
+}
+
 fn persist_stale_activation(
     path: &Path,
     receipt: &StaleActivationReceipt<'_>,
@@ -746,6 +783,7 @@ fn persist_stale_activation(
 
 fn publish_current_stale_generation(
     path: &Path,
+    expected_current: Option<&[u8]>,
     generation: &CurrentStaleGeneration<'_>,
 ) -> Result<(), CliFailure> {
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
@@ -753,12 +791,37 @@ fn publish_current_stale_generation(
     fs::create_dir_all(path).map_err(|error| {
         CliFailure::new(1, format!("create stale generation directory: {error}"))
     })?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.join(".stale-current.lock"))
+        .map_err(|error| CliFailure::new(1, format!("open stale generation lock: {error}")))?;
+    FileExt::lock_exclusive(&lock)
+        .map_err(|error| CliFailure::new(1, format!("lock stale generation: {error}")))?;
     let mut payload = serde_json::to_vec_pretty(generation)
         .map_err(|error| CliFailure::new(1, format!("serialize stale generation: {error}")))?;
     payload.push(b'\n');
     let destination = path.join("stale-current.json");
-    if fs::read(&destination).ok().as_deref() == Some(payload.as_slice()) {
+    let current = match fs::read(&destination) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(CliFailure::new(
+                1,
+                format!("read current stale generation under lease: {error}"),
+            ));
+        }
+    };
+    if current.as_deref() == Some(payload.as_slice()) {
         return Ok(());
+    }
+    if current.as_deref() != expected_current {
+        return Err(CliFailure::new(
+            1,
+            "stale generation advanced after observation; refusing to regress the current pointer",
+        ));
     }
     let temporary = path.join(format!(
         ".stale-current.{}.{}.tmp",
@@ -1060,14 +1123,17 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic,
-        persist_fallback_diagnostic, result_dir, selected_resume_block_reason, shell_quote,
+        CurrentStaleGeneration, FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic,
+        persist_fallback_diagnostic, publish_current_stale_generation,
+        read_current_stale_generation, result_dir, selected_resume_block_reason, shell_quote,
         stale_generation_has_execution_evidence, target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn machine_mode_is_default_off_and_ignores_repo_layers() {
@@ -1116,6 +1182,85 @@ mod tests {
         )
         .unwrap();
         assert!(stale_generation_has_execution_evidence(temp.path()));
+    }
+
+    #[test]
+    fn stale_generation_publication_refuses_observer_regression() {
+        let temp = tempfile::tempdir().unwrap();
+        let newer = CurrentStaleGeneration {
+            schema_version: 1,
+            repository: "owner/repo",
+            pull_request: 7,
+            target: "mac",
+            head_sha: "a",
+            live_base_sha: "newer",
+            context_digest: "newer-context",
+            stale_receipt_sha256: "receipt",
+        };
+        let older = CurrentStaleGeneration {
+            schema_version: 1,
+            repository: "owner/repo",
+            pull_request: 7,
+            target: "mac",
+            head_sha: "a",
+            live_base_sha: "older",
+            context_digest: "older-context",
+            stale_receipt_sha256: "receipt",
+        };
+        let observed_empty = read_current_stale_generation(temp.path()).unwrap();
+        publish_current_stale_generation(temp.path(), observed_empty.as_deref(), &newer).unwrap();
+
+        let error =
+            publish_current_stale_generation(temp.path(), observed_empty.as_deref(), &older)
+                .unwrap_err();
+        assert!(error.message.contains("refusing to regress"));
+        let current = fs::read(temp.path().join("stale-current.json")).unwrap();
+        assert!(
+            String::from_utf8(current)
+                .unwrap()
+                .contains("newer-context")
+        );
+    }
+
+    #[test]
+    fn concurrent_stale_generation_publishers_have_one_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(2));
+        let mut publishers = Vec::new();
+        for (live_base_sha, context_digest) in
+            [("base-one", "context-one"), ("base-two", "context-two")]
+        {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            publishers.push(thread::spawn(move || {
+                let expected = read_current_stale_generation(&root).unwrap();
+                barrier.wait();
+                let generation = CurrentStaleGeneration {
+                    schema_version: 1,
+                    repository: "owner/repo",
+                    pull_request: 7,
+                    target: "mac",
+                    head_sha: "head",
+                    live_base_sha,
+                    context_digest,
+                    stale_receipt_sha256: "receipt",
+                };
+                publish_current_stale_generation(&root, expected.as_deref(), &generation)
+            }));
+        }
+
+        let outcomes = publishers
+            .into_iter()
+            .map(|publisher| publisher.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+            1
+        );
+        let current = fs::read_to_string(root.join("stale-current.json")).unwrap();
+        assert!(current.contains("context-one") || current.contains("context-two"));
     }
 
     #[test]
