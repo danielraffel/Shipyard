@@ -13,7 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
-use super::trial::{ReceiptFile, TrialIdentity, TrialState, evaluate_stale_base_execution};
+use super::trial::{
+    ReceiptFile, TrialIdentity, TrialState, evaluate_stale_base_execution,
+    validate_stale_activation_for_cleanup,
+};
 use super::{StaleBaseShadowReceipt, stale_base_context_digest};
 
 const CLEANUP_RECEIPT_NAME: &str = "stale-cleanup-shadow_compare.json";
@@ -213,8 +216,23 @@ pub(crate) fn reconcile_pending_cleanup(
     let evidence_dir = checkout_parent
         .parent()
         .ok_or_else(|| "integration checkout root has no evidence parent".to_owned())?;
-    if !evidence_dir.join(CLEANUP_PENDING_NAME).exists() {
+    let pending_exists = evidence_dir.join(CLEANUP_PENDING_NAME).exists();
+    let activation_path = evidence_dir.join(ACTIVATION_RECEIPT_NAME);
+    if !pending_exists && !activation_path.exists() {
         return Ok(false);
+    }
+    if !pending_exists {
+        let (stale_name, stale_bytes) =
+            read_single_prefixed_receipt(evidence_dir, "stale-base-shadow-")?;
+        let persisted_stale: StaleBaseShadowReceipt = serde_json::from_slice(&stale_bytes)
+            .map_err(|error| format!("decode persisted stale integration receipt: {error}"))?;
+        if &persisted_stale != receipt {
+            return Err(format!(
+                "persisted stale integration receipt {stale_name} disagrees with exact request"
+            ));
+        }
+        let activation = read_regular_receipt(&activation_path)?;
+        validate_stale_activation_for_cleanup(receipt, &stale_bytes, &activation)?;
     }
     let integration_commit = receipt
         .integration_commit_sha
@@ -676,8 +694,12 @@ fn canonical_git_path(cwd: &Path, value: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
     use crate::changed_surface::{
-        MergeAuthority, StaleBaseShadowDisposition, StaleBaseShadowReceipt,
+        MergeAuthority, PlannedSuite, SelectionOutcomes, SelectionReceipt, SelectionTier,
+        StaleBaseShadowDisposition, StaleBaseShadowReceipt,
     };
+    use serde::Serialize;
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
     use std::process::Command;
 
     fn git(cwd: &Path, args: &[&str]) -> String {
@@ -758,6 +780,132 @@ mod tests {
                 reason: "bounded_shadow_recomputed".to_owned(),
             },
         )
+    }
+
+    fn persist_valid_activation(evidence_dir: &Path, receipt: &mut StaleBaseShadowReceipt) {
+        let context_digest = stale_base_context_digest(receipt);
+        let mut selection = SelectionReceipt {
+            schema_version: 1,
+            exact_head_verified: true,
+            shadow_only: true,
+            repository: receipt.repository.clone(),
+            pull_request: receipt.pull_request,
+            target: receipt.target.clone(),
+            protected_ref: "refs/heads/main".to_owned(),
+            pr_base_sha: receipt.live_protected_base_sha.clone(),
+            protected_ref_sha: receipt.live_protected_base_sha.clone(),
+            merge_base_sha: receipt.live_protected_base_sha.clone(),
+            head_sha: receipt.integration_commit_sha.clone().unwrap(),
+            tree_sha: receipt.integration_tree_sha.clone().unwrap(),
+            changed_paths_digest: receipt.integration_changed_paths_digest.clone(),
+            shadow_context_digest: Some(context_digest.clone()),
+            policy_digest: receipt.live_policy_digest.clone(),
+            build_type: None,
+            build_flags: Vec::new(),
+            changed_paths: vec!["head.txt".to_owned()],
+            selected_families: vec!["head".to_owned()],
+            selected_tests: vec!["test-head".to_owned()],
+            selected_build_targets: Vec::new(),
+            baseline_tests: vec!["test-head".to_owned()],
+            family_coverage: BTreeMap::from([("head".to_owned(), 1)]),
+            secondary_proofs: Vec::new(),
+            planned_suite: PlannedSuite::Bounded,
+            selection_tier: SelectionTier::Affected,
+            authoritative_suite: PlannedSuite::Full,
+            outcomes: SelectionOutcomes {
+                planner: "bounded".to_owned(),
+                authoritative_execution: "full".to_owned(),
+            },
+            selected_count: Some(1),
+            full_count: Some(10),
+            fallback_reason: None,
+            fallback_detail: None,
+            elapsed_ms: 0,
+        };
+        receipt.shadow_selection = Some(Box::new(selection.clone()));
+        selection.shadow_context_digest = None;
+        let selection_receipt_digest = sha(&serde_json::to_vec(&selection).unwrap());
+        let selected_tests_digest = sha(b"test-head\n");
+        let policy_digest = receipt.live_policy_digest.clone().unwrap();
+
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            schema_version: u32,
+            repository: &'a str,
+            pull_request: u64,
+            target: &'a str,
+            base_sha: &'a str,
+            head_sha: &'a str,
+            tree_sha: &'a str,
+            policy_digest: &'a str,
+            selection_receipt_digest: &'a str,
+            validation_contract_digest: &'a str,
+            workflow_digest: &'a str,
+            selected_tests_digest: &'a str,
+            selected_tests: &'a [String],
+        }
+        let integration_commit = receipt.integration_commit_sha.as_deref().unwrap();
+        let integration_tree = receipt.integration_tree_sha.as_deref().unwrap();
+        let payload_digest = sha(&serde_json::to_vec(&Payload {
+            schema_version: 1,
+            repository: &receipt.repository,
+            pull_request: receipt.pull_request,
+            target: &receipt.target,
+            base_sha: &receipt.live_protected_base_sha,
+            head_sha: integration_commit,
+            tree_sha: integration_tree,
+            policy_digest: &policy_digest,
+            selection_receipt_digest: &selection_receipt_digest,
+            validation_contract_digest: &receipt.validation_contract_digest,
+            workflow_digest: &receipt.live_workflow_digest,
+            selected_tests_digest: &selected_tests_digest,
+            selected_tests: &selection.selected_tests,
+        })
+        .unwrap());
+        let mut stale_bytes = serde_json::to_vec_pretty(receipt).unwrap();
+        stale_bytes.push(b'\n');
+        fs::write(
+            evidence_dir.join("stale-base-shadow-test.json"),
+            &stale_bytes,
+        )
+        .unwrap();
+        let activation = serde_json::json!({
+            "schema_version": 1,
+            "machine_mode": "shadow_compare",
+            "merge_authority": "blocked_until_current_merge_tree",
+            "stale_context_digest": context_digest,
+            "stale_receipt_sha256": sha(&stale_bytes),
+            "plan": {
+                "schema_version": 1,
+                "repository": receipt.repository,
+                "pull_request": receipt.pull_request,
+                "target": receipt.target,
+                "base_sha": receipt.live_protected_base_sha,
+                "head_sha": integration_commit,
+                "tree_sha": integration_tree,
+                "policy_digest": policy_digest,
+                "changed_paths_digest": receipt.integration_changed_paths_digest,
+                "validation_contract_digest": receipt.validation_contract_digest,
+                "workflow_digest": receipt.live_workflow_digest,
+                "selection_receipt_digest": selection_receipt_digest,
+                "selected_tests_digest": selected_tests_digest,
+                "selected_build_targets_digest": null,
+                "execution_payload_digest": payload_digest,
+                "selected_count": 1,
+                "selected_build_target_count": 0,
+                "selection_tier": "affected",
+                "stage": "test"
+            }
+        });
+        fs::write(
+            evidence_dir.join(ACTIVATION_RECEIPT_NAME),
+            serde_json::to_vec_pretty(&activation).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
     }
 
     #[test]
@@ -854,5 +1002,30 @@ mod tests {
         assert!(!checkout.path.exists());
         assert!(checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).is_file());
         assert!(!checkout.evidence_dir.join(CLEANUP_PENDING_NAME).exists());
+    }
+
+    #[test]
+    fn restart_reconciles_exact_activated_checkout_before_cleanup_intent() {
+        let (repo, mut receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        persist_valid_activation(repo.path(), &mut receipt);
+
+        assert!(reconcile_pending_cleanup(repo.path(), &parent, &receipt).unwrap());
+        assert!(!checkout.path.exists());
+        assert!(checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).is_file());
+        assert!(!checkout.evidence_dir.join(CLEANUP_PENDING_NAME).exists());
+    }
+
+    #[test]
+    fn restart_refuses_unbound_activation_without_deleting_checkout() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        fs::write(repo.path().join(ACTIVATION_RECEIPT_NAME), b"{}\n").unwrap();
+
+        assert!(reconcile_pending_cleanup(repo.path(), &parent, &receipt).is_err());
+        assert!(checkout.path.exists());
+        assert!(!checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).exists());
     }
 }

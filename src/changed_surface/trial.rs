@@ -161,6 +161,33 @@ struct ActivationPlan {
     stage: String,
 }
 
+pub(crate) fn validate_stale_activation_for_cleanup(
+    stale: &super::StaleBaseShadowReceipt,
+    stale_bytes: &[u8],
+    activation_bytes: &[u8],
+) -> Result<(), String> {
+    let activation: StaleActivationReceipt = serde_json::from_slice(activation_bytes)
+        .map_err(|error| format!("decode stale integration activation: {error}"))?;
+    if activation.schema_version != activation.plan.schema_version
+        || activation.machine_mode != "shadow_compare"
+        || activation.merge_authority != super::MergeAuthority::BlockedUntilCurrentMergeTree
+        || activation.stale_context_digest != super::stale_base_context_digest(stale)
+        || sha256(stale_bytes) != activation.stale_receipt_sha256
+        || activation.plan.repository != stale.repository
+        || activation.plan.pull_request != stale.pull_request
+        || activation.plan.target != stale.target
+        || Some(activation.plan.head_sha.as_str()) != stale.integration_commit_sha.as_deref()
+        || Some(activation.plan.tree_sha.as_str()) != stale.integration_tree_sha.as_deref()
+        || activation.plan.base_sha != stale.live_protected_base_sha
+        || activation.plan.validation_contract_digest != stale.validation_contract_digest
+        || activation.plan.workflow_digest != stale.live_workflow_digest
+        || validate_stale_plan_selection(&activation.plan, stale).is_err()
+    {
+        return Err("stale integration activation identity or linkage mismatch".to_owned());
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct ExecutionPayloadBinding<'a> {
     schema_version: u32,
@@ -445,21 +472,8 @@ pub fn evaluate_stale_base_execution(
         "malformed_stale_base_cleanup_receipt".clone_into(&mut status.reason);
         return status;
     };
-    let stale_digest = sha256(stale_file.bytes);
-    if activation.schema_version != activation.plan.schema_version
-        || activation.machine_mode != "shadow_compare"
-        || activation.merge_authority != super::MergeAuthority::BlockedUntilCurrentMergeTree
-        || activation.stale_context_digest != super::stale_base_context_digest(&stale)
-        || stale_digest != activation.stale_receipt_sha256
-        || activation.plan.repository != stale.repository
-        || activation.plan.pull_request != stale.pull_request
-        || activation.plan.target != stale.target
-        || Some(activation.plan.head_sha.as_str()) != stale.integration_commit_sha.as_deref()
-        || Some(activation.plan.tree_sha.as_str()) != stale.integration_tree_sha.as_deref()
-        || activation.plan.base_sha != stale.live_protected_base_sha
-        || activation.plan.validation_contract_digest != stale.validation_contract_digest
-        || activation.plan.workflow_digest != stale.live_workflow_digest
-        || validate_stale_plan_selection(&activation.plan, &stale).is_err()
+    if validate_stale_activation_for_cleanup(&stale, stale_file.bytes, activation_file.bytes)
+        .is_err()
         || cleanup.schema_version != 1
         || cleanup.context_digest != activation.stale_context_digest
         || cleanup.integration_commit_sha != activation.plan.head_sha
