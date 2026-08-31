@@ -127,9 +127,10 @@ fn ensure_materialized(checkout: &IntegrationCheckout) -> Result<(), String> {
         Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
         Ok(_) => return Err("integration checkout path is not a real directory".to_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let checkout_path = git_cli_path(&checkout.path);
             let status = Command::new("git")
                 .args(["worktree", "add", "--detach"])
-                .arg(&checkout.path)
+                .arg(&checkout_path)
                 .arg(&checkout.marker.integration_commit_sha)
                 .current_dir(&checkout.source_repo)
                 .status()
@@ -276,9 +277,10 @@ pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
     }
     persist_cleanup_pending(checkout)?;
     if checkout.path.exists() {
+        let checkout_path = git_cli_path(&checkout.path);
         let status = Command::new("git")
             .args(["worktree", "remove", "--force"])
-            .arg(&checkout.path)
+            .arg(&checkout_path)
             .current_dir(&checkout.source_repo)
             .status()
             .map_err(|error| format!("remove integration checkout: {error}"))?;
@@ -771,6 +773,53 @@ fn canonical_git_path(cwd: &Path, value: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("canonicalize Git common directory: {error}"))
 }
 
+#[cfg(not(windows))]
+fn git_cli_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Git for Windows does not accept Win32 verbatim paths as worktree path
+/// arguments. Keep the canonical path for filesystem and custody checks, but
+/// remove only that transport prefix at the Git CLI boundary.
+#[cfg(windows)]
+fn git_cli_path(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let ordinary = if let Some(remainder) = encoded.strip_prefix(VERBATIM_UNC) {
+        let mut ordinary = vec![b'\\' as u16, b'\\' as u16];
+        ordinary.extend_from_slice(remainder);
+        ordinary
+    } else if let Some(remainder) = encoded.strip_prefix(VERBATIM) {
+        if remainder.len() >= 3
+            && remainder[0] <= u16::from(u8::MAX)
+            && (remainder[0] as u8).is_ascii_alphabetic()
+            && remainder[1] == b':' as u16
+            && remainder[2] == b'\\' as u16
+        {
+            remainder.to_vec()
+        } else {
+            return path.to_path_buf();
+        }
+    } else {
+        return path.to_path_buf();
+    };
+    PathBuf::from(OsString::from_wide(&ordinary))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,6 +1040,29 @@ mod tests {
         format!("{:x}", Sha256::digest(bytes))
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn git_cli_paths_drop_only_the_windows_verbatim_prefix() {
+        assert_eq!(
+            git_cli_path(Path::new(r"\\?\C:\work\shadow")),
+            PathBuf::from(r"C:\work\shadow")
+        );
+        assert_eq!(
+            git_cli_path(Path::new(r"\\?\UNC\server\share\shadow")),
+            PathBuf::from(r"\\server\share\shadow")
+        );
+        assert_eq!(
+            git_cli_path(Path::new(r"C:\work\shadow")),
+            PathBuf::from(r"C:\work\shadow")
+        );
+        assert_eq!(
+            git_cli_path(Path::new(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\shadow"
+            )),
+            PathBuf::from(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\shadow")
+        );
+    }
+
     #[test]
     fn materialize_reconcile_and_cleanup_exact_integration_checkout() {
         let (repo, receipt) = fixture();
@@ -1140,14 +1212,16 @@ mod tests {
                 "vendor/child",
             ],
         );
-        fs::write(
-            parent.path().join(".gitmodules"),
-            format!(
-                "[submodule \"vendor/child\"]\n\tpath = vendor/child\n\turl = {}\n\tignore = all\n",
-                child.path().display()
-            ),
-        )
-        .unwrap();
+        git(
+            parent.path(),
+            &[
+                "config",
+                "-f",
+                ".gitmodules",
+                "submodule.vendor/child.ignore",
+                "all",
+            ],
+        );
         git(parent.path(), &["add", "."]);
         git(parent.path(), &["commit", "-qm", "parent"]);
         fs::write(parent.path().join("vendor/child/tracked.txt"), "dirty\n").unwrap();
@@ -1175,9 +1249,10 @@ mod tests {
         let parent = repo.path().join("isolated");
         let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
         persist_cleanup_pending(&checkout).unwrap();
+        let checkout_path = git_cli_path(&checkout.path);
         let status = Command::new("git")
             .args(["worktree", "remove", "--force"])
-            .arg(&checkout.path)
+            .arg(&checkout_path)
             .current_dir(repo.path())
             .status()
             .unwrap();
