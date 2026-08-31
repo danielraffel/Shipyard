@@ -123,6 +123,7 @@ pub(crate) use actionable_scheduler::NativeStewardDisposition;
 #[cfg(unix)]
 pub(crate) use actionable_scheduler::{
     DispatchProbeTargetRecord, MAX_DISPATCH_PROBE_TARGETS, NativeStewardApplyReport,
+    dispatch_probe_target_key,
 };
 #[cfg(test)]
 #[allow(unused_imports)] // Some target-specific test builds do not exercise the Unix carrier.

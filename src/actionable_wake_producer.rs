@@ -168,21 +168,24 @@ pub(crate) struct ActionableWakeProducer {
 impl ActionableWakeProducer {
     pub(crate) fn new(state_dir: PathBuf) -> Self {
         let mut status = load_status(&state_dir).unwrap_or_default();
-        let legacy_dispatch_targets = std::mem::take(&mut status.dispatch_targets);
-        let dispatch_state = WorkLedger::open(&state_dir)
-            .and_then(|ledger| ledger.load_dispatch_probe_targets())
-            .map_err(|error| error.to_string())
-            .and_then(|records| {
-                if records.is_empty() && !legacy_dispatch_targets.is_empty() {
-                    persist_dispatch_targets(&state_dir, &legacy_dispatch_targets)
-                        .map_err(|error| error.to_string())?;
-                    save_aggregate_status(&state_dir, &status)
-                        .map_err(|error| error.to_string())?;
-                    Ok(legacy_dispatch_targets)
-                } else {
-                    decode_dispatch_target_records(records)
-                }
-            });
+        let legacy_dispatch_targets =
+            canonicalize_dispatch_target_keys(std::mem::take(&mut status.dispatch_targets));
+        let dispatch_state = legacy_dispatch_targets.and_then(|legacy_dispatch_targets| {
+            WorkLedger::open(&state_dir)
+                .and_then(|ledger| ledger.load_dispatch_probe_targets())
+                .map_err(|error| error.to_string())
+                .and_then(|records| {
+                    if records.is_empty() && !legacy_dispatch_targets.is_empty() {
+                        persist_dispatch_targets(&state_dir, &legacy_dispatch_targets)
+                            .map_err(|error| error.to_string())?;
+                        save_aggregate_status(&state_dir, &status)
+                            .map_err(|error| error.to_string())?;
+                        Ok(legacy_dispatch_targets)
+                    } else {
+                        decode_dispatch_target_records(records)
+                    }
+                })
+        });
         let dispatch_state_available = if let Ok(targets) = dispatch_state {
             status.dispatch_targets = targets;
             true
@@ -470,8 +473,28 @@ impl ActionableWakeProducer {
         clippy::too_many_lines,
         reason = "checkpoint and WorkLedger publication remain one auditable fail-closed boundary"
     )]
+    #[cfg(test)]
     pub(crate) fn process_dispatch_wedge_observation(
         &mut self,
+        observation: &DispatchWedgeObservation,
+        assignment_threshold_secs: i64,
+    ) -> ActionableWakeProducerStatus {
+        self.process_dispatch_wedge_observation_for_repository(
+            test_repository_provider(),
+            test_repository_id(),
+            observation,
+            assignment_threshold_secs,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checkpoint and WorkLedger publication remain one auditable fail-closed boundary"
+    )]
+    fn process_dispatch_wedge_observation_for_repository(
+        &mut self,
+        repository_provider: &str,
+        repository_id: &str,
         observation: &DispatchWedgeObservation,
         assignment_threshold_secs: i64,
     ) -> ActionableWakeProducerStatus {
@@ -488,6 +511,8 @@ impl ActionableWakeProducer {
         }
         let key = dispatch_observation_key(authority);
         let scope = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
             &authority.repository,
             authority.pull_request,
             &authority.pull_request_head,
@@ -670,8 +695,8 @@ impl ActionableWakeProducer {
                 .dispatch_targets
                 .entry(scope.clone())
                 .or_insert_with(|| DispatchTargetCheckpoint {
-                    repository_provider: test_repository_provider().to_owned(),
-                    repository_id: test_repository_id().to_owned(),
+                    repository_provider: repository_provider.to_owned(),
+                    repository_id: repository_id.to_owned(),
                     repository: authority.repository.clone(),
                     pull_request: authority.pull_request,
                     head_sha: authority.pull_request_head.clone(),
@@ -754,7 +779,9 @@ impl ActionableWakeProducer {
                 false,
             );
         };
-        let status = self.process_dispatch_wedge_cycle_at_generation(
+        let status = self.process_dispatch_wedge_cycle_at_generation_for_repository(
+            test_repository_provider(),
+            test_repository_id(),
             repository,
             pull_request,
             head_sha,
@@ -763,7 +790,13 @@ impl ActionableWakeProducer {
             assignment_threshold_secs,
         );
         if status.reason_code.as_deref() == Some("dispatch_wedge_candidate_absent") {
-            self.finish_dispatch_cycle_without_followup(repository, pull_request, head_sha);
+            self.finish_dispatch_cycle_without_followup_for_repository(
+                test_repository_provider(),
+                test_repository_id(),
+                repository,
+                pull_request,
+                head_sha,
+            );
         }
         status
     }
@@ -803,7 +836,13 @@ impl ActionableWakeProducer {
             );
             return None;
         }
-        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        let key = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
         if !self.status.dispatch_targets.contains_key(&key)
             && self.status.dispatch_targets.len() >= MAX_DISPATCH_PROBE_TARGETS
         {
@@ -851,8 +890,14 @@ impl ActionableWakeProducer {
         Some(generation)
     }
 
-    pub(crate) fn process_dispatch_wedge_cycle_at_generation(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "repository identity and exact target generation are independent mutation fences"
+    )]
+    pub(crate) fn process_dispatch_wedge_cycle_at_generation_for_repository(
         &mut self,
+        repository_provider: &str,
+        repository_id: &str,
         repository: &str,
         pull_request: u64,
         head_sha: &str,
@@ -860,11 +905,12 @@ impl ActionableWakeProducer {
         observations: &[DispatchWedgeObservation],
         assignment_threshold_secs: i64,
     ) -> ActionableWakeProducerStatus {
-        let prefix = format!(
-            "{}/{}/{}/",
-            repository.to_ascii_lowercase(),
+        let prefix = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
             pull_request,
-            head_sha.to_ascii_lowercase()
+            head_sha,
         );
         if self
             .status
@@ -880,7 +926,13 @@ impl ActionableWakeProducer {
             .get(&prefix)
             .is_some_and(|target| target.pending_publication.is_some())
         {
-            return self.publish_pending_dispatch_wedge(repository, pull_request, head_sha);
+            return self.publish_pending_dispatch_wedge(
+                repository_provider,
+                repository_id,
+                repository,
+                pull_request,
+                head_sha,
+            );
         }
         let present = observations
             .iter()
@@ -895,8 +947,12 @@ impl ActionableWakeProducer {
             if !processed.insert(dispatch_observation_key(&observation.authority)) {
                 continue;
             }
-            let observed =
-                self.process_dispatch_wedge_observation(observation, assignment_threshold_secs);
+            let observed = self.process_dispatch_wedge_observation_for_repository(
+                repository_provider,
+                repository_id,
+                observation,
+                assignment_threshold_secs,
+            );
             let terminal_dispatch = matches!(
                 observed.reason_code.as_deref(),
                 Some(
@@ -929,8 +985,32 @@ impl ActionableWakeProducer {
         })
     }
 
-    pub(crate) fn invalidate_dispatch_wedge_scope(
+    #[cfg(test)]
+    pub(crate) fn process_dispatch_wedge_cycle_at_generation(
         &mut self,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+        generation: u64,
+        observations: &[DispatchWedgeObservation],
+        assignment_threshold_secs: i64,
+    ) -> ActionableWakeProducerStatus {
+        self.process_dispatch_wedge_cycle_at_generation_for_repository(
+            test_repository_provider(),
+            test_repository_id(),
+            repository,
+            pull_request,
+            head_sha,
+            generation,
+            observations,
+            assignment_threshold_secs,
+        )
+    }
+
+    pub(crate) fn invalidate_dispatch_wedge_scope_for_repository(
+        &mut self,
+        repository_provider: &str,
+        repository_id: &str,
         repository: &str,
         pull_request: u64,
         head_sha: &str,
@@ -946,11 +1026,12 @@ impl ActionableWakeProducer {
                 false,
             );
         }
-        let prefix = format!(
-            "{}/{}/{}/",
-            repository.to_ascii_lowercase(),
+        let prefix = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
             pull_request,
-            head_sha.to_ascii_lowercase()
+            head_sha,
         );
         if self
             .status
@@ -958,7 +1039,13 @@ impl ActionableWakeProducer {
             .get(&prefix)
             .is_some_and(|target| target.pending_publication.is_some())
         {
-            return self.publish_pending_dispatch_wedge(repository, pull_request, head_sha);
+            return self.publish_pending_dispatch_wedge(
+                repository_provider,
+                repository_id,
+                repository,
+                pull_request,
+                head_sha,
+            );
         }
         let previous = self.status.dispatch_targets.remove(&prefix);
         let status = self.record(
@@ -977,13 +1064,39 @@ impl ActionableWakeProducer {
         status
     }
 
-    fn publish_pending_dispatch_wedge(
+    #[cfg(test)]
+    pub(crate) fn invalidate_dispatch_wedge_scope(
         &mut self,
         repository: &str,
         pull_request: u64,
         head_sha: &str,
+        reason: &str,
     ) -> ActionableWakeProducerStatus {
-        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        self.invalidate_dispatch_wedge_scope_for_repository(
+            test_repository_provider(),
+            test_repository_id(),
+            repository,
+            pull_request,
+            head_sha,
+            reason,
+        )
+    }
+
+    fn publish_pending_dispatch_wedge(
+        &mut self,
+        repository_provider: &str,
+        repository_id: &str,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+    ) -> ActionableWakeProducerStatus {
+        let key = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
         let Some(pending) = self
             .status
             .dispatch_targets
@@ -1065,22 +1178,36 @@ impl ActionableWakeProducer {
         }
     }
 
-    pub(crate) fn invalidate_dispatch_wedge_scope_at_generation(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "repository identity and exact target generation are independent mutation fences"
+    )]
+    pub(crate) fn invalidate_dispatch_wedge_scope_at_generation_for_repository(
         &mut self,
+        repository_provider: &str,
+        repository_id: &str,
         repository: &str,
         pull_request: u64,
         head_sha: &str,
         generation: u64,
         reason: &str,
     ) -> ActionableWakeProducerStatus {
-        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        let key = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
         if self
             .status
             .dispatch_targets
             .get(&key)
             .is_some_and(|target| target.generation == generation)
         {
-            return self.invalidate_dispatch_wedge_scope(
+            return self.invalidate_dispatch_wedge_scope_for_repository(
+                repository_provider,
+                repository_id,
                 repository,
                 pull_request,
                 head_sha,
@@ -1090,6 +1217,49 @@ impl ActionableWakeProducer {
         self.status()
     }
 
+    #[cfg(test)]
+    pub(crate) fn invalidate_dispatch_wedge_scope_at_generation(
+        &mut self,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+        generation: u64,
+        reason: &str,
+    ) -> ActionableWakeProducerStatus {
+        self.invalidate_dispatch_wedge_scope_at_generation_for_repository(
+            test_repository_provider(),
+            test_repository_id(),
+            repository,
+            pull_request,
+            head_sha,
+            generation,
+            reason,
+        )
+    }
+
+    pub(crate) fn dispatch_cycle_generation_current_for_repository(
+        &self,
+        repository_provider: &str,
+        repository_id: &str,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+        generation: u64,
+    ) -> bool {
+        let key = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
+        self.status
+            .dispatch_targets
+            .get(&key)
+            .is_some_and(|target| target.generation == generation)
+    }
+
+    #[cfg(test)]
     pub(crate) fn dispatch_cycle_generation_current(
         &self,
         repository: &str,
@@ -1097,11 +1267,14 @@ impl ActionableWakeProducer {
         head_sha: &str,
         generation: u64,
     ) -> bool {
-        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
-        self.status
-            .dispatch_targets
-            .get(&key)
-            .is_some_and(|target| target.generation == generation)
+        self.dispatch_cycle_generation_current_for_repository(
+            test_repository_provider(),
+            test_repository_id(),
+            repository,
+            pull_request,
+            head_sha,
+            generation,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1153,8 +1326,10 @@ impl ActionableWakeProducer {
         )
     }
 
-    pub(crate) fn retain_dispatch_scope_after_steward_failure_at_generation(
+    pub(crate) fn retain_dispatch_scope_after_steward_failure_at_generation_for_repository(
         &mut self,
+        repository_provider: &str,
+        repository_id: &str,
         repository: &str,
         pull_request: u64,
         head_sha: &str,
@@ -1170,7 +1345,13 @@ impl ActionableWakeProducer {
                 false,
             );
         }
-        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        let key = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
         let previous = self.status.dispatch_targets.get(&key).cloned();
         let Some(target) = self.status.dispatch_targets.get_mut(&key) else {
             return self.status();
@@ -1179,7 +1360,13 @@ impl ActionableWakeProducer {
             return self.status();
         }
         if target.pending_publication.is_some() {
-            return self.publish_pending_dispatch_wedge(repository, pull_request, head_sha);
+            return self.publish_pending_dispatch_wedge(
+                repository_provider,
+                repository_id,
+                repository,
+                pull_request,
+                head_sha,
+            );
         }
         target.observations.clear();
         target.schedule = None;
@@ -1197,6 +1384,24 @@ impl ActionableWakeProducer {
             self.status.dispatch_targets.insert(key, previous);
         }
         status
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_dispatch_scope_after_steward_failure_at_generation(
+        &mut self,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+        generation: u64,
+    ) -> ActionableWakeProducerStatus {
+        self.retain_dispatch_scope_after_steward_failure_at_generation_for_repository(
+            test_repository_provider(),
+            test_repository_id(),
+            repository,
+            pull_request,
+            head_sha,
+            generation,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1222,7 +1427,13 @@ impl ActionableWakeProducer {
                 false,
             );
         }
-        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        let key = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
         let previous = self.status.dispatch_targets.get(&key).cloned();
         let Some(target) = self.status.dispatch_targets.get_mut(&key) else {
             return self.status();
@@ -1234,7 +1445,13 @@ impl ActionableWakeProducer {
             return self.status();
         }
         if target.pending_publication.is_some() {
-            return self.publish_pending_dispatch_wedge(repository, pull_request, head_sha);
+            return self.publish_pending_dispatch_wedge(
+                repository_provider,
+                repository_id,
+                repository,
+                pull_request,
+                head_sha,
+            );
         }
         target.observations.clear();
         target.schedule = Some(DispatchProbeSchedule {
@@ -1298,7 +1515,13 @@ impl ActionableWakeProducer {
                 false,
             );
         }
-        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        let key = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
         if !self.status.dispatch_targets.contains_key(&key)
             && self.status.dispatch_targets.len() >= MAX_DISPATCH_PROBE_TARGETS
         {
@@ -1358,8 +1581,10 @@ impl ActionableWakeProducer {
         status
     }
 
-    pub(crate) fn finish_dispatch_cycle_without_followup(
+    pub(crate) fn finish_dispatch_cycle_without_followup_for_repository(
         &mut self,
+        repository_provider: &str,
+        repository_id: &str,
         repository: &str,
         pull_request: u64,
         head_sha: &str,
@@ -1367,7 +1592,13 @@ impl ActionableWakeProducer {
         if !self.dispatch_state_available {
             return false;
         }
-        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        let key = dispatch_scope_prefix(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
         let previous = self.status.dispatch_targets.remove(&key);
         if self.persist_status().is_ok() {
             return true;
@@ -1376,6 +1607,22 @@ impl ActionableWakeProducer {
             self.status.dispatch_targets.insert(key, previous);
         }
         false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_dispatch_cycle_without_followup(
+        &mut self,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+    ) -> bool {
+        self.finish_dispatch_cycle_without_followup_for_repository(
+            test_repository_provider(),
+            test_repository_id(),
+            repository,
+            pull_request,
+            head_sha,
+        )
     }
 
     pub(crate) fn due_dispatch_probes(
@@ -1399,9 +1646,20 @@ impl ActionableWakeProducer {
             .collect::<Vec<_>>();
         due.sort_by(|left, right| {
             left.due_at.cmp(&right.due_at).then_with(|| {
-                dispatch_scope_prefix(&left.repository, left.pull_request, &left.head_sha).cmp(
-                    &dispatch_scope_prefix(&right.repository, right.pull_request, &right.head_sha),
+                dispatch_scope_prefix(
+                    &left.repository_provider,
+                    &left.repository_id,
+                    &left.repository,
+                    left.pull_request,
+                    &left.head_sha,
                 )
+                .cmp(&dispatch_scope_prefix(
+                    &right.repository_provider,
+                    &right.repository_id,
+                    &right.repository,
+                    right.pull_request,
+                    &right.head_sha,
+                ))
             })
         });
         due.truncate(limit);
@@ -1628,13 +1886,39 @@ fn dispatch_cycle_status_priority(status: &ActionableWakeProducerStatus) -> u8 {
     }
 }
 
-fn dispatch_scope_prefix(repository: &str, pull_request: u64, head_sha: &str) -> String {
-    format!(
-        "{}/{}/{}/",
-        repository.to_ascii_lowercase(),
+fn dispatch_scope_prefix(
+    repository_provider: &str,
+    repository_id: &str,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+) -> String {
+    crate::work_ledger::dispatch_probe_target_key(
+        repository_provider,
+        repository_id,
+        repository,
         pull_request,
-        head_sha.to_ascii_lowercase()
+        head_sha,
     )
+}
+
+fn canonicalize_dispatch_target_keys(
+    targets: BTreeMap<String, DispatchTargetCheckpoint>,
+) -> Result<BTreeMap<String, DispatchTargetCheckpoint>, String> {
+    let mut canonical = BTreeMap::new();
+    for target in targets.into_values() {
+        let key = dispatch_scope_prefix(
+            &target.repository_provider,
+            &target.repository_id,
+            &target.repository,
+            target.pull_request,
+            &target.head_sha,
+        );
+        if canonical.insert(key, target).is_some() {
+            return Err("duplicate canonical dispatch target identity".to_owned());
+        }
+    }
+    Ok(canonical)
 }
 
 fn nonempty_identity(value: &str) -> Option<&str> {
@@ -1646,19 +1930,9 @@ const fn test_repository_provider() -> &'static str {
     "github.com"
 }
 
-#[cfg(not(test))]
-const fn test_repository_provider() -> &'static str {
-    ""
-}
-
 #[cfg(test)]
 const fn test_repository_id() -> &'static str {
     "R_test_repository"
-}
-
-#[cfg(not(test))]
-const fn test_repository_id() -> &'static str {
-    ""
 }
 
 const fn stability_delay_seconds() -> i64 {
@@ -1829,7 +2103,16 @@ fn decode_dispatch_target_records(
         {
             return Err("dispatch target row and checkpoint payload disagree".to_owned());
         }
-        targets.insert(record.target_key, checkpoint);
+        let key = dispatch_scope_prefix(
+            &checkpoint.repository_provider,
+            &checkpoint.repository_id,
+            &checkpoint.repository,
+            checkpoint.pull_request,
+            &checkpoint.head_sha,
+        );
+        if targets.insert(key, checkpoint).is_some() {
+            return Err("duplicate canonical dispatch target identity".to_owned());
+        }
     }
     Ok(targets)
 }
@@ -1985,6 +2268,8 @@ mod tests {
         observation: &DispatchWedgeObservation,
     ) {
         let scope = dispatch_scope_prefix(
+            test_repository_provider(),
+            test_repository_id(),
             &observation.authority.repository,
             observation.authority.pull_request,
             &observation.authority.pull_request_head,
@@ -2332,7 +2617,13 @@ mod tests {
         let due_at = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
         for pull_request in 1..=u64::try_from(MAX_DISPATCH_PROBE_TARGETS).unwrap() {
             let head_sha = format!("{pull_request:040x}");
-            let key = dispatch_scope_prefix("owner/repo", pull_request, &head_sha);
+            let key = dispatch_scope_prefix(
+                test_repository_provider(),
+                test_repository_id(),
+                "owner/repo",
+                pull_request,
+                &head_sha,
+            );
             status.dispatch_targets.insert(
                 key,
                 DispatchTargetCheckpoint {
@@ -2387,7 +2678,13 @@ mod tests {
         let mut active = std::collections::BTreeSet::new();
         for pull_request in 1..=u64::try_from(MAX_DISPATCH_PROBE_TARGETS).unwrap() {
             let head_sha = format!("{pull_request:040x}");
-            let key = dispatch_scope_prefix("Owner/Repo", pull_request, &head_sha);
+            let key = dispatch_scope_prefix(
+                test_repository_provider(),
+                test_repository_id(),
+                "Owner/Repo",
+                pull_request,
+                &head_sha,
+            );
             active.insert(DispatchTargetInventoryIdentity::new(
                 test_repository_provider(),
                 test_repository_id(),
@@ -2454,6 +2751,77 @@ mod tests {
 
         producer.retain_dispatch_targets(&active);
 
+        assert!(producer.status.dispatch_targets.is_empty());
+    }
+
+    #[test]
+    fn same_slug_head_with_distinct_repository_identities_cycle_and_clean_independently() {
+        let state = tempfile::tempdir().expect("state");
+        let repository = "owner/repo";
+        let head_sha = "a".repeat(40);
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        let first_generation = producer
+            .begin_dispatch_wedge_cycle_for_repository(
+                "github.com",
+                "R_first",
+                repository,
+                42,
+                &head_sha,
+            )
+            .expect("first identity generation");
+        let second_generation = producer
+            .begin_dispatch_wedge_cycle_for_repository(
+                "enterprise.example",
+                "R_second",
+                repository,
+                42,
+                &head_sha,
+            )
+            .expect("second identity generation");
+        assert_eq!(producer.status.dispatch_targets.len(), 2);
+
+        let first = producer.process_dispatch_wedge_cycle_at_generation_for_repository(
+            "github.com",
+            "R_first",
+            repository,
+            42,
+            &head_sha,
+            first_generation,
+            &[],
+            300,
+        );
+        assert_eq!(
+            first.reason_code.as_deref(),
+            Some("dispatch_wedge_candidate_absent")
+        );
+        assert!(
+            producer.finish_dispatch_cycle_without_followup_for_repository(
+                "github.com",
+                "R_first",
+                repository,
+                42,
+                &head_sha,
+            )
+        );
+        assert_eq!(producer.status.dispatch_targets.len(), 1);
+        assert!(producer.dispatch_cycle_generation_current_for_repository(
+            "enterprise.example",
+            "R_second",
+            repository,
+            42,
+            &head_sha,
+            second_generation,
+        ));
+
+        producer.invalidate_dispatch_wedge_scope_at_generation_for_repository(
+            "enterprise.example",
+            "R_second",
+            repository,
+            42,
+            &head_sha,
+            second_generation,
+            "test_cleanup",
+        );
         assert!(producer.status.dispatch_targets.is_empty());
     }
 
@@ -2543,6 +2911,59 @@ mod tests {
             !std::fs::read_to_string(status_path(state.path()))
                 .unwrap()
                 .contains("dispatch_targets")
+        );
+    }
+
+    #[test]
+    fn legacy_json_duplicate_canonical_identity_fails_closed() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now() - chrono::Duration::seconds(1),
+        );
+        let checkpoint = producer
+            .status
+            .dispatch_targets
+            .values()
+            .next()
+            .expect("scheduled checkpoint")
+            .clone();
+        let mut duplicate_targets = BTreeMap::new();
+        duplicate_targets.insert("legacy-key-one".to_owned(), checkpoint.clone());
+        duplicate_targets.insert("legacy-key-two".to_owned(), checkpoint);
+        let mut legacy = serde_json::to_value(&producer.status).expect("legacy status");
+        legacy.as_object_mut().unwrap().insert(
+            "dispatch_targets".to_owned(),
+            serde_json::to_value(duplicate_targets).unwrap(),
+        );
+        WorkLedger::open_existing(state.path())
+            .unwrap()
+            .unwrap()
+            .replace_dispatch_probe_targets(&[])
+            .expect("pre-migration empty ledger");
+        std::fs::write(
+            status_path(state.path()),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .expect("legacy JSON fixture");
+
+        let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        assert_eq!(
+            restarted.status.reason_code.as_deref(),
+            Some("dispatch_probe_state_unreadable")
+        );
+        assert!(restarted.status.dispatch_targets.is_empty());
+        assert!(
+            WorkLedger::open_existing(state.path())
+                .unwrap()
+                .unwrap()
+                .load_dispatch_probe_targets()
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -2855,6 +3276,8 @@ mod tests {
         make_dispatch_observation_due(&mut producer, &observation);
 
         let scope = dispatch_scope_prefix(
+            test_repository_provider(),
+            test_repository_id(),
             &observation.authority.repository,
             observation.authority.pull_request,
             &observation.authority.pull_request_head,

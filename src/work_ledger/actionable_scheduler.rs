@@ -662,11 +662,12 @@ fn validate_repository_identity(
 
 fn validate_dispatch_probe_record(record: &DispatchProbeTargetRecord) -> WorkLedgerResult<()> {
     validate_target(&record.repository, record.pull_request, &record.head_sha)?;
-    let expected_key = format!(
-        "{}/{}/{}/",
-        record.repository.to_ascii_lowercase(),
+    let expected_key = dispatch_probe_target_key(
+        &record.repository_provider,
+        &record.repository_id,
+        &record.repository,
         record.pull_request,
-        record.head_sha.to_ascii_lowercase()
+        &record.head_sha,
     );
     if record.repository_provider.trim() != record.repository_provider
         || record.repository_provider.len() < 3
@@ -680,6 +681,23 @@ fn validate_dispatch_probe_record(record: &DispatchProbeTargetRecord) -> WorkLed
         ));
     }
     Ok(())
+}
+
+pub(crate) fn dispatch_probe_target_key(
+    repository_provider: &str,
+    repository_id: &str,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+) -> String {
+    serde_json::to_string(&(
+        repository_provider.to_ascii_lowercase(),
+        repository_id,
+        repository.to_ascii_lowercase(),
+        pull_request,
+        head_sha.to_ascii_lowercase(),
+    ))
+    .expect("dispatch scope tuple is serializable")
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -716,13 +734,20 @@ mod tests {
     use crate::work_ledger::native_publication::tests::{policy, request};
 
     fn dispatch_probe_record(index: u64) -> DispatchProbeTargetRecord {
+        let head_sha = format!("{index:040x}");
         DispatchProbeTargetRecord {
-            target_key: format!("owner/repo/{index}/{index:040x}/"),
+            target_key: dispatch_probe_target_key(
+                "github.com",
+                "R_test_repository",
+                "owner/repo",
+                index,
+                &head_sha,
+            ),
             repository_provider: "github.com".to_owned(),
             repository_id: "R_test_repository".to_owned(),
             repository: "owner/repo".to_owned(),
             pull_request: index,
-            head_sha: format!("{index:040x}"),
+            head_sha,
             generation: 1,
             due_at: Some("2026-08-31T18:00:00Z".to_owned()),
             checkpoint_json: b"{}".to_vec(),

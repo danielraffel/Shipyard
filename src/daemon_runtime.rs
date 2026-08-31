@@ -392,7 +392,9 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 continue;
             }
             steward_repository_in_flight = None;
-            if !actionable_producer.dispatch_cycle_generation_current(
+            if !actionable_producer.dispatch_cycle_generation_current_for_repository(
+                &completed.repository_provider,
+                &completed.repository_id,
                 &completed.repository,
                 completed.pull_request,
                 &completed.head_sha,
@@ -424,7 +426,9 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             match (result_identity_valid, completed.result) {
                 (false, _) | (true, Err(_)) => {
                     let status = actionable_producer
-                        .retain_dispatch_scope_after_steward_failure_at_generation(
+                        .retain_dispatch_scope_after_steward_failure_at_generation_for_repository(
+                            &completed.repository_provider,
+                            &completed.repository_id,
                             &completed.repository,
                             completed.pull_request,
                             &completed.head_sha,
@@ -462,7 +466,9 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 (true, Ok(cycle)) => match cycle.dispatch_observations {
                     Ok(observations) => {
                         let status = actionable_producer
-                            .process_dispatch_wedge_cycle_at_generation(
+                            .process_dispatch_wedge_cycle_at_generation_for_repository(
+                                &completed.repository_provider,
+                                &completed.repository_id,
                                 &completed.repository,
                                 completed.pull_request,
                                 &completed.head_sha,
@@ -507,7 +513,9 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                     target.pull_request,
                     &target.head_sha,
                 ));
-                if !actionable_producer.dispatch_cycle_generation_current(
+                if !actionable_producer.dispatch_cycle_generation_current_for_repository(
+                    &completed.repository_provider,
+                    &completed.repository_id,
                     &completed.repository,
                     target.pull_request,
                     &target.head_sha,
@@ -518,7 +526,9 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 match target.result {
                     Ok(observations) => {
                         let status = actionable_producer
-                            .process_dispatch_wedge_cycle_at_generation(
+                            .process_dispatch_wedge_cycle_at_generation_for_repository(
+                                &completed.repository_provider,
+                                &completed.repository_id,
                                 &completed.repository,
                                 target.pull_request,
                                 &target.head_sha,
@@ -575,7 +585,9 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             let mut targets = Vec::new();
             for schedule in batch.schedules {
                 if !schedule.repository.eq_ignore_ascii_case(&batch.repository) {
-                    actionable_producer.invalidate_dispatch_wedge_scope(
+                    actionable_producer.invalidate_dispatch_wedge_scope_for_repository(
+                        &schedule.repository_provider,
+                        &schedule.repository_id,
                         &schedule.repository,
                         schedule.pull_request,
                         &schedule.head_sha,
@@ -623,13 +635,16 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                         });
                     }
                     NativeBaseRefLookup::Absent => {
-                        actionable_producer.invalidate_dispatch_wedge_scope_at_generation(
-                            &schedule.repository,
-                            schedule.pull_request,
-                            &schedule.head_sha,
-                            generation,
-                            "dispatch_wedge_authority_unavailable",
-                        );
+                        actionable_producer
+                            .invalidate_dispatch_wedge_scope_at_generation_for_repository(
+                                &schedule.repository_provider,
+                                &schedule.repository_id,
+                                &schedule.repository,
+                                schedule.pull_request,
+                                &schedule.head_sha,
+                                generation,
+                                "dispatch_wedge_authority_unavailable",
+                            );
                     }
                     NativeBaseRefLookup::Retry => {
                         actionable_producer.reschedule_dispatch_probe_after_failure_at_generation(
@@ -792,17 +807,22 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                     );
                 }
                 NativeBaseRefLookup::Absent => {
-                    actionable_producer.invalidate_dispatch_wedge_scope_at_generation(
-                        &repository,
-                        pull_request,
-                        &head_sha,
-                        generation,
-                        "dispatch_wedge_authority_unavailable",
-                    );
+                    actionable_producer
+                        .invalidate_dispatch_wedge_scope_at_generation_for_repository(
+                            &repository_provider,
+                            &repository_id,
+                            &repository,
+                            pull_request,
+                            &head_sha,
+                            generation,
+                            "dispatch_wedge_authority_unavailable",
+                        );
                 }
                 NativeBaseRefLookup::Retry => {
                     let status = actionable_producer
-                        .retain_dispatch_scope_after_steward_failure_at_generation(
+                        .retain_dispatch_scope_after_steward_failure_at_generation_for_repository(
+                            &repository_provider,
+                            &repository_id,
                             &repository,
                             pull_request,
                             &head_sha,
@@ -1303,7 +1323,13 @@ fn schedule_dispatch_followup(
             due_at,
         );
     } else {
-        producer.finish_dispatch_cycle_without_followup(repository, pull_request, head_sha);
+        producer.finish_dispatch_cycle_without_followup_for_repository(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+        );
     }
 }
 
