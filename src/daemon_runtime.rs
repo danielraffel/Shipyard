@@ -321,6 +321,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     );
     let steward_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut pending_steward_targets = native_steward_inventory(&config.state_dir);
+    let mut steward_retry_not_before = BTreeMap::new();
     let (steward_tx, steward_rx) = mpsc::channel::<DaemonStewardResult>();
     let (dispatch_probe_tx, dispatch_probe_rx) = mpsc::channel::<DaemonDispatchProbeBatchResult>();
     let mut steward_in_flight = false;
@@ -420,16 +421,41 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 .is_ok();
             match (result_identity_valid, completed.result) {
                 (false, _) | (true, Err(_)) => {
-                    actionable_producer.reschedule_dispatch_probe_after_failure_at_generation(
-                        &completed.repository_provider,
-                        &completed.repository_id,
-                        &completed.repository,
-                        completed.pull_request,
-                        &completed.head_sha,
-                        completed.generation,
-                        Utc::now() + chrono::Duration::seconds(60),
-                        "dispatch_wedge_observation_failed",
-                    );
+                    let status = actionable_producer
+                        .retain_dispatch_scope_after_steward_failure_at_generation(
+                            &completed.repository,
+                            completed.pull_request,
+                            &completed.head_sha,
+                            completed.generation,
+                        );
+                    if steward_retry_required(&status) {
+                        pending_steward_targets.insert((
+                            Some(completed.repository_provider.clone()),
+                            Some(completed.repository_id.clone()),
+                            completed.repository.clone(),
+                            completed.pull_request,
+                            completed.head_sha.clone(),
+                        ));
+                        steward_retry_not_before.insert(
+                            normalized_dispatch_target(
+                                &completed.repository,
+                                completed.pull_request,
+                                &completed.head_sha,
+                            ),
+                            Utc::now() + chrono::Duration::seconds(60),
+                        );
+                    } else {
+                        schedule_dispatch_followup(
+                            &mut actionable_producer,
+                            &completed.repository_provider,
+                            &completed.repository_id,
+                            &completed.repository,
+                            completed.pull_request,
+                            &completed.head_sha,
+                            &[],
+                            &status,
+                        );
+                    }
                 }
                 (true, Ok(cycle)) => match cycle.dispatch_observations {
                     Ok(observations) => {
@@ -636,6 +662,11 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
 
         let shadow_transitions = shadow_lane.tick(Instant::now());
         for observation in shadow_lane.take_completed_observations() {
+            steward_retry_not_before.remove(&normalized_dispatch_target(
+                &observation.repo,
+                observation.pr,
+                &observation.expected_head_sha,
+            ));
             pending_steward_targets.insert((
                 observation.repository_provider,
                 observation.repository_id,
@@ -650,17 +681,28 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                     .iter()
                     .find(
                         |(provider, repository_id, repository, pull_request, head_sha)| {
+                            let retry_due = steward_retry_not_before
+                                .get(&normalized_dispatch_target(
+                                    repository,
+                                    *pull_request,
+                                    head_sha,
+                                ))
+                                .is_none_or(|not_before| *not_before <= Utc::now());
                             !dispatch_probes_in_flight.contains(&normalized_dispatch_target(
                                 repository,
                                 *pull_request,
                                 head_sha,
-                            )) && provider.as_ref().zip(repository_id.as_ref()).is_none_or(
-                                |(provider, repository_id)| {
-                                    !dispatch_probe_repositories_in_flight.contains(
-                                        &normalized_dispatch_repository(provider, repository_id),
-                                    )
-                                },
-                            )
+                            )) && retry_due
+                                && provider.as_ref().zip(repository_id.as_ref()).is_none_or(
+                                    |(provider, repository_id)| {
+                                        !dispatch_probe_repositories_in_flight.contains(
+                                            &normalized_dispatch_repository(
+                                                provider,
+                                                repository_id,
+                                            ),
+                                        )
+                                    },
+                                )
                         },
                     )
                     .cloned()
@@ -671,6 +713,11 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 repository.clone(),
                 pull_request,
                 head_sha.clone(),
+            ));
+            steward_retry_not_before.remove(&normalized_dispatch_target(
+                &repository,
+                pull_request,
+                &head_sha,
             ));
             let (Some(repository_provider), Some(repository_id)) =
                 (repository_provider, repository_id)
@@ -690,6 +737,17 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 &head_sha,
             ) else {
                 actionable_producer.mark_uncertain(&repository, pull_request, &head_sha);
+                pending_steward_targets.insert((
+                    Some(repository_provider.clone()),
+                    Some(repository_id.clone()),
+                    repository.clone(),
+                    pull_request,
+                    head_sha.clone(),
+                ));
+                steward_retry_not_before.insert(
+                    normalized_dispatch_target(&repository, pull_request, &head_sha),
+                    Utc::now() + chrono::Duration::seconds(60),
+                );
                 continue;
             };
             let result = WorkLedger::open_existing(&config.state_dir).and_then(|ledger| {
@@ -741,16 +799,37 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                     );
                 }
                 NativeBaseRefLookup::Retry => {
-                    actionable_producer.reschedule_dispatch_probe_after_failure_at_generation(
-                        &repository_provider,
-                        &repository_id,
-                        &repository,
-                        pull_request,
-                        &head_sha,
-                        generation,
-                        Utc::now() + chrono::Duration::seconds(60),
-                        "dispatch_wedge_ledger_read_failed",
-                    );
+                    let status = actionable_producer
+                        .retain_dispatch_scope_after_steward_failure_at_generation(
+                            &repository,
+                            pull_request,
+                            &head_sha,
+                            generation,
+                        );
+                    if steward_retry_required(&status) {
+                        pending_steward_targets.insert((
+                            Some(repository_provider.clone()),
+                            Some(repository_id.clone()),
+                            repository.clone(),
+                            pull_request,
+                            head_sha.clone(),
+                        ));
+                        steward_retry_not_before.insert(
+                            normalized_dispatch_target(&repository, pull_request, &head_sha),
+                            Utc::now() + chrono::Duration::seconds(60),
+                        );
+                    } else {
+                        schedule_dispatch_followup(
+                            &mut actionable_producer,
+                            &repository_provider,
+                            &repository_id,
+                            &repository,
+                            pull_request,
+                            &head_sha,
+                            &[],
+                            &status,
+                        );
+                    }
                 }
             }
         }
@@ -1216,6 +1295,18 @@ fn schedule_dispatch_followup(
     } else {
         producer.finish_dispatch_cycle_without_followup(repository, pull_request, head_sha);
     }
+}
+
+#[cfg(unix)]
+fn steward_retry_required(status: &ActionableWakeProducerStatus) -> bool {
+    matches!(
+        status.reason_code.as_deref(),
+        Some(
+            "steward_retry_scheduled"
+                | "dispatch_probe_state_unreadable"
+                | "status_persistence_refused"
+        )
+    )
 }
 
 #[cfg(unix)]
@@ -2647,7 +2738,7 @@ mod tests {
     use super::{
         DaemonDispatchProbeTarget, NativeBaseRefLookup, classify_native_base_ref_lookup,
         join_dispatch_probe_batch_results, normalized_dispatch_target, release_steward_ownership,
-        schedule_dispatch_followup,
+        schedule_dispatch_followup, steward_retry_required,
     };
     #[cfg(unix)]
     use crate::actionable_wake_producer::{ActionableWakeProducer, ActionableWakeProducerStatus};
@@ -2680,6 +2771,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_steward_failures_reenter_the_steward_lane() {
+        let status = |reason: &str| ActionableWakeProducerStatus {
+            reason_code: Some(reason.to_owned()),
+            ..ActionableWakeProducerStatus::default()
+        };
+        assert!(steward_retry_required(&status("steward_retry_scheduled")));
+        assert!(steward_retry_required(&status(
+            "status_persistence_refused"
+        )));
+        assert!(!steward_retry_required(&status(
+            "dispatch_wedge_observation_retry_scheduled"
+        )));
+        assert!(!steward_retry_required(&status("dispatch_wedge")));
+        assert!(!steward_retry_required(&status(
+            "dispatch_wedge_publication_refused"
+        )));
     }
 
     #[cfg(unix)]

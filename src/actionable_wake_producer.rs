@@ -1122,6 +1122,52 @@ impl ActionableWakeProducer {
         )
     }
 
+    pub(crate) fn retain_dispatch_scope_after_steward_failure_at_generation(
+        &mut self,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+        generation: u64,
+    ) -> ActionableWakeProducerStatus {
+        if !self.dispatch_state_available {
+            return self.record(
+                repository.to_owned(),
+                pull_request,
+                head_sha.to_owned(),
+                "uncertain",
+                Some("dispatch_probe_state_unreadable".to_owned()),
+                false,
+            );
+        }
+        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        let previous = self.status.dispatch_targets.get(&key).cloned();
+        let Some(target) = self.status.dispatch_targets.get_mut(&key) else {
+            return self.status();
+        };
+        if target.generation != generation {
+            return self.status();
+        }
+        if target.pending_publication.is_some() {
+            return self.publish_pending_dispatch_wedge(repository, pull_request, head_sha);
+        }
+        target.observations.clear();
+        target.schedule = None;
+        let status = self.record(
+            repository.to_owned(),
+            pull_request,
+            head_sha.to_owned(),
+            "uncertain",
+            Some("steward_retry_scheduled".to_owned()),
+            false,
+        );
+        if status.state == "status_persistence_error"
+            && let Some(previous) = previous
+        {
+            self.status.dispatch_targets.insert(key, previous);
+        }
+        status
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn reschedule_dispatch_probe_at_generation(
         &mut self,
@@ -1334,11 +1380,11 @@ impl ActionableWakeProducer {
     pub(crate) fn retain_dispatch_targets(
         &mut self,
         active: &std::collections::BTreeSet<(String, u64, String)>,
-    ) {
+    ) -> ActionableWakeProducerStatus {
         if !self.dispatch_state_available {
-            return;
+            return self.status();
         }
-        let before = self.status.dispatch_targets.len();
+        let previous = self.status.dispatch_targets.clone();
         self.status.dispatch_targets.retain(|_, target| {
             active.iter().any(|(repository, pull_request, head_sha)| {
                 repository.eq_ignore_ascii_case(&target.repository)
@@ -1346,9 +1392,16 @@ impl ActionableWakeProducer {
                     && head_sha.eq_ignore_ascii_case(&target.head_sha)
             })
         });
-        if self.status.dispatch_targets.len() != before {
-            let _ = self.persist_status();
+        if self.status.dispatch_targets.len() == previous.len() {
+            return self.status();
         }
+        if self.persist_status().is_err() {
+            self.status.dispatch_targets = previous;
+            "status_persistence_error".clone_into(&mut self.status.state);
+            self.status.reason_code = Some("status_persistence_refused".to_owned());
+            self.status.wake_enqueued = false;
+        }
+        self.status()
     }
 
     fn prune_empty_dispatch_target(&mut self, key: &str) {
@@ -2436,6 +2489,56 @@ mod tests {
     }
 
     #[test]
+    fn inventory_prune_persistence_failure_rolls_back_and_survives_restart() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let due_at = Utc::now() - chrono::Duration::seconds(1);
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.process_dispatch_wedge_cycle(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            std::slice::from_ref(&observation),
+            300,
+        );
+        producer.process_dispatch_wedge_cycle(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            std::slice::from_ref(&observation),
+            300,
+        );
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            due_at,
+        );
+
+        let daemon_dir = state.path().join("daemon");
+        let saved_dir = state.path().join("daemon-saved");
+        std::fs::rename(&daemon_dir, &saved_dir).expect("move daemon state");
+        std::fs::write(&daemon_dir, b"block aggregate persistence").expect("block daemon dir");
+        let refused = producer.retain_dispatch_targets(&std::collections::BTreeSet::new());
+        assert_eq!(refused.state, "status_persistence_error");
+        assert_eq!(producer.status.dispatch_targets.len(), 1);
+        let retained = producer.status.dispatch_targets.values().next().unwrap();
+        assert!(retained.schedule.is_some());
+        assert!(!retained.observations.is_empty());
+        assert!(retained.pending_publication.is_some());
+
+        std::fs::remove_file(&daemon_dir).expect("remove blocker");
+        std::fs::rename(&saved_dir, &daemon_dir).expect("restore daemon state");
+        let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        let due = restarted.due_dispatch_probes(Utc::now(), usize::MAX);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].pull_request, observation.authority.pull_request);
+        let retained = restarted.status.dispatch_targets.values().next().unwrap();
+        assert!(!retained.observations.is_empty());
+        assert!(retained.pending_publication.is_some());
+    }
+
+    #[test]
     fn pending_publication_survives_restart_and_assigned_or_absent_probe() {
         let state = tempfile::tempdir().expect("state");
         let observation = dispatch_observation();
@@ -2941,6 +3044,55 @@ mod tests {
         let due = restarted.due_dispatch_probes(retry_at + chrono::Duration::seconds(1), 10);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].pull_request, observation.authority.pull_request);
+    }
+
+    #[test]
+    fn failed_steward_retains_scope_for_restart_without_entering_observer_lane() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now(),
+        );
+        let generation = producer
+            .begin_dispatch_wedge_cycle_for_repository(
+                test_repository_provider(),
+                test_repository_id(),
+                &observation.authority.repository,
+                observation.authority.pull_request,
+                &observation.authority.pull_request_head,
+            )
+            .expect("generation");
+        let status = producer.retain_dispatch_scope_after_steward_failure_at_generation(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            generation,
+        );
+        assert_eq!(status.state, "uncertain");
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some("steward_retry_scheduled")
+        );
+        let target = producer
+            .status
+            .dispatch_targets
+            .values()
+            .next()
+            .expect("retained target");
+        assert!(target.schedule.is_none());
+        assert!(target.observations.is_empty());
+
+        let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        assert_eq!(restarted.status.dispatch_targets.len(), 1);
+        assert!(
+            restarted
+                .due_dispatch_probes(Utc::now(), usize::MAX)
+                .is_empty()
+        );
     }
 
     #[test]
