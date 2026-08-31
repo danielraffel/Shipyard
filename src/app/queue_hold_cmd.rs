@@ -29,7 +29,7 @@ use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::parallel_proof::Sha256Digest;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 use crate::queue::Queue;
 use crate::worker_process_custody::{ProcessLiveness, process_id_liveness};
 

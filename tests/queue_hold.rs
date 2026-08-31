@@ -1,6 +1,6 @@
-#![cfg(target_os = "macos")]
-
 //! Concurrent contract tests for the live local queue-admission hold.
+
+#![cfg(target_os = "macos")]
 
 use std::fs;
 use std::os::unix::process::ExitStatusExt as _;
