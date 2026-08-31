@@ -170,8 +170,14 @@ pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
         verify_marker(&checkout.path, &checkout.marker)?;
     }
     persist_cleanup_receipt(checkout)?;
-    fs::remove_file(marker_path(&checkout.path))
+    let marker_path = marker_path(&checkout.path);
+    fs::remove_file(&marker_path)
         .map_err(|error| format!("remove completed integration marker: {error}"))?;
+    sync_directory(
+        marker_path
+            .parent()
+            .ok_or_else(|| "integration marker has no parent directory".to_owned())?,
+    )?;
     Ok(())
 }
 
@@ -268,6 +274,11 @@ fn persist_or_verify_marker(path: &Path, marker: &CheckoutMarker) -> Result<(), 
         }
         Err(error) => return Err(format!("create integration marker: {error}")),
     }
+    sync_directory(
+        marker_path
+            .parent()
+            .ok_or_else(|| "integration marker has no parent directory".to_owned())?,
+    )?;
     Ok(())
 }
 
@@ -327,7 +338,14 @@ fn persist_cleanup_receipt(checkout: &IntegrationCheckout) -> Result<(), String>
         }
         Err(error) => return Err(format!("create integration cleanup receipt: {error}")),
     }
+    sync_directory(&checkout.evidence_dir)?;
     Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync integration evidence directory: {error}"))
 }
 
 fn exact_git(cwd: &Path, args: &[&str], expected: &str) -> Result<(), String> {
