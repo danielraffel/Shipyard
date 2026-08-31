@@ -110,8 +110,10 @@ fn materialize(
 ) -> Result<IntegrationCheckout, String> {
     ensure_real_directory(checkout_parent)?;
     let checkout = checkout_from_receipt(source_repo, checkout_parent, receipt)?;
-    let _materialize_guard = acquire_fence(&checkout.lock_path)?;
+    let materialize_guard = acquire_fence(&checkout.lock_path)?;
     ensure_materialized(&checkout)?;
+    fs2::FileExt::unlock(&materialize_guard)
+        .map_err(|error| format!("release integration materialization fence: {error}"))?;
     Ok(checkout)
 }
 
