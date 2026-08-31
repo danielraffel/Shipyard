@@ -1,5 +1,5 @@
-#![cfg(target_os = "macos")]
 //! Production-shaped installed auth-generation acceptance controls.
+#![cfg(target_os = "macos")]
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -14,6 +14,10 @@ fn write_private(path: &Path, contents: &[u8], mode: u32) {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the acceptance control intentionally keeps one ordered installed-path scenario"
+)]
 fn installed_generation_uses_real_sibling_shipyard_and_machine_global_auth_under_env_i() {
     let temp = tempfile::tempdir().expect("fixture home");
     let home = temp.path();

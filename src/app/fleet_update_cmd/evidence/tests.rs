@@ -44,7 +44,7 @@ fn local_refresh_pid_survives_preceding_update_event_stream() {
 
 #[test]
 fn local_auth_launch_probe_requires_the_exact_typed_credential_contract() {
-    let plan = super::super::host_update_plan(&host(None), "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
     let valid = serde_json::json!({
         "schema_version": 1,
         "command": "auth.helper-argv",
@@ -92,7 +92,7 @@ fn local_auth_launch_probe_requires_the_exact_typed_credential_contract() {
 
 #[test]
 fn local_generation_context_binds_mode_and_global_directory() {
-    let plan = super::super::host_update_plan(&host(None), "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
     let temp = tempfile::tempdir().expect("temp dir");
     let path = temp.path().join("ghapp.shipyard-context.json");
     let generation_id = "7".repeat(64);

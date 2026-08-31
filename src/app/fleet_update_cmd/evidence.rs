@@ -697,6 +697,8 @@ fn collect_generation_member(
             path.display()
         ))
     })?;
+    #[cfg(not(unix))]
+    let _ = &metadata;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -940,6 +942,8 @@ fn validate_generation_parent(directory: &Path, private: bool) -> Result<(), Pla
             directory.display()
         ))
     })?;
+    #[cfg(not(unix))]
+    let _ = (&metadata, private);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1003,6 +1007,8 @@ fn validate_generation_member(target: &Path) -> Result<(), PlanExecutionError> {
             target.display()
         ))
     })?;
+    #[cfg(not(unix))]
+    let _ = &target_metadata;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1026,7 +1032,12 @@ fn validate_generation_target_shape(
     plan: &HostUpdatePlan,
 ) -> Result<PathBuf, PlanExecutionError> {
     let root = generation_root(plan)?;
-    if !root.is_absolute() || !target.is_absolute() {
+    let paths_are_absolute = if plan.ssh.is_some() {
+        super::is_lexically_normal_absolute(&root) && super::is_lexically_normal_absolute(target)
+    } else {
+        root.is_absolute() && target.is_absolute()
+    };
+    if !paths_are_absolute {
         return Err(PlanExecutionError::Failed(format!(
             "support file {} used a non-absolute generation target",
             path.display()

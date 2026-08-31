@@ -222,13 +222,13 @@ impl ReaderFixture {
 }
 
 fn exercise_continuous_readers(
-    fixture: Arc<ReaderFixture>,
+    fixture: &Arc<ReaderFixture>,
     mutation: impl FnOnce(&ReaderFixture),
 ) -> Vec<Result<String, String>> {
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicUsize::new(0));
     let results = Arc::new(Mutex::new(Vec::new()));
-    let reader_fixture = Arc::clone(&fixture);
+    let reader_fixture = Arc::clone(fixture);
     let reader_stop = Arc::clone(&stop);
     let reader_reads = Arc::clone(&reads);
     let reader_results = Arc::clone(&results);
@@ -250,7 +250,7 @@ fn exercise_continuous_readers(
         );
         thread::sleep(Duration::from_millis(10));
     }
-    mutation(&fixture);
+    mutation(fixture);
     let post_mutation_target = reads.load(Ordering::Acquire) + 2;
     let resume_deadline = Instant::now() + Duration::from_secs(30);
     while reads.load(Ordering::Acquire) < post_mutation_target {
@@ -299,7 +299,7 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
     let mut legacy_wrapper = std::fs::read_to_string(&fixture.wrapper).expect("legacy wrapper");
     let latch = "fi\nif [[ -n \"${SHIPYARD_TEST_OLD_READER_ENTERED:-}\" ]]; then /usr/bin/touch \"$SHIPYARD_TEST_OLD_READER_ENTERED\"; while [[ ! -e \"$SHIPYARD_TEST_OLD_READER_ENTERED.release\" ]]; do /bin/sleep 0.02; done; fi\ncache_dir=";
     assert_eq!(legacy_wrapper.matches("fi\ncache_dir=").count(), 1);
-    legacy_wrapper = legacy_wrapper.replacen("fi\ncache_dir=", &latch, 1);
+    legacy_wrapper = legacy_wrapper.replacen("fi\ncache_dir=", latch, 1);
     ReaderFixture::write_executable(&fixture.wrapper, legacy_wrapper.as_bytes());
 
     let old_reader = Command::new(&fixture.wrapper)
@@ -439,7 +439,7 @@ fn real_wrapper_readers_remain_valid_during_first_generation_migration() {
     fixture.install_direct_legacy_reader();
     assert_eq!(fixture.read_once().expect("legacy read"), "reader-bin");
 
-    let results = exercise_continuous_readers(Arc::clone(&fixture), |fixture| {
+    let results = exercise_continuous_readers(&fixture, |fixture| {
         let output = fixture.run_script_traced(&fixture.transaction_script());
         assert!(
             output.status.success(),
@@ -474,7 +474,7 @@ fn real_wrapper_readers_remain_valid_during_generation_upgrade() {
     fixture.update_release("release-two");
     let fixture = Arc::new(fixture);
 
-    let results = exercise_continuous_readers(Arc::clone(&fixture), |fixture| {
+    let results = exercise_continuous_readers(&fixture, |fixture| {
         assert!(fixture.run_script(&fixture.transaction_script()).success());
     });
 
@@ -519,7 +519,7 @@ fn sigkill_after_generation_publish_preserves_reader_and_recovers_atomically() {
     );
 
     let fixture = Arc::new(fixture);
-    let results = exercise_continuous_readers(Arc::clone(&fixture), |fixture| {
+    let results = exercise_continuous_readers(&fixture, |fixture| {
         assert!(
             fixture.run_script(&fixture.transaction_script()).success(),
             "successor transaction must recover the interrupted journal"
@@ -578,9 +578,7 @@ fn rollback_intent_survives_sigkill_before_first_restore() {
     assert_eq!(script.matches(intent_boundary).count(), 1);
     let interrupted = script.replacen(
         intent_boundary,
-        &format!(
-            "if [ \"$auth_recovery_phase\" != rollback-intent ]; then auth_write_recovery_phase rollback-intent; fi\n    /bin/kill -9 $$\n    auth_validate_recovery_prior\n    if [ \"$auth_recovery_anchor_id\" != absent ]; then\n"
-        ),
+        "if [ \"$auth_recovery_phase\" != rollback-intent ]; then auth_write_recovery_phase rollback-intent; fi\n    /bin/kill -9 $$\n    auth_validate_recovery_prior\n    if [ \"$auth_recovery_anchor_id\" != absent ]; then\n",
         1,
     );
     let probe = "\"$auth_binary\" --mode \"$auth_mode\" --global-dir \"$auth_global_dir\" auth helper-argv --wrapper \"$auth_wrapper\" --repo \"$auth_probe_repo\" >/dev/null\n";
@@ -802,7 +800,7 @@ fn run_rollback_sigkill_checkpoint(name: &str, target: &str) {
     let interrupted = interrupted.replacen(probe, "/usr/bin/false\n", 1);
 
     let fixture = Arc::new(fixture);
-    let results = exercise_continuous_readers(Arc::clone(&fixture), |fixture| {
+    let results = exercise_continuous_readers(&fixture, |fixture| {
         assert!(
             !fixture.run_script(&interrupted).success(),
             "rollback checkpoint {name} unexpectedly completed"
