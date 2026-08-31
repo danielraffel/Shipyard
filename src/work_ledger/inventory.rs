@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     WorkLedger, WorkLedgerError, WorkLedgerResult, is_canonical_repo_slug, validate_opaque_ref,
-    validate_workstream_handle, verify_integrity, verify_supported_schema,
+    validate_workstream_handle, verify_integrity, verify_open_lineage, verify_supported_schema,
 };
 
 /// Maximum number of local work records returned by one inventory call.
@@ -20,6 +20,13 @@ pub const MAX_LOCAL_WORK_INVENTORY_ITEMS: usize = 256;
 
 const MAX_LEDGER_DATABASE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SQLITE_SIDECAR_BYTES: u64 = 4 * 1024 * 1024;
+const LEGACY_INVENTORY_SCHEMA_VERSION: i64 = 11;
+
+#[derive(Clone, Copy)]
+enum InventorySchema {
+    Current,
+    LegacyV11,
+}
 
 /// A bounded local inventory response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -98,11 +105,11 @@ fn local_work_inventory_with_preopen_hook(
 
     let connection = connect_immutable(&path)?;
     validate_database_resources(&connection)?;
-    verify_supported_schema(&connection)?;
-    validate_inventory_rows_sql_side(&connection)?;
+    let schema = verify_inventory_schema(&connection)?;
+    validate_inventory_rows_sql_side(&connection, schema)?;
     verify_integrity(&connection)?;
 
-    let mut selected = load_inventory_rows(&connection)?;
+    let mut selected = load_inventory_rows(&connection, schema)?;
     let truncated = selected.len() > MAX_LOCAL_WORK_INVENTORY_ITEMS;
     selected.truncate(MAX_LOCAL_WORK_INVENTORY_ITEMS);
     let mut items = Vec::with_capacity(selected.len());
@@ -129,9 +136,100 @@ fn local_work_inventory_with_preopen_hook(
 
 type InventoryRow = (LocalWorkInventoryItem, Option<String>, Option<String>);
 
-fn load_inventory_rows(connection: &Connection) -> WorkLedgerResult<Vec<InventoryRow>> {
+fn verify_inventory_schema(connection: &Connection) -> WorkLedgerResult<InventorySchema> {
+    let version = super::schema_version(connection)?;
+    match version {
+        super::SCHEMA_VERSION => {
+            verify_supported_schema(connection)?;
+            Ok(InventorySchema::Current)
+        }
+        LEGACY_INVENTORY_SCHEMA_VERSION => {
+            verify_open_lineage(connection, version)?;
+            verify_legacy_inventory_schema(connection)?;
+            Ok(InventorySchema::LegacyV11)
+        }
+        _ => Err(WorkLedgerError::UnsupportedSchema(version)),
+    }
+}
+
+fn verify_legacy_inventory_schema(connection: &Connection) -> WorkLedgerResult<()> {
+    // Exact sqlite_schema object sets produced by Shipyard v0.139.1 schema v11.
+    // This binds table constraints, automatic/named indexes, and every trigger
+    // owned by each table, rather than trusting column metadata alone.
+    for (table, expected) in [
+        (
+            "workstream_projection_bindings",
+            "93ad7a2dfb12e804a7589013803975e5f54a73eb413f5c999cfc24d34f512b52",
+        ),
+        (
+            "work_items",
+            "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9",
+        ),
+        (
+            "agent_ownership",
+            "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d",
+        ),
+    ] {
+        let actual = schema_objects_digest(connection, table)?;
+        if actual != expected {
+            return Err(WorkLedgerError::Refused(format!(
+                "schema v11 inventory table {table} is missing or altered"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn schema_objects_digest(connection: &Connection, table: &str) -> WorkLedgerResult<String> {
     let mut statement = connection.prepare(
-        "SELECT binding.repository_provider, binding.repository_id,
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema
+          WHERE tbl_name = ?1 ORDER BY type, name",
+    )?;
+    let objects = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"shipyard.work-ledger.inventory-schema.v11\0");
+    for (kind, name, owner, sql) in objects {
+        for value in [kind, name, owner] {
+            let length = u64::try_from(value.len()).map_err(|_| {
+                WorkLedgerError::Refused("schema object identity is too large".to_owned())
+            })?;
+            hasher.update(length.to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        match sql {
+            Some(sql) => {
+                hasher.update([1]);
+                let length = u64::try_from(sql.len()).map_err(|_| {
+                    WorkLedgerError::Refused("schema object SQL is too large".to_owned())
+                })?;
+                hasher.update(length.to_le_bytes());
+                hasher.update(sql.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn load_inventory_rows(
+    connection: &Connection,
+    schema: InventorySchema,
+) -> WorkLedgerResult<Vec<InventoryRow>> {
+    let repository_identity = match schema {
+        InventorySchema::Current => "binding.repository_provider, binding.repository_id",
+        InventorySchema::LegacyV11 => "NULL, NULL",
+    };
+    let mut statement = connection.prepare(&format!(
+        "SELECT {repository_identity},
                 binding.repository, work.pr, binding.exact_head, work.phase,
                 binding.workstream_handle, work.id, work.work_generation,
                 work.owner_id, work.owner_generation, ownership.ownership_id,
@@ -145,8 +243,8 @@ fn load_inventory_rows(connection: &Connection) -> WorkLedgerResult<Vec<Inventor
             AND ownership.owner_generation = work.owner_generation
           ORDER BY binding.repository, work.pr, binding.exact_head,
                    binding.workstream_handle, work.id
-          LIMIT ?1",
-    )?;
+          LIMIT ?1"
+    ))?;
     let limit = i64::try_from(MAX_LOCAL_WORK_INVENTORY_ITEMS + 1)
         .map_err(|_| WorkLedgerError::Refused("inventory limit is invalid".to_owned()))?;
     let rows = statement.query_map([limit], |row| {
@@ -513,7 +611,10 @@ fn validate_database_resources(connection: &Connection) -> WorkLedgerResult<()> 
     Ok(())
 }
 
-fn validate_inventory_rows_sql_side(connection: &Connection) -> WorkLedgerResult<()> {
+fn validate_inventory_rows_sql_side(
+    connection: &Connection,
+    schema: InventorySchema,
+) -> WorkLedgerResult<()> {
     let unbound: bool = connection.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM work_items work
@@ -529,8 +630,21 @@ fn validate_inventory_rows_sql_side(connection: &Connection) -> WorkLedgerResult
             "zero-write inventory found an unbound local work row".to_owned(),
         ));
     }
+    let repository_identity_validation = match schema {
+        InventorySchema::Current => {
+            "OR ((binding.repository_provider IS NULL)
+                   != (binding.repository_id IS NULL))
+               OR (binding.repository_provider IS NOT NULL AND
+                   (typeof(binding.repository_provider) != 'text'
+                    OR length(CAST(binding.repository_provider AS BLOB)) NOT BETWEEN 3 AND 64
+                    OR typeof(binding.repository_id) != 'text'
+                    OR length(CAST(binding.repository_id AS BLOB)) NOT BETWEEN 1 AND 512))"
+        }
+        InventorySchema::LegacyV11 => "",
+    };
     let invalid: bool = connection.query_row(
-        "SELECT EXISTS(
+        &format!(
+            "SELECT EXISTS(
            SELECT 1
              FROM workstream_projection_bindings binding
              JOIN work_items work ON work.id = binding.work_item_id
@@ -540,13 +654,7 @@ fn validate_inventory_rows_sql_side(connection: &Connection) -> WorkLedgerResult
               AND ownership.owner_generation = work.owner_generation
             WHERE typeof(binding.repository) != 'text'
                OR length(CAST(binding.repository AS BLOB)) NOT BETWEEN 3 AND 255
-               OR ((binding.repository_provider IS NULL)
-                   != (binding.repository_id IS NULL))
-               OR (binding.repository_provider IS NOT NULL AND
-                   (typeof(binding.repository_provider) != 'text'
-                    OR length(CAST(binding.repository_provider AS BLOB)) NOT BETWEEN 3 AND 64
-                    OR typeof(binding.repository_id) != 'text'
-                    OR length(CAST(binding.repository_id AS BLOB)) NOT BETWEEN 1 AND 512))
+               {repository_identity_validation}
                OR typeof(binding.exact_head) != 'text'
                OR length(CAST(binding.exact_head AS BLOB)) != 40
                OR typeof(binding.workstream_handle) != 'text'
@@ -574,7 +682,8 @@ fn validate_inventory_rows_sql_side(connection: &Connection) -> WorkLedgerResult
                     OR ownership.work_generation <= 0
                     OR typeof(ownership.owner_generation) != 'integer'
                     OR ownership.owner_generation <= 0))
-         )",
+         )"
+        ),
         [],
         |row| row.get(0),
     )?;
@@ -779,6 +888,220 @@ mod tests {
             .expect("bind workstream");
     }
 
+    fn seed_production_v11(
+        ledger: &WorkLedger,
+        repository: &str,
+        pull_request: u64,
+        handle: &str,
+        label: &str,
+    ) {
+        let head = digest(label.as_bytes())[..40].to_owned();
+        let imported = candidate(repository, pull_request, &head, label);
+        let work_id = imported.work_id.clone();
+        ledger.import(&[imported]).expect("v11 work item");
+        let connection = ledger.connect_read_write().expect("v11 fixture connection");
+        connection
+            .execute_batch(
+                "DROP TABLE workstream_projection_bindings;
+                 CREATE TABLE workstream_projection_bindings (
+                   work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT,
+                   workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
+                   plan_sha256 TEXT NOT NULL
+                     CHECK(length(plan_sha256) = 64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+                   root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
+                   issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
+                   projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
+                   material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
+                   repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
+                   exact_head TEXT NOT NULL
+                     CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
+                   created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+                   UNIQUE(workstream_handle, repository, exact_head)
+                 );
+                 CREATE TRIGGER workstream_projection_binding_identity_immutable
+                 BEFORE UPDATE OF work_item_id, workstream_handle, plan_sha256, root_revision,
+                                  issue_revision, projection_revision, material_event_revision,
+                                  repository, created_at
+                 ON workstream_projection_bindings
+                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
+                 CREATE TRIGGER workstream_projection_binding_no_delete
+                 BEFORE DELETE ON workstream_projection_bindings
+                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
+                 PRAGMA user_version = 11;",
+            )
+            .expect("production v11 binding schema");
+        connection
+            .execute(
+                "INSERT INTO workstream_projection_bindings
+                 (work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
+                  projection_revision, material_event_revision, repository, exact_head, created_at)
+                 VALUES (?1, ?2, ?3, 1, 1, 1, 1, ?4, ?5, '2026-08-31T00:00:00Z')",
+                rusqlite::params![work_id, handle, digest(b"v11 plan"), repository, head],
+            )
+            .expect("v11 binding");
+    }
+
+    fn replace_v11_binding_schema(
+        connection: &Connection,
+        work_item_column: &str,
+        handle_column: &str,
+        unique_constraint: &str,
+    ) {
+        connection
+            .execute_batch(&format!(
+                "DROP TABLE workstream_projection_bindings;
+                 CREATE TABLE workstream_projection_bindings (
+                   {work_item_column},
+                   {handle_column},
+                   plan_sha256 TEXT NOT NULL
+                     CHECK(length(plan_sha256) = 64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+                   root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
+                   issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
+                   projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
+                   material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
+                   repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
+                   exact_head TEXT NOT NULL
+                     CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
+                   created_at TEXT NOT NULL CHECK(length(created_at) >= 20)
+                   {unique_constraint}
+                 );
+                 CREATE TRIGGER workstream_projection_binding_identity_immutable
+                 BEFORE UPDATE OF work_item_id, workstream_handle, plan_sha256, root_revision,
+                                  issue_revision, projection_revision, material_event_revision,
+                                  repository, created_at
+                 ON workstream_projection_bindings
+                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
+                 CREATE TRIGGER workstream_projection_binding_no_delete
+                 BEFORE DELETE ON workstream_projection_bindings
+                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;"
+            ))
+            .expect("replace v11 binding schema");
+    }
+
+    fn assert_v11_schema_mutation_refuses(label: &str, mutation: impl FnOnce(&Connection)) {
+        let state = tempfile::tempdir().expect("state");
+        let ledger = WorkLedger::open(state.path()).expect("ledger");
+        seed_production_v11(&ledger, "alpha/repo", 7, "GEN-7", label);
+        let connection = ledger.connect_read_write().expect("fixture connection");
+        mutation(&connection);
+        drop(connection);
+        drop(ledger);
+        #[cfg(unix)]
+        let before = snapshot(state.path());
+
+        let error = local_work_inventory(state.path()).expect_err("schema drift must refuse");
+
+        assert!(error.to_string().contains("missing or altered"));
+        #[cfg(unix)]
+        assert_eq!(snapshot(state.path()), before);
+    }
+
+    #[test]
+    fn production_v11_inventory_is_truthful_and_zero_write() {
+        let state = tempfile::tempdir().expect("state");
+        let ledger = WorkLedger::open(state.path()).expect("ledger");
+        seed_production_v11(&ledger, "alpha/repo", 7, "GEN-7", "production-v11");
+        drop(ledger);
+        #[cfg(unix)]
+        let before = snapshot(state.path());
+
+        let inventory = local_work_inventory(state.path()).expect("v11 inventory");
+
+        #[cfg(unix)]
+        assert_eq!(snapshot(state.path()), before);
+        assert!(!inventory.complete);
+        assert!(!inventory.truncated);
+        assert_eq!(inventory.items.len(), 1);
+        assert_eq!(inventory.items[0].repository_provider, None);
+        assert_eq!(inventory.items[0].repository_id, None);
+        assert_eq!(inventory.items[0].repository, "alpha/repo");
+        assert_eq!(inventory.items[0].pull_request, 7);
+        assert_eq!(inventory.items[0].workstream_handle, "GEN-7");
+    }
+
+    #[test]
+    fn v11_inventory_refuses_lineage_and_column_drift_zero_write() {
+        let bad_lineage = tempfile::tempdir().expect("bad lineage state");
+        let ledger = WorkLedger::open(bad_lineage.path()).expect("ledger");
+        seed_production_v11(&ledger, "alpha/repo", 7, "GEN-7", "bad-lineage");
+        let connection = ledger.connect_read_write().expect("fixture connection");
+        connection
+            .execute_batch("DROP TRIGGER ledger_schema_identity_immutable;")
+            .expect("alter lineage");
+        drop(connection);
+        drop(ledger);
+        #[cfg(unix)]
+        let before = snapshot(bad_lineage.path());
+        let error = local_work_inventory(bad_lineage.path()).expect_err("lineage must refuse");
+        assert!(error.to_string().contains("identity"));
+        #[cfg(unix)]
+        assert_eq!(snapshot(bad_lineage.path()), before);
+
+        let column_drift = tempfile::tempdir().expect("column drift state");
+        let ledger = WorkLedger::open(column_drift.path()).expect("ledger");
+        seed_production_v11(&ledger, "alpha/repo", 7, "GEN-7", "column-drift");
+        let connection = ledger.connect_read_write().expect("fixture connection");
+        connection
+            .execute_batch("ALTER TABLE work_items ADD COLUMN surprise TEXT;")
+            .expect("alter columns");
+        drop(connection);
+        drop(ledger);
+        #[cfg(unix)]
+        let before = snapshot(column_drift.path());
+        let error = local_work_inventory(column_drift.path()).expect_err("drift must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("work_items is missing or altered")
+        );
+        #[cfg(unix)]
+        assert_eq!(snapshot(column_drift.path()), before);
+    }
+
+    #[test]
+    fn v11_inventory_refuses_same_column_ddl_and_object_drift_zero_write() {
+        const WORK_ITEM_WITH_FK: &str =
+            "work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT";
+        const WORK_ITEM_WITHOUT_FK: &str = "work_item_id TEXT PRIMARY KEY";
+        const HANDLE_WITH_CHECK: &str = "workstream_handle TEXT NOT NULL \
+CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
+        const HANDLE_WITHOUT_CHECK: &str = "workstream_handle TEXT NOT NULL";
+        const UNIQUE: &str = ", UNIQUE(workstream_handle, repository, exact_head)";
+
+        assert_v11_schema_mutation_refuses("removed-fk", |connection| {
+            replace_v11_binding_schema(connection, WORK_ITEM_WITHOUT_FK, HANDLE_WITH_CHECK, UNIQUE);
+        });
+        assert_v11_schema_mutation_refuses("removed-check", |connection| {
+            replace_v11_binding_schema(connection, WORK_ITEM_WITH_FK, HANDLE_WITHOUT_CHECK, UNIQUE);
+        });
+        assert_v11_schema_mutation_refuses("removed-unique", |connection| {
+            replace_v11_binding_schema(connection, WORK_ITEM_WITH_FK, HANDLE_WITH_CHECK, "");
+        });
+        assert_v11_schema_mutation_refuses("removed-trigger", |connection| {
+            connection
+                .execute_batch("DROP TRIGGER workstream_projection_binding_no_delete;")
+                .expect("remove trigger");
+        });
+        assert_v11_schema_mutation_refuses("altered-trigger", |connection| {
+            connection
+                .execute_batch(
+                    "DROP TRIGGER workstream_projection_binding_identity_immutable;
+                     CREATE TRIGGER workstream_projection_binding_identity_immutable
+                     BEFORE UPDATE ON workstream_projection_bindings
+                     BEGIN SELECT RAISE(ABORT, 'altered'); END;",
+                )
+                .expect("alter trigger");
+        });
+        assert_v11_schema_mutation_refuses("altered-index", |connection| {
+            connection
+                .execute_batch(
+                    "DROP INDEX work_items_nonterminal;
+                     CREATE INDEX work_items_nonterminal ON work_items(phase, id);",
+                )
+                .expect("alter index");
+        });
+    }
+
     #[test]
     fn inventory_is_repository_scoped_and_deterministically_sorted() {
         let state = tempfile::tempdir().expect("state");
@@ -855,55 +1178,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn migrated_legacy_binding_has_unknown_immutable_identity_and_is_incomplete() {
         let state = tempfile::tempdir().expect("state");
         let ledger = WorkLedger::open(state.path()).expect("ledger");
-        let head = "a".repeat(40);
-        let plan_sha256 = digest(b"legacy plan");
-        let imported = candidate("alpha/repo", 7, &head, "legacy-v11");
-        let work_id = imported.work_id.clone();
-        ledger.import(&[imported]).expect("legacy work");
-        let connection = ledger.connect_read_write().expect("fixture connection");
-        connection
-            .execute_batch(
-                "DROP TRIGGER workstream_projection_binding_no_delete;
-                 DROP TRIGGER workstream_projection_binding_identity_immutable;
-                 DROP TRIGGER IF EXISTS workstream_projection_binding_repository_identity_complete;
-                 DROP TABLE workstream_projection_bindings;
-                 CREATE TABLE workstream_projection_bindings (
-                   work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT,
-                   workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
-                   plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
-                   root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
-                   issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
-                   projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
-                   material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
-                   repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
-                   exact_head TEXT NOT NULL CHECK(length(exact_head) = 40),
-                   created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
-                   UNIQUE(workstream_handle, repository, exact_head)
-                 );
-                 CREATE TRIGGER workstream_projection_binding_identity_immutable
-                 BEFORE UPDATE ON workstream_projection_bindings
-                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
-                 CREATE TRIGGER workstream_projection_binding_no_delete
-                 BEFORE DELETE ON workstream_projection_bindings
-                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
-                 PRAGMA user_version = 11;",
-            )
-            .expect("exact v11 binding schema");
-        connection
-            .execute(
-                "INSERT INTO workstream_projection_bindings
-                 (work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
-                  projection_revision, material_event_revision, repository, exact_head, created_at)
-                 VALUES (?1, 'GEN-7', ?2, 1, 1, 1, 1, 'alpha/repo', ?3,
-                         '2026-08-31T00:00:00Z')",
-                rusqlite::params![work_id, plan_sha256, head],
-            )
-            .expect("legacy binding");
-        drop(connection);
+        seed_production_v11(&ledger, "alpha/repo", 7, "GEN-7", "legacy-v11");
+        drop(ledger);
 
         WorkLedger::open(state.path()).expect("migrate v11");
         let inventory = local_work_inventory(state.path()).expect("legacy inventory");
@@ -998,7 +1277,8 @@ mod tests {
             )
             .expect("historical ownership");
 
-        let rows = load_inventory_rows(&connection).expect("inventory rows");
+        let rows =
+            load_inventory_rows(&connection, InventorySchema::Current).expect("inventory rows");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0.work_generation, 2);
@@ -1070,10 +1350,14 @@ mod tests {
             .pragma_update(None, "user_version", super::super::SCHEMA_VERSION + 1)
             .expect("plant newer schema");
         drop(connection);
+        #[cfg(unix)]
+        let before = snapshot(state.path());
         assert!(matches!(
             local_work_inventory(state.path()),
             Err(WorkLedgerError::UnsupportedSchema(_))
         ));
+        #[cfg(unix)]
+        assert_eq!(snapshot(state.path()), before);
     }
 
     #[cfg(unix)]
