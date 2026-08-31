@@ -45,10 +45,18 @@ pub(crate) fn daemon_steward_repository(
     mode: crate::identity::RuntimeMode,
     runtime_paths: &crate::paths::RuntimePaths,
     cwd: &std::path::Path,
+    repository_provider: &str,
+    repository_id: &str,
     repository: &str,
     base_ref: &str,
 ) -> Result<(), String> {
     let actions = crate::cloud::GitHubActions::from_cwd(mode, cwd).with_repo_override(repository);
+    merge_steward_cmd::verify_native_repository_identity(
+        &actions,
+        repository_provider,
+        repository_id,
+        repository,
+    )?;
     let args = merge_steward_cmd::StewardCommandArgs {
         repos: vec![repository.to_owned()],
         base: base_ref.to_owned(),

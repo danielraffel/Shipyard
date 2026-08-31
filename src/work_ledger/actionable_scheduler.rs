@@ -6,10 +6,7 @@
 
 use serde::Serialize;
 
-use super::{
-    LifecycleState, OptionalExtension, WakeIntent, WorkLedger, WorkLedgerError, WorkLedgerResult,
-    params,
-};
+use super::{LifecycleState, WakeIntent, WorkLedger, WorkLedgerError, WorkLedgerResult, params};
 
 /// A zero-model steward disposition for one exact managed PR head.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,44 +50,93 @@ impl WorkLedger {
     /// reconciliation. Unlike the GitHub shadow projection, this recovery
     /// inventory does not depend on repository polling policy being present.
     #[cfg(unix)]
-    pub(crate) fn native_steward_targets(&self) -> WorkLedgerResult<Vec<(String, u64, String)>> {
+    #[allow(clippy::type_complexity)] // Preserve the complete durable repository target key.
+    pub(crate) fn native_steward_targets(
+        &self,
+    ) -> WorkLedgerResult<Vec<(Option<String>, Option<String>, String, u64, String)>> {
         let connection = self.connect_read_only()?;
         let mut statement = connection.prepare(
-            "SELECT lower(repo), pr, lower(head_sha) FROM work_items
+            "SELECT binding.repository_provider, binding.repository_id,
+                    lower(work.repo), work.pr, lower(work.head_sha)
+               FROM work_items work
+               LEFT JOIN workstream_projection_bindings binding ON binding.work_item_id = work.id
               WHERE kind = 'terminal_handoff'
                 AND phase IN ('managed', 'waiting', 'actionable', 'dispatching',
                               'agent_owned_repair', 'returned')
                 AND pr IS NOT NULL AND pr > 0 AND head_sha IS NOT NULL
               ORDER BY lower(repo), pr, lower(head_sha)",
         )?;
-        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Resolve the exact base ref bound into one native target. The daemon
     /// never guesses `main` when invoking repository stewardship.
     #[cfg(unix)]
+    #[allow(dead_code)] // Explicit compatibility boundary for legacy unbound callers.
     pub(crate) fn native_steward_base_ref(
         &self,
         repo: &str,
         pr: u64,
         head_sha: &str,
     ) -> WorkLedgerResult<Option<String>> {
+        self.native_steward_base_ref_for_repository(None, None, repo, pr, head_sha)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn native_steward_base_ref_for_repository(
+        &self,
+        repository_provider: Option<&str>,
+        repository_id: Option<&str>,
+        repo: &str,
+        pr: u64,
+        head_sha: &str,
+    ) -> WorkLedgerResult<Option<String>> {
+        validate_repository_identity(repository_provider, repository_id)?;
         let connection = self.connect_read_only()?;
-        Ok(connection
-            .query_row(
-                "SELECT base_ref FROM work_items
-              WHERE kind = 'terminal_handoff' AND lower(repo) = lower(?1)
-                AND pr = ?2 AND lower(head_sha) = lower(?3)
+        let mut statement = connection.prepare(
+            "SELECT work.base_ref FROM work_items work
+              LEFT JOIN workstream_projection_bindings binding ON binding.work_item_id = work.id
+              WHERE work.kind = 'terminal_handoff' AND lower(work.repo) = lower(?1)
+                AND work.pr = ?2 AND lower(work.head_sha) = lower(?3)
                 AND phase IN ('managed', 'waiting', 'actionable', 'dispatching',
                               'agent_owned_repair', 'returned')",
-                params![repo, pr, head_sha],
-                |row| row.get(0),
-            )
-            .optional()?)
+        )?;
+        if repository_provider.is_some() {
+            let mut exact = connection.prepare(
+                "SELECT work.base_ref FROM work_items work
+                     JOIN workstream_projection_bindings binding ON binding.work_item_id = work.id
+                    WHERE work.kind = 'terminal_handoff' AND lower(work.repo) = lower(?1)
+                      AND work.pr = ?2 AND lower(work.head_sha) = lower(?3)
+                      AND binding.repository_provider = ?4 AND binding.repository_id = ?5
+                      AND work.phase IN ('managed', 'waiting', 'actionable', 'dispatching',
+                                         'agent_owned_repair', 'returned')
+                     ORDER BY work.id LIMIT 2",
+            )?;
+            let rows = exact
+                .query_map(
+                    params![repo, pr, head_sha, repository_provider, repository_id],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            return unique_base_ref(&rows);
+        }
+        let rows = statement
+            .query_map(params![repo, pr, head_sha], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        unique_base_ref(&rows)
     }
 
     /// Apply a classified steward observation to one exact native publication.
+    #[allow(dead_code)] // Explicit compatibility boundary for legacy unbound callers.
     pub(crate) fn apply_native_steward_disposition(
         &self,
         repo: &str,
@@ -98,12 +144,41 @@ impl WorkLedger {
         head_sha: &str,
         disposition: NativeStewardDisposition,
     ) -> WorkLedgerResult<NativeStewardApplyReport> {
-        self.apply_native_steward_disposition_with(repo, pr, head_sha, disposition, |_| {})
+        self.apply_native_steward_disposition_for_repository(
+            None,
+            None,
+            repo,
+            pr,
+            head_sha,
+            disposition,
+        )
     }
 
-    #[allow(clippy::too_many_lines)] // Kept together so every lifecycle arm shares one reload fence.
+    pub(crate) fn apply_native_steward_disposition_for_repository(
+        &self,
+        repository_provider: Option<&str>,
+        repository_id: Option<&str>,
+        repo: &str,
+        pr: u64,
+        head_sha: &str,
+        disposition: NativeStewardDisposition,
+    ) -> WorkLedgerResult<NativeStewardApplyReport> {
+        self.apply_native_steward_disposition_with(
+            repository_provider,
+            repository_id,
+            repo,
+            pr,
+            head_sha,
+            disposition,
+            |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One exact identity fence and lifecycle reload path.
     fn apply_native_steward_disposition_with<F>(
         &self,
+        repository_provider: Option<&str>,
+        repository_id: Option<&str>,
         repo: &str,
         pr: u64,
         head_sha: &str,
@@ -114,7 +189,10 @@ impl WorkLedger {
         F: FnMut(&str),
     {
         validate_target(repo, pr, head_sha)?;
-        let Some(mut work) = self.native_work_for_target(repo, pr, head_sha)? else {
+        validate_repository_identity(repository_provider, repository_id)?;
+        let Some(mut work) =
+            self.native_work_for_target(repository_provider, repository_id, repo, pr, head_sha)?
+        else {
             return Ok(NativeStewardApplyReport {
                 matched: false,
                 changed: false,
@@ -177,7 +255,13 @@ impl WorkLedger {
                     )?;
                     changed = advanced;
                     work = self
-                        .native_work_for_target(repo, pr, head_sha)?
+                        .native_work_for_target(
+                            repository_provider,
+                            repository_id,
+                            repo,
+                            pr,
+                            head_sha,
+                        )?
                         .ok_or_else(|| {
                             WorkLedgerError::Refused(
                                 "native work disappeared after terminal transition".to_owned(),
@@ -199,7 +283,13 @@ impl WorkLedger {
                         crash_hook("after_actionable");
                     }
                     work = self
-                        .native_work_for_target(repo, pr, head_sha)?
+                        .native_work_for_target(
+                            repository_provider,
+                            repository_id,
+                            repo,
+                            pr,
+                            head_sha,
+                        )?
                         .ok_or_else(|| {
                             WorkLedgerError::Refused(
                                 "native work disappeared after actionable transition".to_owned(),
@@ -239,7 +329,13 @@ impl WorkLedger {
                         crash_hook("after_dispatching");
                     }
                     work = self
-                        .native_work_for_target(repo, pr, head_sha)?
+                        .native_work_for_target(
+                            repository_provider,
+                            repository_id,
+                            repo,
+                            pr,
+                            head_sha,
+                        )?
                         .ok_or_else(|| {
                             WorkLedgerError::Refused(
                                 "native work disappeared after dispatch transition".to_owned(),
@@ -267,25 +363,33 @@ impl WorkLedger {
 
     fn native_work_for_target(
         &self,
+        repository_provider: Option<&str>,
+        repository_id: Option<&str>,
         repo: &str,
         pr: u64,
         head_sha: &str,
     ) -> WorkLedgerResult<Option<NativeWork>> {
         let connection = self.connect_read_only()?;
-        connection
-            .query_row(
-                "SELECT work.id, work.phase, work.work_generation,
+        let mut statement = connection.prepare(
+            "SELECT work.id, work.phase, work.work_generation,
                         work.owner_generation, work.repair_route_ref,
                         object.content_digest
                    FROM work_items work
+                   LEFT JOIN workstream_projection_bindings binding
+                     ON binding.work_item_id = work.id
                    JOIN protected_objects object
                      ON object.work_item_id = work.id
                     AND object.kind = 'launch_profile'
                   WHERE work.kind = 'terminal_handoff'
                     AND lower(work.repo) = ?1 AND work.pr = ?2
                     AND lower(work.head_sha) = ?3
-                  LIMIT 1",
-                params![repo, pr, head_sha],
+                    AND ((?4 IS NULL AND ?5 IS NULL)
+                         OR (binding.repository_provider = ?4 AND binding.repository_id = ?5))
+                  ORDER BY work.id LIMIT 2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![repo, pr, head_sha, repository_provider, repository_id],
                 |row| {
                     Ok(NativeWork {
                         id: row.get(0)?,
@@ -296,9 +400,38 @@ impl WorkLedger {
                         profile_digest: row.get(5)?,
                     })
                 },
-            )
-            .optional()
-            .map_err(Into::into)
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [work] => Ok(Some(work.clone())),
+            _ => Err(WorkLedgerError::Refused(
+                "native steward target repository identity is ambiguous".to_owned(),
+            )),
+        }
+    }
+}
+
+fn validate_repository_identity(
+    repository_provider: Option<&str>,
+    repository_id: Option<&str>,
+) -> WorkLedgerResult<()> {
+    match (repository_provider, repository_id) {
+        (None, None) | (Some(_), Some(_)) => Ok(()),
+        _ => Err(WorkLedgerError::Refused(
+            "native steward repository identity is incomplete".to_owned(),
+        )),
+    }
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn unique_base_ref(rows: &[String]) -> WorkLedgerResult<Option<String>> {
+    match rows {
+        [] => Ok(None),
+        [base_ref] => Ok(Some(base_ref.clone())),
+        _ => Err(WorkLedgerError::Refused(
+            "native steward target repository identity is ambiguous".to_owned(),
+        )),
     }
 }
 
@@ -390,6 +523,8 @@ mod tests {
         let crashed = catch_unwind(AssertUnwindSafe(|| {
             ledger
                 .apply_native_steward_disposition_with(
+                    None,
+                    None,
                     &repo,
                     43,
                     &"a".repeat(40),

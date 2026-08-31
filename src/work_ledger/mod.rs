@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -61,6 +61,7 @@ mod dispatch;
 #[allow(dead_code)] // Enabled with the cross-machine daemon transport canary.
 mod durable_custody;
 mod importer;
+mod inventory;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use delivery_authority::verify_delivery_authority_at;
@@ -122,6 +123,7 @@ pub(crate) use actionable_scheduler::NativeStewardDisposition;
 use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};
+pub use inventory::{LocalWorkInventory, LocalWorkInventoryItem, local_work_inventory};
 pub(crate) use lifecycle::deterministic_wake_id;
 pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};
 #[cfg(unix)]
@@ -129,7 +131,7 @@ pub(crate) use native_publication::bind_legacy_native_policy;
 #[allow(unused_imports)] // Consumed by the CLI/runtime integration follow-up.
 pub(crate) use native_publication::{
     ExactProtectedProfileResolver, NativePublicationReport, NativePublicationRequest,
-    verify_native_policy_binding,
+    verify_native_policy_binding, verify_native_policy_binding_for_repository,
 };
 pub use observation::ShadowPrTarget;
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
@@ -430,6 +432,25 @@ pub(super) fn validate_candidate(candidate: &ImportCandidate) -> WorkLedgerResul
 fn validate_token(name: &str, value: &str) -> WorkLedgerResult<()> {
     if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
         return Err(WorkLedgerError::Refused(format!("invalid {name}")));
+    }
+    Ok(())
+}
+
+/// Validate the one canonical Linear-style durable workstream handle grammar.
+pub(crate) fn validate_workstream_handle(value: &str) -> WorkLedgerResult<()> {
+    let Some(number) = value.strip_prefix("GEN-") else {
+        return Err(WorkLedgerError::Refused(
+            "invalid canonical workstream handle".to_owned(),
+        ));
+    };
+    let valid = !number.is_empty()
+        && !number.starts_with('0')
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && value.len() <= 128;
+    if !valid {
+        return Err(WorkLedgerError::Refused(
+            "invalid canonical workstream handle".to_owned(),
+        ));
     }
     Ok(())
 }

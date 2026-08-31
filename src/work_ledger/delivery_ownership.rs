@@ -763,17 +763,7 @@ impl WorkLedger {
             |row| row.get(0),
         )?;
         if projection_bound {
-            let rebound = transaction.execute(
-                "UPDATE workstream_projection_bindings SET exact_head = ?1
-                  WHERE work_item_id = ?2 AND exact_head = ?3",
-                params![expected.head_sha, authority.0, request.resume.head_sha],
-            )?;
-            if rebound != 1 {
-                return Err(WorkLedgerError::Refused(
-                    "workstream projection exact-head binding changed during return".to_owned(),
-                ));
-            }
-            Self::stage_projection_intent(
+            Self::stage_projection_intent_for_head(
                 &transaction,
                 &authority.0,
                 expected_work_generation + 1,
@@ -784,8 +774,19 @@ impl WorkLedger {
                 LifecycleState::Returned.as_str(),
                 &receipt_digest,
                 None,
+                Some(&expected.head_sha),
                 &now,
             )?;
+            let rebound = transaction.execute(
+                "UPDATE workstream_projection_bindings SET exact_head = ?1
+                  WHERE work_item_id = ?2 AND exact_head = ?3",
+                params![expected.head_sha, authority.0, request.resume.head_sha],
+            )?;
+            if rebound != 1 {
+                return Err(WorkLedgerError::Refused(
+                    "workstream projection exact-head binding changed during return".to_owned(),
+                ));
+            }
         }
         transaction.commit()?;
         Ok(AgentOwnershipReceipt {

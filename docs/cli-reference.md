@@ -116,6 +116,7 @@ shipyard runner recovery-worker                     # inspect/revalidate one pen
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
 shipyard runner recovery-worker --drain --apply     # process one bounded pending snapshot (maximum 32)
 shipyard work-ledger status                         # inspect canonical shadow storage; does not create it
+shipyard work-ledger inventory                      # bounded immutable local-work view; does not create storage
 shipyard work-ledger import                         # deterministic redacted legacy-import plan; no writes
 shipyard work-ledger import --apply                 # idempotently populate shadow storage; no activation/dispatch
 shipyard work-ledger policy list                    # list revision-fenced per-repository lane policy
@@ -205,6 +206,14 @@ head, recovered check, or changed merge state supersedes the old request
 instead of spending an attempt on stale evidence.
 
 `work-ledger` is a migration and inspection surface, not an activation switch.
+`work-ledger inventory` returns at most 256 deterministically ordered items and
+reports whether the result is complete. It opens only existing ledger storage,
+never takes writer custody, and never creates or migrates a database. Each item
+binds the canonical `GEN-N` workstream handle and exact work/owner generation to
+the provider, immutable repository ID, canonical repository coordinate, PR,
+and head. A valid migrated legacy `NULL,NULL` repository identity is retained
+and makes `complete=false`; malformed or half-bound identity refuses the entire
+snapshot rather than returning ambiguous data.
 Its versioned SQLite database uses WAL, full synchronous durability, foreign
 keys, integrity checks, protected permissions, and the machine writer-domain
 fence. Import selects canonical lifecycle fields and opaque digests from the

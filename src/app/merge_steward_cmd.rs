@@ -232,15 +232,25 @@ pub(crate) enum ExactStewardTransition {
 #[cfg(unix)]
 pub(crate) fn exact_steward_transition(
     state_dir: &Path,
+    repository_provider: Option<&str>,
+    repository_id: Option<&str>,
     repo: &str,
     pr: u64,
     head_sha: &str,
 ) -> Result<ExactStewardTransition, String> {
-    if crate::work_ledger::verify_native_policy_binding(state_dir, repo, pr, head_sha).is_err() {
-        handoff::migrate_legacy_native_policy_authority(state_dir, repo, pr, head_sha)?;
-        crate::work_ledger::verify_native_policy_binding(state_dir, repo, pr, head_sha)
-            .map_err(|error| error.to_string())?;
-    }
+    let (Some(repository_provider), Some(repository_id)) = (repository_provider, repository_id)
+    else {
+        return Err("exact steward transition lacks immutable repository identity".to_owned());
+    };
+    crate::work_ledger::verify_native_policy_binding_for_repository(
+        state_dir,
+        repository_provider,
+        repository_id,
+        repo,
+        pr,
+        head_sha,
+    )
+    .map_err(|error| error.to_string())?;
     let path = state_dir.join("merge-steward.json");
     let Some(ledger) = ledger::load_existing_ledger(&path).map_err(|error| error.message)? else {
         return Ok(ExactStewardTransition::None);
@@ -441,6 +451,8 @@ pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
 mod handoff;
 #[cfg(test)]
 pub(crate) use handoff::steward_handoff_command_without_ambient;
+#[cfg(unix)]
+pub(crate) use handoff::verify_native_repository_identity;
 pub(crate) use handoff::{
     StewardHandoffArgs, native_publication_request, steward_handoff_command,
     steward_handoff_transfer_report,

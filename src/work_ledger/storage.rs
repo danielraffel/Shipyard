@@ -179,7 +179,11 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
         version = 10;
     }
     if version == 10 {
-        migrate_v10_to_v11(connection)?;
+        migrate_v10_to_v12(connection)?;
+        return Ok(());
+    }
+    if version == 11 {
+        migrate_v11_to_v12(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
@@ -744,7 +748,7 @@ pub(super) fn verify_open_lineage(connection: &Connection, version: i64) -> Work
     if version == SCHEMA_VERSION {
         return verify_schema_identity(connection);
     }
-    if version == 8 || version == 9 || version == 10 {
+    if version == 8 || version == 9 || version == 10 || version == 11 {
         return verify_schema_identity(connection);
     }
     if version == 7 {
@@ -900,7 +904,7 @@ fn migrate_v9_to_v10(connection: &mut Connection) -> WorkLedgerResult<()> {
     Ok(())
 }
 
-fn migrate_v10_to_v11(connection: &mut Connection) -> WorkLedgerResult<()> {
+fn migrate_v10_to_v12(connection: &mut Connection) -> WorkLedgerResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     if schema_version(&transaction)? != 10 {
         return Err(WorkLedgerError::Refused(
@@ -918,39 +922,217 @@ fn migrate_v10_to_v11(connection: &mut Connection) -> WorkLedgerResult<()> {
     Ok(())
 }
 
-fn install_projection_intent_schema(
-    transaction: &rusqlite::Transaction<'_>,
-) -> WorkLedgerResult<()> {
+#[allow(clippy::too_many_lines)] // Keep the one atomic identity migration auditable intact.
+fn migrate_v11_to_v12(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 11 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the repository identity migration fence"
+                .to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 11)?;
+    validate_relational_integrity(&transaction)?;
     transaction.execute_batch(
-        "CREATE TABLE workstream_projection_bindings (
+        "DROP TRIGGER workstream_projection_binding_no_delete;
+         DROP TRIGGER workstream_projection_binding_identity_immutable;
+         ALTER TABLE workstream_projection_bindings RENAME TO workstream_projection_bindings_v11;
+         CREATE TABLE workstream_projection_bindings (
            work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT,
-           workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
+           workstream_handle TEXT NOT NULL
+             CHECK(length(workstream_handle) BETWEEN 5 AND 128
+                   AND substr(workstream_handle, 1, 4) = 'GEN-'
+                   AND substr(workstream_handle, 5, 1) BETWEEN '1' AND '9'
+                   AND substr(workstream_handle, 5) NOT GLOB '*[^0-9]*'),
            plan_sha256 TEXT NOT NULL
              CHECK(length(plan_sha256) = 64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
            root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
            issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
            projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
            material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
+           repository_provider TEXT
+             CHECK(repository_provider IS NULL OR length(repository_provider) BETWEEN 3 AND 64),
+           repository_id TEXT
+             CHECK(repository_id IS NULL OR length(repository_id) BETWEEN 1 AND 512),
            repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
            exact_head TEXT NOT NULL
              CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
            created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
-           UNIQUE(workstream_handle, repository, exact_head)
+           CHECK((repository_provider IS NULL) = (repository_id IS NULL)),
+           UNIQUE(workstream_handle, repository_provider, repository_id, exact_head)
+         );
+         INSERT INTO workstream_projection_bindings
+           (work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
+            projection_revision, material_event_revision, repository_provider, repository_id,
+            repository, exact_head, created_at)
+         SELECT work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
+                projection_revision, material_event_revision, NULL, NULL, repository,
+                exact_head, created_at
+           FROM workstream_projection_bindings_v11;
+         DROP TABLE workstream_projection_bindings_v11;
+         CREATE TRIGGER workstream_projection_binding_identity_immutable
+         BEFORE UPDATE OF work_item_id, workstream_handle, plan_sha256, root_revision,
+                          issue_revision, projection_revision, material_event_revision,
+                          created_at
+         ON workstream_projection_bindings
+         BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
+         CREATE TRIGGER workstream_projection_binding_exact_head_transition
+         BEFORE UPDATE OF exact_head ON workstream_projection_bindings
+         WHEN NEW.exact_head = OLD.exact_head OR NOT EXISTS (
+           SELECT 1 FROM work_items work
+           JOIN agent_ownership ownership ON ownership.work_item_id = work.id
+           JOIN events event ON event.work_item_id = work.id
+           JOIN protected_objects receipt ON receipt.work_item_id = work.id
+           JOIN projection_intents intent ON intent.work_item_id = work.id
+            WHERE work.id = OLD.work_item_id AND work.phase = 'returned'
+              AND work.head_sha = NEW.exact_head
+              AND ownership.state = 'returned'
+              AND ownership.owner_generation = work.owner_generation
+              AND ownership.work_generation + 2 = work.work_generation
+              AND event.kind = 'agent_ownership_returned'
+              AND event.work_generation = work.work_generation
+              AND event.owner_generation = work.owner_generation
+              AND receipt.kind = 'agent_receipt'
+              AND receipt.content_digest = event.payload_digest
+              AND intent.kind = 'new_head' AND intent.state = 'pending'
+              AND intent.exact_head = NEW.exact_head
+              AND json_extract(CAST(intent.receipt_snapshot AS TEXT), '$.work_generation')
+                    = work.work_generation
+              AND json_extract(CAST(intent.receipt_snapshot AS TEXT), '$.owner_generation')
+                    = work.owner_generation
+              AND json_extract(CAST(intent.receipt_snapshot AS TEXT), '$.authority_digest')
+                    = event.payload_digest
+         )
+         BEGIN SELECT RAISE(ABORT, 'workstream projection exact-head transition is unauthorized'); END;
+         CREATE TRIGGER workstream_projection_binding_repository_coordinate_update
+         BEFORE UPDATE OF repository ON workstream_projection_bindings
+         WHEN OLD.repository_provider IS NULL OR OLD.repository_id IS NULL
+              OR NEW.repository_provider != OLD.repository_provider
+              OR NEW.repository_id != OLD.repository_id
+         BEGIN SELECT RAISE(ABORT, 'repository coordinate update lacks immutable identity'); END;
+         CREATE TRIGGER workstream_projection_binding_repository_identity_enrichment
+         BEFORE UPDATE OF repository_provider, repository_id ON workstream_projection_bindings
+         WHEN NOT (OLD.repository_provider IS NULL AND OLD.repository_id IS NULL
+                   AND NEW.repository_provider IS NOT NULL AND NEW.repository_id IS NOT NULL)
+         BEGIN SELECT RAISE(ABORT, 'workstream repository identity enrichment is not monotonic'); END;
+         CREATE TRIGGER workstream_projection_binding_no_delete
+         BEFORE DELETE ON workstream_projection_bindings
+         BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
+         CREATE TRIGGER workstream_projection_binding_no_second_insert
+         BEFORE INSERT ON workstream_projection_bindings
+         WHEN EXISTS (
+           SELECT 1 FROM workstream_projection_bindings prior
+            WHERE prior.workstream_handle = NEW.workstream_handle
+              AND prior.repository = NEW.repository
+              AND prior.exact_head = NEW.exact_head
+              AND (prior.repository_provider IS NULL OR NEW.repository_provider IS NULL)
+         )
+         BEGIN SELECT RAISE(ABORT, 'legacy and immutable repository bindings cannot overlap'); END;",
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn install_projection_intent_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE workstream_projection_bindings (
+           work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT,
+           workstream_handle TEXT NOT NULL
+             CHECK(length(workstream_handle) BETWEEN 5 AND 128
+                   AND substr(workstream_handle, 1, 4) = 'GEN-'
+                   AND substr(workstream_handle, 5, 1) BETWEEN '1' AND '9'
+                   AND substr(workstream_handle, 5) NOT GLOB '*[^0-9]*'),
+           plan_sha256 TEXT NOT NULL
+             CHECK(length(plan_sha256) = 64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+           root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
+           issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
+           projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
+           material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
+           repository_provider TEXT
+             CHECK(repository_provider IS NULL OR
+                   length(repository_provider) BETWEEN 3 AND 64),
+           repository_id TEXT
+             CHECK(repository_id IS NULL OR length(repository_id) BETWEEN 1 AND 512),
+           repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
+           exact_head TEXT NOT NULL
+             CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           CHECK((repository_provider IS NULL) = (repository_id IS NULL)),
+           UNIQUE(workstream_handle, repository_provider, repository_id, exact_head)
          );
          CREATE TRIGGER workstream_projection_binding_identity_immutable
          BEFORE UPDATE OF work_item_id, workstream_handle, plan_sha256, root_revision,
                           issue_revision, projection_revision, material_event_revision,
-                          repository, created_at
+                          created_at
          ON workstream_projection_bindings
          BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
+         CREATE TRIGGER workstream_projection_binding_exact_head_transition
+         BEFORE UPDATE OF exact_head ON workstream_projection_bindings
+         WHEN NEW.exact_head = OLD.exact_head OR NOT EXISTS (
+           SELECT 1 FROM work_items work
+           JOIN agent_ownership ownership ON ownership.work_item_id = work.id
+           JOIN events event ON event.work_item_id = work.id
+           JOIN protected_objects receipt ON receipt.work_item_id = work.id
+           JOIN projection_intents intent ON intent.work_item_id = work.id
+            WHERE work.id = OLD.work_item_id AND work.phase = 'returned'
+              AND work.head_sha = NEW.exact_head
+              AND ownership.state = 'returned'
+              AND ownership.owner_generation = work.owner_generation
+              AND ownership.work_generation + 2 = work.work_generation
+              AND event.kind = 'agent_ownership_returned'
+              AND event.work_generation = work.work_generation
+              AND event.owner_generation = work.owner_generation
+              AND receipt.kind = 'agent_receipt'
+              AND receipt.content_digest = event.payload_digest
+              AND intent.kind = 'new_head' AND intent.state = 'pending'
+              AND intent.exact_head = NEW.exact_head
+              AND json_extract(CAST(intent.receipt_snapshot AS TEXT), '$.work_generation')
+                    = work.work_generation
+              AND json_extract(CAST(intent.receipt_snapshot AS TEXT), '$.owner_generation')
+                    = work.owner_generation
+              AND json_extract(CAST(intent.receipt_snapshot AS TEXT), '$.authority_digest')
+                    = event.payload_digest
+         )
+         BEGIN SELECT RAISE(ABORT, 'workstream projection exact-head transition is unauthorized'); END;
+         CREATE TRIGGER workstream_projection_binding_repository_coordinate_update
+         BEFORE UPDATE OF repository ON workstream_projection_bindings
+         WHEN OLD.repository_provider IS NULL OR OLD.repository_id IS NULL
+              OR NEW.repository_provider != OLD.repository_provider
+              OR NEW.repository_id != OLD.repository_id
+         BEGIN SELECT RAISE(ABORT, 'repository coordinate update lacks immutable identity'); END;
+         CREATE TRIGGER workstream_projection_binding_repository_identity_enrichment
+         BEFORE UPDATE OF repository_provider, repository_id ON workstream_projection_bindings
+         WHEN NOT (OLD.repository_provider IS NULL AND OLD.repository_id IS NULL
+                   AND NEW.repository_provider IS NOT NULL AND NEW.repository_id IS NOT NULL)
+         BEGIN SELECT RAISE(ABORT, 'workstream repository identity enrichment is not monotonic'); END;
          CREATE TRIGGER workstream_projection_binding_no_delete
          BEFORE DELETE ON workstream_projection_bindings
          BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
+         CREATE TRIGGER workstream_projection_binding_no_second_insert
+         BEFORE INSERT ON workstream_projection_bindings
+         WHEN EXISTS (
+           SELECT 1 FROM workstream_projection_bindings prior
+            WHERE prior.workstream_handle = NEW.workstream_handle
+              AND prior.repository = NEW.repository
+              AND prior.exact_head = NEW.exact_head
+              AND (prior.repository_provider IS NULL OR NEW.repository_provider IS NULL)
+         )
+         BEGIN SELECT RAISE(ABORT, 'legacy and immutable repository bindings cannot overlap'); END;
          CREATE TABLE projection_intents (
            intent_id TEXT PRIMARY KEY
              CHECK(length(intent_id) = 64 AND intent_id NOT GLOB '*[^0-9a-f]*'),
            work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
-           workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
+           workstream_handle TEXT NOT NULL
+             CHECK(length(workstream_handle) BETWEEN 5 AND 128
+                   AND substr(workstream_handle, 1, 4) = 'GEN-'
+                   AND substr(workstream_handle, 5, 1) BETWEEN '1' AND '9'
+                   AND substr(workstream_handle, 5) NOT GLOB '*[^0-9]*'),
            sequence INTEGER NOT NULL CHECK(sequence > 0),
            kind TEXT NOT NULL CHECK(kind IN ('handoff', 'waiting', 'actionable', 'new_head',
                                               'merge', 'configured_closure')),
@@ -1864,6 +2046,9 @@ fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()
     if schema_version(connection)? < 5 {
         return Ok(());
     }
+    if schema_version(connection)? >= 11 {
+        validate_persisted_workstream_handles(connection)?;
+    }
     if schema_version(connection)? >= 9 {
         super::durable_custody::validate_persisted_custody(connection)?;
     }
@@ -2004,6 +2189,18 @@ fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()
                 "provider delivery observation history is not exact".to_owned(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_persisted_workstream_handles(connection: &Connection) -> WorkLedgerResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT workstream_handle FROM workstream_projection_bindings
+         UNION SELECT workstream_handle FROM projection_intents",
+    )?;
+    let handles = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for handle in handles {
+        super::validate_workstream_handle(&handle?)?;
     }
     Ok(())
 }

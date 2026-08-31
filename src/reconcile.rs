@@ -129,6 +129,10 @@ impl Display for ReconcileFetchError {
 /// Exhaustive producer-provenanced check snapshot plus exact API cost.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProvenancedCheckRollup {
+    /// Provider-scoped immutable repository node ID observed with the pull request.
+    pub repository_id: String,
+    /// Provider-canonical lowercase repository coordinate observed with the node ID.
+    pub repository: String,
     /// Live pull-request head.
     pub head_sha: String,
     /// Complete check/status nodes across all fetched pages.
@@ -494,7 +498,7 @@ fn fetch_head_and_provenanced_status_check_rollup_with_client(
     deadline: Option<Instant>,
 ) -> Result<ProvenancedCheckRollup, ProvenancedFetchError> {
     const MAX_PAGES: usize = 10;
-    const QUERY: &str = r"query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid statusCheckRollup{contexts(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name status conclusion checkSuite{app{databaseId slug}}} ... on StatusContext{context state creator{__typename login ... on User{databaseId} ... on Bot{databaseId} ... on Organization{databaseId}}}}}}}}}";
+    const QUERY: &str = r"query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){id nameWithOwner pullRequest(number:$number){headRefOid statusCheckRollup{contexts(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name status conclusion checkSuite{app{databaseId slug}}} ... on StatusContext{context state creator{__typename login ... on User{databaseId} ... on Bot{databaseId} ... on Organization{databaseId}}}}}}}}}";
     let (owner, name) = repo.split_once('/').ok_or_else(|| ProvenancedFetchError {
         error: ReconcileFetchError::Prepare(format!("invalid repository identity '{repo}'")),
         api_requests: 0,
@@ -502,6 +506,8 @@ fn fetch_head_and_provenanced_status_check_rollup_with_client(
     let mut api_requests = 0;
     let mut cursor = None::<String>;
     let mut expected_head = None::<String>;
+    let mut expected_repository_id = None::<String>;
+    let mut expected_repository = None::<String>;
     let mut checks = Vec::new();
     for _ in 0..MAX_PAGES {
         let parsed = fetch_provenanced_page(
@@ -529,10 +535,28 @@ fn fetch_head_and_provenanced_status_check_rollup_with_client(
                 api_requests,
             });
         }
+        if expected_repository_id
+            .as_ref()
+            .is_some_and(|identity| identity != &parsed.repository_id)
+            || expected_repository
+                .as_ref()
+                .is_some_and(|repository| repository != &parsed.repository)
+        {
+            return Err(ProvenancedFetchError {
+                error: ReconcileFetchError::Parse(
+                    "repository identity changed during provenanced pagination".to_owned(),
+                ),
+                api_requests,
+            });
+        }
         expected_head.get_or_insert(parsed.head_sha);
+        expected_repository_id.get_or_insert(parsed.repository_id);
+        expected_repository.get_or_insert(parsed.repository);
         checks.extend(parsed.checks);
         if !parsed.has_next_page {
             return Ok(ProvenancedCheckRollup {
+                repository_id: expected_repository_id.unwrap_or_default(),
+                repository: expected_repository.unwrap_or_default(),
                 head_sha: expected_head.unwrap_or_default(),
                 checks,
                 api_requests,
@@ -640,6 +664,8 @@ fn fetch_provenanced_page(
 
 #[derive(Debug)]
 struct ProvenancedPage {
+    repository_id: String,
+    repository: String,
     head_sha: String,
     checks: Vec<Value>,
     has_next_page: bool,
@@ -674,8 +700,23 @@ fn parse_provenanced_page(
             "gh api graphql returned partial-data errors".to_owned(),
         ));
     }
-    let pull = value
-        .pointer("/data/repository/pullRequest")
+    let repository = value
+        .pointer("/data/repository")
+        .ok_or_else(|| ReconcileFetchError::Parse("missing repository object".to_owned()))?;
+    let repository_id = repository
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.is_empty())
+        .ok_or_else(|| ReconcileFetchError::Parse("missing repository ID".to_owned()))?
+        .to_owned();
+    let canonical_repository = repository
+        .get("nameWithOwner")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .filter(|coordinate| coordinate.split('/').count() == 2)
+        .ok_or_else(|| ReconcileFetchError::Parse("missing canonical repository".to_owned()))?;
+    let pull = repository
+        .get("pullRequest")
         .ok_or_else(|| ReconcileFetchError::Parse("missing pullRequest object".to_owned()))?;
     let head_sha = pull
         .get("headRefOid")
@@ -685,6 +726,8 @@ fn parse_provenanced_page(
         .to_owned();
     if pull.get("statusCheckRollup").is_none_or(Value::is_null) {
         return Ok(ProvenancedPage {
+            repository_id,
+            repository: canonical_repository,
             head_sha,
             checks: Vec::new(),
             has_next_page: false,
@@ -711,6 +754,8 @@ fn parse_provenanced_page(
         .and_then(Value::as_str)
         .map(str::to_owned);
     Ok(ProvenancedPage {
+        repository_id,
+        repository: canonical_repository,
         head_sha,
         checks,
         has_next_page,
@@ -1006,7 +1051,7 @@ mod tests {
         let capture = CommandCapture {
             returncode: Some(0),
             stdout: serde_json::json!({
-                "data": {"repository": {"pullRequest": {
+                "data": {"repository": {"id": "R_owner_repo", "nameWithOwner": "Owner/Repo", "pullRequest": {
                     "headRefOid": "a".repeat(40),
                     "statusCheckRollup": {"contexts": {
                         "pageInfo": {"hasNextPage": true, "endCursor": "cursor-100"},
@@ -1020,6 +1065,8 @@ mod tests {
         };
         let page = parse_provenanced_page(&capture, "owner/repo", 42).expect("page");
         assert_eq!(page.head_sha, "a".repeat(40));
+        assert_eq!(page.repository_id, "R_owner_repo");
+        assert_eq!(page.repository, "owner/repo");
         assert!(page.has_next_page);
         assert_eq!(page.end_cursor.as_deref(), Some("cursor-100"));
         assert_eq!(page.checks.len(), 1);
@@ -1030,7 +1077,7 @@ mod tests {
         let capture = CommandCapture {
             returncode: Some(0),
             stdout: serde_json::json!({
-                "data": {"repository": {"pullRequest": {
+                "data": {"repository": {"id": "R_owner_repo", "nameWithOwner": "owner/repo", "pullRequest": {
                     "headRefOid": "b".repeat(40),
                     "statusCheckRollup": null
                 }}}

@@ -67,6 +67,21 @@ struct ProjectionReceiptSnapshotV1 {
     terminal_disposition: Option<String>,
 }
 
+type LegacyRepositoryIdentityBinding = (
+    String,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 #[derive(Clone, Debug)]
 pub(crate) struct PendingProjectionIntent {
     pub(crate) intent_id: String,
@@ -89,6 +104,7 @@ impl PendingProjectionIntent {
             .map_err(|_| {
                 WorkLedgerError::Refused("projection receipt snapshot is malformed".to_owned())
             })?;
+        super::validate_workstream_handle(&snapshot.workstream_handle)?;
         let draft = TransitionDraft {
             workstream_id: snapshot.workstream_handle,
             sequence: snapshot.sequence,
@@ -181,7 +197,7 @@ impl WorkLedger {
         Ok(true)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn bind_workstream_projection(
         &self,
         work_item_id: &str,
@@ -191,11 +207,22 @@ impl WorkLedger {
         issue_revision: u64,
         projection_revision: u64,
         material_event_revision: u64,
+        repository_provider: &str,
+        repository_id: &str,
         repository: &str,
         exact_head: &str,
     ) -> WorkLedgerResult<()> {
         validate_digest("projection plan digest", plan_sha256)?;
-        if workstream_handle.is_empty() || workstream_handle.len() > 128 || projection_revision == 0
+        super::validate_workstream_handle(workstream_handle)?;
+        super::validate_token("repository provider", repository_provider)?;
+        super::validate_token("repository identity", repository_id)?;
+        if workstream_handle.len() > 128
+            || projection_revision == 0
+            || repository_provider.len() > 64
+            || repository_id.len() > 512
+            || repository_id
+                .bytes()
+                .any(|byte| matches!(byte, b'/' | b'\\'))
         {
             return Err(WorkLedgerError::Refused(
                 "workstream projection binding is incomplete".to_owned(),
@@ -215,8 +242,9 @@ impl WorkLedger {
         transaction.execute(
             "INSERT OR IGNORE INTO workstream_projection_bindings
              (work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
-              projection_revision, material_event_revision, repository, exact_head, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              projection_revision, material_event_revision, repository_provider,
+              repository_id, repository, exact_head, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 work_item_id,
                 workstream_handle,
@@ -225,6 +253,8 @@ impl WorkLedger {
                 issue_revision,
                 projection_revision,
                 material_event_revision,
+                repository_provider,
+                repository_id,
                 repository,
                 exact_head,
                 now,
@@ -233,7 +263,8 @@ impl WorkLedger {
         let exact: bool = transaction.query_row(
             "SELECT workstream_handle = ?2 AND plan_sha256 = ?3 AND root_revision = ?4
                     AND issue_revision = ?5 AND projection_revision = ?6
-                    AND material_event_revision = ?7 AND repository = ?8 AND exact_head = ?9
+                    AND material_event_revision = ?7 AND repository_provider = ?8
+                    AND repository_id = ?9 AND repository = ?10 AND exact_head = ?11
                FROM workstream_projection_bindings WHERE work_item_id = ?1",
             params![
                 work_item_id,
@@ -243,6 +274,8 @@ impl WorkLedger {
                 issue_revision,
                 projection_revision,
                 material_event_revision,
+                repository_provider,
+                repository_id,
                 repository,
                 exact_head,
             ],
@@ -255,6 +288,223 @@ impl WorkLedger {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn enrich_legacy_projection_repository_identity(
+        &self,
+        work_item_id: &str,
+        workstream_handle: &str,
+        plan_sha256: &str,
+        root_revision: u64,
+        issue_revision: u64,
+        projection_revision: u64,
+        material_event_revision: u64,
+        repository_provider: &str,
+        repository_id: &str,
+        legacy_repository: &str,
+        repository: &str,
+        exact_head: &str,
+        publication_digest: &str,
+        route_ref: &str,
+        profile_ref: &str,
+        profile_digest: &str,
+        success_continuation_digest: &str,
+        failure_continuation_digest: &str,
+        pull_request: u64,
+        owner_generation: u64,
+    ) -> WorkLedgerResult<bool> {
+        validate_digest("projection plan digest", plan_sha256)?;
+        validate_digest("native publication digest", publication_digest)?;
+        validate_digest("native profile digest", profile_digest)?;
+        validate_digest("success continuation digest", success_continuation_digest)?;
+        validate_digest("failure continuation digest", failure_continuation_digest)?;
+        super::validate_opaque_ref("native route", route_ref, "route")?;
+        super::validate_workstream_handle(workstream_handle)?;
+        super::validate_token("repository provider", repository_provider)?;
+        super::validate_token("repository identity", repository_id)?;
+        if projection_revision == 0
+            || pull_request == 0
+            || owner_generation == 0
+            || repository_provider.len() > 64
+            || repository_id.len() > 512
+            || repository_id
+                .bytes()
+                .any(|byte| matches!(byte, b'/' | b'\\'))
+            || !super::is_canonical_repo_slug(legacy_repository)
+            || !super::is_canonical_repo_slug(repository)
+        {
+            return Err(WorkLedgerError::Refused(
+                "legacy repository identity enrichment is incomplete".to_owned(),
+            ));
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut connection = self.connect_read_write()?;
+        super::configure_durable(&connection)?;
+        super::verify_supported_schema(&connection)?;
+        let transaction =
+            connection.transaction_with_behavior(super::TransactionBehavior::Immediate)?;
+        let stored: LegacyRepositoryIdentityBinding = transaction
+            .query_row(
+                "SELECT binding.workstream_handle, binding.plan_sha256, binding.root_revision,
+                        binding.issue_revision, binding.projection_revision,
+                        binding.material_event_revision, binding.repository_provider,
+                        binding.repository_id, binding.repository, binding.exact_head,
+                        work.repo, work.head_sha
+                   FROM workstream_projection_bindings binding
+                   JOIN work_items work ON work.id = binding.work_item_id
+                  WHERE binding.work_item_id = ?1",
+                [work_item_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => WorkLedgerError::Refused(
+                    "legacy repository identity enrichment lacks an exact binding".to_owned(),
+                ),
+                other => WorkLedgerError::Sql(other),
+            })?;
+        let exact_fence = stored.0 == workstream_handle
+            && stored.1 == plan_sha256
+            && stored.2 == root_revision
+            && stored.3 == issue_revision
+            && stored.4 == projection_revision
+            && stored.5 == material_event_revision
+            && stored.9 == exact_head
+            && stored.11.as_deref() == Some(exact_head);
+        if !exact_fence {
+            return Err(WorkLedgerError::Refused(
+                "legacy repository identity enrichment fence disagrees".to_owned(),
+            ));
+        }
+        let publication_complete: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM work_items work
+                WHERE work.id = ?1 AND work.source_digest = ?2 AND work.pr = ?3
+                  AND work.head_sha = ?4 AND work.owner_generation = ?5
+                  AND work.phase IN ('managed', 'waiting', 'actionable', 'dispatching',
+                                     'agent_owned_repair', 'returned', 'terminal')
+                  AND EXISTS (
+                    SELECT 1 FROM continuation_contracts continuation
+                     WHERE continuation.work_item_id = work.id
+                       AND continuation.success_contract_digest = ?6
+                       AND continuation.failure_contract_digest = ?7
+                       AND continuation.revision = 1
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM route_records route
+                     WHERE route.route_ref = ?8 AND route.work_item_id = work.id
+                       AND route.head_sha = ?4 AND route.owner_generation = ?5
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM protected_objects profile
+                     WHERE profile.work_item_id = work.id AND profile.kind = 'launch_profile'
+                       AND profile.profile_ref = ?9 AND profile.content_digest = ?10
+                  )
+             )",
+            params![
+                work_item_id,
+                publication_digest,
+                pull_request,
+                exact_head,
+                owner_generation,
+                success_continuation_digest,
+                failure_continuation_digest,
+                route_ref,
+                profile_ref,
+                profile_digest,
+            ],
+            |row| row.get(0),
+        )?;
+        if !publication_complete {
+            return Err(WorkLedgerError::Refused(
+                "legacy repository identity enrichment requires an exact complete publication"
+                    .to_owned(),
+            ));
+        }
+        match (&stored.6, &stored.7) {
+            (Some(provider), Some(identity))
+                if provider == repository_provider && identity == repository_id =>
+            {
+                transaction.commit()?;
+                return Ok(false);
+            }
+            (None, None)
+                if stored.8 == legacy_repository
+                    && stored.10.as_deref() == Some(legacy_repository) => {}
+            (None, None) => {
+                return Err(WorkLedgerError::Refused(
+                    "unbound legacy repository coordinate disagrees".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(WorkLedgerError::Refused(
+                    "legacy repository identity enrichment conflicts".to_owned(),
+                ));
+            }
+        }
+        let changed = transaction.execute(
+            "UPDATE workstream_projection_bindings
+                SET repository_provider = ?2, repository_id = ?3
+              WHERE work_item_id = ?1 AND repository_provider IS NULL AND repository_id IS NULL",
+            params![work_item_id, repository_provider, repository_id],
+        )?;
+        if changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "legacy repository identity enrichment lost its compare-and-swap".to_owned(),
+            ));
+        }
+        if legacy_repository != repository {
+            let binding_changed = transaction.execute(
+                "UPDATE workstream_projection_bindings SET repository = ?2
+                  WHERE work_item_id = ?1 AND repository_provider = ?3 AND repository_id = ?4
+                    AND repository = ?5 AND exact_head = ?6",
+                params![
+                    work_item_id,
+                    repository,
+                    repository_provider,
+                    repository_id,
+                    legacy_repository,
+                    exact_head,
+                ],
+            )?;
+            let work_changed = transaction.execute(
+                "UPDATE work_items SET repo = ?2
+                  WHERE id = ?1 AND repo = ?3 AND pr = ?4 AND head_sha = ?5",
+                params![
+                    work_item_id,
+                    repository,
+                    legacy_repository,
+                    pull_request,
+                    exact_head,
+                ],
+            )?;
+            if binding_changed != 1 || work_changed != 1 {
+                return Err(WorkLedgerError::Refused(
+                    "legacy repository redirect lost its atomic compare-and-swap".to_owned(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -271,13 +521,61 @@ impl WorkLedger {
         terminal_disposition: Option<&str>,
         now: &str,
     ) -> WorkLedgerResult<String> {
+        Self::stage_projection_intent_for_head(
+            transaction,
+            work_item_id,
+            work_generation,
+            owner_generation,
+            kind,
+            event_kind,
+            from_state,
+            to_state,
+            authority_digest,
+            terminal_disposition,
+            None,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn stage_projection_intent_for_head(
+        transaction: &Transaction<'_>,
+        work_item_id: &str,
+        work_generation: u64,
+        owner_generation: u64,
+        kind: ProjectionIntentKind,
+        event_kind: &str,
+        from_state: Option<&str>,
+        to_state: &str,
+        authority_digest: &str,
+        terminal_disposition: Option<&str>,
+        exact_head_override: Option<&str>,
+        now: &str,
+    ) -> WorkLedgerResult<String> {
         validate_digest("projection authority digest", authority_digest)?;
-        let binding: (String, String, String, String) = transaction
+        let binding: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = transaction
             .query_row(
-                "SELECT workstream_handle, plan_sha256, repository, exact_head
+                "SELECT workstream_handle, plan_sha256, repository_provider, repository_id,
+                        repository, exact_head
                FROM workstream_projection_bindings WHERE work_item_id = ?1",
                 [work_item_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .map_err(|error| match error {
                 rusqlite::Error::QueryReturnedNoRows => WorkLedgerError::Refused(
@@ -286,6 +584,7 @@ impl WorkLedger {
                 ),
                 other => WorkLedgerError::Sql(other),
             })?;
+        super::validate_workstream_handle(&binding.0)?;
         let sequence: u64 = transaction.query_row(
             "SELECT coalesce(max(sequence), 0) + 1 FROM projection_intents
               WHERE workstream_handle = ?1",
@@ -298,13 +597,16 @@ impl WorkLedger {
                    FROM projection_intents intent
                    JOIN workstream_projection_bindings prior_binding
                      ON prior_binding.work_item_id = intent.work_item_id
-                  WHERE intent.workstream_handle = ?1 AND prior_binding.repository = ?2
+                  WHERE intent.workstream_handle = ?1
+                    AND prior_binding.repository_provider IS ?2
+                    AND prior_binding.repository_id IS ?3
+                    AND prior_binding.repository = ?4
                   ORDER BY intent.sequence DESC LIMIT 1",
-                params![binding.0, binding.2],
+                params![binding.0, binding.2, binding.3, binding.4],
                 |row| row.get(0),
             )
             .optional()?;
-        let exact_head = Some(binding.3.clone());
+        let exact_head = Some(exact_head_override.unwrap_or(&binding.5).to_owned());
         let snapshot = ProjectionReceiptSnapshotV1 {
             schema_version: 1,
             work_item_id: work_item_id.to_owned(),
@@ -567,14 +869,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_v11_installs_immutable_projection_tables() {
+    fn schema_v12_installs_immutable_projection_tables() {
         let state = tempfile::tempdir().expect("state");
         let ledger = WorkLedger::open(state.path()).expect("ledger");
         let connection = ledger.connect_read_only().expect("connection");
         let version: u64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         for table in ["workstream_projection_bindings", "projection_intents"] {
             let exists: bool = connection
                 .query_row(
@@ -588,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v10_migrates_atomically_to_v11() {
+    fn schema_v10_migrates_atomically_to_v12() {
         let state = tempfile::tempdir().expect("state");
         let ledger = WorkLedger::open(state.path()).expect("ledger");
         let connection = ledger.connect_read_write().expect("connection");
@@ -605,7 +907,7 @@ mod tests {
             .expect("v10 fixture");
         drop(connection);
         let reopened = WorkLedger::open(state.path()).expect("migrated ledger");
-        assert_eq!(reopened.status().expect("status").schema_version, 11);
+        assert_eq!(reopened.status().expect("status").schema_version, 12);
     }
 
     #[test]
@@ -613,10 +915,11 @@ mod tests {
     fn publication_binds_bootstrap_and_stages_managed_receipt_in_one_ledger() {
         let (_state, ledger, request) = published();
         let connection = ledger.connect_read_only().expect("connection");
-        let binding: (String, String, u64, u64, u64, u64, String) = connection
+        let binding: (String, String, u64, u64, u64, u64, String, String, String) = connection
             .query_row(
                 "SELECT workstream_handle, plan_sha256, root_revision, issue_revision,
-                        projection_revision, material_event_revision, exact_head
+                        projection_revision, material_event_revision, exact_head,
+                        repository_provider, repository_id
                    FROM workstream_projection_bindings",
                 [],
                 |row| {
@@ -628,6 +931,8 @@ mod tests {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -636,6 +941,8 @@ mod tests {
         assert_eq!(binding.1, request.plan_sha256);
         assert_eq!((binding.2, binding.3, binding.4, binding.5), (1, 1, 1, 1));
         assert_eq!(binding.6, request.head_sha);
+        assert_eq!(binding.7, request.repository_provider);
+        assert_eq!(binding.8, request.repository_id);
 
         let intents = ledger.pending_projection_intents(0, 32).expect("intents");
         assert_eq!(intents.len(), 1);

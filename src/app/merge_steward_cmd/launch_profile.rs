@@ -417,14 +417,10 @@ fn validate_continuation_bootstrap(
     profile: &LaunchProfileV1,
     bootstrap: &ContinuationBootstrapV1,
 ) -> Result<(), CliFailure> {
-    if bootstrap.workstream_handle.is_empty()
-        || bootstrap.workstream_handle.len() > 124
-        || bootstrap.workstream_handle.chars().any(char::is_whitespace)
-        || bootstrap.workstream_handle.chars().any(char::is_control)
-    {
+    if crate::work_ledger::validate_workstream_handle(&bootstrap.workstream_handle).is_err() {
         return Err(CliFailure::new(
             1,
-            "bootstrap workstream handle must be 1-124 non-whitespace characters",
+            "bootstrap workstream handle must be a canonical GEN-style handle",
         ));
     }
     if let Some(context_url) = bootstrap.context_url.as_deref() {
@@ -1035,6 +1031,16 @@ mod tests {
             .expect("bootstrap")
             .workstream_handle = "GEN 43".into();
         assert!(validate_launch_profile(&invalid).is_err());
+
+        for noncanonical in ["PULP-43", "GEN-0", "GEN-01", "GEN-43 "] {
+            let mut invalid = base.clone();
+            invalid
+                .continuation_bootstrap
+                .as_mut()
+                .expect("bootstrap")
+                .workstream_handle = noncanonical.into();
+            assert!(validate_launch_profile(&invalid).is_err(), "{noncanonical}");
+        }
 
         let mutations: [fn(&mut ContinuationBootstrapV1); 9] = [
             |bootstrap| bootstrap.plan_sha256 = "F".repeat(64),

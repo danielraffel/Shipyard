@@ -685,6 +685,21 @@ fn malformed_repository_is_contained_without_starving_healthy_repository() {
 #[allow(clippy::too_many_lines)]
 fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
     let (temp, ledger, profile, work_id, _wake_id) = setup_wake();
+    ledger
+        .bind_workstream_projection(
+            &work_id,
+            "GEN-43",
+            &"a".repeat(64),
+            0,
+            0,
+            4,
+            0,
+            "github.com",
+            "R_test_pulp",
+            "danielraffel/pulp",
+            "0123456789012345678901234567890123456789",
+        )
+        .expect("projection binding");
     let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
     let context = context_receipt(&ledger, &wake_id);
     assert_eq!(
@@ -791,6 +806,59 @@ fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
         )
         .expect("returned work");
     assert_eq!(work, ("returned".to_owned(), 8, expected.head_sha.clone()));
+    let projection_head: String = restarted
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT exact_head FROM workstream_projection_bindings WHERE work_item_id = ?1",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("projection head");
+    assert_eq!(projection_head, expected.head_sha);
+    assert!(
+        restarted
+            .connect_read_write()
+            .expect("connection")
+            .execute(
+                "UPDATE workstream_projection_bindings SET exact_head = ?1
+                  WHERE work_item_id = ?2",
+                rusqlite::params!["f".repeat(40), work_id],
+            )
+            .is_err(),
+        "unfenced projection-head mutation must remain rejected"
+    );
+    let forged_head = "e".repeat(40);
+    let mut connection = restarted.connect_read_write().expect("forgery connection");
+    let transaction = connection.transaction().expect("forgery transaction");
+    transaction
+        .execute(
+            "UPDATE work_items SET head_sha = ?1 WHERE id = ?2 AND phase = 'returned'",
+            rusqlite::params![forged_head, work_id],
+        )
+        .expect("mutable work row alone is not projection authority");
+    assert!(
+        transaction
+            .execute(
+                "UPDATE workstream_projection_bindings SET exact_head = ?1
+                  WHERE work_item_id = ?2",
+                rusqlite::params![forged_head, work_id],
+            )
+            .is_err(),
+        "two-step work plus binding SQL forgery must be rejected"
+    );
+    drop(transaction);
+    let unchanged: (String, String) = connection
+        .query_row(
+            "SELECT work.head_sha, binding.exact_head
+               FROM work_items work
+               JOIN workstream_projection_bindings binding ON binding.work_item_id = work.id
+              WHERE work.id = ?1",
+            [&work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("rolled-back exact heads");
+    assert_eq!(unchanged, (expected.head_sha.clone(), expected.head_sha));
 }
 
 #[test]

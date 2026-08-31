@@ -9,6 +9,10 @@ use super::{RepoPolicy, WorkLedger, WorkLedgerResult, verify_integrity, verify_s
 /// exact `(repo, pr, head)` rather than one request per imported record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShadowPrTarget {
+    /// Source provider for the immutable repository identity, when projection-bound.
+    pub repository_provider: Option<String>,
+    /// Provider-scoped immutable repository identity, when projection-bound.
+    pub repository_id: Option<String>,
     /// Canonical lowercase `owner/repo` identity.
     pub repo: String,
     /// Pull-request number.
@@ -34,55 +38,63 @@ impl WorkLedger {
         verify_integrity(&connection)?;
 
         let mut statement = connection.prepare(
-            "SELECT work_items.repo, work_items.pr, work_items.head_sha, COUNT(*),
+            "SELECT binding.repository_provider, binding.repository_id,
+                    work_items.repo, work_items.pr, work_items.head_sha, COUNT(*),
                     repo_policies.primary_platform, repo_policies.compatibility_mode,
                     repo_policies.compatibility_lanes_json, repo_policies.blocking_rule,
                     repo_policies.declared_dependency_lanes_json, repo_policies.revision
              FROM work_items
              JOIN repo_policies ON repo_policies.repo = work_items.repo
+             LEFT JOIN workstream_projection_bindings binding
+               ON binding.work_item_id = work_items.id
              WHERE work_items.phase IN (
                        'published', 'ready', 'managed', 'waiting', 'actionable',
                        'dispatching', 'agent_owned_repair', 'returned'
                    )
                AND work_items.pr IS NOT NULL AND work_items.pr > 0
                AND work_items.head_sha IS NOT NULL
-             GROUP BY work_items.repo, work_items.pr, work_items.head_sha,
+               AND binding.repository_provider = 'github.com'
+               AND binding.repository_id IS NOT NULL
+             GROUP BY binding.repository_provider, binding.repository_id,
+                      work_items.repo, work_items.pr, work_items.head_sha,
                       repo_policies.primary_platform, repo_policies.compatibility_mode,
                       repo_policies.compatibility_lanes_json, repo_policies.blocking_rule,
                       repo_policies.declared_dependency_lanes_json, repo_policies.revision
              ORDER BY work_items.repo, work_items.pr, work_items.head_sha",
         )?;
         let rows = statement.query_map([], |row| {
-            let repo = row.get::<_, String>(0)?;
+            let repo = row.get::<_, String>(2)?;
             Ok(ShadowPrTarget {
+                repository_provider: row.get(0)?,
+                repository_id: row.get(1)?,
                 policy: RepoPolicy {
                     repo: repo.clone(),
-                    primary_platform: row.get(4)?,
-                    compatibility_mode: row.get(5)?,
-                    compatibility_lanes: serde_json::from_str(&row.get::<_, String>(6)?).map_err(
+                    primary_platform: row.get(6)?,
+                    compatibility_mode: row.get(7)?,
+                    compatibility_lanes: serde_json::from_str(&row.get::<_, String>(8)?).map_err(
                         |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                6,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        },
-                    )?,
-                    blocking_rule: row.get(7)?,
-                    declared_dependency_lanes: serde_json::from_str(&row.get::<_, String>(8)?)
-                        .map_err(|error| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 8,
                                 rusqlite::types::Type::Text,
                                 Box::new(error),
                             )
+                        },
+                    )?,
+                    blocking_rule: row.get(9)?,
+                    declared_dependency_lanes: serde_json::from_str(&row.get::<_, String>(10)?)
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                10,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
                         })?,
-                    revision: row.get(9)?,
+                    revision: row.get(11)?,
                 },
                 repo,
-                pr: row.get(1)?,
-                head_sha: row.get(2)?,
-                work_items: row.get(3)?,
+                pr: row.get(3)?,
+                head_sha: row.get(4)?,
+                work_items: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -140,13 +152,32 @@ mod tests {
         let state = tempfile::tempdir().expect("state");
         let ledger = WorkLedger::open(state.path()).expect("ledger");
         let head = "a".repeat(40);
+        let pulp_ship = candidate("generous-corp/pulp", 42, &head, "pulp-ship");
+        let pulp_handoff = candidate("generous-corp/pulp", 42, &head, "pulp-handoff");
         ledger
             .import(&[
-                candidate("generous-corp/pulp", 42, &head, "pulp-ship"),
-                candidate("generous-corp/pulp", 42, &head, "pulp-handoff"),
+                pulp_ship.clone(),
+                pulp_handoff.clone(),
                 candidate("other/repo", 7, &"b".repeat(40), "other"),
             ])
             .expect("import");
+        for (candidate, handle) in [(&pulp_ship, "GEN-42"), (&pulp_handoff, "GEN-43")] {
+            ledger
+                .bind_workstream_projection(
+                    &candidate.work_id,
+                    handle,
+                    &digest(format!("plan:{handle}").as_bytes()),
+                    1,
+                    1,
+                    1,
+                    1,
+                    "github.com",
+                    "R_pulp",
+                    "generous-corp/pulp",
+                    &head,
+                )
+                .expect("authenticated projection binding");
+        }
         let connection = ledger.connect_read_write().expect("test connection");
         connection
             .execute(
@@ -165,6 +196,11 @@ mod tests {
         assert_eq!(targets[0].pr, 42);
         assert_eq!(targets[0].head_sha, head);
         assert_eq!(targets[0].work_items, 2);
+        assert_eq!(
+            targets[0].repository_provider.as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(targets[0].repository_id.as_deref(), Some("R_pulp"));
         assert_eq!(targets[0].policy.primary_platform, "macos");
         assert_eq!(targets[0].policy.compatibility_mode, "independent");
         assert!(
