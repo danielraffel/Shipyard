@@ -16,6 +16,7 @@ use crate::output::write_json_envelope;
 
 const ACTIVATION_RECEIPT: &str = "activation-shadow_compare.json";
 const STALE_ACTIVATION_RECEIPT: &str = "stale-activation-shadow_compare.json";
+const STALE_CLEANUP_RECEIPT: &str = "stale-cleanup-shadow_compare.json";
 const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
 
 pub(super) struct ChangedSurfaceTrialStatusArgs {
@@ -55,6 +56,7 @@ fn read_trial(identity: &TrialIdentity, result_dir: &Path) -> TrialStatus {
     read_trial_with_final_snapshot_hook(identity, result_dir, || {})
 }
 
+#[allow(clippy::too_many_lines)]
 fn read_trial_with_final_snapshot_hook<F>(
     identity: &TrialIdentity,
     result_dir: &Path,
@@ -89,6 +91,18 @@ where
                 );
             }
         };
+    let stale_cleanup_bytes = match read_regular_receipt(&result_dir.join(STALE_CLEANUP_RECEIPT)) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            return rejected_trial(
+                identity,
+                Some(STALE_CLEANUP_RECEIPT.to_owned()),
+                0,
+                None,
+                reason,
+            );
+        }
+    };
     let results = match read_result_receipts(result_dir) {
         Ok(results) => results,
         Err(failure) => {
@@ -108,6 +122,7 @@ where
         result_dir,
         activation_bytes.is_some(),
         stale_activation_bytes.as_deref(),
+        stale_cleanup_bytes.as_deref(),
         &results,
         &mut before_final_snapshot,
     ) {
@@ -165,11 +180,13 @@ where
     status
 }
 
+#[allow(clippy::too_many_lines)]
 fn read_stale_trial<F>(
     identity: &TrialIdentity,
     result_dir: &Path,
     ordinary_evidence_present: bool,
     stale_activation: Option<&[u8]>,
+    stale_cleanup: Option<&[u8]>,
     results: &[(String, Vec<u8>)],
     before_final_snapshot: &mut F,
 ) -> Option<TrialStatus>
@@ -215,7 +232,7 @@ where
         return Some(status);
     }
     let (name, bytes) = stale.first()?;
-    let status = if let Some(activation) = stale_activation {
+    let status = if let (Some(activation), Some(cleanup)) = (stale_activation, stale_cleanup) {
         let result_files = results
             .iter()
             .map(|(name, bytes)| ReceiptFile { name, bytes })
@@ -227,22 +244,28 @@ where
                 name: STALE_ACTIVATION_RECEIPT,
                 bytes: activation,
             },
+            ReceiptFile {
+                name: STALE_CLEANUP_RECEIPT,
+                bytes: cleanup,
+            },
             &result_files,
         )
-    } else if results.is_empty() {
-        evaluate_stale_base_terminal(identity, ReceiptFile { name, bytes })
-    } else {
+    } else if stale_activation.is_some() || stale_cleanup.is_some() || !results.is_empty() {
         let mut status = rejected_trial(
             identity,
-            None,
+            stale_activation.map(|_| STALE_ACTIVATION_RECEIPT.to_owned()),
             results.len(),
             results.first().map(|(name, _)| name.clone()),
-            "stale_base_result_without_activation",
+            "incomplete_stale_base_execution_generation",
         );
         status.state = TrialState::Terminal;
         status.shadow_disposition =
             Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated);
         status
+    } else if results.is_empty() {
+        evaluate_stale_base_terminal(identity, ReceiptFile { name, bytes })
+    } else {
+        unreachable!()
     };
     before_final_snapshot();
     let final_ordinary_evidence_absent = matches!(
@@ -250,6 +273,7 @@ where
         Ok(None)
     );
     let final_stale_activation = read_regular_receipt(&result_dir.join(STALE_ACTIVATION_RECEIPT));
+    let final_stale_cleanup = read_regular_receipt(&result_dir.join(STALE_CLEANUP_RECEIPT));
     let final_results = read_result_receipts(result_dir);
     Some(
         match read_named_receipts(result_dir, "stale-base-shadow-") {
@@ -257,6 +281,7 @@ where
                 if final_stale == stale
                     && final_ordinary_evidence_absent
                     && matches!(final_stale_activation, Ok(ref value) if value.as_deref() == stale_activation)
+                    && matches!(final_stale_cleanup, Ok(ref value) if value.as_deref() == stale_cleanup)
                     && matches!(final_results, Ok(ref value) if value == results) =>
             {
                 status

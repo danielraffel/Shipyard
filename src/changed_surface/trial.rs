@@ -130,6 +130,15 @@ struct StaleActivationReceipt {
 }
 
 #[derive(Debug, Deserialize)]
+struct StaleCleanupReceipt {
+    schema_version: u32,
+    context_digest: String,
+    integration_commit_sha: String,
+    integration_tree_sha: String,
+    disposition: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ActivationPlan {
     schema_version: u32,
     repository: String,
@@ -379,11 +388,25 @@ pub fn evaluate_stale_base_execution(
     identity: &TrialIdentity,
     stale_file: ReceiptFile<'_>,
     activation_file: ReceiptFile<'_>,
+    cleanup_file: ReceiptFile<'_>,
     results: &[ReceiptFile<'_>],
 ) -> TrialStatus {
     let mut status = evaluate_stale_base_terminal(identity, stale_file);
     status.activation_receipt = Some(activation_file.name.to_owned());
     status.result_receipt_count = results.len();
+    if status.state != TrialState::Terminal
+        || !matches!(
+            status.shadow_disposition,
+            Some(
+                super::StaleBaseShadowDisposition::Recomputed
+                    | super::StaleBaseShadowDisposition::Reused
+            )
+        )
+    {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "invalid_outer_stale_base_execution_receipt".clone_into(&mut status.reason);
+        return status;
+    }
     let Ok(stale) = serde_json::from_slice::<super::StaleBaseShadowReceipt>(stale_file.bytes)
     else {
         return status;
@@ -392,6 +415,11 @@ pub fn evaluate_stale_base_execution(
     else {
         status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
         "malformed_stale_base_activation".clone_into(&mut status.reason);
+        return status;
+    };
+    let Ok(cleanup) = serde_json::from_slice::<StaleCleanupReceipt>(cleanup_file.bytes) else {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "malformed_stale_base_cleanup_receipt".clone_into(&mut status.reason);
         return status;
     };
     let stale_digest = serde_json::to_vec(&stale).ok().map(|bytes| sha256(&bytes));
@@ -408,6 +436,11 @@ pub fn evaluate_stale_base_execution(
         || activation.plan.base_sha != stale.live_protected_base_sha
         || activation.plan.validation_contract_digest != stale.validation_contract_digest
         || activation.plan.workflow_digest != stale.live_workflow_digest
+        || cleanup.schema_version != 1
+        || cleanup.context_digest != activation.stale_context_digest
+        || cleanup.integration_commit_sha != activation.plan.head_sha
+        || cleanup.integration_tree_sha != activation.plan.tree_sha
+        || cleanup.disposition != "cleaned"
     {
         status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
         "stale_base_activation_identity_or_link_mismatch".clone_into(&mut status.reason);

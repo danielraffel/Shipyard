@@ -9,11 +9,12 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use super::{StaleBaseShadowReceipt, stale_base_context_digest};
 
-const MARKER_NAME: &str = ".shipyard-shadow-integration.json";
+const CLEANUP_RECEIPT_NAME: &str = "stale-cleanup-shadow_compare.json";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -35,7 +36,18 @@ struct CheckoutMarker {
 pub(crate) struct IntegrationCheckout {
     pub(crate) path: PathBuf,
     source_repo: PathBuf,
+    evidence_dir: PathBuf,
+    lock_path: PathBuf,
     marker: CheckoutMarker,
+}
+
+#[derive(Debug, Serialize)]
+struct CleanupReceipt<'a> {
+    schema_version: u32,
+    context_digest: &'a str,
+    integration_commit_sha: &'a str,
+    integration_tree_sha: &'a str,
+    disposition: &'static str,
 }
 
 /// Materialize or reconcile one exact content-addressed linked worktree.
@@ -64,6 +76,10 @@ pub(crate) fn materialize(
     let source_common_dir = canonical_git_path(&source_repo, &source_common_dir)?;
     ensure_real_directory(checkout_parent)?;
     let checkout = checkout_parent.join(format!("shadow-{context_digest}"));
+    let evidence_dir = checkout_parent
+        .parent()
+        .ok_or_else(|| "integration checkout root has no evidence parent".to_owned())?
+        .to_path_buf();
     let marker = CheckoutMarker {
         schema_version: 1,
         source_git_common_dir: source_common_dir.to_string_lossy().into_owned(),
@@ -102,31 +118,60 @@ pub(crate) fn materialize(
     Ok(IntegrationCheckout {
         path: checkout,
         source_repo,
+        evidence_dir,
+        lock_path: checkout_parent.join(format!("shadow-{}.lock", marker.context_digest)),
         marker,
     })
+}
+
+/// Hold the exact checkout's execution fence and prove its content before a
+/// command can start. The returned file must remain alive through execution,
+/// post-execution verification, and cleanup.
+pub(crate) fn prepare_for_execution(checkout: &IntegrationCheckout) -> Result<fs::File, String> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&checkout.lock_path)
+        .map_err(|error| format!("open integration execution fence: {error}"))?;
+    lock.try_lock_exclusive()
+        .map_err(|error| format!("integration checkout is already owned: {error}"))?;
+    verify_checkout(&checkout.path, &checkout.marker)?;
+    verify_marker(&checkout.path, &checkout.marker)?;
+    verify_clean(&checkout.path)?;
+    Ok(lock)
+}
+
+/// Recheck exact content while the caller still holds the execution fence.
+pub(crate) fn verify_after_execution(checkout: &IntegrationCheckout) -> Result<(), String> {
+    verify_checkout(&checkout.path, &checkout.marker)?;
+    verify_marker(&checkout.path, &checkout.marker)?;
+    verify_clean(&checkout.path)
 }
 
 /// Remove only the exact linked worktree whose immutable marker and Git
 /// identity still match. A mismatch refuses without deleting anything.
 pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
-    if !checkout.path.exists() {
-        let _ = Command::new("git")
-            .args(["worktree", "prune"])
+    if checkout.path.exists() {
+        verify_checkout(&checkout.path, &checkout.marker)?;
+        verify_marker(&checkout.path, &checkout.marker)?;
+        verify_clean(&checkout.path)?;
+        let status = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&checkout.path)
             .current_dir(&checkout.source_repo)
-            .status();
-        return Ok(());
+            .status()
+            .map_err(|error| format!("remove integration checkout: {error}"))?;
+        if !status.success() || checkout.path.exists() {
+            return Err("remove integration checkout: exact worktree remains".to_owned());
+        }
+    } else {
+        verify_marker(&checkout.path, &checkout.marker)?;
     }
-    verify_checkout(&checkout.path, &checkout.marker)?;
-    verify_marker(&checkout.path, &checkout.marker)?;
-    let status = Command::new("git")
-        .args(["worktree", "remove", "--force"])
-        .arg(&checkout.path)
-        .current_dir(&checkout.source_repo)
-        .status()
-        .map_err(|error| format!("remove integration checkout: {error}"))?;
-    if !status.success() || checkout.path.exists() {
-        return Err("remove integration checkout: exact worktree remains".to_owned());
-    }
+    persist_cleanup_receipt(checkout)?;
+    fs::remove_file(marker_path(&checkout.path))
+        .map_err(|error| format!("remove completed integration marker: {error}"))?;
     Ok(())
 }
 
@@ -163,6 +208,15 @@ fn verify_checkout(path: &Path, marker: &CheckoutMarker) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_clean(path: &Path) -> Result<(), String> {
+    let status = git_path(path, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    if status.is_empty() {
+        Ok(())
+    } else {
+        Err("integration checkout contains tracked or unignored content drift".to_owned())
+    }
+}
+
 fn initialize_submodules(path: &Path) -> Result<(), String> {
     let status = Command::new("git")
         .args([
@@ -190,7 +244,7 @@ fn initialize_submodules(path: &Path) -> Result<(), String> {
 }
 
 fn persist_or_verify_marker(path: &Path, marker: &CheckoutMarker) -> Result<(), String> {
-    let marker_path = path.join(MARKER_NAME);
+    let marker_path = marker_path(path);
     let mut payload = serde_json::to_vec_pretty(marker)
         .map_err(|error| format!("serialize integration marker: {error}"))?;
     payload.push(b'\n');
@@ -218,7 +272,7 @@ fn persist_or_verify_marker(path: &Path, marker: &CheckoutMarker) -> Result<(), 
 }
 
 fn verify_marker(path: &Path, marker: &CheckoutMarker) -> Result<(), String> {
-    let marker_path = path.join(MARKER_NAME);
+    let marker_path = marker_path(path);
     let metadata = fs::symlink_metadata(&marker_path)
         .map_err(|error| format!("inspect integration marker: {error}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -230,6 +284,48 @@ fn verify_marker(path: &Path, marker: &CheckoutMarker) -> Result<(), String> {
     .map_err(|error| format!("decode integration marker: {error}"))?;
     if &decoded != marker {
         return Err("integration checkout marker disagrees with exact request".to_owned());
+    }
+    Ok(())
+}
+
+fn marker_path(checkout: &Path) -> PathBuf {
+    let name = checkout
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("invalid-checkout");
+    checkout.with_file_name(format!(".{name}.json"))
+}
+
+fn persist_cleanup_receipt(checkout: &IntegrationCheckout) -> Result<(), String> {
+    let receipt = CleanupReceipt {
+        schema_version: 1,
+        context_digest: &checkout.marker.context_digest,
+        integration_commit_sha: &checkout.marker.integration_commit_sha,
+        integration_tree_sha: &checkout.marker.integration_tree_sha,
+        disposition: "cleaned",
+    };
+    let mut payload = serde_json::to_vec_pretty(&receipt)
+        .map_err(|error| format!("serialize integration cleanup receipt: {error}"))?;
+    payload.push(b'\n');
+    let destination = checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(mut file) => file
+            .write_all(&payload)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("write integration cleanup receipt: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::read(&destination)
+                .map_err(|error| format!("read integration cleanup receipt: {error}"))?
+                != payload
+            {
+                return Err("integration cleanup receipt disagrees with exact checkout".to_owned());
+            }
+        }
+        Err(error) => return Err(format!("create integration cleanup receipt: {error}")),
     }
     Ok(())
 }
@@ -368,8 +464,12 @@ mod tests {
         );
         let reconciled = materialize(repo.path(), &parent, &receipt).unwrap();
         assert_eq!(reconciled.path, checkout.path);
+        let guard = prepare_for_execution(&reconciled).unwrap();
+        assert!(prepare_for_execution(&reconciled).is_err());
+        drop(guard);
         cleanup(&reconciled).unwrap();
         assert!(!checkout.path.exists());
+        assert!(reconciled.evidence_dir.join(CLEANUP_RECEIPT_NAME).is_file());
     }
 
     #[test]
@@ -377,9 +477,22 @@ mod tests {
         let (repo, receipt) = fixture();
         let parent = repo.path().join("isolated");
         let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
-        fs::write(checkout.path.join(MARKER_NAME), "{}\n").unwrap();
+        fs::write(marker_path(&checkout.path), "{}\n").unwrap();
         let error = cleanup(&checkout).unwrap_err();
         assert!(error.contains("decode integration marker") || error.contains("disagrees"));
         assert!(checkout.path.exists());
+        assert!(!checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).exists());
+    }
+
+    #[test]
+    fn tracked_or_unignored_drift_refuses_execution_and_cleanup() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        fs::write(checkout.path.join("base.txt"), "tampered\n").unwrap();
+        assert!(prepare_for_execution(&checkout).is_err());
+        assert!(cleanup(&checkout).is_err());
+        assert!(checkout.path.exists());
+        assert!(!checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).exists());
     }
 }

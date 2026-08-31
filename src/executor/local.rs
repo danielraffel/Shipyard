@@ -292,6 +292,20 @@ impl LocalExecutor {
             started_at,
             start_time,
         };
+        let _integration_guard = match request.validation.integration_cleanup.as_deref() {
+            Some(cleanup) => {
+                match crate::changed_surface::integration_checkout::prepare_for_execution(cleanup) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        return io_error_result(
+                            &context,
+                            &format!("integration checkout preflight refused execution: {error}"),
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
         let source_cwd = request
             .target
             .cwd
@@ -328,14 +342,17 @@ impl LocalExecutor {
             result.source_checkout_clean = Some(clean);
         }
         result.full_execution = Some(full_execution);
-        if let Some(cleanup) = request.validation.integration_cleanup.as_ref()
-            && let Err(error) = crate::changed_surface::integration_checkout::cleanup(cleanup)
-        {
-            result.status = TargetStatus::Error;
-            result.error_message = Some(format!(
-                "integration checkout cleanup uncertain; preserved for reconciliation: {error}"
-            ));
-            result.failure_class = Some(FailureClass::Unknown.as_str().to_owned());
+        if let Some(cleanup) = request.validation.integration_cleanup.as_deref() {
+            let cleanup_result =
+                crate::changed_surface::integration_checkout::verify_after_execution(cleanup)
+                    .and_then(|()| crate::changed_surface::integration_checkout::cleanup(cleanup));
+            if let Err(error) = cleanup_result {
+                result.status = TargetStatus::Error;
+                result.error_message = Some(format!(
+                    "integration checkout cleanup uncertain; preserved for reconciliation: {error}"
+                ));
+                result.failure_class = Some(FailureClass::Unknown.as_str().to_owned());
+            }
         }
         result
     }

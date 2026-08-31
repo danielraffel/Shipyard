@@ -654,6 +654,14 @@ mod tests {
             "graduation_eligible": false
         });
         let activation_bytes = serde_json::to_vec(&activation).unwrap();
+        let cleanup = serde_json::json!({
+            "schema_version": 1,
+            "context_digest": stale_base_context_digest(&receipt),
+            "integration_commit_sha": plan.head_sha,
+            "integration_tree_sha": plan.tree_sha,
+            "disposition": "cleaned"
+        });
+        let cleanup_bytes = serde_json::to_vec(&cleanup).unwrap();
         let result_bytes = serde_json::to_vec(&result).unwrap();
         let status = evaluate_stale_base_execution(
             &TrialIdentity {
@@ -670,6 +678,10 @@ mod tests {
                 name: "stale-activation-shadow_compare.json",
                 bytes: &activation_bytes,
             },
+            ReceiptFile {
+                name: "stale-cleanup-shadow_compare.json",
+                bytes: &cleanup_bytes,
+            },
             &[ReceiptFile {
                 name: "result.json",
                 bytes: &result_bytes,
@@ -677,6 +689,40 @@ mod tests {
         );
         assert_eq!(status.state, TrialState::Terminal);
         assert_eq!(status.reason, "stale_base_recomputed_selected_pass");
+
+        let mut invalid_outer = receipt.clone();
+        invalid_outer.disposition = StaleBaseShadowDisposition::FullRequired;
+        invalid_outer.shadow_selection = None;
+        let invalid_bytes = serde_json::to_vec(&invalid_outer).unwrap();
+        let invalid = evaluate_stale_base_execution(
+            &TrialIdentity {
+                repository: "owner/repo".to_owned(),
+                pull_request: 42,
+                target: "mac".to_owned(),
+                head_sha: HEAD.to_owned(),
+            },
+            ReceiptFile {
+                name: "stale-base-shadow.json",
+                bytes: &invalid_bytes,
+            },
+            ReceiptFile {
+                name: "stale-activation-shadow_compare.json",
+                bytes: &activation_bytes,
+            },
+            ReceiptFile {
+                name: "stale-cleanup-shadow_compare.json",
+                bytes: &cleanup_bytes,
+            },
+            &[ReceiptFile {
+                name: "result.json",
+                bytes: &result_bytes,
+            }],
+        );
+        assert_eq!(
+            invalid.shadow_disposition,
+            Some(StaleBaseShadowDisposition::Invalidated)
+        );
+        assert_eq!(invalid.reason, "invalid_outer_stale_base_execution_receipt");
     }
 
     #[test]
