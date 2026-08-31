@@ -1710,6 +1710,12 @@ sequence lock requires the loud `GHAPP_ALLOW_UNINTEGRATED_PR_CLOSE=1` override.
 Never infer integration from `ahead_by=0` obtained from the reversed
 `PR-head...current-base` endpoint.
 
+The installed `ghapp` wrapper requires an executable `pr-close-guard` for every
+non-token command and refuses before native `gh` when it is missing. Install or
+update the guard before publishing the wrapper at the same guards directory
+(`~/.config/shipyard/guards` by default); `token --repo` remains available for
+credential bootstrap without invoking guards.
+
 Five operations detect `is_graphql_rate_limited` in `gh` stderr and
 fall through to a REST equivalent: PR list, PR create, PR view, PR
 snapshot (in `wait_transport`), and PR merge (in
