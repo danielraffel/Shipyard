@@ -467,15 +467,14 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
     let anchor_selected = fixture.root.path().join("anchor-selected");
     let transaction_release = fixture.root.path().join("transaction.release");
     let script = fixture.transaction_script();
-    let selector_publish =
-        "auth_publish_generation_selection \"$auth_wrapper\" \"$auth_anchor/ghapp\"\n";
-    assert_eq!(script.matches(selector_publish).count(), 1);
+    let anchor_publish = "auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"\n    auth_public_trampoline_active=1\n";
+    assert_eq!(script.matches(anchor_publish).count(), 1);
     let injected = format!(
-        "{selector_publish}/usr/bin/touch {}\nwhile [ ! -e {} ]; do /bin/sleep 0.02; done\n",
+        "{anchor_publish}/usr/bin/touch {}\nwhile [ ! -e {} ]; do /bin/sleep 0.02; done\n",
         shlex_quote(&anchor_selected.display().to_string()),
         shlex_quote(&transaction_release.display().to_string()),
     );
-    let transaction_script = script.replacen(selector_publish, &injected, 1);
+    let transaction_script = script.replacen(anchor_publish, &injected, 1);
     let transaction_home = fixture.root.path().to_path_buf();
     let transaction = thread::spawn(move || {
         Command::new("/bin/bash")
@@ -488,7 +487,12 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
     });
     wait_for_path(&anchor_selected, "anchor selector publication");
 
-    let anchor_target = std::fs::read_link(&fixture.wrapper).expect("anchor selector");
+    assert!(
+        !fixture.wrapper.is_symlink(),
+        "public wrapper became a symlink"
+    );
+    let anchor_target = std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+        .expect("anchor selector");
     let anchor_generation = anchor_target
         .parent()
         .and_then(Path::file_name)
@@ -945,12 +949,17 @@ fn sigkill_checkpoint_matrix_never_exposes_an_unreadable_generation() {
         ),
         (
             "before-anchor-selector",
-            "auth_publish_generation_selection \"$auth_wrapper\" \"$auth_anchor/ghapp\"\n",
+            "auth_publish_link \"$auth_selector\" \"$auth_anchor/ghapp\"\n",
             true,
         ),
         (
             "after-anchor-selector",
-            "auth_publish_generation_selection \"$auth_wrapper\" \"$auth_anchor/ghapp\"\n",
+            "auth_publish_link \"$auth_selector\" \"$auth_anchor/ghapp\"\n",
+            false,
+        ),
+        (
+            "after-anchor-trampoline",
+            "auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"\n    auth_public_trampoline_active=1\n",
             false,
         ),
         (

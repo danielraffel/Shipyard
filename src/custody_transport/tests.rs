@@ -273,6 +273,418 @@ fn contradictory_local_publication_never_commits_a_processed_effect() {
     assert_eq!(authority.custody_status().unwrap().incoming_processed, 0);
 }
 
+#[test]
+#[allow(clippy::too_many_lines)] // One planted lifecycle table proves every outcome and zero writes.
+fn custody_inventory_maps_states_without_guessing_a_route() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let authority_dir = tempfile::tempdir().unwrap();
+    seed_native_wake(source_dir.path(), 61);
+    seed_native_wake(authority_dir.path(), 61);
+    let (source_policy, authority_policy) = policy_pair(source_dir.path(), authority_dir.path());
+    stage_native_obligations(
+        &source_policy,
+        &WorkLedger::open_existing(source_dir.path())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    let message_id: String = connection
+        .query_row("SELECT message_id FROM custody_outbox", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    drop(connection);
+
+    let mut never_called = RefusingCarrier;
+    assert!(matches!(
+        custody_inventory_with_carrier(&source_policy, source_dir.path(), &message_id, &mut never_called),
+        CustodyInventoryResult::Uncertain { ref reason_code, .. }
+            if reason_code == "custody-not-yet-accepted"
+    ));
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    connection
+        .execute(
+            "UPDATE custody_outbox SET custody_receipt_digest = ?2 WHERE message_id = ?1",
+            rusqlite::params![message_id, "9".repeat(64)],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        custody_inventory_with_carrier(&source_policy, source_dir.path(), &message_id, &mut never_called),
+        CustodyInventoryResult::Refused { ref reason_code, .. }
+            if reason_code == "custody-state-contradictory"
+    ));
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    connection
+        .execute(
+            "UPDATE custody_outbox SET custody_receipt_digest = NULL WHERE message_id = ?1",
+            [&message_id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        custody_inventory_with_carrier(
+            &source_policy,
+            source_dir.path(),
+            &format!("wm_{}", "0".repeat(64)),
+            &mut never_called,
+        ),
+        CustodyInventoryResult::Refused { ref reason_code, .. }
+            if reason_code == "custody-message-missing-or-contradictory"
+    ));
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    connection
+        .execute(
+            "UPDATE custody_outbox SET state = 'claimed' WHERE message_id = ?1",
+            [&message_id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        custody_inventory_with_carrier(&source_policy, source_dir.path(), &message_id, &mut never_called),
+        CustodyInventoryResult::Uncertain { ref reason_code, .. }
+            if reason_code == "custody-not-yet-accepted"
+    ));
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    connection
+        .execute(
+            "UPDATE custody_outbox SET state = 'superseded' WHERE message_id = ?1",
+            [&message_id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        custody_inventory_with_carrier(&source_policy, source_dir.path(), &message_id, &mut never_called),
+        CustodyInventoryResult::Refused { ref reason_code, .. }
+            if reason_code == "custody-message-terminally-invalid"
+    ));
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    connection
+        .execute(
+            "UPDATE custody_outbox SET state = 'pending' WHERE message_id = ?1",
+            [&message_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut to_authority = LoopbackCarrier::new(
+        &authority_policy,
+        authority_dir.path(),
+        source_policy.local_machine_ref.clone(),
+    );
+    reconcile_once(&source_policy, source_dir.path(), &mut to_authority).unwrap();
+    let source_before = filesystem_snapshot(source_dir.path());
+    let authority_before = filesystem_snapshot(authority_dir.path());
+    let result = custody_inventory_with_carrier(
+        &source_policy,
+        source_dir.path(),
+        &message_id,
+        &mut to_authority,
+    );
+    let CustodyInventoryResult::Complete { inventory, .. } = result else {
+        panic!("accepted custody must query the exact receiver");
+    };
+    assert_eq!(inventory.items.len(), 1);
+    assert_eq!(inventory.items[0].repository, "owner/repo");
+    assert_eq!(inventory.items[0].pull_request, 61);
+    assert_eq!(filesystem_snapshot(source_dir.path()), source_before);
+    assert_eq!(filesystem_snapshot(authority_dir.path()), authority_before);
+    assert!(matches!(
+        custody_inventory_with_carrier(
+            &source_policy,
+            source_dir.path(),
+            &message_id,
+            &mut never_called,
+        ),
+        CustodyInventoryResult::Uncertain { ref reason_code, .. }
+            if reason_code == "custody-peer-unavailable"
+    ));
+
+    let authority_connection =
+        rusqlite::Connection::open(WorkLedger::path_at(authority_dir.path())).unwrap();
+    authority_connection
+        .execute_batch(
+            "DROP TRIGGER workstream_projection_binding_identity_immutable;
+             DROP TRIGGER workstream_projection_binding_repository_identity_enrichment;",
+        )
+        .unwrap();
+    authority_connection
+        .execute(
+            "UPDATE workstream_projection_bindings
+                SET repository_provider = NULL, repository_id = NULL",
+            [],
+        )
+        .unwrap();
+    drop(authority_connection);
+    assert!(matches!(
+        custody_inventory_with_carrier(
+            &source_policy,
+            source_dir.path(),
+            &message_id,
+            &mut to_authority,
+        ),
+        CustodyInventoryResult::Partial { ref inventory, .. }
+            if !inventory.complete && !inventory.truncated
+    ));
+
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    connection
+        .execute(
+            "UPDATE custody_outbox SET state = 'processed', processed_receipt_digest = ?2
+              WHERE message_id = ?1",
+            rusqlite::params![message_id, "8".repeat(64)],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        custody_inventory_with_carrier(
+            &source_policy,
+            source_dir.path(),
+            &message_id,
+            &mut to_authority
+        ),
+        CustodyInventoryResult::Partial { .. }
+    ));
+
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    connection
+        .execute(
+            "UPDATE custody_outbox SET state = 'cancelled' WHERE message_id = ?1",
+            [&message_id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        custody_inventory_with_carrier(&source_policy, source_dir.path(), &message_id, &mut never_called),
+        CustodyInventoryResult::Refused { ref reason_code, .. }
+            if reason_code == "custody-message-terminally-invalid"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn custody_inventory_uses_the_pinned_fixed_argv_ssh_subsystem() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let argv = temp.path().join("argv");
+    let environment = temp.path().join("environment");
+    let script = temp.path().join("fake-ssh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n/usr/bin/env | /usr/bin/sort > '{}'\nprintf '{{}}'\n",
+            argv.display(),
+            environment.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = temp.path().join("identity");
+    std::fs::write(&identity, b"private").unwrap();
+    std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let known_hosts = temp.path().join("known-hosts");
+    std::fs::write(&known_hosts, b"peer ssh-ed25519 AAAA\n").unwrap();
+    std::fs::set_permissions(&known_hosts, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut peer = peer(
+        temp.path(),
+        &opaque("machine", "ssh-peer"),
+        &opaque("incarnation", "ssh-peer"),
+        "a".repeat(64),
+    );
+    peer.ssh_program = script;
+    peer.identity_file = identity;
+    peer.known_hosts_file = known_hosts;
+    peer.destination = "custody@example.invalid".to_owned();
+    peer.port = 22022;
+    peer.remote_subsystem = "shipyard-custody-v1".to_owned();
+    let request = CustodyTransportRequest::Inventory {
+        schema_version: SCHEMA_VERSION,
+        request: CustodyInventoryWireRequest::new(crate::work_ledger::CustodyInventoryBinding {
+            message_id: format!("wm_{}", "1".repeat(64)),
+            identity_digest: "2".repeat(64),
+            source_machine_ref: opaque("machine", "ssh-source"),
+            source_incarnation_ref: opaque("incarnation", "ssh-source"),
+            target_machine_ref: peer.machine_ref.clone(),
+            target_incarnation_ref: peer.incarnation_ref.clone(),
+            target_route_ref: peer.route_ref.clone(),
+            terminal_adapter: peer.terminal_adapter.clone(),
+            rebind_epoch: 1,
+            authority_digest: "3".repeat(64),
+            transfer_digest: "4".repeat(64),
+        })
+        .unwrap(),
+    };
+    let error = SshCustodyCarrier
+        .exchange(
+            &peer,
+            &request,
+            Instant::now() + Duration::from_secs(5),
+            4096,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            CustodyCarrierError::Refused(reason) if reason == "custody-response-malformed"
+        ),
+        "unexpected carrier error: {error:?}"
+    );
+    let argv = std::fs::read_to_string(argv).unwrap();
+    assert!(argv.contains("-F\n/dev/null\n"));
+    assert!(argv.contains("-s\n--\ncustody@example.invalid\nshipyard-custody-v1\n"));
+    assert!(!argv.contains("sh -c"));
+    let environment = std::fs::read_to_string(environment).unwrap();
+    assert!(environment.contains("SHIPYARD_CUSTODY_KNOWN_HOSTS="));
+    assert!(environment.contains("LANG=C\n"));
+    assert!(!environment.contains("HOME="));
+    assert!(!environment.contains("SSH_AUTH_SOCK="));
+
+    std::fs::write(&peer.ssh_program, "#!/bin/sh\nexit 255\n").unwrap();
+    std::fs::set_permissions(&peer.ssh_program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let error = SshCustodyCarrier
+        .exchange(
+            &peer,
+            &request,
+            Instant::now() + Duration::from_secs(5),
+            4096,
+        )
+        .unwrap_err();
+    assert!(matches!(error, CustodyCarrierError::Unavailable(_)));
+}
+
+#[test]
+fn custody_inventory_refuses_tuple_and_response_identity_mutations() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let authority_dir = tempfile::tempdir().unwrap();
+    seed_native_wake(source_dir.path(), 62);
+    seed_native_wake(authority_dir.path(), 62);
+    let (source_policy, authority_policy) = policy_pair(source_dir.path(), authority_dir.path());
+    let mut to_authority = LoopbackCarrier::new(
+        &authority_policy,
+        authority_dir.path(),
+        source_policy.local_machine_ref.clone(),
+    );
+    reconcile_once(&source_policy, source_dir.path(), &mut to_authority).unwrap();
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    let message_id: String = connection
+        .query_row("SELECT message_id FROM custody_outbox", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    drop(connection);
+    let mut raced = RebindingAfterResponseCarrier {
+        inner: LoopbackCarrier::new(
+            &authority_policy,
+            authority_dir.path(),
+            source_policy.local_machine_ref.clone(),
+        ),
+        source_state_dir: source_dir.path(),
+    };
+    assert!(matches!(
+        custody_inventory_with_carrier(
+            &source_policy,
+            source_dir.path(),
+            &message_id,
+            &mut raced,
+        ),
+        CustodyInventoryResult::Refused { ref reason_code, .. }
+            if reason_code == "custody-inventory-response-refused"
+    ));
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    connection
+        .execute(
+            "UPDATE custody_outbox SET active_rebind_epoch = 1 WHERE message_id = ?1",
+            [&message_id],
+        )
+        .unwrap();
+    connection
+        .execute_batch("DROP TRIGGER custody_rebind_no_delete;")
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM custody_rebinds WHERE message_id = ?1 AND epoch = 2",
+            [&message_id],
+        )
+        .unwrap();
+    drop(connection);
+    let mut mutated_response = LoopbackCarrier::new(
+        &authority_policy,
+        authority_dir.path(),
+        source_policy.local_machine_ref.clone(),
+    );
+    mutated_response.mutate_inventory_response = true;
+    assert!(matches!(
+        custody_inventory_with_carrier(
+            &source_policy,
+            source_dir.path(),
+            &message_id,
+            &mut mutated_response,
+        ),
+        CustodyInventoryResult::Refused { ref reason_code, .. }
+            if reason_code == "custody-inventory-response-refused"
+    ));
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path())).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER custody_rebind_immutable;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE custody_rebinds SET target_route_ref = ?2 WHERE message_id = ?1",
+            rusqlite::params![message_id, opaque("route", "mutated")],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        custody_inventory_with_carrier(&source_policy, source_dir.path(), &message_id, &mut to_authority),
+        CustodyInventoryResult::Refused { ref reason_code, .. }
+            if reason_code == "custody-inventory-policy-route-mismatch"
+    ));
+}
+
+#[test]
+fn custody_inventory_preserves_equal_pr_numbers_across_repositories() {
+    let state = tempfile::tempdir().unwrap();
+    let ledger = WorkLedger::open(state.path()).unwrap();
+    seed_native_wake(state.path(), 63);
+    let mut request = native_publication_test_request();
+    request.repository = "another/repo".to_owned();
+    request.pull_request = 63;
+    request.head_sha = "f".repeat(40);
+    request.workstream_handle = "GEN-6300".to_owned();
+    request.repository_id = "R_another".to_owned();
+    ledger
+        .set_repo_policy(
+            &RepoPolicy {
+                repo: request.repository.clone(),
+                primary_platform: "macos".to_owned(),
+                compatibility_mode: "independent".to_owned(),
+                compatibility_lanes: Vec::new(),
+                blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                declared_dependency_lanes: Vec::new(),
+                revision: 0,
+            },
+            0,
+        )
+        .unwrap();
+    let policy =
+        native_publication_test_policy(vec!["owner/repo".to_owned(), request.repository.clone()]);
+    ledger
+        .publish_native_continuation(&request, &policy, true)
+        .unwrap();
+    let inventory = crate::work_ledger::local_work_inventory(state.path()).unwrap();
+    assert_eq!(
+        inventory
+            .items
+            .iter()
+            .filter(|item| item.pull_request == 63)
+            .count(),
+        2
+    );
+    assert_ne!(inventory.items[0].repository, inventory.items[1].repository);
+}
+
 fn test_policy(root: &Path, local_is_authority: bool) -> CustodyTransportPolicy {
     let local = opaque("machine", "local");
     let peer = opaque("machine", "peer");
@@ -432,8 +844,10 @@ impl CustodyCarrier for RefusingCarrier {
         _request: &CustodyTransportRequest,
         _deadline: Instant,
         _max_output_bytes: u64,
-    ) -> Result<(CustodyTransportResponse, String), String> {
-        Err("custody-peer-unavailable".to_owned())
+    ) -> Result<(CustodyTransportResponse, String), CustodyCarrierError> {
+        Err(CustodyCarrierError::Unavailable(
+            "custody-peer-unavailable".to_owned(),
+        ))
     }
 }
 
@@ -444,6 +858,51 @@ struct LoopbackCarrier<'a> {
     refuse_first_transfer: bool,
     refused_transfer: bool,
     last_request: Option<CustodyTransportRequest>,
+    mutate_inventory_response: bool,
+}
+
+struct RebindingAfterResponseCarrier<'a> {
+    inner: LoopbackCarrier<'a>,
+    source_state_dir: &'a Path,
+}
+
+impl CustodyCarrier for RebindingAfterResponseCarrier<'_> {
+    fn exchange(
+        &mut self,
+        peer: &CustodyPeer,
+        request: &CustodyTransportRequest,
+        deadline: Instant,
+        max_output_bytes: u64,
+    ) -> Result<(CustodyTransportResponse, String), CustodyCarrierError> {
+        let response = self
+            .inner
+            .exchange(peer, request, deadline, max_output_bytes)?;
+        let connection =
+            rusqlite::Connection::open(WorkLedger::path_at(self.source_state_dir)).unwrap();
+        connection
+            .execute(
+                "INSERT INTO custody_rebinds
+             SELECT message_id, 2, target_machine_ref, target_incarnation_ref, ?2,
+                    terminal_adapter, authority_digest, created_at
+               FROM custody_rebinds WHERE message_id = ?1 AND epoch = 1",
+                rusqlite::params![request_message_id(request), opaque("route", "raced")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE custody_outbox SET active_rebind_epoch = 2 WHERE message_id = ?1",
+                [request_message_id(request)],
+            )
+            .unwrap();
+        Ok(response)
+    }
+}
+
+fn request_message_id(request: &CustodyTransportRequest) -> &str {
+    match request {
+        CustodyTransportRequest::Inventory { request, .. } => &request.binding.message_id,
+        _ => panic!("expected inventory request"),
+    }
 }
 
 impl<'a> LoopbackCarrier<'a> {
@@ -459,6 +918,7 @@ impl<'a> LoopbackCarrier<'a> {
             refuse_first_transfer: false,
             refused_transfer: false,
             last_request: None,
+            mutate_inventory_response: false,
         }
     }
 }
@@ -470,24 +930,44 @@ impl CustodyCarrier for LoopbackCarrier<'_> {
         request: &CustodyTransportRequest,
         _deadline: Instant,
         _max_output_bytes: u64,
-    ) -> Result<(CustodyTransportResponse, String), String> {
+    ) -> Result<(CustodyTransportResponse, String), CustodyCarrierError> {
         self.last_request = Some(request.clone());
         if self.refuse_first_transfer
             && !self.refused_transfer
             && matches!(request, CustodyTransportRequest::Transfer { .. })
         {
             self.refused_transfer = true;
-            return Err("custody-peer-unavailable".to_owned());
+            return Err(CustodyCarrierError::Unavailable(
+                "custody-peer-unavailable".to_owned(),
+            ));
         }
-        Ok((
-            deliver_request(
-                self.remote_policy,
-                self.remote_state_dir,
-                &self.source_machine_ref,
-                request,
-            ),
-            "1".repeat(64),
-        ))
+        let mut response = deliver_request(
+            self.remote_policy,
+            self.remote_state_dir,
+            &self.source_machine_ref,
+            request,
+        );
+        if self.mutate_inventory_response {
+            match &mut response {
+                CustodyTransportResponse::InventoryComplete {
+                    request_digest,
+                    inventory,
+                    ..
+                }
+                | CustodyTransportResponse::InventoryPartial {
+                    request_digest,
+                    inventory,
+                    ..
+                } => {
+                    *request_digest = "9".repeat(64);
+                    if let Some(item) = inventory.items.first_mut() {
+                        item.exact_head = "A".repeat(40);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((response, "1".repeat(64)))
     }
 }
 
@@ -530,4 +1010,46 @@ fn opaque(prefix: &str, seed: &str) -> String {
 
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn filesystem_snapshot(root: &Path) -> Vec<(String, u64, Option<std::time::SystemTime>, String)> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        rows: &mut Vec<(String, u64, Option<std::time::SystemTime>, String)>,
+    ) {
+        let mut entries = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            let metadata = std::fs::symlink_metadata(&entry).unwrap();
+            let relative = entry
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if metadata.is_dir() {
+                rows.push((
+                    relative,
+                    0,
+                    metadata.modified().ok(),
+                    "directory".to_owned(),
+                ));
+                visit(root, &entry, rows);
+            } else {
+                let content = std::fs::read(&entry).unwrap();
+                rows.push((
+                    relative,
+                    metadata.len(),
+                    metadata.modified().ok(),
+                    sha256(&content),
+                ));
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    visit(root, root, &mut rows);
+    rows
 }

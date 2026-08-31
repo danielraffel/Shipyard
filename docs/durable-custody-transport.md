@@ -23,6 +23,23 @@ human viewing a record cannot prove that an agent read it. Corrections and
 revocations append authenticated controls; they never overwrite the original
 message and lose atomically to an already committed processing effect.
 
+`shipyard --json work-ledger custody-inventory --message wm_<64hex>` queries
+only the destination bound by the source ledger's exact active custody rebind.
+`pending` and `claimed` return `uncertain` without contacting a host;
+`custody_accepted` and `processed` may return `complete` or `partial` inventory;
+cancelled, superseded, missing, malformed, or contradictory custody returns
+`refused`. The request digest binds the complete source incarnation, target
+machine/incarnation/route/adapter, active rebind epoch, authority, identity,
+and transfer tuple. The receiver authenticates that tuple against its exact
+inbox before invoking the immutable local inventory reader. Neither endpoint
+opens the ledger writable for inventory.
+
+Optional `--correlation-hints /owner-only/private.json` accepts only a bounded,
+no-follow, owner-only object containing `linear_workspace_id`, canonical
+`linear_root_uuid`, and `provider_repository_id`. These values are copied only
+into the local rendered result. They are never sent over SSH, included in a
+request digest, used to select a route, or treated as Shipyard authority.
+
 The sender retains its source custody through the processed acknowledgement.
 If either daemon restarts after destination acceptance but before source
 acknowledgement, replay returns the same receipt and does not create a second

@@ -499,7 +499,7 @@ impl CustodyEnvelope {
         })
     }
 
-    pub(super) fn validate(&self) -> WorkLedgerResult<()> {
+    pub(crate) fn validate(&self) -> WorkLedgerResult<()> {
         let rebuilt = Self::new(
             self.wake_id.clone(),
             self.work_item_id.clone(),

@@ -429,12 +429,23 @@ def _is_reconcilable_worker_drift_failure(failure: object) -> bool:
     preserved_drift = (
         "restore production: GuardianError: preserved active worker ownership differs"
     )
-    return failure in (
+    if failure in (
         "GuardianError: production active workers changed during idle wait; "
         f"{preserved_drift}",
         "GuardianError: OwnerEnded: Actions owner ended before canary completion; "
         f"{preserved_drift}; {preserved_drift}",
+    ):
+        return True
+    foreign = (
+        r"GuardianError: foreign process entered the production writer domain: "
+        r"\(([1-9][0-9]*(?:, [1-9][0-9]*)*,?)\)"
     )
+    match = re.fullmatch(
+        "GuardianError: OwnerEnded: Actions owner ended before canary completion; "
+        f"restore production: {foreign}; restore production: {foreign}",
+        failure,
+    )
+    return match is not None and match.group(1) == match.group(2)
 
 
 def _lease_generation_state(path: Path) -> tuple[os.stat_result, str, str]:
