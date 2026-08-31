@@ -25,6 +25,23 @@ fn local_refresh_pid_accepts_current_and_legacy_typed_receipts_only() {
     );
 }
 
+#[test]
+fn local_refresh_pid_survives_preceding_update_event_stream() {
+    let stream = br#"{"command":"update","event":"apply"}
+{"command":"update","event":"applied"}
+{"schema_version":1,"command":"daemon:refresh","new_pid":4242}
+"#;
+    assert_eq!(local_refresh_daemon_pid_from_output(stream), Some(4242));
+    assert_eq!(
+        local_refresh_daemon_pid_from_output(
+            br#"{"command":"update","event":"apply"}
+{"command":"update","event":"applied"}
+"#,
+        ),
+        None
+    );
+}
+
 fn verified_source_identity() -> String {
     "8".repeat(64)
 }

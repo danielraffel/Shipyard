@@ -409,3 +409,22 @@ fn resolver_failure_skips_refresh_and_refresh_failure_releases_both_lock_layers(
         "refresh failure must release the advisory guard"
     );
 }
+
+#[test]
+fn post_commit_signal_is_never_reported_as_success() {
+    let fixture = Fixture::new();
+    let output = fixture.run_output(RunOptions {
+        refresh: RefreshBehavior::SignalTerm,
+        ..RunOptions::default()
+    });
+    assert_eq!(output.status.code(), Some(143));
+    assert!(!fixture.state().join("fleet-auth-support.lock").exists());
+    assert_eq!(
+        std::fs::read(&fixture.helper).expect("committed helper"),
+        b"new helper\n"
+    );
+    assert_eq!(
+        std::fs::read(&fixture.wrapper).expect("committed wrapper"),
+        b"new wrapper\n"
+    );
+}

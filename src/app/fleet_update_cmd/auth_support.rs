@@ -145,6 +145,7 @@ pub(super) fn install_transaction(
     state_dir: &Path,
     probe_repo: &str,
     authority: &ReleaseAuthority,
+    refresh_prefix: &str,
     fail_after_helper_for_test: bool,
 ) -> String {
     let helper = shlex_quote(&helper.display().to_string());
@@ -166,6 +167,7 @@ pub(super) fn install_transaction(
     let state_dir = shlex_quote(&state_dir.display().to_string());
     let probe_repo = shlex_quote(probe_repo);
     let authority_id = shlex_quote(&authority.identity_sha256);
+    let refresh_prefix = shlex_quote(refresh_prefix);
     let helper_digest = shlex_quote(&authority.auth_helper.sha256);
     let wrapper_digest = shlex_quote(&authority.auth_wrapper.sha256);
     let lock_acquisition = LOCK_ACQUISITION_SCRIPT;
@@ -191,6 +193,7 @@ auth_state_dir={state_dir}
 auth_probe_repo={probe_repo}
 auth_context_json={context_json}
 auth_authority={authority_id}
+auth_refresh_prefix={refresh_prefix}
 auth_helper_digest={helper_digest}
 auth_wrapper_digest={wrapper_digest}
 auth_helper_source={helper_source}
@@ -345,8 +348,11 @@ auth_release_lock() {{
   /bin/rmdir "$auth_lock"
   exec 9>&-
 }}
-auth_release_on_error() {{ auth_status=$?; trap - ERR INT TERM; if [ -n "$auth_helper_tmp" ]; then /bin/rm -f "$auth_helper_tmp"; fi; if [ -n "$auth_wrapper_tmp" ]; then /bin/rm -f "$auth_wrapper_tmp"; fi; if [ -n "$auth_context_tmp" ]; then /bin/rm -f "$auth_context_tmp"; fi; auth_release_lock; exit "$auth_status"; }}
-trap auth_release_on_error ERR INT TERM
+auth_release_after_failure() {{ auth_status="$1"; trap - ERR INT TERM; if [ -n "$auth_helper_tmp" ]; then /bin/rm -f "$auth_helper_tmp"; fi; if [ -n "$auth_wrapper_tmp" ]; then /bin/rm -f "$auth_wrapper_tmp"; fi; if [ -n "$auth_context_tmp" ]; then /bin/rm -f "$auth_context_tmp"; fi; auth_release_lock; exit "$auth_status"; }}
+auth_release_on_error() {{ auth_release_after_failure "$?"; }}
+trap auth_release_on_error ERR
+trap 'auth_release_after_failure 130' INT
+trap 'auth_release_after_failure 143' TERM
 
 auth_safe_target "$auth_helper"
 auth_safe_target "$auth_wrapper"
@@ -390,8 +396,8 @@ test "$(/usr/bin/shasum -a 256 "$auth_helper_tmp" | /usr/bin/awk '{{print $1}}')
 test "$(/usr/bin/shasum -a 256 "$auth_wrapper_tmp" | /usr/bin/awk '{{print $1}}')" = "$auth_wrapper_digest"
 auth_write_phase preparing
 
-auth_rollback_on_error() {{
-  auth_status=$?
+auth_rollback_after_failure() {{
+  auth_status="$1"
   trap - ERR INT TERM
   if [ "$auth_resolver_required" = 1 ]; then auth_restore_one "$auth_context"; fi
   auth_restore_one "$auth_companion"
@@ -403,7 +409,10 @@ auth_rollback_on_error() {{
   auth_release_lock
   exit "$auth_status"
 }}
-trap auth_rollback_on_error ERR INT TERM
+auth_rollback_on_error() {{ auth_rollback_after_failure "$?"; }}
+trap auth_rollback_on_error ERR
+trap 'auth_rollback_after_failure 130' INT
+trap 'auth_rollback_after_failure 143' TERM
 
 if [ -e "$auth_helper" ]; then /bin/mv "$auth_helper" "$auth_helper.shipyard-rollback"; else /usr/bin/touch "$auth_helper.shipyard-was-absent"; /bin/chmod 600 "$auth_helper.shipyard-was-absent"; fi
 if [ -e "$auth_wrapper" ]; then /bin/mv "$auth_wrapper" "$auth_wrapper.shipyard-rollback"; else /usr/bin/touch "$auth_wrapper.shipyard-was-absent"; /bin/chmod 600 "$auth_wrapper.shipyard-was-absent"; fi
@@ -437,9 +446,14 @@ fi
 auth_write_phase committed
 trap - ERR INT TERM
 auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"
-auth_post_commit_on_error() {{ auth_status=$?; trap - ERR INT TERM; auth_release_lock; exit "$auth_status"; }}
-trap auth_post_commit_on_error ERR INT TERM
-refresh_receipt="$("$auth_binary" --mode "$auth_mode" --global-dir "$auth_global_dir" --state-dir "$auth_state_dir" --json daemon refresh 9>&- | /usr/bin/tr -d '\n')"
+auth_post_commit_after_failure() {{ auth_status="$1"; trap - ERR INT TERM; auth_release_lock; exit "$auth_status"; }}
+auth_post_commit_on_error() {{ auth_post_commit_after_failure "$?"; }}
+trap auth_post_commit_on_error ERR
+trap 'auth_post_commit_after_failure 130' INT
+trap 'auth_post_commit_after_failure 143' TERM
+/usr/bin/printf '%s' "$auth_refresh_prefix"
+"$auth_binary" --mode "$auth_mode" --global-dir "$auth_global_dir" --state-dir "$auth_state_dir" --json daemon refresh 9>&- | /usr/bin/tr -d '\n'
+/usr/bin/printf '\n'
 trap - ERR INT TERM
 auth_release_lock
 "#

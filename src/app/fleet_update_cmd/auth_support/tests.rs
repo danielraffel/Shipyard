@@ -1,6 +1,6 @@
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
@@ -14,6 +14,7 @@ fn digest(bytes: &[u8]) -> String {
 enum RefreshBehavior {
     Success,
     Fail,
+    SignalTerm,
     SpawnDetached,
     ReplaceLegacyPid,
     ObservePublishedLock(PathBuf),
@@ -166,6 +167,9 @@ impl Fixture {
         match &options.refresh {
             RefreshBehavior::Success => {}
             RefreshBehavior::Fail => lines.push("exit 72".to_owned()),
+            RefreshBehavior::SignalTerm => {
+                lines.push("/bin/kill -TERM \"$PPID\"".to_owned());
+            }
             RefreshBehavior::SpawnDetached => {
                 lines.push("(/bin/sleep 2 >/dev/null 2>&1 &)".to_owned());
             }
@@ -224,7 +228,7 @@ impl Fixture {
         )
     }
 
-    fn run(&self, options: RunOptions) -> std::process::ExitStatus {
+    fn run_output(&self, options: RunOptions) -> Output {
         let resolver_required =
             crate::app::fleet_update_cmd::tag_supports_auth_resolver(options.target);
         let state = self.state();
@@ -254,18 +258,35 @@ impl Fixture {
             &state,
             "danielraffel/Shipyard",
             &self.authority,
+            "",
             options.fail_after_helper,
         );
         let shell_prefix = options.lock_publish.shell_prefix(&state);
         Command::new("/bin/bash")
             .args(["-c", &format!("set -Eeuo pipefail\n{shell_prefix}{script}")])
             .env("HOME", self.root.path())
-            .status()
+            .output()
             .expect("transaction")
+    }
+
+    fn run(&self, options: RunOptions) -> std::process::ExitStatus {
+        self.run_output(options).status
     }
 }
 
 mod lock;
+
+#[test]
+fn committed_transaction_streams_the_typed_refresh_receipt() {
+    let fixture = Fixture::new();
+    let output = fixture.run_output(RunOptions::default());
+    assert!(output.status.success());
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("typed refresh receipt");
+    assert_eq!(receipt["schema_version"], 1);
+    assert_eq!(receipt["command"], "daemon:refresh");
+    assert_eq!(receipt["new_pid"], 4242);
+}
 
 #[test]
 fn legacy_pair_is_migrated_helper_first_to_exact_private_files() {

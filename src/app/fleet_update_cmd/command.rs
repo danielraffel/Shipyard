@@ -57,6 +57,7 @@ pub(super) fn remote_update_command(
         state_dir,
         &authority.repository,
         authority,
+        REMOTE_REFRESH_PREFIX,
         false,
     );
     let before_pair = remote_pair_probe(binary, companion_binary, "before", None, false);
@@ -113,7 +114,7 @@ pub(super) fn remote_update_command(
          printf '%s%s\\n' {} \"$before_auth_wrapper_sha256\"; printf '%s%s\\n' {} \"$before_auth_wrapper_mode\"\n\
          printf '%s%s\\n' {} \"$after_auth_helper_sha256\"; printf '%s%s\\n' {} \"$after_auth_helper_mode\"\n\
          printf '%s%s\\n' {} \"$after_auth_wrapper_sha256\"; printf '%s%s\\n' {} \"$after_auth_wrapper_mode\"\n\
-         printf '%s%s\\n' {} \"$before_status\"; printf '%s%s\\n' {} \"$refresh_receipt\"; printf '%s%s\\n' {} \"$after_status\"\n\
+         printf '%s%s\\n' {} \"$before_status\"; printf '%s%s\\n' {} \"$after_status\"\n\
          printf '%s%s\\n' {} {}; printf '%s%s\\n' {} \"$release_asset_sha256\"",
         before_pair,
         before_auth,
@@ -168,7 +169,6 @@ pub(super) fn remote_update_command(
         shlex_quote(auth_support::AFTER_WRAPPER_SHA_PREFIX),
         shlex_quote(auth_support::AFTER_WRAPPER_MODE_PREFIX),
         shlex_quote(REMOTE_BEFORE_STATUS_PREFIX),
-        shlex_quote(REMOTE_REFRESH_PREFIX),
         shlex_quote(REMOTE_AFTER_STATUS_PREFIX),
         shlex_quote(REMOTE_AUTHORITY_ID_PREFIX),
         shlex_quote(&authority.identity_sha256),
@@ -273,9 +273,18 @@ if completed.returncode != 0:
     refuse("shipyard fleet auth wrapper refused the machine-global credential contract")
 try:
     helper = json.loads(completed.stdout)
-except Exception:
-    refuse("shipyard fleet auth wrapper returned malformed JSON")
-token = helper.get("token") if isinstance(helper, dict) else None
+except json.JSONDecodeError:
+    # A deployed pre-release-matched repository-routed wrapper printed one raw
+    # cached installation token. Accept only that narrow legacy framing so the
+    # transaction can replace the wrapper with the current JSON contract.
+    legacy = completed.stdout
+    if not legacy.endswith("\n") or "\n" in legacy[:-1] or "\r" in legacy:
+        refuse("shipyard fleet auth wrapper returned malformed JSON or legacy token")
+    token = legacy[:-1]
+    if not token.startswith("ghs_") or not 40 <= len(token) <= 4096 or not token.isascii():
+        refuse("shipyard fleet auth wrapper returned malformed JSON or legacy token")
+else:
+    token = helper.get("token") if isinstance(helper, dict) else None
 if not isinstance(token, str) or not token or any(ord(character) <= 32 or ord(character) == 127 for character in token):
     refuse("shipyard fleet auth wrapper returned a malformed token")
 sys.stdout.write(token)"#;
@@ -419,10 +428,11 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         &plan.state_dir,
         &plan.release_authority.repository,
         &plan.release_authority,
+        "",
         false,
     );
     format!(
-        "set -euo pipefail; {}; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; token=\"$({})\"; {}; /usr/bin/curl -fsSL --output \"$installer\" {}; test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H \"@$auth_header\" -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; test \"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H \"@$auth_header\" --output \"$auth_helper_source\" {}; /usr/bin/curl -fsSL -H \"@$auth_header\" --output \"$auth_wrapper_source\" {}; unset token; test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; {}; /usr/bin/printf '%s\\n' \"$refresh_receipt\"",
+        "set -euo pipefail; {}; staging_dir=\"$(/usr/bin/mktemp -d)\"; installer=\"$staging_dir/install.sh\"; release_asset=\"$staging_dir/release-asset\"; auth_helper_source=\"$staging_dir/shipyard-github-app-token\"; auth_wrapper_source=\"$staging_dir/ghapp\"; curl_shim=\"$staging_dir/curl-exact-asset\"; trap '/bin/rm -rf \"$staging_dir\"' EXIT; token=\"$({})\"; {}; /usr/bin/curl -fsSL --output \"$installer\" {}; test \"$(/usr/bin/shasum -a 256 \"$installer\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H \"@$auth_header\" -H 'Accept: application/octet-stream' --output \"$release_asset\" {}; test \"$(/usr/bin/shasum -a 256 \"$release_asset\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/curl -fsSL -H \"@$auth_header\" --output \"$auth_helper_source\" {}; /usr/bin/curl -fsSL -H \"@$auth_header\" --output \"$auth_wrapper_source\" {}; unset token; test \"$(/usr/bin/shasum -a 256 \"$auth_helper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"; {}",
         auth_contract,
         auth_token_command,
         auth_header_setup,
