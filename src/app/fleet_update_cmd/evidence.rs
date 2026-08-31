@@ -17,7 +17,7 @@ use super::{
     REMOTE_AFTER_STATUS_PREFIX, REMOTE_AUTHORITY_ID_PREFIX, REMOTE_BEFORE_COMPANION_SHA256_PREFIX,
     REMOTE_BEFORE_COMPANION_VERSION_PREFIX, REMOTE_BEFORE_PRIMARY_SHA256_PREFIX,
     REMOTE_BEFORE_PRIMARY_VERSION_PREFIX, REMOTE_BEFORE_STATUS_PREFIX, REMOTE_REFRESH_PREFIX,
-    REMOTE_RELEASE_ASSET_SHA256_PREFIX, tag_requires_companion,
+    REMOTE_RELEASE_ASSET_SHA256_PREFIX, tag_requires_companion, tag_supports_auth_resolver,
 };
 use crate::paths::{home_dir, unattended_tool_path};
 
@@ -33,20 +33,83 @@ pub(super) struct HostUpdateEvidence {
     pub(super) cli_version: String,
     pub(super) daemon_version: String,
     pub(super) daemon_pid: u32,
+    pub(super) daemon_runtime: DaemonRuntimeEvidence,
     pub(super) configured_repos_before: Option<Vec<String>>,
     pub(super) configured_repos_after: Vec<String>,
     pub(super) configured_repos_preserved: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct DaemonRuntimeEvidence {
+    pub(super) pid: u32,
+    pub(super) loaded_executable_path: PathBuf,
+    pub(super) loaded_executable_sha256: String,
+    pub(super) rendered_launch_sha256: String,
+    pub(super) loaded_launch_sha256: String,
+    pub(super) machine_auth_probe_sha256: String,
+    pub(super) machine_auth_generation_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct AuthSupportEvidence {
     pub(super) helper: SupportFileEvidence,
     pub(super) wrapper: SupportFileEvidence,
+    pub(super) generation: Option<GenerationEvidence>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct GenerationEvidence {
+    pub(super) generation_contract: String,
+    pub(super) generation_id: String,
+    pub(super) authority_identity: String,
+    pub(super) selector_path: PathBuf,
+    pub(super) selector_target: PathBuf,
+    pub(super) selector_recheck_target: PathBuf,
+    pub(super) manifest: GenerationMemberEvidence,
+    pub(super) helper: GenerationMemberEvidence,
+    pub(super) wrapper: GenerationMemberEvidence,
+    pub(super) binary: GenerationMemberEvidence,
+    pub(super) companion: Option<GenerationMemberEvidence>,
+    pub(super) context: Option<GenerationMemberEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct GenerationMemberEvidence {
+    pub(super) path: PathBuf,
+    pub(super) sha256: String,
+    pub(super) mode: u32,
+}
+
+pub(super) const REMOTE_GENERATION_SELECTOR_PREFIX: &str = "SHIPYARD_FLEET_GENERATION_SELECTOR=";
+pub(super) const REMOTE_GENERATION_SELECTOR_RECHECK_PREFIX: &str =
+    "SHIPYARD_FLEET_GENERATION_SELECTOR_RECHECK=";
+pub(super) const REMOTE_GENERATION_ID_PREFIX: &str = "SHIPYARD_FLEET_GENERATION_ID=";
+pub(super) const REMOTE_GENERATION_CONTRACT_PREFIX: &str = "SHIPYARD_FLEET_GENERATION_CONTRACT=";
+pub(super) const REMOTE_GENERATION_AUTHORITY_PREFIX: &str = "SHIPYARD_FLEET_GENERATION_AUTHORITY=";
+pub(super) const REMOTE_GENERATION_MANIFEST_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_GENERATION_MANIFEST_SHA256=";
+pub(super) const REMOTE_GENERATION_HELPER_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_GENERATION_HELPER_SHA256=";
+pub(super) const REMOTE_GENERATION_WRAPPER_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_GENERATION_WRAPPER_SHA256=";
+pub(super) const REMOTE_GENERATION_BINARY_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_GENERATION_BINARY_SHA256=";
+pub(super) const REMOTE_GENERATION_COMPANION_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_GENERATION_COMPANION_SHA256=";
+pub(super) const REMOTE_GENERATION_CONTEXT_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_GENERATION_CONTEXT_SHA256=";
+pub(super) const REMOTE_DAEMON_PID_PREFIX: &str = "SHIPYARD_FLEET_DAEMON_PID=";
+pub(super) const REMOTE_DAEMON_EXECUTABLE_PREFIX: &str = "SHIPYARD_FLEET_DAEMON_EXECUTABLE=";
+pub(super) const REMOTE_DAEMON_EXECUTABLE_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_DAEMON_EXECUTABLE_SHA256=";
+pub(super) const REMOTE_DAEMON_LAUNCH_PREFIX: &str = "SHIPYARD_FLEET_DAEMON_LAUNCH=";
+pub(super) const REMOTE_DAEMON_AUTH_PROBE_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_DAEMON_AUTH_PROBE_SHA256=";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct SupportFileEvidence {
     pub(super) path: PathBuf,
+    pub(super) generation_target: Option<PathBuf>,
     pub(super) sha256: Option<String>,
     pub(super) mode: Option<u32>,
     pub(super) source_blob_oid: Option<String>,
@@ -205,12 +268,18 @@ fn collect_local_evidence(
             "local update returned no typed nonzero daemon PID receipt".to_owned(),
         )
     })?;
+    let generation = after_auth.generation.as_ref().ok_or_else(|| {
+        PlanExecutionError::Failed("local update omitted auth generation".to_owned())
+    })?;
+    let daemon_runtime =
+        collect_local_daemon_runtime(plan, daemon_pid, generation, &after_status, host_deadline)?;
     evidence_from_values(
         before_pair,
         after_pair,
         before_auth,
         after_auth,
         daemon_pid,
+        daemon_runtime,
         before_status,
         &after_status,
         plan.release_authority.identity_sha256.clone(),
@@ -227,6 +296,217 @@ fn local_refresh_daemon_pid_from_output(update_stdout: &[u8]) -> Option<u32> {
         .filter(|pid| *pid != 0)
 }
 
+fn collect_local_daemon_runtime(
+    plan: &HostUpdatePlan,
+    daemon_pid: u32,
+    generation: &GenerationEvidence,
+    after_status: &Value,
+    host_deadline: Instant,
+) -> Result<DaemonRuntimeEvidence, PlanExecutionError> {
+    let pid_path = plan.state_dir.join("daemon/daemon.pid");
+    let recorded_pid = std::fs::read_to_string(&pid_path)
+        .map_err(|error| {
+            PlanExecutionError::Failed(format!("failed to read {}: {error}", pid_path.display()))
+        })?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| PlanExecutionError::Failed("daemon PID file was invalid".to_owned()))?;
+    if recorded_pid != daemon_pid {
+        return Err(PlanExecutionError::Failed(
+            "refreshed daemon PID disagreed with the live daemon PID file".to_owned(),
+        ));
+    }
+    let mut lsof = Command::new("/usr/sbin/lsof");
+    lsof.args(["-a", "-p", &daemon_pid.to_string(), "-d", "txt", "-Fn"]);
+    let lsof = run_bounded_output(
+        &mut lsof,
+        probe_deadline(host_deadline),
+        "daemon loaded executable",
+    )?;
+    if !lsof.status.success() {
+        return Err(PlanExecutionError::Failed(
+            "failed to inspect daemon loaded executable".to_owned(),
+        ));
+    }
+    let loaded_executable_path = parse_lsof_text_path(&lsof.stdout)?;
+    let loaded_executable_sha256 = sha256_file(&loaded_executable_path).map_err(|error| {
+        PlanExecutionError::Failed(format!("failed to hash daemon loaded executable: {error}"))
+    })?;
+    let mut ps = Command::new("/bin/ps");
+    ps.args(["-ww", "-p", &daemon_pid.to_string(), "-o", "command="]);
+    let ps = run_bounded_output(
+        &mut ps,
+        probe_deadline(host_deadline),
+        "daemon loaded launch",
+    )?;
+    if !ps.status.success() {
+        return Err(PlanExecutionError::Failed(
+            "failed to inspect daemon launch command".to_owned(),
+        ));
+    }
+    let loaded_launch = single_line(&ps.stdout, "daemon launch command")?;
+    let rendered_launch = rendered_daemon_launch(plan, &configured_repos(after_status)?);
+    let mut auth = Command::new(&generation.binary.path);
+    auth.args(["--mode", plan.runtime_mode.as_str(), "--global-dir"])
+        .arg(&plan.global_dir)
+        .arg("--state-dir")
+        .arg(&plan.state_dir)
+        .args(["auth", "helper-argv", "--wrapper"])
+        .arg(&plan.auth_wrapper)
+        .args(["--repo", &plan.release_authority.repository])
+        .env_clear()
+        .env("HOME", home_dir())
+        .env("PATH", unattended_tool_path());
+    let auth = run_bounded_output(
+        &mut auth,
+        probe_deadline(host_deadline),
+        "machine-global auth launch",
+    )?;
+    if !auth.status.success() {
+        return Err(PlanExecutionError::Failed(
+            "machine-global auth launch probe failed".to_owned(),
+        ));
+    }
+    validate_auth_launch_probe(plan, &auth.stdout)?;
+    let final_pid = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    let final_selector = std::fs::read_link(&plan.auth_wrapper).ok();
+    if final_pid != Some(daemon_pid) || final_selector.as_ref() != Some(&generation.selector_target)
+    {
+        return Err(PlanExecutionError::Failed(
+            "daemon PID or auth selector changed while runtime evidence was collected".to_owned(),
+        ));
+    }
+    Ok(DaemonRuntimeEvidence {
+        pid: daemon_pid,
+        loaded_executable_path,
+        loaded_executable_sha256,
+        rendered_launch_sha256: sha256_bytes(rendered_launch.as_bytes()),
+        loaded_launch_sha256: sha256_bytes(loaded_launch.as_bytes()),
+        machine_auth_probe_sha256: sha256_bytes(&auth.stdout),
+        machine_auth_generation_id: generation.generation_id.clone(),
+    })
+}
+
+fn parse_lsof_text_path(stdout: &[u8]) -> Result<PathBuf, PlanExecutionError> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|_| PlanExecutionError::Failed("daemon lsof output was not UTF-8".to_owned()))?;
+    let mut saw_text = false;
+    for line in text.lines() {
+        if line == "ftxt" {
+            saw_text = true;
+        } else if saw_text && line.starts_with('n') && line.len() > 1 {
+            return Ok(PathBuf::from(&line[1..]));
+        }
+    }
+    Err(PlanExecutionError::Failed(
+        "daemon lsof output omitted the loaded text executable".to_owned(),
+    ))
+}
+
+fn single_line(stdout: &[u8], label: &str) -> Result<String, PlanExecutionError> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|_| PlanExecutionError::Failed(format!("{label} was not UTF-8")))?;
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() != 1 || lines[0].is_empty() {
+        return Err(PlanExecutionError::Failed(format!(
+            "{label} was not one nonempty line"
+        )));
+    }
+    Ok(lines[0].to_owned())
+}
+
+fn validate_auth_launch_probe(
+    plan: &HostUpdatePlan,
+    stdout: &[u8],
+) -> Result<(), PlanExecutionError> {
+    let value = parse_json_value(stdout, "machine-global auth launch probe")?;
+    let Some(object) = value.as_object() else {
+        return Err(invalid_auth_launch_probe());
+    };
+    let expected_keys = [
+        "schema_version",
+        "command",
+        "wrapper",
+        "repo",
+        "credential_argv",
+    ];
+    let argv = object.get("credential_argv").and_then(Value::as_array);
+    if object.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !object.contains_key(*key))
+        || object.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || object.get("command").and_then(Value::as_str) != Some("auth.helper-argv")
+        || value.get("wrapper").and_then(Value::as_str) != plan.auth_wrapper.to_str()
+        || value.get("repo").and_then(Value::as_str)
+            != Some(plan.release_authority.repository.as_str())
+        || !argv.is_some_and(|argv| argv.len() == 4 && argv.iter().all(Value::is_string))
+    {
+        return Err(invalid_auth_launch_probe());
+    }
+    let argv = argv.expect("validated credential argv");
+    let app_id = argv[1].as_str().expect("validated string argv");
+    let private_key = argv[3].as_str().expect("validated string argv");
+    if argv[0].as_str() != Some("--app-id")
+        || argv[2].as_str() != Some("--private-key")
+        || !valid_app_id(app_id)
+        || !normalized_absolute_credential_path(private_key)
+        || argv
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|item| item.is_empty() || item.chars().any(char::is_control))
+    {
+        return Err(invalid_auth_launch_probe());
+    }
+    Ok(())
+}
+
+fn invalid_auth_launch_probe() -> PlanExecutionError {
+    PlanExecutionError::Failed(
+        "machine-global auth launch probe did not bind the exact typed credential contract"
+            .to_owned(),
+    )
+}
+
+fn valid_app_id(value: &str) -> bool {
+    (1..=20).contains(&value.len())
+        && value.is_ascii()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|parsed| parsed > 0)
+}
+
+fn normalized_absolute_credential_path(value: &str) -> bool {
+    (2..=4096).contains(&value.len())
+        && value.starts_with('/')
+        && !value.chars().any(char::is_control)
+        && value
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn rendered_daemon_launch(plan: &HostUpdatePlan, repos: &[String]) -> String {
+    let mut repos = repos.to_vec();
+    repos.sort();
+    repos.dedup();
+    let mut rendered = format!(
+        "{} --mode {} --global-dir {} --state-dir {} daemon run",
+        plan.binary.display(),
+        plan.runtime_mode.as_str(),
+        plan.global_dir.display(),
+        plan.state_dir.display()
+    );
+    for repo in repos {
+        rendered.push_str(" --repo ");
+        rendered.push_str(&repo);
+    }
+    rendered
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
 fn local_refresh_daemon_pid(value: &Value) -> Option<u64> {
     if value.get("event").and_then(Value::as_str) == Some("daemon_refreshed") {
         return value.get("daemon_pid").and_then(Value::as_u64);
@@ -240,20 +520,294 @@ fn collect_local_auth_support(
     plan: &HostUpdatePlan,
     verified: bool,
 ) -> Result<AuthSupportEvidence, PlanExecutionError> {
+    let helper = collect_local_support_file(
+        &plan.auth_helper,
+        verified.then_some(plan.release_authority.auth_helper.blob_oid.as_str()),
+        verified,
+        plan,
+    )?;
+    let wrapper = collect_local_support_file(
+        &plan.auth_wrapper,
+        verified.then_some(plan.release_authority.auth_wrapper.blob_oid.as_str()),
+        verified,
+        plan,
+    )?;
+    let generation = verified
+        .then(|| collect_local_generation(plan))
+        .transpose()?;
     Ok(AuthSupportEvidence {
-        helper: collect_local_support_file(
-            &plan.auth_helper,
-            verified.then_some(plan.release_authority.auth_helper.blob_oid.as_str()),
-            verified,
-            plan,
-        )?,
-        wrapper: collect_local_support_file(
-            &plan.auth_wrapper,
-            verified.then_some(plan.release_authority.auth_wrapper.blob_oid.as_str()),
-            verified,
-            plan,
-        )?,
+        helper,
+        wrapper,
+        generation,
     })
+}
+
+fn collect_local_generation(
+    plan: &HostUpdatePlan,
+) -> Result<GenerationEvidence, PlanExecutionError> {
+    let selector_target = std::fs::read_link(&plan.auth_wrapper).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to read auth generation selector {}: {error}",
+            plan.auth_wrapper.display()
+        ))
+    })?;
+    let generation_dir =
+        validate_generation_target_shape(&plan.auth_wrapper, &selector_target, plan)?;
+    let generation_id = generation_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| PlanExecutionError::Failed("generation identity was not UTF-8".to_owned()))?
+        .to_owned();
+    let manifest = collect_generation_member(&generation_dir.join("generation.manifest"), 0o600)?;
+    let manifest_values = parse_generation_manifest(&manifest.path)?;
+    let helper =
+        collect_generation_member(&generation_dir.join("shipyard-github-app-token"), 0o700)?;
+    let wrapper = collect_generation_member(&generation_dir.join("ghapp"), 0o700)?;
+    let binary = collect_generation_member(&generation_dir.join("shipyard"), 0o700)?;
+    let companion = plan
+        .companion_required
+        .then(|| collect_generation_member(&generation_dir.join(COMPANION_BINARY_NAME), 0o700))
+        .transpose()?;
+    let context = tag_supports_auth_resolver(&plan.target)
+        .then(|| {
+            collect_generation_member(&generation_dir.join("ghapp.shipyard-context.json"), 0o600)
+        })
+        .transpose()?;
+    validate_generation_manifest_values(
+        &manifest_values,
+        &generation_id,
+        &helper,
+        &wrapper,
+        &binary,
+        companion.as_ref(),
+        context.as_ref(),
+    )?;
+    let authority_identity = manifest_values["authority_identity"].clone();
+    let generation_contract = manifest_values["generation_contract"].clone();
+    for member in [
+        Some(&manifest),
+        Some(&helper),
+        Some(&wrapper),
+        Some(&binary),
+        companion.as_ref(),
+        context.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        verify_generation_member_unchanged(member)?;
+    }
+    if let Some(context) = &context {
+        validate_generation_context(context, &generation_id, &authority_identity, plan)?;
+    }
+    let selector_recheck_target = std::fs::read_link(&plan.auth_wrapper).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to re-read auth generation selector {}: {error}",
+            plan.auth_wrapper.display()
+        ))
+    })?;
+    if selector_recheck_target != selector_target {
+        return Err(PlanExecutionError::Failed(
+            "auth generation selector changed while evidence was collected".to_owned(),
+        ));
+    }
+    Ok(GenerationEvidence {
+        generation_contract,
+        generation_id,
+        authority_identity,
+        selector_path: plan.auth_wrapper.clone(),
+        selector_target,
+        selector_recheck_target,
+        manifest,
+        helper,
+        wrapper,
+        binary,
+        companion,
+        context,
+    })
+}
+
+fn verify_generation_member_unchanged(
+    member: &GenerationMemberEvidence,
+) -> Result<(), PlanExecutionError> {
+    let recheck = sha256_file(&member.path).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to re-hash generation member {}: {error}",
+            member.path.display()
+        ))
+    })?;
+    if recheck != member.sha256 {
+        return Err(PlanExecutionError::Failed(format!(
+            "generation member {} changed while evidence was collected",
+            member.path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_generation_context(
+    context: &GenerationMemberEvidence,
+    generation_id: &str,
+    authority_identity: &str,
+    plan: &HostUpdatePlan,
+) -> Result<(), PlanExecutionError> {
+    let value: Value =
+        serde_json::from_reader(std::fs::File::open(&context.path).map_err(|error| {
+            PlanExecutionError::Failed(format!(
+                "failed to open generation context {}: {error}",
+                context.path.display()
+            ))
+        })?)
+        .map_err(|_| {
+            PlanExecutionError::Failed("generation context was not valid JSON".to_owned())
+        })?;
+    let object = value.as_object().ok_or_else(|| {
+        PlanExecutionError::Failed("generation context was not a JSON object".to_owned())
+    })?;
+    let expected_keys = [
+        "authority_identity",
+        "generation_id",
+        "global_dir",
+        "mode",
+        "schema_version",
+    ];
+    if object.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !object.contains_key(*key))
+        || object.get("schema_version").and_then(Value::as_u64) != Some(2)
+        || object.get("generation_id").and_then(Value::as_str) != Some(generation_id)
+        || object.get("authority_identity").and_then(Value::as_str) != Some(authority_identity)
+        || object.get("global_dir").and_then(Value::as_str) != plan.global_dir.to_str()
+        || object.get("mode").and_then(Value::as_str) != Some(plan.runtime_mode.as_str())
+    {
+        return Err(PlanExecutionError::Failed(
+            "generation context did not bind its generation, authority, mode, and global directory"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn collect_generation_member(
+    path: &Path,
+    expected_mode: u32,
+) -> Result<GenerationMemberEvidence, PlanExecutionError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to inspect generation member {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+            || file_mode(&metadata) != expected_mode
+        {
+            return Err(PlanExecutionError::Failed(format!(
+                "generation member {} was not an owned mode-{expected_mode:o} regular file",
+                path.display()
+            )));
+        }
+    }
+    Ok(GenerationMemberEvidence {
+        path: path.to_owned(),
+        sha256: sha256_file(path).map_err(|error| {
+            PlanExecutionError::Failed(format!(
+                "failed to hash generation member {}: {error}",
+                path.display()
+            ))
+        })?,
+        mode: expected_mode,
+    })
+}
+
+fn parse_generation_manifest(
+    path: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, PlanExecutionError> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to read generation manifest {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut values = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            PlanExecutionError::Failed("generation manifest contained a malformed line".to_owned())
+        })?;
+        if key.is_empty()
+            || value.is_empty()
+            || values.insert(key.to_owned(), value.to_owned()).is_some()
+        {
+            return Err(PlanExecutionError::Failed(
+                "generation manifest contained an empty or duplicate field".to_owned(),
+            ));
+        }
+    }
+    Ok(values)
+}
+
+fn validate_generation_manifest_values(
+    values: &std::collections::BTreeMap<String, String>,
+    generation_id: &str,
+    helper: &GenerationMemberEvidence,
+    wrapper: &GenerationMemberEvidence,
+    binary: &GenerationMemberEvidence,
+    companion: Option<&GenerationMemberEvidence>,
+    context: Option<&GenerationMemberEvidence>,
+) -> Result<(), PlanExecutionError> {
+    let expected = std::collections::BTreeMap::from([
+        ("schema_version".to_owned(), "1".to_owned()),
+        (
+            "generation_contract".to_owned(),
+            "auth-selector-v1".to_owned(),
+        ),
+        ("generation_id".to_owned(), generation_id.to_owned()),
+        (
+            "authority_identity".to_owned(),
+            values
+                .get("authority_identity")
+                .cloned()
+                .unwrap_or_default(),
+        ),
+        ("helper_sha256".to_owned(), helper.sha256.clone()),
+        ("helper_mode".to_owned(), format!("{:o}", helper.mode)),
+        ("wrapper_sha256".to_owned(), wrapper.sha256.clone()),
+        ("wrapper_mode".to_owned(), format!("{:o}", wrapper.mode)),
+        ("binary_sha256".to_owned(), binary.sha256.clone()),
+        ("binary_mode".to_owned(), format!("{:o}", binary.mode)),
+        (
+            "companion_sha256".to_owned(),
+            companion.map_or_else(|| "absent".to_owned(), |member| member.sha256.clone()),
+        ),
+        (
+            "context_sha256".to_owned(),
+            context.map_or_else(|| "absent".to_owned(), |member| member.sha256.clone()),
+        ),
+        (
+            "context_template_sha256".to_owned(),
+            values
+                .get("context_template_sha256")
+                .cloned()
+                .unwrap_or_default(),
+        ),
+    ]);
+    if values != &expected
+        || !valid_sha256(generation_id)
+        || !values
+            .get("authority_identity")
+            .is_some_and(|value| valid_sha256(value))
+        || !values
+            .get("context_template_sha256")
+            .is_some_and(|value| valid_sha256(value))
+    {
+        return Err(PlanExecutionError::Failed(
+            "generation manifest did not bind the exact immutable member set".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn collect_local_support_file(
@@ -265,6 +819,7 @@ fn collect_local_support_file(
     if !path_present_no_follow(path)? {
         return Ok(SupportFileEvidence {
             path: path.to_owned(),
+            generation_target: None,
             sha256: None,
             mode: None,
             source_blob_oid: None,
@@ -278,18 +833,42 @@ fn collect_local_support_file(
             path.display()
         ))
     })?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+    let generation_target = if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(path).map_err(|error| {
+            PlanExecutionError::Failed(format!(
+                "failed to read support-file generation link {}: {error}",
+                path.display()
+            ))
+        })?;
+        validate_local_generation_target(path, &target, plan)?;
+        Some(target)
+    } else if metadata.file_type().is_file() {
+        None
+    } else {
         return Err(PlanExecutionError::Failed(format!(
-            "support file {} was not a no-follow regular file",
+            "support file {} was neither a regular file nor a generation link",
+            path.display()
+        )));
+    };
+    let followed_metadata = std::fs::metadata(path).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to inspect support-file generation target {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !followed_metadata.file_type().is_file() {
+        return Err(PlanExecutionError::Failed(format!(
+            "support file {} did not resolve to a regular file",
             path.display()
         )));
     }
     #[cfg(unix)]
-    let mode = Some(file_mode(&metadata));
+    let mode = Some(file_mode(&followed_metadata));
     #[cfg(not(unix))]
     let mode = None;
     Ok(SupportFileEvidence {
         path: path.to_owned(),
+        generation_target,
         sha256: Some(sha256_file(path).map_err(|error| {
             PlanExecutionError::Failed(format!(
                 "failed to hash support file {}: {error}",
@@ -305,6 +884,215 @@ fn collect_local_support_file(
             SourceIdentityBasis::UnverifiedPreinstall
         },
     })
+}
+
+fn validate_local_generation_target(
+    path: &Path,
+    target: &Path,
+    plan: &HostUpdatePlan,
+) -> Result<(), PlanExecutionError> {
+    let generation_root = generation_root(plan)?;
+    let private_root = generation_root.parent().ok_or_else(|| {
+        PlanExecutionError::Failed("generation root had no private parent".to_owned())
+    })?;
+    let share_root = private_root.parent().ok_or_else(|| {
+        PlanExecutionError::Failed("generation private root had no share parent".to_owned())
+    })?;
+    let local_root = share_root.parent().ok_or_else(|| {
+        PlanExecutionError::Failed("generation share root had no local parent".to_owned())
+    })?;
+    let expected_home = plan
+        .auth_wrapper
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            PlanExecutionError::Failed(
+                "canonical auth wrapper did not identify its HOME root".to_owned(),
+            )
+        })?;
+    if local_root.parent() != Some(expected_home)
+        || local_root.file_name().and_then(|value| value.to_str()) != Some(".local")
+        || share_root.file_name().and_then(|value| value.to_str()) != Some("share")
+        || private_root.file_name().and_then(|value| value.to_str()) != Some("shipyard")
+    {
+        return Err(PlanExecutionError::Failed(
+            "generation roots were not under the canonical HOME/.local/share/shipyard path"
+                .to_owned(),
+        ));
+    }
+    for directory in [expected_home, local_root, share_root] {
+        validate_generation_parent(directory, false)?;
+    }
+    for directory in [private_root, generation_root.as_path()] {
+        validate_generation_parent(directory, true)?;
+    }
+    let generation_dir = validate_generation_target_shape(path, target, plan)?;
+    validate_generation_directory(&generation_dir)?;
+    validate_generation_member(target)?;
+    Ok(())
+}
+
+fn validate_generation_parent(directory: &Path, private: bool) -> Result<(), PlanExecutionError> {
+    let metadata = std::fs::symlink_metadata(directory).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to inspect generation parent {}: {error}",
+            directory.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = file_mode(&metadata);
+        let unsafe_mode = if private {
+            mode != 0o700
+        } else {
+            mode & 0o022 != 0
+        };
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+            || unsafe_mode
+        {
+            let requirement = if private {
+                "owned mode-0700 no-follow directory"
+            } else {
+                "owned no-follow non-writable directory"
+            };
+            return Err(PlanExecutionError::Failed(format!(
+                "generation parent {} was not an {requirement}",
+                directory.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_generation_directory(generation_dir: &Path) -> Result<(), PlanExecutionError> {
+    let generation_metadata = std::fs::symlink_metadata(generation_dir).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to inspect generation directory {}: {error}",
+            generation_dir.display()
+        ))
+    })?;
+    if !generation_metadata.file_type().is_dir() || generation_metadata.file_type().is_symlink() {
+        return Err(PlanExecutionError::Failed(format!(
+            "generation directory {} was not a no-follow directory",
+            generation_dir.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if generation_metadata.uid() != nix::unistd::Uid::effective().as_raw()
+            || file_mode(&generation_metadata) != 0o700
+        {
+            return Err(PlanExecutionError::Failed(format!(
+                "generation directory {} had unsafe ownership or mode",
+                generation_dir.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_generation_member(target: &Path) -> Result<(), PlanExecutionError> {
+    let target_metadata = std::fs::symlink_metadata(target).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to inspect generation target {}: {error}",
+            target.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !target_metadata.file_type().is_file()
+            || target_metadata.file_type().is_symlink()
+            || target_metadata.uid() != nix::unistd::Uid::effective().as_raw()
+            || file_mode(&target_metadata) != 0o700
+        {
+            return Err(PlanExecutionError::Failed(format!(
+                "generation target {} was not an owned mode-0700 regular file",
+                target.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_generation_target_shape(
+    path: &Path,
+    target: &Path,
+    plan: &HostUpdatePlan,
+) -> Result<PathBuf, PlanExecutionError> {
+    let root = generation_root(plan)?;
+    if !root.is_absolute() || !target.is_absolute() {
+        return Err(PlanExecutionError::Failed(format!(
+            "support file {} used a non-absolute generation target",
+            path.display()
+        )));
+    }
+    let relative = target.strip_prefix(&root).map_err(|_| {
+        PlanExecutionError::Failed(format!(
+            "support file {} targeted a path outside the generation root",
+            path.display()
+        ))
+    })?;
+    let components = relative.components().collect::<Vec<_>>();
+    let generation = components
+        .first()
+        .and_then(|component| component.as_os_str().to_str());
+    let expected_name = path.file_name().ok_or_else(|| {
+        PlanExecutionError::Failed(format!(
+            "support path {} had no canonical file name",
+            path.display()
+        ))
+    })?;
+    if components.len() != 2
+        || generation.is_none_or(|value| {
+            value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        || components.get(1).map(|component| component.as_os_str()) != Some(expected_name)
+    {
+        return Err(PlanExecutionError::Failed(format!(
+            "support file {} used a malformed generation target",
+            path.display()
+        )));
+    }
+    let generation_dir = target.parent().ok_or_else(|| {
+        PlanExecutionError::Failed(format!(
+            "support file {} used a parentless generation target",
+            path.display()
+        ))
+    })?;
+    let expected_target = root
+        .join(generation.ok_or_else(|| {
+            PlanExecutionError::Failed(format!(
+                "support file {} omitted its generation identity",
+                path.display()
+            ))
+        })?)
+        .join(expected_name);
+    if expected_target != target {
+        return Err(PlanExecutionError::Failed(format!(
+            "support file {} used a non-canonical generation target",
+            path.display()
+        )));
+    }
+    Ok(generation_dir.to_owned())
+}
+
+fn generation_root(plan: &HostUpdatePlan) -> Result<PathBuf, PlanExecutionError> {
+    let home = plan
+        .binary
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| PlanExecutionError::Failed("fleet binary has no home root".to_owned()))?;
+    Ok(home.join(".local/share/shipyard/auth-generations"))
 }
 
 #[cfg(unix)]
@@ -431,6 +1219,8 @@ pub(super) fn parse_remote_evidence(
         &unique_marker(text, REMOTE_AFTER_STATUS_PREFIX)?,
         "remote post-update daemon status",
     )?;
+    let daemon_runtime =
+        daemon_runtime_from_markers(plan, text, daemon_pid, &after_status, &after_auth)?;
     let release_authority_identity = unique_marker(text, REMOTE_AUTHORITY_ID_PREFIX)?;
     let release_asset_sha256 = unique_marker(text, REMOTE_RELEASE_ASSET_SHA256_PREFIX)?;
     let evidence = evidence_from_values(
@@ -439,6 +1229,7 @@ pub(super) fn parse_remote_evidence(
         before_auth,
         after_auth,
         daemon_pid,
+        daemon_runtime,
         &before_status,
         &after_status,
         release_authority_identity,
@@ -452,31 +1243,80 @@ pub(super) fn parse_remote_evidence(
     Ok(evidence)
 }
 
+fn daemon_runtime_from_markers(
+    plan: &HostUpdatePlan,
+    text: &str,
+    daemon_pid: u32,
+    after_status: &Value,
+    after_auth: &AuthSupportEvidence,
+) -> Result<DaemonRuntimeEvidence, PlanExecutionError> {
+    let observed_pid = unique_marker(text, REMOTE_DAEMON_PID_PREFIX)?
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| {
+            PlanExecutionError::Failed("remote daemon PID marker was invalid".to_owned())
+        })?;
+    let generation = after_auth.generation.as_ref().ok_or_else(|| {
+        PlanExecutionError::Failed("remote daemon receipt omitted auth generation".to_owned())
+    })?;
+    let loaded_executable_path =
+        PathBuf::from(unique_marker(text, REMOTE_DAEMON_EXECUTABLE_PREFIX)?);
+    let loaded_executable_sha256 = unique_marker(text, REMOTE_DAEMON_EXECUTABLE_SHA_PREFIX)?;
+    let loaded_launch = unique_marker(text, REMOTE_DAEMON_LAUNCH_PREFIX)?;
+    let machine_auth_probe_sha256 = unique_marker(text, REMOTE_DAEMON_AUTH_PROBE_SHA_PREFIX)?;
+    let rendered_launch = rendered_daemon_launch(plan, &configured_repos(after_status)?);
+    if observed_pid != daemon_pid
+        || loaded_executable_path != generation.binary.path
+        || !valid_sha256(&loaded_executable_sha256)
+        || !valid_sha256(&machine_auth_probe_sha256)
+    {
+        return Err(PlanExecutionError::Failed(
+            "remote daemon runtime markers did not bind the refreshed generation".to_owned(),
+        ));
+    }
+    Ok(DaemonRuntimeEvidence {
+        pid: observed_pid,
+        loaded_executable_path,
+        loaded_executable_sha256,
+        rendered_launch_sha256: sha256_bytes(rendered_launch.as_bytes()),
+        loaded_launch_sha256: sha256_bytes(loaded_launch.as_bytes()),
+        machine_auth_probe_sha256,
+        machine_auth_generation_id: generation.generation_id.clone(),
+    })
+}
+
 fn remote_auth_support_from_markers(
     plan: &HostUpdatePlan,
     text: &str,
     after: bool,
 ) -> Result<AuthSupportEvidence, PlanExecutionError> {
-    let (helper_sha, helper_mode, wrapper_sha, wrapper_mode) = if after {
-        (
-            auth_support::AFTER_HELPER_SHA_PREFIX,
-            auth_support::AFTER_HELPER_MODE_PREFIX,
-            auth_support::AFTER_WRAPPER_SHA_PREFIX,
-            auth_support::AFTER_WRAPPER_MODE_PREFIX,
-        )
-    } else {
-        (
-            auth_support::BEFORE_HELPER_SHA_PREFIX,
-            auth_support::BEFORE_HELPER_MODE_PREFIX,
-            auth_support::BEFORE_WRAPPER_SHA_PREFIX,
-            auth_support::BEFORE_WRAPPER_MODE_PREFIX,
-        )
-    };
+    let (helper_sha, helper_mode, helper_target, wrapper_sha, wrapper_mode, wrapper_target) =
+        if after {
+            (
+                auth_support::AFTER_HELPER_SHA_PREFIX,
+                auth_support::AFTER_HELPER_MODE_PREFIX,
+                auth_support::AFTER_HELPER_TARGET_PREFIX,
+                auth_support::AFTER_WRAPPER_SHA_PREFIX,
+                auth_support::AFTER_WRAPPER_MODE_PREFIX,
+                auth_support::AFTER_WRAPPER_TARGET_PREFIX,
+            )
+        } else {
+            (
+                auth_support::BEFORE_HELPER_SHA_PREFIX,
+                auth_support::BEFORE_HELPER_MODE_PREFIX,
+                auth_support::BEFORE_HELPER_TARGET_PREFIX,
+                auth_support::BEFORE_WRAPPER_SHA_PREFIX,
+                auth_support::BEFORE_WRAPPER_MODE_PREFIX,
+                auth_support::BEFORE_WRAPPER_TARGET_PREFIX,
+            )
+        };
     Ok(AuthSupportEvidence {
         helper: support_file_from_markers(
             &plan.auth_helper,
             &unique_marker(text, helper_sha)?,
             &unique_marker(text, helper_mode)?,
+            &unique_marker(text, helper_target)?,
             after.then_some(plan.release_authority.auth_helper.blob_oid.as_str()),
             after,
             plan,
@@ -485,9 +1325,116 @@ fn remote_auth_support_from_markers(
             &plan.auth_wrapper,
             &unique_marker(text, wrapper_sha)?,
             &unique_marker(text, wrapper_mode)?,
+            &unique_marker(text, wrapper_target)?,
             after.then_some(plan.release_authority.auth_wrapper.blob_oid.as_str()),
             after,
             plan,
+        )?,
+        generation: after
+            .then(|| generation_from_markers(plan, text))
+            .transpose()?,
+    })
+}
+
+fn generation_from_markers(
+    plan: &HostUpdatePlan,
+    text: &str,
+) -> Result<GenerationEvidence, PlanExecutionError> {
+    let selector_target = PathBuf::from(unique_marker(text, REMOTE_GENERATION_SELECTOR_PREFIX)?);
+    let selector_recheck_target = PathBuf::from(unique_marker(
+        text,
+        REMOTE_GENERATION_SELECTOR_RECHECK_PREFIX,
+    )?);
+    if selector_target != selector_recheck_target {
+        return Err(PlanExecutionError::Failed(
+            "remote auth generation selector changed while evidence was collected".to_owned(),
+        ));
+    }
+    let generation_dir =
+        validate_generation_target_shape(&plan.auth_wrapper, &selector_target, plan)?;
+    let generation_id = unique_marker(text, REMOTE_GENERATION_ID_PREFIX)?;
+    if generation_dir.file_name().and_then(|value| value.to_str()) != Some(&generation_id)
+        || !valid_sha256(&generation_id)
+    {
+        return Err(PlanExecutionError::Failed(
+            "remote auth generation identity disagreed with the selector".to_owned(),
+        ));
+    }
+    let authority_identity = unique_marker(text, REMOTE_GENERATION_AUTHORITY_PREFIX)?;
+    if !valid_sha256(&authority_identity) {
+        return Err(PlanExecutionError::Failed(
+            "remote auth generation authority identity was invalid".to_owned(),
+        ));
+    }
+    let member = |name: &str, prefix: &str, mode: u32| {
+        let sha256 = unique_marker(text, prefix)?;
+        if !valid_sha256(&sha256) {
+            return Err(PlanExecutionError::Failed(format!(
+                "remote auth generation member {name} had an invalid digest"
+            )));
+        }
+        Ok(GenerationMemberEvidence {
+            path: generation_dir.join(name),
+            sha256,
+            mode,
+        })
+    };
+    let optional_member = |name: &str, prefix: &str, mode: u32, required: bool| {
+        let sha256 = unique_marker(text, prefix)?;
+        match (sha256.as_str(), required) {
+            ("absent", false) => Ok(None),
+            ("absent", true) => Err(PlanExecutionError::Failed(format!(
+                "remote auth generation omitted required member {name}"
+            ))),
+            (_, false) => Err(PlanExecutionError::Failed(format!(
+                "remote auth generation retained unexpected member {name}"
+            ))),
+            (_, true) if valid_sha256(&sha256) => Ok(Some(GenerationMemberEvidence {
+                path: generation_dir.join(name),
+                sha256,
+                mode,
+            })),
+            _ => Err(PlanExecutionError::Failed(format!(
+                "remote auth generation member {name} had an invalid digest"
+            ))),
+        }
+    };
+    let generation_contract = unique_marker(text, REMOTE_GENERATION_CONTRACT_PREFIX)?;
+    if generation_contract != "auth-selector-v1" {
+        return Err(PlanExecutionError::Failed(
+            "remote auth generation contract was unsupported".to_owned(),
+        ));
+    }
+    Ok(GenerationEvidence {
+        generation_contract,
+        generation_id,
+        authority_identity,
+        selector_path: plan.auth_wrapper.clone(),
+        selector_target,
+        selector_recheck_target,
+        manifest: member(
+            "generation.manifest",
+            REMOTE_GENERATION_MANIFEST_SHA_PREFIX,
+            0o600,
+        )?,
+        helper: member(
+            "shipyard-github-app-token",
+            REMOTE_GENERATION_HELPER_SHA_PREFIX,
+            0o700,
+        )?,
+        wrapper: member("ghapp", REMOTE_GENERATION_WRAPPER_SHA_PREFIX, 0o700)?,
+        binary: member("shipyard", REMOTE_GENERATION_BINARY_SHA_PREFIX, 0o700)?,
+        companion: optional_member(
+            COMPANION_BINARY_NAME,
+            REMOTE_GENERATION_COMPANION_SHA_PREFIX,
+            0o700,
+            plan.companion_required,
+        )?,
+        context: optional_member(
+            "ghapp.shipyard-context.json",
+            REMOTE_GENERATION_CONTEXT_SHA_PREFIX,
+            0o600,
+            tag_supports_auth_resolver(&plan.target),
         )?,
     })
 }
@@ -496,18 +1443,19 @@ fn support_file_from_markers(
     path: &Path,
     sha256: &str,
     mode: &str,
+    target: &str,
     blob_oid: Option<&str>,
     verified: bool,
     plan: &HostUpdatePlan,
 ) -> Result<SupportFileEvidence, PlanExecutionError> {
-    let (sha256, mode) = match (sha256, mode) {
-        ("absent", "absent") => (None, None),
-        ("absent", _) | (_, "absent") => {
+    let (sha256, mode, generation_target) = match (sha256, mode, target) {
+        ("absent", "absent", "absent") => (None, None, None),
+        ("absent", _, _) | (_, "absent", _) | (_, _, "absent") => {
             return Err(PlanExecutionError::Failed(
                 "auth support presence markers disagreed".to_owned(),
             ));
         }
-        (sha256, mode) => {
+        (sha256, mode, target) => {
             if !valid_sha256(sha256) {
                 return Err(PlanExecutionError::Failed(
                     "auth support SHA-256 marker was invalid".to_owned(),
@@ -516,11 +1464,20 @@ fn support_file_from_markers(
             let parsed = u32::from_str_radix(mode, 8).map_err(|_| {
                 PlanExecutionError::Failed("auth support mode marker was invalid".to_owned())
             })?;
-            (Some(sha256.to_owned()), Some(parsed))
+            let generation_target = match target {
+                "direct" => None,
+                value => {
+                    let target = PathBuf::from(value);
+                    validate_generation_target_shape(path, &target, plan)?;
+                    Some(target)
+                }
+            };
+            (Some(sha256.to_owned()), Some(parsed), generation_target)
         }
     };
     Ok(SupportFileEvidence {
         path: path.to_owned(),
+        generation_target,
         sha256,
         mode,
         source_blob_oid: blob_oid.map(str::to_owned),
@@ -717,6 +1674,7 @@ fn evidence_from_values(
     auth_support_before: AuthSupportEvidence,
     auth_support_after: AuthSupportEvidence,
     daemon_pid: u32,
+    daemon_runtime: DaemonRuntimeEvidence,
     before_status: &Value,
     after_status: &Value,
     release_authority_identity: String,
@@ -767,6 +1725,7 @@ fn evidence_from_values(
         auth_support_after,
         daemon_version,
         daemon_pid,
+        daemon_runtime,
         configured_repos_before,
         configured_repos_after,
         configured_repos_preserved,
@@ -869,6 +1828,24 @@ pub(super) fn validate_evidence(
     validate_binary_pair(plan, &evidence.after_pair, Some(&plan.target))?;
     validate_auth_support(plan, &evidence.auth_support_before, false)?;
     validate_auth_support(plan, &evidence.auth_support_after, true)?;
+    let generation = evidence
+        .auth_support_after
+        .generation
+        .as_ref()
+        .ok_or_else(|| "post-install evidence omitted composed auth generation".to_owned())?;
+    if generation.binary.sha256 != evidence.after_pair.primary.sha256
+        || generation
+            .companion
+            .as_ref()
+            .map(|member| member.sha256.as_str())
+            != evidence
+                .after_pair
+                .companion
+                .as_ref()
+                .map(|member| member.sha256.as_str())
+    {
+        return Err("composed auth generation disagreed with installed binary pair".to_owned());
+    }
     let version = plan.target.trim_start_matches('v');
     let expected_cli = format!("shipyard {version}");
     if evidence.cli_version != expected_cli
@@ -883,6 +1860,19 @@ pub(super) fn validate_evidence(
             "daemon version mismatch: expected {version:?}, observed {:?}",
             evidence.daemon_version
         ));
+    }
+    if evidence.daemon_runtime.pid != evidence.daemon_pid
+        || evidence.daemon_runtime.loaded_executable_path != generation.binary.path
+        || evidence.daemon_runtime.loaded_executable_sha256 != generation.binary.sha256
+        || evidence.daemon_runtime.rendered_launch_sha256
+            != evidence.daemon_runtime.loaded_launch_sha256
+        || evidence.daemon_runtime.machine_auth_generation_id != generation.generation_id
+        || !valid_sha256(&evidence.daemon_runtime.machine_auth_probe_sha256)
+    {
+        return Err(
+            "refreshed daemon was not bound to the exact loaded generation, launch identity, and machine-global auth selector"
+                .to_owned(),
+        );
     }
     if evidence.configured_repos_preserved == Some(false) {
         return Err("configured repositories changed across daemon refresh".to_owned());
@@ -932,7 +1922,109 @@ fn validate_auth_support(
             );
         }
     }
+    if after {
+        let helper_target = support
+            .helper
+            .generation_target
+            .as_deref()
+            .ok_or_else(|| "post-install auth helper was not generation-bound".to_owned())?;
+        let wrapper_target = support
+            .wrapper
+            .generation_target
+            .as_deref()
+            .ok_or_else(|| "post-install auth wrapper was not generation-bound".to_owned())?;
+        validate_generation_target_shape(&support.helper.path, helper_target, plan)
+            .map_err(plan_execution_message)?;
+        validate_generation_target_shape(&support.wrapper.path, wrapper_target, plan)
+            .map_err(plan_execution_message)?;
+        if helper_target.parent() != wrapper_target.parent() {
+            return Err("post-install auth support mixed generation identities".to_owned());
+        }
+        let generation = support.generation.as_ref().ok_or_else(|| {
+            "post-install auth support omitted composed generation evidence".to_owned()
+        })?;
+        validate_generation_evidence(plan, support, generation)?;
+    } else if support.generation.is_some() {
+        return Err("pre-install auth support claimed verified generation evidence".to_owned());
+    }
     Ok(())
+}
+
+fn validate_generation_evidence(
+    plan: &HostUpdatePlan,
+    support: &AuthSupportEvidence,
+    generation: &GenerationEvidence,
+) -> Result<(), String> {
+    if generation.selector_path != plan.auth_wrapper
+        || generation.generation_contract != "auth-selector-v1"
+        || generation.selector_target != generation.selector_recheck_target
+        || generation.authority_identity != plan.release_authority.identity_sha256
+        || !valid_sha256(&generation.generation_id)
+        || !valid_sha256(&generation.manifest.sha256)
+    {
+        return Err("composed auth generation identity was unstable or unauthorized".to_owned());
+    }
+    let generation_dir =
+        validate_generation_target_shape(&plan.auth_wrapper, &generation.selector_target, plan)
+            .map_err(plan_execution_message)?;
+    if generation_dir.file_name().and_then(|value| value.to_str())
+        != Some(generation.generation_id.as_str())
+    {
+        return Err("composed auth generation selector disagreed with its identity".to_owned());
+    }
+    let validate_member =
+        |member: &GenerationMemberEvidence, name: &str, mode: u32| -> Result<(), String> {
+            if member.path != generation_dir.join(name)
+                || member.mode != mode
+                || !valid_sha256(&member.sha256)
+            {
+                return Err(format!(
+                    "composed auth generation member {name} was invalid"
+                ));
+            }
+            Ok(())
+        };
+    validate_member(&generation.manifest, "generation.manifest", 0o600)?;
+    validate_member(&generation.helper, "shipyard-github-app-token", 0o700)?;
+    validate_member(&generation.wrapper, "ghapp", 0o700)?;
+    validate_member(&generation.binary, "shipyard", 0o700)?;
+    if generation.helper.sha256 != support.helper.sha256.as_deref().unwrap_or_default()
+        || generation.wrapper.sha256 != support.wrapper.sha256.as_deref().unwrap_or_default()
+    {
+        return Err(
+            "composed auth generation disagreed with installed support or asset authority"
+                .to_owned(),
+        );
+    }
+    match (&generation.companion, plan.companion_required) {
+        (Some(companion), true) => {
+            validate_member(companion, COMPANION_BINARY_NAME, 0o700)?;
+        }
+        (None, false) => {}
+        _ => return Err("composed auth generation companion presence was invalid".to_owned()),
+    }
+    match (
+        &generation.context,
+        tag_supports_auth_resolver(&plan.target),
+    ) {
+        (Some(context), true) => {
+            validate_member(context, "ghapp.shipyard-context.json", 0o600)?;
+        }
+        (None, false) => {}
+        _ => return Err("composed auth generation context presence was invalid".to_owned()),
+    }
+    if support.helper.generation_target.as_deref() != Some(generation.helper.path.as_path())
+        || support.wrapper.generation_target.as_deref() != Some(generation.wrapper.path.as_path())
+    {
+        return Err("compatibility projections disagreed with composed auth generation".to_owned());
+    }
+    Ok(())
+}
+
+fn plan_execution_message(error: PlanExecutionError) -> String {
+    match error {
+        PlanExecutionError::TimedOut(message) | PlanExecutionError::Failed(message) => message,
+    }
 }
 
 fn ssh_binary() -> PathBuf {

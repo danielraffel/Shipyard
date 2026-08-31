@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::app::fleet_update_cmd::test_release_authority;
 
+const NEW_WRAPPER: &[u8] =
+    b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v1\nexit 0\n";
+
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -73,7 +76,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             fail_after_helper: false,
-            target: "v0.131.0",
+            target: "v0.134.0",
             resolver_succeeds: true,
             refresh_prefix: "",
             refresh: RefreshBehavior::Success,
@@ -105,10 +108,10 @@ impl Fixture {
         let helper_source = root.path().join("new-helper");
         let wrapper_source = root.path().join("new-wrapper");
         std::fs::write(&helper_source, b"new helper\n").expect("helper source");
-        std::fs::write(&wrapper_source, b"new wrapper\n").expect("wrapper source");
+        std::fs::write(&wrapper_source, NEW_WRAPPER).expect("wrapper source");
         let mut authority = test_release_authority("v0.127.0");
         authority.auth_helper.sha256 = digest(b"new helper\n");
-        authority.auth_wrapper.sha256 = digest(b"new wrapper\n");
+        authority.auth_wrapper.sha256 = digest(NEW_WRAPPER);
         Self {
             root,
             helper,
@@ -139,7 +142,7 @@ impl Fixture {
         &self,
         options: &RunOptions,
         state: &Path,
-        binary: &Path,
+        _binary: &Path,
     ) -> String {
         let expected_global_dir = shlex_quote(&state.display().to_string());
         let expected_wrapper = shlex_quote(&self.wrapper.display().to_string());
@@ -224,9 +227,7 @@ impl Fixture {
             .collect::<Vec<_>>()
             .join(" ");
         format!(
-            "/usr/bin/printf '%s\\n' {quoted_lines} > {}; /bin/chmod 700 {}",
-            shlex_quote(&binary.display().to_string()),
-            shlex_quote(&binary.display().to_string()),
+            "/usr/bin/printf '%s\\n' {quoted_lines} > \"$auth_generation_stage/shipyard\"; /bin/chmod 700 \"$auth_generation_stage/shipyard\"; /bin/cp \"$auth_generation_stage/shipyard\" \"$auth_generation_stage/shipyard-workstream-provider\""
         )
     }
 
@@ -276,6 +277,8 @@ impl Fixture {
     }
 }
 
+mod atomic_readers;
+mod journal_v2;
 mod lock;
 
 #[test]
@@ -329,7 +332,7 @@ fn legacy_pair_is_migrated_helper_first_to_exact_private_files() {
     );
     assert_eq!(
         std::fs::read(&fixture.wrapper).expect("wrapper"),
-        b"new wrapper\n"
+        NEW_WRAPPER
     );
     let context = fixture
         .wrapper
@@ -337,14 +340,28 @@ fn legacy_pair_is_migrated_helper_first_to_exact_private_files() {
     let context_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&context).expect("resolver context"))
             .expect("typed resolver context");
+    let wrapper_target = std::fs::read_link(&fixture.wrapper).expect("generation wrapper");
+    let generation_id = wrapper_target
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .expect("generation id");
+    assert_eq!(context_value["schema_version"], 2);
+    assert_eq!(context_value["mode"], "shipyard");
     assert_eq!(
-        context_value,
-        serde_json::json!({
-            "schema_version": 1,
-            "mode": "shipyard",
-            "global_dir": fixture.root.path().join("Library/Application Support/shipyard"),
-        })
+        context_value["global_dir"],
+        fixture
+            .root
+            .path()
+            .join("Library/Application Support/shipyard")
+            .display()
+            .to_string()
     );
+    assert_eq!(
+        context_value["authority_identity"],
+        fixture.authority.identity_sha256
+    );
+    assert_eq!(context_value["generation_id"], generation_id);
     assert_eq!(
         std::fs::metadata(&context)
             .expect("context metadata")
@@ -453,7 +470,7 @@ fn v0_131_recovers_v0_130_nine_line_journal_and_partial_atomic_backups() {
         !fixture
             .run(RunOptions {
                 fail_after_helper: true,
-                target: "v0.131.0",
+                target: "v0.134.0",
                 resolver_succeeds: false,
                 ..RunOptions::default()
             })
@@ -522,7 +539,7 @@ fn v0_131_preparing_recovery_discards_v0_130_partial_direct_backups() {
             binary.display(),
             companion.display(),
             digest(b"new helper\n"),
-            digest(b"new wrapper\n"),
+            digest(NEW_WRAPPER),
         ),
     )
     .expect("legacy preparing journal");
@@ -531,7 +548,7 @@ fn v0_131_preparing_recovery_discards_v0_130_partial_direct_backups() {
         !fixture
             .run(RunOptions {
                 fail_after_helper: true,
-                target: "v0.131.0",
+                target: "v0.134.0",
                 ..RunOptions::default()
             })
             .success()
@@ -599,7 +616,7 @@ fn post_install_resolver_failure_rolls_back_all_installed_artifacts() {
         !fixture
             .run(RunOptions {
                 fail_after_helper: false,
-                target: "v0.131.0",
+                target: "v0.134.0",
                 resolver_succeeds: false,
                 ..RunOptions::default()
             })
@@ -716,7 +733,7 @@ fn next_release_recovers_an_interrupted_prior_release_before_installing() {
     );
     assert_eq!(
         std::fs::read(&fixture.wrapper).expect("wrapper"),
-        b"new wrapper\n"
+        NEW_WRAPPER
     );
 }
 
@@ -744,7 +761,7 @@ fn next_release_rolls_back_an_interrupted_context_install() {
         ),
         (
             &fixture.wrapper,
-            b"new wrapper\n".as_slice(),
+            NEW_WRAPPER,
             b"old wrapper\n".as_slice(),
             0o700,
         ),
@@ -787,7 +804,7 @@ fn next_release_rolls_back_an_interrupted_context_install() {
             companion.display(),
             context.display(),
             digest(b"new helper\n"),
-            digest(b"new wrapper\n"),
+            digest(NEW_WRAPPER),
             digest(b"new context\n"),
         ),
     )

@@ -23,8 +23,8 @@ use command::{local_update_command, remote_update_command, render_host_result, r
 use evidence::execute_plan_with_timeout;
 #[cfg(test)]
 use evidence::{
-    AuthSupportEvidence, BinaryEvidence, BinaryPairEvidence, SourceIdentityBasis,
-    SupportFileEvidence,
+    AuthSupportEvidence, BinaryEvidence, BinaryPairEvidence, DaemonRuntimeEvidence,
+    GenerationEvidence, GenerationMemberEvidence, SourceIdentityBasis, SupportFileEvidence,
 };
 use evidence::{HostUpdateEvidence, PlanExecutionError, execute_plan, validate_evidence};
 use release_authority::{
@@ -40,13 +40,13 @@ use crate::config::LoadedConfig;
 use crate::executor::ssh::shlex_quote;
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
-use crate::paths::{RuntimePaths, home_dir, unattended_tool_path};
+use crate::paths::RuntimePaths;
 
 const REMOTE_MINIMAL_PATH: &str =
     "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const HOST_UPDATE_TIMEOUT: Duration = Duration::from_mins(10);
 const REMOTE_UPDATE_TIMEOUT: Duration = Duration::from_mins(9);
-const MIN_FLEET_UPDATE_TARGET: [u64; 3] = [0, 100, 0];
+const MIN_FLEET_UPDATE_TARGET: [u64; 3] = [0, 134, 0];
 const MIN_PAIRED_BINARY_TARGET: [u64; 3] = [0, 127, 0];
 const MIN_AUTH_RESOLVER_TARGET: [u64; 3] = [0, 131, 0];
 const COMPANION_BINARY_NAME: &str = "shipyard-workstream-provider";
@@ -373,7 +373,7 @@ fn normalize_exact_tag(raw: &str) -> Result<String, CliFailure> {
     if parsed.as_slice() < MIN_FLEET_UPDATE_TARGET.as_slice() {
         return Err(CliFailure::new(
             2,
-            "fleet-update cannot safely bootstrap or validate targets older than v0.100.0; use that release's documented manual rollback procedure",
+            "fleet-update requires v0.134.0 or newer with the authenticated atomic auth-selector generation capability; use the older release's documented manual rollback procedure",
         ));
     }
     Ok(format!("v{version}"))
@@ -402,6 +402,13 @@ fn host_update_plan_with_authority(
     target: &str,
     release_authority: &ReleaseAuthority,
 ) -> Result<HostUpdatePlan, CliFailure> {
+    let normalized_target = normalize_exact_tag(target)?;
+    if normalized_target != target {
+        return Err(CliFailure::new(
+            2,
+            "fleet-update plan target must be a normalized exact stable tag",
+        ));
+    }
     if let Some(host) = &class.ssh
         && (host.starts_with('-') || host.chars().any(char::is_control))
     {

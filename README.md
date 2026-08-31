@@ -1,8 +1,14 @@
 # Shipyard
 
-**Cross-platform CI for AI agents.** Validates the exact commit on every
-machine you configure — local Mac, SSH-reachable VMs, cloud runners — and
-merges only when everything is green.
+**Shipyard handles the waiting so people and coding tools can focus on the
+work.** For work you hand it, Shipyard watches tests and code changes, remembers
+the exact state, handles supported routine steps automatically, and stops with
+a clear reason when a decision or code change is needed.
+
+Under the hood, Shipyard tracks the exact code and workflow state, checks each
+configured machine, and moves forward only when the required evidence is
+green. GitHub retains merge-order authority; when configured, TartCI supplies
+isolated Mac execution capacity.
 
 ```bash
 curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
@@ -27,11 +33,31 @@ shipyard cloud add-lane    # append a new lane to an in-flight PR
 shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
 ```
 
+## How it fits
+
+- People and development tools make changes and handle work that needs
+  judgment.
+- Shipyard keeps durable workflow state and policy, follows CI and queue
+  progress, takes bounded safe actions, and asks for intervention when needed.
+- GitHub owns merge ordering. When configured, TartCI turns compatible local
+  Macs into isolated execution capacity for Shipyard's validation work.
+
+## Common uses
+
+- Check the same code change on local Macs, TartCI Mac VMs, Linux machines or
+  Proxmox-hosted VMs over SSH, Windows, and hosted runners.
+- Submit a change and, when stewardship is enabled, let Shipyard watch the
+  required tests and merge progress until the work finishes or needs help.
+- Keep long-running work understandable across terminal, daemon, and machine
+  restarts without reconstructing its state from scratch.
+- Use the `ghapp` wrapper for scoped GitHub App authentication without putting
+  short-lived credentials into unattended command lines.
+
 ## Highlights
 
-- **Designed for AI agents.** Claude Code and Codex one-command setup;
-  agents validate and merge without you handing them notarization keys
-  or publishing accounts.
+- **Built for unattended delivery.** Submit work once; Shipyard preserves its
+  exact state, watches the required systems, and takes the next authorized
+  action without exposing notarization keys or publishing accounts.
 - **Evidence-based merge gate.** `shipyard ship` refuses to merge unless
   every required platform has passing evidence **for the exact HEAD SHA** —
   not the most-recent run, not the branch tip, the SHA.
@@ -40,9 +66,14 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   build targets. Shipyard authenticates PR/protected-base provenance and emits
   an exact-head receipt while the full build/test path remains authoritative;
   ambiguity always falls back to full.
-- **Parallel-agent-aware queue.** Multiple agents in multiple worktrees
-  share one machine-global queue with priorities, FIFO scheduling, and
+- **Parallel-work-aware queue.** Multiple worktrees and clients share one
+  machine-global queue with priorities, FIFO scheduling, and
   automatic deduplication.
+- **Durable stewardship and continuation.** An exact PR/head handoff can be
+  persisted in the machine-global work ledger so the trusted daemon, rather
+  than a client polling loop, owns bounded monitoring and continuation across
+  process restarts. Activation is explicit and default-off; every transition
+  is generation-fenced and revalidates the protected route before dispatch.
 - **Declarative security & governance.** One TOML line picks a profile
   (`solo` or `multi`); one CLI command makes GitHub branch protection,
   tag protection, and workflow token permissions match.
@@ -82,7 +113,10 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   GitHub auth helper and a tag-matched installer, and `--check` reports
   installed-vs-available, `--to v0.55.0` pins a specific tag for
   rollback. `shipyard runner fleet-update --to vX.Y.Z` plans one governed
-  rollout; add `--apply` to update and refresh every configured daemon.
+  rollout; add `--apply` to publish one immutable, content-addressed auth
+  generation and refresh every configured daemon. The public wrapper selector
+  changes only after the complete release-matched generation validates, and
+  each host returns an exact generation and release receipt.
 - **Graceful GraphQL rate-limit degradation.** `shipyard auto-merge`
   and `shipyard wait pr` fall back to REST automatically when
   GraphQL exhausts (separate 5000/hr bucket). `shipyard doctor
@@ -207,11 +241,16 @@ It calls your build commands and cares about one thing: did they pass?
   cloud / full setups with one command, plus repo-owned CI routing profiles
   and optional tartci-backed local VM routing.
 - [CLI Reference](docs/cli-reference.md#runner-metrics) — record/import/query
-  runner performance metrics for agent monitoring.
+  runner performance metrics for fleet monitoring.
 - [Manual CLI Workflows](docs/workflows.md) — debugging failed runs,
   managing the queue, partial reruns.
 - [Resuming an interrupted ship](docs/ship-resume.md) — how `shipyard ship`
   recovers across closed laptops and restarted sessions.
+- [Launch profiles](docs/launch-profile.md) — protected, generation-bound
+  resume and fresh-agent metadata for default-off daemon continuation.
+- [Terminal and provider adapters](docs/terminal-adapters.md) — why terminal
+  transport is separate from provider routing, including the current cmux
+  boundary and fail-closed, physically unproven HerdR delivery status.
 - [Release automation](RELEASING.md) — `shipyard release-bot setup`,
   `doctor --release-chain`, and the PAT + secret setup for the auto-
   release tag → binaries chain.
@@ -302,11 +341,20 @@ version you're on at any moment: `shipyard --version`.
 
 ### Do I need to run `shipyard daemon` / enable live mode?
 
-No. The daemon is an optional optimization for realtime webhook updates. Without it, every shipyard command falls back to polling — behavior is identical to earlier versions. `shipyard run`, `ship`, `watch`, `auto-merge`, and the macOS app all work fine without the daemon.
+Not for foreground CI. Without the daemon, `shipyard run`, `ship`, `watch`,
+`auto-merge`, and the macOS app retain their polling fallback. The daemon is
+required only when you explicitly enable trusted, subscriber-independent
+workstream continuation: that path owns durable monitoring and generation-
+fenced wake delivery after the submitting terminal or agent disappears.
 
 ### Does it hurt if I don't enable live mode?
 
-No. You'll still get the same results; they just arrive on a poll cadence (60 s worst case) rather than push-instant. Webhooks aren't registered on your repos unless the daemon is running. No Tailscale Funnel is created if you don't run `shipyard daemon start`.
+Foreground commands still reach the same evidence verdicts; updates arrive on
+a poll cadence (60 s worst case) rather than push-instant. Webhooks aren't
+registered and no Tailscale Funnel is created unless the daemon is running.
+Default-off unattended workstream continuation is different: without its
+trusted daemon consumer, no process owns a durable wake after the subscriber
+exits.
 
 ### I pushed to a repo without running `shipyard ship`. Will it appear in the macOS app?
 
@@ -322,6 +370,10 @@ If live mode is on, the daemon will deliver webhook events for those pushes too,
 - **From the macOS app**: Settings → Live updates → **Off**. The app sends a stop command to the daemon, which unregisters webhooks and resets the Tailscale Funnel config. Nothing persists after that.
 - **From the CLI**: `shipyard daemon stop` does the same teardown.
 
+Stopping the daemon also stops subscriber-independent workstream wake delivery.
+The durable ledger remains on disk, but no new wake is delivered until an
+authorized daemon consumer is enabled again.
+
 ### How do I remove everything shipyard installed?
 
 Shipyard doesn't leave much footprint, but here's the complete list:
@@ -330,16 +382,23 @@ Shipyard doesn't leave much footprint, but here's the complete list:
 # 1. Stop + unregister the daemon (if running)
 shipyard daemon stop
 
-# 2. Uninstall the CLI, provider companion, and CLI alias
-rm -f ~/.local/bin/shipyard ~/.local/bin/shipyard-workstream-provider ~/.local/bin/sy
+# 2. Uninstall the public CLI/provider/auth projections and CLI alias.
+#    If your host profile uses different paths, remove its exact configured
+#    github_cli/github_token_helper paths and the context beside github_cli.
+rm -f ~/.local/bin/shipyard ~/.local/bin/shipyard-workstream-provider ~/.local/bin/ghapp ~/.local/bin/ghapp.shipyard-context.json ~/.local/bin/sy
+rm -f ~/.config/shipyard/bin/shipyard-github-app-token
 
-# 3. Remove state directory (ship-state, daemon config, webhook secret)
+# 3. After the daemon and every ghapp reader have stopped, remove immutable
+#    fleet auth generations. Never remove this while a wrapper is running.
+rm -rf ~/.local/share/shipyard/auth-generations
+
+# 4. Remove state directory (ship-state, daemon config, webhook secret)
 #    macOS:
 rm -rf ~/Library/Application\ Support/shipyard
 #    Linux:
 rm -rf ~/.local/state/shipyard
 
-# 4. (macOS only) Keychain entry for the webhook secret
+# 5. (macOS only) Keychain entry for the webhook secret
 security delete-generic-password -s com.danielraffel.shipyard.webhook
 ```
 
@@ -351,8 +410,16 @@ Not in v1. Tailscale Funnel is the only tunnel backend shipped currently; others
 
 ### Does shipyard read or store any secrets besides the webhook HMAC?
 
-- The webhook HMAC secret is the only secret shipyard stores — in macOS Keychain or a `600`-perm file on Linux. It's generated locally, only sent to GitHub (as part of the webhook registration), and only used to verify that incoming deliveries actually came from GitHub.
-- `gh` auth is read through the `gh` CLI's existing token storage. Shipyard doesn't duplicate or persist it.
+- The webhook HMAC is generated locally and stored in macOS Keychain or a
+  `600`-permission file on Linux. It is sent only to GitHub during webhook
+  registration and verifies incoming deliveries.
+- With ambient `gh` authentication, Shipyard reads the CLI's existing token
+  storage and does not duplicate it.
+- Optional GitHub App authentication uses an operator-provisioned `0600` PEM
+  private key and may keep short-lived installation tokens in an owner-only
+  `0700` cache directory with `0600` entries. The immutable fleet auth
+  generation contains the release-matched helper, wrapper, binaries, manifest,
+  and non-secret resolver context; it never embeds a token or private key.
 - SSH keys for remote targets are whatever's already in your `~/.ssh/`.
 
 ### My macOS app says "shipyard CLI not found on PATH"

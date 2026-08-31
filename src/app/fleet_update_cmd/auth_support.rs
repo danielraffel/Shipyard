@@ -13,6 +13,10 @@ pub(super) const AFTER_HELPER_SHA_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_HELP
 pub(super) const AFTER_HELPER_MODE_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_HELPER_MODE=";
 pub(super) const AFTER_WRAPPER_SHA_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_WRAPPER_SHA256=";
 pub(super) const AFTER_WRAPPER_MODE_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_WRAPPER_MODE=";
+pub(super) const BEFORE_HELPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_AUTH_HELPER_TARGET=";
+pub(super) const BEFORE_WRAPPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_AUTH_WRAPPER_TARGET=";
+pub(super) const AFTER_HELPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_HELPER_TARGET=";
+pub(super) const AFTER_WRAPPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_WRAPPER_TARGET=";
 const WRAPPER_DEFAULT_HELPER: &str = ".config/shipyard/bin/shipyard-github-app-token";
 const LOCK_ACQUISITION_SCRIPT: &str = r#"
 if [ ! -e "$auth_guard" ] && [ ! -L "$auth_guard" ]; then
@@ -119,8 +123,8 @@ pub(super) fn probe(helper: &Path, wrapper: &Path, phase: &str) -> String {
     let helper = shlex_quote(&helper.display().to_string());
     let wrapper = shlex_quote(&wrapper.display().to_string());
     format!(
-        "if [ -e {helper} ] || [ -L {helper} ]; then test -f {helper}; test ! -L {helper}; {phase}_auth_helper_sha256=\"$(/usr/bin/shasum -a 256 {helper} | /usr/bin/awk '{{print $1}}')\"; {phase}_auth_helper_mode=\"$(/usr/bin/stat -f '%Lp' {helper})\"; else {phase}_auth_helper_sha256=absent; {phase}_auth_helper_mode=absent; fi\n\
-         if [ -e {wrapper} ] || [ -L {wrapper} ]; then test -f {wrapper}; test ! -L {wrapper}; {phase}_auth_wrapper_sha256=\"$(/usr/bin/shasum -a 256 {wrapper} | /usr/bin/awk '{{print $1}}')\"; {phase}_auth_wrapper_mode=\"$(/usr/bin/stat -f '%Lp' {wrapper})\"; else {phase}_auth_wrapper_sha256=absent; {phase}_auth_wrapper_mode=absent; fi"
+        "if [ -e {helper} ] || [ -L {helper} ]; then test -f {helper}; {phase}_auth_helper_sha256=\"$(/usr/bin/shasum -a 256 {helper} | /usr/bin/awk '{{print $1}}')\"; {phase}_auth_helper_mode=\"$(/usr/bin/stat -L -f '%Lp' {helper})\"; if [ -L {helper} ]; then {phase}_auth_helper_target=\"$(/usr/bin/readlink {helper})\"; else {phase}_auth_helper_target=direct; fi; else {phase}_auth_helper_sha256=absent; {phase}_auth_helper_mode=absent; {phase}_auth_helper_target=absent; fi\n\
+         if [ -e {wrapper} ] || [ -L {wrapper} ]; then test -f {wrapper}; {phase}_auth_wrapper_sha256=\"$(/usr/bin/shasum -a 256 {wrapper} | /usr/bin/awk '{{print $1}}')\"; {phase}_auth_wrapper_mode=\"$(/usr/bin/stat -L -f '%Lp' {wrapper})\"; if [ -L {wrapper} ]; then {phase}_auth_wrapper_target=\"$(/usr/bin/readlink {wrapper})\"; else {phase}_auth_wrapper_target=direct; fi; else {phase}_auth_wrapper_sha256=absent; {phase}_auth_wrapper_mode=absent; {phase}_auth_wrapper_target=absent; fi"
     )
 }
 
@@ -156,9 +160,11 @@ pub(super) fn install_transaction(
     let resolver_required = if resolver_required { "1" } else { "0" };
     let context_json = shlex_quote(
         &serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "mode": mode,
             "global_dir": global_dir.display().to_string(),
+            "authority_identity": authority.identity_sha256,
+            "generation_id": "__SHIPYARD_AUTH_GENERATION__",
         })
         .to_string(),
     );
@@ -194,6 +200,11 @@ auth_probe_repo={probe_repo}
 auth_context_json={context_json}
 auth_authority={authority_id}
 auth_refresh_prefix={refresh_prefix}
+case "$auth_authority" in ''|*[!0-9a-f]*) exit 1 ;; esac
+test "${{#auth_authority}}" = 64
+auth_generation_root="$HOME/.local/share/shipyard/auth-generations"
+auth_generation=
+auth_generation_id=
 auth_helper_digest={helper_digest}
 auth_wrapper_digest={wrapper_digest}
 auth_helper_source={helper_source}
@@ -201,6 +212,17 @@ auth_wrapper_source={wrapper_source}
 auth_journal="$auth_state_dir/fleet-auth-support.transaction"
 auth_lock="$auth_state_dir/fleet-auth-support.lock"
 auth_guard="$auth_state_dir/fleet-auth-support.guard"
+auth_original_selector_kind=
+auth_original_selector_identity=
+auth_original_authority=absent
+auth_original_manifest_digest=absent
+auth_original_backup_digest=pending
+auth_target_generation_id=
+auth_target_wrapper_target=
+auth_target_manifest_digest=
+auth_anchor_id=absent
+auth_anchor_wrapper_target=absent
+auth_anchor_manifest_digest=absent
 
 auth_safe_target() {{
   auth_target="$1"
@@ -220,28 +242,148 @@ auth_safe_target() {{
   test -d "$HOME"
   test ! -L "$HOME"
   test "$(/usr/bin/stat -f '%u' "$HOME")" = "$(/usr/bin/id -u)"
-  if [ -e "$auth_target" ] || [ -L "$auth_target" ]; then
+  if [ -L "$auth_target" ]; then
+    auth_link_target="$(/usr/bin/readlink "$auth_target")"
+    case "$auth_link_target" in "$auth_generation_root"/*/"$(/usr/bin/basename "$auth_target")") ;; *) return 1 ;; esac
+    auth_link_tail="${{auth_link_target#"$auth_generation_root"/}}"
+    auth_link_id="${{auth_link_tail%%/*}}"
+    test "${{#auth_link_id}}" = 64
+    case "$auth_link_id" in ''|*[!0-9a-f]*) return 1 ;; esac
+    test "$auth_link_tail" = "$auth_link_id/$(/usr/bin/basename "$auth_target")"
+    test -f "$auth_link_target"
+    test ! -L "$auth_link_target"
+    test "$(/usr/bin/stat -f '%u' "$auth_link_target")" = "$(/usr/bin/id -u)"
+  elif [ -e "$auth_target" ]; then
     test -f "$auth_target"
-    test ! -L "$auth_target"
     test "$(/usr/bin/stat -f '%u' "$auth_target")" = "$(/usr/bin/id -u)"
   fi
 }}
 
 auth_write_phase() {{
   auth_phase_tmp="$(/usr/bin/mktemp "$auth_state_dir/.fleet-auth-support.phase.XXXXXX")"
-  if [ "$auth_resolver_required" = 1 ]; then
-    /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-      "$1" "$auth_authority" "$auth_helper" "$auth_wrapper" "$auth_binary" \
-      "$auth_companion" "$auth_context" "$auth_helper_digest" "$auth_wrapper_digest" \
-      "$auth_context_digest" "$auth_companion_required" > "$auth_phase_tmp"
-  else
-    /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-      "$1" "$auth_authority" "$auth_helper" "$auth_wrapper" "$auth_binary" \
-      "$auth_companion" "$auth_helper_digest" "$auth_wrapper_digest" \
-      "$auth_companion_required" > "$auth_phase_tmp"
-  fi
+  /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    'shipyard-fleet-auth-v2' "$1" "$auth_authority" "$auth_helper" "$auth_wrapper" \
+    "$auth_binary" "$auth_companion" "$auth_context" "$auth_helper_digest" \
+    "$auth_wrapper_digest" "$auth_context_digest" "$auth_companion_required" \
+    "$auth_resolver_required" "$auth_original_selector_kind" \
+    "$auth_original_selector_identity" "$auth_target_generation_id" \
+    "$auth_target_wrapper_target" "$auth_target_manifest_digest" "$auth_anchor_id" \
+    "$auth_anchor_wrapper_target" "$auth_anchor_manifest_digest" \
+    "$auth_original_manifest_digest" "$auth_original_backup_digest" \
+    "$auth_original_authority" > "$auth_phase_tmp"
   /bin/chmod 600 "$auth_phase_tmp"
   /bin/mv -f "$auth_phase_tmp" "$auth_journal"
+}}
+
+auth_publish_link() {{
+  auth_target="$1"
+  auth_source="$2"
+  auth_link_stage="$(/usr/bin/mktemp "$auth_target.shipyard-link.XXXXXX")"
+  /bin/rm "$auth_link_stage"
+  /bin/ln -s "$auth_source" "$auth_link_stage"
+  /bin/mv -f "$auth_link_stage" "$auth_target"
+}}
+
+auth_selector_identity() {{
+  auth_selector="$1"
+  if [ -L "$auth_selector" ]; then
+    auth_selector_target="$(/usr/bin/readlink "$auth_selector")"
+    case "$auth_selector_target" in "$auth_generation_root"/*/ghapp) ;; *) return 1 ;; esac
+    auth_selector_tail="${{auth_selector_target#"$auth_generation_root"/}}"
+    auth_selector_id="${{auth_selector_tail%%/*}}"
+    test "${{#auth_selector_id}}" = 64
+    case "$auth_selector_id" in ''|*[!0-9a-f]*) return 1 ;; esac
+    test "$auth_selector_tail" = "$auth_selector_id/ghapp"
+    /usr/bin/printf 'generation:%s\n' "$auth_selector_target"
+  elif [ -f "$auth_selector" ]; then
+    test ! -L "$auth_selector"
+    /usr/bin/printf 'direct:%s\n' "$(/usr/bin/shasum -a 256 "$auth_selector" | /usr/bin/awk '{{print $1}}')"
+  elif [ ! -e "$auth_selector" ]; then
+    /usr/bin/printf 'absent\n'
+  else
+    return 1
+  fi
+}}
+
+auth_manifest_value() {{
+  auth_manifest="$1"
+  auth_key="$2"
+  /usr/bin/awk -F= -v key="$auth_key" '
+    $1 == key {{ if (seen) exit 2; value=substr($0, length(key)+2); seen=1 }}
+    END {{ if (!seen || value == "") exit 1; print value }}
+  ' "$auth_manifest"
+}}
+
+auth_validate_recovery_generation() {{
+  auth_generation_id_check="$1"
+  auth_generation_wrapper_check="$2"
+  auth_generation_manifest_digest_check="$3"
+  auth_generation_kind_check="$4"
+  auth_generation_authority_check="$5"
+  case "$auth_generation_id_check" in ''|*[!0-9a-f]*) return 1 ;; esac
+  test "${{#auth_generation_id_check}}" = 64
+  test "$auth_generation_wrapper_check" = "$auth_generation_root/$auth_generation_id_check/ghapp"
+  auth_generation_dir_check="${{auth_generation_wrapper_check%/ghapp}}"
+  test -d "$auth_generation_dir_check"
+  test ! -L "$auth_generation_dir_check"
+  test "$(/usr/bin/stat -f '%u' "$auth_generation_dir_check")" = "$(/usr/bin/id -u)"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir_check")" = 700
+  auth_generation_manifest_check="$auth_generation_dir_check/generation.manifest"
+  auth_generation_seed_check="$auth_generation_dir_check/generation.seed"
+  for auth_private_member in "$auth_generation_manifest_check" "$auth_generation_seed_check"; do
+    test -f "$auth_private_member"; test ! -L "$auth_private_member"
+    test "$(/usr/bin/stat -f '%u' "$auth_private_member")" = "$(/usr/bin/id -u)"
+    test "$(/usr/bin/stat -f '%Lp' "$auth_private_member")" = 600
+  done
+  test "$(/usr/bin/shasum -a 256 "$auth_generation_manifest_check" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_manifest_digest_check"
+  test "$(/usr/bin/shasum -a 256 "$auth_generation_seed_check" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_id_check"
+  test "$(auth_manifest_value "$auth_generation_manifest_check" generation_id)" = "$auth_generation_id_check"
+  test "$(auth_manifest_value "$auth_generation_manifest_check" generation_contract)" = auth-selector-v1
+  test "$(auth_manifest_value "$auth_generation_manifest_check" authority_identity)" = "$auth_generation_authority_check"
+  if [ "$auth_generation_kind_check" = legacy-anchor ]; then
+    test "$(auth_manifest_value "$auth_generation_manifest_check" generation_kind)" = legacy-anchor
+  else
+    if /usr/bin/grep -q '^generation_kind=' "$auth_generation_manifest_check"; then return 1; fi
+  fi
+  for auth_member_spec in \
+    'shipyard-github-app-token:helper_sha256:700' \
+    'ghapp:wrapper_sha256:700' \
+    'shipyard:binary_sha256:700'; do
+    auth_member_name="${{auth_member_spec%%:*}}"
+    auth_member_rest="${{auth_member_spec#*:}}"
+    auth_member_key="${{auth_member_rest%%:*}}"
+    auth_member_mode="${{auth_member_rest##*:}}"
+    auth_member_path="$auth_generation_dir_check/$auth_member_name"
+    test -f "$auth_member_path"; test ! -L "$auth_member_path"
+    test "$(/usr/bin/stat -f '%u' "$auth_member_path")" = "$(/usr/bin/id -u)"
+    test "$(/usr/bin/stat -f '%Lp' "$auth_member_path")" = "$auth_member_mode"
+    test "$(/usr/bin/shasum -a 256 "$auth_member_path" | /usr/bin/awk '{{print $1}}')" = "$(auth_manifest_value "$auth_generation_manifest_check" "$auth_member_key")"
+  done
+  auth_companion_sha_check="$(auth_manifest_value "$auth_generation_manifest_check" companion_sha256)"
+  if [ "$auth_recovery_companion_required" = 1 ]; then
+    auth_companion_path_check="$auth_generation_dir_check/shipyard-workstream-provider"
+    test -f "$auth_companion_path_check"; test ! -L "$auth_companion_path_check"; test -x "$auth_companion_path_check"
+    test "$(/usr/bin/stat -f '%u' "$auth_companion_path_check")" = "$(/usr/bin/id -u)"
+    test "$(/usr/bin/stat -f '%Lp' "$auth_companion_path_check")" = 700
+    test "$(/usr/bin/shasum -a 256 "$auth_companion_path_check" | /usr/bin/awk '{{print $1}}')" = "$auth_companion_sha_check"
+  else
+    test "$auth_companion_sha_check" = absent
+    test ! -e "$auth_generation_dir_check/shipyard-workstream-provider"
+    test ! -L "$auth_generation_dir_check/shipyard-workstream-provider"
+  fi
+  auth_context_sha_check="$(auth_manifest_value "$auth_generation_manifest_check" context_sha256)"
+  if [ "$auth_recovery_resolver_required" = 1 ]; then
+    auth_context_path_check="$auth_generation_dir_check/ghapp.shipyard-context.json"
+    test -f "$auth_context_path_check"; test ! -L "$auth_context_path_check"
+    test "$(/usr/bin/stat -f '%u' "$auth_context_path_check")" = "$(/usr/bin/id -u)"
+    test "$(/usr/bin/stat -f '%Lp' "$auth_context_path_check")" = 600
+    test "$(/usr/bin/shasum -a 256 "$auth_context_path_check" | /usr/bin/awk '{{print $1}}')" = "$auth_context_sha_check"
+    /usr/bin/grep -q "\"generation_id\":\"$auth_generation_id_check\"" "$auth_context_path_check"
+  else
+    test "$auth_context_sha_check" = absent
+    test ! -e "$auth_generation_dir_check/ghapp.shipyard-context.json"
+    test ! -L "$auth_generation_dir_check/ghapp.shipyard-context.json"
+  fi
 }}
 
 auth_cleanup_markers() {{
@@ -254,24 +396,250 @@ auth_cleanup_markers() {{
   /bin/rm -f "$auth_cleanup_wrapper.shipyard-rollback" "$auth_cleanup_wrapper.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_binary.shipyard-rollback" "$auth_cleanup_binary.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_companion.shipyard-rollback" "$auth_cleanup_companion.shipyard-was-absent"
+  /bin/rm -f "$auth_cleanup_helper.shipyard-rollback.tmp" "$auth_cleanup_wrapper.shipyard-rollback.tmp"
   /bin/rm -f "$auth_cleanup_binary.shipyard-rollback.tmp" "$auth_cleanup_companion.shipyard-rollback.tmp"
-  if [ -n "$auth_cleanup_context" ]; then /bin/rm -f "$auth_cleanup_context.shipyard-rollback" "$auth_cleanup_context.shipyard-was-absent"; fi
+  if [ -n "$auth_cleanup_context" ]; then /bin/rm -f "$auth_cleanup_context.shipyard-rollback" "$auth_cleanup_context.shipyard-was-absent" "$auth_cleanup_context.shipyard-rollback.tmp"; fi
   /bin/rm -f "$auth_journal"
 }}
 
 auth_restore_one() {{
   auth_target="$1"
-  if [ -f "$auth_target.shipyard-rollback" ] && [ ! -L "$auth_target.shipyard-rollback" ]; then
-    /bin/rm -f "$auth_target"
-    /bin/mv "$auth_target.shipyard-rollback" "$auth_target"
+  if [ -e "$auth_target.shipyard-rollback" ] || [ -L "$auth_target.shipyard-rollback" ]; then
+    auth_restore_tmp="$auth_target.shipyard-rollback.tmp"
+    if [ -L "$auth_target.shipyard-rollback" ]; then
+      /bin/cp -P "$auth_target.shipyard-rollback" "$auth_restore_tmp"
+    else
+      /bin/cp -p "$auth_target.shipyard-rollback" "$auth_restore_tmp"
+    fi
+    /bin/mv -f "$auth_restore_tmp" "$auth_target"
   elif [ -f "$auth_target.shipyard-was-absent" ] && [ ! -L "$auth_target.shipyard-was-absent" ]; then
     /bin/rm -f "$auth_target"
   fi
 }}
 
+auth_restore_transaction() {{
+  auth_restore_helper="$1"
+  auth_restore_wrapper="$2"
+  auth_restore_binary="$3"
+  auth_restore_companion="$4"
+  auth_restore_context="$5"
+  # An immutable-generation selector may be restored first because it never
+  # reads compatibility projections. A legacy direct wrapper must be restored
+  # last so it never observes a partially restored helper/binary/context set.
+  if [ -L "$auth_restore_wrapper.shipyard-rollback" ]; then
+    auth_restore_one "$auth_restore_wrapper"
+  fi
+  if [ -n "$auth_restore_context" ]; then auth_restore_one "$auth_restore_context"; fi
+  auth_restore_one "$auth_restore_companion"
+  auth_restore_one "$auth_restore_binary"
+  auth_restore_one "$auth_restore_helper"
+  if [ ! -L "$auth_restore_wrapper.shipyard-rollback" ]; then
+    auth_restore_one "$auth_restore_wrapper"
+  fi
+}}
+
+auth_backup_record() {{
+  auth_backup_label="$1"
+  auth_backup_target="$2"
+  if [ -z "$auth_backup_target" ]; then
+    /usr/bin/printf '%s=unmanaged\n' "$auth_backup_label"
+  elif [ -L "$auth_backup_target.shipyard-rollback" ]; then
+    /usr/bin/printf '%s=symlink:%s\n' "$auth_backup_label" "$(/usr/bin/readlink "$auth_backup_target.shipyard-rollback")"
+  elif [ -f "$auth_backup_target.shipyard-rollback" ] && [ ! -L "$auth_backup_target.shipyard-rollback" ]; then
+    test "$(/usr/bin/stat -f '%u' "$auth_backup_target.shipyard-rollback")" = "$(/usr/bin/id -u)"
+    /usr/bin/printf '%s=file:%s:%s\n' "$auth_backup_label" \
+      "$(/usr/bin/shasum -a 256 "$auth_backup_target.shipyard-rollback" | /usr/bin/awk '{{print $1}}')" \
+      "$(/usr/bin/stat -f '%Lp' "$auth_backup_target.shipyard-rollback")"
+  elif [ -f "$auth_backup_target.shipyard-was-absent" ] && [ ! -L "$auth_backup_target.shipyard-was-absent" ]; then
+    test "$(/usr/bin/stat -f '%u' "$auth_backup_target.shipyard-was-absent")" = "$(/usr/bin/id -u)"
+    test "$(/usr/bin/stat -f '%Lp' "$auth_backup_target.shipyard-was-absent")" = 600
+    /usr/bin/printf '%s=absent\n' "$auth_backup_label"
+  else
+    return 1
+  fi
+}}
+
+auth_backup_cohort_digest() {{
+  {{
+    auth_backup_record helper "$1"
+    auth_backup_record wrapper "$2"
+    auth_backup_record binary "$3"
+    auth_backup_record companion "$4"
+    auth_backup_record context "$5"
+  }} | /usr/bin/shasum -a 256 | /usr/bin/awk '{{print $1}}'
+}}
+
+auth_validate_recovery_prior() {{
+  test "$auth_recovery_original_backup" != pending
+  test "$(auth_backup_cohort_digest "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context")" = "$auth_recovery_original_backup"
+  if [ "$auth_recovery_original_kind" = generation ]; then
+    auth_validate_recovery_generation "$auth_recovery_original_id" "$auth_recovery_original_target" "$auth_recovery_original_manifest" normal "$auth_recovery_original_authority"
+  fi
+}}
+
+auth_write_recovery_phase() {{
+  auth_recovery_phase_tmp="$(/usr/bin/mktemp "$auth_state_dir/.fleet-auth-support.recovery-phase.XXXXXX")"
+  /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    'shipyard-fleet-auth-v2' "$1" "$auth_recovery_authority" \
+    "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" \
+    "$auth_recovery_companion" "$auth_recovery_context" \
+    "$auth_recovery_helper_digest" "$auth_recovery_wrapper_digest" \
+    "$auth_recovery_context_digest" "$auth_recovery_companion_required" \
+    "$auth_recovery_resolver_required" "$auth_recovery_original_kind" \
+    "$auth_recovery_original_identity" "$auth_recovery_target_id" \
+    "$auth_recovery_target_wrapper" "$auth_recovery_target_manifest" \
+    "$auth_recovery_anchor_id" "$auth_recovery_anchor_wrapper" \
+    "$auth_recovery_anchor_manifest" "$auth_recovery_original_manifest" \
+    "$auth_recovery_original_backup" "$auth_recovery_original_authority" > "$auth_recovery_phase_tmp"
+  /bin/chmod 600 "$auth_recovery_phase_tmp"
+  /bin/mv -f "$auth_recovery_phase_tmp" "$auth_journal"
+  auth_recovery_phase="$1"
+}}
+
+auth_recover_v2() {{
+  auth_recovery_disposition="${{1:-auto}}"
+  case "$auth_recovery_disposition" in auto|rollback|rollforward) ;; *) return 1 ;; esac
+  test "$(/usr/bin/wc -l < "$auth_journal" | /usr/bin/tr -d ' ')" = 24
+  auth_recovery_phase="$(/usr/bin/sed -n '2p' "$auth_journal")"
+  auth_recovery_authority="$(/usr/bin/sed -n '3p' "$auth_journal")"
+  auth_recovery_helper="$(/usr/bin/sed -n '4p' "$auth_journal")"
+  auth_recovery_wrapper="$(/usr/bin/sed -n '5p' "$auth_journal")"
+  auth_recovery_binary="$(/usr/bin/sed -n '6p' "$auth_journal")"
+  auth_recovery_companion="$(/usr/bin/sed -n '7p' "$auth_journal")"
+  auth_recovery_context="$(/usr/bin/sed -n '8p' "$auth_journal")"
+  auth_recovery_helper_digest="$(/usr/bin/sed -n '9p' "$auth_journal")"
+  auth_recovery_wrapper_digest="$(/usr/bin/sed -n '10p' "$auth_journal")"
+  auth_recovery_context_digest="$(/usr/bin/sed -n '11p' "$auth_journal")"
+  auth_recovery_companion_required="$(/usr/bin/sed -n '12p' "$auth_journal")"
+  auth_recovery_resolver_required="$(/usr/bin/sed -n '13p' "$auth_journal")"
+  auth_recovery_original_kind="$(/usr/bin/sed -n '14p' "$auth_journal")"
+  auth_recovery_original_identity="$(/usr/bin/sed -n '15p' "$auth_journal")"
+  auth_recovery_target_id="$(/usr/bin/sed -n '16p' "$auth_journal")"
+  auth_recovery_target_wrapper="$(/usr/bin/sed -n '17p' "$auth_journal")"
+  auth_recovery_target_manifest="$(/usr/bin/sed -n '18p' "$auth_journal")"
+  auth_recovery_anchor_id="$(/usr/bin/sed -n '19p' "$auth_journal")"
+  auth_recovery_anchor_wrapper="$(/usr/bin/sed -n '20p' "$auth_journal")"
+  auth_recovery_anchor_manifest="$(/usr/bin/sed -n '21p' "$auth_journal")"
+  auth_recovery_original_manifest="$(/usr/bin/sed -n '22p' "$auth_journal")"
+  auth_recovery_original_backup="$(/usr/bin/sed -n '23p' "$auth_journal")"
+  auth_recovery_original_authority="$(/usr/bin/sed -n '24p' "$auth_journal")"
+  case "$auth_recovery_phase" in preparing|prepared|generation-installed|anchor-select-intent|anchor-selected|projections-publish-intent|projections-published|target-select-intent|target-selected|validation-intent|validated|committed|rollback-intent|rollforward-intent) ;; *) return 1 ;; esac
+  case "$auth_recovery_companion_required:$auth_recovery_resolver_required" in 0:0|0:1|1:0|1:1) ;; *) return 1 ;; esac
+  case "$auth_recovery_original_kind" in absent|direct|generation) ;; *) return 1 ;; esac
+  case "$auth_recovery_authority" in ''|*[!0-9a-f]*) return 1 ;; esac
+  test "${{#auth_recovery_authority}}" = 64
+  for auth_recovery_hex in "$auth_recovery_target_id" "$auth_recovery_target_manifest"; do
+    case "$auth_recovery_hex" in ''|*[!0-9a-f]*) return 1 ;; esac
+    test "${{#auth_recovery_hex}}" = 64
+  done
+  test "$auth_recovery_target_wrapper" = "$auth_generation_root/$auth_recovery_target_id/ghapp"
+  case "$auth_recovery_anchor_id:$auth_recovery_anchor_wrapper:$auth_recovery_anchor_manifest" in
+    absent:absent:absent) ;;
+    *)
+      for auth_recovery_hex in "$auth_recovery_anchor_id" "$auth_recovery_anchor_manifest"; do
+        case "$auth_recovery_hex" in ''|*[!0-9a-f]*) return 1 ;; esac
+        test "${{#auth_recovery_hex}}" = 64
+      done
+      test "$auth_recovery_anchor_wrapper" = "$auth_generation_root/$auth_recovery_anchor_id/ghapp"
+      ;;
+  esac
+  case "$auth_recovery_original_kind:$auth_recovery_original_identity" in
+    absent:absent)
+      test "$auth_recovery_original_manifest" = absent
+      test "$auth_recovery_original_authority" = absent
+      ;;
+    direct:direct:*)
+      test "$auth_recovery_original_manifest" = absent
+      test "$auth_recovery_original_authority" = absent
+      auth_recovery_original_digest="${{auth_recovery_original_identity#direct:}}"
+      case "$auth_recovery_original_digest" in ''|*[!0-9a-f]*) return 1 ;; esac
+      test "${{#auth_recovery_original_digest}}" = 64
+      ;;
+    generation:generation:*)
+      auth_recovery_original_target="${{auth_recovery_original_identity#generation:}}"
+      case "$auth_recovery_original_target" in "$auth_generation_root"/*/ghapp) ;; *) return 1 ;; esac
+      auth_recovery_original_tail="${{auth_recovery_original_target#"$auth_generation_root"/}}"
+      auth_recovery_original_id="${{auth_recovery_original_tail%%/*}}"
+      case "$auth_recovery_original_id" in ''|*[!0-9a-f]*) return 1 ;; esac
+      test "${{#auth_recovery_original_id}}" = 64
+      test "$auth_recovery_original_tail" = "$auth_recovery_original_id/ghapp"
+      case "$auth_recovery_original_manifest" in ''|*[!0-9a-f]*) return 1 ;; esac
+      test "${{#auth_recovery_original_manifest}}" = 64
+      case "$auth_recovery_original_authority" in ''|*[!0-9a-f]*) return 1 ;; esac
+      test "${{#auth_recovery_original_authority}}" = 64
+      ;;
+    *) return 1 ;;
+  esac
+  case "$auth_recovery_original_backup" in
+    pending) test "$auth_recovery_phase" = preparing ;;
+    ''|*[!0-9a-f]*) return 1 ;;
+    *) test "${{#auth_recovery_original_backup}}" = 64 ;;
+  esac
+  auth_safe_target "$auth_recovery_helper"
+  auth_safe_target "$auth_recovery_wrapper"
+  auth_safe_target "$auth_recovery_binary"
+  auth_safe_target "$auth_recovery_companion"
+  if [ "$auth_recovery_resolver_required" = 1 ]; then auth_safe_target "$auth_recovery_context"; else test -z "$auth_recovery_context"; fi
+  auth_recovery_live_selector="$(auth_selector_identity "$auth_recovery_wrapper")" || return 1
+  if [ "$auth_recovery_phase" = preparing ]; then
+    test "$auth_recovery_live_selector" = "$auth_recovery_original_identity"
+    auth_cleanup_markers "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context"
+    return 0
+  fi
+  if [ "$auth_recovery_disposition" = auto ]; then
+    case "$auth_recovery_phase" in
+      validated|committed|rollforward-intent) auth_recovery_disposition=rollforward ;;
+      *) auth_recovery_disposition=rollback ;;
+    esac
+  fi
+  auth_recovery_target_selector="generation:$auth_recovery_target_wrapper"
+  if [ "$auth_recovery_live_selector" = "$auth_recovery_target_selector" ]; then
+    auth_validate_recovery_generation "$auth_recovery_target_id" "$auth_recovery_target_wrapper" "$auth_recovery_target_manifest" normal "$auth_recovery_authority"
+    if [ "$auth_recovery_disposition" = rollforward ]; then
+      if [ "$auth_recovery_phase" != rollforward-intent ]; then auth_write_recovery_phase rollforward-intent; fi
+      auth_publish_link "$auth_recovery_helper" "${{auth_recovery_target_wrapper%/ghapp}}/shipyard-github-app-token"
+      auth_publish_link "$auth_recovery_binary" "${{auth_recovery_target_wrapper%/ghapp}}/shipyard"
+      if [ "$auth_recovery_companion_required" = 1 ]; then auth_publish_link "$auth_recovery_companion" "${{auth_recovery_target_wrapper%/ghapp}}/shipyard-workstream-provider"; fi
+      if [ "$auth_recovery_resolver_required" = 1 ]; then auth_publish_link "$auth_recovery_context" "${{auth_recovery_target_wrapper%/ghapp}}/ghapp.shipyard-context.json"; fi
+      test "$(auth_selector_identity "$auth_recovery_wrapper")" = "$auth_recovery_target_selector"
+      auth_cleanup_markers "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context"
+      return 0
+    fi
+    if [ "$auth_recovery_phase" != rollback-intent ]; then auth_write_recovery_phase rollback-intent; fi
+    auth_validate_recovery_prior
+    if [ "$auth_recovery_anchor_id" != absent ]; then
+      auth_validate_recovery_generation "$auth_recovery_anchor_id" "$auth_recovery_anchor_wrapper" "$auth_recovery_anchor_manifest" legacy-anchor "$auth_recovery_authority"
+      auth_publish_link "$auth_recovery_wrapper" "$auth_recovery_anchor_wrapper"
+      auth_recovery_live_selector="generation:$auth_recovery_anchor_wrapper"
+    elif [ "$auth_recovery_original_kind" = direct ]; then
+      return 1
+    else
+      auth_restore_transaction "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context"
+      test "$(auth_selector_identity "$auth_recovery_wrapper")" = "$auth_recovery_original_identity"
+      auth_cleanup_markers "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context"
+      return 0
+    fi
+  fi
+  if [ "$auth_recovery_disposition" = rollforward ]; then return 1; fi
+  if [ "$auth_recovery_phase" != rollback-intent ]; then auth_write_recovery_phase rollback-intent; fi
+  if [ "$auth_recovery_anchor_id" != absent ] && [ "$auth_recovery_live_selector" = "generation:$auth_recovery_anchor_wrapper" ]; then
+    auth_validate_recovery_generation "$auth_recovery_anchor_id" "$auth_recovery_anchor_wrapper" "$auth_recovery_anchor_manifest" legacy-anchor "$auth_recovery_authority"
+  elif [ "$auth_recovery_live_selector" != "$auth_recovery_original_identity" ]; then
+    return 1
+  fi
+  auth_validate_recovery_prior
+  auth_restore_transaction "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context"
+  test "$(auth_selector_identity "$auth_recovery_wrapper")" = "$auth_recovery_original_identity"
+  auth_cleanup_markers "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context"
+}}
+
 auth_recover() {{
   test -f "$auth_journal"
   test ! -L "$auth_journal"
+  if [ "$(/usr/bin/sed -n '1p' "$auth_journal")" = shipyard-fleet-auth-v2 ]; then
+    auth_recover_v2
+    return
+  fi
   auth_journal_lines="$(/usr/bin/wc -l < "$auth_journal" | /usr/bin/tr -d ' ')"
   case "$auth_journal_lines" in 9|11) ;; *) return 1 ;; esac
   auth_phase="$(/usr/bin/sed -n '1p' "$auth_journal")"
@@ -308,22 +676,30 @@ auth_recover() {{
     if [ "$auth_recovery_companion_required" = 1 ]; then test -x "$auth_recovery_companion"; fi
     if [ -n "$auth_recovery_context" ]; then
       test "$(/usr/bin/shasum -a 256 "$auth_recovery_context" | /usr/bin/awk '{{print $1}}')" = "$auth_recovery_context_digest"
-      test "$(/usr/bin/stat -f '%Lp' "$auth_recovery_context")" = 600
+      test "$(/usr/bin/stat -L -f '%Lp' "$auth_recovery_context")" = 600
     fi
   else
-    case "$auth_phase" in preparing|prepared|helper-installed|auth-installed|context-installed) ;; *) return 1 ;; esac
+    case "$auth_phase" in preparing|prepared|generation-installed|anchor-installed|barrier-installed|wrapper-installed|projections-installed|helper-installed|auth-installed|context-installed) ;; *) return 1 ;; esac
     if [ "$auth_journal_lines" = 9 ] && [ "$auth_phase" = preparing ]; then
       # Pre-v0.131 clients copied binary rollback files directly after writing
       # `preparing`. A crash could leave partial copies while both live binaries
       # were still intact, so only the already-moved helper pair is restored.
-      :
+      auth_restore_one "$auth_recovery_helper"
+      auth_restore_one "$auth_recovery_wrapper"
     else
-      if [ -n "$auth_recovery_context" ]; then auth_restore_one "$auth_recovery_context"; fi
-      auth_restore_one "$auth_recovery_companion"
-      auth_restore_one "$auth_recovery_binary"
+      case "$auth_phase" in
+        generation-installed|anchor-installed|barrier-installed|projections-installed|wrapper-installed)
+          auth_restore_transaction "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context"
+          ;;
+        *)
+          if [ -n "$auth_recovery_context" ]; then auth_restore_one "$auth_recovery_context"; fi
+          auth_restore_one "$auth_recovery_companion"
+          auth_restore_one "$auth_recovery_binary"
+          auth_restore_one "$auth_recovery_helper"
+          auth_restore_one "$auth_recovery_wrapper"
+          ;;
+      esac
     fi
-    auth_restore_one "$auth_recovery_wrapper"
-    auth_restore_one "$auth_recovery_helper"
   fi
   auth_cleanup_markers "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context"
 }}
@@ -334,9 +710,9 @@ test "$(/usr/bin/stat -f '%u' "$auth_state_dir")" = "$(/usr/bin/id -u)"
 auth_state_mode="$(/usr/bin/stat -f '%Lp' "$auth_state_dir")"
 test $((8#$auth_state_mode & 8#22)) -eq 0
 {lock_acquisition}
-auth_helper_tmp=
-auth_wrapper_tmp=
-auth_context_tmp=
+auth_generation_stage=
+auth_anchor_stage=
+auth_generation_created=0
 auth_release_lock() {{
   auth_release_pid="$auth_lock/pid"
   test -f "$auth_release_pid"
@@ -348,7 +724,7 @@ auth_release_lock() {{
   /bin/rmdir "$auth_lock"
   exec 9>&-
 }}
-auth_release_after_failure() {{ auth_status="$1"; trap - ERR INT TERM; if [ -n "$auth_helper_tmp" ]; then /bin/rm -f "$auth_helper_tmp"; fi; if [ -n "$auth_wrapper_tmp" ]; then /bin/rm -f "$auth_wrapper_tmp"; fi; if [ -n "$auth_context_tmp" ]; then /bin/rm -f "$auth_context_tmp"; fi; auth_release_lock; exit "$auth_status"; }}
+auth_release_after_failure() {{ auth_status="$1"; trap - ERR INT TERM; if [ -n "$auth_generation_stage" ] && [ -d "$auth_generation_stage" ] && [ ! -L "$auth_generation_stage" ]; then /bin/rm -rf "$auth_generation_stage"; fi; if [ -n "$auth_anchor_stage" ] && [ -d "$auth_anchor_stage" ] && [ ! -L "$auth_anchor_stage" ]; then /bin/rm -rf "$auth_anchor_stage"; fi; auth_release_lock; exit "$auth_status"; }}
 auth_release_on_error() {{ auth_release_after_failure "$?"; }}
 trap auth_release_on_error ERR
 trap 'auth_release_after_failure 130' INT
@@ -362,6 +738,26 @@ if [ "$auth_resolver_required" = 1 ]; then auth_safe_target "$auth_context"; fi
 auth_recovery_needed=0
 if [ -e "$auth_journal" ] || [ -L "$auth_journal" ]; then auth_recovery_needed=1; fi
 case "$auth_recovery_needed" in 1) auth_recover ;; esac
+auth_original_selector_identity="$(auth_selector_identity "$auth_wrapper")" || exit 1
+case "$auth_original_selector_identity" in
+  absent) auth_original_selector_kind=absent ;;
+  direct:*) auth_original_selector_kind=direct ;;
+  generation:*)
+    auth_original_selector_kind=generation
+    auth_original_wrapper_target="${{auth_original_selector_identity#generation:}}"
+    auth_original_generation_tail="${{auth_original_wrapper_target#"$auth_generation_root"/}}"
+    auth_original_generation_id="${{auth_original_generation_tail%%/*}}"
+    auth_original_manifest="$auth_generation_root/$auth_original_generation_id/generation.manifest"
+    auth_original_manifest_digest="$(/usr/bin/shasum -a 256 "$auth_original_manifest" | /usr/bin/awk '{{print $1}}')"
+    auth_original_authority="$(auth_manifest_value "$auth_original_manifest" authority_identity)"
+    case "$auth_original_authority" in ''|*[!0-9a-f]*) exit 1 ;; esac
+    test "${{#auth_original_authority}}" = 64
+    auth_recovery_companion_required="$auth_companion_required"
+    auth_recovery_resolver_required="$auth_resolver_required"
+    auth_validate_recovery_generation "$auth_original_generation_id" "$auth_original_wrapper_target" "$auth_original_manifest_digest" normal "$auth_original_authority"
+    ;;
+  *) exit 1 ;;
+esac
 for auth_target in "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion"; do
   test ! -e "$auth_target.shipyard-rollback"
   test ! -L "$auth_target.shipyard-rollback"
@@ -372,40 +768,133 @@ test ! -e "$auth_binary.shipyard-rollback.tmp"
 test ! -L "$auth_binary.shipyard-rollback.tmp"
 test ! -e "$auth_companion.shipyard-rollback.tmp"
 test ! -L "$auth_companion.shipyard-rollback.tmp"
+test ! -e "$auth_helper.shipyard-rollback.tmp"
+test ! -L "$auth_helper.shipyard-rollback.tmp"
+test ! -e "$auth_wrapper.shipyard-rollback.tmp"
+test ! -L "$auth_wrapper.shipyard-rollback.tmp"
 if [ "$auth_resolver_required" = 1 ]; then
   test ! -e "$auth_context.shipyard-rollback"
   test ! -L "$auth_context.shipyard-rollback"
   test ! -e "$auth_context.shipyard-was-absent"
   test ! -L "$auth_context.shipyard-was-absent"
+  test ! -e "$auth_context.shipyard-rollback.tmp"
+  test ! -L "$auth_context.shipyard-rollback.tmp"
 fi
 
-auth_helper_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_helper")/.shipyard-auth-helper.XXXXXX")"
-auth_wrapper_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_wrapper")/.shipyard-auth-wrapper.XXXXXX")"
-/bin/cp "$auth_helper_source" "$auth_helper_tmp"
-/bin/cp "$auth_wrapper_source" "$auth_wrapper_tmp"
-/bin/chmod 700 "$auth_helper_tmp" "$auth_wrapper_tmp"
-auth_context_digest=
-auth_context_tmp=
-if [ "$auth_resolver_required" = 1 ]; then
-  auth_context_tmp="$(/usr/bin/mktemp "$(/usr/bin/dirname "$auth_context")/.shipyard-auth-context.XXXXXX")"
-  /usr/bin/printf '%s\n' "$auth_context_json" > "$auth_context_tmp"
-  /bin/chmod 600 "$auth_context_tmp"
-  auth_context_digest="$(/usr/bin/shasum -a 256 "$auth_context_tmp" | /usr/bin/awk '{{print $1}}')"
+for auth_generation_ancestor in "$HOME" "$HOME/.local"; do
+  test -d "$auth_generation_ancestor"
+  test ! -L "$auth_generation_ancestor"
+  test "$(/usr/bin/stat -f '%u' "$auth_generation_ancestor")" = "$(/usr/bin/id -u)"
+  auth_generation_ancestor_mode="$(/usr/bin/stat -f '%Lp' "$auth_generation_ancestor")"
+  test $((8#$auth_generation_ancestor_mode & 8#22)) -eq 0
+done
+auth_generation_share="$HOME/.local/share"
+if [ ! -e "$auth_generation_share" ] && [ ! -L "$auth_generation_share" ]; then
+  /bin/mkdir "$auth_generation_share"
+  /bin/chmod 755 "$auth_generation_share"
 fi
-test "$(/usr/bin/shasum -a 256 "$auth_helper_tmp" | /usr/bin/awk '{{print $1}}')" = "$auth_helper_digest"
-test "$(/usr/bin/shasum -a 256 "$auth_wrapper_tmp" | /usr/bin/awk '{{print $1}}')" = "$auth_wrapper_digest"
+test -d "$auth_generation_share"; test ! -L "$auth_generation_share"
+test "$(/usr/bin/stat -f '%u' "$auth_generation_share")" = "$(/usr/bin/id -u)"
+auth_generation_share_mode="$(/usr/bin/stat -f '%Lp' "$auth_generation_share")"
+test $((8#$auth_generation_share_mode & 8#22)) -eq 0
+auth_generation_private_root="$HOME/.local/share/shipyard"
+for auth_private_root in "$auth_generation_private_root" "$auth_generation_root"; do
+  if [ ! -e "$auth_private_root" ] && [ ! -L "$auth_private_root" ]; then
+    /bin/mkdir "$auth_private_root"
+    /bin/chmod 700 "$auth_private_root"
+  fi
+  test -d "$auth_private_root"; test ! -L "$auth_private_root"
+  test "$(/usr/bin/stat -f '%u' "$auth_private_root")" = "$(/usr/bin/id -u)"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_private_root")" = 700
+done
+auth_generation_stage="$(/usr/bin/mktemp -d "$auth_generation_root/.stage.$auth_authority.XXXXXX")"
+/bin/chmod 700 "$auth_generation_stage"
+/bin/cp "$auth_helper_source" "$auth_generation_stage/shipyard-github-app-token"
+/bin/cp "$auth_wrapper_source" "$auth_generation_stage/ghapp"
+/bin/chmod 700 "$auth_generation_stage/shipyard-github-app-token" "$auth_generation_stage/ghapp"
+test "$(/usr/bin/grep -c '^# Shipyard-Auth-Generation-Contract: auth-selector-v1$' "$auth_generation_stage/ghapp")" = 1
+{binary_install_command}
+/bin/chmod 700 "$auth_generation_stage/shipyard"
+if [ "$auth_companion_required" = 1 ]; then /bin/chmod 700 "$auth_generation_stage/shipyard-workstream-provider"; fi
+auth_stage_helper_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/shipyard-github-app-token" | /usr/bin/awk '{{print $1}}')"
+auth_stage_wrapper_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/ghapp" | /usr/bin/awk '{{print $1}}')"
+auth_stage_binary_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/shipyard" | /usr/bin/awk '{{print $1}}')"
+test "$auth_stage_helper_digest" = "$auth_helper_digest"
+test "$auth_stage_wrapper_digest" = "$auth_wrapper_digest"
+test -x "$auth_generation_stage/shipyard"
+if [ "$auth_companion_required" = 1 ]; then
+  test -x "$auth_generation_stage/shipyard-workstream-provider"
+  auth_stage_companion_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/shipyard-workstream-provider" | /usr/bin/awk '{{print $1}}')"
+else
+  auth_stage_companion_digest=absent
+fi
+auth_context_template_digest="$(/usr/bin/printf '%s' "$auth_context_json" | /usr/bin/shasum -a 256 | /usr/bin/awk '{{print $1}}')"
+auth_generation_seed="$auth_generation_stage/generation.seed"
+  /usr/bin/printf '%s\n' \
+  'schema_version=1' \
+  'generation_contract=auth-selector-v1' \
+  "authority_identity=$auth_authority" \
+  "helper_sha256=$auth_stage_helper_digest" \
+  "wrapper_sha256=$auth_stage_wrapper_digest" \
+  "binary_sha256=$auth_stage_binary_digest" \
+  "companion_sha256=$auth_stage_companion_digest" \
+  "context_template_sha256=$auth_context_template_digest" > "$auth_generation_seed"
+/bin/chmod 600 "$auth_generation_seed"
+auth_generation_id="$(/usr/bin/shasum -a 256 "$auth_generation_seed" | /usr/bin/awk '{{print $1}}')"
+case "$auth_generation_id" in ''|*[!0-9a-f]*) exit 1 ;; esac
+test "${{#auth_generation_id}}" = 64
+auth_generation="$auth_generation_root/$auth_generation_id"
+auth_context_digest=absent
+if [ "$auth_resolver_required" = 1 ]; then
+  /usr/bin/printf '%s\n' "${{auth_context_json/__SHIPYARD_AUTH_GENERATION__/$auth_generation_id}}" > "$auth_generation_stage/ghapp.shipyard-context.json"
+  /bin/chmod 600 "$auth_generation_stage/ghapp.shipyard-context.json"
+  auth_context_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/ghapp.shipyard-context.json" | /usr/bin/awk '{{print $1}}')"
+fi
+auth_generation_manifest="$auth_generation_stage/generation.manifest"
+/usr/bin/printf '%s\n' \
+  'schema_version=1' \
+  'generation_contract=auth-selector-v1' \
+  "generation_id=$auth_generation_id" \
+  "authority_identity=$auth_authority" \
+  "helper_sha256=$auth_stage_helper_digest" \
+  'helper_mode=700' \
+  "wrapper_sha256=$auth_stage_wrapper_digest" \
+  'wrapper_mode=700' \
+  "binary_sha256=$auth_stage_binary_digest" \
+  'binary_mode=700' \
+  "companion_sha256=$auth_stage_companion_digest" \
+  "context_sha256=$auth_context_digest" \
+  "context_template_sha256=$auth_context_template_digest" > "$auth_generation_manifest"
+/bin/chmod 600 "$auth_generation_manifest"
+auth_target_generation_id="$auth_generation_id"
+auth_target_wrapper_target="$auth_generation/ghapp"
+auth_target_manifest_digest="$(/usr/bin/shasum -a 256 "$auth_generation_manifest" | /usr/bin/awk '{{print $1}}')"
 auth_write_phase preparing
+
+auth_backup_one() {{
+  auth_target="$1"
+  if [ -e "$auth_target" ] || [ -L "$auth_target" ]; then
+    auth_backup_tmp="$auth_target.shipyard-rollback.tmp"
+    if [ -L "$auth_target" ]; then /bin/cp -P "$auth_target" "$auth_backup_tmp"; else /bin/cp -p "$auth_target" "$auth_backup_tmp"; fi
+    /bin/mv "$auth_backup_tmp" "$auth_target.shipyard-rollback"
+  else
+    /usr/bin/touch "$auth_target.shipyard-was-absent"
+    /bin/chmod 600 "$auth_target.shipyard-was-absent"
+  fi
+}}
 
 auth_rollback_after_failure() {{
   auth_status="$1"
   trap - ERR INT TERM
-  if [ "$auth_resolver_required" = 1 ]; then auth_restore_one "$auth_context"; fi
-  auth_restore_one "$auth_companion"
-  auth_restore_one "$auth_binary"
-  auth_restore_one "$auth_wrapper"
-  auth_restore_one "$auth_helper"
-  auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"
-  /bin/rm -f "$auth_helper_tmp" "$auth_wrapper_tmp" "$auth_context_tmp"
+  if [ -f "$auth_journal" ] && [ "$(/usr/bin/sed -n '1p' "$auth_journal")" = shipyard-fleet-auth-v2 ]; then
+    auth_recover_v2 rollback
+  else
+    auth_restore_transaction "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"
+    auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"
+  fi
+  if [ -n "${{auth_generation_stage:-}}" ] && [ -d "$auth_generation_stage" ] && [ ! -L "$auth_generation_stage" ]; then /bin/rm -rf "$auth_generation_stage"; fi
+  # Never remove a published generation here. A reader may already have
+  # resolved its wrapper before the selector is rolled back.
   auth_release_lock
   exit "$auth_status"
 }}
@@ -414,36 +903,233 @@ trap auth_rollback_on_error ERR
 trap 'auth_rollback_after_failure 130' INT
 trap 'auth_rollback_after_failure 143' TERM
 
-if [ -e "$auth_helper" ]; then /bin/mv "$auth_helper" "$auth_helper.shipyard-rollback"; else /usr/bin/touch "$auth_helper.shipyard-was-absent"; /bin/chmod 600 "$auth_helper.shipyard-was-absent"; fi
-if [ -e "$auth_wrapper" ]; then /bin/mv "$auth_wrapper" "$auth_wrapper.shipyard-rollback"; else /usr/bin/touch "$auth_wrapper.shipyard-was-absent"; /bin/chmod 600 "$auth_wrapper.shipyard-was-absent"; fi
-if [ -e "$auth_binary" ]; then /bin/cp -p "$auth_binary" "$auth_binary.shipyard-rollback.tmp"; /bin/mv "$auth_binary.shipyard-rollback.tmp" "$auth_binary.shipyard-rollback"; else /usr/bin/touch "$auth_binary.shipyard-was-absent"; /bin/chmod 600 "$auth_binary.shipyard-was-absent"; fi
-if [ -e "$auth_companion" ]; then /bin/cp -p "$auth_companion" "$auth_companion.shipyard-rollback.tmp"; /bin/mv "$auth_companion.shipyard-rollback.tmp" "$auth_companion.shipyard-rollback"; else /usr/bin/touch "$auth_companion.shipyard-was-absent"; /bin/chmod 600 "$auth_companion.shipyard-was-absent"; fi
-if [ "$auth_resolver_required" = 1 ]; then
-  if [ -e "$auth_context" ]; then /bin/mv "$auth_context" "$auth_context.shipyard-rollback"; else /usr/bin/touch "$auth_context.shipyard-was-absent"; /bin/chmod 600 "$auth_context.shipyard-was-absent"; fi
-fi
+auth_backup_one "$auth_helper"
+auth_previous_wrapper_direct=0
+if [ -f "$auth_wrapper" ] && [ ! -L "$auth_wrapper" ]; then auth_previous_wrapper_direct=1; fi
+auth_backup_one "$auth_wrapper"
+auth_backup_one "$auth_binary"
+auth_backup_one "$auth_companion"
+if [ "$auth_resolver_required" = 1 ]; then auth_backup_one "$auth_context"; fi
+auth_original_backup_digest="$(auth_backup_cohort_digest "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context")"
+case "$auth_original_backup_digest" in ''|*[!0-9a-f]*) exit 1 ;; esac
+test "${{#auth_original_backup_digest}}" = 64
 auth_write_phase prepared
-/bin/mv "$auth_helper_tmp" "$auth_helper"
-auth_write_phase helper-installed
-{injected_failure}
-/bin/mv "$auth_wrapper_tmp" "$auth_wrapper"
-auth_write_phase auth-installed
-{binary_install_command}
-if [ "$auth_resolver_required" = 1 ]; then
-  /bin/mv "$auth_context_tmp" "$auth_context"
-  auth_write_phase context-installed
+if [ -e "$auth_generation" ] || [ -L "$auth_generation" ]; then
+  test -d "$auth_generation"
+  test ! -L "$auth_generation"
+  test "$(/usr/bin/stat -f '%u' "$auth_generation")" = "$(/usr/bin/id -u)"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_generation")" = 700
+  /usr/bin/cmp -s "$auth_generation/generation.seed" "$auth_generation_stage/generation.seed"
+  /usr/bin/cmp -s "$auth_generation/generation.manifest" "$auth_generation_stage/generation.manifest"
+  for auth_member in shipyard-github-app-token ghapp shipyard generation.seed generation.manifest; do
+    test -f "$auth_generation/$auth_member"
+    test ! -L "$auth_generation/$auth_member"
+    test "$(/usr/bin/stat -f '%u' "$auth_generation/$auth_member")" = "$(/usr/bin/id -u)"
+    case "$auth_member" in generation.seed|generation.manifest) auth_member_mode=600 ;; *) auth_member_mode=700 ;; esac
+    test "$(/usr/bin/stat -f '%Lp' "$auth_generation/$auth_member")" = "$auth_member_mode"
+    /usr/bin/cmp -s "$auth_generation/$auth_member" "$auth_generation_stage/$auth_member"
+  done
+  if [ "$auth_companion_required" = 1 ]; then
+    test -f "$auth_generation/shipyard-workstream-provider"
+    test ! -L "$auth_generation/shipyard-workstream-provider"
+    test "$(/usr/bin/stat -f '%u' "$auth_generation/shipyard-workstream-provider")" = "$(/usr/bin/id -u)"
+    test "$(/usr/bin/stat -f '%Lp' "$auth_generation/shipyard-workstream-provider")" = 700
+    /usr/bin/cmp -s "$auth_generation/shipyard-workstream-provider" "$auth_generation_stage/shipyard-workstream-provider"
+  else
+    test ! -e "$auth_generation/shipyard-workstream-provider"
+    test ! -L "$auth_generation/shipyard-workstream-provider"
+  fi
+  if [ "$auth_resolver_required" = 1 ]; then
+    test -f "$auth_generation/ghapp.shipyard-context.json"
+    test ! -L "$auth_generation/ghapp.shipyard-context.json"
+    test "$(/usr/bin/stat -f '%u' "$auth_generation/ghapp.shipyard-context.json")" = "$(/usr/bin/id -u)"
+    test "$(/usr/bin/stat -f '%Lp' "$auth_generation/ghapp.shipyard-context.json")" = 600
+    /usr/bin/cmp -s "$auth_generation/ghapp.shipyard-context.json" "$auth_generation_stage/ghapp.shipyard-context.json"
+  else
+    test ! -e "$auth_generation/ghapp.shipyard-context.json"
+    test ! -L "$auth_generation/ghapp.shipyard-context.json"
+  fi
+  /bin/rm -rf "$auth_generation_stage"
+else
+  /bin/mv "$auth_generation_stage" "$auth_generation"
+  auth_generation_created=1
 fi
+auth_generation_stage=
+auth_write_phase generation-installed
+{injected_failure}
+if [ "$auth_previous_wrapper_direct" = 1 ]; then
+  # A direct wrapper is not an immutable reader cohort. Build a bridge anchor
+  # from the exact old helper plus the preflighted selector-aware wrapper and
+  # release-matched binaries, then select it before enumerating old readers.
+  auth_anchor_stage="$(/usr/bin/mktemp -d "$auth_generation_root/.anchor.$auth_authority.XXXXXX")"
+  /bin/chmod 700 "$auth_anchor_stage"
+  /bin/cp "$auth_generation/ghapp" "$auth_anchor_stage/ghapp"
+  /bin/cp "$auth_generation/shipyard" "$auth_anchor_stage/shipyard"
+  /bin/cp "$auth_helper" "$auth_anchor_stage/shipyard-github-app-token"
+  /bin/chmod 700 "$auth_anchor_stage/ghapp" "$auth_anchor_stage/shipyard" "$auth_anchor_stage/shipyard-github-app-token"
+  if [ "$auth_companion_required" = 1 ]; then
+    /bin/cp "$auth_generation/shipyard-workstream-provider" "$auth_anchor_stage/shipyard-workstream-provider"
+    /bin/chmod 700 "$auth_anchor_stage/shipyard-workstream-provider"
+  fi
+  auth_anchor_helper_digest="$(/usr/bin/shasum -a 256 "$auth_anchor_stage/shipyard-github-app-token" | /usr/bin/awk '{{print $1}}')"
+  auth_anchor_seed="$auth_anchor_stage/generation.seed"
+  /usr/bin/printf '%s\n' \
+    'schema_version=1' \
+    'generation_contract=auth-selector-v1' \
+    'generation_kind=legacy-anchor' \
+    "authority_identity=$auth_authority" \
+    "helper_sha256=$auth_anchor_helper_digest" \
+    "wrapper_sha256=$auth_stage_wrapper_digest" \
+    "binary_sha256=$auth_stage_binary_digest" \
+    "companion_sha256=$auth_stage_companion_digest" \
+    "context_template_sha256=$auth_context_template_digest" > "$auth_anchor_seed"
+  /bin/chmod 600 "$auth_anchor_seed"
+  auth_anchor_id="$(/usr/bin/shasum -a 256 "$auth_anchor_seed" | /usr/bin/awk '{{print $1}}')"
+  case "$auth_anchor_id" in ''|*[!0-9a-f]*) exit 1 ;; esac
+  test "${{#auth_anchor_id}}" = 64
+  auth_anchor="$auth_generation_root/$auth_anchor_id"
+  auth_anchor_context_digest=absent
+  if [ "$auth_resolver_required" = 1 ]; then
+    /usr/bin/printf '%s\n' "${{auth_context_json/__SHIPYARD_AUTH_GENERATION__/$auth_anchor_id}}" > "$auth_anchor_stage/ghapp.shipyard-context.json"
+    /bin/chmod 600 "$auth_anchor_stage/ghapp.shipyard-context.json"
+    auth_anchor_context_digest="$(/usr/bin/shasum -a 256 "$auth_anchor_stage/ghapp.shipyard-context.json" | /usr/bin/awk '{{print $1}}')"
+  fi
+  /usr/bin/printf '%s\n' \
+    'schema_version=1' \
+    'generation_contract=auth-selector-v1' \
+    'generation_kind=legacy-anchor' \
+    "generation_id=$auth_anchor_id" \
+    "authority_identity=$auth_authority" \
+    "helper_sha256=$auth_anchor_helper_digest" \
+    'helper_mode=700' \
+    "wrapper_sha256=$auth_stage_wrapper_digest" \
+    'wrapper_mode=700' \
+    "binary_sha256=$auth_stage_binary_digest" \
+    'binary_mode=700' \
+    "companion_sha256=$auth_stage_companion_digest" \
+    "context_sha256=$auth_anchor_context_digest" \
+    "context_template_sha256=$auth_context_template_digest" > "$auth_anchor_stage/generation.manifest"
+  /bin/chmod 600 "$auth_anchor_stage/generation.manifest"
+  auth_anchor_wrapper_target="$auth_anchor/ghapp"
+  auth_anchor_manifest_digest="$(/usr/bin/shasum -a 256 "$auth_anchor_stage/generation.manifest" | /usr/bin/awk '{{print $1}}')"
+  if [ -e "$auth_anchor" ] || [ -L "$auth_anchor" ]; then
+    test -d "$auth_anchor"
+    test ! -L "$auth_anchor"
+    test "$(/usr/bin/stat -f '%u' "$auth_anchor")" = "$(/usr/bin/id -u)"
+    test "$(/usr/bin/stat -f '%Lp' "$auth_anchor")" = 700
+    /usr/bin/cmp -s "$auth_anchor/generation.seed" "$auth_anchor_stage/generation.seed"
+    /usr/bin/cmp -s "$auth_anchor/generation.manifest" "$auth_anchor_stage/generation.manifest"
+    for auth_member in generation.seed generation.manifest; do
+      test -f "$auth_anchor/$auth_member"
+      test ! -L "$auth_anchor/$auth_member"
+      test "$(/usr/bin/stat -f '%u' "$auth_anchor/$auth_member")" = "$(/usr/bin/id -u)"
+      test "$(/usr/bin/stat -f '%Lp' "$auth_anchor/$auth_member")" = 600
+    done
+    for auth_member in shipyard-github-app-token ghapp shipyard; do
+      test -f "$auth_anchor/$auth_member"
+      test ! -L "$auth_anchor/$auth_member"
+      test "$(/usr/bin/stat -f '%u' "$auth_anchor/$auth_member")" = "$(/usr/bin/id -u)"
+      test "$(/usr/bin/stat -f '%Lp' "$auth_anchor/$auth_member")" = 700
+      /usr/bin/cmp -s "$auth_anchor/$auth_member" "$auth_anchor_stage/$auth_member"
+    done
+    if [ "$auth_companion_required" = 1 ]; then
+      test -f "$auth_anchor/shipyard-workstream-provider"
+      test ! -L "$auth_anchor/shipyard-workstream-provider"
+      test "$(/usr/bin/stat -f '%u' "$auth_anchor/shipyard-workstream-provider")" = "$(/usr/bin/id -u)"
+      test "$(/usr/bin/stat -f '%Lp' "$auth_anchor/shipyard-workstream-provider")" = 700
+      /usr/bin/cmp -s "$auth_anchor/shipyard-workstream-provider" "$auth_anchor_stage/shipyard-workstream-provider"
+    else
+      test ! -e "$auth_anchor/shipyard-workstream-provider"
+      test ! -L "$auth_anchor/shipyard-workstream-provider"
+    fi
+    if [ "$auth_resolver_required" = 1 ]; then
+      test -f "$auth_anchor/ghapp.shipyard-context.json"
+      test ! -L "$auth_anchor/ghapp.shipyard-context.json"
+      test "$(/usr/bin/stat -f '%u' "$auth_anchor/ghapp.shipyard-context.json")" = "$(/usr/bin/id -u)"
+      test "$(/usr/bin/stat -f '%Lp' "$auth_anchor/ghapp.shipyard-context.json")" = 600
+      /usr/bin/cmp -s "$auth_anchor/ghapp.shipyard-context.json" "$auth_anchor_stage/ghapp.shipyard-context.json"
+    else
+      test ! -e "$auth_anchor/ghapp.shipyard-context.json"
+      test ! -L "$auth_anchor/ghapp.shipyard-context.json"
+    fi
+    /bin/rm -rf "$auth_anchor_stage"
+  else
+    /bin/mv "$auth_anchor_stage" "$auth_anchor"
+  fi
+  auth_anchor_stage=
+  auth_write_phase anchor-select-intent
+  auth_publish_link "$auth_wrapper" "$auth_anchor/ghapp"
+  auth_write_phase anchor-selected
+  auth_old_reader_cohort=
+  # A direct-wrapper exec can cross the atomic selector rename before it is
+  # visible to one ps snapshot. Observe a bounded post-selector quiescence
+  # window and fence the union of exact PID/start identities before projections
+  # move. New readers resolve the immutable anchor and cannot join this cohort.
+  for auth_observation_round in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    auth_old_reader_pids="$(/bin/ps -axo pid=,command= | /usr/bin/awk -v wrapper="$auth_wrapper" '$2 == "/bin/bash" && $3 == wrapper {{print $1}}')"
+    for auth_reader_pid in $auth_old_reader_pids; do
+      case "$auth_reader_pid" in ''|*[!0-9]*) exit 1 ;; esac
+      auth_reader_started="$(/bin/ps -p "$auth_reader_pid" -o lstart= 2>/dev/null || true)"
+      if [ -n "$auth_reader_started" ]; then
+        auth_reader_start_digest="$(/usr/bin/printf '%s' "$auth_reader_started" | /usr/bin/shasum -a 256 | /usr/bin/awk '{{print $1}}')"
+        auth_reader_identity="$auth_reader_pid:$auth_reader_start_digest"
+        case " $auth_old_reader_cohort " in
+          *" $auth_reader_identity "*) ;;
+          *) auth_old_reader_cohort="$auth_old_reader_cohort $auth_reader_identity" ;;
+        esac
+      fi
+    done
+    /bin/sleep 0.05
+  done
+  auth_reader_deadline=$(( $(/bin/date +%s) + 30 ))
+  while [ -n "${{auth_old_reader_cohort# }}" ]; do
+    auth_reader_remaining=
+    for auth_reader_identity in $auth_old_reader_cohort; do
+      auth_reader_pid="${{auth_reader_identity%%:*}}"
+      auth_reader_expected_start="${{auth_reader_identity#*:}}"
+      case "$auth_reader_pid:$auth_reader_expected_start" in *[!0-9a-f:]*) exit 1 ;; esac
+      test "${{#auth_reader_expected_start}}" = 64
+      if /bin/kill -0 "$auth_reader_pid" 2>/dev/null; then
+        auth_reader_started="$(/bin/ps -p "$auth_reader_pid" -o lstart= 2>/dev/null || true)"
+        if [ -n "$auth_reader_started" ]; then
+          auth_reader_current_start="$(/usr/bin/printf '%s' "$auth_reader_started" | /usr/bin/shasum -a 256 | /usr/bin/awk '{{print $1}}')"
+          if [ "$auth_reader_current_start" = "$auth_reader_expected_start" ]; then
+            auth_reader_remaining="$auth_reader_remaining $auth_reader_identity"
+          fi
+        fi
+      fi
+    done
+    auth_old_reader_cohort="$auth_reader_remaining"
+    test "$(/bin/date +%s)" -lt "$auth_reader_deadline"
+    /bin/sleep 0.05
+  done
+fi
+auth_write_phase projections-publish-intent
+auth_publish_link "$auth_helper" "$auth_generation/shipyard-github-app-token"
+auth_publish_link "$auth_binary" "$auth_generation/shipyard"
+if [ "$auth_companion_required" = 1 ]; then auth_publish_link "$auth_companion" "$auth_generation/shipyard-workstream-provider"; fi
+if [ "$auth_resolver_required" = 1 ]; then
+  auth_publish_link "$auth_context" "$auth_generation/ghapp.shipyard-context.json"
+fi
+auth_write_phase projections-published
+auth_write_phase target-select-intent
+auth_publish_link "$auth_wrapper" "$auth_generation/ghapp"
+auth_write_phase target-selected
+auth_write_phase validation-intent
 test "$(/usr/bin/shasum -a 256 "$auth_helper" | /usr/bin/awk '{{print $1}}')" = "$auth_helper_digest"
 test "$(/usr/bin/shasum -a 256 "$auth_wrapper" | /usr/bin/awk '{{print $1}}')" = "$auth_wrapper_digest"
-test "$(/usr/bin/stat -f '%Lp' "$auth_helper")" = 700
-test "$(/usr/bin/stat -f '%Lp' "$auth_wrapper")" = 700
+test "$(/usr/bin/stat -L -f '%Lp' "$auth_helper")" = 700
+test "$(/usr/bin/stat -L -f '%Lp' "$auth_wrapper")" = 700
 test -x "$auth_binary"
 if [ "$auth_companion_required" = 1 ]; then test -x "$auth_companion"; fi
 if [ "$auth_resolver_required" = 1 ]; then
   test "$(/usr/bin/shasum -a 256 "$auth_context" | /usr/bin/awk '{{print $1}}')" = "$auth_context_digest"
-  test "$(/usr/bin/stat -f '%Lp' "$auth_context")" = 600
+  test "$(/usr/bin/stat -L -f '%Lp' "$auth_context")" = 600
   "$auth_binary" --mode "$auth_mode" --global-dir "$auth_global_dir" auth helper-argv --wrapper "$auth_wrapper" --repo "$auth_probe_repo" >/dev/null
 fi
+auth_write_phase validated
 auth_write_phase committed
+auth_generation_created=0
 trap - ERR INT TERM
 auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context"
 auth_post_commit_after_failure() {{ auth_status="$1"; trap - ERR INT TERM; auth_release_lock; exit "$auth_status"; }}

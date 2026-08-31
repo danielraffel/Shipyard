@@ -112,10 +112,26 @@ ship in Claude Code, close your laptop, then reopen and use Codex
 (or any other agent) to run `shipyard ship`, Codex auto-resumes
 the same state. There is no Claude-specific dependency in Phase 1.
 
-## When resume does *not* help
+## Foreground resume versus unattended continuation
 
-Phase 1 resume still requires a live session on your machine to
-act. If you genuinely cannot return — overnight, travel, weekend —
-the poll loop is not running anywhere. That case is the subject of
-Phase 2 (cloud hand-off via Claude Code Routines), tracked as
-[#41](https://github.com/danielraffel/Shipyard/issues/41).
+The per-PR ship-state path above is foreground resume: another invocation must
+run `shipyard ship` to continue the validation loop. It remains useful without
+the daemon and does not transfer process authority to another agent.
+
+Shipyard also has a separate, explicit and default-off unattended continuation
+path. An exact steward handoff may publish a protected launch profile and a
+zero-wake obligation into the machine-global work ledger. Only after that
+publication returns its exact receipt may the trusted daemon consumer own
+monitoring and a generation-fenced wake after the submitting session exits.
+The daemon revalidates the work item, repository/PR/head, protected route,
+profile digest, owner generations, machine allowlist, and adapter identity
+before provider I/O. An uncertain outcome is recorded and never blindly
+relaunched.
+
+Terminal transport and provider routing are independent. cmux delivery binds a
+live process/surface and native checkpoint. HerdR has a registered endpoint
+shape but physical delivery remains fail-closed and unproven; it never falls
+back to cmux or direct Codex. Subrouter account/model/native-resume choices stay
+digest-bound. See [launch profiles](launch-profile.md) and
+[terminal/provider adapters](terminal-adapters.md) for the activation and
+capability boundaries.

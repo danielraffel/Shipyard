@@ -441,6 +441,19 @@ a reviewed ordered subset, or use explicit `--all-hosts`. Missing, unknown, and
 duplicate selection fails closed; apply stops before later hosts after the
 first failure.
 
+For targets v0.134.0 and newer, the fleet transaction stages the exact
+release-matched CLI, helper, wrapper, and typed context in a private,
+content-addressed auth generation. It publishes the public wrapper selector
+last. Each invocation binds the wrapper file it actually opened (Linux
+`/proc` or macOS `lsof`) and resolves the CLI and context from that same
+generation, so a concurrent selector swap cannot mix generations or expose a
+missing context. Crash recovery rolls back before validation and rolls forward
+after validation or commit; rollback uses the reverse publication order. Do
+not remove a published generation during rollout because an already-open
+reader may still require it. Preserve generation count, total bytes, and free
+disk in each host receipt; any future reader-aware garbage collector remains a
+separately reviewed, dry-run-only operation.
+
 Before any host can mutate, Shipyard resolves the exact annotated tag object,
 commit, tree, release ID, checksum-manifest asset, and macOS DMG asset. It
 streams both assets by immutable ID into owner-private hard-capped staging,
@@ -462,9 +475,10 @@ A successful typed host receipt includes the full authority plus before/after
 primary and `shipyard-workstream-provider` path, version, and double-observed
 SHA-256, CLI/daemon identity, configured runtime paths, and repository
 preservation. Pre-install provenance is explicitly unverified; only the
-post-install pair is bound to the verified authority digest. Releases from
-v0.127.0 require both pair members; older rollback tags at or above v0.100.0
-must prove the companion absent. Fleet rollout requires a self-contained machine-global command auth
+post-install pair is bound to the verified authority digest. Older
+fleet-update releases starting at v0.127.0 required both pair members, while
+rollback tags from v0.100.0 through v0.126.x required the companion absent;
+the current client does not target those releases. Fleet rollout requires a self-contained machine-global command auth
 helper because inherited secrets are deliberately stripped. The updater stages
 the entire exact-tag installer before execution. The first transition from
 v0.130.x or older to a resolver-capable target requires an ordinary exact-tag
@@ -484,10 +498,11 @@ The committed transaction streams the typed daemon-refresh receipt directly;
 receipt cannot be reported as a successful fleet update.
 The wrapper's mandatory strict 0600 non-symlink context preserves those runtime
 arguments for direct calls; manual installs must provision the typed default
-context. Fleet creates and probes it for targets v0.131.0 and newer. Probe
-failure rolls back helper, wrapper, context, CLI, and companion. Targets
-v0.100.0-v0.130.x retain the compatible four-target transaction and nine-line
-journal without the unavailable probe. It terminates any host attempt that exceeds
+context. The current fleet creates and probes it for targets v0.134.0 and
+newer. Probe failure rolls back helper, wrapper, context, CLI, and companion.
+Older fleet-update releases v0.100.0-v0.130.x used the compatible four-target
+transaction and nine-line journal without the unavailable probe; the current
+client does not target them. It terminates any host attempt that exceeds
 ten minutes. A minimal non-login PATH that hides
 Homebrew is launch-environment drift, not evidence that Tart or Shipyard is
 missing.

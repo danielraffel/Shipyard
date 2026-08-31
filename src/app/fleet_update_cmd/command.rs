@@ -1,3 +1,13 @@
+use super::evidence::{
+    REMOTE_DAEMON_AUTH_PROBE_SHA_PREFIX, REMOTE_DAEMON_EXECUTABLE_PREFIX,
+    REMOTE_DAEMON_EXECUTABLE_SHA_PREFIX, REMOTE_DAEMON_LAUNCH_PREFIX, REMOTE_DAEMON_PID_PREFIX,
+    REMOTE_GENERATION_AUTHORITY_PREFIX, REMOTE_GENERATION_BINARY_SHA_PREFIX,
+    REMOTE_GENERATION_COMPANION_SHA_PREFIX, REMOTE_GENERATION_CONTEXT_SHA_PREFIX,
+    REMOTE_GENERATION_CONTRACT_PREFIX, REMOTE_GENERATION_HELPER_SHA_PREFIX,
+    REMOTE_GENERATION_ID_PREFIX, REMOTE_GENERATION_MANIFEST_SHA_PREFIX,
+    REMOTE_GENERATION_SELECTOR_PREFIX, REMOTE_GENERATION_SELECTOR_RECHECK_PREFIX,
+    REMOTE_GENERATION_WRAPPER_SHA_PREFIX,
+};
 use super::{
     BTreeMap, COMPANION_BINARY_NAME, CliFailure, HostUpdateEvidence, HostUpdatePlan,
     MIN_PAIRED_BINARY_TARGET, Path, REMOTE_AFTER_COMPANION_SHA256_PREFIX,
@@ -7,8 +17,8 @@ use super::{
     REMOTE_BEFORE_PRIMARY_SHA256_PREFIX, REMOTE_BEFORE_PRIMARY_VERSION_PREFIX,
     REMOTE_BEFORE_STATUS_PREFIX, REMOTE_MINIMAL_PATH, REMOTE_REFRESH_PREFIX,
     REMOTE_RELEASE_ASSET_SHA256_PREFIX, REMOTE_SUPERVISOR, REMOTE_UPDATE_TIMEOUT, ReleaseAuthority,
-    Value, Write, auth_support, home_dir, shlex_quote, tag_requires_companion,
-    tag_supports_auth_resolver, unattended_tool_path, write_json_envelope,
+    Value, Write, auth_support, shlex_quote, tag_requires_companion, tag_supports_auth_resolver,
+    write_json_envelope,
 };
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -23,7 +33,6 @@ pub(super) fn remote_update_command(
     global_dir: &Path,
     state_dir: &Path,
 ) -> String {
-    let install_dir = binary.parent().unwrap_or_else(|| Path::new("/"));
     let version = target.strip_prefix('v').unwrap_or(target);
     let installer_url = format!(
         "https://raw.githubusercontent.com/{}/{}/{}",
@@ -36,11 +45,24 @@ pub(super) fn remote_update_command(
     let (auth_helper_url, auth_wrapper_url) = auth_support::source_urls(authority);
     let before_auth = auth_support::probe(auth_helper, auth_wrapper, "before");
     let after_auth = auth_support::probe(auth_helper, auth_wrapper, "after");
+    let generation_probe = remote_generation_probe(
+        auth_wrapper,
+        mode,
+        global_dir,
+        tag_requires_companion(target),
+        tag_supports_auth_resolver(target),
+    );
+    let daemon_runtime_probe = remote_daemon_runtime_probe(
+        mode,
+        global_dir,
+        state_dir,
+        &authority.repository,
+        auth_wrapper,
+    );
     let auth_contract = auth_support::wrapper_helper_contract_probe(auth_helper);
     let binary_install_command = format!(
-        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR={} SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null",
+        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$auth_generation_stage\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null",
         shlex_quote(version),
-        shlex_quote(&install_dir.display().to_string())
     );
     let auth_transaction = auth_support::install_transaction(
         auth_helper,
@@ -103,9 +125,9 @@ pub(super) fn remote_update_command(
          SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$staging_dir\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null\n\
          staged_binary=\"$staging_dir/shipyard\"; test \"$(\"$staged_binary\" --version)\" = {}\n\
          \"$staged_binary\" --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
-         {}\nunset token\n{}\n{}\n\
+         {}\nunset token\n{}\n{}\n{}\n\
          {} --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
-         after_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
+         after_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n{}\n\
          printf '%s%s\\n' {} \"$before_primary_sha256\"; printf '%s%s\\n' {} \"$before_primary_version\"\n\
          printf '%s%s\\n' {} \"$before_companion_sha256\"; printf '%s%s\\n' {} \"$before_companion_version\"\n\
          printf '%s%s\\n' {} \"$after_primary_sha256\"; printf '%s%s\\n' {} \"$after_primary_version\"\n\
@@ -114,6 +136,16 @@ pub(super) fn remote_update_command(
          printf '%s%s\\n' {} \"$before_auth_wrapper_sha256\"; printf '%s%s\\n' {} \"$before_auth_wrapper_mode\"\n\
          printf '%s%s\\n' {} \"$after_auth_helper_sha256\"; printf '%s%s\\n' {} \"$after_auth_helper_mode\"\n\
          printf '%s%s\\n' {} \"$after_auth_wrapper_sha256\"; printf '%s%s\\n' {} \"$after_auth_wrapper_mode\"\n\
+         printf '%s%s\\n' {} \"$before_auth_helper_target\"; printf '%s%s\\n' {} \"$before_auth_wrapper_target\"\n\
+         printf '%s%s\\n' {} \"$after_auth_helper_target\"; printf '%s%s\\n' {} \"$after_auth_wrapper_target\"\n\
+         printf '%s%s\\n' {} \"$auth_generation_selector\"; printf '%s%s\\n' {} \"$auth_generation_selector_recheck\"\n\
+         printf '%s%s\\n' {} \"$auth_generation_id\"; printf '%s%s\\n' {} \"$auth_generation_contract\"; printf '%s%s\\n' {} \"$auth_generation_authority\"\n\
+         printf '%s%s\\n' {} \"$auth_generation_manifest_sha256\"; printf '%s%s\\n' {} \"$auth_generation_helper_sha256\"\n\
+         printf '%s%s\\n' {} \"$auth_generation_wrapper_sha256\"; printf '%s%s\\n' {} \"$auth_generation_binary_sha256\"\n\
+         printf '%s%s\\n' {} \"$auth_generation_companion_sha256\"; printf '%s%s\\n' {} \"$auth_generation_context_sha256\"\n\
+         printf '%s%s\\n' {} \"$daemon_observed_pid\"; printf '%s%s\\n' {} \"$daemon_loaded_executable\"\n\
+         printf '%s%s\\n' {} \"$daemon_loaded_executable_sha256\"; printf '%s%s\\n' {} \"$daemon_loaded_launch\"\n\
+         printf '%s%s\\n' {} \"$daemon_auth_probe_sha256\"\n\
          printf '%s%s\\n' {} \"$before_status\"; printf '%s%s\\n' {} \"$after_status\"\n\
          printf '%s%s\\n' {} {}; printf '%s%s\\n' {} \"$release_asset_sha256\"",
         before_pair,
@@ -143,6 +175,7 @@ pub(super) fn remote_update_command(
         auth_transaction,
         after_pair,
         after_auth,
+        generation_probe,
         shlex_quote(&binary.display().to_string()),
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
@@ -152,6 +185,7 @@ pub(super) fn remote_update_command(
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
         shlex_quote(&state_dir.display().to_string()),
+        daemon_runtime_probe,
         shlex_quote(REMOTE_BEFORE_PRIMARY_SHA256_PREFIX),
         shlex_quote(REMOTE_BEFORE_PRIMARY_VERSION_PREFIX),
         shlex_quote(REMOTE_BEFORE_COMPANION_SHA256_PREFIX),
@@ -168,6 +202,26 @@ pub(super) fn remote_update_command(
         shlex_quote(auth_support::AFTER_HELPER_MODE_PREFIX),
         shlex_quote(auth_support::AFTER_WRAPPER_SHA_PREFIX),
         shlex_quote(auth_support::AFTER_WRAPPER_MODE_PREFIX),
+        shlex_quote(auth_support::BEFORE_HELPER_TARGET_PREFIX),
+        shlex_quote(auth_support::BEFORE_WRAPPER_TARGET_PREFIX),
+        shlex_quote(auth_support::AFTER_HELPER_TARGET_PREFIX),
+        shlex_quote(auth_support::AFTER_WRAPPER_TARGET_PREFIX),
+        shlex_quote(REMOTE_GENERATION_SELECTOR_PREFIX),
+        shlex_quote(REMOTE_GENERATION_SELECTOR_RECHECK_PREFIX),
+        shlex_quote(REMOTE_GENERATION_ID_PREFIX),
+        shlex_quote(REMOTE_GENERATION_CONTRACT_PREFIX),
+        shlex_quote(REMOTE_GENERATION_AUTHORITY_PREFIX),
+        shlex_quote(REMOTE_GENERATION_MANIFEST_SHA_PREFIX),
+        shlex_quote(REMOTE_GENERATION_HELPER_SHA_PREFIX),
+        shlex_quote(REMOTE_GENERATION_WRAPPER_SHA_PREFIX),
+        shlex_quote(REMOTE_GENERATION_BINARY_SHA_PREFIX),
+        shlex_quote(REMOTE_GENERATION_COMPANION_SHA_PREFIX),
+        shlex_quote(REMOTE_GENERATION_CONTEXT_SHA_PREFIX),
+        shlex_quote(REMOTE_DAEMON_PID_PREFIX),
+        shlex_quote(REMOTE_DAEMON_EXECUTABLE_PREFIX),
+        shlex_quote(REMOTE_DAEMON_EXECUTABLE_SHA_PREFIX),
+        shlex_quote(REMOTE_DAEMON_LAUNCH_PREFIX),
+        shlex_quote(REMOTE_DAEMON_AUTH_PROBE_SHA_PREFIX),
         shlex_quote(REMOTE_BEFORE_STATUS_PREFIX),
         shlex_quote(REMOTE_AFTER_STATUS_PREFIX),
         shlex_quote(REMOTE_AUTHORITY_ID_PREFIX),
@@ -204,6 +258,177 @@ else
 fi
 test "$auth_header_uid" = "$(/usr/bin/id -u)"
 test "$auth_header_mode" = 600"#
+}
+
+fn remote_generation_probe(
+    auth_wrapper: &Path,
+    mode: &str,
+    global_dir: &Path,
+    companion_required: bool,
+    context_required: bool,
+) -> String {
+    format!(
+        r#"auth_generation_selector="$(/usr/bin/readlink {wrapper})"
+auth_generation_dir="${{auth_generation_selector%/ghapp}}"
+test "$auth_generation_dir" != "$auth_generation_selector"
+test -d "$auth_generation_dir"; test ! -L "$auth_generation_dir"
+test "$(/usr/bin/stat -f '%u' "$auth_generation_dir")" = "$(/usr/bin/id -u)"
+test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir")" = 700
+auth_generation_root="${{auth_generation_dir%/*}}"
+auth_generation_private_root="${{auth_generation_root%/*}}"
+auth_generation_share="${{auth_generation_private_root%/*}}"
+auth_generation_local="${{auth_generation_share%/*}}"
+test "$auth_generation_private_root" = "$HOME/.local/share/shipyard"
+test "$auth_generation_share" = "$HOME/.local/share"
+test "$auth_generation_local" = "$HOME/.local"
+for auth_generation_ancestor in "$HOME" "$auth_generation_local" "$auth_generation_share"; do
+  test -d "$auth_generation_ancestor"; test ! -L "$auth_generation_ancestor"
+  test "$(/usr/bin/stat -f '%u' "$auth_generation_ancestor")" = "$(/usr/bin/id -u)"
+  auth_generation_ancestor_mode="$(/usr/bin/stat -f '%Lp' "$auth_generation_ancestor")"
+  test $((8#$auth_generation_ancestor_mode & 8#22)) -eq 0
+done
+for auth_generation_parent in "$auth_generation_private_root" "$auth_generation_root"; do
+  test -d "$auth_generation_parent"; test ! -L "$auth_generation_parent"
+  test "$(/usr/bin/stat -f '%u' "$auth_generation_parent")" = "$(/usr/bin/id -u)"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_generation_parent")" = 700
+done
+auth_generation_manifest="$auth_generation_dir/generation.manifest"
+test -f "$auth_generation_manifest"; test ! -L "$auth_generation_manifest"
+test "$(/usr/bin/wc -l < "$auth_generation_manifest" | /usr/bin/tr -d ' ')" = 13
+auth_manifest_value() {{ /usr/bin/awk -F= -v key="$1" '$1 == key {{ if (++count > 1) exit 2; value=$2 }} END {{ if (count != 1 || value == "") exit 3; print value }}' "$auth_generation_manifest"; }}
+auth_generation_id="$(auth_manifest_value generation_id)"
+auth_generation_authority="$(auth_manifest_value authority_identity)"
+auth_generation_context_template_sha256="$(auth_manifest_value context_template_sha256)"
+test "$(auth_manifest_value schema_version)" = 1
+auth_generation_contract="$(auth_manifest_value generation_contract)"
+test "$auth_generation_contract" = auth-selector-v1
+case "$auth_generation_id" in ''|*[!0-9a-f]*) exit 1 ;; esac
+test "${{#auth_generation_id}}" = 64
+case "$auth_generation_authority" in ''|*[!0-9a-f]*) exit 1 ;; esac
+test "${{#auth_generation_authority}}" = 64
+case "$auth_generation_context_template_sha256" in ''|*[!0-9a-f]*) exit 1 ;; esac
+test "${{#auth_generation_context_template_sha256}}" = 64
+test "$auth_generation_dir" = "${{auth_generation_selector%/$auth_generation_id/ghapp}}/$auth_generation_id"
+auth_generation_manifest_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_manifest" | /usr/bin/awk '{{print $1}}')"
+auth_generation_helper_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard-github-app-token" | /usr/bin/awk '{{print $1}}')"
+auth_generation_wrapper_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp" | /usr/bin/awk '{{print $1}}')"
+auth_generation_binary_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard" | /usr/bin/awk '{{print $1}}')"
+test "$(/usr/bin/stat -f '%Lp' "$auth_generation_manifest")" = 600
+test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/shipyard-github-app-token")" = 700
+test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/ghapp")" = 700
+test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/shipyard")" = 700
+for auth_generation_member in "$auth_generation_manifest" "$auth_generation_dir/shipyard-github-app-token" "$auth_generation_dir/ghapp" "$auth_generation_dir/shipyard"; do
+  test -f "$auth_generation_member"; test ! -L "$auth_generation_member"
+  test "$(/usr/bin/stat -f '%u' "$auth_generation_member")" = "$(/usr/bin/id -u)"
+done
+test "$(auth_manifest_value helper_sha256)" = "$auth_generation_helper_sha256"
+test "$(auth_manifest_value helper_mode)" = 700
+test "$(auth_manifest_value wrapper_sha256)" = "$auth_generation_wrapper_sha256"
+test "$(auth_manifest_value wrapper_mode)" = 700
+test "$(auth_manifest_value binary_sha256)" = "$auth_generation_binary_sha256"
+test "$(auth_manifest_value binary_mode)" = 700
+if [ {companion_required} = 1 ]; then
+  test -f "$auth_generation_dir/shipyard-workstream-provider"; test ! -L "$auth_generation_dir/shipyard-workstream-provider"
+  test "$(/usr/bin/stat -f '%u' "$auth_generation_dir/shipyard-workstream-provider")" = "$(/usr/bin/id -u)"
+  auth_generation_companion_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard-workstream-provider" | /usr/bin/awk '{{print $1}}')"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/shipyard-workstream-provider")" = 700
+  test "$(auth_manifest_value companion_sha256)" = "$auth_generation_companion_sha256"
+else
+  auth_generation_companion_sha256=absent
+  test "$(auth_manifest_value companion_sha256)" = absent
+  test ! -e "$auth_generation_dir/shipyard-workstream-provider"; test ! -L "$auth_generation_dir/shipyard-workstream-provider"
+fi
+if [ {context_required} = 1 ]; then
+  test -f "$auth_generation_dir/ghapp.shipyard-context.json"; test ! -L "$auth_generation_dir/ghapp.shipyard-context.json"
+  test "$(/usr/bin/stat -f '%u' "$auth_generation_dir/ghapp.shipyard-context.json")" = "$(/usr/bin/id -u)"
+  auth_generation_context_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp.shipyard-context.json" | /usr/bin/awk '{{print $1}}')"
+  test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/ghapp.shipyard-context.json")" = 600
+  test "$(auth_manifest_value context_sha256)" = "$auth_generation_context_sha256"
+  /usr/bin/python3 - "$auth_generation_dir/ghapp.shipyard-context.json" {mode} {global_dir} "$auth_generation_id" "$auth_generation_authority" <<'PY'
+import json, sys
+path, expected_mode, expected_global_dir, expected_generation, expected_authority = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as stream:
+        value = json.load(stream)
+except Exception:
+    raise SystemExit(1)
+expected = {{
+    "schema_version": 2,
+    "mode": expected_mode,
+    "global_dir": expected_global_dir,
+    "generation_id": expected_generation,
+    "authority_identity": expected_authority,
+}}
+if value != expected:
+    raise SystemExit(1)
+PY
+else
+  auth_generation_context_sha256=absent
+  test "$(auth_manifest_value context_sha256)" = absent
+  test ! -e "$auth_generation_dir/ghapp.shipyard-context.json"; test ! -L "$auth_generation_dir/ghapp.shipyard-context.json"
+fi
+test "$(/usr/bin/shasum -a 256 "$auth_generation_manifest" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_manifest_sha256"
+test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard-github-app-token" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_helper_sha256"
+test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_wrapper_sha256"
+test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_binary_sha256"
+if [ {companion_required} = 1 ]; then test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard-workstream-provider" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_companion_sha256"; fi
+if [ {context_required} = 1 ]; then test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp.shipyard-context.json" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_context_sha256"; fi
+auth_generation_selector_recheck="$(/usr/bin/readlink {wrapper})"
+test "$auth_generation_selector_recheck" = "$auth_generation_selector""#,
+        wrapper = shlex_quote(&auth_wrapper.display().to_string()),
+        mode = shlex_quote(mode),
+        global_dir = shlex_quote(&global_dir.display().to_string()),
+        companion_required = u8::from(companion_required),
+        context_required = u8::from(context_required),
+    )
+}
+
+fn remote_daemon_runtime_probe(
+    mode: &str,
+    global_dir: &Path,
+    state_dir: &Path,
+    repository: &str,
+    auth_wrapper: &Path,
+) -> String {
+    format!(
+        r#"daemon_observed_pid="$(/usr/bin/tr -d '[:space:]' < {state_dir}/daemon/daemon.pid)"
+case "$daemon_observed_pid" in ''|*[!0-9]*) exit 1 ;; esac
+test "$daemon_observed_pid" -gt 0
+daemon_loaded_executable="$(/usr/sbin/lsof -a -p "$daemon_observed_pid" -d txt -Fn | /usr/bin/awk '$0 == "ftxt" {{ text=1; next }} text && substr($0,1,1) == "n" {{ print substr($0,2); exit }}')"
+test "$daemon_loaded_executable" = "$auth_generation_dir/shipyard"
+daemon_loaded_executable_sha256="$(/usr/bin/shasum -a 256 "$daemon_loaded_executable" | /usr/bin/awk '{{print $1}}')"
+test "$daemon_loaded_executable_sha256" = "$auth_generation_binary_sha256"
+daemon_loaded_launch="$(/bin/ps -ww -p "$daemon_observed_pid" -o command=)"
+test -n "$daemon_loaded_launch"
+daemon_auth_probe="$("$auth_generation_dir/shipyard" --mode {mode} --global-dir {global_dir} --state-dir {state_dir} auth helper-argv --wrapper {wrapper} --repo {repository})"
+DAEMON_AUTH_PROBE="$daemon_auth_probe" /usr/bin/python3 - {wrapper} {repository} <<'PY'
+import json, os, sys, unicodedata
+try:
+    value = json.loads(os.environ["DAEMON_AUTH_PROBE"])
+except Exception:
+    raise SystemExit(1)
+expected_wrapper, expected_repo = sys.argv[1:3]
+if not isinstance(value, dict) or set(value) != {{"schema_version", "command", "wrapper", "repo", "credential_argv"}}:
+    raise SystemExit(1)
+argv = value.get("credential_argv")
+if type(value.get("schema_version")) is not int or value.get("schema_version") != 1 or value.get("command") != "auth.helper-argv" or value.get("wrapper") != expected_wrapper or value.get("repo") != expected_repo:
+    raise SystemExit(1)
+if not isinstance(argv, list) or len(argv) != 4 or not all(isinstance(item, str) for item in argv):
+    raise SystemExit(1)
+app_id, private_key = argv[1], argv[3]
+normalized_key = 2 <= len(private_key) <= 4096 and private_key.startswith("/") and all(part not in {{"", ".", ".."}} for part in private_key.split("/")[1:]) and not any(unicodedata.category(ch) == "Cc" for ch in private_key)
+if argv[0] != "--app-id" or not 1 <= len(app_id) <= 20 or not app_id.isascii() or not app_id.isdecimal() or not 0 < int(app_id) <= 18446744073709551615 or argv[2] != "--private-key" or not normalized_key:
+    raise SystemExit(1)
+PY
+daemon_auth_probe_sha256="$(/usr/bin/printf '%s' "$daemon_auth_probe" | /usr/bin/shasum -a 256 | /usr/bin/awk '{{print $1}}')"
+test "$(/usr/bin/readlink {wrapper})" = "$auth_generation_selector"
+test "$(/usr/bin/tr -d '[:space:]' < {state_dir}/daemon/daemon.pid)" = "$daemon_observed_pid""#,
+        mode = shlex_quote(mode),
+        global_dir = shlex_quote(&global_dir.display().to_string()),
+        state_dir = shlex_quote(&state_dir.display().to_string()),
+        repository = shlex_quote(repository),
+        wrapper = shlex_quote(&auth_wrapper.display().to_string()),
+    )
 }
 
 pub(super) fn auth_token_command(repository: &str, auth_wrapper: &Path) -> String {
@@ -403,15 +628,10 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         auth_token_command(&plan.release_authority.repository, &plan.auth_wrapper)
     };
     let auth_header_setup = github_api_auth_header_setup();
+    let version = plan.target.strip_prefix('v').unwrap_or(&plan.target);
     let binary_install_command = format!(
-        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" /usr/bin/env -i HOME={} PATH={} SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" {} --mode {} --global-dir {} --state-dir {} --json update --to {} --install-script-url \"file://$installer\" --curl-bin \"$curl_shim\" --unattended-fleet",
-        shlex_quote(&home_dir().display().to_string()),
-        shlex_quote(&unattended_tool_path().to_string_lossy()),
-        shlex_quote(&plan.binary.display().to_string()),
-        plan.runtime_mode.as_str(),
-        shlex_quote(&plan.global_dir.display().to_string()),
-        shlex_quote(&plan.state_dir.display().to_string()),
-        shlex_quote(&plan.target),
+        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$auth_generation_stage\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null",
+        shlex_quote(version),
     );
     let auth_transaction = auth_support::install_transaction(
         &plan.auth_helper,
@@ -591,6 +811,11 @@ pub(super) fn render_host_result<W: Write>(
                 Value::from(evidence.daemon_version.clone()),
             );
             data.insert("daemon_pid".to_owned(), Value::from(evidence.daemon_pid));
+            data.insert(
+                "daemon_runtime".to_owned(),
+                serde_json::to_value(&evidence.daemon_runtime)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
+            );
             data.insert(
                 "configured_repos_before".to_owned(),
                 serde_json::to_value(&evidence.configured_repos_before)
