@@ -139,7 +139,8 @@ pub(crate) fn prepare_for_execution(checkout: &IntegrationCheckout) -> Result<fs
         .map_err(|error| format!("integration checkout is already owned: {error}"))?;
     verify_checkout(&checkout.path, &checkout.marker)?;
     verify_marker(&checkout.path, &checkout.marker)?;
-    verify_clean(&checkout.path)?;
+    restore_pristine_checkout(&checkout.path)?;
+    verify_pristine(&checkout.path)?;
     Ok(lock)
 }
 
@@ -147,7 +148,7 @@ pub(crate) fn prepare_for_execution(checkout: &IntegrationCheckout) -> Result<fs
 pub(crate) fn verify_after_execution(checkout: &IntegrationCheckout) -> Result<(), String> {
     verify_checkout(&checkout.path, &checkout.marker)?;
     verify_marker(&checkout.path, &checkout.marker)?;
-    verify_clean(&checkout.path)
+    verify_tracked_and_unignored(&checkout.path)
 }
 
 /// Remove only the exact linked worktree whose immutable marker and Git
@@ -156,7 +157,7 @@ pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
     if checkout.path.exists() {
         verify_checkout(&checkout.path, &checkout.marker)?;
         verify_marker(&checkout.path, &checkout.marker)?;
-        verify_clean(&checkout.path)?;
+        verify_tracked_and_unignored(&checkout.path)?;
         let status = Command::new("git")
             .args(["worktree", "remove", "--force"])
             .arg(&checkout.path)
@@ -214,12 +215,74 @@ fn verify_checkout(path: &Path, marker: &CheckoutMarker) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_clean(path: &Path) -> Result<(), String> {
+fn verify_tracked_and_unignored(path: &Path) -> Result<(), String> {
     let status = git_path(path, &["status", "--porcelain=v1", "--untracked-files=all"])?;
     if status.is_empty() {
         Ok(())
     } else {
         Err("integration checkout contains tracked or unignored content drift".to_owned())
+    }
+}
+
+fn verify_pristine(path: &Path) -> Result<(), String> {
+    let status = git_path(
+        path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+    )?;
+    if !status.is_empty() {
+        return Err("integration checkout contains ignored or untracked residue".to_owned());
+    }
+    let submodules = git_path(
+        path,
+        &[
+            "submodule",
+            "foreach",
+            "--recursive",
+            "--quiet",
+            "git status --porcelain=v1 --untracked-files=all --ignored=matching",
+        ],
+    )?;
+    if !submodules.is_empty() {
+        return Err("integration submodule contains ignored or untracked residue".to_owned());
+    }
+    Ok(())
+}
+
+fn restore_pristine_checkout(path: &Path) -> Result<(), String> {
+    git_success(
+        path,
+        &["reset", "--hard", "HEAD"],
+        "reset integration checkout",
+    )?;
+    git_success(path, &["clean", "-ffdx"], "clean integration checkout")?;
+    git_success(
+        path,
+        &[
+            "submodule",
+            "foreach",
+            "--recursive",
+            "--quiet",
+            "git reset --hard HEAD && git clean -ffdx",
+        ],
+        "clean integration submodules",
+    )
+}
+
+fn git_success(cwd: &Path, args: &[&str], context: &str) -> Result<(), String> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .map_err(|error| format!("{context}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{context}: git failed"))
     }
 }
 
@@ -411,6 +474,7 @@ mod tests {
         );
         git(temp.path(), &["config", "user.name", "Test"]);
         fs::write(temp.path().join("base.txt"), "base\n").unwrap();
+        fs::write(temp.path().join(".gitignore"), "build/\n").unwrap();
         git(temp.path(), &["add", "."]);
         git(temp.path(), &["commit", "-qm", "base"]);
         let old = git(temp.path(), &["rev-parse", "HEAD"]);
@@ -503,14 +567,32 @@ mod tests {
     }
 
     #[test]
-    fn tracked_or_unignored_drift_refuses_execution_and_cleanup() {
+    fn restart_reconciliation_removes_ignored_attempt_residue_before_execution() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        fs::create_dir_all(checkout.path.join("build")).unwrap();
+        fs::write(checkout.path.join("build/stale.o"), "stale\n").unwrap();
+        let guard = prepare_for_execution(&checkout).unwrap();
+        assert!(!checkout.path.join("build/stale.o").exists());
+        drop(guard);
+        cleanup(&checkout).unwrap();
+    }
+
+    #[test]
+    fn restart_reconciliation_restores_tracked_and_unignored_content() {
         let (repo, receipt) = fixture();
         let parent = repo.path().join("isolated");
         let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
         fs::write(checkout.path.join("base.txt"), "tampered\n").unwrap();
-        assert!(prepare_for_execution(&checkout).is_err());
-        assert!(cleanup(&checkout).is_err());
-        assert!(checkout.path.exists());
-        assert!(!checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).exists());
+        fs::write(checkout.path.join("untracked.txt"), "tampered\n").unwrap();
+        let guard = prepare_for_execution(&checkout).unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.path.join("base.txt")).unwrap(),
+            "base\n"
+        );
+        assert!(!checkout.path.join("untracked.txt").exists());
+        drop(guard);
+        cleanup(&checkout).unwrap();
     }
 }
