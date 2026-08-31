@@ -258,6 +258,13 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
         ),
     )
     .expect("resolver fixture");
+    let legacy_token = format!(
+        "ghs_APP-ID_{}.{}.{}",
+        "a".repeat(120),
+        "b".repeat(120),
+        "c".repeat(120)
+    );
+    assert!(legacy_token.len() > 255);
     std::fs::write(
         &wrapper,
         format!(
@@ -303,6 +310,103 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
     assert!(status.success());
     assert!(wrapper_invoked.exists());
     std::fs::remove_file(&wrapper_invoked).expect("clear wrapper marker");
+
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             /usr/bin/touch '{}'\n\
+             test \"$#\" -eq 7\n\
+             test \"$1\" = token\n\
+             test \"$2\" = --app-id\n\
+             test \"$3\" = 000123456\n\
+             test \"$4\" = --private-key\n\
+             test \"$5\" = '{}'\n\
+             test \"$6\" = --repo\n\
+             test \"$7\" = danielraffel/Shipyard\n\
+             test -z \"${{GH_REPO:-}}${{SHIPYARD_GHAPP_REPO:-}}${{SHIPYARD_GH_APP_REPO:-}}\"\n\
+             printf '%s\\n' '{}'\n",
+            wrapper_invoked.display(),
+            private_key.display(),
+            legacy_token,
+        ),
+    )
+    .expect("legacy wrapper fixture");
+    let probe = format!("token=\"$({token_command})\"; test \"$token\" = '{legacy_token}'");
+    let status = Command::new("/bin/bash")
+        .args(["-c", &probe])
+        .current_dir(temp.path())
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .status()
+        .expect("legacy wrapper bootstrap probe");
+    assert!(status.success());
+    assert!(wrapper_invoked.exists());
+    std::fs::remove_file(&wrapper_invoked).expect("clear legacy wrapper marker");
+
+    for legacy_output in [
+        "ghp_0123456789abcdefghijklmnopqrstuv\\n",
+        "ghs_too-short\\n",
+        "ghs_0123456789abcdefghijklmnopqrstuv\\nextra\\n",
+        "ghs_0123456789abcdefghijklmnopqrstuv",
+    ] {
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nprintf '%b' '{legacy_output}'\n"),
+        )
+        .expect("invalid legacy wrapper fixture");
+        let output = Command::new("/bin/bash")
+            .args(["-c", &token_command])
+            .current_dir(temp.path())
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("invalid legacy wrapper probe");
+        assert!(!output.status.success(), "legacy output must refuse");
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(legacy_output));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("malformed JSON or legacy token"));
+    }
+
+    for valid_but_wrong_json in ["\"ghs_0123456789abcdefghijklmnopqrstuvwxyz\"", "[]"] {
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nprintf '%s\\n' '{valid_but_wrong_json}'\n"),
+        )
+        .expect("wrong-shape JSON wrapper fixture");
+        let output = Command::new("/bin/bash")
+            .args(["-c", &token_command])
+            .current_dir(temp.path())
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("wrong-shape JSON wrapper probe");
+        assert!(!output.status.success(), "wrong-shape JSON must refuse");
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(valid_but_wrong_json));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("malformed token"));
+    }
+
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nprintf '%s\\n' '{legacy_token}'\nexit 2\n"),
+    )
+    .expect("failed legacy wrapper fixture");
+    let output = Command::new("/bin/bash")
+        .args(["-c", &token_command])
+        .current_dir(temp.path())
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("failed legacy wrapper probe");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(&legacy_token));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("wrapper refused"));
 
     std::fs::write(&binary, "#!/bin/sh\nprintf '{'\n").expect("malformed resolver fixture");
     let output = Command::new("/bin/bash")

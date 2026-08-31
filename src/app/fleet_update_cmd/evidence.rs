@@ -200,17 +200,11 @@ fn collect_local_evidence(
     let after_pair = collect_local_pair(plan, host_deadline, true)?;
     let after_auth = collect_local_auth_support(plan, true)?;
     let after_status = run_local_daemon_status(plan, host_deadline)?;
-    let daemon_pid = serde_json::Deserializer::from_slice(update_stdout)
-        .into_iter::<Value>()
-        .filter_map(Result::ok)
-        .find_map(|value| local_refresh_daemon_pid(&value))
-        .and_then(|pid| u32::try_from(pid).ok())
-        .filter(|pid| *pid != 0)
-        .ok_or_else(|| {
-            PlanExecutionError::Failed(
-                "local update returned no typed nonzero daemon PID receipt".to_owned(),
-            )
-        })?;
+    let daemon_pid = local_refresh_daemon_pid_from_output(update_stdout).ok_or_else(|| {
+        PlanExecutionError::Failed(
+            "local update returned no typed nonzero daemon PID receipt".to_owned(),
+        )
+    })?;
     evidence_from_values(
         before_pair,
         after_pair,
@@ -222,6 +216,15 @@ fn collect_local_evidence(
         plan.release_authority.identity_sha256.clone(),
         plan.release_authority.platform_asset.sha256.clone(),
     )
+}
+
+fn local_refresh_daemon_pid_from_output(update_stdout: &[u8]) -> Option<u32> {
+    serde_json::Deserializer::from_slice(update_stdout)
+        .into_iter::<Value>()
+        .filter_map(Result::ok)
+        .find_map(|value| local_refresh_daemon_pid(&value))
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
 }
 
 fn local_refresh_daemon_pid(value: &Value) -> Option<u64> {

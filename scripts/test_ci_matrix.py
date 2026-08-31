@@ -215,6 +215,14 @@ class CiMatrixTests(unittest.TestCase):
         self.assertIn("Never let a self-hosted runner's production Shipyard", workflow)
         self.assertIn("Coverage executes the same tests", workflow)
 
+    def test_local_validation_matches_ci_home_isolation_contract(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = (root / ".shipyard/config.toml").read_text(encoding="utf-8")
+        self.assertIn('SHIPYARD_TEST_HOME=$(mktemp -d', config)
+        self.assertIn("export SHIPYARD_TEST_HOME RUST_MIN_STACK=8388608", config)
+        self.assertIn("--features ci-test-home", config)
+        self.assertIn("trap 'rm -rf -- ", config)
+
     def test_sandbox_m3_bootstrap_is_fenced_by_target_provider_and_host(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(

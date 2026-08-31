@@ -473,6 +473,15 @@ without that predeployment the governed fleet update refuses before download or
 mutation. It refreshes daemons only after
 the staged binary passes its smoke, then runs the installed binary's resolver
 probe at the exact configured mode/global directory before transaction commit.
+During that first replacement only, the resolver also accepts the legacy
+repository-routed wrapper's single newline-terminated `ghs_` token shape; it
+accepts the token body as opaque ASCII within a hard size bound, and
+rejects other prefixes, missing or extra lines, controls, and malformed output.
+The accepted token is used only to fetch the exact frozen release assets before
+the transaction installs and proves the current JSON wrapper.
+The committed transaction streams the typed daemon-refresh receipt directly;
+`INT` and `TERM` always remain nonzero, so a refreshed daemon without a complete
+receipt cannot be reported as a successful fleet update.
 The wrapper's mandatory strict 0600 non-symlink context preserves those runtime
 arguments for direct calls; manual installs must provision the typed default
 context. Fleet creates and probes it for targets v0.131.0 and newer. Probe
