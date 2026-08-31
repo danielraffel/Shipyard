@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const GHAPP: &[u8] = include_bytes!("../scripts/ghapp");
+const PR_CLOSE_GUARD: &[u8] = include_bytes!("../scripts/ghapp_pr_close_guard.py");
 
 fn write_private(path: &Path, contents: &[u8], mode: u32) {
     fs::write(path, contents).expect("write fixture");
@@ -28,9 +29,11 @@ fn installed_generation_uses_real_sibling_shipyard_and_machine_global_auth_under
     let generation_store = generation_parent.join("auth-generations");
     let generation = generation_store.join(&generation_id);
     let global_dir = home.join("Library/Application Support/shipyard");
+    let guards = home.join(".config/shipyard/guards");
     fs::create_dir_all(&bin).expect("bin");
     fs::create_dir_all(&generation).expect("generation");
     fs::create_dir_all(&global_dir).expect("global dir");
+    fs::create_dir_all(&guards).expect("guards dir");
     for private_dir in [&generation_parent, &generation_store, &generation] {
         fs::set_permissions(private_dir, fs::Permissions::from_mode(0o700))
             .expect("private generation directory");
@@ -43,6 +46,7 @@ fn installed_generation_uses_real_sibling_shipyard_and_machine_global_auth_under
     let generation_context = generation.join("ghapp.shipyard-context.json");
     let private_key = home.join("private-key.pem");
     write_private(&generation_wrapper, GHAPP, 0o700);
+    write_private(&guards.join("pr-close-guard"), PR_CLOSE_GUARD, 0o700);
     fs::copy(env!("CARGO_BIN_EXE_shipyard"), &generation_binary).expect("real sibling binary");
     fs::set_permissions(&generation_binary, fs::Permissions::from_mode(0o700))
         .expect("binary mode");

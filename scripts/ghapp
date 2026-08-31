@@ -1114,9 +1114,12 @@ fi
 if [[ "${1:-}" == "pr" && "${2:-}" == "merge" && -x "$guards/merge-guard" ]]; then
     PATH="$trusted_path" "$guards/merge-guard" "$@" || exit 1
 fi
-if [[ -x "$guards/pr-close-guard" ]]; then
-    PATH="$trusted_path" "$guards/pr-close-guard" "${guard_arguments[@]}" || exit 1
+close_guard="$guards/pr-close-guard"
+if [[ ! -f "$close_guard" || ! -x "$close_guard" ]]; then
+    echo "ghapp: required PR-close guard is unavailable" >&2
+    exit 1
 fi
+PATH="$trusted_path" "$close_guard" "${guard_arguments[@]}" || exit 1
 if [[ -x "$guards/queue-removal-guard" ]]; then
     PATH="$trusted_path" "$guards/queue-removal-guard" "$@" || exit 1
 fi

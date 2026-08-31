@@ -120,6 +120,7 @@ class GhappWrapperTests(unittest.TestCase):
         self.resolver_context = self.wrapper.with_name(
             f"{self.wrapper.name}.shipyard-context.json"
         )
+        self.guard_log = self.root / "guard-args"
         self.helper.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
@@ -164,6 +165,15 @@ class GhappWrapperTests(unittest.TestCase):
         self.helper.chmod(0o755)
         self.gh.chmod(0o755)
         self.shipyard.chmod(0o755)
+        guards = self.root / "guards"
+        guards.mkdir()
+        close_guard = guards / "pr-close-guard"
+        close_guard.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$GUARD_LOG\"\n",
+            encoding="utf-8",
+        )
+        close_guard.chmod(0o755)
         self.environment = {
             **os.environ,
             "SHIPYARD_GITHUB_APP_TOKEN_HELPER": str(self.helper),
@@ -174,6 +184,7 @@ class GhappWrapperTests(unittest.TestCase):
             "HELPER_LOG": str(self.helper_log),
             "GH_LOG": str(self.gh_log),
             "GH_ENV_LOG": str(self.gh_env_log),
+            "GUARD_LOG": str(self.guard_log),
             "GH_EXPECTED": str(self.gh),
             "RESOLVER_LOG": str(self.resolver_log),
             "PRIVATE_KEY": str(self.private_key),
@@ -1614,7 +1625,6 @@ class GhappWrapperTests(unittest.TestCase):
 
     def test_existing_merge_guard_uses_app_token_before_native_gh(self) -> None:
         guards = self.root / "guards"
-        guards.mkdir()
         guard = guards / "merge-guard"
         guard.write_text(
             "#!/bin/sh\n"
@@ -1644,7 +1654,6 @@ class GhappWrapperTests(unittest.TestCase):
 
     def test_pr_close_guard_uses_app_token_before_native_gh(self) -> None:
         guards = self.root / "guards"
-        guards.mkdir()
         guard = guards / "pr-close-guard"
         guard.write_text(
             "#!/bin/sh\n"
@@ -1678,7 +1687,6 @@ class GhappWrapperTests(unittest.TestCase):
 
     def test_queue_removal_guard_uses_app_token_before_native_gh(self) -> None:
         guards = self.root / "guards"
-        guards.mkdir()
         guard = guards / "queue-removal-guard"
         guard.write_text(
             "#!/bin/sh\n"
@@ -1696,6 +1704,39 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(self.helper_log.exists())
         self.assertFalse(self.gh_log.exists())
+
+    def test_missing_pr_close_guard_fails_before_native_gh(self) -> None:
+        (self.root / "guards/pr-close-guard").unlink()
+
+        result = self.run_wrapper(
+            "pr", "close", "7", "--repo", "danielraffel/Shipyard"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required PR-close guard is unavailable", result.stderr)
+        self.assertTrue(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_mutation_capable_surfaces_dispatch_pr_close_guard(self) -> None:
+        commands = (
+            ("api", "repos/owner/repo/issues/7", "-XPATCH", "-fstate=closed"),
+            ("pr", "close", "7", "--repo", "owner/repo"),
+            ("pr", "create", "--title", "fixture", "--repo", "owner/repo"),
+            ("pr", "merge", "7", "--merge", "--repo", "owner/repo"),
+            ("pr", "update-branch", "7", "--repo", "owner/repo"),
+            ("release", "edit", "v1", "--draft", "--repo", "owner/repo"),
+            ("run", "cancel", "1", "--repo", "owner/repo"),
+            ("run", "rerun", "1", "--repo", "owner/repo"),
+            ("secret", "set", "NAME", "--body", "value", "--repo", "owner/repo"),
+            ("variable", "set", "NAME", "--body", "value", "--repo", "owner/repo"),
+            ("workflow", "run", "build.yml", "--repo", "owner/repo"),
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.guard_log.unlink(missing_ok=True)
+                result = self.run_wrapper(*command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.guard_log.read_text().strip(), " ".join(command))
 
 
 if __name__ == "__main__":
