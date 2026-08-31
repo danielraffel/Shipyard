@@ -33,6 +33,7 @@ use crate::runner_watchdog::{
 };
 
 mod watch;
+mod zero_job_recover;
 
 use watch::dispatch_watch;
 #[cfg(test)]
@@ -87,6 +88,24 @@ fn runner_command_with_actions<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let state_dir = &runtime_paths.state_dir;
     match command {
+        RunnerCommand::ZeroJobRecover {
+            repo,
+            pr,
+            source_run_id,
+            min_age_minutes,
+            apply,
+        } => zero_job_recover::zero_job_recover_command(
+            zero_job_recover::ZeroJobRecoverArgs {
+                repo,
+                pr,
+                source_run_id,
+                min_age_minutes,
+                apply,
+            },
+            actions,
+            json,
+            stdout,
+        ),
         RunnerCommand::RecoveryWorker { once, drain, apply } => {
             super::merge_steward_cmd::recovery_worker::recovery_worker_command(
                 super::merge_steward_cmd::recovery_worker::RecoveryWorkerCommandArgs {

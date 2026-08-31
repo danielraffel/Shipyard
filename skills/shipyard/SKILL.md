@@ -801,12 +801,24 @@ hours.
 - `shipyard runner status` — one-shot health check, exit 0/1/2, `--json` supported
 - `shipyard runner cleanup --dry-run` — list stale queued runs without cancelling
 - `shipyard runner watch` — advisory daemon mode, polls every 5 min
+- `shipyard runner zero-job-recover --pr <n> --source-run-id <id>` — exact
+  Pulp zero-job selector for a REST `queued` or `pending` run, dry-run by
+  default. It is not the stale-run reaper or merge-steward coalescing path.
 
 ### Mutating commands (require explicit flags)
 
 - `shipyard runner cleanup --fix` — cancel stale queued PR/merge-group runs;
   release, push, schedule, tag, and dispatch runs are protected
 - `shipyard runner watch --fix` — auto-recovery loop (cron-friendly)
+- `shipyard runner zero-job-recover --pr <n> --source-run-id <id> --apply` —
+  persist one remote at-most-once receipt, re-read every selector fact, then
+  dispatch only protected-main `build-macos.yml`. It never cancels, reruns,
+  enqueues, labels, pushes, merges, coalesces, or changes TartCI state. Any
+  receipt on the exact head suppresses every later attempt; a lost dispatch
+  response is terminal for that head. Apply is authorized only from Pulp's
+  live serialized protected-main `Shipyard merge steward` workflow; its exact
+  workflow ref, event, SHA, run, and attempt are re-read from GitHub and bound
+  with the candidate fingerprint in the remote receipt.
 - `shipyard runner admission-clean --repo <owner/repo> --base main --labels self-hosted,<exact-labels> --apply --json` — TartCI's last pre-JIT correctness gate. It emits a flat schema-v1 verdict with exit 0 `admit`, 3 `defer`, 1 operational error, or 2 invalid configuration. It inspects only managed PR/merge-group runs: a compatible queued job inside a superseded queued workflow may authorize cancellation, while one inside an `in_progress` workflow blocks admission but is never cancelled. Every GitHub call made while holding the exact-key observation lock shares one 120-second absolute budget. Observation or stewardship contention returns typed `observation_in_progress` or `stewardship_in_progress` defer; a timeout or other non-contention observation or lock failure releases the lock and returns a typed error with bounded underlying detail. A non-authority machine returns `mutation_authority_required` instead of mutating. TartCI must treat every result except typed `admit` as fail-closed and discard the still-unregistered VM.
 - `shipyard runner kill --pid X --reason "..."` — kill a specific Worker; requires typed `KILL` confirmation
 

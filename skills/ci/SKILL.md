@@ -51,6 +51,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Assess one-host Pulp M3 build-once consumption | Library-only and default-off: bind exactly one successful configure/build receipt to the exact source, toolchain, canonical CTest inventory, proof manifest, and compact artifact content address; require same-session M3 consumption with zero configure/build invocations and exact sorted executed-set reconciliation. The existing full gate remains authoritative, and this cannot run commands, dispatch cross-host work, publish a check, or authorize a merge. |
 | Show run logs | `shipyard logs <job_id> --json` |
 | **Runner watchdog: health check** | `shipyard runner status --repo <r> --runner-id <id>` |
+| **Recover an exact Pulp zero-job Actions wedge** | `shipyard runner zero-job-recover --pr <n> --source-run-id <id>` is read-only by default; review the exact candidate, then add `--apply` once. This is independent of coalescing and stale cancellation. |
 | **Runner watchdog: list stale queued runs (dry-run)** | `shipyard runner cleanup --dry-run` |
 | **Runner watchdog: cancel stale queued runs** | `shipyard runner cleanup --fix` |
 | **Runner watchdog: daemon mode** | `shipyard runner watch --fix` |
@@ -200,6 +201,32 @@ makes no mutation until a current-head revalidation sees the label absent.
 Repeat `--provenance-blocking-label <label>` for another explicit vocabulary.
 The blocker precedes opt-out, and the final force-cancel boundary revalidates
 current PR provenance and management authority even after a restart.
+
+### Pulp zero-job recovery
+
+Use `runner zero-job-recover` only when Pulp's exact `Build and Test`
+`pull_request` run remains REST `queued` or `pending` with no conclusion for at least 45 minutes and exhaustive
+`filter=all` inspection proves that it materialized zero jobs. Supply the exact
+PR and run IDs; dry-run is the default. Apply mode first persists the
+non-required `shipyard/zero-job-redispatch` status on the immutable head, then
+re-reads the complete selector before its only second write: dispatching
+protected-main `.github/workflows/build-macos.yml` with the PR, ref, exact head,
+source run/attempt, recovery marker, and `github-hosted` runner input.
+
+Apply is accepted only inside the live serialized protected-main `Shipyard
+merge steward` Actions workflow. Shipyard verifies its exact workflow ref,
+event, head, run ID, and attempt against GitHub both before the receipt and
+immediately before dispatch. The receipt binds that controller run/attempt and
+the full candidate fingerprint.
+
+The command is Pulp-only and requires the same-repository open non-draft PR,
+the managed label plus successful exact-head steward handoff, main's GitHub
+Actions-owned required `macos` context, the exact workflow identity, exactly
+one active same-head run, and no existing `macos` check or recovery receipt.
+Forks, provenance/opt-out labels, truncated observations, head or governance
+drift, and ambiguous writes fail closed. A receipt is spent before dispatch;
+if the dispatch response is lost or fails, never retry that head. This command
+does not cancel, rerun, enqueue, label, push, merge, coalesce, or mutate TartCI.
 
 ## tartci local VM routing profiles
 
