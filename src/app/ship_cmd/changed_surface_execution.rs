@@ -273,7 +273,7 @@ struct FallbackDiagnostic<'a> {
 // Keep the fail-open-to-full branches adjacent to their exact diagnostics and
 // mutation point; splitting them risks one error path accidentally substituting
 // a command or losing its durable reason.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn apply_changed_surface_execution(
     config: &LoadedConfig,
     cwd: &Path,
