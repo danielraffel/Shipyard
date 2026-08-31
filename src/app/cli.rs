@@ -211,6 +211,13 @@ pub(super) enum Command {
     },
     /// Show all jobs in the queue.
     Queue,
+    /// Hold local queue admission while an exact child mutates runner state.
+    #[command(name = "queue-hold")]
+    QueueHold {
+        /// Queue-hold operation.
+        #[command(subcommand)]
+        command: QueueHoldCommand,
+    },
     /// Observe GitHub pull requests and merge queue, emitting only transitions.
     #[command(name = "queue-observe")]
     QueueObserve {
@@ -710,6 +717,70 @@ pub(super) enum MergeQueueCommand {
         #[arg(long)]
         outcome: String,
         /// Human-readable reconciliation evidence.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum QueueHoldCommand {
+    /// Execute one child while it owns the live local queue-admission hold.
+    Exec {
+        /// Narrow mutation purpose. Currently only tartci-pool-off is accepted.
+        #[arg(long)]
+        purpose: String,
+        /// Canonical local host identity.
+        #[arg(long = "host-id")]
+        host_id: String,
+        /// Exact launchd service label in the requested drain set.
+        #[arg(long = "service", required = true)]
+        services: Vec<String>,
+        /// Exact owner/repository slug in the requested drain set.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Exact GitHub runner name in the requested drain set.
+        #[arg(long = "runner")]
+        runners: Vec<String>,
+        /// Maximum wait for queue.lock before no child is spawned.
+        #[arg(long = "timeout-seconds", default_value_t = 30)]
+        timeout_seconds: u64,
+        /// Child command that assumes live-hold ownership.
+        #[arg(last = true, required = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+    /// Verify live FD, owner, generation, revocation, and exact scope authority.
+    Verify {
+        /// Exact hold identifier received from the inherited environment.
+        #[arg(long = "hold-id")]
+        hold_id: String,
+        /// Exact monotonic generation received from the inherited environment.
+        #[arg(long)]
+        generation: u64,
+        /// Exact host identity received from the inherited environment.
+        #[arg(long = "host-id")]
+        host_id: String,
+        /// Exact canonical-scope digest received from the inherited environment.
+        #[arg(long = "scope-digest")]
+        scope_digest: String,
+        /// Exact child-owner PID received from the inherited environment.
+        #[arg(long = "owner-pid")]
+        owner_pid: u32,
+        /// Exact child birth identity received from the inherited environment.
+        #[arg(long = "owner-process-start")]
+        owner_process_start: String,
+        /// Exact inherited queue.lock descriptor number.
+        #[arg(long)]
+        fd: i32,
+    },
+    /// Revoke one exact current hold without killing its child or unlocking it.
+    Revoke {
+        /// Exact current hold identifier.
+        #[arg(long = "hold-id")]
+        hold_id: String,
+        /// Exact current monotonic hold generation.
+        #[arg(long)]
+        generation: u64,
+        /// Non-empty operator/controller revocation reason.
         #[arg(long)]
         reason: String,
     },
@@ -2268,13 +2339,14 @@ impl From<PathMode> for RuntimeMode {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::Path;
 
     use clap::Parser;
 
     use super::{
-        AuthCommand, Cli, Command, DependencyCommand, PulpDependencyCommand, RunnerCommand,
-        WorkLedgerCommand, WorkLedgerPolicyCommand,
+        AuthCommand, Cli, Command, DependencyCommand, PulpDependencyCommand, QueueHoldCommand,
+        RunnerCommand, WorkLedgerCommand, WorkLedgerPolicyCommand,
     };
 
     #[test]
@@ -2359,6 +2431,120 @@ mod tests {
                 && worker_generation.as_deref() == Some("generation-1")
                 && command == [std::ffi::OsString::from("/usr/bin/true")]
         ));
+    }
+
+    #[test]
+    fn queue_hold_exec_parses_exact_scope() {
+        let exec = Cli::try_parse_from([
+            "shipyard",
+            "queue-hold",
+            "exec",
+            "--purpose",
+            "tartci-pool-off",
+            "--host-id",
+            "m1",
+            "--service",
+            "actions.runner.one",
+            "--repo",
+            "owner/repo",
+            "--runner",
+            "runner-one",
+            "--timeout-seconds",
+            "7",
+            "--",
+            "/usr/bin/true",
+        ])
+        .expect("queue-hold exec");
+        assert!(matches!(
+            exec.command,
+            Command::QueueHold {
+                command: QueueHoldCommand::Exec {
+                    purpose,
+                    host_id,
+                    services,
+                    repos,
+                    runners,
+                    timeout_seconds: 7,
+                    command,
+                }
+            } if purpose == "tartci-pool-off"
+                && host_id == "m1"
+                && services == ["actions.runner.one"]
+                && repos == ["owner/repo"]
+                && runners == ["runner-one"]
+                && command == [OsString::from("/usr/bin/true")]
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "queue-hold",
+                "exec",
+                "--purpose",
+                "tartci-pool-off",
+                "--host-id",
+                "m1",
+                "--",
+                "/usr/bin/true",
+            ])
+            .is_err(),
+            "at least one exact service must be named"
+        );
+    }
+
+    #[test]
+    fn queue_hold_verify_parses_json_after_subcommand_arguments() {
+        let verify = Cli::try_parse_from([
+            "shipyard",
+            "queue-hold",
+            "verify",
+            "--hold-id",
+            "hold",
+            "--generation",
+            "4",
+            "--host-id",
+            "m1",
+            "--scope-digest",
+            &"a".repeat(64),
+            "--owner-pid",
+            "42",
+            "--owner-process-start",
+            &"b".repeat(64),
+            "--fd",
+            "9",
+            "--json",
+        ])
+        .expect("queue-hold verify");
+        assert!(verify.json);
+        assert!(matches!(
+            verify.command,
+            Command::QueueHold {
+                command: QueueHoldCommand::Verify {
+                    generation: 4,
+                    owner_pid: 42,
+                    fd: 9,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn queue_hold_revoke_parses_exact_identity_and_reason() {
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "queue-hold",
+                "revoke",
+                "--hold-id",
+                "hold",
+                "--generation",
+                "4",
+                "--reason",
+                "maintenance",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

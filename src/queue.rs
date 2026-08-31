@@ -1108,6 +1108,33 @@ impl DrainLock {
         }
         Ok(())
     }
+
+    /// Make the exact locked descriptor survive an in-place child `exec`.
+    ///
+    /// A successful `exec` never drops this guard, and clearing `CLOEXEC`
+    /// retains the descriptor until the replacement process exits or closes
+    /// it. If `exec` fails, ordinary guard drop still unlocks safely.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn prepare_exec_inheritance(&self, identity_offset: u64) -> io::Result<i32> {
+        use std::io::{Seek as _, SeekFrom};
+        use std::os::fd::{AsRawFd as _, RawFd};
+
+        use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("queue drain lock was already released"))?;
+        let flags = fcntl(file, FcntlArg::F_GETFD)
+            .map(FdFlag::from_bits_truncate)
+            .map_err(io::Error::other)?;
+        // The seek position belongs to the open file description, so it
+        // survives dup/fork/exec but not close+reopen of the same inode.
+        file.try_clone()?.seek(SeekFrom::Start(identity_offset))?;
+        fcntl(file, FcntlArg::F_SETFD(flags & !FdFlag::FD_CLOEXEC)).map_err(io::Error::other)?;
+        let fd: RawFd = file.as_raw_fd();
+        Ok(fd)
+    }
 }
 
 fn lock_is_contended(error: &io::Error) -> bool {
