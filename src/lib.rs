@@ -3,7 +3,7 @@
     test,
     allow(
         clippy::large_stack_arrays,
-        reason = "Rust 1.92 attributes the generated libtest registry array to the crate root"
+        reason = "Rust 1.92's generated libtest registry exceeds the limit; keep this waiver test-only while production and integration targets remain enforced"
     )
 )]
 
