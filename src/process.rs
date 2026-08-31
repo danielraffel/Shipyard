@@ -8,9 +8,6 @@ use std::time::{Duration, Instant};
 #[cfg(not(windows))]
 use std::process::Child;
 #[cfg(unix)]
-use wait_timeout::ChildExt;
-
-#[cfg(unix)]
 const TERMINATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(not(windows))]
 const TERMINATION_REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -362,11 +359,15 @@ impl ProcessTree {
                 return;
             };
             if !matches!(
-                terminator.wait_timeout(TERMINATION_COMMAND_TIMEOUT),
+                wait_child_until(
+                    &mut terminator,
+                    Instant::now() + TERMINATION_COMMAND_TIMEOUT,
+                ),
                 Ok(Some(_))
             ) {
                 let _ = terminator.kill();
-                let _ = terminator.wait_timeout(TERMINATION_REAP_TIMEOUT);
+                let _ =
+                    wait_child_until(&mut terminator, Instant::now() + TERMINATION_REAP_TIMEOUT);
             }
             let _ = self.child.kill();
             let _ = self.wait_timeout(TERMINATION_REAP_TIMEOUT);
@@ -399,7 +400,7 @@ impl ProcessTree {
             if let Ok(mut terminator) = termination_command(self.child.id()).spawn() {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if !remaining.is_zero()
-                    && !matches!(terminator.wait_timeout(remaining), Ok(Some(_)))
+                    && !matches!(wait_child_until(&mut terminator, deadline), Ok(Some(_)))
                 {
                     let _ = terminator.kill();
                 }
@@ -439,6 +440,20 @@ impl Drop for ProcessTree {
         // Match the Windows Job boundary when a caller returns before its
         // normal explicit cleanup path.
         self.terminate();
+    }
+}
+
+#[cfg(unix)]
+fn wait_child_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(WAIT_POLL_INTERVAL.min(deadline - now));
     }
 }
 
@@ -565,6 +580,95 @@ mod tests {
             Err(super::BoundedOutputError::TimedOut { .. })
         ));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_bounded_output_timeouts_keep_reaping_independent() {
+        use std::process::Command;
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        let barrier = Arc::new(Barrier::new(9));
+        let fixtures = (0..8)
+            .map(|_| {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let pid_path = temp.path().join("descendant.pid");
+                (temp, pid_path)
+            })
+            .collect::<Vec<_>>();
+        let workers = fixtures
+            .iter()
+            .map(|(_, pid_path)| {
+                let barrier = Arc::clone(&barrier);
+                let pid_path = pid_path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::run_output_until(
+                        Command::new("sh")
+                            .args([
+                                "-c",
+                                "sleep 30 & echo $! > \"$SHIPYARD_DESCENDANT_PID\"; wait",
+                            ])
+                            .env("SHIPYARD_DESCENDANT_PID", &pid_path),
+                        Instant::now() + Duration::from_secs(2),
+                        "concurrent timeout probe",
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        let readiness_deadline = Instant::now() + Duration::from_secs(1);
+        let descendant_pids = loop {
+            let pids = fixtures
+                .iter()
+                .map(|(_, pid_path)| {
+                    std::fs::read_to_string(pid_path)
+                        .ok()
+                        .filter(|pid| pid.trim().parse::<u32>().is_ok_and(|pid| pid > 0))
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(pids) = pids {
+                break pids;
+            }
+            assert!(
+                Instant::now() < readiness_deadline,
+                "concurrent timeout fixtures did not all publish descendant identities"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let teardown_started = Instant::now();
+
+        for worker in workers {
+            assert!(matches!(
+                worker.join().expect("timeout worker must not panic"),
+                Err(super::BoundedOutputError::TimedOut { .. })
+            ));
+        }
+        assert!(
+            teardown_started.elapsed() < Duration::from_secs(5),
+            "concurrent teardown serialized beyond its shared bounded window"
+        );
+
+        for ((_, _), pid) in fixtures.into_iter().zip(descendant_pids) {
+            let process_is_running = || {
+                Command::new("kill")
+                    .args(["-0", "--", pid.trim()])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while process_is_running() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !process_is_running(),
+                "concurrent timeout descendant {} survived teardown",
+                pid.trim()
+            );
+        }
     }
 
     #[cfg(unix)]
