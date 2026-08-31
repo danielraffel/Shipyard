@@ -417,7 +417,7 @@ fn first_migration_fences_a_reader_that_appears_after_the_initial_observation() 
     let started = Instant::now();
     assert!(fixture.run_script(&script).success());
     assert!(
-        started.elapsed() >= Duration::from_millis(1_000),
+        started.elapsed() >= Duration::from_secs(1),
         "late reader was not retained in the finite cohort"
     );
     assert!(late_reader_wait.join().expect("late reader wait").success());
