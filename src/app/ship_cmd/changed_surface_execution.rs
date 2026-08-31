@@ -18,7 +18,7 @@ use crate::changed_surface::{
 };
 use crate::config::LoadedConfig;
 use crate::evidence::canonical_repository;
-use crate::executor::dispatch::{ResolvedTarget, ResolvedValidation};
+use crate::executor::dispatch::{ResolvedBackend, ResolvedTarget, ResolvedValidation};
 use crate::queue_request::validation_contract_digest;
 
 const MODE_KEY: &str = "changed_surface_execution.mode";
@@ -230,6 +230,22 @@ struct ActivationReceipt<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct StaleActivationReceipt<'a> {
+    schema_version: u32,
+    machine_mode: MachineMode,
+    merge_authority: crate::changed_surface::MergeAuthority,
+    stale_context_digest: String,
+    stale_receipt_sha256: String,
+    plan: &'a crate::changed_surface::AuthoritativeExecutionPlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_build_command_sha256: Option<String>,
+    original_test_command_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    substituted_build_command_sha256: Option<String>,
+    substituted_test_command_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
 struct FallbackDiagnostic<'a> {
     schema_version: u32,
     repository: &'a str,
@@ -420,11 +436,12 @@ pub(super) fn apply_changed_surface_execution(
                 continue;
             }
         };
+        let mut stale_execution = None;
         if machine.mode == MachineMode::ShadowCompare
             && observation.receipt.fallback_reason == Some(FallbackReason::StaleBase)
             && matches!(disposition, ExecutionDisposition::Full { .. })
         {
-            let (assessment, _) = observe_stale_base_shadow(&observation, cwd, &contract_digest)?;
+            let assessment = observe_stale_base_shadow(&observation, cwd, &contract_digest)?;
             let evidence_dir = result_dir(
                 state_dir,
                 repo,
@@ -432,56 +449,110 @@ pub(super) fn apply_changed_surface_execution(
                 &observation.receipt.head_sha,
                 &target.name,
             );
-            // This is strictly shadow-only telemetry. A read-only assessment
-            // must never prevent the already-selected ordinary full fallback.
-            let _shadow_receipt_persisted =
-                persist_stale_base_shadow(&evidence_dir, &assessment).is_ok();
+            // Persist the shadow-only authority fence before any isolated
+            // execution. If planning, persistence, or materialization cannot
+            // prove the exact integration identity, ordinary full validation
+            // remains untouched below.
+            let shadow_receipt_persisted =
+                persist_stale_base_shadow(&evidence_dir, &assessment.receipt).is_ok();
+            if shadow_receipt_persisted
+                && let (Some(integration_input), Ok(policy), Some(selection)) = (
+                    assessment.integration_input.as_ref(),
+                    assessment.policy.as_ref(),
+                    assessment.receipt.shadow_selection.as_deref(),
+                )
+                && let Ok(ExecutionDisposition::Bounded(plan)) = plan_authoritative_execution(
+                    &{
+                        let mut execution_selection = selection.clone();
+                        // The outer stale receipt, not the repository adapter,
+                        // owns this cross-receipt linkage. Re-derivation sees
+                        // the original planner shape and the activation below
+                        // separately binds its digest to the outer context.
+                        execution_selection.shadow_context_digest = None;
+                        execution_selection
+                    },
+                    integration_input,
+                    policy,
+                    true,
+                    ExecutionCommandTransport::PosixShell,
+                    &contract_digest,
+                    &assessment.workflow_digest,
+                )
+            {
+                match crate::changed_surface::integration_checkout::materialize(
+                    cwd,
+                    &evidence_dir.join("integration-checkouts"),
+                    &assessment.receipt,
+                ) {
+                    Ok(checkout) => stale_execution = Some((plan, assessment.receipt, checkout)),
+                    Err(error) => {
+                        let _ = persist_fallback_diagnostic(
+                            &evidence_dir,
+                            &FallbackDiagnostic {
+                                schema_version: 1,
+                                repository: repo,
+                                pull_request: pr,
+                                target: &target.name,
+                                machine_mode: machine.mode,
+                                category: "stale_integration_materialization",
+                                diagnostic: bounded_diagnostic(&error),
+                            },
+                        );
+                    }
+                }
+            }
         }
-        let plan = match disposition {
-            ExecutionDisposition::Bounded(plan) => plan,
-            ExecutionDisposition::Full { reason } => {
-                persist_fallback_diagnostic(
-                    &result_dir(
-                        state_dir,
-                        repo,
-                        pr,
-                        &observation.receipt.head_sha,
-                        &target.name,
-                    ),
-                    &FallbackDiagnostic {
-                        schema_version: 1,
-                        repository: repo,
-                        pull_request: pr,
-                        target: &target.name,
-                        machine_mode: machine.mode,
-                        category: "full_fallback",
-                        diagnostic: bounded_diagnostic(&format!("{reason:?}")),
-                    },
-                )?;
-                continue;
-            }
-            ExecutionDisposition::Blocked { reason } => {
-                persist_fallback_diagnostic(
-                    &result_dir(
-                        state_dir,
-                        repo,
-                        pr,
-                        &observation.receipt.head_sha,
-                        &target.name,
-                    ),
-                    &FallbackDiagnostic {
-                        schema_version: 1,
-                        repository: repo,
-                        pull_request: pr,
-                        target: &target.name,
-                        machine_mode: machine.mode,
-                        category: "blocked",
-                        diagnostic: bounded_diagnostic(&reason),
-                    },
-                )?;
-                return Err(CliFailure::new(1, bounded_diagnostic(&reason)));
-            }
-        };
+        let (plan, stale_receipt, stale_checkout) =
+            if let Some((plan, receipt, checkout)) = stale_execution {
+                (plan, Some(receipt), Some(checkout))
+            } else {
+                let plan = match disposition {
+                    ExecutionDisposition::Bounded(plan) => plan,
+                    ExecutionDisposition::Full { reason } => {
+                        persist_fallback_diagnostic(
+                            &result_dir(
+                                state_dir,
+                                repo,
+                                pr,
+                                &observation.receipt.head_sha,
+                                &target.name,
+                            ),
+                            &FallbackDiagnostic {
+                                schema_version: 1,
+                                repository: repo,
+                                pull_request: pr,
+                                target: &target.name,
+                                machine_mode: machine.mode,
+                                category: "full_fallback",
+                                diagnostic: bounded_diagnostic(&format!("{reason:?}")),
+                            },
+                        )?;
+                        continue;
+                    }
+                    ExecutionDisposition::Blocked { reason } => {
+                        persist_fallback_diagnostic(
+                            &result_dir(
+                                state_dir,
+                                repo,
+                                pr,
+                                &observation.receipt.head_sha,
+                                &target.name,
+                            ),
+                            &FallbackDiagnostic {
+                                schema_version: 1,
+                                repository: repo,
+                                pull_request: pr,
+                                target: &target.name,
+                                machine_mode: machine.mode,
+                                category: "blocked",
+                                diagnostic: bounded_diagnostic(&reason),
+                            },
+                        )?;
+                        return Err(CliFailure::new(1, bounded_diagnostic(&reason)));
+                    }
+                };
+                (plan, None, None)
+            };
         if !machine.permits_authoritative(repo, &target.name, &plan.policy_digest) {
             persist_fallback_diagnostic(
                 &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
@@ -524,8 +595,18 @@ pub(super) fn apply_changed_surface_execution(
         } else {
             None
         };
-        let result_dir = result_dir(state_dir, repo, pr, &plan.head_sha, &target.name);
-        let compare = if machine.mode == MachineMode::ShadowCompare {
+        let result_dir = result_dir(
+            state_dir,
+            repo,
+            pr,
+            stale_receipt
+                .as_ref()
+                .map_or(plan.head_sha.as_str(), |receipt| receipt.head_sha.as_str()),
+            &target.name,
+        );
+        let compare = if stale_receipt.is_some() {
+            "0"
+        } else if machine.mode == MachineMode::ShadowCompare {
             "1"
         } else {
             "0"
@@ -536,28 +617,63 @@ pub(super) fn apply_changed_surface_execution(
             compare,
             plan.command
         );
-        persist_activation(
-            &result_dir,
-            &ActivationReceipt {
-                schema_version: u32::from(plan.stage == "build_and_test") + 1,
-                machine_mode: machine.mode,
-                plan: &plan,
-                original_build_command_sha256: original_build
-                    .as_ref()
-                    .map(|command| sha256(command.as_bytes())),
-                original_test_command_sha256: sha256(original_test.as_bytes()),
-                substituted_build_command_sha256: (plan.stage == "build_and_test")
-                    .then(|| sha256(substituted.as_bytes())),
-                substituted_test_command_sha256: sha256(
-                    if plan.stage == "build_and_test" {
-                        ":"
-                    } else {
-                        &substituted
-                    }
-                    .as_bytes(),
-                ),
-            },
-        )?;
+        let activation = ActivationReceipt {
+            schema_version: u32::from(plan.stage == "build_and_test") + 1,
+            machine_mode: machine.mode,
+            plan: &plan,
+            original_build_command_sha256: original_build
+                .as_ref()
+                .map(|command| sha256(command.as_bytes())),
+            original_test_command_sha256: sha256(original_test.as_bytes()),
+            substituted_build_command_sha256: (plan.stage == "build_and_test")
+                .then(|| sha256(substituted.as_bytes())),
+            substituted_test_command_sha256: sha256(
+                if plan.stage == "build_and_test" {
+                    ":"
+                } else {
+                    &substituted
+                }
+                .as_bytes(),
+            ),
+        };
+        if let Some(receipt) = stale_receipt.as_ref() {
+            persist_stale_activation(
+                &result_dir,
+                &StaleActivationReceipt {
+                    schema_version: activation.schema_version,
+                    machine_mode: machine.mode,
+                    merge_authority: receipt.merge_authority,
+                    stale_context_digest: crate::changed_surface::stale_base_context_digest(
+                        receipt,
+                    ),
+                    stale_receipt_sha256: sha256(&serde_json::to_vec(receipt).map_err(
+                        |error| {
+                            CliFailure::new(1, format!("serialize stale activation link: {error}"))
+                        },
+                    )?),
+                    plan: &plan,
+                    original_build_command_sha256: activation.original_build_command_sha256,
+                    original_test_command_sha256: activation.original_test_command_sha256,
+                    substituted_build_command_sha256: activation.substituted_build_command_sha256,
+                    substituted_test_command_sha256: activation.substituted_test_command_sha256,
+                },
+            )?;
+        } else {
+            persist_activation(&result_dir, &activation)?;
+        }
+        if let Some(checkout) = stale_checkout {
+            let ResolvedBackend::Local(local) = &mut target.backend else {
+                return Err(CliFailure::new(
+                    1,
+                    "stale integration execution requires the local backend",
+                ));
+            };
+            local.cwd = Some(checkout.path.clone());
+            let ResolvedValidation::Local(validation) = &mut target.validation else {
+                unreachable!();
+            };
+            validation.integration_cleanup = Some(Box::new(checkout));
+        }
         let ResolvedValidation::Local(validation) = &mut target.validation else {
             unreachable!();
         };
@@ -568,6 +684,59 @@ pub(super) fn apply_changed_surface_execution(
             validation.stages.insert("test".to_owned(), substituted);
         }
     }
+    Ok(())
+}
+
+fn persist_stale_activation(
+    path: &Path,
+    receipt: &StaleActivationReceipt<'_>,
+) -> Result<(), CliFailure> {
+    persist_named_receipt(path, "stale-activation-shadow_compare.json", receipt)
+}
+
+fn persist_named_receipt<T: Serialize>(
+    path: &Path,
+    name: &str,
+    receipt: &T,
+) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    fs::create_dir_all(path).map_err(|error| {
+        CliFailure::new(1, format!("create selector evidence directory: {error}"))
+    })?;
+    let mut payload = serde_json::to_vec_pretty(receipt)
+        .map_err(|error| CliFailure::new(1, format!("serialize selector receipt: {error}")))?;
+    payload.push(b'\n');
+    let destination = path.join(name);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(mut file) => file
+            .write_all(&payload)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| CliFailure::new(1, format!("write selector receipt: {error}")))?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::read(&destination).map_err(|error| {
+                CliFailure::new(1, format!("read existing selector receipt: {error}"))
+            })? != payload
+            {
+                return Err(CliFailure::new(
+                    1,
+                    "immutable selector receipt already exists with different bytes",
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(CliFailure::new(
+                1,
+                format!("create selector receipt: {error}"),
+            ));
+        }
+    }
+    #[cfg(unix)]
+    sync_directory(path)?;
     Ok(())
 }
 

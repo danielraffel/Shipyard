@@ -262,6 +262,27 @@ fn recompute_selection(
             .cloned()
             .collect::<Vec<_>>(),
     );
+    let synthetic = integration_exact_input(exact, input);
+    plan_with_policy(
+        base_receipt(&synthetic, combined_paths.clone()),
+        Ok(live_policy),
+        &combined_paths,
+        &synthetic,
+    )
+}
+
+pub(crate) fn integration_exact_input(
+    exact: &ExactHeadInput,
+    input: &StaleBaseShadowInput<'_>,
+) -> ExactHeadInput {
+    let combined_paths = normalized_paths(
+        &input
+            .protected_base_delta_paths
+            .iter()
+            .chain(&input.integration_changed_paths)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
     let mut synthetic = exact.clone();
     synthetic.pr_base_sha.clone_from(&exact.protected_ref_sha);
     synthetic
@@ -289,12 +310,7 @@ fn recompute_selection(
     // Exact-head secondary proofs cannot cross into a distinct integration
     // commit; affected families requiring one remain blocked until re-proved.
     synthetic.secondary_proofs.clear();
-    plan_with_policy(
-        base_receipt(&synthetic, combined_paths.clone()),
-        Ok(live_policy),
-        &combined_paths,
-        &synthetic,
-    )
+    synthetic
 }
 
 fn validated_stale_policies(
@@ -413,9 +429,13 @@ mod tests {
 
     use super::*;
     use crate::changed_surface::trial::{
-        ReceiptFile, TrialIdentity, TrialState, evaluate_stale_base_terminal,
+        ReceiptFile, TrialIdentity, TrialState, evaluate_stale_base_execution,
+        evaluate_stale_base_terminal,
     };
-    use crate::changed_surface::{BuildType, ProtectedRefStatus, RiskClass, TestFamily};
+    use crate::changed_surface::{
+        BuildType, ChangedSurfaceExecutionPolicy, ExecutionCommandTransport, ExecutionDisposition,
+        ExecutionMode, ProtectedRefStatus, RiskClass, TestFamily, plan_authoritative_execution,
+    };
 
     const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const LIVE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -560,6 +580,103 @@ mod tests {
         let selection = receipt.shadow_selection.expect("selection");
         assert_eq!(selection.selected_families, ["audio", "ui"]);
         assert!(selection.selected_tests.contains(&"ui exact".to_owned()));
+    }
+
+    #[test]
+    fn recomputed_selection_can_only_execute_as_exact_integration_identity() {
+        let mut input = context();
+        let mut live_policy = policy();
+        live_policy.execution = Some(ChangedSurfaceExecutionPolicy {
+            mode: ExecutionMode::Authoritative,
+            stage: "test".to_owned(),
+            command: Some(format!(
+                "adapter {} {}",
+                crate::changed_surface::execution::SELECTED_TESTS_PAYLOAD_PLACEHOLDER,
+                crate::changed_surface::execution::SELECTED_TESTS_DIGEST_PLACEHOLDER
+            )),
+        });
+        input.old_policy = Ok(live_policy.clone());
+        input.live_policy = Ok(live_policy.clone());
+        let receipt = plan_stale_base_shadow(&exact(), &input).expect("assessment");
+        let mut selection = receipt.shadow_selection.as_deref().unwrap().clone();
+        assert!(selection.shadow_context_digest.is_some());
+        selection.shadow_context_digest = None;
+        let integration_input = integration_exact_input(&exact(), &input);
+        let ExecutionDisposition::Bounded(plan) = plan_authoritative_execution(
+            &selection,
+            &integration_input,
+            &live_policy,
+            true,
+            ExecutionCommandTransport::PosixShell,
+            DIGEST,
+            DIGEST,
+        )
+        .expect("integration execution plan") else {
+            panic!("expected bounded integration plan");
+        };
+        assert_eq!(plan.head_sha, input.integration_commit_sha);
+        assert_eq!(plan.tree_sha, input.integration_tree_sha);
+        assert_eq!(plan.base_sha, LIVE);
+        assert_ne!(plan.head_sha, HEAD);
+
+        let stale_bytes = serde_json::to_vec(&receipt).unwrap();
+        let activation = serde_json::json!({
+            "schema_version": plan.schema_version,
+            "machine_mode": "shadow_compare",
+            "merge_authority": "blocked_until_current_merge_tree",
+            "stale_context_digest": stale_base_context_digest(&receipt),
+            "stale_receipt_sha256": format!("{:x}", Sha256::digest(&stale_bytes)),
+            "plan": plan,
+        });
+        let result = serde_json::json!({
+            "schema_version": 2,
+            "repository": plan.repository,
+            "pull_request": plan.pull_request,
+            "target": plan.target,
+            "base_sha": plan.base_sha,
+            "head_sha": plan.head_sha,
+            "tree_sha": plan.tree_sha,
+            "execution_payload_sha256": plan.execution_payload_digest,
+            "policy_digest": plan.policy_digest,
+            "selection_receipt_digest": plan.selection_receipt_digest,
+            "validation_contract_digest": plan.validation_contract_digest,
+            "workflow_digest": plan.workflow_digest,
+            "selected_tests_digest": plan.selected_tests_digest,
+            "selected_build_targets_digest": plan.selected_build_targets_digest,
+            "selected_logical_count": plan.selected_count,
+            "selected_build_target_count": plan.selected_build_target_count,
+            "selected_returncode": 0,
+            "selected_build_returncode": null,
+            "full_returncode": null,
+            "full_build_returncode": null,
+            "full_authoritative": false,
+            "comparison_verdict": "not_compared",
+            "graduation_eligible": false
+        });
+        let activation_bytes = serde_json::to_vec(&activation).unwrap();
+        let result_bytes = serde_json::to_vec(&result).unwrap();
+        let status = evaluate_stale_base_execution(
+            &TrialIdentity {
+                repository: "owner/repo".to_owned(),
+                pull_request: 42,
+                target: "mac".to_owned(),
+                head_sha: HEAD.to_owned(),
+            },
+            ReceiptFile {
+                name: "stale-base-shadow.json",
+                bytes: &stale_bytes,
+            },
+            ReceiptFile {
+                name: "stale-activation-shadow_compare.json",
+                bytes: &activation_bytes,
+            },
+            &[ReceiptFile {
+                name: "result.json",
+                bytes: &result_bytes,
+            }],
+        );
+        assert_eq!(status.state, TrialState::Terminal);
+        assert_eq!(status.reason, "stale_base_recomputed_selected_pass");
     }
 
     #[test]

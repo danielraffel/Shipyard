@@ -185,6 +185,9 @@ pub struct LocalValidationConfig {
     pub machine_environment: Vec<String>,
     /// Resolved trusted environment values applied to every validation stage.
     pub environment: BTreeMap<String, String>,
+    /// Exact isolated integration checkout removed after terminal validation.
+    pub(crate) integration_cleanup:
+        Option<Box<crate::changed_surface::integration_checkout::IntegrationCheckout>>,
 }
 
 /// Request for one local validation run.
@@ -325,6 +328,15 @@ impl LocalExecutor {
             result.source_checkout_clean = Some(clean);
         }
         result.full_execution = Some(full_execution);
+        if let Some(cleanup) = request.validation.integration_cleanup.as_ref()
+            && let Err(error) = crate::changed_surface::integration_checkout::cleanup(cleanup)
+        {
+            result.status = TargetStatus::Error;
+            result.error_message = Some(format!(
+                "integration checkout cleanup uncertain; preserved for reconciliation: {error}"
+            ));
+            result.failure_class = Some(FailureClass::Unknown.as_str().to_owned());
+        }
         result
     }
 

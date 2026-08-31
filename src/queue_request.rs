@@ -1753,6 +1753,7 @@ fn restore_validation(validation: &QueuedValidationSnapshot) -> ResolvedValidati
                 allow_tree_drift: validation.allow_tree_drift,
                 machine_environment: validation.machine_environment.clone(),
                 environment: validation.environment.clone(),
+                integration_cleanup: None,
             })
         }
         QueuedValidationSnapshot::Ssh {
@@ -2342,6 +2343,7 @@ mod tests {
                     "PULP_SDK_DIR".to_owned(),
                     "/machine/pulp-sdk".to_owned(),
                 )]),
+                integration_cleanup: None,
             }),
             failure_parser: Some("auto".to_owned()),
         }

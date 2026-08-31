@@ -9,12 +9,13 @@ use serde_json::Value;
 
 use super::CliFailure;
 use crate::changed_surface::trial::{
-    ReceiptFile, TrialIdentity, TrialState, TrialStatus, evaluate_stale_base_terminal,
-    evaluate_trial, rejected_trial, result_directory,
+    ReceiptFile, TrialIdentity, TrialState, TrialStatus, evaluate_stale_base_execution,
+    evaluate_stale_base_terminal, evaluate_trial, rejected_trial, result_directory,
 };
 use crate::output::write_json_envelope;
 
 const ACTIVATION_RECEIPT: &str = "activation-shadow_compare.json";
+const STALE_ACTIVATION_RECEIPT: &str = "stale-activation-shadow_compare.json";
 const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
 
 pub(super) struct ChangedSurfaceTrialStatusArgs {
@@ -75,6 +76,19 @@ where
             );
         }
     };
+    let stale_activation_bytes =
+        match read_regular_receipt(&result_dir.join(STALE_ACTIVATION_RECEIPT)) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                return rejected_trial(
+                    identity,
+                    Some(STALE_ACTIVATION_RECEIPT.to_owned()),
+                    0,
+                    None,
+                    reason,
+                );
+            }
+        };
     let results = match read_result_receipts(result_dir) {
         Ok(results) => results,
         Err(failure) => {
@@ -92,7 +106,9 @@ where
     if let Some(status) = read_stale_trial(
         identity,
         result_dir,
-        activation_bytes.is_some() || !results.is_empty(),
+        activation_bytes.is_some(),
+        stale_activation_bytes.as_deref(),
+        &results,
         &mut before_final_snapshot,
     ) {
         return status;
@@ -153,6 +169,8 @@ fn read_stale_trial<F>(
     identity: &TrialIdentity,
     result_dir: &Path,
     ordinary_evidence_present: bool,
+    stale_activation: Option<&[u8]>,
+    results: &[(String, Vec<u8>)],
     before_final_snapshot: &mut F,
 ) -> Option<TrialStatus>
 where
@@ -197,15 +215,52 @@ where
         return Some(status);
     }
     let (name, bytes) = stale.first()?;
-    let status = evaluate_stale_base_terminal(identity, ReceiptFile { name, bytes });
+    let status = if let Some(activation) = stale_activation {
+        let result_files = results
+            .iter()
+            .map(|(name, bytes)| ReceiptFile { name, bytes })
+            .collect::<Vec<_>>();
+        evaluate_stale_base_execution(
+            identity,
+            ReceiptFile { name, bytes },
+            ReceiptFile {
+                name: STALE_ACTIVATION_RECEIPT,
+                bytes: activation,
+            },
+            &result_files,
+        )
+    } else if results.is_empty() {
+        evaluate_stale_base_terminal(identity, ReceiptFile { name, bytes })
+    } else {
+        let mut status = rejected_trial(
+            identity,
+            None,
+            results.len(),
+            results.first().map(|(name, _)| name.clone()),
+            "stale_base_result_without_activation",
+        );
+        status.state = TrialState::Terminal;
+        status.shadow_disposition =
+            Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated);
+        status
+    };
     before_final_snapshot();
     let final_ordinary_evidence_absent = matches!(
         read_regular_receipt(&result_dir.join(ACTIVATION_RECEIPT)),
         Ok(None)
-    ) && matches!(read_result_receipts(result_dir), Ok(results) if results.is_empty());
+    );
+    let final_stale_activation = read_regular_receipt(&result_dir.join(STALE_ACTIVATION_RECEIPT));
+    let final_results = read_result_receipts(result_dir);
     Some(
         match read_named_receipts(result_dir, "stale-base-shadow-") {
-            Ok(final_stale) if final_stale == stale && final_ordinary_evidence_absent => status,
+            Ok(final_stale)
+                if final_stale == stale
+                    && final_ordinary_evidence_absent
+                    && matches!(final_stale_activation, Ok(ref value) if value.as_deref() == stale_activation)
+                    && matches!(final_results, Ok(ref value) if value == results) =>
+            {
+                status
+            }
             _ => {
                 let mut changed = rejected_trial(
                     identity,

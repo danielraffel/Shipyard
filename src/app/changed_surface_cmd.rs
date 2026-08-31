@@ -40,6 +40,13 @@ pub(crate) struct ChangedSurfaceObservation {
     pub(crate) workflow_digest: String,
 }
 
+pub(crate) struct StaleBaseShadowObservation {
+    pub(crate) receipt: StaleBaseShadowReceipt,
+    pub(crate) integration_input: Option<ExactHeadInput>,
+    pub(crate) policy: Result<ChangedSurfacePolicy, String>,
+    pub(crate) workflow_digest: String,
+}
+
 /// Recompute a strictly shadow-only stale-base plan from local, exact-object
 /// observations. Missing objects, conflicts, and truncated path reads are
 /// represented in the terminal assessment instead of guessed through.
@@ -47,7 +54,7 @@ pub(crate) fn observe_stale_base_shadow(
     observation: &ChangedSurfaceObservation,
     cwd: &Path,
     validation_contract_digest: &str,
-) -> Result<(StaleBaseShadowReceipt, Result<ChangedSurfacePolicy, String>), CliFailure> {
+) -> Result<StaleBaseShadowObservation, CliFailure> {
     let exact = &observation.input;
     let live_config = git_required(
         cwd,
@@ -104,30 +111,37 @@ pub(crate) fn observe_stale_base_shadow(
         ],
     )
     .map_or((Vec::new(), false), |paths| (paths, true));
-    let assessment = plan_stale_base_shadow(
-        exact,
-        &StaleBaseShadowInput {
-            old_policy: observation.policy.clone(),
-            live_policy: live_policy.clone(),
-            old_workflow_digest: observation.workflow_digest.clone(),
-            live_workflow_digest,
-            validation_contract_digest: validation_contract_digest.to_owned(),
-            protected_base_delta_paths,
-            protected_base_delta_status: observation_status(protected_base_delta_complete),
-            integration_changed_paths,
-            integration_changed_paths_status: observation_status(
-                integration_changed_paths_complete,
-            ),
-            integration_tree_sha: integration_tree_sha.unwrap_or_default(),
-            integration_commit_sha: integration_commit_sha.unwrap_or_default(),
-            integration_conflicted,
-            live_base_tracked_paths,
-            live_base_tracked_paths_status: observation_status(live_base_tracked_paths_complete),
-            candidate: None,
-        },
+    let stale_input = StaleBaseShadowInput {
+        old_policy: observation.policy.clone(),
+        live_policy: live_policy.clone(),
+        old_workflow_digest: observation.workflow_digest.clone(),
+        live_workflow_digest,
+        validation_contract_digest: validation_contract_digest.to_owned(),
+        protected_base_delta_paths,
+        protected_base_delta_status: observation_status(protected_base_delta_complete),
+        integration_changed_paths,
+        integration_changed_paths_status: observation_status(integration_changed_paths_complete),
+        integration_tree_sha: integration_tree_sha.unwrap_or_default(),
+        integration_commit_sha: integration_commit_sha.unwrap_or_default(),
+        integration_conflicted,
+        live_base_tracked_paths,
+        live_base_tracked_paths_status: observation_status(live_base_tracked_paths_complete),
+        candidate: None,
+    };
+    let assessment = plan_stale_base_shadow(exact, &stale_input)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let integration_input = matches!(
+        assessment.disposition,
+        crate::changed_surface::StaleBaseShadowDisposition::Recomputed
+            | crate::changed_surface::StaleBaseShadowDisposition::Reused
     )
-    .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    Ok((assessment, live_policy))
+    .then(|| crate::changed_surface::integration_exact_input(exact, &stale_input));
+    Ok(StaleBaseShadowObservation {
+        receipt: assessment,
+        integration_input,
+        policy: live_policy,
+        workflow_digest: stale_input.live_workflow_digest,
+    })
 }
 
 fn observation_status(complete: bool) -> ObservationStatus {
@@ -186,7 +200,6 @@ fn synthesize_integration_commit(
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    use std::io::Write as _;
     child
         .stdin
         .take()?

@@ -1,0 +1,385 @@
+//! Content-addressed, restart-safe checkouts for stale-base shadow execution.
+//!
+//! These checkouts are never merge authority. They only provide an isolated
+//! filesystem whose `HEAD` and tree exactly match the synthetic integration
+//! identity recorded by a stale-base shadow receipt.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+
+use super::{StaleBaseShadowReceipt, stale_base_context_digest};
+
+const MARKER_NAME: &str = ".shipyard-shadow-integration.json";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CheckoutMarker {
+    schema_version: u32,
+    source_git_common_dir: String,
+    repository: String,
+    pull_request: u64,
+    target: String,
+    stale_head_sha: String,
+    live_base_sha: String,
+    integration_commit_sha: String,
+    integration_tree_sha: String,
+    context_digest: String,
+}
+
+/// Exact checkout identity retained for execution and later cleanup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IntegrationCheckout {
+    pub(crate) path: PathBuf,
+    source_repo: PathBuf,
+    marker: CheckoutMarker,
+}
+
+/// Materialize or reconcile one exact content-addressed linked worktree.
+///
+/// An interrupted prior materialization is reusable only when its Git
+/// identity and marker match every requested field. Ambiguity is preserved on
+/// disk and returned as an error; callers must keep ordinary full validation.
+pub(crate) fn materialize(
+    source_repo: &Path,
+    checkout_parent: &Path,
+    receipt: &StaleBaseShadowReceipt,
+) -> Result<IntegrationCheckout, String> {
+    let integration_commit = receipt
+        .integration_commit_sha
+        .as_deref()
+        .ok_or_else(|| "stale shadow receipt has no integration commit".to_owned())?;
+    let integration_tree = receipt
+        .integration_tree_sha
+        .as_deref()
+        .ok_or_else(|| "stale shadow receipt has no integration tree".to_owned())?;
+    let context_digest = stale_base_context_digest(receipt);
+    let source_repo = source_repo
+        .canonicalize()
+        .map_err(|error| format!("canonicalize integration source: {error}"))?;
+    let source_common_dir = git_path(&source_repo, &["rev-parse", "--git-common-dir"])?;
+    let source_common_dir = canonical_git_path(&source_repo, &source_common_dir)?;
+    ensure_real_directory(checkout_parent)?;
+    let checkout = checkout_parent.join(format!("shadow-{context_digest}"));
+    let marker = CheckoutMarker {
+        schema_version: 1,
+        source_git_common_dir: source_common_dir.to_string_lossy().into_owned(),
+        repository: receipt.repository.clone(),
+        pull_request: receipt.pull_request,
+        target: receipt.target.clone(),
+        stale_head_sha: receipt.head_sha.clone(),
+        live_base_sha: receipt.live_protected_base_sha.clone(),
+        integration_commit_sha: integration_commit.to_owned(),
+        integration_tree_sha: integration_tree.to_owned(),
+        context_digest,
+    };
+
+    match fs::symlink_metadata(&checkout) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+        Ok(_) => return Err("integration checkout path is not a real directory".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let status = Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&checkout)
+                .arg(integration_commit)
+                .current_dir(&source_repo)
+                .status()
+                .map_err(|error| format!("create integration checkout: {error}"))?;
+            if !status.success() {
+                return Err("create integration checkout: git worktree add failed".to_owned());
+            }
+        }
+        Err(error) => return Err(format!("inspect integration checkout: {error}")),
+    }
+
+    verify_checkout(&checkout, &marker)?;
+    initialize_submodules(&checkout)?;
+    verify_checkout(&checkout, &marker)?;
+    persist_or_verify_marker(&checkout, &marker)?;
+    Ok(IntegrationCheckout {
+        path: checkout,
+        source_repo,
+        marker,
+    })
+}
+
+/// Remove only the exact linked worktree whose immutable marker and Git
+/// identity still match. A mismatch refuses without deleting anything.
+pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
+    if !checkout.path.exists() {
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&checkout.source_repo)
+            .status();
+        return Ok(());
+    }
+    verify_checkout(&checkout.path, &checkout.marker)?;
+    verify_marker(&checkout.path, &checkout.marker)?;
+    let status = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&checkout.path)
+        .current_dir(&checkout.source_repo)
+        .status()
+        .map_err(|error| format!("remove integration checkout: {error}"))?;
+    if !status.success() || checkout.path.exists() {
+        return Err("remove integration checkout: exact worktree remains".to_owned());
+    }
+    Ok(())
+}
+
+fn ensure_real_directory(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("create integration checkout root: {error}"))?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect integration checkout root: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("integration checkout root is not a real directory".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_checkout(path: &Path, marker: &CheckoutMarker) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect integration checkout: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("integration checkout path is not a real directory".to_owned());
+    }
+    exact_git(path, &["rev-parse", "HEAD"], &marker.integration_commit_sha)?;
+    exact_git(
+        path,
+        &["rev-parse", "HEAD^{tree}"],
+        &marker.integration_tree_sha,
+    )?;
+    exact_git(path, &["rev-parse", "HEAD^1"], &marker.live_base_sha)?;
+    exact_git(path, &["rev-parse", "HEAD^2"], &marker.stale_head_sha)?;
+    let common_dir = git_path(path, &["rev-parse", "--git-common-dir"])?;
+    let common_dir = canonical_git_path(path, &common_dir)?;
+    if common_dir != Path::new(&marker.source_git_common_dir) {
+        return Err("integration checkout belongs to a different repository".to_owned());
+    }
+    Ok(())
+}
+
+fn initialize_submodules(path: &Path) -> Result<(), String> {
+    let status = Command::new("git")
+        .args([
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--jobs",
+            "4",
+        ])
+        .current_dir(path)
+        .status()
+        .map_err(|error| format!("initialize integration submodules: {error}"))?;
+    if !status.success() {
+        return Err("initialize integration submodules: git failed".to_owned());
+    }
+    let output = git_path(path, &["submodule", "status", "--recursive"])?;
+    if output
+        .lines()
+        .any(|line| matches!(line.as_bytes().first(), Some(b'-' | b'+' | b'U')))
+    {
+        return Err("integration submodule identity is incomplete or dirty".to_owned());
+    }
+    Ok(())
+}
+
+fn persist_or_verify_marker(path: &Path, marker: &CheckoutMarker) -> Result<(), String> {
+    let marker_path = path.join(MARKER_NAME);
+    let mut payload = serde_json::to_vec_pretty(marker)
+        .map_err(|error| format!("serialize integration marker: {error}"))?;
+    payload.push(b'\n');
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+    {
+        Ok(mut file) => {
+            file.write_all(&payload)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| format!("write integration marker: {error}"))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::read(&marker_path)
+                .map_err(|error| format!("read integration marker: {error}"))?
+                != payload
+            {
+                return Err("integration checkout marker disagrees with exact request".to_owned());
+            }
+        }
+        Err(error) => return Err(format!("create integration marker: {error}")),
+    }
+    Ok(())
+}
+
+fn verify_marker(path: &Path, marker: &CheckoutMarker) -> Result<(), String> {
+    let marker_path = path.join(MARKER_NAME);
+    let metadata = fs::symlink_metadata(&marker_path)
+        .map_err(|error| format!("inspect integration marker: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("integration checkout marker is not a regular file".to_owned());
+    }
+    let decoded: CheckoutMarker = serde_json::from_slice(
+        &fs::read(&marker_path).map_err(|error| format!("read integration marker: {error}"))?,
+    )
+    .map_err(|error| format!("decode integration marker: {error}"))?;
+    if &decoded != marker {
+        return Err("integration checkout marker disagrees with exact request".to_owned());
+    }
+    Ok(())
+}
+
+fn exact_git(cwd: &Path, args: &[&str], expected: &str) -> Result<(), String> {
+    let actual = git_path(cwd, args)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "integration checkout Git identity mismatch: expected {expected}, got {actual}"
+        ))
+    }
+}
+
+fn git_path(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("run git {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!("git {} failed", args.join(" ")));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|error| format!("decode git {}: {error}", args.join(" ")))
+}
+
+fn canonical_git_path(cwd: &Path, value: &str) -> Result<PathBuf, String> {
+    let path = Path::new(value);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    path.canonicalize()
+        .map_err(|error| format!("canonicalize Git common directory: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::changed_surface::{
+        MergeAuthority, StaleBaseShadowDisposition, StaleBaseShadowReceipt,
+    };
+    use std::process::Command;
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {}", args.join(" "));
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn fixture() -> (tempfile::TempDir, StaleBaseShadowReceipt) {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        git(
+            temp.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(temp.path(), &["config", "user.name", "Test"]);
+        fs::write(temp.path().join("base.txt"), "base\n").unwrap();
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "-qm", "base"]);
+        let old = git(temp.path(), &["rev-parse", "HEAD"]);
+        git(temp.path(), &["checkout", "-qb", "pr-head"]);
+        fs::write(temp.path().join("head.txt"), "head\n").unwrap();
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "-qm", "head"]);
+        let head = git(temp.path(), &["rev-parse", "HEAD"]);
+        let head_tree = git(temp.path(), &["rev-parse", "HEAD^{tree}"]);
+        git(temp.path(), &["checkout", "-q", "--detach", &old]);
+        fs::write(temp.path().join("live.txt"), "live\n").unwrap();
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "-qm", "live"]);
+        let live = git(temp.path(), &["rev-parse", "HEAD"]);
+        let tree = git(temp.path(), &["merge-tree", "--write-tree", &live, &head]);
+        let commit = {
+            let output = Command::new("git")
+                .args(["commit-tree", &tree, "-p", &live, "-p", &head])
+                .current_dir(temp.path())
+                .env("GIT_AUTHOR_NAME", "Shipyard integration")
+                .env("GIT_AUTHOR_EMAIL", "shipyard@example.invalid")
+                .env("GIT_AUTHOR_DATE", "@0 +0000")
+                .env("GIT_COMMITTER_NAME", "Shipyard integration")
+                .env("GIT_COMMITTER_EMAIL", "shipyard@example.invalid")
+                .env("GIT_COMMITTER_DATE", "@0 +0000")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        (
+            temp,
+            StaleBaseShadowReceipt {
+                schema_version: 1,
+                disposition: StaleBaseShadowDisposition::Recomputed,
+                merge_authority: MergeAuthority::BlockedUntilCurrentMergeTree,
+                repository: "owner/repo".to_owned(),
+                pull_request: 7,
+                target: "mac".to_owned(),
+                head_sha: head,
+                head_tree_sha: head_tree,
+                old_protected_base_sha: old.clone(),
+                live_protected_base_sha: live,
+                merge_base_sha: old,
+                integration_tree_sha: Some(tree),
+                integration_commit_sha: Some(commit),
+                changed_paths_digest: "a".repeat(64),
+                protected_base_delta_digest: "b".repeat(64),
+                old_policy_digest: Some("c".repeat(64)),
+                live_policy_digest: Some("c".repeat(64)),
+                old_workflow_digest: "d".repeat(64),
+                live_workflow_digest: "d".repeat(64),
+                validation_contract_digest: "e".repeat(64),
+                integration_changed_paths_digest: "f".repeat(64),
+                shadow_selection: None,
+                reason: "bounded_shadow_recomputed".to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn materialize_reconcile_and_cleanup_exact_integration_checkout() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        assert_eq!(
+            git(&checkout.path, &["rev-parse", "HEAD"]),
+            receipt.integration_commit_sha.as_deref().unwrap()
+        );
+        let reconciled = materialize(repo.path(), &parent, &receipt).unwrap();
+        assert_eq!(reconciled.path, checkout.path);
+        cleanup(&reconciled).unwrap();
+        assert!(!checkout.path.exists());
+    }
+
+    #[test]
+    fn marker_disagreement_refuses_cleanup_without_deletion() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        fs::write(checkout.path.join(MARKER_NAME), "{}\n").unwrap();
+        let error = cleanup(&checkout).unwrap_err();
+        assert!(error.contains("decode integration marker") || error.contains("disagrees"));
+        assert!(checkout.path.exists());
+    }
+}

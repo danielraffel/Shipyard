@@ -120,6 +120,16 @@ struct ActivationReceipt {
 }
 
 #[derive(Debug, Deserialize)]
+struct StaleActivationReceipt {
+    schema_version: u32,
+    machine_mode: String,
+    merge_authority: super::MergeAuthority,
+    stale_context_digest: String,
+    stale_receipt_sha256: String,
+    plan: ActivationPlan,
+}
+
+#[derive(Debug, Deserialize)]
 struct ActivationPlan {
     schema_version: u32,
     repository: String,
@@ -362,6 +372,91 @@ pub fn evaluate_stale_base_terminal(
     status
 }
 
+/// Validate one selected-only stale-base integration execution. The result is
+/// terminal shadow evidence and can never become `Ready` merge authority.
+#[must_use]
+pub fn evaluate_stale_base_execution(
+    identity: &TrialIdentity,
+    stale_file: ReceiptFile<'_>,
+    activation_file: ReceiptFile<'_>,
+    results: &[ReceiptFile<'_>],
+) -> TrialStatus {
+    let mut status = evaluate_stale_base_terminal(identity, stale_file);
+    status.activation_receipt = Some(activation_file.name.to_owned());
+    status.result_receipt_count = results.len();
+    let Ok(stale) = serde_json::from_slice::<super::StaleBaseShadowReceipt>(stale_file.bytes)
+    else {
+        return status;
+    };
+    let Ok(activation) = serde_json::from_slice::<StaleActivationReceipt>(activation_file.bytes)
+    else {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "malformed_stale_base_activation".clone_into(&mut status.reason);
+        return status;
+    };
+    let stale_digest = serde_json::to_vec(&stale).ok().map(|bytes| sha256(&bytes));
+    if activation.schema_version != activation.plan.schema_version
+        || activation.machine_mode != "shadow_compare"
+        || activation.merge_authority != super::MergeAuthority::BlockedUntilCurrentMergeTree
+        || activation.stale_context_digest != super::stale_base_context_digest(&stale)
+        || stale_digest.as_deref() != Some(activation.stale_receipt_sha256.as_str())
+        || activation.plan.repository != stale.repository
+        || activation.plan.pull_request != stale.pull_request
+        || activation.plan.target != stale.target
+        || Some(activation.plan.head_sha.as_str()) != stale.integration_commit_sha.as_deref()
+        || Some(activation.plan.tree_sha.as_str()) != stale.integration_tree_sha.as_deref()
+        || activation.plan.base_sha != stale.live_protected_base_sha
+        || activation.plan.validation_contract_digest != stale.validation_contract_digest
+        || activation.plan.workflow_digest != stale.live_workflow_digest
+    {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "stale_base_activation_identity_or_link_mismatch".clone_into(&mut status.reason);
+        return status;
+    }
+    if results.len() != 1 {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        if results.is_empty() {
+            "stale_base_execution_missing_result"
+        } else {
+            "ambiguous_stale_base_execution_results"
+        }
+        .clone_into(&mut status.reason);
+        return status;
+    }
+    let result_file = results[0];
+    let Ok(result) = serde_json::from_slice::<ResultReceipt>(result_file.bytes) else {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "malformed_stale_base_result".clone_into(&mut status.reason);
+        return status;
+    };
+    if validate_result_binding(&activation.plan, &result).is_err()
+        || result.full_authoritative
+        || result.full_returncode.is_some()
+        || result.full_build_returncode.is_some()
+        || result.selected_returncode != 0
+        || match activation.plan.schema_version {
+            1 => result.selected_build_returncode.is_some(),
+            2 => result.selected_build_returncode != Some(0),
+            _ => true,
+        }
+        || result.comparison_verdict != "not_compared"
+        || result.graduation_eligible
+    {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        status.result_receipt = Some(result_file.name.to_owned());
+        "stale_base_selected_result_mismatch".clone_into(&mut status.reason);
+        return status;
+    }
+    status.state = TrialState::Terminal;
+    status.result_receipt = Some(result_file.name.to_owned());
+    status.shadow_disposition = Some(stale.disposition);
+    status.reason = format!(
+        "stale_base_{}_selected_pass",
+        disposition_name(stale.disposition)
+    );
+    status
+}
+
 /// Construct a stable rejection when the command boundary cannot safely read
 /// the receipt directory or one of its entries.
 #[must_use]
@@ -459,30 +554,7 @@ fn validate_activation(
 }
 
 fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), &'static str> {
-    if result.schema_version != RESULT_RECEIPT_SCHEMA_VERSION {
-        return Err("unsupported_shadow_result_schema");
-    }
-    if result.repository != plan.repository
-        || result.pull_request != plan.pull_request
-        || result.target != plan.target
-        || result.base_sha != plan.base_sha
-        || result.head_sha != plan.head_sha
-        || result.tree_sha != plan.tree_sha
-    {
-        return Err("shadow_result_identity_mismatch");
-    }
-    if result.execution_payload_sha256 != plan.execution_payload_digest
-        || result.policy_digest != plan.policy_digest
-        || result.selection_receipt_digest != plan.selection_receipt_digest
-        || result.validation_contract_digest != plan.validation_contract_digest
-        || result.workflow_digest != plan.workflow_digest
-        || result.selected_tests_digest != plan.selected_tests_digest
-        || result.selected_build_targets_digest != plan.selected_build_targets_digest
-        || result.selected_logical_count != plan.selected_count
-        || result.selected_build_target_count != plan.selected_build_target_count
-    {
-        return Err("shadow_result_digest_or_count_mismatch");
-    }
+    validate_result_binding(plan, result)?;
     if !result.full_authoritative {
         return Err("full_suite_not_authoritative");
     }
@@ -506,6 +578,37 @@ fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), 
     }
     if plan.schema_version == 2 && timing(plan, result).is_none() {
         return Err("invalid_shadow_result_timing");
+    }
+    Ok(())
+}
+
+fn validate_result_binding(
+    plan: &ActivationPlan,
+    result: &ResultReceipt,
+) -> Result<(), &'static str> {
+    if result.schema_version != RESULT_RECEIPT_SCHEMA_VERSION {
+        return Err("unsupported_shadow_result_schema");
+    }
+    if result.repository != plan.repository
+        || result.pull_request != plan.pull_request
+        || result.target != plan.target
+        || result.base_sha != plan.base_sha
+        || result.head_sha != plan.head_sha
+        || result.tree_sha != plan.tree_sha
+    {
+        return Err("shadow_result_identity_mismatch");
+    }
+    if result.execution_payload_sha256 != plan.execution_payload_digest
+        || result.policy_digest != plan.policy_digest
+        || result.selection_receipt_digest != plan.selection_receipt_digest
+        || result.validation_contract_digest != plan.validation_contract_digest
+        || result.workflow_digest != plan.workflow_digest
+        || result.selected_tests_digest != plan.selected_tests_digest
+        || result.selected_build_targets_digest != plan.selected_build_targets_digest
+        || result.selected_logical_count != plan.selected_count
+        || result.selected_build_target_count != plan.selected_build_target_count
+    {
+        return Err("shadow_result_digest_or_count_mismatch");
     }
     Ok(())
 }

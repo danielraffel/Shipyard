@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod execution;
+pub(crate) mod integration_checkout;
 mod stale_base;
 pub mod trial;
 pub use execution::{
@@ -20,11 +21,11 @@ pub use execution::{
     ExecutionDisposition, ExecutionMode, ExecutionPlanError, FullExecutionReason,
     plan_authoritative_execution,
 };
-pub(crate) use stale_base::stale_base_context_digest;
 pub use stale_base::{
     MergeAuthority, StaleBaseCandidate, StaleBaseShadowDisposition, StaleBaseShadowInput,
     StaleBaseShadowReceipt, plan_stale_base_shadow,
 };
+pub(crate) use stale_base::{integration_exact_input, stale_base_context_digest};
 
 /// Oldest changed-surface declaration schema understood by this release.
 pub const MIN_CHANGED_SURFACE_SCHEMA_VERSION: u32 = 1;
