@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01391"></a>
+## [0.139.1] - 2026-08-31
+
+- fix: stabilize coverage checkout and process teardown ([#520](https://github.com/danielraffel/Shipyard/pull/520))
+
 <a id="v01390"></a>
 ## [0.139.0] - 2026-08-31
 
@@ -1221,6 +1226,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.139.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.139.1
 [0.139.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.139.0
 [0.138.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.138.0
 [0.137.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.137.0
