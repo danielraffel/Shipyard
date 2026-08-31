@@ -28,7 +28,9 @@ use serde_json::Value;
 use chrono::Utc;
 
 #[cfg(unix)]
-use crate::actionable_wake_producer::{ActionableWakeProducer, ActionableWakeProducerStatus};
+use crate::actionable_wake_producer::{
+    ActionableWakeProducer, ActionableWakeProducerStatus, DispatchTargetInventoryIdentity,
+};
 use crate::config::LoadedConfig;
 #[cfg(unix)]
 use crate::custody_transport::CustodyTransportRuntime;
@@ -948,7 +950,7 @@ fn native_steward_inventory(
 #[cfg(unix)]
 fn authoritative_native_steward_inventory(
     state_dir: &Path,
-) -> Result<BTreeSet<(String, u64, String)>, String> {
+) -> Result<BTreeSet<DispatchTargetInventoryIdentity>, String> {
     WorkLedger::open_existing(state_dir)
         .and_then(|ledger| {
             ledger.map_or_else(|| Ok(Vec::new()), |ledger| ledger.native_steward_targets())
@@ -956,9 +958,17 @@ fn authoritative_native_steward_inventory(
         .map(|targets| {
             targets
                 .into_iter()
-                .map(|(_, _, repository, pull_request, head_sha)| {
-                    normalized_dispatch_target(&repository, pull_request, &head_sha)
-                })
+                .map(
+                    |(provider, repository_id, repository, pull_request, head_sha)| {
+                        DispatchTargetInventoryIdentity::new(
+                            provider.as_deref().unwrap_or_default(),
+                            repository_id.as_deref().unwrap_or_default(),
+                            &repository,
+                            pull_request,
+                            &head_sha,
+                        )
+                    },
+                )
                 .collect()
         })
         .map_err(|error| error.to_string())

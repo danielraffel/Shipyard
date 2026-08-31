@@ -430,6 +430,25 @@ fn one_target_observation_failure_does_not_poison_repository_batch() {
     assert!(results[1].result.is_ok());
 }
 
+#[test]
+fn unassigned_dispatch_uses_attempt_creation_before_job_started_at_exists() {
+    let run = StewardRun {
+        id: 77,
+        workflow_id: 88,
+        run_attempt: 1,
+        workflow: "Build / Test".to_owned(),
+        head_sha: "a".repeat(40),
+        head_branch: "gh-readonly-queue/main/pr-42".to_owned(),
+        status: "queued".to_owned(),
+        event: "merge_group".to_owned(),
+        pull_request_number: Some(42),
+        created_at: "2026-08-31T18:13:15Z".to_owned(),
+        jobs: Vec::new(),
+    };
+
+    assert_eq!(dispatch_queue_age_origin(&run), run.created_at);
+}
+
 #[cfg(unix)]
 #[test]
 fn required_context_transport_falls_back_from_admin_denial_to_evaluated_rules() {

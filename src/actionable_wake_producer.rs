@@ -99,6 +99,33 @@ pub(crate) struct DispatchTargetCheckpoint {
     pub(crate) pending_publication: Option<DispatchPendingPublication>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DispatchTargetInventoryIdentity {
+    repository_provider: String,
+    repository_id: String,
+    repository: String,
+    pull_request: u64,
+    head_sha: String,
+}
+
+impl DispatchTargetInventoryIdentity {
+    pub(crate) fn new(
+        repository_provider: &str,
+        repository_id: &str,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+    ) -> Self {
+        Self {
+            repository_provider: repository_provider.to_owned(),
+            repository_id: repository_id.to_owned(),
+            repository: repository.to_ascii_lowercase(),
+            pull_request,
+            head_sha: head_sha.to_ascii_lowercase(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct DispatchPendingPublication {
     #[serde(rename = "p")]
@@ -1379,24 +1406,40 @@ impl ActionableWakeProducer {
 
     pub(crate) fn retain_dispatch_targets(
         &mut self,
-        active: &std::collections::BTreeSet<(String, u64, String)>,
+        active: &std::collections::BTreeSet<DispatchTargetInventoryIdentity>,
     ) -> ActionableWakeProducerStatus {
         if !self.dispatch_state_available {
             return self.status();
         }
-        let previous = self.status.dispatch_targets.clone();
-        self.status.dispatch_targets.retain(|_, target| {
-            active.iter().any(|(repository, pull_request, head_sha)| {
-                repository.eq_ignore_ascii_case(&target.repository)
-                    && *pull_request == target.pull_request
-                    && head_sha.eq_ignore_ascii_case(&target.head_sha)
+        let stale_keys = self
+            .status
+            .dispatch_targets
+            .iter()
+            .filter(|(_, target)| {
+                !active.contains(&DispatchTargetInventoryIdentity::new(
+                    &target.repository_provider,
+                    &target.repository_id,
+                    &target.repository,
+                    target.pull_request,
+                    &target.head_sha,
+                ))
             })
-        });
-        if self.status.dispatch_targets.len() == previous.len() {
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if stale_keys.is_empty() {
             return self.status();
         }
+        let removed = stale_keys
+            .into_iter()
+            .filter_map(|key| {
+                self.status
+                    .dispatch_targets
+                    .remove(&key)
+                    .map(|target| (key, target))
+            })
+            .collect::<Vec<_>>();
         if self.persist_status().is_err() {
-            self.status.dispatch_targets = previous;
+            self.status.dispatch_targets.extend(removed);
             "status_persistence_error".clone_into(&mut self.status.state);
             self.status.reason_code = Some("status_persistence_refused".to_owned());
             self.status.wake_enqueued = false;
@@ -2308,6 +2351,83 @@ mod tests {
             restarted.status.reason_code.as_deref(),
             Some("dispatch_probe_capacity_exhausted")
         );
+    }
+
+    #[test]
+    fn full_capacity_inventory_noop_uses_exact_keys_without_persistence() {
+        let state = tempfile::tempdir().expect("state");
+        let mut status = ActionableWakeProducerStatus::default();
+        let mut active = std::collections::BTreeSet::new();
+        for pull_request in 1..=u64::try_from(MAX_DISPATCH_PROBE_TARGETS).unwrap() {
+            let head_sha = format!("{pull_request:040x}");
+            let key = dispatch_scope_prefix("Owner/Repo", pull_request, &head_sha);
+            active.insert(DispatchTargetInventoryIdentity::new(
+                test_repository_provider(),
+                test_repository_id(),
+                "Owner/Repo",
+                pull_request,
+                &head_sha,
+            ));
+            status.dispatch_targets.insert(
+                key,
+                DispatchTargetCheckpoint {
+                    repository_provider: test_repository_provider().to_owned(),
+                    repository_id: test_repository_id().to_owned(),
+                    repository: "owner/repo".to_owned(),
+                    pull_request,
+                    head_sha,
+                    generation: 1,
+                    schedule: None,
+                    observations: BTreeMap::new(),
+                    pending_publication: None,
+                },
+            );
+        }
+        WorkLedger::open(state.path()).expect("ledger");
+        save_status(state.path(), &status).expect("capacity fixture");
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+
+        let daemon_dir = state.path().join("daemon");
+        let saved_dir = state.path().join("daemon-saved");
+        std::fs::rename(&daemon_dir, &saved_dir).expect("move daemon state");
+        std::fs::write(&daemon_dir, b"block aggregate persistence").expect("block daemon dir");
+
+        let retained = producer.retain_dispatch_targets(&active);
+        assert_ne!(retained.state, "status_persistence_error");
+        assert_eq!(
+            producer.status.dispatch_targets.len(),
+            MAX_DISPATCH_PROBE_TARGETS
+        );
+
+        std::fs::remove_file(&daemon_dir).expect("remove blocker");
+        std::fs::rename(&saved_dir, &daemon_dir).expect("restore daemon state");
+    }
+
+    #[test]
+    fn inventory_prune_refuses_same_slug_head_with_different_repository_identity() {
+        let state = tempfile::tempdir().expect("state");
+        let head_sha = "a".repeat(40);
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer
+            .begin_dispatch_wedge_cycle_for_repository(
+                test_repository_provider(),
+                test_repository_id(),
+                "owner/repo",
+                42,
+                &head_sha,
+            )
+            .expect("identity-bound target");
+        let active = std::collections::BTreeSet::from([DispatchTargetInventoryIdentity::new(
+            test_repository_provider(),
+            "different-immutable-repository-id",
+            "OWNER/REPO",
+            42,
+            &head_sha.to_ascii_uppercase(),
+        )]);
+
+        producer.retain_dispatch_targets(&active);
+
+        assert!(producer.status.dispatch_targets.is_empty());
     }
 
     #[test]

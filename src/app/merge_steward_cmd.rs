@@ -1335,12 +1335,11 @@ fn observe_dispatch_wedge_target_from_repository(
             let producer_app_id = check_producers
                 .get(&detail_job.id)
                 .and_then(|check| check.app_id);
-            let queued_at = detail
-                .get("started_at")
-                .and_then(Value::as_str)
-                .or_else(|| detail.get("created_at").and_then(Value::as_str))
-                .unwrap_or_default()
-                .to_owned();
+            // An unassigned queued job normally has no `started_at`, and the
+            // workflow-job endpoint does not guarantee `created_at`. The
+            // exact attempt's immutable run creation time is present before
+            // dispatch and provides a stable, authoritative age origin.
+            let queued_at = dispatch_queue_age_origin(run);
             results.push(DispatchWedgeObservation {
                 authority: DispatchJobAuthority {
                     repository: observation.repo.clone(),
@@ -1371,6 +1370,10 @@ fn observe_dispatch_wedge_target_from_repository(
         }
     }
     Ok(results)
+}
+
+fn dispatch_queue_age_origin(run: &StewardRun) -> String {
+    run.created_at.clone()
 }
 
 fn current_required_dispatch_job<'a>(
