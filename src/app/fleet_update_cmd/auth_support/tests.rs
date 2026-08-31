@@ -64,6 +64,7 @@ struct RunOptions {
     fail_after_helper: bool,
     target: &'static str,
     resolver_succeeds: bool,
+    refresh_prefix: &'static str,
     refresh: RefreshBehavior,
     lock_publish: LockPublishBehavior,
 }
@@ -74,6 +75,7 @@ impl Default for RunOptions {
             fail_after_helper: false,
             target: "v0.131.0",
             resolver_succeeds: true,
+            refresh_prefix: "",
             refresh: RefreshBehavior::Success,
             lock_publish: LockPublishBehavior::Success,
         }
@@ -258,7 +260,7 @@ impl Fixture {
             &state,
             "danielraffel/Shipyard",
             &self.authority,
-            "",
+            options.refresh_prefix,
             options.fail_after_helper,
         );
         let shell_prefix = options.lock_publish.shell_prefix(&state);
@@ -283,6 +285,28 @@ fn committed_transaction_streams_the_typed_refresh_receipt() {
     assert!(output.status.success());
     let receipt: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("typed refresh receipt");
+    assert_eq!(receipt["schema_version"], 1);
+    assert_eq!(receipt["command"], "daemon:refresh");
+    assert_eq!(receipt["new_pid"], 4242);
+}
+
+#[test]
+fn committed_transaction_frames_the_remote_refresh_marker_exactly() {
+    let fixture = Fixture::new();
+    let output = fixture.run_output(RunOptions {
+        refresh_prefix: crate::app::fleet_update_cmd::REMOTE_REFRESH_PREFIX,
+        ..RunOptions::default()
+    });
+    assert!(output.status.success());
+    let line = std::str::from_utf8(&output.stdout).expect("remote refresh marker");
+    assert!(line.ends_with('\n'));
+    assert_eq!(line.matches('\n').count(), 1);
+    let payload = line
+        .strip_prefix(crate::app::fleet_update_cmd::REMOTE_REFRESH_PREFIX)
+        .and_then(|value| value.strip_suffix('\n'))
+        .expect("exact remote marker framing");
+    let receipt: serde_json::Value =
+        serde_json::from_str(payload).expect("typed remote refresh receipt");
     assert_eq!(receipt["schema_version"], 1);
     assert_eq!(receipt["command"], "daemon:refresh");
     assert_eq!(receipt["new_pid"], 4242);
