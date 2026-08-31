@@ -2106,10 +2106,23 @@ fn upgrade_legacy_request(
 }
 
 fn target_has_integration_cleanup(target: &QueuedResolvedTarget) -> bool {
-    matches!(
+    if matches!(
         &target.validation,
         QueuedValidationSnapshot::Local(validation) if validation.integration_cleanup.is_some()
-    )
+    ) {
+        return true;
+    }
+    match &target.backend {
+        QueuedBackendSnapshot::HostPool(pool) => pool
+            .members
+            .iter()
+            .any(|member| target_has_integration_cleanup(&member.target)),
+        QueuedBackendSnapshot::Fallback(chain) => chain
+            .backends
+            .iter()
+            .any(|backend| target_has_integration_cleanup(&backend.target)),
+        _ => false,
+    }
 }
 
 #[cfg(any(unix, test))]
@@ -2779,6 +2792,84 @@ mod tests {
                 .to_string()
                 .contains("v4 integration checkout custody")
         );
+    }
+
+    #[test]
+    fn downgraded_v3_request_cannot_smuggle_nested_v4_checkout_custody() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut nested = super::QueuedResolvedTarget::from(&local_target());
+        let super::QueuedValidationSnapshot::Local(validation) = &mut nested.validation else {
+            panic!("local validation");
+        };
+        validation.integration_cleanup = Some(Box::new(integration_snapshot(
+            temp.path(),
+            &temp.path().join("state/integration-checkouts"),
+        )));
+        let host_pool = super::QueuedResolvedTarget {
+            name: "pool".to_owned(),
+            validation_build_type: None,
+            platform: "macos".to_owned(),
+            backend_name: "host_pool".to_owned(),
+            warm_keepalive_seconds: 0,
+            host: None,
+            backend: super::QueuedBackendSnapshot::HostPool(super::QueuedHostPoolTarget {
+                pool_name: "pool".to_owned(),
+                strategy: "ordered".to_owned(),
+                lease_stale_seconds: 60,
+                heartbeat_interval_seconds: 10,
+                requires: Vec::new(),
+                members: vec![super::QueuedHostPoolMember {
+                    id: "member".to_owned(),
+                    target: Box::new(nested.clone()),
+                    label: "member".to_owned(),
+                    profile_label: "member".to_owned(),
+                    max_concurrency: 1,
+                    capabilities: Vec::new(),
+                }],
+            }),
+            validation: super::QueuedValidationSnapshot::HostPool,
+            failure_parser: None,
+        };
+        let fallback = super::QueuedResolvedTarget {
+            name: "fallback".to_owned(),
+            validation_build_type: None,
+            platform: "macos".to_owned(),
+            backend_name: "fallback".to_owned(),
+            warm_keepalive_seconds: 0,
+            host: None,
+            backend: super::QueuedBackendSnapshot::Fallback(super::QueuedFallbackTarget {
+                backends: vec![super::QueuedFallbackBackend {
+                    target: Box::new(nested),
+                    label: "local".to_owned(),
+                    profile_label: "local".to_owned(),
+                    capabilities: Vec::new(),
+                }],
+                requires: Vec::new(),
+                heartbeat_stale_secs: 60,
+            }),
+            validation: super::QueuedValidationSnapshot::Fallback,
+            failure_parser: None,
+        };
+
+        for (suffix, target) in [("host-pool", host_pool), ("fallback", fallback)] {
+            let mut envelope = QueuedExecutionEnvelope::from_run_request(
+                format!("job-v3-{suffix}"),
+                temp.path(),
+                &run_request(),
+            );
+            envelope.schema_version = 3;
+            let QueuedExecutionRequest::Run(request) = &mut envelope.request else {
+                panic!("run request");
+            };
+            request.targets = vec![target];
+            let error = super::upgrade_legacy_request(envelope)
+                .expect_err("nested v4 custody must not survive v3 upgrade");
+            assert!(
+                error
+                    .to_string()
+                    .contains("v4 integration checkout custody")
+            );
+        }
     }
 
     #[test]
