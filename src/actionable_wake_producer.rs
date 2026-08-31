@@ -61,6 +61,12 @@ pub(crate) struct ActionableRepositoryStatus {
     pub(crate) updated_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DispatchWedgeCycleResult {
+    pub(crate) status: ActionableWakeProducerStatus,
+    pub(crate) matching_second_read_due_at: Option<chrono::DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct DispatchProbeSchedule {
     #[serde(rename = "p")]
@@ -916,6 +922,7 @@ impl ActionableWakeProducer {
         clippy::too_many_arguments,
         reason = "repository identity and exact target generation are independent mutation fences"
     )]
+    #[cfg(test)]
     pub(crate) fn process_dispatch_wedge_cycle_at_generation_for_repository(
         &mut self,
         repository_provider: &str,
@@ -927,6 +934,34 @@ impl ActionableWakeProducer {
         observations: &[DispatchWedgeObservation],
         assignment_threshold_secs: i64,
     ) -> ActionableWakeProducerStatus {
+        self.process_dispatch_wedge_cycle_at_generation_with_followup_for_repository(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+            generation,
+            observations,
+            assignment_threshold_secs,
+        )
+        .status
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "repository identity and exact target generation are independent mutation fences"
+    )]
+    pub(crate) fn process_dispatch_wedge_cycle_at_generation_with_followup_for_repository(
+        &mut self,
+        repository_provider: &str,
+        repository_id: &str,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+        generation: u64,
+        observations: &[DispatchWedgeObservation],
+        assignment_threshold_secs: i64,
+    ) -> DispatchWedgeCycleResult {
         let prefix = dispatch_scope_prefix(
             repository_provider,
             repository_id,
@@ -940,7 +975,10 @@ impl ActionableWakeProducer {
             .get(&prefix)
             .is_none_or(|target| target.generation != generation)
         {
-            return self.status();
+            return DispatchWedgeCycleResult {
+                status: self.status(),
+                matching_second_read_due_at: None,
+            };
         }
         if self
             .status
@@ -948,13 +986,16 @@ impl ActionableWakeProducer {
             .get(&prefix)
             .is_some_and(|target| target.pending_publication.is_some())
         {
-            return self.publish_pending_dispatch_wedge(
-                repository_provider,
-                repository_id,
-                repository,
-                pull_request,
-                head_sha,
-            );
+            return DispatchWedgeCycleResult {
+                status: self.publish_pending_dispatch_wedge(
+                    repository_provider,
+                    repository_id,
+                    repository,
+                    pull_request,
+                    head_sha,
+                ),
+                matching_second_read_due_at: None,
+            };
         }
         let present = observations
             .iter()
@@ -964,6 +1005,7 @@ impl ActionableWakeProducer {
             target.observations.retain(|key, _| present.contains(key));
         }
         let mut status = None;
+        let mut matching_second_read_due_at: Option<chrono::DateTime<Utc>> = None;
         let mut processed = std::collections::BTreeSet::new();
         for observation in observations {
             if !processed.insert(dispatch_observation_key(&observation.authority)) {
@@ -975,6 +1017,18 @@ impl ActionableWakeProducer {
                 observation,
                 assignment_threshold_secs,
             );
+            if observed.reason_code.as_deref() == Some("matching_second_read_required") {
+                let due_at = self.dispatch_matching_second_read_due_at_for_observation(
+                    repository_provider,
+                    repository_id,
+                    observation,
+                );
+                matching_second_read_due_at = match (matching_second_read_due_at, due_at) {
+                    (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                    (None, candidate) => candidate,
+                    (current, None) => current,
+                };
+            }
             let terminal_dispatch = matches!(
                 observed.reason_code.as_deref(),
                 Some(
@@ -995,16 +1049,19 @@ impl ActionableWakeProducer {
                 break;
             }
         }
-        status.unwrap_or_else(|| {
-            self.record(
-                repository.to_owned(),
-                pull_request,
-                head_sha.to_owned(),
-                "ready",
-                Some("dispatch_wedge_candidate_absent".to_owned()),
-                false,
-            )
-        })
+        DispatchWedgeCycleResult {
+            status: status.unwrap_or_else(|| {
+                self.record(
+                    repository.to_owned(),
+                    pull_request,
+                    head_sha.to_owned(),
+                    "ready",
+                    Some("dispatch_wedge_candidate_absent".to_owned()),
+                    false,
+                )
+            }),
+            matching_second_read_due_at,
+        }
     }
 
     #[cfg(test)]
@@ -1702,51 +1759,32 @@ impl ActionableWakeProducer {
         due
     }
 
-    pub(crate) fn dispatch_matching_second_read_due_at_for_repository(
+    pub(crate) fn dispatch_matching_second_read_due_at_for_observation(
         &self,
         repository_provider: &str,
         repository_id: &str,
-        repository: &str,
-        pull_request: u64,
-        head_sha: &str,
-        observations: &[DispatchWedgeObservation],
+        observation: &DispatchWedgeObservation,
     ) -> Option<chrono::DateTime<Utc>> {
+        let authority = &observation.authority;
         let key = dispatch_scope_prefix(
             repository_provider,
             repository_id,
-            repository,
-            pull_request,
-            head_sha,
+            &authority.repository,
+            authority.pull_request,
+            &authority.pull_request_head,
         );
         let target = self.status.dispatch_targets.get(&key)?;
-        observations
-            .iter()
-            .filter(|observation| {
-                observation
-                    .authority
-                    .repository
-                    .eq_ignore_ascii_case(repository)
-                    && observation.authority.pull_request == pull_request
-                    && observation
-                        .authority
-                        .pull_request_head
-                        .eq_ignore_ascii_case(head_sha)
-            })
-            .filter_map(|observation| {
-                let observation_key = dispatch_observation_key(&observation.authority);
-                let digest =
-                    dispatch_wedge_observation_digest(&observation.authority, &observation.runners);
-                target
-                    .observations
-                    .get(&observation_key)
-                    .filter(|checkpoint| checkpoint.digest == digest)
-            })
-            .filter_map(|checkpoint| {
+        let observation_key = dispatch_observation_key(authority);
+        let digest = dispatch_wedge_observation_digest(authority, &observation.runners);
+        target
+            .observations
+            .get(&observation_key)
+            .filter(|checkpoint| checkpoint.digest == digest)
+            .and_then(|checkpoint| {
                 chrono::DateTime::parse_from_rfc3339(&checkpoint.not_before)
                     .ok()
                     .map(|due| due.with_timezone(&Utc))
             })
-            .min()
     }
 
     pub(crate) fn retain_dispatch_targets(
@@ -2651,8 +2689,7 @@ mod tests {
         let now = Utc::now();
         let future = now + chrono::Duration::minutes(5);
         let boot_epoch = producer.boot_epoch.clone();
-        let prior_mature = observation.clone();
-        let mut current_mature_nonmatching = prior_mature.clone();
+        let mut current_mature_nonmatching = observation.clone();
         current_mature_nonmatching.runners.clear();
         let mut fresh_matching = observation.clone();
         fresh_matching.authority.workflow_run_id = 102;
@@ -2664,11 +2701,11 @@ mod tests {
             .next()
             .expect("scheduled target");
         target.observations.insert(
-            dispatch_observation_key(&prior_mature.authority),
+            dispatch_observation_key(&current_mature_nonmatching.authority),
             DispatchObservationCheckpoint {
                 digest: dispatch_wedge_observation_digest(
-                    &prior_mature.authority,
-                    &prior_mature.runners,
+                    &current_mature_nonmatching.authority,
+                    &current_mature_nonmatching.runners,
                 ),
                 not_before: (now - chrono::Duration::minutes(1)).to_rfc3339(),
                 boot_epoch: boot_epoch.clone(),
@@ -2686,17 +2723,29 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            producer.dispatch_matching_second_read_due_at_for_repository(
+        let generation = producer
+            .begin_dispatch_wedge_cycle(
+                &observation.authority.repository,
+                observation.authority.pull_request,
+                &observation.authority.pull_request_head,
+            )
+            .expect("cycle generation");
+        let result = producer
+            .process_dispatch_wedge_cycle_at_generation_with_followup_for_repository(
                 test_repository_provider(),
                 test_repository_id(),
                 &observation.authority.repository,
                 observation.authority.pull_request,
                 &observation.authority.pull_request_head,
+                generation,
                 &[current_mature_nonmatching, fresh_matching],
-            ),
-            Some(future)
+                300,
+            );
+        assert_eq!(
+            result.status.reason_code.as_deref(),
+            Some("matching_second_read_required")
         );
+        assert_eq!(result.matching_second_read_due_at, Some(future));
     }
 
     #[test]
@@ -2731,13 +2780,10 @@ mod tests {
         );
 
         assert_eq!(
-            producer.dispatch_matching_second_read_due_at_for_repository(
+            producer.dispatch_matching_second_read_due_at_for_observation(
                 test_repository_provider(),
                 test_repository_id(),
-                &observation.authority.repository,
-                observation.authority.pull_request,
-                &observation.authority.pull_request_head,
-                std::slice::from_ref(&observation),
+                &observation,
             ),
             Some(matured)
         );

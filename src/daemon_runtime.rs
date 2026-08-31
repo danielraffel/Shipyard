@@ -464,13 +464,14 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                             &completed.head_sha,
                             &[],
                             &status,
+                            None,
                         );
                     }
                 }
                 (true, Ok(cycle)) => match cycle.dispatch_observations {
                     Ok(observations) => {
-                        let status = actionable_producer
-                            .process_dispatch_wedge_cycle_at_generation_for_repository(
+                        let result = actionable_producer
+                            .process_dispatch_wedge_cycle_at_generation_with_followup_for_repository(
                                 &completed.repository_provider,
                                 &completed.repository_id,
                                 &completed.repository,
@@ -488,7 +489,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                             completed.pull_request,
                             &completed.head_sha,
                             &observations,
-                            &status,
+                            &result.status,
+                            result.matching_second_read_due_at,
                         );
                     }
                     Err(_) => {
@@ -531,8 +533,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 }
                 match target.result {
                     Ok(observations) => {
-                        let status = actionable_producer
-                            .process_dispatch_wedge_cycle_at_generation_for_repository(
+                        let result = actionable_producer
+                            .process_dispatch_wedge_cycle_at_generation_with_followup_for_repository(
                                 &completed.repository_provider,
                                 &completed.repository_id,
                                 &completed.repository,
@@ -550,7 +552,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                             target.pull_request,
                             &target.head_sha,
                             &observations,
-                            &status,
+                            &result.status,
+                            result.matching_second_read_due_at,
                         );
                     }
                     Err(_) => {
@@ -887,6 +890,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                             &head_sha,
                             &[],
                             &status,
+                            None,
                         );
                     }
                 }
@@ -1332,21 +1336,14 @@ fn schedule_dispatch_followup(
     head_sha: &str,
     observations: &[crate::dispatch_wedge::DispatchWedgeObservation],
     status: &ActionableWakeProducerStatus,
+    matching_second_read_due_at: Option<chrono::DateTime<Utc>>,
 ) {
     if status.reason_code.as_deref() == Some("dispatch_wedge_cycle_superseded") {
         return;
     }
     let now = Utc::now();
     let due_at = match status.reason_code.as_deref() {
-        Some("matching_second_read_required") => producer
-            .dispatch_matching_second_read_due_at_for_repository(
-                repository_provider,
-                repository_id,
-                repository,
-                pull_request,
-                head_sha,
-                observations,
-            )
+        Some("matching_second_read_required") => matching_second_read_due_at
             .map(|due| due.max(now + chrono::Duration::seconds(1)))
             .or_else(|| Some(now + chrono::Duration::seconds(300))),
         Some(
@@ -2853,6 +2850,7 @@ mod tests {
             &"a".repeat(40),
             &[],
             &status,
+            None,
         );
         assert_eq!(
             producer
@@ -2867,6 +2865,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one integration regression keeps mixed-age classification, scheduling, and fairness coupled"
+    )]
     fn matching_second_read_sleeps_until_durable_checkpoint_deadline() {
         use crate::dispatch_wedge::{
             DispatchJobAuthority, DispatchRunnerObservation, DispatchWedgeObservation,
@@ -2907,21 +2909,55 @@ mod tests {
             }],
             observation_complete: true,
         };
-        let status = producer.process_dispatch_wedge_observation(&observation, 300);
+        let mut mature_nonmatching = observation.clone();
+        mature_nonmatching.runners.clear();
+        let first = producer.process_dispatch_wedge_observation(&mature_nonmatching, 1);
         assert_eq!(
-            status.reason_code.as_deref(),
+            first.reason_code.as_deref(),
             Some("matching_second_read_required")
         );
-        let expected = producer
-            .dispatch_matching_second_read_due_at_for_repository(
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let mature = producer.process_dispatch_wedge_observation(&mature_nonmatching, 1);
+        assert_eq!(
+            mature.reason_code.as_deref(),
+            Some("no_compatible_idle_runner")
+        );
+
+        let mut fresh_matching = observation.clone();
+        fresh_matching.authority.workflow_run_id = 102;
+        fresh_matching.authority.job_id = 304;
+        let generation = producer
+            .begin_dispatch_wedge_cycle_for_repository(
                 "github.com",
                 "R_test_repository",
                 "owner/repo",
                 42,
                 &"a".repeat(40),
-                std::slice::from_ref(&observation),
+            )
+            .expect("cycle generation");
+        let result = producer
+            .process_dispatch_wedge_cycle_at_generation_with_followup_for_repository(
+                "github.com",
+                "R_test_repository",
+                "owner/repo",
+                42,
+                &"a".repeat(40),
+                generation,
+                &[mature_nonmatching, fresh_matching.clone()],
+                300,
+            );
+        assert_eq!(
+            result.status.reason_code.as_deref(),
+            Some("matching_second_read_required")
+        );
+        let expected = producer
+            .dispatch_matching_second_read_due_at_for_observation(
+                "github.com",
+                "R_test_repository",
+                &fresh_matching,
             )
             .expect("durable checkpoint deadline");
+        assert_eq!(result.matching_second_read_due_at, Some(expected));
         schedule_dispatch_followup(
             &mut producer,
             "github.com",
@@ -2929,8 +2965,9 @@ mod tests {
             "owner/repo",
             42,
             &"a".repeat(40),
-            std::slice::from_ref(&observation),
-            &status,
+            &[fresh_matching],
+            &result.status,
+            result.matching_second_read_due_at,
         );
         let current = producer.status();
         let scheduled = current
