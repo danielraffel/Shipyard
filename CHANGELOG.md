@@ -3,6 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01370"></a>
+## [0.137.0] - 2026-08-31
+
+- fix(auth): install close guard during fleet rollout ([#516](https://github.com/danielraffel/Shipyard/pull/516))
+- test: stabilize supported-toolchain baselines ([#517](https://github.com/danielraffel/Shipyard/pull/517))
+- docs: clarify Shipyard coordination model ([#515](https://github.com/danielraffel/Shipyard/pull/515))
+
 <a id="v01360"></a>
 ## [0.136.0] - 2026-08-30
 
@@ -1204,6 +1211,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.137.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.137.0
 [0.136.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.136.0
 [0.135.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.135.0
 [0.134.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.134.0
