@@ -460,11 +460,23 @@ fn verify_checkout(path: &Path, marker: &CheckoutMarker) -> Result<(), String> {
 
 fn verify_tracked_and_unignored(path: &Path) -> Result<(), String> {
     let status = git_path(path, &["status", "--porcelain=v1", "--untracked-files=all"])?;
-    if status.is_empty() {
-        Ok(())
-    } else {
-        Err("integration checkout contains tracked or unignored content drift".to_owned())
+    if !status.is_empty() {
+        return Err("integration checkout contains tracked or unignored content drift".to_owned());
     }
+    let submodules = git_path(
+        path,
+        &[
+            "submodule",
+            "foreach",
+            "--recursive",
+            "--quiet",
+            "git status --porcelain=v1 --untracked-files=all",
+        ],
+    )?;
+    if !submodules.is_empty() {
+        return Err("integration submodule contains tracked or untracked content drift".to_owned());
+    }
+    Ok(())
 }
 
 fn verify_pristine(path: &Path) -> Result<(), String> {
@@ -1023,6 +1035,55 @@ mod tests {
         assert!(!checkout.path.join("untracked.txt").exists());
         drop(guard);
         cleanup(&checkout).unwrap();
+    }
+
+    #[test]
+    fn post_execution_check_detects_submodule_drift_hidden_by_ignore_all() {
+        let child = tempfile::tempdir().unwrap();
+        git(child.path(), &["init", "-q"]);
+        git(
+            child.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(child.path(), &["config", "user.name", "Test"]);
+        fs::write(child.path().join("tracked.txt"), "clean\n").unwrap();
+        git(child.path(), &["add", "."]);
+        git(child.path(), &["commit", "-qm", "child"]);
+
+        let parent = tempfile::tempdir().unwrap();
+        git(parent.path(), &["init", "-q"]);
+        git(
+            parent.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(parent.path(), &["config", "user.name", "Test"]);
+        git(
+            parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                child.path().to_str().unwrap(),
+                "vendor/child",
+            ],
+        );
+        fs::write(
+            parent.path().join(".gitmodules"),
+            format!(
+                "[submodule \"vendor/child\"]\n\tpath = vendor/child\n\turl = {}\n\tignore = all\n",
+                child.path().display()
+            ),
+        )
+        .unwrap();
+        git(parent.path(), &["add", "."]);
+        git(parent.path(), &["commit", "-qm", "parent"]);
+        fs::write(parent.path().join("vendor/child/tracked.txt"), "dirty\n").unwrap();
+
+        assert!(git(parent.path(), &["status", "--porcelain=v1"]).is_empty());
+        let error = verify_tracked_and_unignored(parent.path()).unwrap_err();
+        assert!(error.contains("integration submodule"));
     }
 
     #[test]
