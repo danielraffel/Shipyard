@@ -424,6 +424,7 @@ fn validate_repository_identity(
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn unique_base_ref(rows: &[String]) -> WorkLedgerResult<Option<String>> {
     match rows {
         [] => Ok(None),

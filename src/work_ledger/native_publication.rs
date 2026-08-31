@@ -1040,6 +1040,7 @@ pub(crate) fn verify_native_policy_binding(
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn verify_native_policy_binding_for_repository(
     state_dir: &Path,
     repository_provider: &str,
@@ -2323,6 +2324,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn immutable_repository_identity_prevents_slug_reuse_dedup_collision() {
         let temp = TempDir::new().expect("temp");
         let original = request();
@@ -2523,6 +2525,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn legacy_native_identity_is_enriched_in_place_and_replays_without_duplication() {
         let temp = TempDir::new().expect("temp");
         let request = request();

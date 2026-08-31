@@ -438,7 +438,7 @@ fn connect_immutable(database: &Path) -> WorkLedgerResult<Connection> {
     let path = pinned.to_str().ok_or_else(|| {
         WorkLedgerError::Refused("ledger database path is not valid UTF-8".to_owned())
     })?;
-    let normalized = path.replace('\\', "/");
+    let normalized = normalize_sqlite_uri_path(path)?;
     let mut uri = String::from("file:");
     for byte in normalized.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'.' | b'_' | b'-') {
@@ -463,6 +463,40 @@ fn connect_immutable(database: &Path) -> WorkLedgerResult<Connection> {
          PRAGMA temp_store = MEMORY;",
     )?;
     Ok(connection)
+}
+
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+fn normalize_sqlite_uri_path(path: &str) -> WorkLedgerResult<String> {
+    let normalized = path.replace('\\', "/");
+    #[cfg(windows)]
+    {
+        normalize_windows_sqlite_uri_path(&normalized)
+    }
+    #[cfg(not(windows))]
+    Ok(normalized)
+}
+
+#[cfg(any(windows, test))]
+fn normalize_windows_sqlite_uri_path(path: &str) -> WorkLedgerResult<String> {
+    if path.starts_with("//?/UNC/") {
+        return Err(WorkLedgerError::Refused(
+            "zero-write inventory does not support a UNC ledger path".to_owned(),
+        ));
+    }
+    let path = path.strip_prefix("//?/").unwrap_or(path);
+    if path.starts_with("//") {
+        return Err(WorkLedgerError::Refused(
+            "zero-write inventory does not support a UNC ledger path".to_owned(),
+        ));
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        Ok(format!("/{path}"))
+    } else {
+        Err(WorkLedgerError::Refused(
+            "zero-write inventory Windows ledger path is not absolute".to_owned(),
+        ))
+    }
 }
 
 fn validate_database_resources(connection: &Connection) -> WorkLedgerResult<()> {
@@ -668,12 +702,30 @@ fn is_canonical_identity_token(value: &str, max_bytes: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::collections::BTreeMap;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::time::SystemTime;
 
     use super::*;
     use crate::work_ledger::{ImportCandidate, LifecycleState, digest, opaque_ref};
+
+    #[test]
+    fn sqlite_uri_path_removes_windows_verbatim_authority_prefix() {
+        assert_eq!(
+            normalize_windows_sqlite_uri_path("//?/D:/state/work-items.sqlite3")
+                .expect("verbatim drive path"),
+            "/D:/state/work-items.sqlite3"
+        );
+        assert!(
+            normalize_windows_sqlite_uri_path("//?/UNC/server/share/work-items.sqlite3")
+                .unwrap_err()
+                .to_string()
+                .contains("UNC ledger path")
+        );
+    }
 
     fn candidate(repository: &str, pull_request: u64, head: &str, label: &str) -> ImportCandidate {
         ImportCandidate {

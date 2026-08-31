@@ -472,8 +472,14 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
             "--head must be a full 40-character SHA-1",
         ));
     }
-    crate::work_ledger::validate_workstream_handle(&args.workstream_id)
-        .map_err(|_| CliFailure::new(1, "--workstream-id must be a canonical GEN-style handle"))?;
+    if crate::work_ledger::validate_workstream_handle(&args.workstream_id).is_err()
+        && !is_legacy_pr_fallback(args)
+    {
+        return Err(CliFailure::new(
+            1,
+            "--workstream-id must be a canonical GEN-style handle",
+        ));
+    }
     if let Some(url) = args.context_url.as_deref()
         && !(url.starts_with("https://") || url.starts_with("http://"))
     {
@@ -498,6 +504,24 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
         ));
     }
     Ok(())
+}
+
+fn is_legacy_pr_fallback(args: &StewardHandoffArgs) -> bool {
+    args.launch_profile.is_none()
+        && !args.goal_managed
+        && args.agent_provider.is_none()
+        && args.agent_session_id.is_none()
+        && args.agent_parent_session_id.is_none()
+        && args.agent_surface_id.is_none()
+        && args.task_graph.is_none()
+        && args.after_handoff == "continue"
+        && !args.transfer_agent_owner
+        && args.repo.as_deref().is_some_and(|repository| {
+            let normalized = repository.to_ascii_lowercase();
+            normalized == repository
+                && normalized.split('/').count() == 2
+                && args.workstream_id == format!("{normalized}#{}", args.pr)
+        })
 }
 
 #[derive(Clone, Default)]
@@ -1252,6 +1276,7 @@ struct NativeSourceAuthority {
     base_sha: String,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn verify_native_repository_identity(
     actions: &GitHubActions,
     repository_provider: &str,
@@ -3335,6 +3360,28 @@ fn main() {{
             assert!(validate_args(&invalid).is_err(), "accepted {value:?}");
         }
         assert!(validate_args(&args()).is_ok());
+    }
+
+    #[test]
+    fn legacy_pr_fallback_is_exact_and_cannot_authorize_workstream_custody() {
+        let mut legacy = args();
+        legacy.workstream_id = "owner/repo#7".to_owned();
+        assert!(validate_args(&legacy).is_ok());
+
+        for invalid_id in ["owner/repo#8", "owner/other#7", "OWNER/repo#7"] {
+            let mut invalid = legacy.clone();
+            invalid.workstream_id = invalid_id.to_owned();
+            assert!(validate_args(&invalid).is_err(), "accepted {invalid_id:?}");
+        }
+
+        let mut managed = legacy.clone();
+        managed.goal_managed = true;
+        assert!(validate_args(&managed).is_err());
+
+        let mut routed = legacy;
+        routed.agent_provider = Some("codex".to_owned());
+        routed.agent_session_id = Some("session-7".to_owned());
+        assert!(validate_args(&routed).is_err());
     }
 
     #[test]
