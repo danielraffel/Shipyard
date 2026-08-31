@@ -1146,12 +1146,13 @@ mod tests {
         let (repo, receipt) = fixture();
         let parent = repo.path().join("isolated");
         let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        let expected_tracked = fs::read(checkout.path.join("base.txt")).unwrap();
         fs::write(checkout.path.join("base.txt"), "tampered\n").unwrap();
         fs::write(checkout.path.join("untracked.txt"), "tampered\n").unwrap();
         let guard = prepare_for_execution(&checkout).unwrap();
         assert_eq!(
-            fs::read_to_string(checkout.path.join("base.txt")).unwrap(),
-            "base\n"
+            fs::read(checkout.path.join("base.txt")).unwrap(),
+            expected_tracked
         );
         assert!(!checkout.path.join("untracked.txt").exists());
         drop(guard);
