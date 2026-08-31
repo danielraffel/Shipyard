@@ -498,11 +498,14 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                         );
                     }
                     Err(_) => {
-                        actionable_producer.invalidate_dispatch_wedge_scope_at_generation(
+                        actionable_producer.reschedule_dispatch_probe_after_failure_at_generation(
+                            &completed.repository_provider,
+                            &completed.repository_id,
                             &completed.repository,
                             target.pull_request,
                             &target.head_sha,
                             target.generation,
+                            Utc::now() + chrono::Duration::seconds(60),
                             "dispatch_wedge_observation_failed",
                         );
                     }

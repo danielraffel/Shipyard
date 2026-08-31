@@ -1073,6 +1073,67 @@ impl ActionableWakeProducer {
             .is_some_and(|target| target.generation == generation)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reschedule_dispatch_probe_after_failure_at_generation(
+        &mut self,
+        repository_provider: &str,
+        repository_id: &str,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+        generation: u64,
+        due_at: chrono::DateTime<Utc>,
+        reason: &str,
+    ) -> ActionableWakeProducerStatus {
+        if !self.dispatch_state_available {
+            return self.record(
+                repository.to_owned(),
+                pull_request,
+                head_sha.to_owned(),
+                "uncertain",
+                Some("dispatch_probe_state_unreadable".to_owned()),
+                false,
+            );
+        }
+        let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        let previous = self.status.dispatch_targets.get(&key).cloned();
+        let Some(target) = self.status.dispatch_targets.get_mut(&key) else {
+            return self.status();
+        };
+        if target.generation != generation
+            || target.repository_provider != repository_provider
+            || target.repository_id != repository_id
+        {
+            return self.status();
+        }
+        if target.pending_publication.is_some() {
+            return self.publish_pending_dispatch_wedge(repository, pull_request, head_sha);
+        }
+        target.observations.clear();
+        target.schedule = Some(DispatchProbeSchedule {
+            repository_provider: repository_provider.to_owned(),
+            repository_id: repository_id.to_owned(),
+            repository: repository.to_owned(),
+            pull_request,
+            head_sha: head_sha.to_owned(),
+            due_at: due_at.to_rfc3339(),
+        });
+        let status = self.record(
+            repository.to_owned(),
+            pull_request,
+            head_sha.to_owned(),
+            "uncertain",
+            Some(reason.to_owned()),
+            false,
+        );
+        if status.state == "status_persistence_error"
+            && let Some(previous) = previous
+        {
+            self.status.dispatch_targets.insert(key, previous);
+        }
+        status
+    }
+
     #[cfg(test)]
     pub(crate) fn schedule_dispatch_probe(
         &mut self,
@@ -2724,6 +2785,70 @@ mod tests {
             aggregate.reason_code.as_deref(),
             Some("matching_second_read_required")
         );
+    }
+
+    #[test]
+    fn transient_probe_failure_invalidates_evidence_and_restarts_with_backoff() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now(),
+        );
+        let generation = producer
+            .begin_dispatch_wedge_cycle_for_repository(
+                test_repository_provider(),
+                test_repository_id(),
+                &observation.authority.repository,
+                observation.authority.pull_request,
+                &observation.authority.pull_request_head,
+            )
+            .expect("generation");
+        let first = producer.process_dispatch_wedge_cycle_at_generation(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            generation,
+            std::slice::from_ref(&observation),
+            300,
+        );
+        assert_eq!(
+            first.reason_code.as_deref(),
+            Some("matching_second_read_required")
+        );
+
+        let retry_at = Utc::now() + chrono::Duration::seconds(60);
+        let failed = producer.reschedule_dispatch_probe_after_failure_at_generation(
+            test_repository_provider(),
+            test_repository_id(),
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            generation,
+            retry_at,
+            "dispatch_wedge_observation_failed",
+        );
+        assert_eq!(
+            failed.reason_code.as_deref(),
+            Some("dispatch_wedge_observation_failed")
+        );
+        let checkpoint = producer
+            .status
+            .dispatch_targets
+            .values()
+            .next()
+            .expect("target retained");
+        assert!(checkpoint.observations.is_empty());
+        assert!(checkpoint.schedule.is_some());
+
+        let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        let due = restarted.due_dispatch_probes(retry_at + chrono::Duration::seconds(1), 10);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].pull_request, observation.authority.pull_request);
+        assert_eq!(due[0].repository_id, test_repository_id());
     }
 
     #[test]
