@@ -379,6 +379,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         }
         while let Ok(completed) = steward_rx.try_recv() {
             let completed_target = normalized_dispatch_target(
+                &completed.repository_provider,
+                &completed.repository_id,
                 &completed.repository,
                 completed.pull_request,
                 &completed.head_sha,
@@ -444,6 +446,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                         ));
                         steward_retry_not_before.insert(
                             normalized_dispatch_target(
+                                &completed.repository_provider,
+                                &completed.repository_id,
                                 &completed.repository,
                                 completed.pull_request,
                                 &completed.head_sha,
@@ -509,6 +513,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             ));
             for target in completed.targets {
                 dispatch_probes_in_flight.remove(&normalized_dispatch_target(
+                    &completed.repository_provider,
+                    &completed.repository_id,
                     &completed.repository,
                     target.pull_request,
                     &target.head_sha,
@@ -623,6 +629,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 match classify_native_base_ref_lookup(base_ref) {
                     NativeBaseRefLookup::Available(base_ref) => {
                         dispatch_probes_in_flight.insert(normalized_dispatch_target(
+                            &schedule.repository_provider,
+                            &schedule.repository_id,
                             &schedule.repository,
                             schedule.pull_request,
                             &schedule.head_sha,
@@ -680,6 +688,11 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         let shadow_transitions = shadow_lane.tick(Instant::now());
         for observation in shadow_lane.take_completed_observations() {
             steward_retry_not_before.remove(&normalized_dispatch_target(
+                observation
+                    .repository_provider
+                    .as_deref()
+                    .unwrap_or_default(),
+                observation.repository_id.as_deref().unwrap_or_default(),
                 &observation.repo,
                 observation.pr,
                 &observation.expected_head_sha,
@@ -700,12 +713,16 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                         |(provider, repository_id, repository, pull_request, head_sha)| {
                             let retry_due = steward_retry_not_before
                                 .get(&normalized_dispatch_target(
+                                    provider.as_deref().unwrap_or_default(),
+                                    repository_id.as_deref().unwrap_or_default(),
                                     repository,
                                     *pull_request,
                                     head_sha,
                                 ))
                                 .is_none_or(|not_before| *not_before <= Utc::now());
                             !dispatch_probes_in_flight.contains(&normalized_dispatch_target(
+                                provider.as_deref().unwrap_or_default(),
+                                repository_id.as_deref().unwrap_or_default(),
                                 repository,
                                 *pull_request,
                                 head_sha,
@@ -732,6 +749,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 head_sha.clone(),
             ));
             steward_retry_not_before.remove(&normalized_dispatch_target(
+                repository_provider.as_deref().unwrap_or_default(),
+                repository_id.as_deref().unwrap_or_default(),
                 &repository,
                 pull_request,
                 &head_sha,
@@ -762,7 +781,13 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                     head_sha.clone(),
                 ));
                 steward_retry_not_before.insert(
-                    normalized_dispatch_target(&repository, pull_request, &head_sha),
+                    normalized_dispatch_target(
+                        &repository_provider,
+                        &repository_id,
+                        &repository,
+                        pull_request,
+                        &head_sha,
+                    ),
                     Utc::now() + chrono::Duration::seconds(60),
                 );
                 continue;
@@ -789,7 +814,13 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                         &repository_id,
                     ));
                     steward_target_in_flight = Some((
-                        normalized_dispatch_target(&repository, pull_request, &head_sha),
+                        normalized_dispatch_target(
+                            &repository_provider,
+                            &repository_id,
+                            &repository,
+                            pull_request,
+                            &head_sha,
+                        ),
                         generation,
                     ));
                     start_daemon_steward_worker(
@@ -837,7 +868,13 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                             head_sha.clone(),
                         ));
                         steward_retry_not_before.insert(
-                            normalized_dispatch_target(&repository, pull_request, &head_sha),
+                            normalized_dispatch_target(
+                                &repository_provider,
+                                &repository_id,
+                                &repository,
+                                pull_request,
+                                &head_sha,
+                            ),
                             Utc::now() + chrono::Duration::seconds(60),
                         );
                     } else {
@@ -1031,7 +1068,7 @@ struct DispatchProbeBatch {
 #[cfg(unix)]
 fn select_due_dispatch_probe_batches(
     due: Vec<crate::actionable_wake_producer::DispatchProbeSchedule>,
-    targets_in_flight: &BTreeSet<(String, u64, String)>,
+    targets_in_flight: &BTreeSet<NormalizedDispatchTarget>,
     repositories_in_flight: &BTreeSet<(String, String)>,
     limit: usize,
 ) -> Vec<DispatchProbeBatch> {
@@ -1039,6 +1076,8 @@ fn select_due_dispatch_probe_batches(
     let mut selected: BTreeMap<(String, String), usize> = BTreeMap::new();
     for schedule in due {
         if targets_in_flight.contains(&normalized_dispatch_target(
+            &schedule.repository_provider,
+            &schedule.repository_id,
             &schedule.repository,
             schedule.pull_request,
             &schedule.head_sha,
@@ -1079,12 +1118,19 @@ fn normalized_dispatch_repository(
 }
 
 #[cfg(unix)]
+type NormalizedDispatchTarget = (String, String, String, u64, String);
+
+#[cfg(unix)]
 fn normalized_dispatch_target(
+    repository_provider: &str,
+    repository_id: &str,
     repository: &str,
     pull_request: u64,
     head_sha: &str,
-) -> (String, u64, String) {
+) -> NormalizedDispatchTarget {
     (
+        repository_provider.to_ascii_lowercase(),
+        repository_id.to_owned(),
         repository.to_ascii_lowercase(),
         pull_request,
         head_sha.to_ascii_lowercase(),
@@ -1094,8 +1140,8 @@ fn normalized_dispatch_target(
 #[cfg(unix)]
 fn release_steward_ownership(
     steward_in_flight: &mut bool,
-    owner: &mut Option<((String, u64, String), u64)>,
-    completed_target: &(String, u64, String),
+    owner: &mut Option<(NormalizedDispatchTarget, u64)>,
+    completed_target: &NormalizedDispatchTarget,
     completed_generation: u64,
 ) -> bool {
     if owner.as_ref().is_none_or(|(target, generation)| {
@@ -2860,7 +2906,13 @@ mod tests {
             due_at: "2026-08-31T00:00:00+00:00".to_owned(),
         };
         let due = vec![schedule(1), schedule(2), schedule(3)];
-        let in_flight = BTreeSet::from([("owner/repo-1".to_owned(), 1, format!("{:040x}", 1))]);
+        let in_flight = BTreeSet::from([normalized_dispatch_target(
+            "github",
+            "R_1",
+            "owner/repo-1",
+            1,
+            &format!("{:040x}", 1),
+        )]);
         let selected = select_due_dispatch_probe_batches(due, &in_flight, &BTreeSet::new(), 2);
         assert_eq!(
             selected
@@ -3038,6 +3090,8 @@ mod tests {
             due_at: "2026-08-31T00:00:00+00:00".to_owned(),
         }];
         let in_flight = BTreeSet::from([normalized_dispatch_target(
+            "GITHUB",
+            "R_exact",
             "owner/repo",
             42,
             &"a".repeat(40),
@@ -3047,8 +3101,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn distinct_repository_identity_does_not_inherit_target_occupancy() {
+        let due = vec![crate::actionable_wake_producer::DispatchProbeSchedule {
+            repository_provider: "enterprise.example".to_owned(),
+            repository_id: "R_second".to_owned(),
+            repository: "owner/repo".to_owned(),
+            pull_request: 42,
+            head_sha: "a".repeat(40),
+            due_at: "2026-08-31T00:00:00+00:00".to_owned(),
+        }];
+        let in_flight = BTreeSet::from([normalized_dispatch_target(
+            "github.com",
+            "R_first",
+            "owner/repo",
+            42,
+            &"a".repeat(40),
+        )]);
+        let selected = select_due_dispatch_probe_batches(due, &in_flight, &BTreeSet::new(), 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].repository_id, "R_second");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stale_completion_cannot_split_global_and_target_ownership() {
-        let target = normalized_dispatch_target("owner/repo", 42, &"a".repeat(40));
+        let target =
+            normalized_dispatch_target("github.com", "R_exact", "owner/repo", 42, &"a".repeat(40));
         let mut steward_in_flight = true;
         let mut owner = Some((target.clone(), 2));
         assert!(!release_steward_ownership(
@@ -3067,6 +3145,33 @@ mod tests {
         ));
         assert!(!steward_in_flight);
         assert!(owner.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_repository_identity_cannot_clear_or_inherit_retry_and_ownership() {
+        let first =
+            normalized_dispatch_target("github.com", "R_first", "owner/repo", 42, &"a".repeat(40));
+        let second = normalized_dispatch_target(
+            "enterprise.example",
+            "R_second",
+            "owner/repo",
+            42,
+            &"a".repeat(40),
+        );
+        let retry_not_before = BTreeMap::from([(first.clone(), Utc::now())]);
+        assert!(!retry_not_before.contains_key(&second));
+
+        let mut steward_in_flight = true;
+        let mut owner = Some((first.clone(), 7));
+        assert!(!release_steward_ownership(
+            &mut steward_in_flight,
+            &mut owner,
+            &second,
+            7,
+        ));
+        assert!(steward_in_flight);
+        assert_eq!(owner, Some((first, 7)));
     }
 
     #[cfg(unix)]

@@ -74,6 +74,36 @@ struct NativeActionableAudit<'a> {
 }
 
 impl WorkLedger {
+    pub(crate) fn rekey_dispatch_probe_targets(
+        &self,
+        replacements: &BTreeMap<String, String>,
+    ) -> WorkLedgerResult<()> {
+        if replacements.values().collect::<BTreeSet<_>>().len() != replacements.len() {
+            return Err(WorkLedgerError::Refused(
+                "dispatch_probe_canonical_key_duplicated".to_owned(),
+            ));
+        }
+        let mut connection = self.connect_read_write()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (prior, canonical) in replacements {
+            if prior == canonical {
+                continue;
+            }
+            let changed = transaction.execute(
+                "UPDATE dispatch_probe_targets SET target_key = ?1 WHERE target_key = ?2",
+                params![canonical, prior],
+            )?;
+            if changed != 1 {
+                return Err(WorkLedgerError::Refused(
+                    "dispatch_probe_rekey_source_mismatch".to_owned(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn replace_dispatch_probe_targets(
         &self,
         records: &[DispatchProbeTargetRecord],

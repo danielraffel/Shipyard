@@ -172,9 +172,11 @@ impl ActionableWakeProducer {
             canonicalize_dispatch_target_keys(std::mem::take(&mut status.dispatch_targets));
         let dispatch_state = legacy_dispatch_targets.and_then(|legacy_dispatch_targets| {
             WorkLedger::open(&state_dir)
-                .and_then(|ledger| ledger.load_dispatch_probe_targets())
                 .map_err(|error| error.to_string())
-                .and_then(|records| {
+                .and_then(|ledger| {
+                    let records = ledger
+                        .load_dispatch_probe_targets()
+                        .map_err(|error| error.to_string())?;
                     if records.is_empty() && !legacy_dispatch_targets.is_empty() {
                         persist_dispatch_targets(&state_dir, &legacy_dispatch_targets)
                             .map_err(|error| error.to_string())?;
@@ -182,7 +184,27 @@ impl ActionableWakeProducer {
                             .map_err(|error| error.to_string())?;
                         Ok(legacy_dispatch_targets)
                     } else {
-                        decode_dispatch_target_records(records)
+                        let replacements = records
+                            .iter()
+                            .filter_map(|record| {
+                                let canonical = dispatch_scope_prefix(
+                                    &record.repository_provider,
+                                    &record.repository_id,
+                                    &record.repository,
+                                    record.pull_request,
+                                    &record.head_sha,
+                                );
+                                (record.target_key != canonical)
+                                    .then(|| (record.target_key.clone(), canonical))
+                            })
+                            .collect::<BTreeMap<_, _>>();
+                        let targets = decode_dispatch_target_records(records)?;
+                        if !replacements.is_empty() {
+                            ledger
+                                .rekey_dispatch_probe_targets(&replacements)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        Ok(targets)
                     }
                 })
         });
@@ -1112,6 +1134,20 @@ impl ActionableWakeProducer {
                 false,
             );
         };
+        if !pending
+            .repository_provider
+            .eq_ignore_ascii_case(repository_provider)
+            || pending.repository_id != repository_id
+        {
+            return self.record(
+                repository.to_owned(),
+                pull_request,
+                head_sha.to_owned(),
+                "uncertain",
+                Some("dispatch_wedge_pending_publication_identity_mismatch".to_owned()),
+                false,
+            );
+        }
         let publication = WorkLedger::open_existing(&self.state_dir).and_then(|ledger| {
             ledger.map_or_else(
                 || {
@@ -2103,6 +2139,18 @@ fn decode_dispatch_target_records(
         {
             return Err("dispatch target row and checkpoint payload disagree".to_owned());
         }
+        if checkpoint
+            .pending_publication
+            .as_ref()
+            .is_some_and(|pending| {
+                !pending
+                    .repository_provider
+                    .eq_ignore_ascii_case(&checkpoint.repository_provider)
+                    || pending.repository_id != checkpoint.repository_id
+            })
+        {
+            return Err("dispatch pending publication identity disagrees with target".to_owned());
+        }
         let key = dispatch_scope_prefix(
             &checkpoint.repository_provider,
             &checkpoint.repository_id,
@@ -2965,6 +3013,116 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn predecessor_sqlite_key_rekeys_atomically_without_losing_target_state() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now() - chrono::Duration::seconds(1),
+        );
+        let target = producer
+            .status
+            .dispatch_targets
+            .values_mut()
+            .next()
+            .expect("scheduled target");
+        target.observations.insert(
+            "durable-observation".to_owned(),
+            DispatchObservationCheckpoint {
+                digest: "evidence-digest".to_owned(),
+                not_before: Utc::now().to_rfc3339(),
+                boot_epoch: "prior-boot".to_owned(),
+            },
+        );
+        target.pending_publication = Some(DispatchPendingPublication {
+            repository_provider: target.repository_provider.clone(),
+            repository_id: target.repository_id.clone(),
+            base_ref: "main".to_owned(),
+            observation_digest: "observation-digest".to_owned(),
+            dedupe_key: "dedupe-key".to_owned(),
+            evidence_digest: "evidence-digest".to_owned(),
+        });
+        persist_dispatch_targets(state.path(), &producer.status.dispatch_targets)
+            .expect("persist complete predecessor state");
+        let expected = producer.status.dispatch_targets.clone();
+        let predecessor_key = format!(
+            "{}/{}/{}/",
+            observation.authority.repository.to_ascii_lowercase(),
+            observation.authority.pull_request,
+            observation.authority.pull_request_head.to_ascii_lowercase()
+        );
+        rusqlite::Connection::open(state.path().join("work-ledger/work-items.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE dispatch_probe_targets SET target_key = ?1",
+                [&predecessor_key],
+            )
+            .expect("install exact predecessor key");
+
+        let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        assert!(restarted.dispatch_state_available);
+        assert_eq!(restarted.status.dispatch_targets, expected);
+        let rows = WorkLedger::open_existing(state.path())
+            .unwrap()
+            .unwrap()
+            .load_dispatch_probe_targets()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].target_key,
+            dispatch_scope_prefix(
+                &rows[0].repository_provider,
+                &rows[0].repository_id,
+                &rows[0].repository,
+                rows[0].pull_request,
+                &rows[0].head_sha,
+            )
+        );
+        let second_restart = ActionableWakeProducer::new(state.path().to_path_buf());
+        assert_eq!(second_restart.status.dispatch_targets, expected);
+    }
+
+    #[test]
+    fn restart_refuses_pending_publication_for_different_repository_identity() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now() - chrono::Duration::seconds(1),
+        );
+        let target = producer
+            .status
+            .dispatch_targets
+            .values_mut()
+            .next()
+            .expect("scheduled target");
+        target.pending_publication = Some(DispatchPendingPublication {
+            repository_provider: "enterprise.example".to_owned(),
+            repository_id: "R_other".to_owned(),
+            base_ref: "main".to_owned(),
+            observation_digest: "observation-digest".to_owned(),
+            dedupe_key: "dedupe-key".to_owned(),
+            evidence_digest: "evidence-digest".to_owned(),
+        });
+        persist_dispatch_targets(state.path(), &producer.status.dispatch_targets)
+            .expect("persist malformed control");
+
+        let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        assert!(!restarted.dispatch_state_available);
+        assert_eq!(
+            restarted.status.reason_code.as_deref(),
+            Some("dispatch_probe_state_unreadable")
+        );
+        assert!(restarted.status.dispatch_targets.is_empty());
     }
 
     #[test]
