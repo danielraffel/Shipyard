@@ -1,9 +1,145 @@
 #!/bin/bash
+# Shipyard-Auth-Generation-Contract: auth-selector-v1
 # Dual-mode GitHub App wrapper: an audited privileged gh command surface plus
 # a JSON-emitting `token` mode for Shipyard's token_command.
 set -euo pipefail
 
-helper="${SHIPYARD_GITHUB_APP_TOKEN_HELPER:-$HOME/.config/shipyard/bin/shipyard-github-app-token}"
+public_wrapper_path="${BASH_SOURCE[0]}"
+opened_wrapper_path=""
+if [[ -e "/proc/$$/fd/255" ]]; then
+    opened_wrapper_path="$(/usr/bin/readlink "/proc/$$/fd/255")"
+elif [[ -x /usr/sbin/lsof ]]; then
+    opened_wrapper_metadata="$(/usr/sbin/lsof -a -p "$$" -d 255 -Fn 2>/dev/null)" || {
+        echo "ghapp: cannot bind the executing wrapper to its opened file" >&2
+        exit 1
+    }
+    while IFS= read -r opened_wrapper_field; do
+        case "$opened_wrapper_field" in
+            n/*)
+                if [[ -n "$opened_wrapper_path" ]]; then
+                    echo "ghapp: executing wrapper identity was ambiguous" >&2
+                    exit 1
+                fi
+                opened_wrapper_path="${opened_wrapper_field#n}"
+                ;;
+        esac
+    done <<< "$opened_wrapper_metadata"
+else
+    echo "ghapp: cannot bind the executing wrapper to its opened file" >&2
+    exit 1
+fi
+if [[ -z "$opened_wrapper_path" || ! -f "$opened_wrapper_path" || \
+      -L "$opened_wrapper_path" || ! -x "$opened_wrapper_path" ]]; then
+    echo "ghapp: executing wrapper identity was malformed or unsafe" >&2
+    exit 1
+fi
+wrapper_path="$opened_wrapper_path"
+generation_id=""
+generation_store_candidate="$HOME/.local/share/shipyard/auth-generations"
+opened_generation_store=""
+if [[ -d "$generation_store_candidate" && ! -L "$generation_store_candidate" ]]; then
+    opened_generation_store="$(cd "$generation_store_candidate" && pwd -P)"
+fi
+opened_generation_root="${opened_generation_store:+$opened_generation_store/}"
+if [[ -n "$opened_generation_root" && "$opened_wrapper_path" == "$opened_generation_root"* ]]; then
+    generation_tail="${opened_wrapper_path#"$opened_generation_root"}"
+    generation_id="${generation_tail%%/*}"
+    generation_store="$generation_store_candidate"
+    generation_root="$generation_store/"
+    generation_dir="$generation_store/$generation_id"
+    generation_wrapper="$generation_dir/ghapp"
+    if [[ ! "$generation_id" =~ ^[0-9a-f]{64}$ || \
+          "$generation_tail" != "$generation_id/ghapp" || \
+          "$(cd "$generation_dir" 2>/dev/null && pwd -P)/ghapp" != "$opened_wrapper_path" || \
+          ! -f "$generation_wrapper" || -L "$generation_wrapper" || \
+          ! -x "$generation_wrapper" ]]; then
+        echo "ghapp: installed generation wrapper is malformed or unsafe" >&2
+        exit 1
+    fi
+    generation_parent="${generation_store%/auth-generations}"
+    generation_share="${generation_parent%/shipyard}"
+    generation_local="${generation_share%/share}"
+    generation_owner="$(/usr/bin/id -u)"
+    generation_owner_mode() {
+        local identity_path="$1"
+        local metadata=""
+        local owner=""
+        local mode=""
+        if metadata="$(LC_ALL=C /usr/bin/stat -f '%u|%Lp' "$identity_path" 2>/dev/null)"; then
+            :
+        elif metadata="$(LC_ALL=C /usr/bin/stat -c '%u|%a' "$identity_path" 2>/dev/null)"; then
+            :
+        else
+            return 1
+        fi
+        if [[ "$metadata" == *$'\n'* ]]; then
+            return 1
+        fi
+        IFS='|' read -r owner mode <<< "$metadata"
+        if [[ ! "$owner" =~ ^[0-9]+$ || ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+            return 1
+        fi
+        /usr/bin/printf '%s|%s\n' "$owner" "$mode"
+    }
+    validate_generation_directory() {
+        local directory="$1"
+        local required_mode="${2:-}"
+        local metadata=""
+        local owner=""
+        local mode=""
+        if [[ ! -d "$directory" || -L "$directory" ]] || \
+           ! metadata="$(generation_owner_mode "$directory")"; then
+            return 1
+        fi
+        IFS='|' read -r owner mode <<< "$metadata"
+        if [[ "$owner" != "$generation_owner" || ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+            return 1
+        fi
+        if [[ -n "$required_mode" ]]; then
+            [[ "$mode" == "$required_mode" ]]
+            return
+        fi
+        (( (8#$mode & 8#022) == 0 ))
+    }
+    for trusted_ancestor in "$HOME" "$generation_local" "$generation_share"; do
+        if ! validate_generation_directory "$trusted_ancestor"; then
+            echo "ghapp: installed generation ancestor is malformed or unsafe" >&2
+            exit 1
+        fi
+    done
+    for private_dir in "$generation_parent" "$generation_store" "$generation_dir"; do
+        if ! validate_generation_directory "$private_dir" 700; then
+            echo "ghapp: installed generation directory is malformed or unsafe" >&2
+            exit 1
+        fi
+    done
+    wrapper_path="$generation_wrapper"
+    helper="$generation_dir/shipyard-github-app-token"
+    generation_binary="$generation_dir/shipyard"
+    resolver_context="$generation_dir/ghapp.shipyard-context.json"
+    for executable_member in "$generation_wrapper" "$helper" "$generation_binary"; do
+        executable_identity="$(generation_owner_mode "$executable_member")" || executable_identity=""
+        if [[ ! -f "$executable_member" || -L "$executable_member" || ! -x "$executable_member" || \
+              "$executable_identity" != "$generation_owner|700" ]]; then
+            echo "ghapp: installed generation member is malformed or unsafe" >&2
+            exit 1
+        fi
+    done
+    context_identity="$(generation_owner_mode "$resolver_context")" || context_identity=""
+    if [[ ! -f "$resolver_context" || -L "$resolver_context" || \
+          "$context_identity" != "$generation_owner|600" ]]; then
+        echo "ghapp: installed generation context is malformed or unsafe" >&2
+        exit 1
+    fi
+    unset -f validate_generation_directory generation_owner_mode
+    export SHIPYARD_GHAPP_GENERATION_ID="$generation_id"
+else
+    if [[ -L "$public_wrapper_path" ]]; then
+        echo "ghapp: public selector or generation store was malformed or unsafe" >&2
+        exit 1
+    fi
+    helper="${SHIPYARD_GITHUB_APP_TOKEN_HELPER:-$HOME/.config/shipyard/bin/shipyard-github-app-token}"
+fi
 cache_dir="${SHIPYARD_GITHUB_APP_CACHE_DIR:-}"
 guards="${SHIPYARD_GHAPP_GUARDS_DIR:-$HOME/.config/shipyard/guards}"
 trusted_path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -773,8 +909,7 @@ if [[ -z "$gh_binary" || "$gh_binary" != /* || ! -x "$gh_binary" ]]; then
     exit 1
 fi
 
-wrapper_path="${BASH_SOURCE[0]}"
-if [[ "$wrapper_path" != /* ]]; then
+if [[ "$public_wrapper_path" != /* || "$wrapper_path" != /* ]]; then
     echo "ghapp: wrapper must be invoked through an absolute installed path" >&2
     exit 1
 fi
@@ -783,7 +918,7 @@ if [[ ! -f "$shipyard_binary" || -L "$shipyard_binary" || ! -x "$shipyard_binary
     echo "ghapp: release-matched sibling shipyard resolver is unavailable" >&2
     exit 1
 fi
-resolver_context="${wrapper_path}.shipyard-context.json"
+resolver_context="${resolver_context:-${wrapper_path}.shipyard-context.json}"
 resolver_command=("$shipyard_binary")
 if [[ ! -e "$resolver_context" && ! -L "$resolver_context" ]]; then
     echo "ghapp: resolver context is required for direct mode" >&2
@@ -824,25 +959,39 @@ def load_private_json(path, maximum):
         if descriptor is not None:
             os.close(descriptor)
 value = load_private_json(sys.argv[1], 8192)
+expected_generation = sys.argv[2]
 required = {"schema_version", "mode", "global_dir"}
+if expected_generation:
+    required |= {"authority_identity", "generation_id"}
 mode = value.get("mode") if isinstance(value, dict) else None
 global_dir = value.get("global_dir") if isinstance(value, dict) else None
+authority_identity = value.get("authority_identity") if isinstance(value, dict) else None
+context_generation = value.get("generation_id") if isinstance(value, dict) else None
 if (
     not isinstance(value, dict)
     or set(value) != required
     or type(value.get("schema_version")) is not int
-    or value.get("schema_version") != 1
+    or value.get("schema_version") != (2 if expected_generation else 1)
     or mode not in {"shipyard", "isolated"}
     or not isinstance(global_dir, str)
     or not global_dir.startswith("/")
     or not 2 <= len(global_dir) <= 4096
     or any(unicodedata.category(ch) == "Cc" for ch in global_dir)
     or any(part in {"", ".", ".."} for part in global_dir.split("/")[1:])
+    or (
+        expected_generation
+        and (
+            not isinstance(authority_identity, str)
+            or len(authority_identity) != 64
+            or any(ch not in "0123456789abcdef" for ch in authority_identity)
+            or context_generation != expected_generation
+        )
+    )
 ):
     raise SystemExit("ghapp: resolver context is malformed or unsafe")
 for item in ("--mode", mode, "--global-dir", global_dir):
     sys.stdout.write(item + "\n")
-' "$resolver_context")
+' "$resolver_context" "$generation_id")
 if [[ "${#resolver_context_argv[@]}" != 4 || \
       "${resolver_context_argv[0]}" != "--mode" || \
       ( "${resolver_context_argv[1]}" != "shipyard" && "${resolver_context_argv[1]}" != "isolated" ) || \
@@ -853,7 +1002,7 @@ if [[ "${#resolver_context_argv[@]}" != 4 || \
 fi
 resolver_command+=("${resolver_context_argv[@]}")
 resolver_json="$(/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
-    "${resolver_command[@]}" auth helper-argv --wrapper "$wrapper_path" --repo "$repo" | \
+    "${resolver_command[@]}" auth helper-argv --wrapper "$public_wrapper_path" --repo "$repo" | \
     /usr/bin/head -c 16385)"
 unset resolver_command
 if [[ "${#resolver_json}" -gt 16384 ]]; then
@@ -899,7 +1048,7 @@ if (
     raise SystemExit("ghapp: shipyard helper-argv returned malformed JSON")
 for item in argv:
     sys.stdout.write(item + "\n")
-' "$wrapper_path" "$repo" <<<"$resolver_json")
+' "$public_wrapper_path" "$repo" <<<"$resolver_json")
 unset resolver_json
 if [[ "${#credential_argv[@]}" != 4 || \
       "${credential_argv[0]}" != "--app-id" || \

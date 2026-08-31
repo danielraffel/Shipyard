@@ -90,9 +90,22 @@ context. A post-install resolver probe runs before transaction commit, and
 failure rolls back helper, wrapper, context, CLI, and companion. The first
 transition from v0.130.x or older requires an ordinary exact-tag update on each
 host and migration to the exact machine-global wrapper command before the
-governed fleet pass; otherwise it refuses before download or mutation. Targets
-v0.100.0-v0.130.x retain the compatible four-target transaction and nine-line
-journal without that unavailable probe.
+governed fleet pass; otherwise it refuses before download or mutation. Older
+fleet-update releases v0.100.0-v0.130.x used the compatible four-target
+transaction and nine-line journal without that unavailable probe; the current
+client does not target them.
+
+Targets v0.134.0 and newer publish machine-global auth as a private,
+content-addressed generation containing the release-matched Shipyard binary,
+helper, wrapper, and typed context. The public wrapper is the final atomic
+selector: a running reader binds the wrapper file it actually opened (Linux
+`/proc` or macOS `lsof`) and resolves every sibling from that same generation,
+never from a second read of the mutable selector. Rollback reverses publication
+order, while crash recovery rolls back an unvalidated generation and rolls
+forward a validated or committed one. A rollout must not delete a published
+generation because an already-open wrapper may still need its siblings. Record
+generation count, generation bytes, and free disk for every host; reader-aware
+generation garbage collection is a separate dry-run-only follow-up.
 
 Native delivery also requires fresh exact-head/base-SHA GitHub App installation
 authority and a live terminal checkpoint. cmux workspace moves preserve surface

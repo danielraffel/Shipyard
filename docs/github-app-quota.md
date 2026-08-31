@@ -218,17 +218,19 @@ The wrapper decodes the resolver's bounded typed JSON without shell evaluation
 and appends its own GitHub Cloud API, cache, and resolved repository arguments.
 `ghapp token ...` remains the recursion-free helper mode Shipyard invokes from
 that configured command. Direct mode requires a strict 0600
-`ghapp.shipyard-context.json` sibling containing exactly `schema_version: 1`,
-`mode`, and the absolute normalized `global_dir`; missing, malformed, open-mode,
-oversized, FIFO, or symlink contexts fail closed. Fleet targets v0.131.0 and
-newer install it automatically. A manual or non-fleet installation must create
-the same typed context beside `ghapp`, using `shipyard` plus the default global
-directory reported by `shipyard paths` when no override is intended.
+`ghapp.shipyard-context.json` in the same validated auth generation as the
+wrapper. It binds `schema_version: 2`, `mode`, the absolute normalized
+`global_dir`, generation ID, and authority identity; missing, malformed,
+open-mode, oversized, FIFO, symlink, or mixed-generation contexts fail closed.
+Governed fleet targets v0.134.0 and newer install this as one content-addressed
+generation. A manual or non-fleet installation must provision an equivalent
+release-matched wrapper, binary, and typed context; do not combine independently
+copied members.
 
-The first `token_command` element may remain the fleet's configured `ghapp`
-wrapper path; tartci and host policy can continue referring to that same path.
-Update the wrapper in place on M1/M3/M5 so it forwards `--repo` to this helper
-without injecting a fixed installation id. Do not replace it with whichever
+The first `token_command` element remains the fleet's configured public
+`ghapp` path; tartci and host policy can continue referring to it. Under a
+governed rollout that path is an atomic selector into the validated immutable
+generation. Do not update its members in place or replace it with whichever
 `gh` happens to be on `PATH`.
 
 Normal CLI calls must also carry repository provenance: use `--repo`, a
@@ -282,11 +284,10 @@ but `token_command[0]` must remain the host's configured `ghapp` wrapper path:
 
 1. Record `shipyard paths` and the current sanitized `[github.auth]` shape with
    `shipyard auth export`. Do not copy or print a token or private key.
-2. Stage both `scripts/ghapp` and `scripts/shipyard-github-app-token`, compare
-   them with the reviewed release copies, then replace the helper first and the
-   wrapper second at their existing paths, using an atomic rename for each
-   file. Installing the wrapper first would send its new `--cache-dir` protocol
-   to an old helper. The dual-mode
+2. Use `shipyard runner fleet-update` to stage the release-matched helper,
+   wrapper, Shipyard CLI, optional workstream provider, resolver context, and
+   manifest under
+   `~/.local/share/shipyard/auth-generations/<generation-id>`. The dual-mode
    wrapper preserves the audited guarded `ghapp ...` automation surface
    (including merge, queue-removal, and PR-close guards when installed) and
    adds the `ghapp token ...` helper protocol. It intentionally rejects other
@@ -296,28 +297,37 @@ but `token_command[0]` must remain the host's configured `ghapp` wrapper path:
    execute before the guarded command. Install the PR-close guard as an
    all-command inspector; it recognizes `pr close`, issue aliases, REST, and
    GraphQL closure shapes itself.
-   Keep both executable; keep the config and
-   cache directories `0700` and App key/cache files `0600`; all must be owned
-   by the unattended account. The wrapper invokes the paired helper with an
+   Keep executable members mode `0700`; keep generation/config/cache
+   directories `0700` and manifests, contexts, App keys, and cache entries
+   `0600`; all must be owned by the unattended account. The wrapper invokes
+   the paired helper with an
    absolute trusted Python interpreter and exports the minted token directly to
    native `gh`, keeping token material out of process argv.
-   Governed `runner fleet-update` performs this sequence automatically when
+   Governed `runner fleet-update` performs this publication automatically when
    each host class declares absolute `github_cli` and `github_token_helper`
    paths. `github_cli` must be named `ghapp` beside the configured `shipyard`
    binary, and the helper path must explicitly equal the frozen wrapper contract,
    `$HOME/.config/shipyard/bin/shipyard-github-app-token`; fleet rollout checks
-   both before mutation. Its frozen release authority includes both exact source blobs; its
-   private recovery journal rolls back an interrupted helper-first install on
-   the next attempt. The first transition from v0.130.x or older to a
+   both before mutation. Its frozen release authority includes both exact
+   source blobs. The public helper, binary, companion, and context projections
+   are published to the same generation before the wrapper selector changes
+   last. A wrapper process binds its actual opened generation and never rereads
+   the mutable selector to find sibling members. The private recovery journal
+   rolls back an unvalidated transition and rolls forward a validated or
+   committed generation on the next attempt. It never deletes a published
+   generation during recovery because an already-open reader may still need
+   its siblings. The first transition from v0.130.x or older to a
    resolver-capable target requires an ordinary exact-tag update on each host,
    followed by migration to the exact wrapper command above; the governed fleet
    update then verifies and commits the complete state. Without that predeployment
-   it refuses before download or mutation. For targets v0.131.0 and newer, before committing the five-artifact transaction, the new
-   binary must resolve the new wrapper against the host class's exact
-   `shipyard_mode` and `shipyard_global_dir`; probe failure restores the prior
-   helper, wrapper, resolver context, Shipyard binary, and companion. Targets
-   v0.100.0 through v0.130.x retain the compatible four-target, nine-line-journal
-   transaction without the unavailable resolver probe. It preserves the existing auth configuration and never
+   it refuses before download or mutation. For targets v0.134.0 and newer,
+   before selecting the new generation, the new binary must resolve the staged
+   wrapper against the host class's exact `shipyard_mode` and
+   `shipyard_global_dir`; probe failure leaves the prior selector and validated
+   generation available for recovery. Older fleet-update releases v0.100.0
+   through v0.130.x used the compatible four-target, nine-line-journal
+   transaction without the unavailable resolver probe; the current client does
+   not target them. It preserves the existing auth configuration and never
    emits a token or private-key value in plan or result evidence.
 3. Remove the fixed installation id and old single cache file from the wrapper.
    Configure the exact machine-global shape shown above, including one
@@ -330,9 +340,12 @@ but `token_command[0]` must remain the host's configured `ghapp` wrapper path:
    multi-remote checkout must fail;
    it must not reuse the previous repository's token.
 5. Restart the daemon only after both installation probes pass, then repeat the
-   probes through the daemon-served repository configuration. Roll back by
-   restoring the staged wrapper copy at the same path; do not restore the fixed
-   installation id as a multi-repository fallback.
+   probes through the daemon-served repository configuration. Treat the
+   machine-auth generation ID, selector target, authority identity, manifest,
+   and member digests as part of the rollout receipt. Rollback selects the
+   validated prior generation through the governed transaction; do not copy
+   individual members back in place or restore a fixed installation id as a
+   multi-repository fallback.
 
 This migration changes routing, not App permissions. A repository whose
 installation already has the required Webhooks permission does not need a

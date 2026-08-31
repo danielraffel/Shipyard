@@ -1,8 +1,8 @@
 # Rust Shipyard Release And Rollback
 
-Shipyard is Rust-backed by default as of `v0.51.0`. The current
-post-cutover release is `v0.51.1`, which includes the `cloud retarget`
-cancellation-denial diagnostics from issue `#265`.
+Shipyard is Rust-backed by default as of `v0.51.0`. This runbook is
+release-agnostic; substitute the exact candidate and rollback tags being
+validated rather than relying on a version copied from an earlier rollout.
 
 This page is now an operator runbook: how to validate the installed
 binary, how release artifacts are produced, how to test live webhook
@@ -31,7 +31,7 @@ shipyard --version
 sy --version
 shipyard --json doctor
 shipyard --json doctor --release-chain
-shipyard wait release v0.51.1 --repo danielraffel/Shipyard --timeout 60 --json
+shipyard wait release vX.Y.Z --repo danielraffel/Shipyard --timeout 60 --json
 codesign --verify --deep --strict "$(command -v shipyard)"
 ```
 
@@ -103,6 +103,13 @@ For a release that changes merge-queue behavior, add these fleet gates:
 6. Install the same release on every fleet host and verify both
    `shipyard --version` and the artifact checksum before activating the sole
    authority.
+7. For a generation-aware GitHub App rollout, record the wrapper selector,
+   machine-auth generation and authority IDs, manifest/member digests,
+   generation count and bytes, and free space on every host. Prove the loaded
+   daemon uses that same generation. Retain the prior generation for rollback;
+   cleanup is a separate reader-aware dry-run and must preserve every selected,
+   journal-referenced, rollback/rollforward-referenced, or open/ambiguous
+   generation.
 
 For release candidates, also validate the package/install path in an
 isolated sandbox:

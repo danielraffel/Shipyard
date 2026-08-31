@@ -279,10 +279,11 @@ wrapper, `token`, `--app-id VALUE`, `--private-key ABSOLUTE_PATH`, and literal
 credential shape through the sibling Shipyard binary; repository overlays,
 fixed installation IDs, API/cache arguments, and foreign wrappers fail before
 the token helper runs. Direct mode requires a strict 0600 typed
-`ghapp.shipyard-context.json` sibling; fleet writes it for targets v0.131.0 and
-newer so subsequent direct wrapper calls retain the configured runtime mode and
-global directory. Manual/non-fleet installs must provision the same context
-beside `ghapp`; missing or unsafe context fails closed.
+`ghapp.shipyard-context.json` in the same validated auth generation as the
+wrapper. Fleet targets v0.134.0 and newer bind the runtime mode, global
+directory, generation ID, and authority identity there. Manual/non-fleet
+installs must provision an equivalent release-matched wrapper, binary, and
+typed context; a missing, unsafe, or mixed-generation context fails closed.
 
 The command uses a stripped remote environment deliberately, invokes the
 configured absolute binary, bounds each host attempt to ten minutes, and
@@ -302,17 +303,30 @@ the profile actually owns; direct
 `shipyard update` continues to support env auth. A missing absolute profile
 path is reported as launch-
 environment drift, not as evidence that Homebrew, Tart, or Shipyard is
-uninstalled. Fleet rollout rejects targets older than v0.100.0 before mutation;
-use an older release's documented manual procedure when rollback crosses that
-bootstrap boundary.
+uninstalled. The current fleet rollout accepts only targets v0.134.0 and
+newer; use the target release's documented manual procedure when rollback
+crosses that capability boundary.
 
-For targets v0.131.0 and newer, fleet installation commits its helper, wrapper,
-resolver context, Shipyard binary, and companion
-transaction only after the newly installed Shipyard resolves the installed
-wrapper using the host class's exact mode and global directory. A resolver
-failure restores all five prior artifacts before the host can report success.
-Targets v0.100.0 through v0.130.x preserve the legacy four-target transaction
-and nine-line recovery journal, with no resolver context or unsupported probe.
+For targets v0.134.0 and newer, fleet installation stages the helper, wrapper,
+resolver context, Shipyard binary, optional companion, and manifest as one
+content-addressed directory under
+`~/.local/share/shipyard/auth-generations/<generation-id>`. It publishes the
+public helper, binary, companion, and context projections to that generation,
+then changes the public wrapper selector last. A running wrapper binds the
+generation from the file it actually opened and never follows the public
+selector again to resolve sibling members. The new Shipyard validates the
+complete generation using the host class's exact mode and global directory
+before the host can report success.
+
+The crash journal rolls back an unvalidated transition and rolls forward a
+validated or committed target. Recovery never removes a published generation:
+an already-open wrapper may still require its release-matched helper, binary,
+or context. Generation garbage collection is a separate reader-aware operation,
+not part of rollout or rollback.
+
+Older fleet-update releases v0.100.0 through v0.130.x used the legacy
+four-target transaction and nine-line recovery journal, with no resolver
+context or unsupported probe; the current client does not target them.
 
 Before any host can mutate, fleet rollout resolves the annotated release tag to
 its full tag-object, commit, and tree OIDs; binds the published release ID; and
@@ -323,8 +337,10 @@ the DMG to `danielraffel/Shipyard/.github/workflows/release.yml`, the exact tag
 ref, and source commit. A missing DMG attestation makes the release ineligible;
 an operator-provided tag or receipt cannot substitute for this verification.
 
-Each successful JSON host receipt carries that complete immutable authority and
-before/after primary and adjacent `shipyard-workstream-provider` paths,
+Each successful JSON host receipt carries that complete immutable authority,
+the selected machine-auth generation ID, authority identity, selector target,
+manifest and member digests, and before/after primary and adjacent
+`shipyard-workstream-provider` paths,
 versions, and double-observed SHA-256 values. Pre-install source provenance is
 explicitly unverified; post-install source identity is the canonical digest of
 the verified release authority. Paired releases from v0.127.0 onward must match

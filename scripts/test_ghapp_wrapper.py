@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -209,6 +211,212 @@ class GhappWrapperTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.resolver_context.chmod(0o600)
+
+    def install_generation_wrapper(self) -> list[Path]:
+        home = self.root / "home"
+        local = home / ".local"
+        share = local / "share"
+        shipyard = share / "shipyard"
+        generation_store = shipyard / "auth-generations"
+        generation = generation_store / ("a" * 64)
+        generation.mkdir(parents=True)
+        for ancestor in (home, local, share):
+            ancestor.chmod(0o755)
+        for private_dir in (shipyard, generation_store, generation):
+            private_dir.chmod(0o700)
+
+        generation_wrapper = generation / "ghapp"
+        generation_wrapper.write_bytes(WRAPPER.read_bytes())
+        generation_helper = generation / "shipyard-github-app-token"
+        generation_helper.write_bytes(self.helper.read_bytes())
+        generation_binary = generation / "shipyard"
+        generation_binary.write_bytes(self.shipyard.read_bytes())
+        for executable in (
+            generation_wrapper,
+            generation_helper,
+            generation_binary,
+        ):
+            executable.chmod(0o700)
+        context = generation / "ghapp.shipyard-context.json"
+        context.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "mode": "shipyard",
+                    "global_dir": str(self.root / "governed global"),
+                    "authority_identity": "b" * 64,
+                    "generation_id": "a" * 64,
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        context.chmod(0o600)
+
+        self.wrapper.unlink()
+        self.wrapper.symlink_to(generation_wrapper)
+        self.environment["HOME"] = str(home)
+        return [home, local, share, shipyard, generation_store, generation]
+
+    def test_generation_wrapper_accepts_safe_public_ancestors(self) -> None:
+        self.install_generation_wrapper()
+
+        result = self.run_wrapper(
+            "token", "--repo", "danielraffel/Shipyard"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"kind":"github-app-installation"', result.stdout)
+
+    def test_generation_wrapper_accepts_gnu_stat_fallback(self) -> None:
+        self.install_generation_wrapper()
+        generation_wrapper = self.wrapper.resolve()
+        gnu_stat = shutil.which("gstat")
+        native_is_gnu = subprocess.run(
+            ["/usr/bin/stat", "--version"],
+            text=True,
+            capture_output=True,
+            check=False,
+        ).returncode == 0
+        if not native_is_gnu:
+            if gnu_stat is None:
+                self.skipTest("GNU stat is unavailable on this BSD-stat host")
+            generation_wrapper.write_text(
+                generation_wrapper.read_text(encoding="utf-8").replace(
+                    "/usr/bin/stat", gnu_stat
+                ),
+                encoding="utf-8",
+            )
+            generation_wrapper.chmod(0o700)
+
+        result = self.run_wrapper(
+            "token", "--repo", "danielraffel/Shipyard"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"kind":"github-app-installation"', result.stdout)
+
+    def test_generation_wrapper_binds_the_file_opened_before_selector_swap(self) -> None:
+        self.install_generation_wrapper()
+        generation_a = self.wrapper.resolve().parent
+        generation_b = generation_a.parent / ("b" * 64)
+        shutil.copytree(generation_a, generation_b)
+        context_b = generation_b / "ghapp.shipyard-context.json"
+        payload = json.loads(context_b.read_text(encoding="utf-8"))
+        payload["generation_id"] = "b" * 64
+        context_b.write_text(
+            json.dumps(payload, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        context_b.chmod(0o600)
+        for generation, marker in ((generation_a, "A"), (generation_b, "B")):
+            binary = generation / "shipyard"
+            binary.write_text(
+                binary.read_text(encoding="utf-8").replace(
+                    "log.write(' '.join(sys.argv[1:]) + '\\n')",
+                    f"log.write('{marker} ' + ' '.join(sys.argv[1:]) + '\\n')",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+        started = self.root / "wrapper-opened"
+        release = self.root / "release-wrapper"
+        self.environment["SHIPYARD_TEST_RACE_STARTED"] = str(started)
+        self.environment["SHIPYARD_TEST_RACE_RELEASE"] = str(release)
+        blocker = (
+            '/usr/bin/touch "$SHIPYARD_TEST_RACE_STARTED"\n'
+            'while [[ ! -e "$SHIPYARD_TEST_RACE_RELEASE" ]]; do '
+            "/bin/sleep 0.01; done\n"
+        )
+        original = generation_a.joinpath("ghapp").read_text(encoding="utf-8")
+
+        def run_race(wrapper_text: str) -> subprocess.CompletedProcess[str]:
+            generation_a.joinpath("ghapp").write_text(
+                wrapper_text.replace("set -euo pipefail\n", f"set -euo pipefail\n{blocker}", 1),
+                encoding="utf-8",
+            )
+            generation_a.joinpath("ghapp").chmod(0o700)
+            self.wrapper.unlink()
+            self.wrapper.symlink_to(generation_a / "ghapp")
+            started.unlink(missing_ok=True)
+            release.unlink(missing_ok=True)
+            process = subprocess.Popen(
+                [str(self.wrapper), "pr", "view", "--repo", "danielraffel/Shipyard"],
+                cwd=self.root,
+                env=self.environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 5
+            while not started.exists() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    self.fail("wrapper did not reach the selector race boundary")
+                time.sleep(0.01)
+            next_selector = self.wrapper.with_name("ghapp.next")
+            next_selector.symlink_to(generation_b / "ghapp")
+            os.replace(next_selector, self.wrapper)
+            release.touch()
+            stdout, stderr = process.communicate(timeout=5)
+            return subprocess.CompletedProcess(
+                process.args, process.returncode, stdout, stderr
+            )
+
+        result = run_race(original)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            self.resolver_log.read_text(encoding="utf-8").startswith("A "),
+            "running wrapper did not retain its opened generation",
+        )
+
+        self.resolver_log.unlink()
+        selector_reread = original.replace(
+            'if [[ -z "$opened_wrapper_path" || ! -f "$opened_wrapper_path" || \\\n',
+            'opened_wrapper_path="$(/usr/bin/readlink "$public_wrapper_path")"\n'
+            'if [[ -z "$opened_wrapper_path" || ! -f "$opened_wrapper_path" || \\\n',
+            1,
+        )
+        self.assertNotEqual(selector_reread, original, "mutation control did not apply")
+        mutation = run_race(selector_reread)
+        self.assertEqual(mutation.returncode, 0, mutation.stderr)
+        self.assertTrue(
+            self.resolver_log.read_text(encoding="utf-8").startswith("B "),
+            "selector-reread mutation did not reproduce mixed-generation binding",
+        )
+
+    def test_generation_wrapper_rejects_writable_ancestor_chain(self) -> None:
+        ancestors = self.install_generation_wrapper()
+        for ancestor in ancestors:
+            with self.subTest(ancestor=ancestor):
+                original_mode = ancestor.stat().st_mode & 0o777
+                ancestor.chmod(0o733)
+                result = self.run_wrapper(
+                    "token", "--repo", "danielraffel/Shipyard"
+                )
+                ancestor.chmod(original_mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("malformed or unsafe", result.stderr)
+                self.assertFalse(self.helper_log.exists())
+
+    def test_generation_wrapper_rejects_symlinked_ancestor_chain(self) -> None:
+        ancestors = self.install_generation_wrapper()
+        for index in range(len(ancestors) - 1, -1, -1):
+            ancestor = ancestors[index]
+            with self.subTest(ancestor=ancestor):
+                real_ancestor = ancestor.with_name(f"{ancestor.name}-real")
+                ancestor.rename(real_ancestor)
+                ancestor.symlink_to(real_ancestor)
+                result = self.run_wrapper(
+                    "token", "--repo", "danielraffel/Shipyard"
+                )
+                ancestor.unlink()
+                real_ancestor.rename(ancestor)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("malformed or unsafe", result.stderr)
+                self.assertFalse(self.helper_log.exists())
 
     def test_token_mode_preserves_json_helper_contract(self) -> None:
         result = self.run_wrapper("token", "--repo", "danielraffel/Shipyard")
