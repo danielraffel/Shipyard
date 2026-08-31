@@ -1339,14 +1339,15 @@ fn schedule_dispatch_followup(
     let now = Utc::now();
     let due_at = match status.reason_code.as_deref() {
         Some("matching_second_read_required") => producer
-            .dispatch_second_read_due_at_for_repository(
+            .dispatch_matching_second_read_due_at_for_repository(
                 repository_provider,
                 repository_id,
                 repository,
                 pull_request,
                 head_sha,
-                now,
+                observations,
             )
+            .map(|due| due.max(now + chrono::Duration::seconds(1)))
             .or_else(|| Some(now + chrono::Duration::seconds(300))),
         Some(
             "dispatch_wedge_checkpoint_failed"
@@ -2912,13 +2913,13 @@ mod tests {
             Some("matching_second_read_required")
         );
         let expected = producer
-            .dispatch_second_read_due_at_for_repository(
+            .dispatch_matching_second_read_due_at_for_repository(
                 "github.com",
                 "R_test_repository",
                 "owner/repo",
                 42,
                 &"a".repeat(40),
-                Utc::now(),
+                std::slice::from_ref(&observation),
             )
             .expect("durable checkpoint deadline");
         schedule_dispatch_followup(

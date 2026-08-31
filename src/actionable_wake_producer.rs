@@ -1702,14 +1702,14 @@ impl ActionableWakeProducer {
         due
     }
 
-    pub(crate) fn dispatch_second_read_due_at_for_repository(
+    pub(crate) fn dispatch_matching_second_read_due_at_for_repository(
         &self,
         repository_provider: &str,
         repository_id: &str,
         repository: &str,
         pull_request: u64,
         head_sha: &str,
-        now: chrono::DateTime<Utc>,
+        observations: &[DispatchWedgeObservation],
     ) -> Option<chrono::DateTime<Utc>> {
         let key = dispatch_scope_prefix(
             repository_provider,
@@ -1718,17 +1718,34 @@ impl ActionableWakeProducer {
             pull_request,
             head_sha,
         );
-        self.status
-            .dispatch_targets
-            .get(&key)?
-            .observations
-            .values()
+        let target = self.status.dispatch_targets.get(&key)?;
+        observations
+            .iter()
+            .filter(|observation| {
+                observation
+                    .authority
+                    .repository
+                    .eq_ignore_ascii_case(repository)
+                    && observation.authority.pull_request == pull_request
+                    && observation
+                        .authority
+                        .pull_request_head
+                        .eq_ignore_ascii_case(head_sha)
+            })
+            .filter_map(|observation| {
+                let observation_key = dispatch_observation_key(&observation.authority);
+                let digest =
+                    dispatch_wedge_observation_digest(&observation.authority, &observation.runners);
+                target
+                    .observations
+                    .get(&observation_key)
+                    .filter(|checkpoint| checkpoint.digest == digest)
+            })
             .filter_map(|checkpoint| {
                 chrono::DateTime::parse_from_rfc3339(&checkpoint.not_before)
                     .ok()
                     .map(|due| due.with_timezone(&Utc))
             })
-            .filter(|due| *due > now)
             .min()
     }
 
@@ -2634,6 +2651,12 @@ mod tests {
         let now = Utc::now();
         let future = now + chrono::Duration::minutes(5);
         let boot_epoch = producer.boot_epoch.clone();
+        let prior_mature = observation.clone();
+        let mut current_mature_nonmatching = prior_mature.clone();
+        current_mature_nonmatching.runners.clear();
+        let mut fresh_matching = observation.clone();
+        fresh_matching.authority.workflow_run_id = 102;
+        fresh_matching.authority.job_id = 304;
         let target = producer
             .status
             .dispatch_targets
@@ -2641,32 +2664,82 @@ mod tests {
             .next()
             .expect("scheduled target");
         target.observations.insert(
-            "mature-nonmatching-job".to_owned(),
+            dispatch_observation_key(&prior_mature.authority),
             DispatchObservationCheckpoint {
-                digest: "old-digest".to_owned(),
+                digest: dispatch_wedge_observation_digest(
+                    &prior_mature.authority,
+                    &prior_mature.runners,
+                ),
                 not_before: (now - chrono::Duration::minutes(1)).to_rfc3339(),
                 boot_epoch: boot_epoch.clone(),
             },
         );
         target.observations.insert(
-            "fresh-matching-job".to_owned(),
+            dispatch_observation_key(&fresh_matching.authority),
             DispatchObservationCheckpoint {
-                digest: "new-digest".to_owned(),
+                digest: dispatch_wedge_observation_digest(
+                    &fresh_matching.authority,
+                    &fresh_matching.runners,
+                ),
                 not_before: future.to_rfc3339(),
                 boot_epoch,
             },
         );
 
         assert_eq!(
-            producer.dispatch_second_read_due_at_for_repository(
+            producer.dispatch_matching_second_read_due_at_for_repository(
                 test_repository_provider(),
                 test_repository_id(),
                 &observation.authority.repository,
                 observation.authority.pull_request,
                 &observation.authority.pull_request_head,
-                now,
+                &[current_mature_nonmatching, fresh_matching],
             ),
             Some(future)
+        );
+    }
+
+    #[test]
+    fn matching_deadline_that_just_matured_is_not_discarded() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now(),
+        );
+        let matured = Utc::now() - chrono::Duration::milliseconds(1);
+        let boot_epoch = producer.boot_epoch.clone();
+        let target = producer
+            .status
+            .dispatch_targets
+            .values_mut()
+            .next()
+            .expect("scheduled target");
+        target.observations.insert(
+            dispatch_observation_key(&observation.authority),
+            DispatchObservationCheckpoint {
+                digest: dispatch_wedge_observation_digest(
+                    &observation.authority,
+                    &observation.runners,
+                ),
+                not_before: matured.to_rfc3339(),
+                boot_epoch,
+            },
+        );
+
+        assert_eq!(
+            producer.dispatch_matching_second_read_due_at_for_repository(
+                test_repository_provider(),
+                test_repository_id(),
+                &observation.authority.repository,
+                observation.authority.pull_request,
+                &observation.authority.pull_request_head,
+                std::slice::from_ref(&observation),
+            ),
+            Some(matured)
         );
     }
 
