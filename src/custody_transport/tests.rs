@@ -474,7 +474,7 @@ fn custody_inventory_uses_the_pinned_fixed_argv_ssh_subsystem() {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nenv | sort > '{}'\nprintf '{{}}'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n/usr/bin/env | /usr/bin/sort > '{}'\nprintf '{{}}'\n",
             argv.display(),
             environment.display()
         ),
@@ -524,10 +524,13 @@ fn custody_inventory_uses_the_pinned_fixed_argv_ssh_subsystem() {
             4096,
         )
         .unwrap_err();
-    assert!(matches!(
-        error,
-        CustodyCarrierError::Refused(reason) if reason == "custody-response-malformed"
-    ));
+    assert!(
+        matches!(
+            &error,
+            CustodyCarrierError::Refused(reason) if reason == "custody-response-malformed"
+        ),
+        "unexpected carrier error: {error:?}"
+    );
     let argv = std::fs::read_to_string(argv).unwrap();
     assert!(argv.contains("-F\n/dev/null\n"));
     assert!(argv.contains("-s\n--\ncustody@example.invalid\nshipyard-custody-v1\n"));
