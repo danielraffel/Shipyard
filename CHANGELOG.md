@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01360"></a>
+## [0.136.0] - 2026-08-30
+
+- feature/live queue drain hold 20260830 ([#507](https://github.com/danielraffel/Shipyard/pull/507))
+
 <a id="v01350"></a>
 ## [0.135.0] - 2026-08-30
 
@@ -1199,6 +1204,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.136.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.136.0
 [0.135.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.135.0
 [0.134.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.134.0
 [0.133.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.133.0
