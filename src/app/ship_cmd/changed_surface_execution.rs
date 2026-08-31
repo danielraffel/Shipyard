@@ -8,10 +8,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::super::CliFailure;
-use super::super::changed_surface_cmd::{ChangedSurfacePlanArgs, observe_changed_surface_plan};
+use super::super::changed_surface_cmd::{
+    ChangedSurfacePlanArgs, observe_changed_surface_plan, observe_stale_base_shadow,
+};
 use crate::changed_surface::trial::{TrialIdentity, result_directory};
 use crate::changed_surface::{
-    ExecutionCommandTransport, ExecutionDisposition, plan_authoritative_execution,
+    ExecutionCommandTransport, ExecutionDisposition, FallbackReason, StaleBaseShadowReceipt,
+    plan_authoritative_execution,
 };
 use crate::config::LoadedConfig;
 use crate::evidence::canonical_repository;
@@ -417,6 +420,23 @@ pub(super) fn apply_changed_surface_execution(
                 continue;
             }
         };
+        if machine.mode == MachineMode::ShadowCompare
+            && observation.receipt.fallback_reason == Some(FallbackReason::StaleBase)
+            && matches!(disposition, ExecutionDisposition::Full { .. })
+        {
+            let (assessment, _) = observe_stale_base_shadow(&observation, cwd, &contract_digest)?;
+            let evidence_dir = result_dir(
+                state_dir,
+                repo,
+                pr,
+                &observation.receipt.head_sha,
+                &target.name,
+            );
+            // This is strictly shadow-only telemetry. A read-only assessment
+            // must never prevent the already-selected ordinary full fallback.
+            let _shadow_receipt_persisted =
+                persist_stale_base_shadow(&evidence_dir, &assessment).is_ok();
+        }
         let plan = match disposition {
             ExecutionDisposition::Bounded(plan) => plan,
             ExecutionDisposition::Full { reason } => {
@@ -663,6 +683,61 @@ fn persist_fallback_diagnostic(
         1,
         "cannot allocate immutable selector diagnostic",
     ))
+}
+
+fn persist_stale_base_shadow(
+    path: &Path,
+    receipt: &StaleBaseShadowReceipt,
+) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    fs::create_dir_all(path).map_err(|error| {
+        CliFailure::new(1, format!("create selector evidence directory: {error}"))
+    })?;
+    let payload = serde_json::to_vec_pretty(receipt)
+        .map_err(|error| CliFailure::new(1, format!("serialize stale-base shadow: {error}")))?;
+    let destination = path.join(format!(
+        "stale-base-shadow-{}-{}-{}.json",
+        receipt.live_protected_base_sha,
+        receipt.protected_base_delta_digest,
+        crate::changed_surface::stale_base_context_digest(receipt)
+    ));
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(mut file) => {
+            file.write_all(&payload)
+                .and_then(|()| file.write_all(b"\n"))
+                .and_then(|()| file.sync_all())
+                .map_err(|error| {
+                    CliFailure::new(1, format!("write stale-base shadow receipt: {error}"))
+                })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = fs::read(&destination).map_err(|error| {
+                CliFailure::new(1, format!("read stale-base shadow receipt: {error}"))
+            })?;
+            let mut expected = payload;
+            expected.push(b'\n');
+            if existing != expected {
+                return Err(CliFailure::new(
+                    1,
+                    "immutable stale-base shadow receipt already exists with different bytes",
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(CliFailure::new(
+                1,
+                format!("create stale-base shadow receipt: {error}"),
+            ));
+        }
+    }
+    #[cfg(unix)]
+    sync_directory(path)?;
+    Ok(())
 }
 
 #[cfg(unix)]

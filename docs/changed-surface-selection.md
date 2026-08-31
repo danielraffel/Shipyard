@@ -187,6 +187,23 @@ the stable reason when:
 - the head modifies `.shipyard/config.toml`, another declared policy/schema
   path, or declared test-topology path.
 
+`stale_base` remains one of those authoritative full-suite reasons. In trusted
+machine mode `shadow_compare`, Shipyard additionally computes a strictly
+shadow-only stale-base assessment. It reads both old and live base policies,
+the complete old-to-live delta, and a conflict-free synthesized integration
+tree; then it maps the cumulative base-plus-head surface through the live
+policy. The receipt binds repository/PR/head/tree, old and live base SHAs,
+merge base, integration tree, policy/workflow/validation-contract digests, and
+both changed-path digests. Harmless movement can therefore produce a bounded
+selection assessment, and an affected-family movement expands that selection.
+This release records the assessment but deliberately leaves the ordinary full
+validation unchanged: executing the bounded comparison requires a separately
+reviewed, exact integration-tree checkout boundary. Policy,
+topology, toolchain, producer-target, full-required, unmapped, conflicting, or
+incomplete movement remains full. This path always records
+`merge_authority: blocked_until_current_merge_tree`; it is not accepted by the
+authoritative planner and cannot satisfy a merge gate.
+
 An eligible bound always contains every baseline test plus the complete literal
 test set for every affected family and, for medium risk, every declared extended
 neighbor. A path that matches multiple families selects all of them and the
@@ -282,6 +299,10 @@ The command is read-only and reports one stable state under `trial.state`:
   validation-contract, workflow, selected-test, and selected-build-target
   identities; the selected and full return codes are zero; the full suite is
   explicitly authoritative; and the comparison verdict is `matched_pass`;
+- `terminal` (exit 0 for `blocked` or `full_required`, exit 1 for
+  `invalidated`): stale-base planning safely ended with an immutable typed
+  receipt instead of waiting indefinitely for an activation that should never
+  run;
 - `rejected` (exit 1): evidence is malformed, unsafe to read, non-passing,
   identity/digest-inconsistent, or ambiguous. More than one append-only result
   for the exact identity is intentionally ambiguous even if the files are
@@ -306,7 +327,10 @@ diagnostic duplicate that the adapter result schema does not emit, so trial
 status neither treats that duplicate as independent authority nor pretends to
 compare a field that is absent from the result.
 
-This status is comparison evidence only. It does not promote the selector,
+This status is comparison evidence only. A stale `recomputed` or `reused`
+assessment is terminal selection telemetry, not an execution result; receipt
+replay or head/tree/contract mismatch is invalidated. The status does not
+promote the selector,
 write a graduation decision, enqueue work, mutate a receipt, or replace any
 merge/release gate.
 

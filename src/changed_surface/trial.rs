@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Current stable trial-status schema.
-pub const TRIAL_STATUS_SCHEMA_VERSION: u32 = 1;
+pub const TRIAL_STATUS_SCHEMA_VERSION: u32 = 2;
 /// Result schema emitted by the current changed-surface adapter.
 const RESULT_RECEIPT_SCHEMA_VERSION: u32 = 2;
 
@@ -45,6 +45,9 @@ pub enum TrialState {
     Collecting,
     /// The single observed receipt is exact-bound and proves a matched pass.
     Ready,
+    /// Planning reached a safe terminal shadow-only disposition without a
+    /// runnable bounded activation.
+    Terminal,
     /// Observed evidence is malformed, contradictory, or non-passing.
     Rejected,
 }
@@ -76,6 +79,9 @@ pub struct TrialStatus {
     /// includes build-target selection telemetry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<TrialTiming>,
+    /// Typed stale-base result when planning terminated before activation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_disposition: Option<super::StaleBaseShadowDisposition>,
     /// Stable bounded reason for the current state.
     pub reason: String,
 }
@@ -205,6 +211,7 @@ pub fn evaluate_trial(
         result_receipt_count: results.len(),
         result_receipt: None,
         timing: None,
+        shadow_disposition: None,
         reason: "waiting_for_shadow_activation".to_owned(),
     };
 
@@ -247,6 +254,108 @@ pub fn evaluate_trial(
     status
 }
 
+/// Validate a terminal stale-base receipt when no runnable activation exists.
+#[must_use]
+pub fn evaluate_stale_base_terminal(
+    identity: &TrialIdentity,
+    receipt_file: ReceiptFile<'_>,
+) -> TrialStatus {
+    let mut status = TrialStatus {
+        schema_version: TRIAL_STATUS_SCHEMA_VERSION,
+        state: TrialState::Terminal,
+        repository: identity.repository.clone(),
+        pull_request: identity.pull_request,
+        target: identity.target.clone(),
+        head_sha: identity.head_sha.clone(),
+        activation_receipt: None,
+        result_receipt_count: 0,
+        result_receipt: Some(receipt_file.name.to_owned()),
+        timing: None,
+        shadow_disposition: Some(super::StaleBaseShadowDisposition::Invalidated),
+        reason: "malformed_stale_base_shadow_receipt".to_owned(),
+    };
+    if let Err(reason) = validate_identity(identity) {
+        reason.clone_into(&mut status.reason);
+        return status;
+    }
+    let Ok(receipt) = serde_json::from_slice::<super::StaleBaseShadowReceipt>(receipt_file.bytes)
+    else {
+        return status;
+    };
+    if receipt.schema_version != 1
+        || receipt.merge_authority != super::MergeAuthority::BlockedUntilCurrentMergeTree
+        || receipt.repository != identity.repository
+        || receipt.pull_request != identity.pull_request
+        || receipt.target != identity.target
+        || receipt.head_sha != identity.head_sha
+        || !valid_sha(&receipt.head_tree_sha)
+        || !valid_sha(&receipt.old_protected_base_sha)
+        || !valid_sha(&receipt.live_protected_base_sha)
+        || !valid_sha(&receipt.merge_base_sha)
+        || !valid_digest(&receipt.changed_paths_digest)
+        || !valid_digest(&receipt.protected_base_delta_digest)
+        || !valid_digest(&receipt.old_workflow_digest)
+        || !valid_digest(&receipt.live_workflow_digest)
+        || !valid_digest(&receipt.validation_contract_digest)
+        || !valid_digest(&receipt.integration_changed_paths_digest)
+    {
+        "stale_base_shadow_identity_or_contract_mismatch".clone_into(&mut status.reason);
+        return status;
+    }
+    status.shadow_disposition = Some(receipt.disposition);
+    match receipt.disposition {
+        super::StaleBaseShadowDisposition::Recomputed
+        | super::StaleBaseShadowDisposition::Reused => {
+            let selection_valid = receipt
+                .shadow_selection
+                .as_deref()
+                .is_some_and(|selection| {
+                    selection.planned_suite == super::PlannedSuite::Bounded
+                        && selection.authoritative_suite == super::PlannedSuite::Full
+                        && selection.shadow_only
+                        && selection.shadow_context_digest.as_deref()
+                            == Some(super::stale_base::stale_base_context_digest(&receipt).as_str())
+                        && selection.repository == receipt.repository
+                        && selection.pull_request == receipt.pull_request
+                        && selection.target == receipt.target
+                        && selection.head_sha == receipt.head_sha
+                        && selection.tree_sha == receipt.head_tree_sha
+                        && selection.pr_base_sha == receipt.live_protected_base_sha
+                        && selection.protected_ref_sha == receipt.live_protected_base_sha
+                        && selection.merge_base_sha == receipt.live_protected_base_sha
+                });
+            if !receipt
+                .integration_tree_sha
+                .as_deref()
+                .is_some_and(valid_sha)
+                || !receipt
+                    .old_policy_digest
+                    .as_deref()
+                    .is_some_and(valid_digest)
+                || !receipt
+                    .live_policy_digest
+                    .as_deref()
+                    .is_some_and(valid_digest)
+                || !selection_valid
+            {
+                status.state = TrialState::Terminal;
+                status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+                "stale_base_shadow_selection_mismatch".clone_into(&mut status.reason);
+                return status;
+            }
+            status.state = TrialState::Terminal;
+            status.reason = format!("stale_base_{}", disposition_name(receipt.disposition));
+        }
+        super::StaleBaseShadowDisposition::Blocked
+        | super::StaleBaseShadowDisposition::Invalidated
+        | super::StaleBaseShadowDisposition::FullRequired => {
+            status.state = TrialState::Terminal;
+            status.reason = format!("stale_base_{}", disposition_name(receipt.disposition));
+        }
+    }
+    status
+}
+
 /// Construct a stable rejection when the command boundary cannot safely read
 /// the receipt directory or one of its entries.
 #[must_use]
@@ -268,7 +377,18 @@ pub(crate) fn rejected_trial(
         result_receipt_count,
         result_receipt,
         timing: None,
+        shadow_disposition: None,
         reason: reason.to_owned(),
+    }
+}
+
+fn disposition_name(disposition: super::StaleBaseShadowDisposition) -> &'static str {
+    match disposition {
+        super::StaleBaseShadowDisposition::Reused => "reused",
+        super::StaleBaseShadowDisposition::Recomputed => "recomputed",
+        super::StaleBaseShadowDisposition::Blocked => "blocked",
+        super::StaleBaseShadowDisposition::Invalidated => "invalidated",
+        super::StaleBaseShadowDisposition::FullRequired => "full_required",
     }
 }
 

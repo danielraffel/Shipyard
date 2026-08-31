@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use super::CliFailure;
 use crate::changed_surface::{
     BuildType, ChangedSurfacePolicy, ExactHeadInput, ObservationStatus, PlannedSuite,
-    ProtectedRefStatus, SecondaryProof, SelectionReceipt, plan_selection, policy_from_toml,
+    ProtectedRefStatus, SecondaryProof, SelectionReceipt, StaleBaseShadowInput,
+    StaleBaseShadowReceipt, plan_selection, plan_stale_base_shadow, policy_from_toml,
 };
 use crate::config::LoadedConfig;
 use crate::evidence::EvidenceStore;
@@ -37,6 +38,120 @@ pub(crate) struct ChangedSurfaceObservation {
     pub(crate) input: ExactHeadInput,
     pub(crate) policy: Result<ChangedSurfacePolicy, String>,
     pub(crate) workflow_digest: String,
+}
+
+/// Recompute a strictly shadow-only stale-base plan from local, exact-object
+/// observations. Missing objects, conflicts, and truncated path reads are
+/// represented in the terminal assessment instead of guessed through.
+pub(crate) fn observe_stale_base_shadow(
+    observation: &ChangedSurfaceObservation,
+    cwd: &Path,
+    validation_contract_digest: &str,
+) -> Result<(StaleBaseShadowReceipt, Result<ChangedSurfacePolicy, String>), CliFailure> {
+    let exact = &observation.input;
+    let live_config = git_required(
+        cwd,
+        &[
+            "show",
+            &format!("{}:.shipyard/config.toml", exact.protected_ref_sha),
+        ],
+        "read selector policy from current protected base",
+    );
+    let live_workflow_digest = live_config.as_ref().map_or_else(
+        |_| String::new(),
+        |contents| format!("{:x}", Sha256::digest(contents.as_bytes())),
+    );
+    let live_policy = live_config
+        .map_err(|error| error.message)
+        .and_then(|contents| policy_from_toml(&contents, &exact.target));
+    let (protected_base_delta_paths, protected_base_delta_complete) = git_nul_paths(
+        cwd,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &format!("{}..{}", exact.pr_base_sha, exact.protected_ref_sha),
+        ],
+    )
+    .map_or((Vec::new(), false), |paths| (paths, true));
+    let (integration_tree_sha, integration_conflicted) =
+        synthesize_integration_tree(cwd, &exact.protected_ref_sha, &exact.pr_head_sha);
+    let (integration_changed_paths, integration_changed_paths_complete) = integration_tree_sha
+        .as_deref()
+        .filter(|_| !integration_conflicted)
+        .map_or((Vec::new(), false), |tree| {
+            git_nul_paths(
+                cwd,
+                &[
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    &format!("{}..{tree}", exact.protected_ref_sha),
+                ],
+            )
+            .map_or((Vec::new(), false), |paths| (paths, true))
+        });
+    let (live_base_tracked_paths, live_base_tracked_paths_complete) = git_nul_paths(
+        cwd,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            &exact.protected_ref_sha,
+        ],
+    )
+    .map_or((Vec::new(), false), |paths| (paths, true));
+    let assessment = plan_stale_base_shadow(
+        exact,
+        &StaleBaseShadowInput {
+            old_policy: observation.policy.clone(),
+            live_policy: live_policy.clone(),
+            old_workflow_digest: observation.workflow_digest.clone(),
+            live_workflow_digest,
+            validation_contract_digest: validation_contract_digest.to_owned(),
+            protected_base_delta_paths,
+            protected_base_delta_status: observation_status(protected_base_delta_complete),
+            integration_changed_paths,
+            integration_changed_paths_status: observation_status(
+                integration_changed_paths_complete,
+            ),
+            integration_tree_sha: integration_tree_sha.unwrap_or_default(),
+            integration_conflicted,
+            live_base_tracked_paths,
+            live_base_tracked_paths_status: observation_status(live_base_tracked_paths_complete),
+            candidate: None,
+        },
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok((assessment, live_policy))
+}
+
+fn observation_status(complete: bool) -> ObservationStatus {
+    if complete {
+        ObservationStatus::Complete
+    } else {
+        ObservationStatus::Incomplete
+    }
+}
+
+fn synthesize_integration_tree(cwd: &Path, live_base: &str, head: &str) -> (Option<String>, bool) {
+    let output = Command::new("git")
+        .args(["merge-tree", "--write-tree", live_base, head])
+        .current_dir(cwd)
+        .output();
+    let Ok(output) = output else {
+        return (None, true);
+    };
+    let tree = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_owned);
+    (tree, !output.status.success())
 }
 
 #[derive(Debug, Deserialize)]
@@ -595,6 +710,61 @@ mod tests {
             previous_filename: Some("schema/selector.json".to_owned()),
         }]);
         assert_eq!(paths, ["schema/selector.json", "docs/new.md"]);
+    }
+
+    #[test]
+    fn synthesized_integration_tree_reports_clean_and_conflicting_merges() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Shipyard Test"]);
+        git(&["config", "user.email", "shipyard@example.invalid"]);
+        fs::write(temp.path().join("base.txt"), "base\n").expect("base");
+        fs::write(temp.path().join("shared.txt"), "base\n").expect("shared");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+
+        git(&["checkout", "-qb", "head"]);
+        fs::write(temp.path().join("head.txt"), "head\n").expect("head");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "head"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "--detach", &base]);
+        fs::write(temp.path().join("live.txt"), "live\n").expect("live");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "live"]);
+        let live = git(&["rev-parse", "HEAD"]);
+
+        let (tree, conflicted) = synthesize_integration_tree(temp.path(), &live, &head);
+        assert!(!conflicted);
+        assert!(tree.is_some_and(|tree| tree.len() == 40));
+
+        git(&["checkout", "-q", "--detach", &base]);
+        fs::write(temp.path().join("shared.txt"), "head side\n").expect("head conflict");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "head conflict"]);
+        let conflict_head = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "--detach", &base]);
+        fs::write(temp.path().join("shared.txt"), "live side\n").expect("live conflict");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "live conflict"]);
+        let conflict_live = git(&["rev-parse", "HEAD"]);
+        let (_, conflicted) =
+            synthesize_integration_tree(temp.path(), &conflict_live, &conflict_head);
+        assert!(conflicted);
     }
 
     #[test]
