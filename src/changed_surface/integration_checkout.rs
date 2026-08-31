@@ -76,6 +76,8 @@ pub(crate) fn materialize(
     let source_common_dir = canonical_git_path(&source_repo, &source_common_dir)?;
     ensure_real_directory(checkout_parent)?;
     let checkout = checkout_parent.join(format!("shadow-{context_digest}"));
+    let lock_path = checkout_parent.join(format!("shadow-{context_digest}.lock"));
+    let _materialize_guard = acquire_fence(&lock_path)?;
     let evidence_dir = checkout_parent
         .parent()
         .ok_or_else(|| "integration checkout root has no evidence parent".to_owned())?
@@ -119,7 +121,7 @@ pub(crate) fn materialize(
         path: checkout,
         source_repo,
         evidence_dir,
-        lock_path: checkout_parent.join(format!("shadow-{}.lock", marker.context_digest)),
+        lock_path,
         marker,
     })
 }
@@ -128,19 +130,24 @@ pub(crate) fn materialize(
 /// command can start. The returned file must remain alive through execution,
 /// post-execution verification, and cleanup.
 pub(crate) fn prepare_for_execution(checkout: &IntegrationCheckout) -> Result<fs::File, String> {
+    let lock = acquire_fence(&checkout.lock_path)?;
+    verify_checkout(&checkout.path, &checkout.marker)?;
+    verify_marker(&checkout.path, &checkout.marker)?;
+    restore_pristine_checkout(&checkout.path)?;
+    verify_pristine(&checkout.path)?;
+    Ok(lock)
+}
+
+fn acquire_fence(path: &Path) -> Result<fs::File, String> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&checkout.lock_path)
+        .open(path)
         .map_err(|error| format!("open integration execution fence: {error}"))?;
     lock.try_lock_exclusive()
         .map_err(|error| format!("integration checkout is already owned: {error}"))?;
-    verify_checkout(&checkout.path, &checkout.marker)?;
-    verify_marker(&checkout.path, &checkout.marker)?;
-    restore_pristine_checkout(&checkout.path)?;
-    verify_pristine(&checkout.path)?;
     Ok(lock)
 }
 
@@ -548,6 +555,7 @@ mod tests {
         assert_eq!(reconciled.path, checkout.path);
         let guard = prepare_for_execution(&reconciled).unwrap();
         assert!(prepare_for_execution(&reconciled).is_err());
+        assert!(materialize(repo.path(), &parent, &receipt).is_err());
         drop(guard);
         cleanup(&reconciled).unwrap();
         assert!(!checkout.path.exists());
