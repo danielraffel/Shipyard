@@ -366,7 +366,7 @@ fn foreign_replacement_of_legacy_pid_is_preserved_at_release() {
     );
     assert_eq!(
         std::fs::read(&fixture.wrapper).expect("committed wrapper"),
-        NEW_WRAPPER
+        PUBLIC_TRAMPOLINE
     );
 }
 
@@ -402,7 +402,7 @@ fn resolver_failure_skips_refresh_and_refresh_failure_releases_both_lock_layers(
     );
     assert_eq!(
         std::fs::read(&fixture.wrapper).expect("committed wrapper"),
-        NEW_WRAPPER
+        PUBLIC_TRAMPOLINE
     );
     let guard = state.join("fleet-auth-support.guard");
     assert!(
@@ -436,6 +436,6 @@ fn post_commit_signal_is_never_reported_as_success() {
     );
     assert_eq!(
         std::fs::read(&fixture.wrapper).expect("committed wrapper"),
-        NEW_WRAPPER
+        PUBLIC_TRAMPOLINE
     );
 }

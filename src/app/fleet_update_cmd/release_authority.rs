@@ -24,6 +24,7 @@ const CHECKSUM_ASSET: &str = "checksums.sha256";
 const INSTALLER_PATH: &str = "install.sh";
 const AUTH_HELPER_PATH: &str = "scripts/shipyard-github-app-token";
 const AUTH_WRAPPER_PATH: &str = "scripts/ghapp";
+const PR_CLOSE_GUARD_PATH: &str = "scripts/ghapp_pr_close_guard.py";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -38,6 +39,7 @@ pub(super) struct ReleaseAuthority {
     pub(super) installer: InstallerAuthority,
     pub(super) auth_helper: SourceFileAuthority,
     pub(super) auth_wrapper: SourceFileAuthority,
+    pub(super) pr_close_guard: SourceFileAuthority,
     pub(super) checksum_manifest: ReleaseAssetAuthority,
     pub(super) platform_asset: ReleaseAssetAuthority,
     pub(super) identity_sha256: String,
@@ -262,6 +264,7 @@ impl ReleaseAuthorityVerifier for GitHubReleaseAuthorityVerifier<'_> {
         };
         let auth_helper = self.source_file_authority(commit_oid, AUTH_HELPER_PATH)?;
         let auth_wrapper = self.source_file_authority(commit_oid, AUTH_WRAPPER_PATH)?;
+        let pr_close_guard = self.source_file_authority(commit_oid, PR_CLOSE_GUARD_PATH)?;
 
         let release = self.api_json(&format!("repos/{repository}/releases/tags/{tag}"))?;
         if string(&release, "/tag_name", "release tag")? != tag
@@ -298,6 +301,7 @@ impl ReleaseAuthorityVerifier for GitHubReleaseAuthorityVerifier<'_> {
             installer: installer_authority,
             auth_helper,
             auth_wrapper,
+            pr_close_guard,
             checksum_manifest: checksum.with_attestation(None),
             platform_asset: platform.with_attestation(Some(platform_attestation)),
             identity_sha256: String::new(),

@@ -46,7 +46,7 @@ const REMOTE_MINIMAL_PATH: &str =
     "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const HOST_UPDATE_TIMEOUT: Duration = Duration::from_mins(10);
 const REMOTE_UPDATE_TIMEOUT: Duration = Duration::from_mins(9);
-const MIN_FLEET_UPDATE_TARGET: [u64; 3] = [0, 134, 0];
+const MIN_FLEET_UPDATE_TARGET: [u64; 3] = [0, 137, 0];
 const MIN_PAIRED_BINARY_TARGET: [u64; 3] = [0, 127, 0];
 const MIN_AUTH_RESOLVER_TARGET: [u64; 3] = [0, 131, 0];
 const COMPANION_BINARY_NAME: &str = "shipyard-workstream-provider";
@@ -373,7 +373,7 @@ fn normalize_exact_tag(raw: &str) -> Result<String, CliFailure> {
     if parsed.as_slice() < MIN_FLEET_UPDATE_TARGET.as_slice() {
         return Err(CliFailure::new(
             2,
-            "fleet-update requires v0.134.0 or newer with the authenticated atomic auth-selector generation capability; use the older release's documented manual rollback procedure",
+            "fleet-update requires v0.137.0 or newer with the authenticated sibling-guard auth generation capability; use the older release's documented manual rollback procedure",
         ));
     }
     Ok(format!("v{version}"))
@@ -748,6 +748,11 @@ fn test_release_authority(tag: &str) -> ReleaseAuthority {
             path: "scripts/ghapp".to_owned(),
             blob_oid: "d".repeat(40),
             sha256: "e".repeat(64),
+        },
+        pr_close_guard: release_authority::SourceFileAuthority {
+            path: "scripts/ghapp_pr_close_guard.py".to_owned(),
+            blob_oid: "f".repeat(40),
+            sha256: "0".repeat(64),
         },
         checksum_manifest: ReleaseAssetAuthority {
             id: 10,

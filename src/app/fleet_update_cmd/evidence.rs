@@ -68,6 +68,7 @@ pub(super) struct GenerationEvidence {
     pub(super) manifest: GenerationMemberEvidence,
     pub(super) helper: GenerationMemberEvidence,
     pub(super) wrapper: GenerationMemberEvidence,
+    pub(super) close_guard: GenerationMemberEvidence,
     pub(super) binary: GenerationMemberEvidence,
     pub(super) companion: Option<GenerationMemberEvidence>,
     pub(super) context: Option<GenerationMemberEvidence>,
@@ -92,6 +93,8 @@ pub(super) const REMOTE_GENERATION_HELPER_SHA_PREFIX: &str =
     "SHIPYARD_FLEET_GENERATION_HELPER_SHA256=";
 pub(super) const REMOTE_GENERATION_WRAPPER_SHA_PREFIX: &str =
     "SHIPYARD_FLEET_GENERATION_WRAPPER_SHA256=";
+pub(super) const REMOTE_GENERATION_CLOSE_GUARD_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_GENERATION_CLOSE_GUARD_SHA256=";
 pub(super) const REMOTE_GENERATION_BINARY_SHA_PREFIX: &str =
     "SHIPYARD_FLEET_GENERATION_BINARY_SHA256=";
 pub(super) const REMOTE_GENERATION_COMPANION_SHA_PREFIX: &str =
@@ -563,6 +566,7 @@ fn collect_local_generation(
     let helper =
         collect_generation_member(&generation_dir.join("shipyard-github-app-token"), 0o700)?;
     let wrapper = collect_generation_member(&generation_dir.join("ghapp"), 0o700)?;
+    let close_guard = collect_generation_member(&generation_dir.join("pr-close-guard"), 0o700)?;
     let binary = collect_generation_member(&generation_dir.join("shipyard"), 0o700)?;
     let companion = plan
         .companion_required
@@ -578,6 +582,7 @@ fn collect_local_generation(
         &generation_id,
         &helper,
         &wrapper,
+        &close_guard,
         &binary,
         companion.as_ref(),
         context.as_ref(),
@@ -588,6 +593,7 @@ fn collect_local_generation(
         Some(&manifest),
         Some(&helper),
         Some(&wrapper),
+        Some(&close_guard),
         Some(&binary),
         companion.as_ref(),
         context.as_ref(),
@@ -621,6 +627,7 @@ fn collect_local_generation(
         manifest,
         helper,
         wrapper,
+        close_guard,
         binary,
         companion,
         context,
@@ -751,11 +758,13 @@ fn parse_generation_manifest(
     Ok(values)
 }
 
+#[allow(clippy::too_many_arguments)] // Every immutable generation member is an explicit manifest binding.
 fn validate_generation_manifest_values(
     values: &std::collections::BTreeMap<String, String>,
     generation_id: &str,
     helper: &GenerationMemberEvidence,
     wrapper: &GenerationMemberEvidence,
+    close_guard: &GenerationMemberEvidence,
     binary: &GenerationMemberEvidence,
     companion: Option<&GenerationMemberEvidence>,
     context: Option<&GenerationMemberEvidence>,
@@ -764,7 +773,7 @@ fn validate_generation_manifest_values(
         ("schema_version".to_owned(), "1".to_owned()),
         (
             "generation_contract".to_owned(),
-            "auth-selector-v1".to_owned(),
+            "auth-selector-v2".to_owned(),
         ),
         ("generation_id".to_owned(), generation_id.to_owned()),
         (
@@ -778,6 +787,11 @@ fn validate_generation_manifest_values(
         ("helper_mode".to_owned(), format!("{:o}", helper.mode)),
         ("wrapper_sha256".to_owned(), wrapper.sha256.clone()),
         ("wrapper_mode".to_owned(), format!("{:o}", wrapper.mode)),
+        ("close_guard_sha256".to_owned(), close_guard.sha256.clone()),
+        (
+            "close_guard_mode".to_owned(),
+            format!("{:o}", close_guard.mode),
+        ),
         ("binary_sha256".to_owned(), binary.sha256.clone()),
         ("binary_mode".to_owned(), format!("{:o}", binary.mode)),
         (
@@ -1347,6 +1361,7 @@ fn remote_auth_support_from_markers(
     })
 }
 
+#[allow(clippy::too_many_lines)] // Keep the remote generation's fail-closed marker parsing in one audit boundary.
 fn generation_from_markers(
     plan: &HostUpdatePlan,
     text: &str,
@@ -1411,7 +1426,7 @@ fn generation_from_markers(
         }
     };
     let generation_contract = unique_marker(text, REMOTE_GENERATION_CONTRACT_PREFIX)?;
-    if generation_contract != "auth-selector-v1" {
+    if generation_contract != "auth-selector-v2" {
         return Err(PlanExecutionError::Failed(
             "remote auth generation contract was unsupported".to_owned(),
         ));
@@ -1434,6 +1449,11 @@ fn generation_from_markers(
             0o700,
         )?,
         wrapper: member("ghapp", REMOTE_GENERATION_WRAPPER_SHA_PREFIX, 0o700)?,
+        close_guard: member(
+            "pr-close-guard",
+            REMOTE_GENERATION_CLOSE_GUARD_SHA_PREFIX,
+            0o700,
+        )?,
         binary: member("shipyard", REMOTE_GENERATION_BINARY_SHA_PREFIX, 0o700)?,
         companion: optional_member(
             COMPANION_BINARY_NAME,
@@ -1967,7 +1987,7 @@ fn validate_generation_evidence(
     generation: &GenerationEvidence,
 ) -> Result<(), String> {
     if generation.selector_path != plan.auth_wrapper
-        || generation.generation_contract != "auth-selector-v1"
+        || generation.generation_contract != "auth-selector-v2"
         || generation.selector_target != generation.selector_recheck_target
         || generation.authority_identity != plan.release_authority.identity_sha256
         || !valid_sha256(&generation.generation_id)
@@ -1998,9 +2018,11 @@ fn validate_generation_evidence(
     validate_member(&generation.manifest, "generation.manifest", 0o600)?;
     validate_member(&generation.helper, "shipyard-github-app-token", 0o700)?;
     validate_member(&generation.wrapper, "ghapp", 0o700)?;
+    validate_member(&generation.close_guard, "pr-close-guard", 0o700)?;
     validate_member(&generation.binary, "shipyard", 0o700)?;
     if generation.helper.sha256 != support.helper.sha256.as_deref().unwrap_or_default()
         || generation.wrapper.sha256 != support.wrapper.sha256.as_deref().unwrap_or_default()
+        || generation.close_guard.sha256 != plan.release_authority.pr_close_guard.sha256
     {
         return Err(
             "composed auth generation disagreed with installed support or asset authority"

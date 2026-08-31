@@ -45,7 +45,7 @@ fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
 fn remote_plan_uses_absolute_binary_and_minimal_canonical_path() {
     let plan = host_update_plan(
         &host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard")),
-        "v0.134.0",
+        "v0.137.0",
     )
     .expect("plan");
     assert!(plan.command.starts_with("/usr/bin/env -i HOME=\"$HOME\""));
@@ -95,7 +95,7 @@ fn remote_plan_uses_absolute_binary_and_minimal_canonical_path() {
     );
     assert!(
         plan.command
-            .contains("update --to v0.134.0 --check --unattended-fleet")
+            .contains("update --to v0.137.0 --check --unattended-fleet")
     );
     assert_eq!(
         plan.companion_binary,
@@ -135,7 +135,7 @@ fn remote_plan_uses_absolute_binary_and_minimal_canonical_path() {
 fn remote_daemon_auth_probe_executes_the_typed_parser_in_a_scrubbed_environment() {
     let plan = host_update_plan(
         &host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard")),
-        "v0.134.0",
+        "v0.137.0",
     )
     .expect("plan");
     let quoted_remote_script = plan
@@ -219,7 +219,7 @@ fn remote_daemon_auth_probe_executes_the_typed_parser_in_a_scrubbed_environment(
 fn remote_generation_context_probe_executes_exact_mode_and_global_dir_checks() {
     let plan = host_update_plan(
         &host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard")),
-        "v0.134.0",
+        "v0.137.0",
     )
     .expect("plan");
     let quoted_remote_script = plan
@@ -297,11 +297,11 @@ fn remote_generation_context_probe_executes_exact_mode_and_global_dir_checks() {
 fn fleet_plan_requires_ghapp_and_shipyard_to_be_siblings() {
     let mut class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
     class.github_cli = Some("/Users/ci/bin/ghapp".to_owned());
-    let error = host_update_plan(&class, "v0.134.0").expect_err("foreign wrapper directory");
+    let error = host_update_plan(&class, "v0.137.0").expect_err("foreign wrapper directory");
     assert!(error.message.contains("ghapp sibling of shipyard_bin"));
 
     class.github_cli = Some("/Users/ci/.local/bin/renamed-ghapp".to_owned());
-    let error = host_update_plan(&class, "v0.134.0").expect_err("foreign wrapper name");
+    let error = host_update_plan(&class, "v0.137.0").expect_err("foreign wrapper name");
     assert!(error.message.contains("ghapp sibling of shipyard_bin"));
 }
 
@@ -311,7 +311,7 @@ fn fleet_resolver_probe_uses_exact_global_dir_before_commit() {
     class.shipyard_global_dir = Some("/Users/ci/governed global".to_owned());
     class.shipyard_state_dir = Some("/Users/ci/governed state".to_owned());
 
-    let plan = host_update_plan(&class, "v0.134.0").expect("differing governed dirs");
+    let plan = host_update_plan(&class, "v0.137.0").expect("differing governed dirs");
     assert!(plan.command.contains("auth_resolver_required=1"));
     assert!(!plan.command.contains("ghapp auth token"));
 
@@ -746,7 +746,7 @@ fn remote_pair_probe_rejects_mixed_or_malformed_preinstall_state() {
             .success()
     );
 
-    write_binary(&companion, COMPANION_BINARY_NAME, "0.134.0");
+    write_binary(&companion, COMPANION_BINARY_NAME, "0.137.0");
     assert!(
         !Command::new("/bin/bash")
             .args(["-c", &legacy_probe])
@@ -755,7 +755,7 @@ fn remote_pair_probe_rejects_mixed_or_malformed_preinstall_state() {
             .success()
     );
 
-    write_binary(&primary, "shipyard", "0.134.0");
+    write_binary(&primary, "shipyard", "0.137.0");
     let paired_probe = remote_pair_probe(&primary, &companion, "before", None, false);
     assert!(
         Command::new("/bin/bash")
@@ -768,7 +768,7 @@ fn remote_pair_probe_rejects_mixed_or_malformed_preinstall_state() {
     for malformed in [
         "0.126.",
         "0.0126.3",
-        "0.134.0.1",
+        "0.137.0.1",
         "18446744073709551616.0.0",
     ] {
         write_binary(&primary, "shipyard", malformed);
@@ -792,7 +792,7 @@ fn local_plan_preserves_host_class_daemon_context() {
     class.shipyard_mode = Some("isolated".to_owned());
     class.shipyard_global_dir = Some("/tmp/governed config".to_owned());
     class.shipyard_state_dir = Some("/tmp/governed state".to_owned());
-    let plan = host_update_plan(&class, "v0.134.0").expect("plan");
+    let plan = host_update_plan(&class, "v0.137.0").expect("plan");
     let command = local_update_command(&plan);
 
     assert!(command.contains("auth_mode=isolated"));
@@ -831,11 +831,11 @@ fn local_plan_preserves_host_class_daemon_context() {
 fn rendered_plans_contain_only_the_token_resolver_not_token_material() {
     let plan = host_update_plan(
         &host(None, Some("/Users/ci/.local/bin/shipyard")),
-        "v0.134.0",
+        "v0.137.0",
     )
     .expect("plan");
     let mut json = Vec::new();
-    render_plan(&mut json, true, "v0.134.0", &[plan], false).expect("rendered plan");
+    render_plan(&mut json, true, "v0.137.0", &[plan], false).expect("rendered plan");
     let rendered = String::from_utf8(json).expect("UTF-8 plan");
 
     assert!(rendered.contains("auth helper-argv"));
@@ -927,7 +927,7 @@ fn exact_asset_shim_serves_authenticated_and_unauthenticated_installer_urls() {
 
 #[test]
 fn stripped_path_is_launch_environment_drift_not_absence() {
-    let error = host_update_plan(&host(Some("m5"), None), "v0.134.0")
+    let error = host_update_plan(&host(Some("m5"), None), "v0.137.0")
         .expect_err("remote relative lookup must fail closed");
     assert!(error.message.contains("launch-environment drift"));
     assert!(!error.message.contains("not installed"));
@@ -941,7 +941,7 @@ fn option_like_ssh_destination_is_rejected_before_spawn() {
             Some("-oProxyCommand=/tmp/untrusted"),
             Some("/Users/ci/.local/bin/shipyard"),
         ),
-        "v0.134.0",
+        "v0.137.0",
     )
     .expect_err("SSH option injection");
     assert!(error.message.contains("not a valid SSH destination"));
@@ -952,7 +952,7 @@ fn auth_support_paths_reject_dot_and_parent_components() {
     let mut class = host(Some("m5"), Some("/Users/ci/.local/bin/shipyard"));
     class.github_token_helper =
         Some("/Users/ci/.config/shipyard/bin/../shipyard-github-app-token".to_owned());
-    let error = host_update_plan(&class, "v0.134.0")
+    let error = host_update_plan(&class, "v0.137.0")
         .expect_err("parent component must fail before command construction");
     assert!(
         error
@@ -962,7 +962,7 @@ fn auth_support_paths_reject_dot_and_parent_components() {
 
     class.github_token_helper =
         Some("/Users/ci/.config/shipyard/./bin/shipyard-github-app-token".to_owned());
-    let error = host_update_plan(&class, "v0.134.0")
+    let error = host_update_plan(&class, "v0.137.0")
         .expect_err("dot component must fail before command construction");
     assert!(
         error
@@ -976,7 +976,7 @@ fn daemon_context_paths_reject_controls_dot_and_parent_components() {
     for global_dir in ["/Users/ci/global/../foreign", "/Users/ci/global\nforeign"] {
         let mut class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
         class.shipyard_global_dir = Some(global_dir.to_owned());
-        let error = host_update_plan(&class, "v0.134.0").expect_err("unsafe global dir");
+        let error = host_update_plan(&class, "v0.137.0").expect_err("unsafe global dir");
         assert!(error.message.contains("normalized absolute paths"));
     }
 }
@@ -985,32 +985,32 @@ fn daemon_context_paths_reject_controls_dot_and_parent_components() {
 fn auth_support_paths_reject_managed_binary_and_transaction_collisions() {
     let mut class = host(Some("m5"), Some("/Users/ci/.local/bin/shipyard"));
     class.github_token_helper = Some("/Users/ci/.local/bin/shipyard".to_owned());
-    let error = host_update_plan(&class, "v0.134.0")
+    let error = host_update_plan(&class, "v0.137.0")
         .expect_err("primary binary collision must fail before rollout");
     assert!(error.message.contains("must not overlap managed binaries"));
 
     class.github_token_helper =
         Some("/Users/ci/.local/bin/shipyard-workstream-provider".to_owned());
-    let error = host_update_plan(&class, "v0.134.0")
+    let error = host_update_plan(&class, "v0.137.0")
         .expect_err("companion binary collision must fail before rollout");
     assert!(error.message.contains("must not overlap managed binaries"));
 
     class.github_token_helper =
         Some("/Users/ci/.local/bin/shipyard.shipyard-rollback.tmp".to_owned());
-    let error = host_update_plan(&class, "v0.134.0")
+    let error = host_update_plan(&class, "v0.137.0")
         .expect_err("atomic backup temp collision must fail before rollout");
     assert!(error.message.contains("must not overlap managed binaries"));
 
     class.github_token_helper = Some(
         "/Users/ci/Library/Application Support/shipyard/fleet-auth-support.transaction".to_owned(),
     );
-    let error = host_update_plan(&class, "v0.134.0")
+    let error = host_update_plan(&class, "v0.137.0")
         .expect_err("journal collision must fail before rollout");
     assert!(error.message.contains("or transaction state"));
 
     class.github_token_helper =
         Some("/Users/ci/Library/Application Support/shipyard/fleet-auth-support.guard".to_owned());
-    let error = host_update_plan(&class, "v0.134.0")
+    let error = host_update_plan(&class, "v0.137.0")
         .expect_err("advisory guard collision must fail before rollout");
     assert!(error.message.contains("or transaction state"));
 }
@@ -1019,7 +1019,7 @@ fn auth_support_paths_reject_managed_binary_and_transaction_collisions() {
 fn remote_bootstrap_requires_absolute_governed_auth_helper() {
     let mut config = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
     config.github_cli = Some("ghapp".to_owned());
-    let error = host_update_plan(&config, "v0.134.0").expect_err("relative helper");
+    let error = host_update_plan(&config, "v0.137.0").expect_err("relative helper");
     assert!(
         error
             .message
@@ -1031,7 +1031,7 @@ fn remote_bootstrap_requires_absolute_governed_auth_helper() {
 fn remote_rollout_requires_an_explicit_daemon_context() {
     let mut config = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
     config.shipyard_state_dir = None;
-    let error = host_update_plan(&config, "v0.134.0").expect_err("missing context");
+    let error = host_update_plan(&config, "v0.137.0").expect_err("missing context");
     assert!(
         error
             .message
@@ -1043,7 +1043,7 @@ fn remote_rollout_requires_an_explicit_daemon_context() {
 fn remote_bootstrap_rejects_a_filename_the_installer_cannot_replace() {
     let error = host_update_plan(
         &host(Some("m5-lan"), Some("/Users/ci/.local/bin/current")),
-        "v0.134.0",
+        "v0.137.0",
     )
     .expect_err("renamed binary");
     assert!(error.message.contains("must end in /shipyard"));
@@ -1054,7 +1054,7 @@ fn remote_bootstrap_rejects_a_filename_the_installer_cannot_replace() {
 fn local_rollout_rejects_a_filename_the_installer_cannot_replace() {
     let error = host_update_plan(
         &host(None, Some("/Users/ci/.local/bin/current")),
-        "v0.134.0",
+        "v0.137.0",
     )
     .expect_err("renamed local binary");
     assert!(error.message.contains("must end in /shipyard"));
@@ -1073,7 +1073,7 @@ fn one_stalled_host_is_terminated_at_its_bound() {
     )
     .expect("fixture");
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("executable");
-    let plan = host_update_plan(&host(None, binary.to_str()), "v0.134.0").expect("plan");
+    let plan = host_update_plan(&host(None, binary.to_str()), "v0.137.0").expect("plan");
     assert!(matches!(
         execute_plan_with_timeout(&plan, Duration::from_millis(50)),
         Err(PlanExecutionError::TimedOut(_))
@@ -1112,7 +1112,7 @@ fn configured_absolute_tool_survives_a_stripped_non_login_path() {
         "ambient lookup must miss the fixture"
     );
 
-    let plan = host_update_plan(&host(Some("m5-lan"), shipyard.to_str()), "v0.134.0")
+    let plan = host_update_plan(&host(Some("m5-lan"), shipyard.to_str()), "v0.137.0")
         .expect("an absolute profile path remains authoritative");
     assert_eq!(plan.binary, shipyard);
     assert!(
@@ -1125,7 +1125,8 @@ fn configured_absolute_tool_survives_a_stripped_non_login_path() {
 fn exact_release_tag_is_required() {
     assert!(normalize_exact_tag("v0.130.0").is_err());
     assert!(normalize_exact_tag("v0.131.0").is_err());
-    assert_eq!(normalize_exact_tag("0.134.0").expect("tag"), "v0.134.0");
+    assert!(normalize_exact_tag("v0.136.0").is_err());
+    assert_eq!(normalize_exact_tag("0.137.0").expect("tag"), "v0.137.0");
     assert!(normalize_exact_tag("v0.99.0").is_err());
     assert!(normalize_exact_tag("v0.98.1").is_err());
     assert!(normalize_exact_tag("latest").is_err());
@@ -1133,7 +1134,7 @@ fn exact_release_tag_is_required() {
     assert!(normalize_exact_tag("v0.98.1-rc1").is_err());
     assert!(normalize_exact_tag("v18446744073709551616.0.0").is_err());
     assert!(!tag_requires_companion("v0.126.2"));
-    assert!(tag_requires_companion("v0.134.0"));
+    assert!(tag_requires_companion("v0.137.0"));
     assert!(!tag_supports_auth_resolver("v0.128.9"));
     assert!(!tag_supports_auth_resolver("v0.129.0"));
     assert!(!tag_supports_auth_resolver("v0.130.0"));
@@ -1144,15 +1145,15 @@ fn exact_release_tag_is_required() {
 #[test]
 fn fleet_plan_refuses_pre_atomic_generation_targets_before_rendering() {
     let class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
-    for target in ["v0.130.0", "v0.131.0", "v0.132.0", "v0.132.1"] {
+    for target in ["v0.130.0", "v0.131.0", "v0.132.0", "v0.136.0"] {
         let error = host_update_plan(&class, target).expect_err("pre-contract target");
         assert!(
             error
                 .message
-                .contains("atomic auth-selector generation capability")
+                .contains("sibling-guard auth generation capability")
         );
     }
-    host_update_plan(&class, "v0.134.0").expect("atomic generation target");
+    host_update_plan(&class, "v0.137.0").expect("atomic generation target");
 }
 
 #[cfg(target_os = "macos")]
@@ -1176,6 +1177,7 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
     let companion = bin.join(COMPANION_BINARY_NAME);
     let helper_source = temp.path().join("release-helper");
     let wrapper_source = temp.path().join("release-ghapp");
+    let close_guard_source = temp.path().join("release-close-guard");
     let binary_source = temp.path().join("release-shipyard");
     let executable = |path: &Path, bytes: &[u8]| {
         std::fs::write(path, bytes).expect("write executable");
@@ -1187,15 +1189,20 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
         b"#!/bin/sh\n/usr/bin/printf '{\"token\":\"fixture\"}\\n'\n",
     );
     executable(&wrapper_source, include_bytes!("../../../scripts/ghapp"));
+    executable(
+        &close_guard_source,
+        include_bytes!("../../../scripts/ghapp_pr_close_guard.py"),
+    );
     executable(&binary_source, b"#!/bin/sh\nexit 0\n");
 
     let digest = |path: &Path| {
         let bytes = std::fs::read(path).expect("digest input");
         format!("{:x}", Sha256::digest(bytes))
     };
-    let mut authority = test_release_authority("v0.134.0");
+    let mut authority = test_release_authority("v0.137.0");
     authority.auth_helper.sha256 = digest(&helper_source);
     authority.auth_wrapper.sha256 = digest(&wrapper_source);
+    authority.pr_close_guard.sha256 = digest(&close_guard_source);
     let install_binary = format!(
         "/bin/cp {} \"$auth_generation_stage/shipyard\"; /bin/chmod 700 \"$auth_generation_stage/shipyard\"; /bin/cp \"$auth_generation_stage/shipyard\" \"$auth_generation_stage/{COMPANION_BINARY_NAME}\"",
         shlex_quote(&binary_source.display().to_string())
@@ -1209,6 +1216,7 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
         true,
         &shlex_quote(&helper_source.display().to_string()),
         &shlex_quote(&wrapper_source.display().to_string()),
+        &shlex_quote(&close_guard_source.display().to_string()),
         &install_binary,
         "shipyard",
         &state,
@@ -1227,8 +1235,15 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
         .expect("real auth transaction");
     assert!(status.success());
 
-    let wrapper_target = std::fs::read_link(&wrapper).expect("wrapper selector");
+    assert!(!wrapper.is_symlink());
+    let wrapper_target = std::fs::read_link(wrapper.with_extension("shipyard-generation"))
+        .expect("wrapper generation selector");
     let generation = wrapper_target.parent().expect("generation directory");
+    assert_eq!(
+        std::fs::read(&wrapper).expect("stable public trampoline"),
+        std::fs::read(generation.join("ghapp.public-trampoline"))
+            .expect("generation public trampoline")
+    );
     assert_eq!(
         std::fs::read_link(&binary).expect("binary selector"),
         generation.join("shipyard")
@@ -1239,11 +1254,12 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
     );
     let manifest = std::fs::read_to_string(generation.join("generation.manifest"))
         .expect("generation manifest");
-    assert_eq!(manifest.lines().count(), 13);
+    assert_eq!(manifest.lines().count(), 17);
+    assert!(generation.join("pr-close-guard").is_file());
     assert!(
         manifest
             .lines()
-            .any(|line| line == "generation_contract=auth-selector-v1")
+            .any(|line| line == "generation_contract=auth-selector-v2")
     );
 }
 
@@ -1346,7 +1362,7 @@ fn auth_support(verified: bool) -> AuthSupportEvidence {
         ),
         wrapper: file("/Users/ci/.local/bin/ghapp", 'e', 'd'),
         generation: verified.then(|| GenerationEvidence {
-            generation_contract: "auth-selector-v1".to_owned(),
+            generation_contract: "auth-selector-v2".to_owned(),
             generation_id: "7".repeat(64),
             authority_identity: "8".repeat(64),
             selector_path: PathBuf::from("/Users/ci/.local/bin/ghapp"),
@@ -1355,6 +1371,7 @@ fn auth_support(verified: bool) -> AuthSupportEvidence {
             manifest: generation_member(&generation_dir, "generation.manifest", '9', 0o600),
             helper: generation_member(&generation_dir, "shipyard-github-app-token", 'c', 0o700),
             wrapper: generation_member(&generation_dir, "ghapp", 'e', 0o700),
+            close_guard: generation_member(&generation_dir, "pr-close-guard", '0', 0o700),
             binary: generation_member(&generation_dir, "shipyard", 'a', 0o700),
             companion: Some(generation_member(
                 &generation_dir,
@@ -1420,16 +1437,16 @@ fn host_selection_is_explicit_ordered_and_fail_closed() {
 fn apply_stops_before_every_later_host_after_first_failure() {
     let plans = ["m1", "m3", "m5"]
         .iter()
-        .map(|name| host_update_plan(&named_host(name), "v0.134.0").expect("plan"))
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(&plans, "v0.134.0", true, &mut output, |plan| {
+    let error = apply_plans(&plans, "v0.137.0", true, &mut output, |plan| {
         attempted.push(plan.class.clone());
         if plan.class == "m3" {
             Err(PlanExecutionError::Failed("controlled failure".to_owned()))
         } else {
-            Ok(evidence("0.134.0"))
+            Ok(evidence("0.137.0"))
         }
     })
     .expect_err("apply stops");
@@ -1442,7 +1459,7 @@ fn apply_stops_before_every_later_host_after_first_failure() {
         .expect("typed receipts");
     assert_eq!(receipts.len(), 2);
     assert_eq!(receipts[0]["host_class"], "m1");
-    assert_eq!(receipts[0]["target"], "v0.134.0");
+    assert_eq!(receipts[0]["target"], "v0.137.0");
     assert_eq!(receipts[0]["executable_sha256"], "a".repeat(64));
     assert_eq!(
         receipts[0]["binary_pair_before"]["primary"]["source_identity"],
@@ -1464,13 +1481,13 @@ fn apply_stops_before_every_later_host_after_first_failure() {
 fn authority_receipt_mismatch_stops_before_the_next_host() {
     let plans = ["m1", "m3"]
         .iter()
-        .map(|name| host_update_plan(&named_host(name), "v0.134.0").expect("plan"))
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(&plans, "v0.134.0", true, &mut output, |plan| {
+    let error = apply_plans(&plans, "v0.137.0", true, &mut output, |plan| {
         attempted.push(plan.class.clone());
-        let mut observed = evidence("0.134.0");
+        let mut observed = evidence("0.137.0");
         if plan.class == "m3" {
             observed.release_authority_identity = "f".repeat(64);
         }
@@ -1486,13 +1503,13 @@ fn authority_receipt_mismatch_stops_before_the_next_host() {
 fn cross_host_binary_pair_hash_drift_stops_rollout() {
     let plans = ["m1", "m3", "m5"]
         .iter()
-        .map(|name| host_update_plan(&named_host(name), "v0.134.0").expect("plan"))
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(&plans, "v0.134.0", true, &mut output, |plan| {
+    let error = apply_plans(&plans, "v0.137.0", true, &mut output, |plan| {
         attempted.push(plan.class.clone());
-        let mut observed = evidence("0.134.0");
+        let mut observed = evidence("0.137.0");
         if plan.class == "m3" {
             observed.after_pair.primary.sha256 = "d".repeat(64);
             observed.executable_sha256 = "d".repeat(64);
@@ -1514,13 +1531,13 @@ fn cross_host_binary_pair_hash_drift_stops_rollout() {
 
 #[test]
 fn paired_host_receipt_exposes_reconcilable_before_and_after_identities() {
-    let plan = host_update_plan(&named_host("m1"), "v0.134.0").expect("plan");
-    let evidence = evidence("0.134.0");
+    let plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    let evidence = evidence("0.137.0");
     let mut output = Vec::new();
     render_host_result(
         &mut output,
         true,
-        "v0.134.0",
+        "v0.137.0",
         &plan,
         true,
         Some(&evidence),
@@ -1529,8 +1546,8 @@ fn paired_host_receipt_exposes_reconcilable_before_and_after_identities() {
     .expect("receipt");
     let receipt: Value = serde_json::from_slice(&output).expect("json");
     for phase in ["binary_pair_before", "binary_pair_after"] {
-        assert_eq!(receipt[phase]["primary"]["semantic_version"], "0.134.0");
-        assert_eq!(receipt[phase]["companion"]["semantic_version"], "0.134.0");
+        assert_eq!(receipt[phase]["primary"]["semantic_version"], "0.137.0");
+        assert_eq!(receipt[phase]["companion"]["semantic_version"], "0.137.0");
         assert_eq!(
             receipt[phase]["primary"]["source_identity"],
             receipt[phase]["companion"]["source_identity"]

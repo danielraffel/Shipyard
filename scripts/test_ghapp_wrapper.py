@@ -242,10 +242,13 @@ class GhappWrapperTests(unittest.TestCase):
         generation_helper.write_bytes(self.helper.read_bytes())
         generation_binary = generation / "shipyard"
         generation_binary.write_bytes(self.shipyard.read_bytes())
+        generation_close_guard = generation / "pr-close-guard"
+        generation_close_guard.write_bytes((self.root / "guards/pr-close-guard").read_bytes())
         for executable in (
             generation_wrapper,
             generation_helper,
             generation_binary,
+            generation_close_guard,
         ):
             executable.chmod(0o700)
         context = generation / "ghapp.shipyard-context.json"
@@ -269,6 +272,66 @@ class GhappWrapperTests(unittest.TestCase):
         self.wrapper.symlink_to(generation_wrapper)
         self.environment["HOME"] = str(home)
         return [home, local, share, shipyard, generation_store, generation]
+
+    def install_public_trampoline(self) -> tuple[Path, Path, Path]:
+        self.install_generation_wrapper()
+        selected_wrapper = Path(os.readlink(self.wrapper))
+        home = Path(self.environment["HOME"])
+        public_bin = home / ".local/bin"
+        public_bin.mkdir()
+        public_bin.chmod(0o755)
+        public_wrapper = public_bin / "ghapp"
+        public_wrapper.write_bytes(WRAPPER.read_bytes())
+        public_wrapper.chmod(0o700)
+        selector = public_wrapper.with_name("ghapp.shipyard-generation")
+        selector.symlink_to(selected_wrapper)
+        self.wrapper = public_wrapper
+        return public_wrapper, selector, selected_wrapper
+
+    def test_public_trampoline_selects_safe_immutable_generation(self) -> None:
+        _, _, selected_wrapper = self.install_public_trampoline()
+
+        result = self.run_wrapper("token", "--repo", "danielraffel/Shipyard")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.wrapper.is_symlink())
+        self.assertTrue(selected_wrapper.is_file())
+
+    def test_public_trampoline_rejects_missing_selector(self) -> None:
+        _, selector, _ = self.install_public_trampoline()
+        selector.unlink()
+
+        result = self.run_wrapper("token", "--repo", "danielraffel/Shipyard")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("generation selector is missing or unsafe", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+
+    def test_public_trampoline_rejects_non_symlink_selector(self) -> None:
+        _, selector, selected_wrapper = self.install_public_trampoline()
+        selector.unlink()
+        selector.write_text(str(selected_wrapper), encoding="utf-8")
+
+        result = self.run_wrapper("token", "--repo", "danielraffel/Shipyard")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("generation selector is missing or unsafe", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+
+    def test_public_trampoline_rejects_selector_outside_private_store(self) -> None:
+        _, selector, _ = self.install_public_trampoline()
+        outside = self.root / ("f" * 64) / "ghapp"
+        outside.parent.mkdir()
+        outside.write_bytes(WRAPPER.read_bytes())
+        outside.chmod(0o700)
+        selector.unlink()
+        selector.symlink_to(outside)
+
+        result = self.run_wrapper("token", "--repo", "danielraffel/Shipyard")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("selector escapes the private store", result.stderr)
+        self.assertFalse(self.helper_log.exists())
 
     def test_generation_wrapper_accepts_safe_public_ancestors(self) -> None:
         self.install_generation_wrapper()
@@ -529,6 +592,31 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("sibling shipyard resolver is unavailable", result.stderr)
         self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_generation_wrapper_refuses_missing_sibling_close_guard(self) -> None:
+        self.install_generation_wrapper()
+        self.wrapper.resolve().parent.joinpath("pr-close-guard").unlink()
+
+        result = self.run_wrapper("auth", "status", "--repo", "danielraffel/Shipyard")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed generation member is malformed or unsafe", result.stderr)
+        self.assertFalse(self.gh_log.exists())
+
+    def test_generation_wrapper_keeps_optional_merge_guard_global(self) -> None:
+        self.install_generation_wrapper()
+        guard = self.root / "guards/merge-guard"
+        guard.write_text("#!/bin/sh\nexit 73\n", encoding="utf-8")
+        guard.chmod(0o755)
+
+        result = self.run_wrapper(
+            "pr", "merge", "7", "--repo", "danielraffel/Shipyard"
+        )
+
+        # Guard refusals retain the wrapper's established fail-closed exit
+        # contract rather than leaking an implementation-specific guard code.
+        self.assertEqual(result.returncode, 1)
         self.assertFalse(self.gh_log.exists())
 
     def test_cli_mode_uses_exact_fleet_resolver_context(self) -> None:
