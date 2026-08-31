@@ -16,6 +16,8 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
+import re
 import secrets
 import signal
 import socket
@@ -83,6 +85,11 @@ RETAINED_RECONCILIATION_MAX_SECONDS = 6 * 60 * 60
 LEASE_GENERATION_MARKER = ".shipyard-lease-generation.json"
 LEASE_PHASE_ACQUIRING = "acquiring"
 LEASE_PHASE_TRANSITIONING = "transitioning"
+SANDBOX_CANARY_LABEL_PREFIX = "com.danielraffel.shipyard.sandbox-canary."
+SANDBOX_CANARY_LABEL_RE = re.compile(
+    rf"^{re.escape(SANDBOX_CANARY_LABEL_PREFIX)}([1-9][0-9]*)\.([1-9][0-9]*)$"
+)
+SANDBOX_CANARY_RECOVERY_LIMIT = 4
 
 
 @dataclass(frozen=True)
@@ -372,6 +379,35 @@ def _json_object(path: Path) -> dict[str, object]:
         raise GuardianError(f"could not read retained-lease evidence {path}: {error}") from error
     if not isinstance(value, dict):
         raise GuardianError(f"retained-lease evidence is not an object: {path}")
+    return value
+
+
+def _plist_object(path: Path) -> dict[str, object]:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+    ):
+        raise GuardianError(f"launchd evidence has unsafe metadata: {path}")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise GuardianError(f"launchd evidence changed while opening: {path}")
+        payload = os.read(descriptor, 1024 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) > 1024 * 1024:
+        raise GuardianError(f"launchd evidence is oversized: {path}")
+    try:
+        value = plistlib.loads(payload)
+    except plistlib.InvalidFileException as error:
+        raise GuardianError(f"could not parse launchd evidence {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise GuardianError(f"launchd evidence is not a dictionary: {path}")
     return value
 
 
@@ -1232,6 +1268,19 @@ class Guardian:
             f".{self.lease_dir.name}.reconcile.lock"
         )
         self.production_pid_file = Path(args.production_pid_file)
+        self.launchd_label = args.launchd_label
+        label_match = SANDBOX_CANARY_LABEL_RE.fullmatch(self.launchd_label)
+        if label_match is None:
+            raise GuardianError("sandbox guardian launchd label is not canonical")
+        self.github_run_id = int(label_match.group(1))
+        self.github_run_attempt = int(label_match.group(2))
+        expected_root_name = (
+            f"shipyard-sandbox-m3-{self.github_run_id}-{self.github_run_attempt}"
+        )
+        if self.root.name != expected_root_name:
+            raise GuardianError("sandbox guardian label does not match canary root")
+        self.guardian_pid = os.getpid()
+        self.guardian_start_time = _process_start(self.guardian_pid)
         self.production_state_dir = self.production_pid_file.parent.parent
         self.audit_ready_file = self.root / "exclusive-audit-ready"
         self.mutation_receipt = self.root / "mutation-fence.json"
@@ -1264,9 +1313,176 @@ class Guardian:
         self.post_audit_active_runs: Optional[tuple[str, ...]] = None
         self.worker_turnover_observed: Optional[bool] = None
         self.worker_turnover_observation_error: Optional[str] = None
+        self.launchd_recovery: dict[str, object] = {
+            "loaded": 0,
+            "eligible": 0,
+            "attempted": 0,
+            "removed": 0,
+            "legacy_migrated": 0,
+            "deferred": 0,
+            "skipped": 0,
+            "errors": [],
+        }
 
     def request_stop(self, _signum: int, _frame: object) -> None:
         self.stop_requested = True
+
+    def unregister_terminal_launchd_job(self) -> None:
+        """Remove this exact inert registration after recovery evidence is durable."""
+        _run(
+            [
+                "/bin/launchctl",
+                "bootout",
+                f"gui/{os.getuid()}/{self.launchd_label}",
+            ],
+            cwd=self.root,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        )
+
+    def legacy_terminal_launchd_receipt_is_authorized(
+        self,
+        *,
+        root: Path,
+        label: str,
+        receipt: dict[str, object],
+    ) -> bool:
+        """Authenticate one pre-terminal-schema inert registration."""
+        if receipt.get("terminal_lifecycle_state") is not None:
+            return False
+        if not (
+            receipt.get("schema_version") == 1
+            and isinstance(receipt.get("reason"), str)
+            and receipt.get("candidate_stopped") is True
+            and receipt.get("lease_retained") is False
+            and receipt.get("lease_removed") is True
+        ):
+            return False
+        plist = _plist_object(root / "guardian.plist")
+        argv = plist.get("ProgramArguments")
+        if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+            return False
+        arguments = tuple(argv)
+        expected_script = root / "sandbox-daemon-guardian.py"
+        expected_receipt = root / "guardian-receipt.json"
+        return (
+            plist.get("Label") == label
+            and plist.get("RunAtLoad") is True
+            and plist.get("KeepAlive") is False
+            and len(arguments) >= 2
+            and arguments[0] == "/usr/bin/python3"
+            and arguments[1] == str(expected_script)
+            and _argument_value(arguments, "--canary-root") == str(root)
+            and _argument_value(arguments, "--final-receipt")
+            == str(expected_receipt)
+            and plist.get("StandardOutPath") == str(root / "guardian.log")
+            and plist.get("StandardErrorPath") == str(root / "guardian.log")
+        )
+
+    def recover_terminal_launchd_jobs(self) -> dict[str, object]:
+        """Boundedly unload old exact services backed by authenticated receipts."""
+        result = _run(
+            ["/bin/launchctl", "list"],
+            cwd=self.root,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            timeout=3.0,
+        )
+        loaded: list[tuple[str, str]] = []
+        for raw_line in result.stdout.splitlines():
+            fields = raw_line.split(None, 2)
+            if len(fields) != 3:
+                continue
+            pid, _status, label = fields
+            if SANDBOX_CANARY_LABEL_RE.fullmatch(label):
+                loaded.append((pid, label))
+
+        recovery: dict[str, object] = {
+            "loaded": len(loaded),
+            "eligible": 0,
+            "attempted": 0,
+            "removed": 0,
+            "legacy_migrated": 0,
+            "deferred": 0,
+            "skipped": 0,
+            "errors": [],
+        }
+        errors = recovery["errors"]
+        assert isinstance(errors, list)
+        for launchd_pid, label in sorted(loaded, key=lambda item: item[1]):
+            if label == self.launchd_label:
+                recovery["skipped"] = int(recovery["skipped"]) + 1
+                continue
+            match = SANDBOX_CANARY_LABEL_RE.fullmatch(label)
+            assert match is not None
+            run_id, run_attempt = (int(match.group(1)), int(match.group(2)))
+            root = self.root.parent / f"shipyard-sandbox-m3-{run_id}-{run_attempt}"
+            try:
+                _validate_private_directory(root)
+                receipt = _json_object(root / "guardian-receipt.json")
+                expected = {
+                    "terminal_lifecycle_state": "terminal-cleanup-authorized",
+                    "launchd_label": label,
+                    "github_run_id": run_id,
+                    "github_run_attempt": run_attempt,
+                    "canary_root": str(root),
+                    "launchd_cleanup_requested": True,
+                }
+                is_current_receipt = all(
+                    receipt.get(key) == value for key, value in expected.items()
+                )
+                is_legacy_receipt = False
+                guardian_is_exact_incarnation = False
+                if is_current_receipt:
+                    guardian_pid = receipt.get("guardian_pid")
+                    guardian_start = receipt.get("guardian_start_time")
+                    if (
+                        not isinstance(guardian_pid, int)
+                        or isinstance(guardian_pid, bool)
+                        or not isinstance(guardian_start, str)
+                        or not guardian_start
+                    ):
+                        raise GuardianError(
+                            "terminal cleanup receipt process identity invalid"
+                        )
+                    if _pid_alive(guardian_pid):
+                        guardian_is_exact_incarnation = (
+                            _process_start(guardian_pid) == guardian_start
+                        )
+                else:
+                    is_legacy_receipt = (
+                        self.legacy_terminal_launchd_receipt_is_authorized(
+                            root=root,
+                            label=label,
+                            receipt=receipt,
+                        )
+                    )
+                    if not is_legacy_receipt:
+                        raise GuardianError("terminal cleanup receipt identity mismatch")
+                if launchd_pid != "-" or guardian_is_exact_incarnation:
+                    raise GuardianError("terminal cleanup guardian may still be active")
+                if int(recovery["attempted"]) >= SANDBOX_CANARY_RECOVERY_LIMIT:
+                    recovery["deferred"] = int(recovery["deferred"]) + 1
+                    continue
+                recovery["eligible"] = int(recovery["eligible"]) + 1
+                recovery["attempted"] = int(recovery["attempted"]) + 1
+                _run(
+                    [
+                        "/bin/launchctl",
+                        "bootout",
+                        f"gui/{os.getuid()}/{label}",
+                    ],
+                    cwd=self.root,
+                    env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+                    timeout=2.0,
+                )
+                recovery["removed"] = int(recovery["removed"]) + 1
+                if is_legacy_receipt:
+                    recovery["legacy_migrated"] = (
+                        int(recovery["legacy_migrated"]) + 1
+                    )
+            except Exception as error:
+                recovery["skipped"] = int(recovery["skipped"]) + 1
+                errors.append(f"{label}: {type(error).__name__}: {error}")
+        return recovery
 
     @contextlib.contextmanager
     def retained_reconciliation_lock(self):
@@ -2504,6 +2720,19 @@ class Guardian:
     def run(self) -> int:
         signal.signal(signal.SIGTERM, self.request_stop)
         signal.signal(signal.SIGINT, self.request_stop)
+        try:
+            self.launchd_recovery = self.recover_terminal_launchd_jobs()
+        except Exception as error:
+            self.launchd_recovery = {
+                "loaded": 0,
+                "eligible": 0,
+                "attempted": 0,
+                "removed": 0,
+                "legacy_migrated": 0,
+                "deferred": 0,
+                "skipped": 0,
+                "errors": [f"{type(error).__name__}: {error}"],
+            }
         reason = "completed"
         try:
             run_lifecycle(
@@ -2569,6 +2798,16 @@ class Guardian:
                 self.failure = prefix + "; ".join(cleanup_failures)
             final_payload = {
                     "schema_version": 1,
+                    "terminal_lifecycle_state": "terminal-cleanup-authorized",
+                    "launchd_label": self.launchd_label,
+                    "github_run_id": self.github_run_id,
+                    "github_run_attempt": self.github_run_attempt,
+                    "guardian_pid": self.guardian_pid,
+                    "guardian_start_time": self.guardian_start_time,
+                    "canary_root": str(self.root),
+                    "launchd_cleanup_requested": True,
+                    "launchd_cleanup_error": None,
+                    "launchd_recovery": self.launchd_recovery,
                     "reason": reason,
                     "failure": self.failure,
                     "candidate_stopped": self.candidate_stopped,
@@ -2613,10 +2852,16 @@ class Guardian:
                     "lease_removed": not self.lease_dir.exists(),
                     "reconciled_prior_canary_root": self.reconciled_prior_canary_root,
                 }
-            if reason == RETAINED_RECONCILED_REASON:
+            # This receipt is recovery authority for the narrow crash window
+            # between publication and launchd accepting the self-unload.
+            _durable_atomic_json(self.final_receipt, final_payload)
+            try:
+                self.unregister_terminal_launchd_job()
+            except Exception as error:
+                final_payload["launchd_cleanup_error"] = (
+                    f"{type(error).__name__}: {error}"
+                )
                 _durable_atomic_json(self.final_receipt, final_payload)
-            else:
-                _atomic_json(self.final_receipt, final_payload)
         production_ready = self.production_restored or self.production_preserved
         return 0 if production_ready and self.candidate_stopped and not self.failure else 1
 
@@ -2634,6 +2879,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--final-receipt", required=True)
     parser.add_argument("--lease-dir", required=True)
     parser.add_argument("--production-pid-file", required=True)
+    parser.add_argument("--launchd-label", required=True)
     return parser.parse_args(argv)
 
 

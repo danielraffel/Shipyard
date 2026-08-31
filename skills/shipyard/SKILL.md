@@ -201,6 +201,17 @@ exact production PID and requires the configured repository set from the
 guardian receipt before accepting liveness. A PID change, process loss,
 repository drift, or deadline still fails closed.
 
+Each macOS sandbox guardian also owns its unique launchd registration. It must
+publish an fsynced terminal receipt before unloading its exact canonical label;
+an active retained-lease reconciliation remains loaded until it reaches that
+terminal state. A later canary may recover at most four inert registrations per
+run, and only from a private receipt/plist pair that binds the exact label and
+canary root. PID incarnation, receipt identity, and a successful full launchd
+inventory must agree. Missing, malformed, live, ambiguous, or over-limit
+entries are skipped or deferred, never removed by prefix alone. Terminal paths
+poll for label disappearance and fail after bounded fallback cleanup, so an
+unload regression cannot silently repopulate Background Items.
+
 Opaque recovery-model HOME/TMP scratch lives outside durable Shipyard state in
 an identity-keyed OS temporary directory, so a session-independent model child
 cannot contaminate the audit. Only its validated durable receipts are published

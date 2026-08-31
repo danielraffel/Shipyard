@@ -25,9 +25,13 @@ SPEC.loader.exec_module(guardian)
 
 class GuardianLifecycleTests(unittest.TestCase):
     def make_guardian(self, root: Path) -> guardian.Guardian:
+        canonical_root = root / "shipyard-sandbox-m3-123-1"
+        canonical_root.mkdir(parents=True, exist_ok=True)
+        canonical_root.chmod(0o700)
+        root = canonical_root
         production_pid_file = root / "production-state" / "daemon" / "daemon.pid"
         production_pid_file.parent.mkdir(parents=True, exist_ok=True)
-        return guardian.Guardian(
+        active = guardian.Guardian(
             Namespace(
                 owner_pid=os.getpid(),
                 installed=str(root / "installed"),
@@ -40,8 +44,25 @@ class GuardianLifecycleTests(unittest.TestCase):
                 final_receipt=str(root / "final.json"),
                 lease_dir=str(root / "lease"),
                 production_pid_file=str(production_pid_file),
+                launchd_label="com.danielraffel.shipyard.sandbox-canary.123.1",
             )
         )
+        # Unit tests never mutate the host launchd domain. Tests for the exact
+        # terminal-unload argv replace this mock explicitly.
+        active.unregister_terminal_launchd_job = mock.Mock()
+        active.recover_terminal_launchd_jobs = mock.Mock(
+            return_value={
+                "loaded": 0,
+                "eligible": 0,
+                "attempted": 0,
+                "removed": 0,
+                "legacy_migrated": 0,
+                "deferred": 0,
+                "skipped": 0,
+                "errors": [],
+            }
+        )
+        return active
 
     def create_generation_lease(
         self,
@@ -2417,6 +2438,272 @@ class GuardianLifecycleTests(unittest.TestCase):
             receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
             self.assertFalse(receipt["lease_retained"])
             self.assertTrue(receipt["lease_removed"])
+
+    def test_terminal_receipt_precedes_exact_launchd_self_unload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            events: list[str] = []
+
+            def publish(_path: Path, payload: dict[str, object]) -> None:
+                self.assertEqual(
+                    payload["terminal_lifecycle_state"],
+                    "terminal-cleanup-authorized",
+                )
+                self.assertEqual(payload["launchd_label"], active.launchd_label)
+                self.assertEqual(payload["github_run_id"], 123)
+                self.assertEqual(payload["github_run_attempt"], 1)
+                self.assertEqual(payload["guardian_pid"], os.getpid())
+                self.assertEqual(payload["canary_root"], str(active.root))
+                events.append("durable-receipt")
+
+            active.unregister_terminal_launchd_job = mock.Mock(
+                side_effect=lambda: events.append("launchd-bootout")
+            )
+            with mock.patch.object(guardian, "run_lifecycle"), mock.patch.object(
+                guardian, "_durable_atomic_json", side_effect=publish
+            ), mock.patch.object(guardian.signal, "signal"):
+                active.run()
+
+            self.assertEqual(events, ["durable-receipt", "launchd-bootout"])
+            active.unregister_terminal_launchd_job.assert_called_once_with()
+
+    def test_launchd_bootout_failure_is_durably_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            active.unregister_terminal_launchd_job = mock.Mock(
+                side_effect=guardian.GuardianError("bootout refused")
+            )
+            with mock.patch.object(guardian, "run_lifecycle"), mock.patch.object(
+                guardian.signal, "signal"
+            ):
+                active.run()
+
+            receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
+            self.assertEqual(
+                receipt["terminal_lifecycle_state"],
+                "terminal-cleanup-authorized",
+            )
+            self.assertIn("bootout refused", receipt["launchd_cleanup_error"])
+            self.assertTrue(receipt["launchd_cleanup_requested"])
+
+    def test_launchd_self_unload_uses_fixed_exact_argv_without_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            with mock.patch.object(guardian, "_run") as run:
+                guardian.Guardian.unregister_terminal_launchd_job(active)
+
+            run.assert_called_once_with(
+                [
+                    "/bin/launchctl",
+                    "bootout",
+                    "gui/%d/com.danielraffel.shipyard.sandbox-canary.123.1"
+                    % os.getuid(),
+                ],
+                cwd=active.root,
+                env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            )
+
+    def write_terminal_launchd_receipt(
+        self, active: guardian.Guardian, run_id: int, run_attempt: int
+    ) -> tuple[Path, str]:
+        root = active.root.parent / f"shipyard-sandbox-m3-{run_id}-{run_attempt}"
+        root.mkdir(mode=0o700)
+        label = f"com.danielraffel.shipyard.sandbox-canary.{run_id}.{run_attempt}"
+        guardian._durable_atomic_json(
+            root / "guardian-receipt.json",
+            {
+                "schema_version": 1,
+                "terminal_lifecycle_state": "terminal-cleanup-authorized",
+                "launchd_label": label,
+                "github_run_id": run_id,
+                "github_run_attempt": run_attempt,
+                "guardian_pid": 999999,
+                "guardian_start_time": "Sat Aug 30 00:00:00 2026",
+                "canary_root": str(root),
+                "launchd_cleanup_requested": True,
+            },
+        )
+        return root, label
+
+    def write_legacy_terminal_launchd_receipt(
+        self, active: guardian.Guardian, run_id: int, run_attempt: int
+    ) -> tuple[Path, str]:
+        root = active.root.parent / f"shipyard-sandbox-m3-{run_id}-{run_attempt}"
+        root.mkdir(mode=0o700)
+        label = f"com.danielraffel.shipyard.sandbox-canary.{run_id}.{run_attempt}"
+        receipt = root / "guardian-receipt.json"
+        guardian._durable_atomic_json(
+            receipt,
+            {
+                "schema_version": 1,
+                "reason": "failed",
+                "candidate_stopped": True,
+                "lease_retained": False,
+                "lease_removed": True,
+            },
+        )
+        plist = root / "guardian.plist"
+        plist.write_bytes(
+            guardian.plistlib.dumps(
+                {
+                    "Label": label,
+                    "RunAtLoad": True,
+                    "KeepAlive": False,
+                    "ProgramArguments": [
+                        "/usr/bin/python3",
+                        str(root / "sandbox-daemon-guardian.py"),
+                        "--canary-root",
+                        str(root),
+                        "--final-receipt",
+                        str(receipt),
+                    ],
+                    "StandardOutPath": str(root / "guardian.log"),
+                    "StandardErrorPath": str(root / "guardian.log"),
+                }
+            )
+        )
+        plist.chmod(0o600)
+        return root, label
+
+    def test_next_run_recovers_exact_receipted_inert_launchd_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _root, old_label = self.write_terminal_launchd_receipt(active, 122, 2)
+            listed = subprocess.CompletedProcess(
+                ["/bin/launchctl", "list"],
+                0,
+                stdout=(
+                    f"-\t1\t{old_label}\n"
+                    f"{os.getpid()}\t0\t{active.launchd_label}\n"
+                ),
+                stderr="",
+            )
+            booted = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with mock.patch.object(
+                guardian, "_run", side_effect=[listed, booted]
+            ) as run, mock.patch.object(guardian, "_pid_alive", return_value=False):
+                recovery = guardian.Guardian.recover_terminal_launchd_jobs(active)
+
+            self.assertEqual(
+                recovery,
+                {
+                    "loaded": 2,
+                    "eligible": 1,
+                    "attempted": 1,
+                    "removed": 1,
+                    "legacy_migrated": 0,
+                    "deferred": 0,
+                    "skipped": 1,
+                    "errors": [],
+                },
+            )
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(
+                run.call_args_list[1].args[0],
+                [
+                    "/bin/launchctl",
+                    "bootout",
+                    f"gui/{os.getuid()}/{old_label}",
+                ],
+            )
+
+    def test_next_run_migrates_only_authenticated_legacy_terminal_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _root, old_label = self.write_legacy_terminal_launchd_receipt(
+                active, 118, 1
+            )
+            listed = subprocess.CompletedProcess(
+                ["/bin/launchctl", "list"],
+                0,
+                stdout=f"-\t1\t{old_label}\n",
+                stderr="",
+            )
+            booted = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with mock.patch.object(
+                guardian, "_run", side_effect=[listed, booted]
+            ), mock.patch.object(guardian, "_pid_alive", return_value=False):
+                recovery = guardian.Guardian.recover_terminal_launchd_jobs(active)
+
+            self.assertEqual(recovery["removed"], 1)
+            self.assertEqual(recovery["legacy_migrated"], 1)
+            self.assertEqual(recovery["errors"], [])
+
+    def test_next_run_skips_active_or_unreceipted_launchd_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _root, active_label = self.write_terminal_launchd_receipt(active, 121, 1)
+            missing_label = "com.danielraffel.shipyard.sandbox-canary.120.1"
+            listed = subprocess.CompletedProcess(
+                ["/bin/launchctl", "list"],
+                0,
+                stdout=f"-\t1\t{active_label}\n-\t1\t{missing_label}\n",
+                stderr="",
+            )
+            with mock.patch.object(guardian, "_run", return_value=listed) as run, mock.patch.object(
+                guardian, "_pid_alive", return_value=True
+            ), mock.patch.object(
+                guardian, "_process_start", return_value="Sat Aug 30 00:00:00 2026"
+            ):
+                recovery = guardian.Guardian.recover_terminal_launchd_jobs(active)
+
+            self.assertEqual(recovery["loaded"], 2)
+            self.assertEqual(recovery["eligible"], 0)
+            self.assertEqual(recovery["removed"], 0)
+            self.assertEqual(recovery["skipped"], 2)
+            self.assertEqual(len(recovery["errors"]), 2)
+            run.assert_called_once()
+
+    def test_next_run_treats_reused_pid_as_old_guardian_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _root, old_label = self.write_terminal_launchd_receipt(active, 119, 1)
+            listed = subprocess.CompletedProcess(
+                ["/bin/launchctl", "list"],
+                0,
+                stdout=f"-\t1\t{old_label}\n",
+                stderr="",
+            )
+            booted = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with mock.patch.object(
+                guardian, "_run", side_effect=[listed, booted]
+            ), mock.patch.object(
+                guardian, "_pid_alive", return_value=True
+            ), mock.patch.object(
+                guardian, "_process_start", return_value="Sun Aug 31 00:00:00 2026"
+            ):
+                recovery = guardian.Guardian.recover_terminal_launchd_jobs(active)
+
+            self.assertEqual(recovery["attempted"], 1)
+            self.assertEqual(recovery["removed"], 1)
+            self.assertEqual(recovery["errors"], [])
+
+    def test_next_run_recovery_caps_attempts_even_when_bootout_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            labels = [
+                self.write_terminal_launchd_receipt(active, run_id, 1)[1]
+                for run_id in range(110, 116)
+            ]
+            listed = subprocess.CompletedProcess(
+                ["/bin/launchctl", "list"],
+                0,
+                stdout="".join(f"-\t1\t{label}\n" for label in labels),
+                stderr="",
+            )
+            failures = [guardian.GuardianError("bootout refused")] * 4
+            with mock.patch.object(
+                guardian, "_run", side_effect=[listed, *failures]
+            ) as run, mock.patch.object(guardian, "_pid_alive", return_value=False):
+                recovery = guardian.Guardian.recover_terminal_launchd_jobs(active)
+
+            self.assertEqual(recovery["loaded"], 6)
+            self.assertEqual(recovery["eligible"], 4)
+            self.assertEqual(recovery["attempted"], 4)
+            self.assertEqual(recovery["removed"], 0)
+            self.assertEqual(recovery["deferred"], 2)
+            self.assertEqual(recovery["skipped"], 4)
+            self.assertEqual(run.call_count, 5)
 
     def test_preserved_production_allows_worker_turnover_after_capacity_release(
         self,

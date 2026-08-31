@@ -285,6 +285,30 @@ class CiMatrixTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('launchctl bootstrap "gui/$(id -u)" "$guardian_plist"', workflow)
+        self.assertIn(
+            '<string>--launchd-label</string><string>$guardian_label</string>',
+            workflow,
+        )
+        self.assertEqual(
+            workflow.count(
+                "terminal sandbox guardian remained registered after self-bootout"
+            ),
+            2,
+        )
+        self.assertEqual(workflow.count("launchd_deadline=$((SECONDS + 10))"), 2)
+        self.assertEqual(
+            workflow.count(
+                "could not inventory launchd after terminal sandbox guardian"
+            ),
+            2,
+        )
+        self.assertEqual(
+            workflow.count(
+                ".launchd_cleanup_error == null and "
+                "(.launchd_recovery.errors | length) == 0"
+            ),
+            2,
+        )
         self.assertIn("<key>KeepAlive</key><false/>", workflow)
         self.assertIn(
             'cp "$GITHUB_WORKSPACE/scripts/sandbox_daemon_guardian.py" "$guardian"',
