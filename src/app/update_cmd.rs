@@ -171,8 +171,16 @@ fn update_install_dir(
 }
 
 fn verify_installed_version(binary: &Path, target_tag: &str) -> Result<(), CliFailure> {
+    verify_installed_version_with_command(&mut Command::new(binary), binary, target_tag)
+}
+
+fn verify_installed_version_with_command(
+    command: &mut Command,
+    binary: &Path,
+    target_tag: &str,
+) -> Result<(), CliFailure> {
     let expected = format!("shipyard {}", target_tag.trim_start_matches('v'));
-    let output = Command::new(binary)
+    let output = command
         .arg("--version")
         .stdin(Stdio::null())
         .output()
@@ -1010,8 +1018,15 @@ mod tests {
         let binary = temp.path().join("shipyard");
         write_executable(&binary, "#!/bin/sh\nprintf 'shipyard 0.99.1\\n'\n");
 
-        verify_installed_version(&binary, "v0.99.1").expect("exact version");
-        let error = verify_installed_version(&binary, "v0.99.2").expect_err("mismatch");
+        let mut exact = Command::new("/bin/sh");
+        exact.arg(&binary);
+        verify_installed_version_with_command(&mut exact, &binary, "v0.99.1")
+            .expect("exact version");
+
+        let mut mismatch = Command::new("/bin/sh");
+        mismatch.arg(&binary);
+        let error = verify_installed_version_with_command(&mut mismatch, &binary, "v0.99.2")
+            .expect_err("mismatch");
         assert!(error.message.contains("daemon was not refreshed"));
     }
 

@@ -1081,7 +1081,15 @@ fn value_matches_text(value: Option<&Value>, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::io::{BufRead, BufReader, Write};
+    #[cfg(unix)]
+    use std::net::Shutdown;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
     use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     #[cfg(unix)]
@@ -1470,7 +1478,11 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
+        let event_seen = Arc::new(AtomicBool::new(false));
+        let event_seen_by_filter = Arc::clone(&event_seen);
+        let event_seen_by_snapshot = Arc::clone(&event_seen);
         let waiter = std::thread::spawn(move || {
+            let expected_event = pr_event_filter(42, "o/r");
             wait_for_condition_with_timeout(
                 |snapshot| {
                     Ok(TruthResult {
@@ -1490,12 +1502,22 @@ mod tests {
                     })
                 },
                 move |_| {
-                    let count = counter.fetch_add(1, Ordering::SeqCst);
+                    counter.fetch_add(1, Ordering::SeqCst);
                     Ok(Some(json!({
-                        "status": if count == 0 { "pending" } else { "completed" }
+                        "status": if event_seen_by_snapshot.load(Ordering::SeqCst) {
+                            "completed"
+                        } else {
+                            "pending"
+                        }
                     })))
                 },
-                pr_event_filter(42, "o/r"),
+                move |event| {
+                    let matches = expected_event(event);
+                    if matches {
+                        event_seen_by_filter.store(true, Ordering::SeqCst);
+                    }
+                    matches
+                },
                 3.0,
                 0.05,
                 false,
@@ -1571,43 +1593,46 @@ mod tests {
     fn daemon_disconnect_falls_back_to_polling() {
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("daemon.sock");
-        let mut server = IpcServer::new(socket_path.clone(), dummy_state);
-        server.start().expect("start");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut subscribe = String::new();
+            BufReader::new(stream.try_clone().expect("clone stream"))
+                .read_line(&mut subscribe)
+                .expect("read subscribe");
+            assert_eq!(subscribe.trim(), r#"{"type":"subscribe"}"#);
+            stream
+                .write_all(b"{\"type\":\"goodbye\"}\n")
+                .expect("write goodbye");
+            stream.flush().expect("flush goodbye");
+            stream.shutdown(Shutdown::Both).expect("shutdown");
+        });
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
-        let waiter = std::thread::spawn(move || {
-            wait_for_condition_with_timeout(
-                |snapshot| {
-                    Ok(TruthResult {
-                        matched: snapshot
-                            .and_then(|snapshot| snapshot.get("status"))
-                            .and_then(Value::as_str)
-                            == Some("completed"),
-                        observed: std::collections::BTreeMap::new(),
-                    })
-                },
-                move |_| {
-                    let count = counter.fetch_add(1, Ordering::SeqCst);
-                    let status = if count >= 2 { "completed" } else { "pending" };
-                    Ok(Some(json!({"status": status})))
-                },
-                |_| true,
-                2.0,
-                0.02,
-                false,
-                &socket_path,
-            )
-            .expect("wait")
-        });
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while server.subscriber_count() == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        server.stop().expect("stop");
-
-        let outcome = waiter.join().expect("join");
+        let outcome = wait_for_condition_with_timeout(
+            |snapshot| {
+                Ok(TruthResult {
+                    matched: snapshot
+                        .and_then(|snapshot| snapshot.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("completed"),
+                    observed: std::collections::BTreeMap::new(),
+                })
+            },
+            move |_| {
+                let count = counter.fetch_add(1, Ordering::SeqCst);
+                let status = if count >= 2 { "completed" } else { "pending" };
+                Ok(Some(json!({"status": status})))
+            },
+            |_| true,
+            2.0,
+            0.02,
+            false,
+            &socket_path,
+        )
+        .expect("wait");
+        server.join().expect("server");
         assert!(outcome.matched);
         assert_eq!(outcome.transport, "polling");
         assert!(outcome.fallback_used);
