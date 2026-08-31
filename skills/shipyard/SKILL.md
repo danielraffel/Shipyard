@@ -448,16 +448,19 @@ also contains the mandatory release-matched `pr-close-guard` and advertises
 the mutually exclusive `auth-selector-v2` contract. A v0.134-v0.136 fleet
 client must reject that target wrapper before publication; first install a
 v0.137-or-newer controller through the supported exact-release path, then run
-the governed fleet transaction. The transaction publishes the public wrapper
-selector last. Each invocation binds the wrapper file it actually opened (Linux
-`/proc` or macOS `lsof`) and resolves the CLI and context from that same
-generation, so a concurrent selector swap cannot mix generations or expose a
-missing context or guard. Crash recovery rolls back before validation and rolls
-forward after validation or commit; rollback uses the reverse publication
-order. Do not remove a published generation during rollout because an
-already-open reader may still require it. Preserve generation count, total
-bytes, and free disk in each host receipt; any future reader-aware garbage
-collector remains a separately reviewed, dry-run-only operation.
+the governed fleet transaction. The first v0.137 activation publishes a
+digest-bound, regular-file public trampoline only after legacy readers drain.
+Later updates never replace that public file: they atomically move an
+owner-private generation selector instead. The trampoline reads the selector
+once and executes the selected immutable wrapper; that wrapper resolves the
+CLI, context, helper, and close guard from its own generation. The v4 journal
+binds the trampoline, selector, and complete cohort while retaining bounded
+v2/v3 recovery compatibility. Crash recovery rolls back before validation and
+rolls forward after validation or commit. Do not remove a published generation
+during rollout because an already-open reader may still require it. Preserve
+generation count, total bytes, and free disk in each host receipt; any future
+reader-aware garbage collector remains a separately reviewed, dry-run-only
+operation.
 
 Before any host can mutate, Shipyard resolves the exact annotated tag object,
 commit, tree, release ID, checksum-manifest asset, and macOS DMG asset. It

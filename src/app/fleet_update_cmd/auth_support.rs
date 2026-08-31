@@ -125,7 +125,7 @@ pub(super) fn probe(helper: &Path, wrapper: &Path, phase: &str) -> String {
     let wrapper = shlex_quote(&wrapper.display().to_string());
     format!(
         "if [ -e {helper} ] || [ -L {helper} ]; then test -f {helper}; {phase}_auth_helper_sha256=\"$(/usr/bin/shasum -a 256 {helper} | /usr/bin/awk '{{print $1}}')\"; {phase}_auth_helper_mode=\"$(/usr/bin/stat -L -f '%Lp' {helper})\"; if [ -L {helper} ]; then {phase}_auth_helper_target=\"$(/usr/bin/readlink {helper})\"; else {phase}_auth_helper_target=direct; fi; else {phase}_auth_helper_sha256=absent; {phase}_auth_helper_mode=absent; {phase}_auth_helper_target=absent; fi\n\
-         if [ -e {wrapper} ] || [ -L {wrapper} ]; then test -f {wrapper}; {phase}_auth_wrapper_sha256=\"$(/usr/bin/shasum -a 256 {wrapper} | /usr/bin/awk '{{print $1}}')\"; {phase}_auth_wrapper_mode=\"$(/usr/bin/stat -L -f '%Lp' {wrapper})\"; if [ -L {wrapper} ]; then {phase}_auth_wrapper_target=\"$(/usr/bin/readlink {wrapper})\"; else {phase}_auth_wrapper_target=direct; fi; else {phase}_auth_wrapper_sha256=absent; {phase}_auth_wrapper_mode=absent; {phase}_auth_wrapper_target=absent; fi"
+         if [ -e {wrapper} ] || [ -L {wrapper} ]; then test -f {wrapper}; if [ -L {wrapper} ]; then {phase}_auth_wrapper_target=\"$(/usr/bin/readlink {wrapper})\"; {phase}_auth_wrapper_sha256=\"$(/usr/bin/shasum -a 256 {wrapper} | /usr/bin/awk '{{print $1}}')\"; {phase}_auth_wrapper_mode=\"$(/usr/bin/stat -L -f '%Lp' {wrapper})\"; elif [ -L {wrapper}.shipyard-generation ]; then {phase}_auth_wrapper_target=\"$(/usr/bin/readlink {wrapper}.shipyard-generation)\"; test -f \"${{{phase}_auth_wrapper_target}}\"; test ! -L \"${{{phase}_auth_wrapper_target}}\"; {phase}_auth_wrapper_sha256=\"$(/usr/bin/shasum -a 256 \"${{{phase}_auth_wrapper_target}}\" | /usr/bin/awk '{{print $1}}')\"; {phase}_auth_wrapper_mode=\"$(/usr/bin/stat -f '%Lp' \"${{{phase}_auth_wrapper_target}}\")\"; else {phase}_auth_wrapper_target=direct; {phase}_auth_wrapper_sha256=\"$(/usr/bin/shasum -a 256 {wrapper} | /usr/bin/awk '{{print $1}}')\"; {phase}_auth_wrapper_mode=\"$(/usr/bin/stat -f '%Lp' {wrapper})\"; fi; else {phase}_auth_wrapper_sha256=absent; {phase}_auth_wrapper_mode=absent; {phase}_auth_wrapper_target=absent; fi"
     )
 }
 
@@ -215,6 +215,7 @@ auth_close_guard_digest={close_guard_digest}
 auth_helper_source={helper_source}
 auth_wrapper_source={wrapper_source}
 auth_close_guard_source={close_guard_source}
+auth_selector="$auth_wrapper.shipyard-generation"
 auth_journal="$auth_state_dir/fleet-auth-support.transaction"
 auth_lock="$auth_state_dir/fleet-auth-support.lock"
 auth_guard="$auth_state_dir/fleet-auth-support.guard"
@@ -250,12 +251,14 @@ auth_safe_target() {{
   test "$(/usr/bin/stat -f '%u' "$HOME")" = "$(/usr/bin/id -u)"
   if [ -L "$auth_target" ]; then
     auth_link_target="$(/usr/bin/readlink "$auth_target")"
-    case "$auth_link_target" in "$auth_generation_root"/*/"$(/usr/bin/basename "$auth_target")") ;; *) return 1 ;; esac
+    auth_link_member="$(/usr/bin/basename "$auth_target")"
+    if [ "$auth_target" = "$auth_selector" ]; then auth_link_member=ghapp; fi
+    case "$auth_link_target" in "$auth_generation_root"/*/"$auth_link_member") ;; *) return 1 ;; esac
     auth_link_tail="${{auth_link_target#"$auth_generation_root"/}}"
     auth_link_id="${{auth_link_tail%%/*}}"
     test "${{#auth_link_id}}" = 64
     case "$auth_link_id" in ''|*[!0-9a-f]*) return 1 ;; esac
-    test "$auth_link_tail" = "$auth_link_id/$(/usr/bin/basename "$auth_target")"
+    test "$auth_link_tail" = "$auth_link_id/$auth_link_member"
     test -f "$auth_link_target"
     test ! -L "$auth_link_target"
     test "$(/usr/bin/stat -f '%u' "$auth_link_target")" = "$(/usr/bin/id -u)"
@@ -268,7 +271,7 @@ auth_safe_target() {{
 auth_write_phase() {{
   auth_phase_tmp="$(/usr/bin/mktemp "$auth_state_dir/.fleet-auth-support.phase.XXXXXX")"
   /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-    'shipyard-fleet-auth-v3' "$1" "$auth_authority" "$auth_helper" "$auth_wrapper" \
+    'shipyard-fleet-auth-v4' "$1" "$auth_authority" "$auth_helper" "$auth_wrapper" \
     "$auth_binary" "$auth_companion" "$auth_context" "$auth_close_guard" \
     "$auth_helper_digest" "$auth_wrapper_digest" "$auth_close_guard_digest" \
     "$auth_context_digest" "$auth_companion_required" \
@@ -291,10 +294,34 @@ auth_publish_link() {{
   /bin/mv -f "$auth_link_stage" "$auth_target"
 }}
 
+auth_publish_file() {{
+  auth_target="$1"
+  auth_source="$2"
+  auth_file_stage="$(/usr/bin/mktemp "$auth_target.shipyard-file.XXXXXX")"
+  /bin/cp "$auth_source" "$auth_file_stage"
+  /bin/chmod 700 "$auth_file_stage"
+  /bin/mv -f "$auth_file_stage" "$auth_target"
+}}
+
+auth_publish_generation_selection() {{
+  auth_selection_wrapper="$1"
+  auth_selection_target="$2"
+  auth_selection_stable=0
+  if [ -f "$auth_selection_wrapper" ] && [ ! -L "$auth_selection_wrapper" ] && \
+     [ "$(/usr/bin/grep -c '^# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1$' "$auth_selection_wrapper" || true)" = 1 ]; then
+    auth_selection_stable=1
+  fi
+  if [ "$auth_selection_stable" = 1 ]; then
+    auth_publish_link "$auth_selection_wrapper.shipyard-generation" "$auth_selection_target"
+  else
+    auth_publish_link "$auth_selection_wrapper" "$auth_selection_target"
+  fi
+}}
+
 auth_selector_identity() {{
-  auth_selector="$1"
-  if [ -L "$auth_selector" ]; then
-    auth_selector_target="$(/usr/bin/readlink "$auth_selector")"
+  auth_selector_path="$1"
+  if [ -L "$auth_selector_path" ]; then
+    auth_selector_target="$(/usr/bin/readlink "$auth_selector_path")"
     case "$auth_selector_target" in "$auth_generation_root"/*/ghapp) ;; *) return 1 ;; esac
     auth_selector_tail="${{auth_selector_target#"$auth_generation_root"/}}"
     auth_selector_id="${{auth_selector_tail%%/*}}"
@@ -302,10 +329,23 @@ auth_selector_identity() {{
     case "$auth_selector_id" in ''|*[!0-9a-f]*) return 1 ;; esac
     test "$auth_selector_tail" = "$auth_selector_id/ghapp"
     /usr/bin/printf 'generation:%s\n' "$auth_selector_target"
-  elif [ -f "$auth_selector" ]; then
-    test ! -L "$auth_selector"
-    /usr/bin/printf 'direct:%s\n' "$(/usr/bin/shasum -a 256 "$auth_selector" | /usr/bin/awk '{{print $1}}')"
-  elif [ ! -e "$auth_selector" ]; then
+  elif [ -f "$auth_selector_path" ] && [ ! -L "$auth_selector_path" ] && \
+       [ "$(/usr/bin/grep -c '^# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1$' "$auth_selector_path" || true)" = 1 ] && \
+       [ -L "$auth_selector_path.shipyard-generation" ]; then
+    auth_selector_target="$(/usr/bin/readlink "$auth_selector_path.shipyard-generation")"
+    case "$auth_selector_target" in "$auth_generation_root"/*/ghapp) ;; *) return 1 ;; esac
+    auth_selector_tail="${{auth_selector_target#"$auth_generation_root"/}}"
+    auth_selector_id="${{auth_selector_tail%%/*}}"
+    test "${{#auth_selector_id}}" = 64
+    case "$auth_selector_id" in ''|*[!0-9a-f]*) return 1 ;; esac
+    test "$auth_selector_tail" = "$auth_selector_id/ghapp"
+    /usr/bin/printf 'generation:%s\n' "$auth_selector_target"
+  elif [ -e "$auth_selector_path.shipyard-generation" ] || [ -L "$auth_selector_path.shipyard-generation" ]; then
+    return 1
+  elif [ -f "$auth_selector_path" ]; then
+    test ! -L "$auth_selector_path"
+    /usr/bin/printf 'direct:%s\n' "$(/usr/bin/shasum -a 256 "$auth_selector_path" | /usr/bin/awk '{{print $1}}')"
+  elif [ ! -e "$auth_selector_path" ]; then
     /usr/bin/printf 'absent\n'
   else
     return 1
@@ -373,6 +413,18 @@ auth_validate_recovery_generation() {{
     test "$(/usr/bin/stat -f '%Lp' "$auth_member_path")" = "$auth_member_mode"
     test "$(/usr/bin/shasum -a 256 "$auth_member_path" | /usr/bin/awk '{{print $1}}')" = "$(auth_manifest_value "$auth_generation_manifest_check" "$auth_member_key")"
   done
+  if /usr/bin/grep -q '^public_trampoline_sha256=' "$auth_generation_manifest_check"; then
+    auth_trampoline_path_check="$auth_generation_dir_check/ghapp.public-trampoline"
+    test -f "$auth_trampoline_path_check"; test ! -L "$auth_trampoline_path_check"
+    test "$(/usr/bin/stat -f '%u' "$auth_trampoline_path_check")" = "$(/usr/bin/id -u)"
+    test "$(auth_manifest_value "$auth_generation_manifest_check" public_trampoline_mode)" = 700
+    test "$(/usr/bin/stat -f '%Lp' "$auth_trampoline_path_check")" = 700
+    test "$(/usr/bin/shasum -a 256 "$auth_trampoline_path_check" | /usr/bin/awk '{{print $1}}')" = "$(auth_manifest_value "$auth_generation_manifest_check" public_trampoline_sha256)"
+  else
+    test "$auth_generation_guard_required_check" = 0
+    test ! -e "$auth_generation_dir_check/ghapp.public-trampoline"
+    test ! -L "$auth_generation_dir_check/ghapp.public-trampoline"
+  fi
   if /usr/bin/grep -q '^close_guard_sha256=' "$auth_generation_manifest_check"; then
     auth_close_guard_path_check="$auth_generation_dir_check/pr-close-guard"
     test -f "$auth_close_guard_path_check"; test ! -L "$auth_close_guard_path_check"
@@ -423,12 +475,14 @@ auth_cleanup_markers() {{
   auth_cleanup_companion="$4"
   auth_cleanup_context="$5"
   auth_cleanup_close_guard="${{6:-}}"
+  auth_cleanup_selector="$auth_cleanup_wrapper.shipyard-generation"
   /bin/rm -f "$auth_cleanup_helper.shipyard-rollback" "$auth_cleanup_helper.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_wrapper.shipyard-rollback" "$auth_cleanup_wrapper.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_binary.shipyard-rollback" "$auth_cleanup_binary.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_companion.shipyard-rollback" "$auth_cleanup_companion.shipyard-was-absent"
   /bin/rm -f "$auth_cleanup_helper.shipyard-rollback.tmp" "$auth_cleanup_wrapper.shipyard-rollback.tmp"
   /bin/rm -f "$auth_cleanup_binary.shipyard-rollback.tmp" "$auth_cleanup_companion.shipyard-rollback.tmp"
+  /bin/rm -f "$auth_cleanup_selector.shipyard-rollback" "$auth_cleanup_selector.shipyard-was-absent" "$auth_cleanup_selector.shipyard-rollback.tmp"
   if [ -n "$auth_cleanup_context" ]; then /bin/rm -f "$auth_cleanup_context.shipyard-rollback" "$auth_cleanup_context.shipyard-was-absent" "$auth_cleanup_context.shipyard-rollback.tmp"; fi
   if [ -n "$auth_cleanup_close_guard" ]; then /bin/rm -f "$auth_cleanup_close_guard.shipyard-rollback" "$auth_cleanup_close_guard.shipyard-was-absent" "$auth_cleanup_close_guard.shipyard-rollback.tmp"; fi
   /bin/rm -f "$auth_journal"
@@ -456,20 +510,32 @@ auth_restore_transaction() {{
   auth_restore_companion="$4"
   auth_restore_context="$5"
   auth_restore_close_guard="${{6:-}}"
+  auth_restore_selector="$auth_restore_wrapper.shipyard-generation"
   # Only a sibling-guard generation is independent of compatibility
   # projections and safe to restore first. A direct wrapper or guardless v2
   # generation must remain behind the immutable anchor until the public guard
   # and the rest of its projections have been restored.
   auth_restore_wrapper_first=0
-  if [ -L "$auth_restore_wrapper.shipyard-rollback" ]; then
-    auth_restore_wrapper_target="$(/usr/bin/readlink "$auth_restore_wrapper.shipyard-rollback")"
+  auth_restore_public_stable=0
+  if [ -L "$auth_restore_selector.shipyard-rollback" ] && \
+     [ -f "$auth_restore_wrapper.shipyard-rollback" ] && [ ! -L "$auth_restore_wrapper.shipyard-rollback" ] && \
+     [ "$(/usr/bin/grep -c '^# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1$' "$auth_restore_wrapper.shipyard-rollback" || true)" = 1 ]; then
+    auth_restore_public_stable=1
+  fi
+  auth_restore_selector_source="$auth_restore_wrapper.shipyard-rollback"
+  if [ -L "$auth_restore_selector.shipyard-rollback" ]; then
+    auth_restore_selector_source="$auth_restore_selector.shipyard-rollback"
+  fi
+  if [ -L "$auth_restore_selector_source" ]; then
+    auth_restore_wrapper_target="$(/usr/bin/readlink "$auth_restore_selector_source")"
     case "$auth_restore_wrapper_target" in "$auth_generation_root"/*/ghapp) ;; *) return 1 ;; esac
     if [ "$(/usr/bin/grep -c '^# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1$' "$auth_restore_wrapper_target")" = 1 ]; then
       auth_restore_wrapper_first=1
     fi
   fi
   if [ "$auth_restore_wrapper_first" = 1 ]; then
-    auth_restore_one "$auth_restore_wrapper"
+    if [ "$auth_restore_public_stable" = 0 ]; then auth_restore_one "$auth_restore_wrapper"; fi
+    auth_restore_one "$auth_restore_selector"
   fi
   if [ -n "$auth_restore_context" ]; then auth_restore_one "$auth_restore_context"; fi
   if [ -n "$auth_restore_close_guard" ]; then auth_restore_one "$auth_restore_close_guard"; fi
@@ -477,7 +543,8 @@ auth_restore_transaction() {{
   auth_restore_one "$auth_restore_binary"
   auth_restore_one "$auth_restore_helper"
   if [ "$auth_restore_wrapper_first" = 0 ]; then
-    auth_restore_one "$auth_restore_wrapper"
+    auth_restore_one "$auth_restore_selector"
+    if [ "$auth_restore_public_stable" = 0 ]; then auth_restore_one "$auth_restore_wrapper"; fi
   fi
 }}
 
@@ -502,7 +569,7 @@ auth_backup_record() {{
   fi
 }}
 
-auth_backup_cohort_digest() {{
+auth_backup_cohort_digest_legacy() {{
   {{
     auth_backup_record helper "$1"
     auth_backup_record wrapper "$2"
@@ -513,9 +580,26 @@ auth_backup_cohort_digest() {{
   }} | /usr/bin/shasum -a 256 | /usr/bin/awk '{{print $1}}'
 }}
 
+auth_backup_cohort_digest() {{
+  {{
+    auth_backup_record helper "$1"
+    auth_backup_record wrapper "$2"
+    auth_backup_record binary "$3"
+    auth_backup_record companion "$4"
+    auth_backup_record context "$5"
+    if [ -n "${{6:-}}" ]; then auth_backup_record close_guard "$6"; fi
+    auth_backup_record selector "$2.shipyard-generation"
+  }} | /usr/bin/shasum -a 256 | /usr/bin/awk '{{print $1}}'
+}}
+
 auth_validate_recovery_prior() {{
   test "$auth_recovery_original_backup" != pending
-  test "$(auth_backup_cohort_digest "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context" "$auth_recovery_close_guard")" = "$auth_recovery_original_backup"
+  if [ "$auth_recovery_selector_backed" = 1 ]; then
+    auth_recovery_backup_digest="$(auth_backup_cohort_digest "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context" "$auth_recovery_close_guard")"
+  else
+    auth_recovery_backup_digest="$(auth_backup_cohort_digest_legacy "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context" "$auth_recovery_close_guard")"
+  fi
+  test "$auth_recovery_backup_digest" = "$auth_recovery_original_backup"
   if [ "$auth_recovery_original_kind" = generation ]; then
     auth_validate_recovery_generation "$auth_recovery_original_id" "$auth_recovery_original_target" "$auth_recovery_original_manifest" normal "$auth_recovery_original_authority" 0
   fi
@@ -538,7 +622,7 @@ auth_write_recovery_phase() {{
       "$auth_recovery_original_backup" "$auth_recovery_original_authority" > "$auth_recovery_phase_tmp"
   else
     /usr/bin/printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-      'shipyard-fleet-auth-v3' "$1" "$auth_recovery_authority" \
+      "$auth_recovery_schema" "$1" "$auth_recovery_authority" \
       "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" \
       "$auth_recovery_companion" "$auth_recovery_context" "$auth_recovery_close_guard" \
       "$auth_recovery_helper_digest" "$auth_recovery_wrapper_digest" \
@@ -566,7 +650,8 @@ auth_recover_generation_transaction() {{
   auth_recovery_binary="$(/usr/bin/sed -n '6p' "$auth_journal")"
   auth_recovery_companion="$(/usr/bin/sed -n '7p' "$auth_journal")"
   auth_recovery_context="$(/usr/bin/sed -n '8p' "$auth_journal")"
-  if [ "$auth_recovery_schema" = shipyard-fleet-auth-v3 ]; then
+  auth_recovery_selector_backed=0
+  if [ "$auth_recovery_schema" = shipyard-fleet-auth-v3 ] || [ "$auth_recovery_schema" = shipyard-fleet-auth-v4 ]; then
     test "$(/usr/bin/wc -l < "$auth_journal" | /usr/bin/tr -d ' ')" = 26
     auth_recovery_close_guard="$(/usr/bin/sed -n '9p' "$auth_journal")"
     auth_recovery_helper_digest="$(/usr/bin/sed -n '10p' "$auth_journal")"
@@ -575,6 +660,7 @@ auth_recover_generation_transaction() {{
     auth_recovery_context_digest="$(/usr/bin/sed -n '13p' "$auth_journal")"
     auth_recovery_offset=2
     auth_recovery_guard_required=1
+    if [ "$auth_recovery_schema" = shipyard-fleet-auth-v4 ]; then auth_recovery_selector_backed=1; fi
   else
     test "$auth_recovery_schema" = shipyard-fleet-auth-v2
     test "$(/usr/bin/wc -l < "$auth_journal" | /usr/bin/tr -d ' ')" = 24
@@ -655,14 +741,40 @@ auth_recover_generation_transaction() {{
   auth_safe_target "$auth_recovery_wrapper"
   auth_safe_target "$auth_recovery_binary"
   auth_safe_target "$auth_recovery_companion"
-  if [ "$auth_recovery_schema" = shipyard-fleet-auth-v3 ]; then
+  if [ "$auth_recovery_schema" = shipyard-fleet-auth-v3 ] || [ "$auth_recovery_schema" = shipyard-fleet-auth-v4 ]; then
     test "$auth_recovery_close_guard" = "$HOME/.config/shipyard/guards/pr-close-guard"
     case "$auth_recovery_close_guard_digest" in ''|*[!0-9a-f]*) return 1 ;; esac
     test "${{#auth_recovery_close_guard_digest}}" = 64
     auth_safe_target "$auth_recovery_close_guard"
   fi
   if [ "$auth_recovery_resolver_required" = 1 ]; then auth_safe_target "$auth_recovery_context"; else test -z "$auth_recovery_context"; fi
-  auth_recovery_live_selector="$(auth_selector_identity "$auth_recovery_wrapper")" || return 1
+  # This observation can intentionally fail at the first-install selector-only
+  # checkpoint. Suppress the inherited ERR trap inside the substitution so the
+  # recovery owner retains its transaction lock while classifying that state.
+  auth_recovery_live_selector="$(auth_selector_identity "$auth_recovery_wrapper" || true)"
+  if [ -n "$auth_recovery_live_selector" ]; then
+    :
+  elif [ "$auth_recovery_selector_backed" = 1 ] && \
+       [ "$auth_recovery_phase" = target-select-intent ] && \
+       [ -L "$auth_recovery_wrapper.shipyard-generation" ]; then
+    # The selector is published before the stable public trampoline so direct
+    # readers never observe a trampoline without a target. A clean first
+    # install can therefore be interrupted with only the authenticated target
+    # selector live; recognize exactly that journaled boundary for rollback.
+    auth_recovery_transition_target="$(/usr/bin/readlink "$auth_recovery_wrapper.shipyard-generation")"
+    test "$auth_recovery_transition_target" = "$auth_recovery_target_wrapper"
+    case "$auth_recovery_original_kind" in
+      absent) test ! -e "$auth_recovery_wrapper"; test ! -L "$auth_recovery_wrapper" ;;
+      direct)
+        test -f "$auth_recovery_wrapper"; test ! -L "$auth_recovery_wrapper"
+        test "direct:$(/usr/bin/shasum -a 256 "$auth_recovery_wrapper" | /usr/bin/awk '{{print $1}}')" = "$auth_recovery_original_identity"
+        ;;
+      *) return 1 ;;
+    esac
+    auth_recovery_live_selector="generation:$auth_recovery_transition_target"
+  else
+    return 1
+  fi
   if [ "$auth_recovery_phase" = rollback-complete ]; then
     test "$auth_recovery_live_selector" = "$auth_recovery_original_identity"
     auth_cleanup_markers "$auth_recovery_helper" "$auth_recovery_wrapper" "$auth_recovery_binary" "$auth_recovery_companion" "$auth_recovery_context" "$auth_recovery_close_guard"
@@ -697,7 +809,7 @@ auth_recover_generation_transaction() {{
     auth_validate_recovery_prior
     if [ "$auth_recovery_anchor_id" != absent ]; then
       auth_validate_recovery_generation "$auth_recovery_anchor_id" "$auth_recovery_anchor_wrapper" "$auth_recovery_anchor_manifest" legacy-anchor "$auth_recovery_authority" "$auth_recovery_guard_required"
-      auth_publish_link "$auth_recovery_wrapper" "$auth_recovery_anchor_wrapper"
+      auth_publish_generation_selection "$auth_recovery_wrapper" "$auth_recovery_anchor_wrapper"
       auth_recovery_live_selector="generation:$auth_recovery_anchor_wrapper"
     elif [ "$auth_recovery_original_kind" = direct ]; then
       return 1
@@ -727,7 +839,7 @@ auth_recover() {{
   test -f "$auth_journal"
   test ! -L "$auth_journal"
   case "$(/usr/bin/sed -n '1p' "$auth_journal")" in
-  shipyard-fleet-auth-v2|shipyard-fleet-auth-v3)
+  shipyard-fleet-auth-v2|shipyard-fleet-auth-v3|shipyard-fleet-auth-v4)
     auth_recover_generation_transaction
     return
     ;;
@@ -834,6 +946,7 @@ auth_close_guard_dir_mode="$(/usr/bin/stat -f '%Lp' "$auth_close_guard_dir")"
 test $((8#$auth_close_guard_dir_mode & 8#22)) -eq 0
 auth_safe_target "$auth_helper"
 auth_safe_target "$auth_wrapper"
+auth_safe_target "$auth_selector"
 auth_safe_target "$auth_binary"
 auth_safe_target "$auth_companion"
 auth_safe_target "$auth_close_guard"
@@ -843,6 +956,12 @@ if [ -e "$auth_journal" ] || [ -L "$auth_journal" ]; then auth_recovery_needed=1
 case "$auth_recovery_needed" in 1) auth_recover ;; esac
 auth_original_selector_identity="$(auth_selector_identity "$auth_wrapper")" || exit 1
 auth_previous_wrapper_needs_anchor=0
+auth_public_trampoline_active=0
+if [ -f "$auth_wrapper" ] && [ ! -L "$auth_wrapper" ] && [ -L "$auth_selector" ]; then
+  test "$(/usr/bin/grep -c '^# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1$' "$auth_wrapper")" = 1
+  test "$(/usr/bin/stat -f '%Lp' "$auth_wrapper")" = 700
+  auth_public_trampoline_active=1
+fi
 case "$auth_original_selector_identity" in
   absent) auth_original_selector_kind=absent ;;
   direct:*) auth_original_selector_kind=direct; auth_previous_wrapper_needs_anchor=1 ;;
@@ -866,7 +985,7 @@ case "$auth_original_selector_identity" in
     ;;
   *) exit 1 ;;
 esac
-for auth_target in "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion"; do
+for auth_target in "$auth_helper" "$auth_wrapper" "$auth_selector" "$auth_binary" "$auth_companion"; do
   test ! -e "$auth_target.shipyard-rollback"
   test ! -L "$auth_target.shipyard-rollback"
   test ! -e "$auth_target.shipyard-was-absent"
@@ -888,6 +1007,8 @@ test ! -e "$auth_helper.shipyard-rollback.tmp"
 test ! -L "$auth_helper.shipyard-rollback.tmp"
 test ! -e "$auth_wrapper.shipyard-rollback.tmp"
 test ! -L "$auth_wrapper.shipyard-rollback.tmp"
+test ! -e "$auth_selector.shipyard-rollback.tmp"
+test ! -L "$auth_selector.shipyard-rollback.tmp"
 if [ "$auth_resolver_required" = 1 ]; then
   test ! -e "$auth_context.shipyard-rollback"
   test ! -L "$auth_context.shipyard-rollback"
@@ -933,16 +1054,24 @@ test "$(/usr/bin/grep -c '^# Shipyard-Auth-Generation-Contract: auth-selector-v2
 auth_legacy_contract_count="$(/usr/bin/grep -c '^# Shipyard-Auth-Generation-Contract: auth-selector-v1$' "$auth_generation_stage/ghapp" || true)"
 test "$auth_legacy_contract_count" = 0
 test "$(/usr/bin/grep -c '^# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1$' "$auth_generation_stage/ghapp")" = 1
+test "$(/usr/bin/grep -c '^# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1$' "$auth_generation_stage/ghapp")" = 1
+/usr/bin/awk '{{ print }} /^# Shipyard-Stable-Public-Trampoline-END$/ {{ found=1; exit }} END {{ if (!found) exit 1 }}' "$auth_generation_stage/ghapp" > "$auth_generation_stage/ghapp.public-trampoline"
+/usr/bin/printf '%s\n' 'echo "ghapp: stable public trampoline fell through" >&2' 'exit 1' >> "$auth_generation_stage/ghapp.public-trampoline"
+/bin/chmod 700 "$auth_generation_stage/ghapp.public-trampoline"
 {binary_install_command}
 /bin/chmod 700 "$auth_generation_stage/shipyard"
 if [ "$auth_companion_required" = 1 ]; then /bin/chmod 700 "$auth_generation_stage/shipyard-workstream-provider"; fi
 auth_stage_helper_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/shipyard-github-app-token" | /usr/bin/awk '{{print $1}}')"
 auth_stage_wrapper_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/ghapp" | /usr/bin/awk '{{print $1}}')"
+auth_stage_trampoline_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/ghapp.public-trampoline" | /usr/bin/awk '{{print $1}}')"
 auth_stage_close_guard_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/pr-close-guard" | /usr/bin/awk '{{print $1}}')"
 auth_stage_binary_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/shipyard" | /usr/bin/awk '{{print $1}}')"
 test "$auth_stage_helper_digest" = "$auth_helper_digest"
 test "$auth_stage_wrapper_digest" = "$auth_wrapper_digest"
 test "$auth_stage_close_guard_digest" = "$auth_close_guard_digest"
+if [ "$auth_public_trampoline_active" = 1 ]; then
+  test "$(/usr/bin/shasum -a 256 "$auth_wrapper" | /usr/bin/awk '{{print $1}}')" = "$auth_stage_trampoline_digest"
+fi
 test -x "$auth_generation_stage/shipyard"
 if [ "$auth_companion_required" = 1 ]; then
   test -x "$auth_generation_stage/shipyard-workstream-provider"
@@ -958,6 +1087,7 @@ auth_generation_seed="$auth_generation_stage/generation.seed"
   "authority_identity=$auth_authority" \
   "helper_sha256=$auth_stage_helper_digest" \
   "wrapper_sha256=$auth_stage_wrapper_digest" \
+  "public_trampoline_sha256=$auth_stage_trampoline_digest" \
   "close_guard_sha256=$auth_stage_close_guard_digest" \
   "binary_sha256=$auth_stage_binary_digest" \
   "companion_sha256=$auth_stage_companion_digest" \
@@ -983,6 +1113,8 @@ auth_generation_manifest="$auth_generation_stage/generation.manifest"
   'helper_mode=700' \
   "wrapper_sha256=$auth_stage_wrapper_digest" \
   'wrapper_mode=700' \
+  "public_trampoline_sha256=$auth_stage_trampoline_digest" \
+  'public_trampoline_mode=700' \
   "close_guard_sha256=$auth_stage_close_guard_digest" \
   'close_guard_mode=700' \
   "binary_sha256=$auth_stage_binary_digest" \
@@ -1013,7 +1145,7 @@ auth_rollback_after_failure() {{
   trap - ERR INT TERM
   if [ -f "$auth_journal" ]; then
     case "$(/usr/bin/sed -n '1p' "$auth_journal")" in
-      shipyard-fleet-auth-v2|shipyard-fleet-auth-v3) auth_recover_generation_transaction rollback ;;
+      shipyard-fleet-auth-v2|shipyard-fleet-auth-v3|shipyard-fleet-auth-v4) auth_recover_generation_transaction rollback ;;
       *) auth_restore_transaction "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context" "$auth_close_guard"; auth_cleanup_markers "$auth_helper" "$auth_wrapper" "$auth_binary" "$auth_companion" "$auth_context" "$auth_close_guard" ;;
     esac
   else
@@ -1033,6 +1165,7 @@ trap 'auth_rollback_after_failure 143' TERM
 
 auth_backup_one "$auth_helper"
 auth_backup_one "$auth_wrapper"
+auth_backup_one "$auth_selector"
 auth_backup_one "$auth_binary"
 auth_backup_one "$auth_companion"
 if [ "$auth_resolver_required" = 1 ]; then auth_backup_one "$auth_context"; fi
@@ -1048,7 +1181,7 @@ if [ -e "$auth_generation" ] || [ -L "$auth_generation" ]; then
   test "$(/usr/bin/stat -f '%Lp' "$auth_generation")" = 700
   /usr/bin/cmp -s "$auth_generation/generation.seed" "$auth_generation_stage/generation.seed"
   /usr/bin/cmp -s "$auth_generation/generation.manifest" "$auth_generation_stage/generation.manifest"
-  for auth_member in shipyard-github-app-token ghapp pr-close-guard shipyard generation.seed generation.manifest; do
+  for auth_member in shipyard-github-app-token ghapp ghapp.public-trampoline pr-close-guard shipyard generation.seed generation.manifest; do
     test -f "$auth_generation/$auth_member"
     test ! -L "$auth_generation/$auth_member"
     test "$(/usr/bin/stat -f '%u' "$auth_generation/$auth_member")" = "$(/usr/bin/id -u)"
@@ -1091,10 +1224,11 @@ if [ "$auth_previous_wrapper_needs_anchor" = 1 ]; then
   auth_anchor_stage="$(/usr/bin/mktemp -d "$auth_generation_root/.anchor.$auth_authority.XXXXXX")"
   /bin/chmod 700 "$auth_anchor_stage"
   /bin/cp "$auth_generation/ghapp" "$auth_anchor_stage/ghapp"
+  /bin/cp "$auth_generation/ghapp.public-trampoline" "$auth_anchor_stage/ghapp.public-trampoline"
   /bin/cp "$auth_generation/pr-close-guard" "$auth_anchor_stage/pr-close-guard"
   /bin/cp "$auth_generation/shipyard" "$auth_anchor_stage/shipyard"
   /bin/cp "$auth_helper" "$auth_anchor_stage/shipyard-github-app-token"
-  /bin/chmod 700 "$auth_anchor_stage/ghapp" "$auth_anchor_stage/pr-close-guard" "$auth_anchor_stage/shipyard" "$auth_anchor_stage/shipyard-github-app-token"
+  /bin/chmod 700 "$auth_anchor_stage/ghapp" "$auth_anchor_stage/ghapp.public-trampoline" "$auth_anchor_stage/pr-close-guard" "$auth_anchor_stage/shipyard" "$auth_anchor_stage/shipyard-github-app-token"
   if [ "$auth_companion_required" = 1 ]; then
     /bin/cp "$auth_generation/shipyard-workstream-provider" "$auth_anchor_stage/shipyard-workstream-provider"
     /bin/chmod 700 "$auth_anchor_stage/shipyard-workstream-provider"
@@ -1108,6 +1242,7 @@ if [ "$auth_previous_wrapper_needs_anchor" = 1 ]; then
     "authority_identity=$auth_authority" \
     "helper_sha256=$auth_anchor_helper_digest" \
     "wrapper_sha256=$auth_stage_wrapper_digest" \
+    "public_trampoline_sha256=$auth_stage_trampoline_digest" \
     "close_guard_sha256=$auth_stage_close_guard_digest" \
     "binary_sha256=$auth_stage_binary_digest" \
     "companion_sha256=$auth_stage_companion_digest" \
@@ -1133,6 +1268,8 @@ if [ "$auth_previous_wrapper_needs_anchor" = 1 ]; then
     'helper_mode=700' \
     "wrapper_sha256=$auth_stage_wrapper_digest" \
     'wrapper_mode=700' \
+    "public_trampoline_sha256=$auth_stage_trampoline_digest" \
+    'public_trampoline_mode=700' \
     "close_guard_sha256=$auth_stage_close_guard_digest" \
     'close_guard_mode=700' \
     "binary_sha256=$auth_stage_binary_digest" \
@@ -1156,7 +1293,7 @@ if [ "$auth_previous_wrapper_needs_anchor" = 1 ]; then
       test "$(/usr/bin/stat -f '%u' "$auth_anchor/$auth_member")" = "$(/usr/bin/id -u)"
       test "$(/usr/bin/stat -f '%Lp' "$auth_anchor/$auth_member")" = 600
     done
-    for auth_member in shipyard-github-app-token ghapp pr-close-guard shipyard; do
+    for auth_member in shipyard-github-app-token ghapp ghapp.public-trampoline pr-close-guard shipyard; do
       test -f "$auth_anchor/$auth_member"
       test ! -L "$auth_anchor/$auth_member"
       test "$(/usr/bin/stat -f '%u' "$auth_anchor/$auth_member")" = "$(/usr/bin/id -u)"
@@ -1189,7 +1326,7 @@ if [ "$auth_previous_wrapper_needs_anchor" = 1 ]; then
   fi
   auth_anchor_stage=
   auth_write_phase anchor-select-intent
-  auth_publish_link "$auth_wrapper" "$auth_anchor/ghapp"
+  auth_publish_generation_selection "$auth_wrapper" "$auth_anchor/ghapp"
   auth_write_phase anchor-selected
   auth_old_reader_cohort=
   # A direct-wrapper exec can cross the atomic selector rename before it is
@@ -1245,11 +1382,13 @@ if [ "$auth_resolver_required" = 1 ]; then
 fi
 auth_write_phase projections-published
 auth_write_phase target-select-intent
-auth_publish_link "$auth_wrapper" "$auth_generation/ghapp"
+auth_publish_link "$auth_selector" "$auth_generation/ghapp"
+if [ "$auth_public_trampoline_active" = 0 ]; then auth_publish_file "$auth_wrapper" "$auth_generation/ghapp.public-trampoline"; fi
 auth_write_phase target-selected
 auth_write_phase validation-intent
 test "$(/usr/bin/shasum -a 256 "$auth_helper" | /usr/bin/awk '{{print $1}}')" = "$auth_helper_digest"
-test "$(/usr/bin/shasum -a 256 "$auth_wrapper" | /usr/bin/awk '{{print $1}}')" = "$auth_wrapper_digest"
+test "$(/usr/bin/shasum -a 256 "$(/usr/bin/readlink "$auth_selector")" | /usr/bin/awk '{{print $1}}')" = "$auth_wrapper_digest"
+test "$(/usr/bin/shasum -a 256 "$auth_wrapper" | /usr/bin/awk '{{print $1}}')" = "$auth_stage_trampoline_digest"
 test "$(/usr/bin/shasum -a 256 "$auth_close_guard" | /usr/bin/awk '{{print $1}}')" = "$auth_close_guard_digest"
 test "$(/usr/bin/stat -L -f '%Lp' "$auth_helper")" = 700
 test "$(/usr/bin/stat -L -f '%Lp' "$auth_wrapper")" = 700

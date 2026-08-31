@@ -1,6 +1,7 @@
 #!/bin/bash
 # Shipyard-Auth-Generation-Contract: auth-selector-v2
 # Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1
+# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1
 # Dual-mode GitHub App wrapper: an audited privileged gh command surface plus
 # a JSON-emitting `token` mode for Shipyard's token_command.
 set -euo pipefail
@@ -38,6 +39,84 @@ wrapper_path="$opened_wrapper_path"
 generation_id=""
 guards="${SHIPYARD_GHAPP_GUARDS_DIR:-$HOME/.config/shipyard/guards}"
 generation_store_candidate="$HOME/.local/share/shipyard/auth-generations"
+installed_public_wrapper="$HOME/.local/bin/ghapp"
+installed_generation_selector="$installed_public_wrapper.shipyard-generation"
+installed_public_wrapper_opened="$installed_public_wrapper"
+if [[ -d "${installed_public_wrapper%/*}" && ! -L "${installed_public_wrapper%/*}" ]]; then
+    installed_public_wrapper_opened="$(cd "${installed_public_wrapper%/*}" && pwd -P)/ghapp"
+fi
+
+# Shipyard-Stable-Public-Trampoline-BEGIN
+# The installed public entrypoint remains a regular file so a shebang reader is
+# never reopened through a concurrently replaced symlink. The independently
+# published selector is read exactly once; the immutable generation wrapper
+# repeats the complete member and provenance validation below.
+if [[ "$opened_wrapper_path" == "$installed_public_wrapper_opened" ]]; then
+    if [[ ! -L "$installed_generation_selector" ]]; then
+        echo "ghapp: installed generation selector is missing or unsafe" >&2
+        exit 1
+    fi
+    selected_owner="$(/usr/bin/id -u)"
+    for selected_private_root in \
+        "$HOME/.local/share/shipyard" \
+        "$generation_store_candidate"; do
+        selected_metadata=""
+        if selected_metadata="$(LC_ALL=C /usr/bin/stat -f '%u|%Lp' "$selected_private_root" 2>/dev/null)"; then
+            :
+        elif selected_metadata="$(LC_ALL=C /usr/bin/stat -c '%u|%a' "$selected_private_root" 2>/dev/null)"; then
+            :
+        else
+            selected_metadata=""
+        fi
+        if [[ ! -d "$selected_private_root" || -L "$selected_private_root" || \
+              "$selected_metadata" != "$selected_owner|700" ]]; then
+            echo "ghapp: installed generation store is malformed or unsafe" >&2
+            exit 1
+        fi
+    done
+    selected_generation_wrapper="$(/usr/bin/readlink "$installed_generation_selector")"
+    selected_generation_prefix="$generation_store_candidate/"
+    if [[ "$selected_generation_wrapper" != "$selected_generation_prefix"* ]]; then
+        echo "ghapp: installed generation selector escapes the private store" >&2
+        exit 1
+    fi
+    selected_generation_tail="${selected_generation_wrapper#"$selected_generation_prefix"}"
+    selected_generation_id="${selected_generation_tail%%/*}"
+    if [[ ! "$selected_generation_id" =~ ^[0-9a-f]{64}$ || \
+          "$selected_generation_tail" != "$selected_generation_id/ghapp" ]]; then
+        echo "ghapp: installed generation selector is malformed" >&2
+        exit 1
+    fi
+    selected_generation_dir="$generation_store_candidate/$selected_generation_id"
+    selected_metadata=""
+    if selected_metadata="$(LC_ALL=C /usr/bin/stat -f '%u|%Lp' "$selected_generation_dir" 2>/dev/null)"; then
+        :
+    elif selected_metadata="$(LC_ALL=C /usr/bin/stat -c '%u|%a' "$selected_generation_dir" 2>/dev/null)"; then
+        :
+    else
+        selected_metadata=""
+    fi
+    if [[ ! -d "$selected_generation_dir" || -L "$selected_generation_dir" || \
+          "$selected_metadata" != "$selected_owner|700" || \
+          ! -f "$selected_generation_wrapper" || -L "$selected_generation_wrapper" || \
+          ! -x "$selected_generation_wrapper" ]]; then
+        echo "ghapp: selected generation wrapper is malformed or unsafe" >&2
+        exit 1
+    fi
+    if selected_metadata="$(LC_ALL=C /usr/bin/stat -f '%u|%Lp' "$selected_generation_wrapper" 2>/dev/null)"; then
+        :
+    elif selected_metadata="$(LC_ALL=C /usr/bin/stat -c '%u|%a' "$selected_generation_wrapper" 2>/dev/null)"; then
+        :
+    else
+        selected_metadata=""
+    fi
+    if [[ "$selected_metadata" != "$selected_owner|700" ]]; then
+        echo "ghapp: selected generation wrapper identity is malformed or unsafe" >&2
+        exit 1
+    fi
+    exec /bin/bash "$selected_generation_wrapper" "$@"
+fi
+# Shipyard-Stable-Public-Trampoline-END
 opened_generation_store=""
 if [[ -d "$generation_store_candidate" && ! -L "$generation_store_candidate" ]]; then
     opened_generation_store="$(cd "$generation_store_candidate" && pwd -P)"

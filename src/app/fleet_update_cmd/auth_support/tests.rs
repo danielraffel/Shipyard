@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::app::fleet_update_cmd::test_release_authority;
 
-const NEW_WRAPPER: &[u8] = b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v2\n# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1\nexit 0\n";
+const NEW_WRAPPER: &[u8] = b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v2\n# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1\n# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1\n# Shipyard-Stable-Public-Trampoline-BEGIN\n# Shipyard-Stable-Public-Trampoline-END\nexit 0\n";
+const PUBLIC_TRAMPOLINE: &[u8] = b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v2\n# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1\n# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1\n# Shipyard-Stable-Public-Trampoline-BEGIN\n# Shipyard-Stable-Public-Trampoline-END\necho \"ghapp: stable public trampoline fell through\" >&2\nexit 1\n";
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -339,7 +340,7 @@ fn legacy_pair_is_migrated_helper_first_to_exact_private_files() {
     );
     assert_eq!(
         std::fs::read(&fixture.wrapper).expect("wrapper"),
-        NEW_WRAPPER
+        PUBLIC_TRAMPOLINE
     );
     let context = fixture
         .wrapper
@@ -347,7 +348,8 @@ fn legacy_pair_is_migrated_helper_first_to_exact_private_files() {
     let context_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&context).expect("resolver context"))
             .expect("typed resolver context");
-    let wrapper_target = std::fs::read_link(&fixture.wrapper).expect("generation wrapper");
+    let wrapper_target = std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+        .expect("generation selector");
     let generation_id = wrapper_target
         .parent()
         .and_then(Path::file_name)
@@ -740,7 +742,7 @@ fn next_release_recovers_an_interrupted_prior_release_before_installing() {
     );
     assert_eq!(
         std::fs::read(&fixture.wrapper).expect("wrapper"),
-        NEW_WRAPPER
+        PUBLIC_TRAMPOLINE
     );
 }
 

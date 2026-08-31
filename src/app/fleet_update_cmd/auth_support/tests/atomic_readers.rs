@@ -1,4 +1,4 @@
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{
@@ -92,6 +92,33 @@ impl ReaderFixture {
             .expect("executable mode");
     }
 
+    fn legacy_direct_wrapper() -> Vec<u8> {
+        let wrapper = String::from_utf8(REAL_GHAPP.to_vec()).expect("UTF-8 wrapper");
+        let begin = wrapper
+            .find("# Shipyard-Stable-Public-Trampoline-BEGIN\n")
+            .expect("trampoline begin");
+        let end_marker = "# Shipyard-Stable-Public-Trampoline-END\n";
+        let end = wrapper[begin..]
+            .find(end_marker)
+            .map(|offset| begin + offset + end_marker.len())
+            .expect("trampoline end");
+        let mut legacy = format!("{}{}", &wrapper[..begin], &wrapper[end..]);
+        legacy = legacy
+            .replace(
+                "# Shipyard-Auth-Generation-Contract: auth-selector-v2\n",
+                "# Shipyard-Auth-Generation-Contract: auth-selector-v1\n",
+            )
+            .replace(
+                "# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1\n",
+                "",
+            )
+            .replace(
+                "# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1\n",
+                "",
+            );
+        legacy.into_bytes()
+    }
+
     fn write_helper_source(path: &Path, release: &str) {
         Self::write_executable(
             path,
@@ -120,9 +147,10 @@ impl ReaderFixture {
     }
 
     fn install_direct_legacy_reader(&self) {
+        let legacy_wrapper = Self::legacy_direct_wrapper();
+        Self::write_executable(&self.wrapper, &legacy_wrapper);
         for (source, target, mode) in [
             (&self.helper_source, &self.helper, 0o700),
-            (&self.wrapper_source, &self.wrapper, 0o700),
             (&self.binary_source, &self.binary, 0o700),
             (&self.binary_source, &self.companion, 0o700),
         ] {
@@ -151,8 +179,20 @@ impl ReaderFixture {
         self.authority.identity_sha256 = digest(format!("authority-{release}").as_bytes());
     }
 
+    fn update_wrapper_body(&mut self, release: &str) {
+        let mut wrapper = std::fs::read_to_string(&self.wrapper_source).expect("wrapper source");
+        wrapper.push('\n');
+        wrapper.push_str("# release body marker: ");
+        wrapper.push_str(release);
+        wrapper.push('\n');
+        Self::write_executable(&self.wrapper_source, wrapper.as_bytes());
+        self.authority.auth_wrapper.sha256 = digest(wrapper.as_bytes());
+        self.authority.identity_sha256 = digest(format!("authority-{release}").as_bytes());
+    }
+
     fn downgrade_selected_generation_to_guardless_v1(&self) {
-        let selected = std::fs::read_link(&self.wrapper).expect("selected generation");
+        let selected = std::fs::read_link(self.wrapper.with_extension("shipyard-generation"))
+            .expect("selected generation");
         let generation = selected.parent().expect("generation directory");
         let mut wrapper = std::fs::read_to_string(generation.join("ghapp")).expect("wrapper");
         wrapper = wrapper
@@ -242,8 +282,9 @@ impl ReaderFixture {
             std::os::unix::fs::symlink(legacy_generation.join(member), projection)
                 .expect("select legacy member");
         }
-        std::fs::remove_file(&self.wrapper).expect("remove prior selector");
-        std::os::unix::fs::symlink(legacy_generation.join("ghapp"), &self.wrapper)
+        let selector = self.wrapper.with_extension("shipyard-generation");
+        std::fs::remove_file(&selector).expect("remove prior selector");
+        std::os::unix::fs::symlink(legacy_generation.join("ghapp"), &selector)
             .expect("select legacy generation");
     }
 
@@ -426,7 +467,8 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
     let anchor_selected = fixture.root.path().join("anchor-selected");
     let transaction_release = fixture.root.path().join("transaction.release");
     let script = fixture.transaction_script();
-    let selector_publish = "auth_publish_link \"$auth_wrapper\" \"$auth_anchor/ghapp\"\n";
+    let selector_publish =
+        "auth_publish_generation_selection \"$auth_wrapper\" \"$auth_anchor/ghapp\"\n";
     assert_eq!(script.matches(selector_publish).count(), 1);
     let injected = format!(
         "{selector_publish}/usr/bin/touch {}\nwhile [ ! -e {} ]; do /bin/sleep 0.02; done\n",
@@ -576,6 +618,11 @@ fn real_wrapper_readers_remain_valid_during_generation_upgrade() {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
     assert!(fixture.run_script(&fixture.transaction_script()).success());
+    let public_wrapper_inode = std::fs::metadata(&fixture.wrapper)
+        .expect("public wrapper metadata")
+        .ino();
+    let public_wrapper_bytes = std::fs::read(&fixture.wrapper).expect("public wrapper bytes");
+    assert!(!fixture.wrapper.is_symlink());
     let first = fixture.read_once().expect("first generation");
     ReaderFixture::assert_valid_reader_value(&first);
     fixture.update_release("release-two");
@@ -591,6 +638,17 @@ fn real_wrapper_readers_remain_valid_during_generation_upgrade() {
     });
 
     assert_all_readers_valid(&results);
+    assert_eq!(
+        std::fs::metadata(&fixture.wrapper)
+            .expect("upgraded public wrapper metadata")
+            .ino(),
+        public_wrapper_inode,
+        "generation upgrade replaced the stable public wrapper"
+    );
+    assert_eq!(
+        std::fs::read(&fixture.wrapper).expect("upgraded public wrapper bytes"),
+        public_wrapper_bytes
+    );
     let second = fixture.read_once().expect("second generation");
     ReaderFixture::assert_valid_reader_value(&second);
     assert_ne!(first, second);
@@ -603,6 +661,63 @@ fn real_wrapper_readers_remain_valid_during_generation_upgrade() {
             .iter()
             .any(|result| result.as_deref() == Ok(&second)),
         "continuous reader did not observe the successor generation"
+    );
+}
+
+#[test]
+fn changed_generation_wrapper_preserves_stable_public_trampoline_and_probe_receipt() {
+    let mut fixture = ReaderFixture::new();
+    fixture.install_direct_legacy_reader();
+    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    let public_inode = std::fs::metadata(&fixture.wrapper)
+        .expect("public wrapper metadata")
+        .ino();
+    let public_digest = digest(&std::fs::read(&fixture.wrapper).expect("public trampoline"));
+    let first_target = std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+        .expect("first selected generation");
+
+    fixture.update_wrapper_body("release-wrapper-body-two");
+    let expected_wrapper_digest = fixture.authority.auth_wrapper.sha256.clone();
+    assert!(fixture.run_script(&fixture.transaction_script()).success());
+
+    assert_eq!(
+        std::fs::metadata(&fixture.wrapper)
+            .expect("upgraded public wrapper metadata")
+            .ino(),
+        public_inode,
+        "release wrapper body change replaced the stable public trampoline"
+    );
+    assert_eq!(
+        digest(&std::fs::read(&fixture.wrapper).expect("stable public trampoline")),
+        public_digest
+    );
+    let selected = std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+        .expect("upgraded selected generation");
+    assert_ne!(selected, first_target);
+    assert_eq!(
+        digest(&std::fs::read(&selected).expect("selected release wrapper")),
+        expected_wrapper_digest
+    );
+
+    let probe_script = format!(
+        "{}\n/usr/bin/printf '%s|%s\\n' \"$after_auth_wrapper_sha256\" \"$after_auth_wrapper_target\"",
+        probe(&fixture.helper, &fixture.wrapper, "after")
+    );
+    let output = Command::new("/bin/bash")
+        .args(["-c", &format!("set -Eeuo pipefail\n{probe_script}")])
+        .env_clear()
+        .env("HOME", fixture.root.path())
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .output()
+        .expect("generation receipt probe");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("{expected_wrapper_digest}|{}", selected.display())
     );
 }
 
@@ -637,6 +752,9 @@ fn guardless_v1_generation_rollback_restores_guard_before_selector() {
     assert!(fixture.run_script(&fixture.transaction_script()).success());
     fixture.downgrade_selected_generation_to_guardless_v1();
     let legacy = fixture.read_once().expect("legacy generation read");
+    let public_wrapper_inode = std::fs::metadata(&fixture.wrapper)
+        .expect("public wrapper metadata")
+        .ino();
     fixture.update_release("guardless-v1-rollback");
     let fixture = Arc::new(fixture);
 
@@ -649,6 +767,14 @@ fn guardless_v1_generation_rollback_restores_guard_before_selector() {
     });
 
     assert_all_readers_valid(&results);
+    assert_eq!(
+        std::fs::metadata(&fixture.wrapper)
+            .expect("rolled-back public wrapper metadata")
+            .ino(),
+        public_wrapper_inode,
+        "rollback replaced the stable public wrapper"
+    );
+    assert!(!fixture.wrapper.is_symlink());
     assert_eq!(fixture.read_once().expect("restored legacy read"), legacy);
 }
 
@@ -729,7 +855,9 @@ fn rollback_intent_survives_sigkill_before_first_restore() {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
     assert!(fixture.run_script(&fixture.transaction_script()).success());
-    let original_selector = std::fs::read_link(&fixture.wrapper).expect("original selector");
+    let original_selector =
+        std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+            .expect("original selector");
     fixture.update_release("rollback-intent");
     let script = fixture.transaction_script();
     let intent_boundary = "if [ \"$auth_recovery_phase\" != rollback-intent ]; then auth_write_recovery_phase rollback-intent; fi\n    auth_validate_recovery_prior\n    if [ \"$auth_recovery_anchor_id\" != absent ]; then\n";
@@ -761,7 +889,8 @@ fn rollback_intent_survives_sigkill_before_first_restore() {
     );
     assert!(!fixture.run_script(&recovery_only).success());
     assert_eq!(
-        std::fs::read_link(&fixture.wrapper).expect("rolled-back selector"),
+        std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+            .expect("rolled-back selector"),
         original_selector,
         "durable rollback intent must win over the visible failed target"
     );
@@ -800,7 +929,9 @@ fn sigkill_validation_boundaries_choose_the_recorded_recovery_direction() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn sigkill_checkpoint_matrix_never_exposes_an_unreadable_generation() {
+    let requested_checkpoint = std::env::var("SHIPYARD_TEST_AUTH_CHECKPOINT").ok();
     let checkpoints = [
         (
             "before-generation-rename",
@@ -814,12 +945,12 @@ fn sigkill_checkpoint_matrix_never_exposes_an_unreadable_generation() {
         ),
         (
             "before-anchor-selector",
-            "auth_publish_link \"$auth_wrapper\" \"$auth_anchor/ghapp\"\n",
+            "auth_publish_generation_selection \"$auth_wrapper\" \"$auth_anchor/ghapp\"\n",
             true,
         ),
         (
             "after-anchor-selector",
-            "auth_publish_link \"$auth_wrapper\" \"$auth_anchor/ghapp\"\n",
+            "auth_publish_generation_selection \"$auth_wrapper\" \"$auth_anchor/ghapp\"\n",
             false,
         ),
         (
@@ -854,12 +985,17 @@ fn sigkill_checkpoint_matrix_never_exposes_an_unreadable_generation() {
         ),
         (
             "before-target-selector",
-            "auth_publish_link \"$auth_wrapper\" \"$auth_generation/ghapp\"\n",
+            "auth_publish_link \"$auth_selector\" \"$auth_generation/ghapp\"\n",
             true,
         ),
         (
             "after-target-selector",
-            "auth_publish_link \"$auth_wrapper\" \"$auth_generation/ghapp\"\n",
+            "auth_publish_link \"$auth_selector\" \"$auth_generation/ghapp\"\n",
+            false,
+        ),
+        (
+            "after-public-trampoline",
+            "if [ \"$auth_public_trampoline_active\" = 0 ]; then auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"; fi\n",
             false,
         ),
         (
@@ -884,6 +1020,19 @@ fn sigkill_checkpoint_matrix_never_exposes_an_unreadable_generation() {
             false,
         ),
     ];
+
+    let checkpoints = checkpoints
+        .into_iter()
+        .filter(|(name, _, _)| {
+            requested_checkpoint
+                .as_deref()
+                .is_none_or(|requested| requested == *name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        requested_checkpoint.is_none() || !checkpoints.is_empty(),
+        "requested auth checkpoint must name a matrix entry"
+    );
 
     for chunk in checkpoints.chunks(4) {
         thread::scope(|scope| {
@@ -919,9 +1068,13 @@ fn run_sigkill_checkpoint(name: &str, needle: &str, kill_before: bool) {
             .read_once()
             .unwrap_or_else(|error| panic!("checkpoint {name} reader failed: {error}")),
     );
+    let successor = fixture.run_script_traced(&script);
     assert!(
-        fixture.run_script(&script).success(),
-        "checkpoint {name} successor recovery failed"
+        successor.status.success(),
+        "checkpoint {name} successor recovery failed; lock_exists={} pid={:?}:\n{}",
+        fixture.state().join("fleet-auth-support.lock").exists(),
+        std::fs::read_to_string(fixture.state().join("fleet-auth-support.lock/pid")),
+        String::from_utf8_lossy(&successor.stderr),
     );
     ReaderFixture::assert_valid_reader_value(
         &fixture
@@ -933,7 +1086,7 @@ fn run_sigkill_checkpoint(name: &str, needle: &str, kill_before: bool) {
 #[test]
 fn rollback_sigkill_checkpoint_matrix_never_exposes_mixed_generation() {
     let targets = [
-        ("wrapper", "$auth_wrapper"),
+        ("selector", "$auth_selector"),
         ("context", "$auth_context"),
         ("companion", "$auth_companion"),
         ("binary", "$auth_binary"),

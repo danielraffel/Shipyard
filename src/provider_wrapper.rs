@@ -2236,12 +2236,16 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let installed = directory.path().join("shipyard-installed");
+        let staged = directory.path().join("shipyard-installed.stage");
         let retired = directory.path().join("shipyard-running-retired");
         let ready = directory.path().join("ready");
         let proceed = directory.path().join("proceed");
         let outcome = directory.path().join("outcome");
-        fs::copy(std::env::current_exe().unwrap(), &installed).unwrap();
-        fs::set_permissions(&installed, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), &staged).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+        File::open(&staged).unwrap().sync_all().unwrap();
+        fs::rename(&staged, &installed).unwrap();
+        File::open(directory.path()).unwrap().sync_all().unwrap();
         let mut child = Command::new(&installed)
             .args([
                 "--exact",

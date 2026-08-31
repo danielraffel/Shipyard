@@ -102,15 +102,18 @@ contains the mandatory release-matched `pr-close-guard` and uses the mutually
 exclusive `auth-selector-v2` contract. Fleet clients from v0.134-v0.136 must
 reject that target before publication; upgrade the controlling client through
 the supported exact-release path before the governed fleet transaction. The
-public wrapper is the final atomic selector: a running reader binds the wrapper
-file it actually opened (Linux
-`/proc` or macOS `lsof`) and resolves every sibling from that same generation,
-never from a second read of the mutable selector. Rollback reverses publication
-order, while crash recovery rolls back an unvalidated generation and rolls
-forward a validated or committed one. A rollout must not delete a published
-generation because an already-open wrapper may still need its siblings. Record
-generation count, generation bytes, and free disk for every host; reader-aware
-generation garbage collection is a separate dry-run-only follow-up.
+first v0.137 activation publishes a digest-bound regular-file trampoline only
+after legacy readers drain. Later updates leave that public file untouched and
+atomically move a separate owner-private generation selector. The trampoline
+reads that selector once and executes the immutable selected wrapper, which
+resolves every sibling from the same generation. The v4 journal binds the
+trampoline, selector, and complete cohort while retaining bounded v2/v3
+recovery compatibility. Crash recovery rolls back an unvalidated generation
+and rolls forward a validated or committed one. A rollout must not delete a
+published generation because an already-open wrapper may still need its
+siblings. Record generation count, generation bytes, and free disk for every
+host; reader-aware generation garbage collection is a separate dry-run-only
+follow-up.
 
 Native delivery also requires fresh exact-head/base-SHA GitHub App installation
 authority and a live terminal checkpoint. cmux workspace moves preserve surface

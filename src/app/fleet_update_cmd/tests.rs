@@ -1235,8 +1235,15 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
         .expect("real auth transaction");
     assert!(status.success());
 
-    let wrapper_target = std::fs::read_link(&wrapper).expect("wrapper selector");
+    assert!(!wrapper.is_symlink());
+    let wrapper_target = std::fs::read_link(wrapper.with_extension("shipyard-generation"))
+        .expect("wrapper generation selector");
     let generation = wrapper_target.parent().expect("generation directory");
+    assert_eq!(
+        std::fs::read(&wrapper).expect("stable public trampoline"),
+        std::fs::read(generation.join("ghapp.public-trampoline"))
+            .expect("generation public trampoline")
+    );
     assert_eq!(
         std::fs::read_link(&binary).expect("binary selector"),
         generation.join("shipyard")
@@ -1247,7 +1254,7 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
     );
     let manifest = std::fs::read_to_string(generation.join("generation.manifest"))
         .expect("generation manifest");
-    assert_eq!(manifest.lines().count(), 15);
+    assert_eq!(manifest.lines().count(), 17);
     assert!(generation.join("pr-close-guard").is_file());
     assert!(
         manifest

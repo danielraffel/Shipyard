@@ -14,6 +14,29 @@ fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn legacy_backup_record(label: &str, target: &Path) -> String {
+    let rollback = PathBuf::from(format!("{}.shipyard-rollback", target.display()));
+    let absent = PathBuf::from(format!("{}.shipyard-was-absent", target.display()));
+    if rollback.is_symlink() {
+        return format!(
+            "{label}=symlink:{}\n",
+            std::fs::read_link(rollback)
+                .expect("rollback symlink")
+                .display()
+        );
+    }
+    if rollback.is_file() {
+        let metadata = std::fs::metadata(&rollback).expect("rollback metadata");
+        return format!(
+            "{label}=file:{}:{:o}\n",
+            digest(&std::fs::read(rollback).expect("rollback file")),
+            metadata.permissions().mode() & 0o777
+        );
+    }
+    assert!(absent.is_file(), "missing legacy backup for {label}");
+    format!("{label}=absent\n")
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     helper: PathBuf,
@@ -178,6 +201,35 @@ impl Fixture {
             .status()
             .expect("run transaction")
     }
+
+    fn run_traced(&self, script: &str) -> std::process::Output {
+        Command::new("/bin/bash")
+            .args(["-c", &format!("set -Eeuox pipefail\n{script}")])
+            .env_clear()
+            .env("HOME", self.root.path())
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .output()
+            .expect("run traced transaction")
+    }
+
+    fn legacy_backup_cohort_digest(&self) -> String {
+        let close_guard = self
+            .root
+            .path()
+            .join(".config/shipyard/guards/pr-close-guard");
+        let cohort = [
+            ("helper", self.helper.as_path()),
+            ("wrapper", self.wrapper.as_path()),
+            ("binary", self.binary.as_path()),
+            ("companion", self.companion.as_path()),
+            ("context", self.context.as_path()),
+            ("close_guard", close_guard.as_path()),
+        ]
+        .into_iter()
+        .map(|(label, path)| legacy_backup_record(label, path))
+        .collect::<String>();
+        digest(cohort.as_bytes())
+    }
 }
 
 #[test]
@@ -204,27 +256,110 @@ fn legacy_v2_preparing_journal_recovers_without_schema_upgrade() {
 
     assert!(fixture.run(&script).success(), "legacy v2 recovery");
     assert!(!journal.exists());
-    assert!(std::fs::read_link(&fixture.wrapper).is_ok());
+    assert!(std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation")).is_ok());
+}
+
+#[test]
+fn legacy_v3_prepared_journal_validates_the_pre_selector_backup_cohort() {
+    let fixture = Fixture::new();
+    let script = fixture.script();
+    let needle = "auth_write_phase prepared\n";
+    assert_eq!(script.matches(needle).count(), 1);
+    let interrupted = script.replacen(needle, &format!("{needle}/bin/kill -9 $$\n"), 1);
+    assert!(!fixture.run(&interrupted).success());
+
+    let journal = fixture.state().join("fleet-auth-support.transaction");
+    let mut lines: Vec<String> = std::fs::read_to_string(&journal)
+        .expect("v4 journal")
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 26);
+    assert_eq!(lines[0], "shipyard-fleet-auth-v4");
+    assert_eq!(lines[1], "prepared");
+    lines[0] = "shipyard-fleet-auth-v3".to_owned();
+    lines[24] = fixture.legacy_backup_cohort_digest();
+    std::fs::write(&journal, format!("{}\n", lines.join("\n"))).expect("v3 journal");
+    for suffix in ["shipyard-rollback", "shipyard-was-absent"] {
+        let selector_marker = PathBuf::from(format!(
+            "{}.{}",
+            fixture
+                .wrapper
+                .with_extension("shipyard-generation")
+                .display(),
+            suffix
+        ));
+        if selector_marker.is_symlink() || selector_marker.exists() {
+            std::fs::remove_file(selector_marker).expect("remove v4-only selector marker");
+        }
+    }
+
+    assert!(fixture.run(&script).success(), "legacy v3 recovery");
+    assert!(!journal.exists());
+    assert!(std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation")).is_ok());
 }
 
 #[test]
 fn target_selector_rename_before_journal_rolls_forward_on_successor() {
     let fixture = Fixture::new();
     let script = fixture.script();
-    let needle = "auth_publish_link \"$auth_wrapper\" \"$auth_generation/ghapp\"\nauth_write_phase target-selected\n";
+    let needle = "auth_publish_link \"$auth_selector\" \"$auth_generation/ghapp\"\nif [ \"$auth_public_trampoline_active\" = 0 ]; then auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"; fi\nauth_write_phase target-selected\n";
     assert_eq!(script.matches(needle).count(), 1);
     let interrupted = script.replacen(
         needle,
-        "auth_publish_link \"$auth_wrapper\" \"$auth_generation/ghapp\"\n/bin/kill -9 $$\nauth_write_phase target-selected\n",
+        "auth_publish_link \"$auth_selector\" \"$auth_generation/ghapp\"\nif [ \"$auth_public_trampoline_active\" = 0 ]; then auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"; fi\n/bin/kill -9 $$\nauth_write_phase target-selected\n",
         1,
     );
     assert!(!fixture.run(&interrupted).success());
-    let selected_before = std::fs::read_link(&fixture.wrapper).expect("target selector");
-    assert!(fixture.run(&script).success(), "successor recovery");
+    let selected_before = std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+        .expect("target selector");
+    let successor = fixture.run_traced(&script);
+    assert!(
+        successor.status.success(),
+        "successor recovery:\n{}",
+        String::from_utf8_lossy(&successor.stderr)
+    );
     assert_eq!(
-        std::fs::read_link(&fixture.wrapper).expect("recovered selector"),
+        std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+            .expect("recovered selector"),
         selected_before
     );
+    assert!(
+        !fixture
+            .state()
+            .join("fleet-auth-support.transaction")
+            .exists()
+    );
+}
+
+#[test]
+fn clean_install_recovers_a_selector_published_before_the_public_trampoline() {
+    let fixture = Fixture::new();
+    for installed in [
+        &fixture.helper,
+        &fixture.wrapper,
+        &fixture.binary,
+        &fixture.companion,
+        &fixture.context,
+    ] {
+        std::fs::remove_file(installed).expect("remove legacy installed member");
+    }
+    let script = fixture.script();
+    let needle = "auth_publish_link \"$auth_selector\" \"$auth_generation/ghapp\"\n";
+    assert_eq!(script.matches(needle).count(), 1);
+    let interrupted = script.replacen(needle, &format!("{needle}/bin/kill -9 $$\n"), 1);
+    assert!(!fixture.run(&interrupted).success());
+    assert!(!fixture.wrapper.exists());
+    assert!(std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation")).is_ok());
+
+    let successor = fixture.run_traced(&script);
+    assert!(
+        successor.status.success(),
+        "clean-install recovery:\n{}",
+        String::from_utf8_lossy(&successor.stderr)
+    );
+    assert!(fixture.wrapper.is_file());
+    assert!(std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation")).is_ok());
     assert!(
         !fixture
             .state()
@@ -242,7 +377,8 @@ fn v3_recovery_refuses_a_target_generation_missing_its_guard() {
     let interrupted = script.replacen(needle, &format!("{needle}/bin/kill -9 $$\n"), 1);
     assert!(!fixture.run(&interrupted).success());
 
-    let selected = std::fs::read_link(&fixture.wrapper).expect("target selector");
+    let selected = std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+        .expect("target selector");
     std::fs::remove_file(
         selected
             .parent()
@@ -312,7 +448,9 @@ fn tampered_prior_backup_cohort_refuses_recovery_without_publication() {
         fixture.run(&fixture.script()).success(),
         "initial generation"
     );
-    let original_selector = std::fs::read_link(&fixture.wrapper).expect("original selector");
+    let original_selector =
+        std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+            .expect("original selector");
     fixture.update_release("successor");
     let script = fixture.script();
     let needle = "auth_write_phase prepared\n";
@@ -330,7 +468,8 @@ fn tampered_prior_backup_cohort_refuses_recovery_without_publication() {
         "tampered cohort must refuse"
     );
     assert_eq!(
-        std::fs::read_link(&fixture.wrapper).expect("preserved selector"),
+        std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+            .expect("preserved selector"),
         original_selector
     );
     assert!(
@@ -349,7 +488,9 @@ fn tampered_prior_generation_manifest_refuses_recovery_without_publication() {
         fixture.run(&fixture.script()).success(),
         "initial generation"
     );
-    let original_selector = std::fs::read_link(&fixture.wrapper).expect("original selector");
+    let original_selector =
+        std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+            .expect("original selector");
     let original_manifest = original_selector
         .parent()
         .expect("generation dir")
@@ -369,7 +510,8 @@ fn tampered_prior_generation_manifest_refuses_recovery_without_publication() {
         "tampered prior generation must refuse"
     );
     assert_eq!(
-        std::fs::read_link(&fixture.wrapper).expect("preserved selector"),
+        std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
+            .expect("preserved selector"),
         original_selector
     );
     assert!(
