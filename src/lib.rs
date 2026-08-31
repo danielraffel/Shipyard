@@ -1,4 +1,11 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::large_stack_arrays,
+        reason = "Rust 1.92 attributes the generated libtest registry array to the crate root"
+    )
+)]
 
 //! Core library for Shipyard.
 
