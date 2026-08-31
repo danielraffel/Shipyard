@@ -782,15 +782,14 @@ fn git_cli_path(path: &Path) -> PathBuf {
 
     let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
     let ordinary = if let Some(remainder) = encoded.strip_prefix(VERBATIM_UNC) {
-        let mut ordinary = vec![b'\\' as u16, b'\\' as u16];
+        let mut ordinary = vec![u16::from(b'\\'), u16::from(b'\\')];
         ordinary.extend_from_slice(remainder);
         ordinary
     } else if let Some(remainder) = encoded.strip_prefix(VERBATIM) {
         if remainder.len() >= 3
-            && remainder[0] <= u16::from(u8::MAX)
-            && (remainder[0] as u8).is_ascii_alphabetic()
-            && remainder[1] == b':' as u16
-            && remainder[2] == b'\\' as u16
+            && u8::try_from(remainder[0]).is_ok_and(|value| value.is_ascii_alphabetic())
+            && remainder[1] == u16::from(b':')
+            && remainder[2] == u16::from(b'\\')
         {
             remainder.to_vec()
         } else {
