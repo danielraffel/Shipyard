@@ -367,6 +367,20 @@ build plus the warm incremental remainder before reporting savings or speedup.
 The command is evidence inspection only: it never changes machine mode,
 accepted policy digests, queue state, or merge readiness.
 
+When a PR base is stale in `shadow_compare`, keep `stale_base` as the
+authoritative full-suite reason. Shipyard may still compute a shadow-only
+selection from the complete old-to-live base delta and an exact conflict-free
+integration tree. A bounded result executes selected-versus-full only inside a
+content-addressed, fenced checkout of that integration commit; activation,
+tracked content, submodules, cleanup intent, restart recovery, and the terminal
+receipt must all preserve the same repository/PR/head/tree, old and live base,
+merge base, policy/workflow/validation-contract, changed-path, and integration
+identity. Reuse is exact-identity only. Any drift, conflict, incomplete
+observation, unmapped/full-required path, replay, or semantic disagreement
+invalidates or selects full. The result always remains
+`blocked_until_current_merge_tree`: it is comparison telemetry, never merge
+authority, an automatic rebase, or permission to mutate a runner or PR.
+
 Prospective pre-push selection is only a transport optimization and is also
 machine-global default-off. Shipyard permits one non-delete branch update and
 authenticates the actual `core.hooksPath/pre-push` against the protected base:

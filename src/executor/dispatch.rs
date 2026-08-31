@@ -1270,6 +1270,7 @@ fn resolved_local(
         allow_tree_drift: bool_value(validation_table, "_allow_tree_drift").unwrap_or(false),
         machine_environment,
         environment: BTreeMap::new(),
+        integration_cleanup: None,
     };
     Ok(ResolvedTarget {
         name: name.to_owned(),

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Current stable trial-status schema.
-pub const TRIAL_STATUS_SCHEMA_VERSION: u32 = 1;
+pub const TRIAL_STATUS_SCHEMA_VERSION: u32 = 2;
 /// Result schema emitted by the current changed-surface adapter.
 const RESULT_RECEIPT_SCHEMA_VERSION: u32 = 2;
 
@@ -45,6 +45,9 @@ pub enum TrialState {
     Collecting,
     /// The single observed receipt is exact-bound and proves a matched pass.
     Ready,
+    /// Planning reached a safe terminal shadow-only disposition without a
+    /// runnable bounded activation.
+    Terminal,
     /// Observed evidence is malformed, contradictory, or non-passing.
     Rejected,
 }
@@ -76,6 +79,9 @@ pub struct TrialStatus {
     /// includes build-target selection telemetry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<TrialTiming>,
+    /// Typed stale-base result when planning terminated before activation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_disposition: Option<super::StaleBaseShadowDisposition>,
     /// Stable bounded reason for the current state.
     pub reason: String,
 }
@@ -114,6 +120,25 @@ struct ActivationReceipt {
 }
 
 #[derive(Debug, Deserialize)]
+struct StaleActivationReceipt {
+    schema_version: u32,
+    machine_mode: String,
+    merge_authority: super::MergeAuthority,
+    stale_context_digest: String,
+    stale_receipt_sha256: String,
+    plan: ActivationPlan,
+}
+
+#[derive(Debug, Deserialize)]
+struct StaleCleanupReceipt {
+    schema_version: u32,
+    context_digest: String,
+    integration_commit_sha: String,
+    integration_tree_sha: String,
+    disposition: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ActivationPlan {
     schema_version: u32,
     repository: String,
@@ -123,6 +148,7 @@ struct ActivationPlan {
     head_sha: String,
     tree_sha: String,
     policy_digest: String,
+    changed_paths_digest: String,
     validation_contract_digest: String,
     workflow_digest: String,
     selection_receipt_digest: String,
@@ -131,7 +157,56 @@ struct ActivationPlan {
     execution_payload_digest: String,
     selected_count: usize,
     selected_build_target_count: usize,
+    selection_tier: super::SelectionTier,
     stage: String,
+}
+
+pub(crate) fn validate_stale_activation_for_cleanup(
+    stale: &super::StaleBaseShadowReceipt,
+    stale_bytes: &[u8],
+    activation_bytes: &[u8],
+) -> Result<(), String> {
+    let activation: StaleActivationReceipt = serde_json::from_slice(activation_bytes)
+        .map_err(|error| format!("decode stale integration activation: {error}"))?;
+    if activation.schema_version != activation.plan.schema_version
+        || activation.machine_mode != "shadow_compare"
+        || activation.merge_authority != super::MergeAuthority::BlockedUntilCurrentMergeTree
+        || activation.stale_context_digest != super::stale_base_context_digest(stale)
+        || sha256(stale_bytes) != activation.stale_receipt_sha256
+        || activation.plan.repository != stale.repository
+        || activation.plan.pull_request != stale.pull_request
+        || activation.plan.target != stale.target
+        || Some(activation.plan.head_sha.as_str()) != stale.integration_commit_sha.as_deref()
+        || Some(activation.plan.tree_sha.as_str()) != stale.integration_tree_sha.as_deref()
+        || activation.plan.base_sha != stale.live_protected_base_sha
+        || activation.plan.validation_contract_digest != stale.validation_contract_digest
+        || activation.plan.workflow_digest != stale.live_workflow_digest
+        || validate_stale_plan_selection(&activation.plan, stale).is_err()
+    {
+        return Err("stale integration activation identity or linkage mismatch".to_owned());
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ExecutionPayloadBinding<'a> {
+    schema_version: u32,
+    repository: &'a str,
+    pull_request: u64,
+    target: &'a str,
+    base_sha: &'a str,
+    head_sha: &'a str,
+    tree_sha: &'a str,
+    policy_digest: &'a str,
+    selection_receipt_digest: &'a str,
+    validation_contract_digest: &'a str,
+    workflow_digest: &'a str,
+    selected_tests_digest: &'a str,
+    selected_tests: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_build_targets_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_build_targets: Option<&'a [String]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +280,7 @@ pub fn evaluate_trial(
         result_receipt_count: results.len(),
         result_receipt: None,
         timing: None,
+        shadow_disposition: None,
         reason: "waiting_for_shadow_activation".to_owned(),
     };
 
@@ -247,6 +323,284 @@ pub fn evaluate_trial(
     status
 }
 
+/// Validate a terminal stale-base receipt when no runnable activation exists.
+#[must_use]
+pub fn evaluate_stale_base_terminal(
+    identity: &TrialIdentity,
+    receipt_file: ReceiptFile<'_>,
+) -> TrialStatus {
+    let mut status = TrialStatus {
+        schema_version: TRIAL_STATUS_SCHEMA_VERSION,
+        state: TrialState::Terminal,
+        repository: identity.repository.clone(),
+        pull_request: identity.pull_request,
+        target: identity.target.clone(),
+        head_sha: identity.head_sha.clone(),
+        activation_receipt: None,
+        result_receipt_count: 0,
+        result_receipt: Some(receipt_file.name.to_owned()),
+        timing: None,
+        shadow_disposition: Some(super::StaleBaseShadowDisposition::Invalidated),
+        reason: "malformed_stale_base_shadow_receipt".to_owned(),
+    };
+    if let Err(reason) = validate_identity(identity) {
+        reason.clone_into(&mut status.reason);
+        return status;
+    }
+    let Ok(receipt) = serde_json::from_slice::<super::StaleBaseShadowReceipt>(receipt_file.bytes)
+    else {
+        return status;
+    };
+    if receipt.schema_version != 1
+        || receipt.merge_authority != super::MergeAuthority::BlockedUntilCurrentMergeTree
+        || receipt.repository != identity.repository
+        || receipt.pull_request != identity.pull_request
+        || receipt.target != identity.target
+        || receipt.head_sha != identity.head_sha
+        || !valid_sha(&receipt.head_tree_sha)
+        || !valid_sha(&receipt.old_protected_base_sha)
+        || !valid_sha(&receipt.live_protected_base_sha)
+        || !valid_sha(&receipt.merge_base_sha)
+        || !valid_digest(&receipt.changed_paths_digest)
+        || !valid_digest(&receipt.protected_base_delta_digest)
+        || !valid_digest(&receipt.old_workflow_digest)
+        || !valid_digest(&receipt.live_workflow_digest)
+        || !valid_digest(&receipt.validation_contract_digest)
+        || !valid_digest(&receipt.integration_changed_paths_digest)
+    {
+        "stale_base_shadow_identity_or_contract_mismatch".clone_into(&mut status.reason);
+        return status;
+    }
+    status.shadow_disposition = Some(receipt.disposition);
+    match receipt.disposition {
+        super::StaleBaseShadowDisposition::Recomputed
+        | super::StaleBaseShadowDisposition::Reused => {
+            let selection_valid = receipt
+                .shadow_selection
+                .as_deref()
+                .is_some_and(|selection| {
+                    selection.planned_suite == super::PlannedSuite::Bounded
+                        && selection.authoritative_suite == super::PlannedSuite::Full
+                        && selection.shadow_only
+                        && selection.shadow_context_digest.as_deref()
+                            == Some(super::stale_base::stale_base_context_digest(&receipt).as_str())
+                        && selection.repository == receipt.repository
+                        && selection.pull_request == receipt.pull_request
+                        && selection.target == receipt.target
+                        && Some(selection.head_sha.as_str())
+                            == receipt.integration_commit_sha.as_deref()
+                        && Some(selection.tree_sha.as_str())
+                            == receipt.integration_tree_sha.as_deref()
+                        && selection.pr_base_sha == receipt.live_protected_base_sha
+                        && selection.protected_ref_sha == receipt.live_protected_base_sha
+                        && selection.merge_base_sha == receipt.live_protected_base_sha
+                });
+            if !receipt
+                .integration_tree_sha
+                .as_deref()
+                .is_some_and(valid_sha)
+                || !receipt
+                    .integration_commit_sha
+                    .as_deref()
+                    .is_some_and(valid_sha)
+                || !receipt
+                    .old_policy_digest
+                    .as_deref()
+                    .is_some_and(valid_digest)
+                || !receipt
+                    .live_policy_digest
+                    .as_deref()
+                    .is_some_and(valid_digest)
+                || !selection_valid
+            {
+                status.state = TrialState::Terminal;
+                status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+                "stale_base_shadow_selection_mismatch".clone_into(&mut status.reason);
+                return status;
+            }
+            status.state = TrialState::Terminal;
+            status.reason = format!("stale_base_{}", disposition_name(receipt.disposition));
+        }
+        super::StaleBaseShadowDisposition::Blocked
+        | super::StaleBaseShadowDisposition::Invalidated
+        | super::StaleBaseShadowDisposition::FullRequired => {
+            status.state = TrialState::Terminal;
+            status.reason = format!("stale_base_{}", disposition_name(receipt.disposition));
+        }
+    }
+    status
+}
+
+/// Validate one selected-only stale-base integration execution. The result is
+/// terminal shadow evidence and can never become `Ready` merge authority.
+#[must_use]
+pub fn evaluate_stale_base_execution(
+    identity: &TrialIdentity,
+    stale_file: ReceiptFile<'_>,
+    activation_file: ReceiptFile<'_>,
+    cleanup_file: ReceiptFile<'_>,
+    results: &[ReceiptFile<'_>],
+) -> TrialStatus {
+    let mut status = evaluate_stale_base_terminal(identity, stale_file);
+    status.activation_receipt = Some(activation_file.name.to_owned());
+    status.result_receipt_count = results.len();
+    if status.state != TrialState::Terminal
+        || !matches!(
+            status.shadow_disposition,
+            Some(
+                super::StaleBaseShadowDisposition::Recomputed
+                    | super::StaleBaseShadowDisposition::Reused
+            )
+        )
+    {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "invalid_outer_stale_base_execution_receipt".clone_into(&mut status.reason);
+        return status;
+    }
+    let Ok(stale) = serde_json::from_slice::<super::StaleBaseShadowReceipt>(stale_file.bytes)
+    else {
+        return status;
+    };
+    let Ok(activation) = serde_json::from_slice::<StaleActivationReceipt>(activation_file.bytes)
+    else {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "malformed_stale_base_activation".clone_into(&mut status.reason);
+        return status;
+    };
+    let Ok(cleanup) = serde_json::from_slice::<StaleCleanupReceipt>(cleanup_file.bytes) else {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "malformed_stale_base_cleanup_receipt".clone_into(&mut status.reason);
+        return status;
+    };
+    if validate_stale_activation_for_cleanup(&stale, stale_file.bytes, activation_file.bytes)
+        .is_err()
+        || cleanup.schema_version != 1
+        || cleanup.context_digest != activation.stale_context_digest
+        || cleanup.integration_commit_sha != activation.plan.head_sha
+        || cleanup.integration_tree_sha != activation.plan.tree_sha
+        || cleanup.disposition != "cleaned"
+    {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "stale_base_activation_identity_or_link_mismatch".clone_into(&mut status.reason);
+        return status;
+    }
+    if results.len() != 1 {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        if results.is_empty() {
+            "stale_base_execution_missing_result"
+        } else {
+            "ambiguous_stale_base_execution_results"
+        }
+        .clone_into(&mut status.reason);
+        return status;
+    }
+    let result_file = results[0];
+    let Ok(result) = serde_json::from_slice::<ResultReceipt>(result_file.bytes) else {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        "malformed_stale_base_result".clone_into(&mut status.reason);
+        return status;
+    };
+    if validate_result(&activation.plan, &result).is_err() {
+        status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
+        status.result_receipt = Some(result_file.name.to_owned());
+        "stale_base_selected_result_mismatch".clone_into(&mut status.reason);
+        return status;
+    }
+    status.state = TrialState::Terminal;
+    status.result_receipt = Some(result_file.name.to_owned());
+    status.shadow_disposition = Some(stale.disposition);
+    status.reason = format!(
+        "stale_base_{}_selected_pass",
+        disposition_name(stale.disposition)
+    );
+    status
+}
+
+fn validate_stale_plan_selection(
+    plan: &ActivationPlan,
+    stale: &super::StaleBaseShadowReceipt,
+) -> Result<(), &'static str> {
+    let mut selection = stale
+        .shadow_selection
+        .as_deref()
+        .cloned()
+        .ok_or("missing_stale_shadow_selection")?;
+    if selection.shadow_context_digest.as_deref()
+        != Some(super::stale_base_context_digest(stale).as_str())
+        || selection.repository != plan.repository
+        || selection.pull_request != plan.pull_request
+        || selection.target != plan.target
+        || selection.pr_base_sha != plan.base_sha
+        || selection.head_sha != plan.head_sha
+        || selection.tree_sha != plan.tree_sha
+        || selection.policy_digest.as_deref() != Some(plan.policy_digest.as_str())
+        || selection.changed_paths_digest != plan.changed_paths_digest
+        || selection.selection_tier != plan.selection_tier
+        || selection.selected_tests.len() != plan.selected_count
+        || selection.selected_build_targets.len() != plan.selected_build_target_count
+    {
+        return Err("stale_shadow_selection_plan_mismatch");
+    }
+    selection.shadow_context_digest = None;
+    let selection_bytes =
+        serde_json::to_vec(&selection).map_err(|_| "serialize_stale_shadow_selection_failed")?;
+    let selected_tests = literal_file_bytes(&selection.selected_tests)?;
+    let selected_build_targets = match plan.schema_version {
+        1 => None,
+        2 => Some(literal_file_bytes(&selection.selected_build_targets)?),
+        _ => return Err("unsupported_stale_activation_schema"),
+    };
+    let selected_build_targets_digest = selected_build_targets
+        .as_ref()
+        .map(|targets| sha256(targets));
+    if sha256(&selection_bytes) != plan.selection_receipt_digest
+        || sha256(&selected_tests) != plan.selected_tests_digest
+        || selected_build_targets_digest != plan.selected_build_targets_digest
+    {
+        return Err("stale_shadow_selection_digest_mismatch");
+    }
+    let payload = serde_json::to_vec(&ExecutionPayloadBinding {
+        schema_version: plan.schema_version,
+        repository: &plan.repository,
+        pull_request: plan.pull_request,
+        target: &plan.target,
+        base_sha: &plan.base_sha,
+        head_sha: &plan.head_sha,
+        tree_sha: &plan.tree_sha,
+        policy_digest: &plan.policy_digest,
+        selection_receipt_digest: &plan.selection_receipt_digest,
+        validation_contract_digest: &plan.validation_contract_digest,
+        workflow_digest: &plan.workflow_digest,
+        selected_tests_digest: &plan.selected_tests_digest,
+        selected_tests: &selection.selected_tests,
+        selected_build_targets_digest: plan.selected_build_targets_digest.as_deref(),
+        selected_build_targets: selected_build_targets
+            .as_ref()
+            .map(|_| selection.selected_build_targets.as_slice()),
+    })
+    .map_err(|_| "serialize_stale_execution_payload_failed")?;
+    if sha256(&payload) != plan.execution_payload_digest {
+        return Err("stale_execution_payload_digest_mismatch");
+    }
+    Ok(())
+}
+
+fn literal_file_bytes(values: &[String]) -> Result<Vec<u8>, &'static str> {
+    if values.is_empty()
+        || values
+            .iter()
+            .any(|value| value.is_empty() || value.contains('\n'))
+    {
+        return Err("invalid_stale_literal_file_value");
+    }
+    let mut bytes = Vec::new();
+    for value in values {
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
+}
+
 /// Construct a stable rejection when the command boundary cannot safely read
 /// the receipt directory or one of its entries.
 #[must_use]
@@ -268,7 +622,18 @@ pub(crate) fn rejected_trial(
         result_receipt_count,
         result_receipt,
         timing: None,
+        shadow_disposition: None,
         reason: reason.to_owned(),
+    }
+}
+
+fn disposition_name(disposition: super::StaleBaseShadowDisposition) -> &'static str {
+    match disposition {
+        super::StaleBaseShadowDisposition::Reused => "reused",
+        super::StaleBaseShadowDisposition::Recomputed => "recomputed",
+        super::StaleBaseShadowDisposition::Blocked => "blocked",
+        super::StaleBaseShadowDisposition::Invalidated => "invalidated",
+        super::StaleBaseShadowDisposition::FullRequired => "full_required",
     }
 }
 
@@ -333,30 +698,7 @@ fn validate_activation(
 }
 
 fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), &'static str> {
-    if result.schema_version != RESULT_RECEIPT_SCHEMA_VERSION {
-        return Err("unsupported_shadow_result_schema");
-    }
-    if result.repository != plan.repository
-        || result.pull_request != plan.pull_request
-        || result.target != plan.target
-        || result.base_sha != plan.base_sha
-        || result.head_sha != plan.head_sha
-        || result.tree_sha != plan.tree_sha
-    {
-        return Err("shadow_result_identity_mismatch");
-    }
-    if result.execution_payload_sha256 != plan.execution_payload_digest
-        || result.policy_digest != plan.policy_digest
-        || result.selection_receipt_digest != plan.selection_receipt_digest
-        || result.validation_contract_digest != plan.validation_contract_digest
-        || result.workflow_digest != plan.workflow_digest
-        || result.selected_tests_digest != plan.selected_tests_digest
-        || result.selected_build_targets_digest != plan.selected_build_targets_digest
-        || result.selected_logical_count != plan.selected_count
-        || result.selected_build_target_count != plan.selected_build_target_count
-    {
-        return Err("shadow_result_digest_or_count_mismatch");
-    }
+    validate_result_binding(plan, result)?;
     if !result.full_authoritative {
         return Err("full_suite_not_authoritative");
     }
@@ -380,6 +722,37 @@ fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), 
     }
     if plan.schema_version == 2 && timing(plan, result).is_none() {
         return Err("invalid_shadow_result_timing");
+    }
+    Ok(())
+}
+
+fn validate_result_binding(
+    plan: &ActivationPlan,
+    result: &ResultReceipt,
+) -> Result<(), &'static str> {
+    if result.schema_version != RESULT_RECEIPT_SCHEMA_VERSION {
+        return Err("unsupported_shadow_result_schema");
+    }
+    if result.repository != plan.repository
+        || result.pull_request != plan.pull_request
+        || result.target != plan.target
+        || result.base_sha != plan.base_sha
+        || result.head_sha != plan.head_sha
+        || result.tree_sha != plan.tree_sha
+    {
+        return Err("shadow_result_identity_mismatch");
+    }
+    if result.execution_payload_sha256 != plan.execution_payload_digest
+        || result.policy_digest != plan.policy_digest
+        || result.selection_receipt_digest != plan.selection_receipt_digest
+        || result.validation_contract_digest != plan.validation_contract_digest
+        || result.workflow_digest != plan.workflow_digest
+        || result.selected_tests_digest != plan.selected_tests_digest
+        || result.selected_build_targets_digest != plan.selected_build_targets_digest
+        || result.selected_logical_count != plan.selected_count
+        || result.selected_build_target_count != plan.selected_build_target_count
+    {
+        return Err("shadow_result_digest_or_count_mismatch");
     }
     Ok(())
 }

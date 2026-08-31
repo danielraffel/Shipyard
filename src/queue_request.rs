@@ -42,9 +42,10 @@ use crate::ship_state::ShipState;
 use crate::warm_pool::{is_backend_eligible, warm_host_key};
 
 /// Current queued-execution schema.
-pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 3;
+pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 4;
 const LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 1;
 const TRUSTED_ENVIRONMENT_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 2;
+const PREVIOUS_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 3;
 const MAX_SHIP_POST_VALIDATION_DETAIL_BYTES: usize = 1_200;
 
 /// Durable submitter ownership. Running ownership is derived by admitting
@@ -1316,6 +1317,7 @@ pub fn validation_contract_digest(target: &ResolvedTarget) -> Option<String> {
         // machine-local execution snapshot. Prepared-state reuse binds the
         // values separately at execution time.
         local.environment.clear();
+        local.integration_cleanup = None;
     }
     let payload = serde_json::to_vec(&(build_type, validation)).ok()?;
     Some(format!("{:x}", Sha256::digest(payload)))
@@ -1340,6 +1342,10 @@ pub struct QueuedLocalValidation {
     /// Resolved trusted values snapshotted for daemon-owned execution.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Exact stale-integration checkout custody restored by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_cleanup:
+        Option<Box<crate::changed_surface::integration_checkout::IntegrationCheckoutSnapshot>>,
 }
 
 impl From<&LocalValidationConfig> for QueuedLocalValidation {
@@ -1352,6 +1358,10 @@ impl From<&LocalValidationConfig> for QueuedLocalValidation {
             allow_tree_drift: validation.allow_tree_drift,
             machine_environment: validation.machine_environment.clone(),
             environment: validation.environment.clone(),
+            integration_cleanup: validation
+                .integration_cleanup
+                .as_ref()
+                .map(|checkout| Box::new(checkout.snapshot())),
         }
     }
 }
@@ -1623,6 +1633,22 @@ fn restore_targets(targets: &[QueuedResolvedTarget]) -> QueueRequestResult<Vec<R
 }
 
 fn restore_target(target: &QueuedResolvedTarget) -> QueueRequestResult<ResolvedTarget> {
+    let backend = restore_backend(&target.backend)?;
+    let validation = restore_validation(&target.validation)?;
+    if let ResolvedValidation::Local(local_validation) = &validation
+        && let Some(cleanup) = local_validation.integration_cleanup.as_deref()
+    {
+        let ResolvedBackend::Local(local_backend) = &backend else {
+            return Err(invalid_snapshot(
+                "integration checkout custody requires a local backend",
+            ));
+        };
+        if local_backend.cwd.as_deref() != Some(cleanup.path.as_path()) {
+            return Err(invalid_snapshot(
+                "integration checkout custody does not match local execution cwd",
+            ));
+        }
+    }
     Ok(ResolvedTarget {
         name: target.name.clone(),
         validation_build_type: target.validation_build_type.clone(),
@@ -1630,8 +1656,8 @@ fn restore_target(target: &QueuedResolvedTarget) -> QueueRequestResult<ResolvedT
         backend_name: target.backend_name.clone(),
         warm_keepalive_seconds: target.warm_keepalive_seconds,
         host: target.host.clone(),
-        backend: restore_backend(&target.backend)?,
-        validation: restore_validation(&target.validation),
+        backend,
+        validation,
         failure_parser: target.failure_parser.clone(),
     })
 }
@@ -1742,8 +1768,10 @@ fn restore_fallback_backend(
     })
 }
 
-fn restore_validation(validation: &QueuedValidationSnapshot) -> ResolvedValidation {
-    match validation {
+fn restore_validation(
+    validation: &QueuedValidationSnapshot,
+) -> QueueRequestResult<ResolvedValidation> {
+    Ok(match validation {
         QueuedValidationSnapshot::Local(validation) => {
             ResolvedValidation::Local(LocalValidationConfig {
                 command: validation.command.clone(),
@@ -1753,6 +1781,14 @@ fn restore_validation(validation: &QueuedValidationSnapshot) -> ResolvedValidati
                 allow_tree_drift: validation.allow_tree_drift,
                 machine_environment: validation.machine_environment.clone(),
                 environment: validation.environment.clone(),
+                integration_cleanup: validation
+                    .integration_cleanup
+                    .as_ref()
+                    .map(|snapshot| snapshot.restore().map(Box::new))
+                    .transpose()
+                    .map_err(|error| {
+                        invalid_snapshot(format!("restore integration checkout: {error}"))
+                    })?,
             })
         }
         QueuedValidationSnapshot::Ssh {
@@ -1772,7 +1808,7 @@ fn restore_validation(validation: &QueuedValidationSnapshot) -> ResolvedValidati
         QueuedValidationSnapshot::Cloud => ResolvedValidation::Cloud,
         QueuedValidationSnapshot::HostPool => ResolvedValidation::HostPool,
         QueuedValidationSnapshot::Fallback => ResolvedValidation::Fallback,
-    }
+    })
 }
 
 fn restore_ssh_validation(validation: &QueuedRemoteValidation) -> SshValidation {
@@ -2034,6 +2070,7 @@ fn upgrade_legacy_request(
         envelope.schema_version,
         LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION
             | TRUSTED_ENVIRONMENT_QUEUED_EXECUTION_SCHEMA_VERSION
+            | PREVIOUS_QUEUED_EXECUTION_SCHEMA_VERSION
     ) {
         return Err(QueueRequestError::UnsupportedSchema {
             version: envelope.schema_version,
@@ -2050,6 +2087,13 @@ fn upgrade_legacy_request(
             "legacy v1 request contains v2 trusted-environment fields",
         ));
     }
+    if envelope.schema_version <= PREVIOUS_QUEUED_EXECUTION_SCHEMA_VERSION
+        && targets.iter().any(target_has_integration_cleanup)
+    {
+        return Err(invalid_snapshot(
+            "legacy request contains v4 integration checkout custody",
+        ));
+    }
     if let QueuedExecutionRequest::Ship(request) = &envelope.request
         && (request.metadata_authority_receipt.is_some() || request.targets.is_empty())
     {
@@ -2059,6 +2103,26 @@ fn upgrade_legacy_request(
     }
     envelope.schema_version = QUEUED_EXECUTION_SCHEMA_VERSION;
     Ok(envelope)
+}
+
+fn target_has_integration_cleanup(target: &QueuedResolvedTarget) -> bool {
+    if matches!(
+        &target.validation,
+        QueuedValidationSnapshot::Local(validation) if validation.integration_cleanup.is_some()
+    ) {
+        return true;
+    }
+    match &target.backend {
+        QueuedBackendSnapshot::HostPool(pool) => pool
+            .members
+            .iter()
+            .any(|member| target_has_integration_cleanup(&member.target)),
+        QueuedBackendSnapshot::Fallback(chain) => chain
+            .backends
+            .iter()
+            .any(|backend| target_has_integration_cleanup(&backend.target)),
+        _ => false,
+    }
 }
 
 #[cfg(any(unix, test))]
@@ -2315,6 +2379,41 @@ mod tests {
         local_target_with_name("mac", Some(PathBuf::from("/repo")))
     }
 
+    fn integration_snapshot(
+        source_repo: &Path,
+        checkout_parent: &Path,
+    ) -> crate::changed_surface::integration_checkout::IntegrationCheckoutSnapshot {
+        serde_json::from_value(json!({
+            "source_repo": source_repo,
+            "checkout_parent": checkout_parent,
+            "receipt": {
+                "schema_version": 1,
+                "disposition": "recomputed",
+                "merge_authority": "blocked_until_current_merge_tree",
+                "repository": "owner/repo",
+                "pull_request": 7,
+                "target": "mac",
+                "head_sha": "a".repeat(40),
+                "head_tree_sha": "b".repeat(40),
+                "old_protected_base_sha": "c".repeat(40),
+                "live_protected_base_sha": "d".repeat(40),
+                "merge_base_sha": "c".repeat(40),
+                "integration_tree_sha": "e".repeat(40),
+                "integration_commit_sha": "f".repeat(40),
+                "changed_paths_digest": "1".repeat(64),
+                "protected_base_delta_digest": "2".repeat(64),
+                "old_policy_digest": "3".repeat(64),
+                "live_policy_digest": "3".repeat(64),
+                "old_workflow_digest": "4".repeat(64),
+                "live_workflow_digest": "4".repeat(64),
+                "validation_contract_digest": "5".repeat(64),
+                "integration_changed_paths_digest": "6".repeat(64),
+                "reason": "bounded_shadow_recomputed"
+            }
+        }))
+        .expect("integration snapshot")
+    }
+
     fn local_target_with_name(name: &str, cwd: Option<PathBuf>) -> ResolvedTarget {
         let mut stages = BTreeMap::new();
         stages.insert("test".to_owned(), "cargo test".to_owned());
@@ -2342,6 +2441,7 @@ mod tests {
                     "PULP_SDK_DIR".to_owned(),
                     "/machine/pulp-sdk".to_owned(),
                 )]),
+                integration_cleanup: None,
             }),
             failure_parser: Some("auto".to_owned()),
         }
@@ -2617,23 +2717,218 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v2_reader_rejects_current_v3_request() {
+    fn legacy_v3_reader_rejects_current_v4_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-v4", "/work/repo", &run_request());
+        store.save(&envelope).expect("save v4");
+
+        let error = super::read_versioned_json_through::<QueuedExecutionEnvelope>(
+            &store.path_for("job-v4"),
+            3,
+        )
+        .expect_err("v3 reader must reject v4");
+
+        assert!(matches!(
+            error,
+            QueueRequestError::UnsupportedSchema { version: 4 }
+        ));
+    }
+
+    #[test]
+    fn current_reader_upgrades_an_ordinary_v3_request() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = QueueRequestStore::new(temp.path()).expect("store");
         let envelope =
             QueuedExecutionEnvelope::from_run_request("job-v3", "/work/repo", &run_request());
-        store.save(&envelope).expect("save v3");
-
-        let error = super::read_versioned_json_through::<QueuedExecutionEnvelope>(
-            &store.path_for("job-v3"),
-            2,
+        let mut value = serde_json::to_value(envelope).expect("serialize request");
+        value["schema_version"] = json!(3);
+        std::fs::write(
+            store.path_for("job-v3"),
+            serde_json::to_vec_pretty(&value).expect("encode v3"),
         )
-        .expect_err("v2 reader must reject v3");
+        .expect("write v3");
 
-        assert!(matches!(
-            error,
-            QueueRequestError::UnsupportedSchema { version: 3 }
-        ));
+        let loaded = store.load("job-v3").expect("load v3").expect("present");
+        assert_eq!(loaded.schema_version, QUEUED_EXECUTION_SCHEMA_VERSION);
+        loaded.to_run_request().expect("restore v3");
+    }
+
+    #[test]
+    fn downgraded_v3_request_cannot_smuggle_v4_checkout_custody() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(temp.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let mut envelope = QueuedExecutionEnvelope::from_run_request(
+            "job-v3-custody",
+            temp.path(),
+            &run_request(),
+        );
+        envelope.schema_version = 3;
+        let QueuedExecutionRequest::Run(request) = &mut envelope.request else {
+            panic!("run request");
+        };
+        let super::QueuedValidationSnapshot::Local(validation) = &mut request.targets[0].validation
+        else {
+            panic!("local validation");
+        };
+        validation.integration_cleanup = Some(Box::new(integration_snapshot(
+            temp.path(),
+            &temp.path().join("state/integration-checkouts"),
+        )));
+
+        let error = super::upgrade_legacy_request(envelope)
+            .expect_err("v3 must not carry v4 checkout custody");
+        assert!(matches!(error, QueueRequestError::InvalidSnapshot { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("v4 integration checkout custody")
+        );
+    }
+
+    #[test]
+    fn downgraded_v3_request_cannot_smuggle_nested_v4_checkout_custody() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut nested = super::QueuedResolvedTarget::from(&local_target());
+        let super::QueuedValidationSnapshot::Local(validation) = &mut nested.validation else {
+            panic!("local validation");
+        };
+        validation.integration_cleanup = Some(Box::new(integration_snapshot(
+            temp.path(),
+            &temp.path().join("state/integration-checkouts"),
+        )));
+        let host_pool = super::QueuedResolvedTarget {
+            name: "pool".to_owned(),
+            validation_build_type: None,
+            platform: "macos".to_owned(),
+            backend_name: "host_pool".to_owned(),
+            warm_keepalive_seconds: 0,
+            host: None,
+            backend: super::QueuedBackendSnapshot::HostPool(super::QueuedHostPoolTarget {
+                pool_name: "pool".to_owned(),
+                strategy: "ordered".to_owned(),
+                lease_stale_seconds: 60,
+                heartbeat_interval_seconds: 10,
+                requires: Vec::new(),
+                members: vec![super::QueuedHostPoolMember {
+                    id: "member".to_owned(),
+                    target: Box::new(nested.clone()),
+                    label: "member".to_owned(),
+                    profile_label: "member".to_owned(),
+                    max_concurrency: 1,
+                    capabilities: Vec::new(),
+                }],
+            }),
+            validation: super::QueuedValidationSnapshot::HostPool,
+            failure_parser: None,
+        };
+        let fallback = super::QueuedResolvedTarget {
+            name: "fallback".to_owned(),
+            validation_build_type: None,
+            platform: "macos".to_owned(),
+            backend_name: "fallback".to_owned(),
+            warm_keepalive_seconds: 0,
+            host: None,
+            backend: super::QueuedBackendSnapshot::Fallback(super::QueuedFallbackTarget {
+                backends: vec![super::QueuedFallbackBackend {
+                    target: Box::new(nested),
+                    label: "local".to_owned(),
+                    profile_label: "local".to_owned(),
+                    capabilities: Vec::new(),
+                }],
+                requires: Vec::new(),
+                heartbeat_stale_secs: 60,
+            }),
+            validation: super::QueuedValidationSnapshot::Fallback,
+            failure_parser: None,
+        };
+
+        for (suffix, target) in [("host-pool", host_pool), ("fallback", fallback)] {
+            let mut envelope = QueuedExecutionEnvelope::from_run_request(
+                format!("job-v3-{suffix}"),
+                temp.path(),
+                &run_request(),
+            );
+            envelope.schema_version = 3;
+            let QueuedExecutionRequest::Run(request) = &mut envelope.request else {
+                panic!("run request");
+            };
+            request.targets = vec![target];
+            let error = super::upgrade_legacy_request(envelope)
+                .expect_err("nested v4 custody must not survive v3 upgrade");
+            assert!(
+                error
+                    .to_string()
+                    .contains("v4 integration checkout custody")
+            );
+        }
+    }
+
+    #[test]
+    fn restored_checkout_custody_must_equal_local_execution_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(temp.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        std::fs::create_dir_all(temp.path().join("state")).expect("state root");
+        let snapshot = integration_snapshot(
+            temp.path(),
+            &temp.path().join("state/integration-checkouts"),
+        );
+        let expected_cwd = snapshot.restore().expect("restore snapshot").path;
+        let mut envelope = QueuedExecutionEnvelope::from_run_request(
+            "job-v4-custody",
+            temp.path(),
+            &run_request(),
+        );
+        {
+            let QueuedExecutionRequest::Run(request) = &mut envelope.request else {
+                panic!("run request");
+            };
+            let super::QueuedValidationSnapshot::Local(validation) =
+                &mut request.targets[0].validation
+            else {
+                panic!("local validation");
+            };
+            validation.integration_cleanup = Some(Box::new(snapshot.clone()));
+            let super::QueuedBackendSnapshot::Local(backend) = &mut request.targets[0].backend
+            else {
+                panic!("local backend");
+            };
+            backend.cwd = Some(temp.path().join("wrong-checkout"));
+        }
+        let error = envelope
+            .to_run_request()
+            .expect_err("mismatched execution cwd must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match local execution cwd")
+        );
+
+        let QueuedExecutionRequest::Run(request) = &mut envelope.request else {
+            panic!("run request");
+        };
+        let super::QueuedBackendSnapshot::Local(backend) = &mut request.targets[0].backend else {
+            panic!("local backend");
+        };
+        backend.cwd = Some(expected_cwd);
+        envelope
+            .to_run_request()
+            .expect("matching exact checkout custody");
     }
 
     #[test]

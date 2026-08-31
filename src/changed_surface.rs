@@ -13,12 +13,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod execution;
+pub(crate) mod integration_checkout;
+mod stale_base;
 pub mod trial;
 pub use execution::{
     AuthoritativeExecutionPlan, ChangedSurfaceExecutionPolicy, ExecutionCommandTransport,
     ExecutionDisposition, ExecutionMode, ExecutionPlanError, FullExecutionReason,
     plan_authoritative_execution,
 };
+pub use stale_base::{
+    MergeAuthority, StaleBaseCandidate, StaleBaseShadowDisposition, StaleBaseShadowInput,
+    StaleBaseShadowReceipt, plan_stale_base_shadow,
+};
+pub(crate) use stale_base::{integration_exact_input, stale_base_context_digest};
 
 /// Oldest changed-surface declaration schema understood by this release.
 pub const MIN_CHANGED_SURFACE_SCHEMA_VERSION: u32 = 1;
@@ -274,7 +281,7 @@ impl std::fmt::Display for IdentityError {
 impl std::error::Error for IdentityError {}
 
 /// Why an exact-head plan conservatively selected the full suite.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackReason {
     /// The protected-ref query was missing or malformed.
@@ -310,7 +317,7 @@ pub enum FallbackReason {
 }
 
 /// Risk tier selected for shadow comparison.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionTier {
     /// Mandatory kernel only.
@@ -324,7 +331,7 @@ pub enum SelectionTier {
 }
 
 /// Planner decision retained in the exact-head receipt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlannedSuite {
     /// A bounded suite was computed for shadow comparison.
@@ -336,7 +343,7 @@ pub enum PlannedSuite {
 }
 
 /// Secondary proof bound into a completed selection receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SecondaryProofReceipt {
     /// Required target.
     pub target: String,
@@ -360,7 +367,7 @@ pub struct SecondaryProofReceipt {
 }
 
 /// Outcomes carried by a shadow receipt. This phase never claims target proof.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SelectionOutcomes {
     /// Planner result after exact-head verification.
     pub planner: String,
@@ -369,7 +376,7 @@ pub struct SelectionOutcomes {
 }
 
 /// Exact-head shadow-planning receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SelectionReceipt {
     /// Receipt schema version.
     pub schema_version: u32,
@@ -397,6 +404,10 @@ pub struct SelectionReceipt {
     pub tree_sha: String,
     /// Digest of the authenticated changed-path set.
     pub changed_paths_digest: String,
+    /// Optional digest of a strictly shadow-only context that cannot be
+    /// rederived by the merge-authoritative exact-head planner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_context_digest: Option<String>,
     /// Digest of the selector policy loaded from the authenticated base.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_digest: Option<String>,
@@ -1295,6 +1306,7 @@ fn base_receipt(input: &ExactHeadInput, changed_paths: Vec<String>) -> Selection
         head_sha: input.pr_head_sha.clone(),
         tree_sha: input.remote_tree_sha.clone(),
         changed_paths_digest: digest_lines(&changed_paths),
+        shadow_context_digest: None,
         policy_digest: None,
         build_type: None,
         build_flags: Vec::new(),
