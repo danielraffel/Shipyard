@@ -344,7 +344,7 @@ where
         .next()
         .ok_or_else(|| CliFailure::new(1, "repository was not resolved"))?;
     verify_exact_open_pr(actions, &repo, args.pr, &args.head)?;
-    let agent = resolve_agent(args)?;
+    let agent = resolve_handoff_agent(args, resolve_agent)?;
     let launch_profile = args
         .launch_profile
         .as_deref()
@@ -522,6 +522,40 @@ fn is_legacy_pr_fallback(args: &StewardHandoffArgs) -> bool {
                 && normalized.split('/').count() == 2
                 && args.workstream_id == format!("{normalized}#{}", args.pr)
         })
+}
+
+fn validate_resolved_workstream_identity(
+    args: &StewardHandoffArgs,
+    agent: Option<&AgentResumeContext>,
+) -> Result<(), CliFailure> {
+    if crate::work_ledger::validate_workstream_handle(&args.workstream_id).is_ok() {
+        return Ok(());
+    }
+    if !is_legacy_pr_fallback(args) {
+        return Err(CliFailure::new(
+            1,
+            "--workstream-id must be a canonical GEN-style handle",
+        ));
+    }
+    if agent.is_some() {
+        return Err(CliFailure::new(
+            1,
+            "legacy PR fallback cannot bind an agent route or managed lifecycle",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_handoff_agent<F>(
+    args: &StewardHandoffArgs,
+    resolve_agent: F,
+) -> Result<Option<AgentResumeContext>, CliFailure>
+where
+    F: FnOnce(&StewardHandoffArgs) -> Result<Option<AgentResumeContext>, CliFailure>,
+{
+    let agent = resolve_agent(args)?;
+    validate_resolved_workstream_identity(args, agent.as_ref())?;
+    Ok(agent)
 }
 
 #[derive(Clone, Default)]
@@ -3382,6 +3416,113 @@ fn main() {{
         routed.agent_provider = Some("codex".to_owned());
         routed.agent_session_id = Some("session-7".to_owned());
         assert!(validate_args(&routed).is_err());
+    }
+
+    #[test]
+    fn legacy_pr_fallback_refuses_ambient_agent_routes_and_managed_lifecycles() {
+        let mut legacy = args();
+        legacy.workstream_id = "owner/repo#7".to_owned();
+        assert!(validate_args(&legacy).is_ok());
+
+        let absent = resolve_handoff_agent(&legacy, |args| {
+            resolve_agent_context_with_environment(args, &AgentEnvironment::default())
+        })
+        .expect("resolve profile-free legacy context");
+        assert!(absent.is_none());
+
+        let environments = [
+            (
+                "ambient Codex",
+                AgentEnvironment {
+                    codex_session: Some("codex-session".to_owned()),
+                    ..AgentEnvironment::default()
+                },
+            ),
+            (
+                "ambient Claude",
+                AgentEnvironment {
+                    claude_session: Some("claude-session".to_owned()),
+                    ..AgentEnvironment::default()
+                },
+            ),
+            (
+                "ambient goal-managed Codex",
+                AgentEnvironment {
+                    codex_session: Some("codex-managed".to_owned()),
+                    goal_managed: true,
+                    ..AgentEnvironment::default()
+                },
+            ),
+            (
+                "ambient HerdR Codex",
+                AgentEnvironment {
+                    codex_session: Some("codex-herdr".to_owned()),
+                    herdr_env: Some("1".to_owned()),
+                    herdr_session: Some("herdr-session".to_owned()),
+                    herdr_workspace_id: Some("workspace".to_owned()),
+                    herdr_tab_id: Some("tab".to_owned()),
+                    herdr_pane_id: Some("pane".to_owned()),
+                    ..AgentEnvironment::default()
+                },
+            ),
+            (
+                "ambient cmux Codex",
+                AgentEnvironment {
+                    codex_session: Some("codex-cmux".to_owned()),
+                    surface_id: Some("surface".to_owned()),
+                    ..AgentEnvironment::default()
+                },
+            ),
+            (
+                "ambient goal-managed HerdR Codex",
+                AgentEnvironment {
+                    codex_session: Some("codex-managed-herdr".to_owned()),
+                    goal_managed: true,
+                    herdr_env: Some("1".to_owned()),
+                    herdr_session: Some("herdr-session".to_owned()),
+                    herdr_workspace_id: Some("workspace".to_owned()),
+                    herdr_tab_id: Some("tab".to_owned()),
+                    herdr_pane_id: Some("pane".to_owned()),
+                    ..AgentEnvironment::default()
+                },
+            ),
+            (
+                "ambient goal-managed cmux Claude",
+                AgentEnvironment {
+                    claude_session: Some("claude-managed-cmux".to_owned()),
+                    surface_id: Some("surface".to_owned()),
+                    goal_managed: true,
+                    ..AgentEnvironment::default()
+                },
+            ),
+        ];
+        for (name, environment) in environments {
+            let error = resolve_handoff_agent(&legacy, |args| {
+                resolve_agent_context_with_environment(args, &environment)
+            })
+            .expect_err("ambient route must refuse legacy fallback");
+            assert!(
+                error
+                    .message()
+                    .contains("cannot bind an agent route or managed lifecycle"),
+                "unexpected {name} refusal: {}",
+                error.message()
+            );
+        }
+
+        let goal_only = AgentEnvironment {
+            goal_managed: true,
+            ..AgentEnvironment::default()
+        };
+        let error = resolve_handoff_agent(&legacy, |args| {
+            resolve_agent_context_with_environment(args, &goal_only)
+        })
+        .expect_err("ambient managed lifecycle without an agent must be refused");
+        assert!(
+            error
+                .message()
+                .contains("--goal-managed requires a resumable agent session")
+        );
     }
 
     #[test]
