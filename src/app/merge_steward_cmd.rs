@@ -1339,7 +1339,7 @@ fn observe_dispatch_wedge_target_from_repository(
             // workflow-job endpoint does not guarantee `created_at`. The
             // exact attempt's immutable run creation time is present before
             // dispatch and provides a stable, authoritative age origin.
-            let queued_at = dispatch_queue_age_origin(run);
+            let queued_at = dispatch_queue_age_origin(actions, &observation.repo, run)?;
             results.push(DispatchWedgeObservation {
                 authority: DispatchJobAuthority {
                     repository: observation.repo.clone(),
@@ -1372,8 +1372,40 @@ fn observe_dispatch_wedge_target_from_repository(
     Ok(results)
 }
 
-fn dispatch_queue_age_origin(run: &StewardRun) -> String {
-    run.created_at.clone()
+fn dispatch_queue_age_origin(
+    actions: &GitHubActions,
+    repository: &str,
+    run: &StewardRun,
+) -> Result<String, String> {
+    if run.run_attempt == 1 {
+        return Ok(run.created_at.clone());
+    }
+    let detail = observation::gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!(
+                "repos/{repository}/actions/runs/{}/attempts/{}",
+                run.id, run.run_attempt
+            ),
+        ],
+        "exact workflow attempt detail",
+    )?;
+    let observed_id = detail.get("id").and_then(Value::as_u64);
+    let observed_attempt = detail.get("run_attempt").and_then(Value::as_u64);
+    let observed_head = detail.get("head_sha").and_then(Value::as_str);
+    if observed_id != Some(run.id)
+        || observed_attempt != Some(run.run_attempt)
+        || observed_head.is_none_or(|head| !head.eq_ignore_ascii_case(&run.head_sha))
+    {
+        return Err("exact workflow attempt identity mismatch".to_owned());
+    }
+    detail
+        .get("run_started_at")
+        .and_then(Value::as_str)
+        .filter(|value| DateTime::parse_from_rfc3339(value).is_ok())
+        .map(str::to_owned)
+        .ok_or_else(|| "exact workflow attempt start time unavailable".to_owned())
 }
 
 fn current_required_dispatch_job<'a>(
