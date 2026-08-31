@@ -185,6 +185,7 @@ fn materialize_inventory(
     })
 }
 
+#[cfg(any(unix, test))]
 pub(super) fn validate_remote_inventory(inventory: &LocalWorkInventory) -> WorkLedgerResult<()> {
     let has_legacy_repository_identity = inventory
         .items

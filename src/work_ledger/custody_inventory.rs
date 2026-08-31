@@ -3,9 +3,9 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use super::inventory::{
-    immutable_ledger_query, inventory_from_connection, validate_remote_inventory,
-};
+#[cfg(any(unix, test))]
+use super::inventory::validate_remote_inventory;
+use super::inventory::{immutable_ledger_query, inventory_from_connection};
 use super::{
     CustodyEnvelope, LocalWorkInventory, WorkLedgerError, WorkLedgerResult, digest,
     validate_digest, validate_opaque_ref,
@@ -222,6 +222,7 @@ fn resolve_from_connection(
 }
 
 impl CustodyInventoryWireRequest {
+    #[cfg(any(unix, test))]
     pub(crate) fn new(binding: CustodyInventoryBinding) -> WorkLedgerResult<Self> {
         validate_binding(&binding)?;
         let request_digest = request_digest(&binding)?;
@@ -357,6 +358,7 @@ pub(crate) fn verify_custody_inventory_inbox(
     Ok(inventory)
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn verify_custody_inventory_response(
     expected: &CustodyInventoryWireRequest,
     authenticated_peer_machine_ref: &str,
