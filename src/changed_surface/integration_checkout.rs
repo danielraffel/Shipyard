@@ -8,6 +8,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -169,6 +170,15 @@ pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
         verify_checkout(&checkout.path, &checkout.marker)?;
         verify_marker(&checkout.path, &checkout.marker)?;
         verify_tracked_and_unignored(&checkout.path)?;
+    } else if marker_path(&checkout.path).exists() {
+        verify_marker(&checkout.path, &checkout.marker)?;
+    } else if !checkout.evidence_dir.join(CLEANUP_PENDING_NAME).exists()
+        && !checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).exists()
+    {
+        return Err("absent integration checkout has no resumable cleanup evidence".to_owned());
+    }
+    persist_cleanup_pending(checkout)?;
+    if checkout.path.exists() {
         let status = Command::new("git")
             .args(["worktree", "remove", "--force"])
             .arg(&checkout.path)
@@ -178,14 +188,7 @@ pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
         if !status.success() || checkout.path.exists() {
             return Err("remove integration checkout: exact worktree remains".to_owned());
         }
-    } else if marker_path(&checkout.path).exists() {
-        verify_marker(&checkout.path, &checkout.marker)?;
-    } else if !checkout.evidence_dir.join(CLEANUP_PENDING_NAME).exists()
-        && !checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).exists()
-    {
-        return Err("absent integration checkout has no resumable cleanup evidence".to_owned());
     }
-    persist_cleanup_pending(checkout)?;
     let marker_path = marker_path(&checkout.path);
     if marker_path.exists() {
         fs::remove_file(&marker_path)
@@ -228,9 +231,6 @@ pub(crate) fn reconcile_pending_cleanup(
     let source_common_dir = git_path(&source_repo, &["rev-parse", "--git-common-dir"])?;
     let source_common_dir = canonical_git_path(&source_repo, &source_common_dir)?;
     let path = checkout_parent.join(format!("shadow-{context_digest}"));
-    if path.exists() {
-        return Ok(false);
-    }
     let checkout = IntegrationCheckout {
         path,
         source_repo,
@@ -579,24 +579,33 @@ fn cleanup_payload(checkout: &IntegrationCheckout) -> Result<Vec<u8>, String> {
 fn persist_cleanup_pending(checkout: &IntegrationCheckout) -> Result<(), String> {
     let payload = cleanup_payload(checkout)?;
     let destination = checkout.evidence_dir.join(CLEANUP_PENDING_NAME);
-    match OpenOptions::new()
+    if destination.exists() {
+        if read_regular_receipt(&destination)? != payload {
+            return Err(
+                "pending integration cleanup receipt disagrees with exact checkout".to_owned(),
+            );
+        }
+        return Ok(());
+    }
+    let temporary = checkout.evidence_dir.join(format!(
+        ".stale-cleanup.{}.{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&destination)
-    {
-        Ok(mut file) => file
-            .write_all(&payload)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("write integration cleanup receipt: {error}"))?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if read_regular_receipt(&destination)? != payload {
-                return Err(
-                    "pending integration cleanup receipt disagrees with exact checkout".to_owned(),
-                );
-            }
-        }
-        Err(error) => return Err(format!("create pending cleanup receipt: {error}")),
-    }
+        .open(&temporary)
+        .map_err(|error| format!("create cleanup intent temp: {error}"))?;
+    file.write_all(&payload)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("write cleanup intent temp: {error}"))?;
+    drop(file);
+    fs::rename(&temporary, &destination)
+        .map_err(|error| format!("publish pending cleanup intent: {error}"))?;
     sync_directory(&checkout.evidence_dir)?;
     Ok(())
 }
@@ -818,6 +827,7 @@ mod tests {
         let (repo, receipt) = fixture();
         let parent = repo.path().join("isolated");
         let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        persist_cleanup_pending(&checkout).unwrap();
         let status = Command::new("git")
             .args(["worktree", "remove", "--force"])
             .arg(&checkout.path)
@@ -825,11 +835,23 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        persist_cleanup_pending(&checkout).unwrap();
         fs::remove_file(marker_path(&checkout.path)).unwrap();
         sync_directory(&parent).unwrap();
 
         assert!(reconcile_pending_cleanup(repo.path(), &parent, &receipt).unwrap());
+        assert!(checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).is_file());
+        assert!(!checkout.evidence_dir.join(CLEANUP_PENDING_NAME).exists());
+    }
+
+    #[test]
+    fn restart_finishes_cleanup_when_intent_precedes_checkout_removal() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        persist_cleanup_pending(&checkout).unwrap();
+
+        assert!(reconcile_pending_cleanup(repo.path(), &parent, &receipt).unwrap());
+        assert!(!checkout.path.exists());
         assert!(checkout.evidence_dir.join(CLEANUP_RECEIPT_NAME).is_file());
         assert!(!checkout.evidence_dir.join(CLEANUP_PENDING_NAME).exists());
     }

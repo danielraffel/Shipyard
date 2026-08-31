@@ -799,6 +799,7 @@ fn stale_generation_has_execution_evidence(path: &Path) -> bool {
         };
         if name == "stale-activation-shadow_compare.json"
             || name == "stale-cleanup-shadow_compare.json"
+            || name == ".stale-cleanup-shadow_compare.pending"
             || name.starts_with("result-")
             || name.starts_with("fallback-")
         {
