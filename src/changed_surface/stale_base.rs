@@ -68,6 +68,8 @@ pub struct StaleBaseShadowInput<'a> {
     pub integration_changed_paths_status: ObservationStatus,
     /// Tree produced by a conflict-free integration of live base and exact head.
     pub integration_tree_sha: String,
+    /// Deterministic synthetic commit whose tree is the exact integration tree.
+    pub integration_commit_sha: String,
     /// Whether integration reported conflicts or an otherwise unusable tree.
     pub integration_conflicted: bool,
     /// Tracked paths in the live protected-base tree.
@@ -107,6 +109,9 @@ pub struct StaleBaseShadowReceipt {
     /// Conflict-free synthesized integration tree, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_tree_sha: Option<String>,
+    /// Deterministic synthetic commit for isolated execution, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_commit_sha: Option<String>,
     /// Digest of the exact PR changed-path set.
     pub changed_paths_digest: String,
     /// Digest of the complete old-to-live protected-base delta.
@@ -182,12 +187,16 @@ pub fn plan_stale_base_shadow(
         "ambiguous_stale_base_lineage_or_diff".clone_into(&mut receipt.reason);
         return Ok(receipt);
     }
-    if input.integration_conflicted || !valid_sha(&input.integration_tree_sha) {
+    if input.integration_conflicted
+        || !valid_sha(&input.integration_tree_sha)
+        || !valid_sha(&input.integration_commit_sha)
+    {
         receipt.disposition = StaleBaseShadowDisposition::FullRequired;
         "conflicting_or_unavailable_integration_tree".clone_into(&mut receipt.reason);
         return Ok(receipt);
     }
     receipt.integration_tree_sha = Some(input.integration_tree_sha.clone());
+    receipt.integration_commit_sha = Some(input.integration_commit_sha.clone());
 
     let Some((old_policy, live_policy)) = validated_stale_policies(input, &mut receipt) else {
         return Ok(receipt);
@@ -265,6 +274,21 @@ fn recompute_selection(
     synthetic.local_changed_paths.clone_from(&combined_paths);
     synthetic.base_tracked_paths = normalized_paths(&input.live_base_tracked_paths);
     synthetic.base_tracked_paths_status = ObservationStatus::Complete;
+    synthetic
+        .pr_head_sha
+        .clone_from(&input.integration_commit_sha);
+    synthetic
+        .local_head_sha
+        .clone_from(&input.integration_commit_sha);
+    synthetic
+        .remote_tree_sha
+        .clone_from(&input.integration_tree_sha);
+    synthetic
+        .local_tree_sha
+        .clone_from(&input.integration_tree_sha);
+    // Exact-head secondary proofs cannot cross into a distinct integration
+    // commit; affected families requiring one remain blocked until re-proved.
+    synthetic.secondary_proofs.clear();
     plan_with_policy(
         base_receipt(&synthetic, combined_paths.clone()),
         Ok(live_policy),
@@ -310,6 +334,7 @@ fn base_stale_receipt(
         live_protected_base_sha: exact.protected_ref_sha.clone(),
         merge_base_sha: exact.local_merge_base_sha.clone(),
         integration_tree_sha: None,
+        integration_commit_sha: None,
         changed_paths_digest: paths_digest(&changed_paths),
         protected_base_delta_digest: paths_digest(&protected_delta),
         old_policy_digest: None,
@@ -335,6 +360,7 @@ fn candidate_matches(current: &StaleBaseShadowReceipt, candidate: &StaleBaseShad
         && candidate.live_protected_base_sha == current.live_protected_base_sha
         && candidate.merge_base_sha == current.merge_base_sha
         && candidate.integration_tree_sha == current.integration_tree_sha
+        && candidate.integration_commit_sha == current.integration_commit_sha
         && candidate.changed_paths_digest == current.changed_paths_digest
         && candidate.protected_base_delta_digest == current.protected_base_delta_digest
         && candidate.old_policy_digest == current.old_policy_digest
@@ -369,7 +395,10 @@ pub(crate) fn stale_base_context_digest(receipt: &StaleBaseShadowReceipt) -> Str
 }
 
 fn valid_sha(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -477,6 +506,7 @@ mod tests {
             integration_changed_paths: vec!["src/audio/change.cpp".to_owned()],
             integration_changed_paths_status: ObservationStatus::Complete,
             integration_tree_sha: INTEGRATION.to_owned(),
+            integration_commit_sha: "1".repeat(40),
             integration_conflicted: false,
             live_base_tracked_paths: vec![
                 ".shipyard/config.toml".to_owned(),

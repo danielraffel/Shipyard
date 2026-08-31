@@ -75,7 +75,7 @@ pub(crate) fn observe_stale_base_shadow(
         ],
     )
     .map_or((Vec::new(), false), |paths| (paths, true));
-    let (integration_tree_sha, integration_conflicted) =
+    let (integration_tree_sha, integration_commit_sha, integration_conflicted) =
         synthesize_integration_tree(cwd, &exact.protected_ref_sha, &exact.pr_head_sha);
     let (integration_changed_paths, integration_changed_paths_complete) = integration_tree_sha
         .as_deref()
@@ -119,6 +119,7 @@ pub(crate) fn observe_stale_base_shadow(
                 integration_changed_paths_complete,
             ),
             integration_tree_sha: integration_tree_sha.unwrap_or_default(),
+            integration_commit_sha: integration_commit_sha.unwrap_or_default(),
             integration_conflicted,
             live_base_tracked_paths,
             live_base_tracked_paths_status: observation_status(live_base_tracked_paths_complete),
@@ -137,13 +138,17 @@ fn observation_status(complete: bool) -> ObservationStatus {
     }
 }
 
-fn synthesize_integration_tree(cwd: &Path, live_base: &str, head: &str) -> (Option<String>, bool) {
+fn synthesize_integration_tree(
+    cwd: &Path,
+    live_base: &str,
+    head: &str,
+) -> (Option<String>, Option<String>, bool) {
     let output = Command::new("git")
         .args(["merge-tree", "--write-tree", live_base, head])
         .current_dir(cwd)
         .output();
     let Ok(output) = output else {
-        return (None, true);
+        return (None, None, true);
     };
     let tree = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -151,7 +156,49 @@ fn synthesize_integration_tree(cwd: &Path, live_base: &str, head: &str) -> (Opti
         .map(str::trim)
         .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .map(str::to_owned);
-    (tree, !output.status.success())
+    if !output.status.success() {
+        return (tree, None, true);
+    }
+    let commit = tree
+        .as_deref()
+        .and_then(|tree| synthesize_integration_commit(cwd, tree, live_base, head));
+    let unavailable = commit.is_none();
+    (tree, commit, unavailable)
+}
+
+fn synthesize_integration_commit(
+    cwd: &Path,
+    tree: &str,
+    live_base: &str,
+    head: &str,
+) -> Option<String> {
+    let mut child = Command::new("git")
+        .args(["commit-tree", tree, "-p", live_base, "-p", head])
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "Shipyard integration")
+        .env("GIT_AUTHOR_EMAIL", "shipyard@example.invalid")
+        .env("GIT_AUTHOR_DATE", "@0 +0000")
+        .env("GIT_COMMITTER_NAME", "Shipyard integration")
+        .env("GIT_COMMITTER_EMAIL", "shipyard@example.invalid")
+        .env("GIT_COMMITTER_DATE", "@0 +0000")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()?
+        .write_all(b"Shipyard shadow integration\n")
+        .ok()?;
+    let output = child.wait_with_output().ok()?;
+    let commit = String::from_utf8(output.stdout).ok()?;
+    let commit = commit.trim();
+    (output.status.success()
+        && commit.len() == 40
+        && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| commit.to_owned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -748,9 +795,17 @@ mod tests {
         git(&["commit", "-qm", "live"]);
         let live = git(&["rev-parse", "HEAD"]);
 
-        let (tree, conflicted) = synthesize_integration_tree(temp.path(), &live, &head);
+        let (tree, commit, conflicted) = synthesize_integration_tree(temp.path(), &live, &head);
         assert!(!conflicted);
-        assert!(tree.is_some_and(|tree| tree.len() == 40));
+        let tree = tree.expect("tree");
+        let commit = commit.expect("commit");
+        let (_, repeated_commit, repeated_conflicted) =
+            synthesize_integration_tree(temp.path(), &live, &head);
+        assert!(!repeated_conflicted);
+        assert_eq!(repeated_commit.as_deref(), Some(commit.as_str()));
+        assert_eq!(git(&["rev-parse", &format!("{commit}^{{tree}}")]), tree);
+        assert_eq!(git(&["rev-parse", &format!("{commit}^1")]), live);
+        assert_eq!(git(&["rev-parse", &format!("{commit}^2")]), head);
 
         git(&["checkout", "-q", "--detach", &base]);
         fs::write(temp.path().join("shared.txt"), "head side\n").expect("head conflict");
@@ -762,7 +817,7 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-qm", "live conflict"]);
         let conflict_live = git(&["rev-parse", "HEAD"]);
-        let (_, conflicted) =
+        let (_, _, conflicted) =
             synthesize_integration_tree(temp.path(), &conflict_live, &conflict_head);
         assert!(conflicted);
     }

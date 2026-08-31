@@ -318,8 +318,10 @@ pub fn evaluate_stale_base_terminal(
                         && selection.repository == receipt.repository
                         && selection.pull_request == receipt.pull_request
                         && selection.target == receipt.target
-                        && selection.head_sha == receipt.head_sha
-                        && selection.tree_sha == receipt.head_tree_sha
+                        && Some(selection.head_sha.as_str())
+                            == receipt.integration_commit_sha.as_deref()
+                        && Some(selection.tree_sha.as_str())
+                            == receipt.integration_tree_sha.as_deref()
                         && selection.pr_base_sha == receipt.live_protected_base_sha
                         && selection.protected_ref_sha == receipt.live_protected_base_sha
                         && selection.merge_base_sha == receipt.live_protected_base_sha
@@ -328,6 +330,10 @@ pub fn evaluate_stale_base_terminal(
                 .integration_tree_sha
                 .as_deref()
                 .is_some_and(valid_sha)
+                || !receipt
+                    .integration_commit_sha
+                    .as_deref()
+                    .is_some_and(valid_sha)
                 || !receipt
                     .old_policy_digest
                     .as_deref()
