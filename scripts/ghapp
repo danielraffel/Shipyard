@@ -392,6 +392,7 @@ surface|pr|close
 surface|pr|create
 surface|pr|list
 surface|pr|merge
+surface|pr|ready
 surface|pr|update-branch
 surface|pr|view
 surface|release|edit
@@ -429,6 +430,7 @@ boolean|pr|list|-d --draft -w --web
 value|pr|list|--app -a --assignee -A --author -B --base -H --head -q --jq --json -l --label -L --limit -S --search -s --state -t --template
 boolean|pr|merge|--admin --auto -d --delete-branch --disable-auto -m --merge -r --rebase -s --squash
 value|pr|merge|-A --author-email -b --body -F --body-file --match-head-commit -t --subject
+boolean|pr|ready|--undo
 boolean|pr|update-branch|--rebase
 boolean|pr|view|-c --comments -w --web
 value|pr|view|-q --jq --json -t --template
