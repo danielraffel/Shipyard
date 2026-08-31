@@ -2588,7 +2588,7 @@ mod tests {
         let violation_dir = tempfile::tempdir().unwrap();
         let child_pid = violation_dir.path().join("parallel-violation.pid");
         let violating_body = format!(
-            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; }} {}",
+            "pid_t child = fork(); if (child < 0) return 91; if (child == 0) {{ setsid(); sleep(30); return 0; }} FILE *file = fopen(\"{}\", \"w\"); if (file == NULL) return 92; fprintf(file, \"%d\", child); fclose(file); {}",
             child_pid.display(),
             response_program(&violating_request, "delivered"),
         );
