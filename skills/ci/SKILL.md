@@ -115,6 +115,18 @@ siblings. Record generation count, generation bytes, and free disk for every
 host; reader-aware generation garbage collection is a separate dry-run-only
 follow-up.
 
+Keep machine-global `token_command[0]` on that stable public `ghapp`
+trampoline, never on an immutable generation member. If a v0.137-era install
+left the command pointing directly at a generation wrapper, use `shipyard auth
+helper-argv --wrapper <public-ghapp> --repo <owner/repo>` for the bounded
+repair. It rewrites only that command argument after validating the complete
+generation manifest and installed member digests, proving the live selector
+still names the configured generation under the writer-domain lease, and
+re-reading the configuration before publication. Selector drift, an
+unmanifested or tampered member, or an invalid public trampoline refuses with
+no mutation. The repaired TOML remains an owner-private regular file at mode
+0600.
+
 Native delivery also requires fresh exact-head/base-SHA GitHub App installation
 authority and a live terminal checkpoint. cmux workspace moves preserve surface
 identity; static labels and HerdR environment metadata do not grant authority.

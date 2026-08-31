@@ -1,4 +1,11 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::large_stack_arrays,
+        reason = "Rust 1.92's generated libtest registry exceeds the limit; keep this waiver test-only while production and integration targets remain enforced"
+    )
+)]
 
 //! Core library for Shipyard.
 

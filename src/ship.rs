@@ -59,7 +59,7 @@ const WARM_DEFAULT_RESUME_FROM: &str = "configure";
 const DEFAULT_WORKDIR: &str = "~/repo";
 const DEFAULT_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_DRAIN_MAX_WORKERS: usize = 2;
-#[allow(clippy::duration_suboptimal_units)]
+#[allow(unknown_lints, clippy::duration_suboptimal_units)]
 const QUEUE_ENVELOPE_SWEEP_GRACE: Duration = Duration::from_secs(60);
 
 /// Resolved inputs for one `ship` execution.

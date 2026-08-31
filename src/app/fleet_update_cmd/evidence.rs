@@ -68,6 +68,7 @@ pub(super) struct GenerationEvidence {
     pub(super) manifest: GenerationMemberEvidence,
     pub(super) helper: GenerationMemberEvidence,
     pub(super) wrapper: GenerationMemberEvidence,
+    pub(super) public_trampoline: GenerationMemberEvidence,
     pub(super) close_guard: GenerationMemberEvidence,
     pub(super) binary: GenerationMemberEvidence,
     pub(super) companion: Option<GenerationMemberEvidence>,
@@ -93,6 +94,8 @@ pub(super) const REMOTE_GENERATION_HELPER_SHA_PREFIX: &str =
     "SHIPYARD_FLEET_GENERATION_HELPER_SHA256=";
 pub(super) const REMOTE_GENERATION_WRAPPER_SHA_PREFIX: &str =
     "SHIPYARD_FLEET_GENERATION_WRAPPER_SHA256=";
+pub(super) const REMOTE_GENERATION_PUBLIC_TRAMPOLINE_SHA_PREFIX: &str =
+    "SHIPYARD_FLEET_GENERATION_PUBLIC_TRAMPOLINE_SHA256=";
 pub(super) const REMOTE_GENERATION_CLOSE_GUARD_SHA_PREFIX: &str =
     "SHIPYARD_FLEET_GENERATION_CLOSE_GUARD_SHA256=";
 pub(super) const REMOTE_GENERATION_BINARY_SHA_PREFIX: &str =
@@ -374,7 +377,8 @@ fn collect_local_daemon_runtime(
     let final_pid = std::fs::read_to_string(&pid_path)
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok());
-    let final_selector = std::fs::read_link(&plan.auth_wrapper).ok();
+    let final_selector =
+        std::fs::read_link(plan.auth_wrapper.with_extension("shipyard-generation")).ok();
     if final_pid != Some(daemon_pid) || final_selector.as_ref() != Some(&generation.selector_target)
     {
         return Err(PlanExecutionError::Failed(
@@ -548,10 +552,11 @@ fn collect_local_auth_support(
 fn collect_local_generation(
     plan: &HostUpdatePlan,
 ) -> Result<GenerationEvidence, PlanExecutionError> {
-    let selector_target = std::fs::read_link(&plan.auth_wrapper).map_err(|error| {
+    let selector_path = plan.auth_wrapper.with_extension("shipyard-generation");
+    let selector_target = std::fs::read_link(&selector_path).map_err(|error| {
         PlanExecutionError::Failed(format!(
             "failed to read auth generation selector {}: {error}",
-            plan.auth_wrapper.display()
+            selector_path.display()
         ))
     })?;
     let generation_dir =
@@ -566,6 +571,14 @@ fn collect_local_generation(
     let helper =
         collect_generation_member(&generation_dir.join("shipyard-github-app-token"), 0o700)?;
     let wrapper = collect_generation_member(&generation_dir.join("ghapp"), 0o700)?;
+    let public_trampoline =
+        collect_generation_member(&generation_dir.join("ghapp.public-trampoline"), 0o700)?;
+    let installed_public_trampoline = collect_generation_member(&plan.auth_wrapper, 0o700)?;
+    if installed_public_trampoline.sha256 != public_trampoline.sha256 {
+        return Err(PlanExecutionError::Failed(
+            "installed public auth trampoline disagreed with its immutable generation".to_owned(),
+        ));
+    }
     let close_guard = collect_generation_member(&generation_dir.join("pr-close-guard"), 0o700)?;
     let binary = collect_generation_member(&generation_dir.join("shipyard"), 0o700)?;
     let companion = plan
@@ -582,6 +595,7 @@ fn collect_local_generation(
         &generation_id,
         &helper,
         &wrapper,
+        &public_trampoline,
         &close_guard,
         &binary,
         companion.as_ref(),
@@ -593,6 +607,7 @@ fn collect_local_generation(
         Some(&manifest),
         Some(&helper),
         Some(&wrapper),
+        Some(&public_trampoline),
         Some(&close_guard),
         Some(&binary),
         companion.as_ref(),
@@ -606,10 +621,10 @@ fn collect_local_generation(
     if let Some(context) = &context {
         validate_generation_context(context, &generation_id, &authority_identity, plan)?;
     }
-    let selector_recheck_target = std::fs::read_link(&plan.auth_wrapper).map_err(|error| {
+    let selector_recheck_target = std::fs::read_link(&selector_path).map_err(|error| {
         PlanExecutionError::Failed(format!(
             "failed to re-read auth generation selector {}: {error}",
-            plan.auth_wrapper.display()
+            selector_path.display()
         ))
     })?;
     if selector_recheck_target != selector_target {
@@ -617,16 +632,18 @@ fn collect_local_generation(
             "auth generation selector changed while evidence was collected".to_owned(),
         ));
     }
+    verify_generation_member_unchanged(&installed_public_trampoline)?;
     Ok(GenerationEvidence {
         generation_contract,
         generation_id,
         authority_identity,
-        selector_path: plan.auth_wrapper.clone(),
+        selector_path,
         selector_target,
         selector_recheck_target,
         manifest,
         helper,
         wrapper,
+        public_trampoline,
         close_guard,
         binary,
         companion,
@@ -764,6 +781,7 @@ fn validate_generation_manifest_values(
     generation_id: &str,
     helper: &GenerationMemberEvidence,
     wrapper: &GenerationMemberEvidence,
+    public_trampoline: &GenerationMemberEvidence,
     close_guard: &GenerationMemberEvidence,
     binary: &GenerationMemberEvidence,
     companion: Option<&GenerationMemberEvidence>,
@@ -787,6 +805,14 @@ fn validate_generation_manifest_values(
         ("helper_mode".to_owned(), format!("{:o}", helper.mode)),
         ("wrapper_sha256".to_owned(), wrapper.sha256.clone()),
         ("wrapper_mode".to_owned(), format!("{:o}", wrapper.mode)),
+        (
+            "public_trampoline_sha256".to_owned(),
+            public_trampoline.sha256.clone(),
+        ),
+        (
+            "public_trampoline_mode".to_owned(),
+            format!("{:o}", public_trampoline.mode),
+        ),
         ("close_guard_sha256".to_owned(), close_guard.sha256.clone()),
         (
             "close_guard_mode".to_owned(),
@@ -859,14 +885,27 @@ fn collect_local_support_file(
         validate_local_generation_target(path, &target, plan)?;
         Some(target)
     } else if metadata.file_type().is_file() {
-        None
+        let selector_path = path.with_extension("shipyard-generation");
+        if path == plan.auth_wrapper && selector_path.is_symlink() {
+            let target = std::fs::read_link(&selector_path).map_err(|error| {
+                PlanExecutionError::Failed(format!(
+                    "failed to read support-file generation selector {}: {error}",
+                    selector_path.display()
+                ))
+            })?;
+            validate_local_generation_target(path, &target, plan)?;
+            Some(target)
+        } else {
+            None
+        }
     } else {
         return Err(PlanExecutionError::Failed(format!(
             "support file {} was neither a regular file nor a generation link",
             path.display()
         )));
     };
-    let followed_metadata = std::fs::metadata(path).map_err(|error| {
+    let evidence_path = generation_target.as_deref().unwrap_or(path);
+    let followed_metadata = std::fs::metadata(evidence_path).map_err(|error| {
         PlanExecutionError::Failed(format!(
             "failed to inspect support-file generation target {}: {error}",
             path.display()
@@ -882,15 +921,16 @@ fn collect_local_support_file(
     let mode = Some(file_mode(&followed_metadata));
     #[cfg(not(unix))]
     let mode = None;
+    let sha256 = sha256_file(evidence_path).map_err(|error| {
+        PlanExecutionError::Failed(format!(
+            "failed to hash support file {}: {error}",
+            evidence_path.display()
+        ))
+    })?;
     Ok(SupportFileEvidence {
         path: path.to_owned(),
         generation_target,
-        sha256: Some(sha256_file(path).map_err(|error| {
-            PlanExecutionError::Failed(format!(
-                "failed to hash support file {}: {error}",
-                path.display()
-            ))
-        })?),
+        sha256: Some(sha256),
         mode,
         source_blob_oid: blob_oid.map(str::to_owned),
         source_identity: verified.then(|| plan.source_identity.clone()),
@@ -1435,7 +1475,7 @@ fn generation_from_markers(
         generation_contract,
         generation_id,
         authority_identity,
-        selector_path: plan.auth_wrapper.clone(),
+        selector_path: plan.auth_wrapper.with_extension("shipyard-generation"),
         selector_target,
         selector_recheck_target,
         manifest: member(
@@ -1449,6 +1489,11 @@ fn generation_from_markers(
             0o700,
         )?,
         wrapper: member("ghapp", REMOTE_GENERATION_WRAPPER_SHA_PREFIX, 0o700)?,
+        public_trampoline: member(
+            "ghapp.public-trampoline",
+            REMOTE_GENERATION_PUBLIC_TRAMPOLINE_SHA_PREFIX,
+            0o700,
+        )?,
         close_guard: member(
             "pr-close-guard",
             REMOTE_GENERATION_CLOSE_GUARD_SHA_PREFIX,
@@ -1986,7 +2031,7 @@ fn validate_generation_evidence(
     support: &AuthSupportEvidence,
     generation: &GenerationEvidence,
 ) -> Result<(), String> {
-    if generation.selector_path != plan.auth_wrapper
+    if generation.selector_path != plan.auth_wrapper.with_extension("shipyard-generation")
         || generation.generation_contract != "auth-selector-v2"
         || generation.selector_target != generation.selector_recheck_target
         || generation.authority_identity != plan.release_authority.identity_sha256
@@ -2018,6 +2063,11 @@ fn validate_generation_evidence(
     validate_member(&generation.manifest, "generation.manifest", 0o600)?;
     validate_member(&generation.helper, "shipyard-github-app-token", 0o700)?;
     validate_member(&generation.wrapper, "ghapp", 0o700)?;
+    validate_member(
+        &generation.public_trampoline,
+        "ghapp.public-trampoline",
+        0o700,
+    )?;
     validate_member(&generation.close_guard, "pr-close-guard", 0o700)?;
     validate_member(&generation.binary, "shipyard", 0o700)?;
     if generation.helper.sha256 != support.helper.sha256.as_deref().unwrap_or_default()

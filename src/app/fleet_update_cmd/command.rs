@@ -5,8 +5,9 @@ use super::evidence::{
     REMOTE_GENERATION_CLOSE_GUARD_SHA_PREFIX, REMOTE_GENERATION_COMPANION_SHA_PREFIX,
     REMOTE_GENERATION_CONTEXT_SHA_PREFIX, REMOTE_GENERATION_CONTRACT_PREFIX,
     REMOTE_GENERATION_HELPER_SHA_PREFIX, REMOTE_GENERATION_ID_PREFIX,
-    REMOTE_GENERATION_MANIFEST_SHA_PREFIX, REMOTE_GENERATION_SELECTOR_PREFIX,
-    REMOTE_GENERATION_SELECTOR_RECHECK_PREFIX, REMOTE_GENERATION_WRAPPER_SHA_PREFIX,
+    REMOTE_GENERATION_MANIFEST_SHA_PREFIX, REMOTE_GENERATION_PUBLIC_TRAMPOLINE_SHA_PREFIX,
+    REMOTE_GENERATION_SELECTOR_PREFIX, REMOTE_GENERATION_SELECTOR_RECHECK_PREFIX,
+    REMOTE_GENERATION_WRAPPER_SHA_PREFIX,
 };
 use super::{
     BTreeMap, COMPANION_BINARY_NAME, CliFailure, HostUpdateEvidence, HostUpdatePlan,
@@ -144,7 +145,8 @@ pub(super) fn remote_update_command(
          printf '%s%s\\n' {} \"$auth_generation_selector\"; printf '%s%s\\n' {} \"$auth_generation_selector_recheck\"\n\
          printf '%s%s\\n' {} \"$auth_generation_id\"; printf '%s%s\\n' {} \"$auth_generation_contract\"; printf '%s%s\\n' {} \"$auth_generation_authority\"\n\
          printf '%s%s\\n' {} \"$auth_generation_manifest_sha256\"; printf '%s%s\\n' {} \"$auth_generation_helper_sha256\"\n\
-         printf '%s%s\\n' {} \"$auth_generation_wrapper_sha256\"; printf '%s%s\\n' {} \"$auth_generation_close_guard_sha256\"; printf '%s%s\\n' {} \"$auth_generation_binary_sha256\"\n\
+         printf '%s%s\\n' {} \"$auth_generation_wrapper_sha256\"; printf '%s%s\\n' {} \"$auth_generation_public_trampoline_sha256\"\n\
+         printf '%s%s\\n' {} \"$auth_generation_close_guard_sha256\"; printf '%s%s\\n' {} \"$auth_generation_binary_sha256\"\n\
          printf '%s%s\\n' {} \"$auth_generation_companion_sha256\"; printf '%s%s\\n' {} \"$auth_generation_context_sha256\"\n\
          printf '%s%s\\n' {} \"$daemon_observed_pid\"; printf '%s%s\\n' {} \"$daemon_loaded_executable\"\n\
          printf '%s%s\\n' {} \"$daemon_loaded_executable_sha256\"; printf '%s%s\\n' {} \"$daemon_loaded_launch\"\n\
@@ -219,6 +221,7 @@ pub(super) fn remote_update_command(
         shlex_quote(REMOTE_GENERATION_MANIFEST_SHA_PREFIX),
         shlex_quote(REMOTE_GENERATION_HELPER_SHA_PREFIX),
         shlex_quote(REMOTE_GENERATION_WRAPPER_SHA_PREFIX),
+        shlex_quote(REMOTE_GENERATION_PUBLIC_TRAMPOLINE_SHA_PREFIX),
         shlex_quote(REMOTE_GENERATION_CLOSE_GUARD_SHA_PREFIX),
         shlex_quote(REMOTE_GENERATION_BINARY_SHA_PREFIX),
         shlex_quote(REMOTE_GENERATION_COMPANION_SHA_PREFIX),
@@ -274,7 +277,7 @@ fn remote_generation_probe(
     context_required: bool,
 ) -> String {
     format!(
-        r#"auth_generation_selector="$(/usr/bin/readlink {wrapper})"
+        r#"auth_generation_selector="$(/usr/bin/readlink {wrapper}.shipyard-generation)"
 auth_generation_dir="${{auth_generation_selector%/ghapp}}"
 test "$auth_generation_dir" != "$auth_generation_selector"
 test -d "$auth_generation_dir"; test ! -L "$auth_generation_dir"
@@ -300,7 +303,7 @@ for auth_generation_parent in "$auth_generation_private_root" "$auth_generation_
 done
 auth_generation_manifest="$auth_generation_dir/generation.manifest"
 test -f "$auth_generation_manifest"; test ! -L "$auth_generation_manifest"
-test "$(/usr/bin/wc -l < "$auth_generation_manifest" | /usr/bin/tr -d ' ')" = 15
+test "$(/usr/bin/wc -l < "$auth_generation_manifest" | /usr/bin/tr -d ' ')" = 17
 auth_manifest_value() {{ /usr/bin/awk -F= -v key="$1" '$1 == key {{ if (++count > 1) exit 2; value=$2 }} END {{ if (count != 1 || value == "") exit 3; print value }}' "$auth_generation_manifest"; }}
 auth_generation_id="$(auth_manifest_value generation_id)"
 auth_generation_authority="$(auth_manifest_value authority_identity)"
@@ -318,14 +321,16 @@ test "$auth_generation_dir" = "${{auth_generation_selector%/$auth_generation_id/
 auth_generation_manifest_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_manifest" | /usr/bin/awk '{{print $1}}')"
 auth_generation_helper_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard-github-app-token" | /usr/bin/awk '{{print $1}}')"
 auth_generation_wrapper_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp" | /usr/bin/awk '{{print $1}}')"
+auth_generation_public_trampoline_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp.public-trampoline" | /usr/bin/awk '{{print $1}}')"
 auth_generation_close_guard_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/pr-close-guard" | /usr/bin/awk '{{print $1}}')"
 auth_generation_binary_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard" | /usr/bin/awk '{{print $1}}')"
 test "$(/usr/bin/stat -f '%Lp' "$auth_generation_manifest")" = 600
 test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/shipyard-github-app-token")" = 700
 test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/ghapp")" = 700
+test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/ghapp.public-trampoline")" = 700
 test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/pr-close-guard")" = 700
 test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/shipyard")" = 700
-for auth_generation_member in "$auth_generation_manifest" "$auth_generation_dir/shipyard-github-app-token" "$auth_generation_dir/ghapp" "$auth_generation_dir/pr-close-guard" "$auth_generation_dir/shipyard"; do
+for auth_generation_member in "$auth_generation_manifest" "$auth_generation_dir/shipyard-github-app-token" "$auth_generation_dir/ghapp" "$auth_generation_dir/ghapp.public-trampoline" "$auth_generation_dir/pr-close-guard" "$auth_generation_dir/shipyard"; do
   test -f "$auth_generation_member"; test ! -L "$auth_generation_member"
   test "$(/usr/bin/stat -f '%u' "$auth_generation_member")" = "$(/usr/bin/id -u)"
 done
@@ -333,6 +338,12 @@ test "$(auth_manifest_value helper_sha256)" = "$auth_generation_helper_sha256"
 test "$(auth_manifest_value helper_mode)" = 700
 test "$(auth_manifest_value wrapper_sha256)" = "$auth_generation_wrapper_sha256"
 test "$(auth_manifest_value wrapper_mode)" = 700
+test "$(auth_manifest_value public_trampoline_sha256)" = "$auth_generation_public_trampoline_sha256"
+test "$(auth_manifest_value public_trampoline_mode)" = 700
+test -f {wrapper}; test ! -L {wrapper}
+test "$(/usr/bin/stat -f '%u' {wrapper})" = "$(/usr/bin/id -u)"
+test "$(/usr/bin/stat -f '%Lp' {wrapper})" = 700
+test "$(/usr/bin/shasum -a 256 {wrapper} | /usr/bin/awk '{{print $1}}')" = "$auth_generation_public_trampoline_sha256"
 test "$(auth_manifest_value close_guard_sha256)" = "$auth_generation_close_guard_sha256"
 test "$(auth_manifest_value close_guard_mode)" = 700
 test "$(auth_manifest_value binary_sha256)" = "$auth_generation_binary_sha256"
@@ -380,12 +391,14 @@ fi
 test "$(/usr/bin/shasum -a 256 "$auth_generation_manifest" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_manifest_sha256"
 test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard-github-app-token" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_helper_sha256"
 test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_wrapper_sha256"
+test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp.public-trampoline" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_public_trampoline_sha256"
 test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/pr-close-guard" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_close_guard_sha256"
 test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_binary_sha256"
 if [ {companion_required} = 1 ]; then test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/shipyard-workstream-provider" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_companion_sha256"; fi
 if [ {context_required} = 1 ]; then test "$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp.shipyard-context.json" | /usr/bin/awk '{{print $1}}')" = "$auth_generation_context_sha256"; fi
-auth_generation_selector_recheck="$(/usr/bin/readlink {wrapper})"
-test "$auth_generation_selector_recheck" = "$auth_generation_selector""#,
+auth_generation_selector_recheck="$(/usr/bin/readlink {wrapper}.shipyard-generation)"
+test "$auth_generation_selector_recheck" = "$auth_generation_selector"
+test "$(/usr/bin/shasum -a 256 {wrapper} | /usr/bin/awk '{{print $1}}')" = "$auth_generation_public_trampoline_sha256""#,
         wrapper = shlex_quote(&auth_wrapper.display().to_string()),
         mode = shlex_quote(mode),
         global_dir = shlex_quote(&global_dir.display().to_string()),
@@ -432,7 +445,7 @@ if argv[0] != "--app-id" or not 1 <= len(app_id) <= 20 or not app_id.isascii() o
     raise SystemExit(1)
 PY
 daemon_auth_probe_sha256="$(/usr/bin/printf '%s' "$daemon_auth_probe" | /usr/bin/shasum -a 256 | /usr/bin/awk '{{print $1}}')"
-test "$(/usr/bin/readlink {wrapper})" = "$auth_generation_selector"
+test "$(/usr/bin/readlink {wrapper}.shipyard-generation)" = "$auth_generation_selector"
 test "$(/usr/bin/tr -d '[:space:]' < {state_dir}/daemon/daemon.pid)" = "$daemon_observed_pid""#,
         mode = shlex_quote(mode),
         global_dir = shlex_quote(&global_dir.display().to_string()),

@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard"
-version = "0.137.0"
+version = "0.138.0"
 dependencies = [
  "atomicwrites",
  "base64",
@@ -850,6 +850,7 @@ dependencies = [
  "tar",
  "tempfile",
  "toml",
+ "toml_edit",
  "wait-timeout",
  "winapi-util",
  "zstd",

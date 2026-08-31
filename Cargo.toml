@@ -1,6 +1,6 @@
 [package]
 name = "shipyard"
-version = "0.137.0"
+version = "0.138.0"
 edition = "2024"
 description = "Cross-platform CI coordination for local, SSH, and cloud runners."
 repository = "https://github.com/danielraffel/Shipyard"
@@ -24,6 +24,7 @@ path = "src/bin/shipyard-workstream-provider.rs"
 ci-test-home = []
 
 [dependencies]
+atomicwrites = "0.4.4"
 base64 = "0.22.1"
 clap = { version = "4.5.38", features = ["derive"] }
 chrono = { version = "0.4.42", features = ["serde"] }
@@ -40,6 +41,7 @@ same-file = "1.0.6"
 tempfile = "3.23.0"
 tar = { version = "0.4.44", default-features = false }
 toml = "0.8.23"
+toml_edit = "0.22.27"
 wait-timeout = "0.2.1"
 zstd = { version = "0.13.3", default-features = false }
 
@@ -48,7 +50,6 @@ nix = { version = "0.31.3", features = ["fs", "user"] }
 rustix = { version = "1.1.4", features = ["fs", "net", "pipe", "process", "thread"] }
 
 [target.'cfg(windows)'.dependencies]
-atomicwrites = "0.4.4"
 known-folders = "1.4.2"
 process-wrap = { version = "9.1.0", default-features = false, features = ["std", "job-object"] }
 winapi-util = "0.1.11"
