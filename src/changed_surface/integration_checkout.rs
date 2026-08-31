@@ -167,6 +167,15 @@ fn checkout_from_receipt(
         .map_err(|error| format!("canonicalize integration source: {error}"))?;
     let source_common_dir = git_path(&source_repo, &["rev-parse", "--git-common-dir"])?;
     let source_common_dir = canonical_git_path(&source_repo, &source_common_dir)?;
+    let parent_name = checkout_parent
+        .file_name()
+        .ok_or_else(|| "integration checkout root has no final component".to_owned())?;
+    let checkout_parent = checkout_parent
+        .parent()
+        .ok_or_else(|| "integration checkout root has no evidence parent".to_owned())?
+        .canonicalize()
+        .map_err(|error| format!("canonicalize integration evidence root: {error}"))?
+        .join(parent_name);
     let path = checkout_parent.join(format!("shadow-{context_digest}"));
     Ok(IntegrationCheckout {
         path,
@@ -475,6 +484,13 @@ fn verify_tracked_and_unignored(path: &Path) -> Result<(), String> {
     )?;
     if !submodules.is_empty() {
         return Err("integration submodule contains tracked or untracked content drift".to_owned());
+    }
+    let identities = git_path(path, &["submodule", "status", "--recursive"])?;
+    if identities
+        .lines()
+        .any(|line| !line.starts_with(' ') || line.len() < 42)
+    {
+        return Err("integration submodule commit identity is incomplete or drifted".to_owned());
     }
     Ok(())
 }
@@ -1049,6 +1065,10 @@ mod tests {
         fs::write(child.path().join("tracked.txt"), "clean\n").unwrap();
         git(child.path(), &["add", "."]);
         git(child.path(), &["commit", "-qm", "child"]);
+        let first_child_commit = git(child.path(), &["rev-parse", "HEAD"]);
+        fs::write(child.path().join("tracked.txt"), "newer\n").unwrap();
+        git(child.path(), &["add", "."]);
+        git(child.path(), &["commit", "-qm", "newer child"]);
 
         let parent = tempfile::tempdir().unwrap();
         git(parent.path(), &["init", "-q"]);
@@ -1084,6 +1104,18 @@ mod tests {
         assert!(git(parent.path(), &["status", "--porcelain=v1"]).is_empty());
         let error = verify_tracked_and_unignored(parent.path()).unwrap_err();
         assert!(error.contains("integration submodule"));
+
+        git(
+            parent.path().join("vendor/child").as_path(),
+            &["reset", "--hard"],
+        );
+        git(
+            parent.path().join("vendor/child").as_path(),
+            &["checkout", "-q", &first_child_commit],
+        );
+        assert!(git(parent.path(), &["status", "--porcelain=v1"]).is_empty());
+        let error = verify_tracked_and_unignored(parent.path()).unwrap_err();
+        assert!(error.contains("commit identity"));
     }
 
     #[test]
