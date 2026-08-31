@@ -1,5 +1,6 @@
 #!/bin/bash
-# Shipyard-Auth-Generation-Contract: auth-selector-v1
+# Shipyard-Auth-Generation-Contract: auth-selector-v2
+# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1
 # Dual-mode GitHub App wrapper: an audited privileged gh command surface plus
 # a JSON-emitting `token` mode for Shipyard's token_command.
 set -euo pipefail
@@ -35,6 +36,7 @@ if [[ -z "$opened_wrapper_path" || ! -f "$opened_wrapper_path" || \
 fi
 wrapper_path="$opened_wrapper_path"
 generation_id=""
+guards="${SHIPYARD_GHAPP_GUARDS_DIR:-$HOME/.config/shipyard/guards}"
 generation_store_candidate="$HOME/.local/share/shipyard/auth-generations"
 opened_generation_store=""
 if [[ -d "$generation_store_candidate" && ! -L "$generation_store_candidate" ]]; then
@@ -115,9 +117,10 @@ if [[ -n "$opened_generation_root" && "$opened_wrapper_path" == "$opened_generat
     done
     wrapper_path="$generation_wrapper"
     helper="$generation_dir/shipyard-github-app-token"
+    close_guard="$generation_dir/pr-close-guard"
     generation_binary="$generation_dir/shipyard"
     resolver_context="$generation_dir/ghapp.shipyard-context.json"
-    for executable_member in "$generation_wrapper" "$helper" "$generation_binary"; do
+    for executable_member in "$generation_wrapper" "$helper" "$close_guard" "$generation_binary"; do
         executable_identity="$(generation_owner_mode "$executable_member")" || executable_identity=""
         if [[ ! -f "$executable_member" || -L "$executable_member" || ! -x "$executable_member" || \
               "$executable_identity" != "$generation_owner|700" ]]; then
@@ -139,9 +142,9 @@ else
         exit 1
     fi
     helper="${SHIPYARD_GITHUB_APP_TOKEN_HELPER:-$HOME/.config/shipyard/bin/shipyard-github-app-token}"
+    close_guard="$guards/pr-close-guard"
 fi
 cache_dir="${SHIPYARD_GITHUB_APP_CACHE_DIR:-}"
-guards="${SHIPYARD_GHAPP_GUARDS_DIR:-$HOME/.config/shipyard/guards}"
 trusted_path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 if [[ "$helper" != /* || ! -f "$helper" || ! -x "$helper" ]]; then
@@ -1114,7 +1117,6 @@ fi
 if [[ "${1:-}" == "pr" && "${2:-}" == "merge" && -x "$guards/merge-guard" ]]; then
     PATH="$trusted_path" "$guards/merge-guard" "$@" || exit 1
 fi
-close_guard="$guards/pr-close-guard"
 if [[ ! -f "$close_guard" || ! -x "$close_guard" ]]; then
     echo "ghapp: required PR-close guard is unavailable" >&2
     exit 1

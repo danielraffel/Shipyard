@@ -7,8 +7,7 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::app::fleet_update_cmd::test_release_authority;
 
-const NEW_WRAPPER: &[u8] =
-    b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v1\nexit 0\n";
+const NEW_WRAPPER: &[u8] = b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v2\n# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1\nexit 0\n";
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -76,7 +75,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             fail_after_helper: false,
-            target: "v0.134.0",
+            target: "v0.137.0",
             resolver_succeeds: true,
             refresh_prefix: "",
             refresh: RefreshBehavior::Success,
@@ -91,6 +90,7 @@ struct Fixture {
     wrapper: PathBuf,
     helper_source: PathBuf,
     wrapper_source: PathBuf,
+    close_guard_source: PathBuf,
     authority: ReleaseAuthority,
 }
 
@@ -107,17 +107,23 @@ impl Fixture {
         let wrapper = bin.join("ghapp");
         let helper_source = root.path().join("new-helper");
         let wrapper_source = root.path().join("new-wrapper");
+        let close_guard_source = root.path().join("new-close-guard");
         std::fs::write(&helper_source, b"new helper\n").expect("helper source");
         std::fs::write(&wrapper_source, NEW_WRAPPER).expect("wrapper source");
+        std::fs::write(&close_guard_source, b"#!/bin/sh\nexit 0\n").expect("guard source");
+        std::fs::set_permissions(&close_guard_source, std::fs::Permissions::from_mode(0o700))
+            .expect("guard mode");
         let mut authority = test_release_authority("v0.127.0");
         authority.auth_helper.sha256 = digest(b"new helper\n");
         authority.auth_wrapper.sha256 = digest(NEW_WRAPPER);
+        authority.pr_close_guard.sha256 = digest(b"#!/bin/sh\nexit 0\n");
         Self {
             root,
             helper,
             wrapper,
             helper_source,
             wrapper_source,
+            close_guard_source,
             authority,
         }
     }
@@ -255,6 +261,7 @@ impl Fixture {
             resolver_required,
             &shlex_quote(&self.helper_source.display().to_string()),
             &shlex_quote(&self.wrapper_source.display().to_string()),
+            &shlex_quote(&self.close_guard_source.display().to_string()),
             &installed_binary,
             "shipyard",
             &state,
@@ -470,7 +477,7 @@ fn v0_131_recovers_v0_130_nine_line_journal_and_partial_atomic_backups() {
         !fixture
             .run(RunOptions {
                 fail_after_helper: true,
-                target: "v0.134.0",
+                target: "v0.137.0",
                 resolver_succeeds: false,
                 ..RunOptions::default()
             })
@@ -548,7 +555,7 @@ fn v0_131_preparing_recovery_discards_v0_130_partial_direct_backups() {
         !fixture
             .run(RunOptions {
                 fail_after_helper: true,
-                target: "v0.134.0",
+                target: "v0.137.0",
                 ..RunOptions::default()
             })
             .success()
@@ -616,7 +623,7 @@ fn post_install_resolver_failure_rolls_back_all_installed_artifacts() {
         !fixture
             .run(RunOptions {
                 fail_after_helper: false,
-                target: "v0.134.0",
+                target: "v0.137.0",
                 resolver_succeeds: false,
                 ..RunOptions::default()
             })
@@ -843,4 +850,75 @@ fn tampered_source_and_symlink_target_fail_before_mutation() {
     symlink(&real, &fixture.helper).expect("symlink");
     assert!(!fixture.run(RunOptions::default()).success());
     assert_eq!(std::fs::read_link(&fixture.helper).expect("link"), real);
+}
+
+#[test]
+fn missing_authenticated_close_guard_fails_before_mutation() {
+    let fixture = Fixture::new();
+    std::fs::remove_file(&fixture.close_guard_source).expect("remove close guard source");
+
+    assert!(!fixture.run(RunOptions::default()).success());
+    assert!(!fixture.helper.exists());
+    assert!(!fixture.wrapper.exists());
+}
+
+#[test]
+fn target_wrapper_requires_the_exclusive_v2_sibling_guard_contract() {
+    for wrapper in [
+        b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v1\n# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1\nexit 0\n".as_slice(),
+        b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v1\n# Shipyard-Auth-Generation-Contract: auth-selector-v2\n# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1\nexit 0\n".as_slice(),
+        b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v2\nexit 0\n".as_slice(),
+    ] {
+        let mut fixture = Fixture::new();
+        std::fs::write(&fixture.wrapper_source, wrapper).expect("candidate wrapper");
+        fixture.authority.auth_wrapper.sha256 = digest(wrapper);
+
+        assert!(!fixture.run(RunOptions::default()).success());
+        assert!(!fixture.helper.exists());
+        assert!(!fixture.wrapper.exists());
+    }
+}
+
+#[test]
+fn guardless_generation_is_anchored_and_restored_after_the_public_guard() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let script = install_transaction(
+        &fixture.helper,
+        &fixture.wrapper,
+        &fixture.binary(),
+        &fixture.companion(),
+        true,
+        true,
+        &shlex_quote(&fixture.helper_source.display().to_string()),
+        &shlex_quote(&fixture.wrapper_source.display().to_string()),
+        &shlex_quote(&fixture.close_guard_source.display().to_string()),
+        "/bin/true",
+        "shipyard",
+        &state,
+        &state,
+        "danielraffel/Shipyard",
+        &fixture.authority,
+        "",
+        false,
+    );
+    assert!(
+        script.contains("if ! /usr/bin/grep -q '^close_guard_sha256=' \"$auth_original_manifest\"")
+    );
+    assert!(script.contains("auth_previous_wrapper_needs_anchor=1"));
+
+    let restore = script
+        .split("auth_restore_transaction() {")
+        .nth(1)
+        .and_then(|tail| tail.split("auth_backup_record() {").next())
+        .expect("restore transaction body");
+    let guard_restore = restore
+        .find("auth_restore_one \"$auth_restore_close_guard\"")
+        .expect("public guard restore");
+    let legacy_selector_restore = restore
+        .rfind("auth_restore_one \"$auth_restore_wrapper\"")
+        .expect("legacy selector restore");
+    assert!(guard_restore < legacy_selector_restore);
+    assert!(restore.contains("auth_restore_wrapper_first=0"));
+    assert!(restore.contains("Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1"));
 }

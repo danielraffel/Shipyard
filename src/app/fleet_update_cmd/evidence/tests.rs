@@ -44,7 +44,7 @@ fn local_refresh_pid_survives_preceding_update_event_stream() {
 
 #[test]
 fn local_auth_launch_probe_requires_the_exact_typed_credential_contract() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
     let valid = serde_json::json!({
         "schema_version": 1,
         "command": "auth.helper-argv",
@@ -92,7 +92,7 @@ fn local_auth_launch_probe_requires_the_exact_typed_credential_contract() {
 
 #[test]
 fn local_generation_context_binds_mode_and_global_directory() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
     let temp = tempfile::tempdir().expect("temp dir");
     let path = temp.path().join("ghapp.shipyard-context.json");
     let generation_id = "7".repeat(64);
@@ -237,7 +237,7 @@ fn auth_support(verified: bool) -> AuthSupportEvidence {
         ),
         wrapper: file("/Users/ci/.local/bin/ghapp", 'e', 'd'),
         generation: verified.then(|| GenerationEvidence {
-            generation_contract: "auth-selector-v1".to_owned(),
+            generation_contract: "auth-selector-v2".to_owned(),
             generation_id: "7".repeat(64),
             authority_identity: verified_source_identity(),
             selector_path: PathBuf::from("/Users/ci/.local/bin/ghapp"),
@@ -246,6 +246,7 @@ fn auth_support(verified: bool) -> AuthSupportEvidence {
             manifest: generation_member(&generation_dir, "generation.manifest", '9', 0o600),
             helper: generation_member(&generation_dir, "shipyard-github-app-token", 'c', 0o700),
             wrapper: generation_member(&generation_dir, "ghapp", 'e', 0o700),
+            close_guard: generation_member(&generation_dir, "pr-close-guard", '0', 0o700),
             binary: generation_member(&generation_dir, "shipyard", 'a', 0o700),
             companion: Some(generation_member(
                 &generation_dir,
@@ -278,7 +279,7 @@ fn generation_member(
 
 #[test]
 fn remote_evidence_is_typed_and_proves_repo_preservation() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
     let before = serde_json::json!({
         "command": "daemon:status",
         "running": true,
@@ -294,10 +295,10 @@ fn remote_evidence_is_typed_and_proves_repo_preservation() {
         "command": "daemon:status",
         "running": true,
         "configured_repos": ["owner/a", "owner/b"],
-        "shipyard_version": "0.134.0"
+        "shipyard_version": "0.137.0"
     });
     let stdout = format!(
-        "{REMOTE_BEFORE_PRIMARY_SHA256_PREFIX}{}\n{REMOTE_BEFORE_PRIMARY_VERSION_PREFIX}shipyard 0.126.2\n{REMOTE_BEFORE_COMPANION_SHA256_PREFIX}absent\n{REMOTE_BEFORE_COMPANION_VERSION_PREFIX}absent\n{REMOTE_AFTER_PRIMARY_SHA256_PREFIX}{}\n{REMOTE_AFTER_PRIMARY_VERSION_PREFIX}shipyard 0.134.0\n{REMOTE_AFTER_COMPANION_SHA256_PREFIX}{}\n{REMOTE_AFTER_COMPANION_VERSION_PREFIX}shipyard-workstream-provider 0.134.0\n{}{}\n{}755\n{}direct\n{}{}\n{}755\n{}direct\n{}{}\n{}700\n{}{generation_root}/shipyard-github-app-token\n{}{}\n{}700\n{}{generation_root}/ghapp\n{REMOTE_GENERATION_SELECTOR_PREFIX}{generation_root}/ghapp\n{REMOTE_GENERATION_SELECTOR_RECHECK_PREFIX}{generation_root}/ghapp\n{REMOTE_GENERATION_ID_PREFIX}{generation_id}\n{REMOTE_GENERATION_CONTRACT_PREFIX}auth-selector-v1\n{REMOTE_GENERATION_AUTHORITY_PREFIX}{authority_identity}\n{REMOTE_GENERATION_MANIFEST_SHA_PREFIX}{manifest_sha}\n{REMOTE_GENERATION_HELPER_SHA_PREFIX}{helper_sha}\n{REMOTE_GENERATION_WRAPPER_SHA_PREFIX}{wrapper_sha}\n{REMOTE_GENERATION_BINARY_SHA_PREFIX}{binary_sha}\n{REMOTE_GENERATION_COMPANION_SHA_PREFIX}{companion_sha}\n{REMOTE_GENERATION_CONTEXT_SHA_PREFIX}{context_sha}\n{REMOTE_DAEMON_PID_PREFIX}4242\n{REMOTE_DAEMON_EXECUTABLE_PREFIX}{generation_root}/shipyard\n{REMOTE_DAEMON_EXECUTABLE_SHA_PREFIX}{binary_sha}\n{REMOTE_DAEMON_LAUNCH_PREFIX}{daemon_launch}\n{REMOTE_DAEMON_AUTH_PROBE_SHA_PREFIX}{auth_probe_sha}\n{REMOTE_BEFORE_STATUS_PREFIX}{before}\n{REMOTE_REFRESH_PREFIX}{refresh}\n{REMOTE_AFTER_STATUS_PREFIX}{after}\n{REMOTE_AUTHORITY_ID_PREFIX}{}\n{REMOTE_RELEASE_ASSET_SHA256_PREFIX}{}\n",
+        "{REMOTE_BEFORE_PRIMARY_SHA256_PREFIX}{}\n{REMOTE_BEFORE_PRIMARY_VERSION_PREFIX}shipyard 0.126.2\n{REMOTE_BEFORE_COMPANION_SHA256_PREFIX}absent\n{REMOTE_BEFORE_COMPANION_VERSION_PREFIX}absent\n{REMOTE_AFTER_PRIMARY_SHA256_PREFIX}{}\n{REMOTE_AFTER_PRIMARY_VERSION_PREFIX}shipyard 0.137.0\n{REMOTE_AFTER_COMPANION_SHA256_PREFIX}{}\n{REMOTE_AFTER_COMPANION_VERSION_PREFIX}shipyard-workstream-provider 0.137.0\n{}{}\n{}755\n{}direct\n{}{}\n{}755\n{}direct\n{}{}\n{}700\n{}{generation_root}/shipyard-github-app-token\n{}{}\n{}700\n{}{generation_root}/ghapp\n{REMOTE_GENERATION_SELECTOR_PREFIX}{generation_root}/ghapp\n{REMOTE_GENERATION_SELECTOR_RECHECK_PREFIX}{generation_root}/ghapp\n{REMOTE_GENERATION_ID_PREFIX}{generation_id}\n{REMOTE_GENERATION_CONTRACT_PREFIX}auth-selector-v1\n{REMOTE_GENERATION_AUTHORITY_PREFIX}{authority_identity}\n{REMOTE_GENERATION_MANIFEST_SHA_PREFIX}{manifest_sha}\n{REMOTE_GENERATION_HELPER_SHA_PREFIX}{helper_sha}\n{REMOTE_GENERATION_WRAPPER_SHA_PREFIX}{wrapper_sha}\n{REMOTE_GENERATION_CLOSE_GUARD_SHA_PREFIX}{close_guard_sha}\n{REMOTE_GENERATION_BINARY_SHA_PREFIX}{binary_sha}\n{REMOTE_GENERATION_COMPANION_SHA_PREFIX}{companion_sha}\n{REMOTE_GENERATION_CONTEXT_SHA_PREFIX}{context_sha}\n{REMOTE_DAEMON_PID_PREFIX}4242\n{REMOTE_DAEMON_EXECUTABLE_PREFIX}{generation_root}/shipyard\n{REMOTE_DAEMON_EXECUTABLE_SHA_PREFIX}{binary_sha}\n{REMOTE_DAEMON_LAUNCH_PREFIX}{daemon_launch}\n{REMOTE_DAEMON_AUTH_PROBE_SHA_PREFIX}{auth_probe_sha}\n{REMOTE_BEFORE_STATUS_PREFIX}{before}\n{REMOTE_REFRESH_PREFIX}{refresh}\n{REMOTE_AFTER_STATUS_PREFIX}{after}\n{REMOTE_AUTHORITY_ID_PREFIX}{}\n{REMOTE_RELEASE_ASSET_SHA256_PREFIX}{}\n",
         "a".repeat(64),
         "b".repeat(64),
         "c".repeat(64),
@@ -328,11 +329,16 @@ fn remote_evidence_is_typed_and_proves_repo_preservation() {
         manifest_sha = "9".repeat(64),
         helper_sha = "c".repeat(64),
         wrapper_sha = "e".repeat(64),
+        close_guard_sha = "0".repeat(64),
         binary_sha = "b".repeat(64),
         companion_sha = "c".repeat(64),
         context_sha = "d".repeat(64),
         daemon_launch = "/Users/ci/.local/bin/shipyard --mode shipyard --global-dir /Users/ci/Library/Application Support/shipyard --state-dir /Users/ci/Library/Application Support/shipyard daemon run --repo owner/a --repo owner/b",
         auth_probe_sha = "5".repeat(64),
+    );
+    let stdout = stdout.replace(
+        "SHIPYARD_FLEET_GENERATION_CONTRACT=auth-selector-v1",
+        "SHIPYARD_FLEET_GENERATION_CONTRACT=auth-selector-v2",
     );
     let evidence = parse_remote_evidence(&plan, stdout.as_bytes()).expect("evidence");
     assert_eq!(evidence.daemon_pid, 4242);
@@ -342,11 +348,21 @@ fn remote_evidence_is_typed_and_proves_repo_preservation() {
 
 #[test]
 fn evidence_rejects_version_repo_and_digest_drift() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
-    let mut observed = evidence("0.134.0");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
+    let mut observed = evidence("0.137.0");
+    validate_evidence(&plan, &observed).expect("coherent evidence control");
+    observed
+        .auth_support_after
+        .generation
+        .as_mut()
+        .expect("generation")
+        .close_guard
+        .sha256 = "f".repeat(64);
+    assert!(validate_evidence(&plan, &observed).is_err());
+    observed = evidence("0.137.0");
     observed.daemon_version = "0.126.2".to_owned();
     assert!(validate_evidence(&plan, &observed).is_err());
-    observed.daemon_version = "0.134.0".to_owned();
+    observed.daemon_version = "0.137.0".to_owned();
     observed.configured_repos_preserved = Some(false);
     assert!(validate_evidence(&plan, &observed).is_err());
     observed.configured_repos_preserved = Some(true);
@@ -364,8 +380,8 @@ fn evidence_rejects_version_repo_and_digest_drift() {
 
 #[test]
 fn daemon_runtime_receipt_refuses_pid_binary_launch_and_auth_generation_drift() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
-    let control = evidence("0.134.0");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
+    let control = evidence("0.137.0");
     validate_evidence(&plan, &control).expect("coherent daemon runtime control");
 
     let mut pid = control.clone();
@@ -387,8 +403,8 @@ fn daemon_runtime_receipt_refuses_pid_binary_launch_and_auth_generation_drift() 
 
 #[test]
 fn auth_support_evidence_rejects_tamper_and_mixed_release_source() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
-    let mut observed = evidence("0.134.0");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
+    let mut observed = evidence("0.137.0");
     observed.auth_support_after.helper.sha256 = Some("f".repeat(64));
     assert!(validate_evidence(&plan, &observed).is_err());
 
@@ -415,8 +431,8 @@ fn auth_support_evidence_rejects_tamper_and_mixed_release_source() {
 
 #[test]
 fn composed_generation_rejects_selector_toctou_and_mixed_members() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
-    let mut observed = evidence("0.134.0");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
+    let mut observed = evidence("0.137.0");
     let generation = observed
         .auth_support_after
         .generation
@@ -466,7 +482,7 @@ fn composed_generation_rejects_selector_toctou_and_mixed_members() {
 
 #[test]
 fn generation_target_shape_requires_canonical_absolute_exact_member() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
     let root = PathBuf::from("/Users/ci/.local/share/shipyard/auth-generations");
     let generation = "7".repeat(64);
     let expected = root.join(&generation).join("ghapp");
@@ -517,7 +533,7 @@ fn local_generation_target_requires_private_owned_regular_member() {
             .display()
             .to_string(),
     );
-    let plan = super::super::host_update_plan(&class, "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&class, "v0.137.0").expect("plan");
     let generation_dir = home
         .join(".local/share/shipyard/auth-generations")
         .join("7".repeat(64));
@@ -585,8 +601,8 @@ fn local_generation_target_requires_private_owned_regular_member() {
 #[test]
 fn evidence_never_accepts_mixed_pair_or_legacy_companion() {
     let paired_plan =
-        super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("paired plan");
-    let mut mixed = evidence("0.134.0");
+        super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("paired plan");
+    let mut mixed = evidence("0.137.0");
     mixed
         .after_pair
         .companion
@@ -595,7 +611,7 @@ fn evidence_never_accepts_mixed_pair_or_legacy_companion() {
         .semantic_version = "0.126.4".to_owned();
     assert!(validate_evidence(&paired_plan, &mixed).is_err());
 
-    let mut wrong_source = evidence("0.134.0");
+    let mut wrong_source = evidence("0.137.0");
     wrong_source.after_pair.primary.source_identity = Some("9".repeat(64));
     assert!(validate_evidence(&paired_plan, &wrong_source).is_err());
 
@@ -614,9 +630,9 @@ fn evidence_never_accepts_mixed_pair_or_legacy_companion() {
 
 #[test]
 fn evidence_never_infers_preinstall_provenance_or_omits_postinstall_binding() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
 
-    let mut fabricated_before = evidence("0.134.0");
+    let mut fabricated_before = evidence("0.137.0");
     fabricated_before.before_pair.primary.source_identity = Some(verified_source_identity());
     fabricated_before.before_pair.primary.source_identity_basis =
         SourceIdentityBasis::VerifiedReleaseAuthority;
@@ -634,7 +650,7 @@ fn evidence_never_infers_preinstall_provenance_or_omits_postinstall_binding() {
         .source_identity_basis = SourceIdentityBasis::VerifiedReleaseAuthority;
     assert!(validate_evidence(&plan, &fabricated_before).is_err());
 
-    let mut unbound_after = evidence("0.134.0");
+    let mut unbound_after = evidence("0.137.0");
     unbound_after.after_pair.primary.source_identity = None;
     unbound_after.after_pair.primary.source_identity_basis =
         SourceIdentityBasis::UnverifiedPreinstall;
@@ -660,9 +676,9 @@ fn fresh_daemon_reports_preservation_as_not_applicable() {
         "command": "daemon:status",
         "running": true,
         "configured_repos": [],
-        "shipyard_version": "0.134.0"
+        "shipyard_version": "0.137.0"
     });
-    let pair = evidence("0.134.0").after_pair;
+    let pair = evidence("0.137.0").after_pair;
     let observed = evidence_from_values(
         pair.clone(),
         pair,
@@ -682,7 +698,7 @@ fn fresh_daemon_reports_preservation_as_not_applicable() {
 
 #[test]
 fn remote_evidence_rejects_duplicate_or_incomplete_markers() {
-    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
     let duplicate = format!(
         "{REMOTE_BEFORE_PRIMARY_SHA256_PREFIX}{}\n{REMOTE_BEFORE_PRIMARY_SHA256_PREFIX}{}\n",
         "a".repeat(64),
@@ -708,7 +724,7 @@ fn local_evidence_probes_share_the_host_attempt_deadline() {
     let mut class = host(None);
     class.shipyard_bin = Some(binary.display().to_string());
     class.github_cli = Some(temp.path().join("ghapp").display().to_string());
-    let plan = super::super::host_update_plan(&class, "v0.134.0").expect("plan");
+    let plan = super::super::host_update_plan(&class, "v0.137.0").expect("plan");
     let started = Instant::now();
     assert!(matches!(
         execute_plan_with_timeout(&plan, Duration::from_millis(100)),

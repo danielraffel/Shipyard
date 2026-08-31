@@ -8,6 +8,7 @@ use super::*;
 use crate::app::fleet_update_cmd::test_release_authority;
 
 const REAL_GHAPP: &[u8] = include_bytes!("../../../../../scripts/ghapp");
+const REAL_PR_CLOSE_GUARD: &[u8] = include_bytes!("../../../../../scripts/ghapp_pr_close_guard.py");
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -22,6 +23,7 @@ struct Fixture {
     context: PathBuf,
     helper_source: PathBuf,
     wrapper_source: PathBuf,
+    close_guard_source: PathBuf,
     binary_source: PathBuf,
     authority: ReleaseAuthority,
 }
@@ -42,6 +44,7 @@ impl Fixture {
         let context = bin.join("ghapp.shipyard-context.json");
         let helper_source = root.path().join("release-helper");
         let wrapper_source = root.path().join("release-ghapp");
+        let close_guard_source = root.path().join("release-pr-close-guard");
         let binary_source = root.path().join("release-shipyard");
         let private_key = root.path().join("private-key.pem");
         Self::write_executable(
@@ -49,6 +52,7 @@ impl Fixture {
             b"#!/bin/bash\n/usr/bin/printf '{\"token\":\"fixture\"}\\n'\n",
         );
         Self::write_executable(&wrapper_source, REAL_GHAPP);
+        Self::write_executable(&close_guard_source, REAL_PR_CLOSE_GUARD);
         Self::write_executable(
             &binary_source,
             format!(
@@ -60,9 +64,10 @@ impl Fixture {
         std::fs::write(&private_key, b"key\n").expect("private key");
         std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(0o600))
             .expect("private key mode");
-        let mut authority = test_release_authority("v0.134.0");
+        let mut authority = test_release_authority("v0.137.0");
         authority.auth_helper.sha256 = digest(&std::fs::read(&helper_source).expect("helper"));
         authority.auth_wrapper.sha256 = digest(REAL_GHAPP);
+        authority.pr_close_guard.sha256 = digest(REAL_PR_CLOSE_GUARD);
         let fixture = Self {
             root,
             helper,
@@ -72,6 +77,7 @@ impl Fixture {
             context,
             helper_source,
             wrapper_source,
+            close_guard_source,
             binary_source,
             authority,
         };
@@ -140,6 +146,7 @@ impl Fixture {
             true,
             &shlex_quote(&self.helper_source.display().to_string()),
             &shlex_quote(&self.wrapper_source.display().to_string()),
+            &shlex_quote(&self.close_guard_source.display().to_string()),
             &install_binary,
             "shipyard",
             &self.state(),
@@ -174,6 +181,33 @@ impl Fixture {
 }
 
 #[test]
+fn legacy_v2_preparing_journal_recovers_without_schema_upgrade() {
+    let fixture = Fixture::new();
+    let script = fixture.script();
+    let needle = "auth_write_phase preparing\n";
+    assert_eq!(script.matches(needle).count(), 1);
+    let interrupted = script.replacen(needle, &format!("{needle}/bin/kill -9 $$\n"), 1);
+    assert!(!fixture.run(&interrupted).success());
+
+    let journal = fixture.state().join("fleet-auth-support.transaction");
+    let mut lines: Vec<String> = std::fs::read_to_string(&journal)
+        .expect("v3 journal")
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 26);
+    lines[0] = "shipyard-fleet-auth-v2".to_owned();
+    lines.remove(11);
+    lines.remove(8);
+    assert_eq!(lines.len(), 24);
+    std::fs::write(&journal, format!("{}\n", lines.join("\n"))).expect("v2 journal");
+
+    assert!(fixture.run(&script).success(), "legacy v2 recovery");
+    assert!(!journal.exists());
+    assert!(std::fs::read_link(&fixture.wrapper).is_ok());
+}
+
+#[test]
 fn target_selector_rename_before_journal_rolls_forward_on_successor() {
     let fixture = Fixture::new();
     let script = fixture.script();
@@ -193,6 +227,33 @@ fn target_selector_rename_before_journal_rolls_forward_on_successor() {
     );
     assert!(
         !fixture
+            .state()
+            .join("fleet-auth-support.transaction")
+            .exists()
+    );
+}
+
+#[test]
+fn v3_recovery_refuses_a_target_generation_missing_its_guard() {
+    let fixture = Fixture::new();
+    let script = fixture.script();
+    let needle = "auth_write_phase target-selected\n";
+    assert_eq!(script.matches(needle).count(), 1);
+    let interrupted = script.replacen(needle, &format!("{needle}/bin/kill -9 $$\n"), 1);
+    assert!(!fixture.run(&interrupted).success());
+
+    let selected = std::fs::read_link(&fixture.wrapper).expect("target selector");
+    std::fs::remove_file(
+        selected
+            .parent()
+            .expect("generation directory")
+            .join("pr-close-guard"),
+    )
+    .expect("remove target guard");
+
+    assert!(!fixture.run(&script).success());
+    assert!(
+        fixture
             .state()
             .join("fleet-auth-support.transaction")
             .exists()

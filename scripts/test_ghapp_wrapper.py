@@ -242,10 +242,13 @@ class GhappWrapperTests(unittest.TestCase):
         generation_helper.write_bytes(self.helper.read_bytes())
         generation_binary = generation / "shipyard"
         generation_binary.write_bytes(self.shipyard.read_bytes())
+        generation_close_guard = generation / "pr-close-guard"
+        generation_close_guard.write_bytes((self.root / "guards/pr-close-guard").read_bytes())
         for executable in (
             generation_wrapper,
             generation_helper,
             generation_binary,
+            generation_close_guard,
         ):
             executable.chmod(0o700)
         context = generation / "ghapp.shipyard-context.json"
@@ -529,6 +532,31 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("sibling shipyard resolver is unavailable", result.stderr)
         self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_generation_wrapper_refuses_missing_sibling_close_guard(self) -> None:
+        self.install_generation_wrapper()
+        self.wrapper.resolve().parent.joinpath("pr-close-guard").unlink()
+
+        result = self.run_wrapper("auth", "status", "--repo", "danielraffel/Shipyard")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed generation member is malformed or unsafe", result.stderr)
+        self.assertFalse(self.gh_log.exists())
+
+    def test_generation_wrapper_keeps_optional_merge_guard_global(self) -> None:
+        self.install_generation_wrapper()
+        guard = self.root / "guards/merge-guard"
+        guard.write_text("#!/bin/sh\nexit 73\n", encoding="utf-8")
+        guard.chmod(0o755)
+
+        result = self.run_wrapper(
+            "pr", "merge", "7", "--repo", "danielraffel/Shipyard"
+        )
+
+        # Guard refusals retain the wrapper's established fail-closed exit
+        # contract rather than leaking an implementation-specific guard code.
+        self.assertEqual(result.returncode, 1)
         self.assertFalse(self.gh_log.exists())
 
     def test_cli_mode_uses_exact_fleet_resolver_context(self) -> None:
