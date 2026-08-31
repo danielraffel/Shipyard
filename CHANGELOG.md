@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01321"></a>
+## [0.132.1] - 2026-08-30
+
+- investigate/sandbox canary cleanup 20260830 ([#510](https://github.com/danielraffel/Shipyard/pull/510))
+
 <a id="v01320"></a>
 ## [0.132.0] - 2026-08-30
 
@@ -1179,6 +1184,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.132.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.132.1
 [0.132.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.132.0
 [0.131.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.131.1
 [0.131.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.131.0
