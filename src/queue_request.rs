@@ -42,9 +42,10 @@ use crate::ship_state::ShipState;
 use crate::warm_pool::{is_backend_eligible, warm_host_key};
 
 /// Current queued-execution schema.
-pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 3;
+pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 4;
 const LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 1;
 const TRUSTED_ENVIRONMENT_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 2;
+const PREVIOUS_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 3;
 const MAX_SHIP_POST_VALIDATION_DETAIL_BYTES: usize = 1_200;
 
 /// Durable submitter ownership. Running ownership is derived by admitting
@@ -1316,6 +1317,7 @@ pub fn validation_contract_digest(target: &ResolvedTarget) -> Option<String> {
         // machine-local execution snapshot. Prepared-state reuse binds the
         // values separately at execution time.
         local.environment.clear();
+        local.integration_cleanup = None;
     }
     let payload = serde_json::to_vec(&(build_type, validation)).ok()?;
     Some(format!("{:x}", Sha256::digest(payload)))
@@ -1340,6 +1342,10 @@ pub struct QueuedLocalValidation {
     /// Resolved trusted values snapshotted for daemon-owned execution.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Exact stale-integration checkout custody restored by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_cleanup:
+        Option<Box<crate::changed_surface::integration_checkout::IntegrationCheckoutSnapshot>>,
 }
 
 impl From<&LocalValidationConfig> for QueuedLocalValidation {
@@ -1352,6 +1358,10 @@ impl From<&LocalValidationConfig> for QueuedLocalValidation {
             allow_tree_drift: validation.allow_tree_drift,
             machine_environment: validation.machine_environment.clone(),
             environment: validation.environment.clone(),
+            integration_cleanup: validation
+                .integration_cleanup
+                .as_ref()
+                .map(|checkout| Box::new(checkout.snapshot())),
         }
     }
 }
@@ -1631,7 +1641,7 @@ fn restore_target(target: &QueuedResolvedTarget) -> QueueRequestResult<ResolvedT
         warm_keepalive_seconds: target.warm_keepalive_seconds,
         host: target.host.clone(),
         backend: restore_backend(&target.backend)?,
-        validation: restore_validation(&target.validation),
+        validation: restore_validation(&target.validation)?,
         failure_parser: target.failure_parser.clone(),
     })
 }
@@ -1742,8 +1752,10 @@ fn restore_fallback_backend(
     })
 }
 
-fn restore_validation(validation: &QueuedValidationSnapshot) -> ResolvedValidation {
-    match validation {
+fn restore_validation(
+    validation: &QueuedValidationSnapshot,
+) -> QueueRequestResult<ResolvedValidation> {
+    Ok(match validation {
         QueuedValidationSnapshot::Local(validation) => {
             ResolvedValidation::Local(LocalValidationConfig {
                 command: validation.command.clone(),
@@ -1753,7 +1765,14 @@ fn restore_validation(validation: &QueuedValidationSnapshot) -> ResolvedValidati
                 allow_tree_drift: validation.allow_tree_drift,
                 machine_environment: validation.machine_environment.clone(),
                 environment: validation.environment.clone(),
-                integration_cleanup: None,
+                integration_cleanup: validation
+                    .integration_cleanup
+                    .as_ref()
+                    .map(|snapshot| snapshot.restore().map(Box::new))
+                    .transpose()
+                    .map_err(|error| {
+                        invalid_snapshot(format!("restore integration checkout: {error}"))
+                    })?,
             })
         }
         QueuedValidationSnapshot::Ssh {
@@ -1773,7 +1792,7 @@ fn restore_validation(validation: &QueuedValidationSnapshot) -> ResolvedValidati
         QueuedValidationSnapshot::Cloud => ResolvedValidation::Cloud,
         QueuedValidationSnapshot::HostPool => ResolvedValidation::HostPool,
         QueuedValidationSnapshot::Fallback => ResolvedValidation::Fallback,
-    }
+    })
 }
 
 fn restore_ssh_validation(validation: &QueuedRemoteValidation) -> SshValidation {
@@ -2035,6 +2054,7 @@ fn upgrade_legacy_request(
         envelope.schema_version,
         LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION
             | TRUSTED_ENVIRONMENT_QUEUED_EXECUTION_SCHEMA_VERSION
+            | PREVIOUS_QUEUED_EXECUTION_SCHEMA_VERSION
     ) {
         return Err(QueueRequestError::UnsupportedSchema {
             version: envelope.schema_version,
@@ -2619,23 +2639,42 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v2_reader_rejects_current_v3_request() {
+    fn legacy_v3_reader_rejects_current_v4_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-v4", "/work/repo", &run_request());
+        store.save(&envelope).expect("save v4");
+
+        let error = super::read_versioned_json_through::<QueuedExecutionEnvelope>(
+            &store.path_for("job-v4"),
+            3,
+        )
+        .expect_err("v3 reader must reject v4");
+
+        assert!(matches!(
+            error,
+            QueueRequestError::UnsupportedSchema { version: 4 }
+        ));
+    }
+
+    #[test]
+    fn current_reader_upgrades_an_ordinary_v3_request() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = QueueRequestStore::new(temp.path()).expect("store");
         let envelope =
             QueuedExecutionEnvelope::from_run_request("job-v3", "/work/repo", &run_request());
-        store.save(&envelope).expect("save v3");
-
-        let error = super::read_versioned_json_through::<QueuedExecutionEnvelope>(
-            &store.path_for("job-v3"),
-            2,
+        let mut value = serde_json::to_value(envelope).expect("serialize request");
+        value["schema_version"] = json!(3);
+        std::fs::write(
+            store.path_for("job-v3"),
+            serde_json::to_vec_pretty(&value).expect("encode v3"),
         )
-        .expect_err("v2 reader must reject v3");
+        .expect("write v3");
 
-        assert!(matches!(
-            error,
-            QueueRequestError::UnsupportedSchema { version: 3 }
-        ));
+        let loaded = store.load("job-v3").expect("load v3").expect("present");
+        assert_eq!(loaded.schema_version, QUEUED_EXECUTION_SCHEMA_VERSION);
+        loaded.to_run_request().expect("restore v3");
     }
 
     #[test]

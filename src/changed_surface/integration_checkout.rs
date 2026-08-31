@@ -47,6 +47,46 @@ pub(crate) struct IntegrationCheckout {
     evidence_dir: PathBuf,
     lock_path: PathBuf,
     marker: CheckoutMarker,
+    receipt: StaleBaseShadowReceipt,
+}
+
+/// Durable exact identity needed to restore checkout custody in the daemon.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationCheckoutSnapshot {
+    source_repo: PathBuf,
+    checkout_parent: PathBuf,
+    receipt: StaleBaseShadowReceipt,
+}
+
+impl IntegrationCheckout {
+    pub(crate) fn snapshot(&self) -> IntegrationCheckoutSnapshot {
+        IntegrationCheckoutSnapshot {
+            source_repo: self.source_repo.clone(),
+            checkout_parent: self
+                .path
+                .parent()
+                .expect("materialized checkout has a parent")
+                .to_path_buf(),
+            receipt: self.receipt.clone(),
+        }
+    }
+}
+
+impl IntegrationCheckoutSnapshot {
+    pub(crate) fn restore(&self) -> Result<IntegrationCheckout, String> {
+        checkout_from_receipt(&self.source_repo, &self.checkout_parent, &self.receipt)
+    }
+}
+
+/// Plan exact checkout custody without creating a worktree. This is the queue
+/// boundary: the daemon materializes only after it owns the execution fence.
+pub(crate) fn plan(
+    source_repo: &Path,
+    checkout_parent: &Path,
+    receipt: &StaleBaseShadowReceipt,
+) -> Result<IntegrationCheckout, String> {
+    checkout_from_receipt(source_repo, checkout_parent, receipt)
 }
 
 #[derive(Debug, Serialize)]
@@ -63,7 +103,52 @@ struct CleanupReceipt<'a> {
 /// An interrupted prior materialization is reusable only when its Git
 /// identity and marker match every requested field. Ambiguity is preserved on
 /// disk and returned as an error; callers must keep ordinary full validation.
-pub(crate) fn materialize(
+#[cfg(test)]
+fn materialize(
+    source_repo: &Path,
+    checkout_parent: &Path,
+    receipt: &StaleBaseShadowReceipt,
+) -> Result<IntegrationCheckout, String> {
+    ensure_real_directory(checkout_parent)?;
+    let checkout = checkout_from_receipt(source_repo, checkout_parent, receipt)?;
+    let _materialize_guard = acquire_fence(&checkout.lock_path)?;
+    ensure_materialized(&checkout)?;
+    Ok(checkout)
+}
+
+fn ensure_materialized(checkout: &IntegrationCheckout) -> Result<(), String> {
+    ensure_real_directory(
+        checkout
+            .path
+            .parent()
+            .ok_or_else(|| "integration checkout has no parent".to_owned())?,
+    )?;
+    match fs::symlink_metadata(&checkout.path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+        Ok(_) => return Err("integration checkout path is not a real directory".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let status = Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&checkout.path)
+                .arg(&checkout.marker.integration_commit_sha)
+                .current_dir(&checkout.source_repo)
+                .status()
+                .map_err(|error| format!("create integration checkout: {error}"))?;
+            if !status.success() {
+                return Err("create integration checkout: git worktree add failed".to_owned());
+            }
+        }
+        Err(error) => return Err(format!("inspect integration checkout: {error}")),
+    }
+
+    verify_checkout(&checkout.path, &checkout.marker)?;
+    initialize_submodules(&checkout.path)?;
+    verify_checkout(&checkout.path, &checkout.marker)?;
+    persist_or_verify_marker(&checkout.path, &checkout.marker)?;
+    Ok(())
+}
+
+fn checkout_from_receipt(
     source_repo: &Path,
     checkout_parent: &Path,
     receipt: &StaleBaseShadowReceipt,
@@ -82,55 +167,28 @@ pub(crate) fn materialize(
         .map_err(|error| format!("canonicalize integration source: {error}"))?;
     let source_common_dir = git_path(&source_repo, &["rev-parse", "--git-common-dir"])?;
     let source_common_dir = canonical_git_path(&source_repo, &source_common_dir)?;
-    ensure_real_directory(checkout_parent)?;
-    let checkout = checkout_parent.join(format!("shadow-{context_digest}"));
-    let lock_path = checkout_parent.join(format!("shadow-{context_digest}.lock"));
-    let _materialize_guard = acquire_fence(&lock_path)?;
-    let evidence_dir = checkout_parent
-        .parent()
-        .ok_or_else(|| "integration checkout root has no evidence parent".to_owned())?
-        .to_path_buf();
-    let marker = CheckoutMarker {
-        schema_version: 1,
-        source_git_common_dir: source_common_dir.to_string_lossy().into_owned(),
-        repository: receipt.repository.clone(),
-        pull_request: receipt.pull_request,
-        target: receipt.target.clone(),
-        stale_head_sha: receipt.head_sha.clone(),
-        live_base_sha: receipt.live_protected_base_sha.clone(),
-        integration_commit_sha: integration_commit.to_owned(),
-        integration_tree_sha: integration_tree.to_owned(),
-        context_digest,
-    };
-
-    match fs::symlink_metadata(&checkout) {
-        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
-        Ok(_) => return Err("integration checkout path is not a real directory".to_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let status = Command::new("git")
-                .args(["worktree", "add", "--detach"])
-                .arg(&checkout)
-                .arg(integration_commit)
-                .current_dir(&source_repo)
-                .status()
-                .map_err(|error| format!("create integration checkout: {error}"))?;
-            if !status.success() {
-                return Err("create integration checkout: git worktree add failed".to_owned());
-            }
-        }
-        Err(error) => return Err(format!("inspect integration checkout: {error}")),
-    }
-
-    verify_checkout(&checkout, &marker)?;
-    initialize_submodules(&checkout)?;
-    verify_checkout(&checkout, &marker)?;
-    persist_or_verify_marker(&checkout, &marker)?;
+    let path = checkout_parent.join(format!("shadow-{context_digest}"));
     Ok(IntegrationCheckout {
-        path: checkout,
+        path,
         source_repo,
-        evidence_dir,
-        lock_path,
-        marker,
+        evidence_dir: checkout_parent
+            .parent()
+            .ok_or_else(|| "integration checkout root has no evidence parent".to_owned())?
+            .to_path_buf(),
+        lock_path: checkout_parent.join(format!("shadow-{context_digest}.lock")),
+        marker: CheckoutMarker {
+            schema_version: 1,
+            source_git_common_dir: source_common_dir.to_string_lossy().into_owned(),
+            repository: receipt.repository.clone(),
+            pull_request: receipt.pull_request,
+            target: receipt.target.clone(),
+            stale_head_sha: receipt.head_sha.clone(),
+            live_base_sha: receipt.live_protected_base_sha.clone(),
+            integration_commit_sha: integration_commit.to_owned(),
+            integration_tree_sha: integration_tree.to_owned(),
+            context_digest,
+        },
+        receipt: receipt.clone(),
     })
 }
 
@@ -138,7 +196,14 @@ pub(crate) fn materialize(
 /// command can start. The returned file must remain alive through execution,
 /// post-execution verification, and cleanup.
 pub(crate) fn prepare_for_execution(checkout: &IntegrationCheckout) -> Result<fs::File, String> {
+    ensure_real_directory(
+        checkout
+            .path
+            .parent()
+            .ok_or_else(|| "integration checkout has no parent".to_owned())?,
+    )?;
     let lock = acquire_fence(&checkout.lock_path)?;
+    ensure_materialized(checkout)?;
     verify_checkout(&checkout.path, &checkout.marker)?;
     verify_marker(&checkout.path, &checkout.marker)?;
     restore_pristine_checkout(&checkout.path)?;
@@ -234,39 +299,7 @@ pub(crate) fn reconcile_pending_cleanup(
         let activation = read_regular_receipt(&activation_path)?;
         validate_stale_activation_for_cleanup(receipt, &stale_bytes, &activation)?;
     }
-    let integration_commit = receipt
-        .integration_commit_sha
-        .as_deref()
-        .ok_or_else(|| "stale shadow receipt has no integration commit".to_owned())?;
-    let integration_tree = receipt
-        .integration_tree_sha
-        .as_deref()
-        .ok_or_else(|| "stale shadow receipt has no integration tree".to_owned())?;
-    let context_digest = stale_base_context_digest(receipt);
-    let source_repo = source_repo
-        .canonicalize()
-        .map_err(|error| format!("canonicalize integration source: {error}"))?;
-    let source_common_dir = git_path(&source_repo, &["rev-parse", "--git-common-dir"])?;
-    let source_common_dir = canonical_git_path(&source_repo, &source_common_dir)?;
-    let path = checkout_parent.join(format!("shadow-{context_digest}"));
-    let checkout = IntegrationCheckout {
-        path,
-        source_repo,
-        evidence_dir: evidence_dir.to_path_buf(),
-        lock_path: checkout_parent.join(format!("shadow-{context_digest}.lock")),
-        marker: CheckoutMarker {
-            schema_version: 1,
-            source_git_common_dir: source_common_dir.to_string_lossy().into_owned(),
-            repository: receipt.repository.clone(),
-            pull_request: receipt.pull_request,
-            target: receipt.target.clone(),
-            stale_head_sha: receipt.head_sha.clone(),
-            live_base_sha: receipt.live_protected_base_sha.clone(),
-            integration_commit_sha: integration_commit.to_owned(),
-            integration_tree_sha: integration_tree.to_owned(),
-            context_digest,
-        },
-    };
+    let checkout = checkout_from_receipt(source_repo, checkout_parent, receipt)?;
     let _guard = acquire_fence(&checkout.lock_path)?;
     cleanup(&checkout)?;
     Ok(true)
@@ -919,6 +952,11 @@ mod tests {
         );
         let reconciled = materialize(repo.path(), &parent, &receipt).unwrap();
         assert_eq!(reconciled.path, checkout.path);
+        let snapshot: IntegrationCheckoutSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&reconciled.snapshot()).unwrap()).unwrap();
+        let restored = snapshot.restore().unwrap();
+        assert_eq!(restored.path, checkout.path);
+        assert_eq!(restored.receipt, receipt);
         let guard = prepare_for_execution(&reconciled).unwrap();
         assert!(prepare_for_execution(&reconciled).is_err());
         assert!(materialize(repo.path(), &parent, &receipt).is_err());
@@ -926,6 +964,23 @@ mod tests {
         cleanup(&reconciled).unwrap();
         assert!(!checkout.path.exists());
         assert!(reconciled.evidence_dir.join(CLEANUP_RECEIPT_NAME).is_file());
+    }
+
+    #[test]
+    fn durable_snapshot_defers_materialization_until_execution_fence() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let planned = plan(repo.path(), &parent, &receipt).unwrap();
+        assert!(!planned.path.exists());
+        let snapshot: IntegrationCheckoutSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&planned.snapshot()).unwrap()).unwrap();
+        let restored = snapshot.restore().unwrap();
+        assert!(!restored.path.exists());
+
+        let guard = prepare_for_execution(&restored).unwrap();
+        assert!(restored.path.exists());
+        drop(guard);
+        cleanup(&restored).unwrap();
     }
 
     #[test]

@@ -522,7 +522,7 @@ pub(super) fn apply_changed_surface_execution(
                     &assessment.workflow_digest,
                 )
             {
-                match crate::changed_surface::integration_checkout::materialize(
+                match crate::changed_surface::integration_checkout::plan(
                     cwd,
                     &checkout_parent,
                     &assessment.receipt,
