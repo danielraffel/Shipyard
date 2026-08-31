@@ -776,7 +776,11 @@ pub(super) fn active_runs(actions: &GitHubActions, repo: &str) -> Result<Vec<Ste
                 .and_then(Value::as_array)
                 .ok_or_else(|| "active workflow response missing workflow_runs".to_owned())?;
             let count = rows.len();
-            all.extend(rows.iter().filter_map(parse_run));
+            for row in rows {
+                all.push(parse_run(row).ok_or_else(|| {
+                    "active workflow response contained malformed run".to_owned()
+                })?);
+            }
             if count < 100 {
                 break;
             }

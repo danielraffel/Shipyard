@@ -493,6 +493,12 @@ case "$*" in
     printf '%s' '{"id":77,"run_attempt":2,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_started_at":"2026-08-31T19:00:00Z"}' ;;
   *"repos/owner/repo/actions/runs/77/attempts/3"*)
     printf '%s' '{"id":77,"run_attempt":3,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_started_at":null}' ;;
+  *"repos/owner/repo/actions/runs/77/attempts/4"*)
+    printf '%s' '{"id":78,"run_attempt":4,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_started_at":"2026-08-31T19:00:00Z"}' ;;
+  *"repos/owner/repo/actions/runs/77/attempts/5"*)
+    printf '%s' '{"id":77,"run_attempt":4,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_started_at":"2026-08-31T19:00:00Z"}' ;;
+  *"repos/owner/repo/actions/runs/77/attempts/6"*)
+    printf '%s' '{"id":77,"run_attempt":6,"head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","run_started_at":"2026-08-31T19:00:00Z"}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
@@ -517,6 +523,10 @@ esac
 
     run.run_attempt = 3;
     assert!(dispatch_queue_age_origin(&actions, "owner/repo", &run).is_err());
+    for attempt in 4..=6 {
+        run.run_attempt = attempt;
+        assert!(dispatch_queue_age_origin(&actions, "owner/repo", &run).is_err());
+    }
 }
 
 #[cfg(unix)]
@@ -773,6 +783,26 @@ esac
     let runs = active_runs(&actions, "owner/repo").expect("active runs");
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].id, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn active_run_transport_refuses_any_malformed_attempt_identity() {
+    for attempt_field in ["", ",\"run_attempt\":0", ",\"run_attempt\":\"1\""] {
+        let temp = tempfile::tempdir().expect("temp");
+        let body = format!(
+            r#"
+case "$*" in
+  *"actions/runs?status=queued"*)
+    printf '%s' '{{"workflow_runs":[{{"id":1,"workflow_id":77{attempt_field},"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}]}}' ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#
+        );
+        let actions = fake_gh(&temp, &body);
+        assert!(active_runs(&actions, "owner/repo").is_err());
+    }
 }
 
 #[cfg(unix)]
