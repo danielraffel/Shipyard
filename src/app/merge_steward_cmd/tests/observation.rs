@@ -357,6 +357,81 @@ fn dispatch_job_detail_vetoes_assignment_or_completion_race() {
 
 #[cfg(unix)]
 #[test]
+fn one_hundred_same_repository_targets_load_shared_observation_once() {
+    use std::cell::Cell;
+
+    let targets = (1..=100)
+        .map(|pull_request| DispatchWedgeTargetRequest {
+            base_ref: "main".to_owned(),
+            pull_request,
+            expected_head_sha: format!("{pull_request:040x}"),
+        })
+        .collect::<Vec<_>>();
+    let runner_loads = Cell::new(0);
+    let repository_loads = Cell::new(0);
+    let target_observations = Cell::new(0);
+    let results = observe_dispatch_wedge_targets_with(
+        &targets,
+        || {
+            runner_loads.set(runner_loads.get() + 1);
+            Ok(Vec::new())
+        },
+        |base_ref| {
+            repository_loads.set(repository_loads.get() + 1);
+            Ok(base_ref.to_owned())
+        },
+        |shared, target, _| {
+            target_observations.set(target_observations.get() + 1);
+            assert_eq!(shared, &target.base_ref);
+            Ok(Vec::new())
+        },
+    );
+
+    assert_eq!(results.len(), 100);
+    assert!(results.iter().all(|result| result.result.is_ok()));
+    assert_eq!(runner_loads.get(), 1);
+    assert_eq!(repository_loads.get(), 1);
+    assert_eq!(target_observations.get(), 100);
+}
+
+#[cfg(unix)]
+#[test]
+fn one_target_observation_failure_does_not_poison_repository_batch() {
+    let targets = [
+        DispatchWedgeTargetRequest {
+            base_ref: "main".to_owned(),
+            pull_request: 42,
+            expected_head_sha: "a".repeat(40),
+        },
+        DispatchWedgeTargetRequest {
+            base_ref: "main".to_owned(),
+            pull_request: 43,
+            expected_head_sha: "b".repeat(40),
+        },
+    ];
+    let results = observe_dispatch_wedge_targets_with(
+        &targets,
+        || Ok(Vec::new()),
+        |_| Ok(()),
+        |(), target, _| {
+            if target.pull_request == 42 {
+                Err("exact target detail failed".to_owned())
+            } else {
+                Ok(Vec::new())
+            }
+        },
+    );
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].result.as_ref().expect_err("target 42 fails"),
+        "exact target detail failed"
+    );
+    assert!(results[1].result.is_ok());
+}
+
+#[cfg(unix)]
+#[test]
 fn required_context_transport_falls_back_from_admin_denial_to_evaluated_rules() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(

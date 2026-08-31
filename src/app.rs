@@ -37,6 +37,8 @@ mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
 #[cfg(unix)]
+pub(crate) use merge_steward_cmd::{DispatchWedgeTargetRequest, DispatchWedgeTargetResult};
+#[cfg(unix)]
 pub(crate) use merge_steward_cmd::{ExactStewardTransition, exact_steward_transition};
 pub(crate) use merge_steward_cmd::{LaunchProfileV1, decode_protected_launch_profile};
 
@@ -105,25 +107,24 @@ pub(crate) fn daemon_steward_repository(
 }
 
 #[cfg(unix)]
-pub(crate) fn daemon_dispatch_wedge_observation(
+pub(crate) fn daemon_dispatch_wedge_observations(
     mode: crate::identity::RuntimeMode,
     cwd: &std::path::Path,
-    request: &DaemonStewardRequest<'_>,
-) -> Result<Vec<crate::dispatch_wedge::DispatchWedgeObservation>, String> {
-    let actions = daemon_dispatch_probe_actions(mode, cwd, request.repository);
+    repository_provider: &str,
+    repository_id: &str,
+    repository: &str,
+    targets: &[merge_steward_cmd::DispatchWedgeTargetRequest],
+) -> Result<Vec<merge_steward_cmd::DispatchWedgeTargetResult>, String> {
+    let actions = daemon_dispatch_probe_actions(mode, cwd, repository);
     merge_steward_cmd::verify_native_repository_identity(
         &actions,
-        request.repository_provider,
-        request.repository_id,
-        request.repository,
+        repository_provider,
+        repository_id,
+        repository,
     )?;
-    merge_steward_cmd::observe_dispatch_wedge_target(
-        &actions,
-        request.repository,
-        request.base_ref,
-        request.pull_request,
-        request.head_sha,
-    )
+    Ok(merge_steward_cmd::observe_dispatch_wedge_targets(
+        &actions, repository, targets,
+    ))
 }
 
 #[cfg(unix)]

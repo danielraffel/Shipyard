@@ -1181,7 +1181,98 @@ pub(crate) fn observe_dispatch_wedge_target(
     pull_request: u64,
     expected_head_sha: &str,
 ) -> Result<Vec<DispatchWedgeObservation>, String> {
-    let observation = observe_repo(actions, repository, base_ref, false)?;
+    let target = DispatchWedgeTargetRequest {
+        base_ref: base_ref.to_owned(),
+        pull_request,
+        expected_head_sha: expected_head_sha.to_owned(),
+    };
+    let mut results = observe_dispatch_wedge_targets(actions, repository, &[target]);
+    results
+        .pop()
+        .ok_or_else(|| "dispatch-wedge batch omitted its only target".to_owned())?
+        .result
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DispatchWedgeTargetRequest {
+    pub(crate) base_ref: String,
+    pub(crate) pull_request: u64,
+    pub(crate) expected_head_sha: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct DispatchWedgeTargetResult {
+    pub(crate) target: DispatchWedgeTargetRequest,
+    pub(crate) result: Result<Vec<DispatchWedgeObservation>, String>,
+}
+
+/// Observe every due target for one immutable repository identity in a single
+/// bounded cycle. Repository policy/queue/run state is shared per exact base
+/// and the registered-runner inventory is shared for the whole repository;
+/// merge-head, run-attempt, job-detail, and producer identity remain exact to
+/// each target. There is deliberately no cache across cycles.
+pub(crate) fn observe_dispatch_wedge_targets(
+    actions: &GitHubActions,
+    repository: &str,
+    targets: &[DispatchWedgeTargetRequest],
+) -> Vec<DispatchWedgeTargetResult> {
+    observe_dispatch_wedge_targets_with(
+        targets,
+        || dispatch_runner_observations(actions, repository),
+        |base_ref| observe_repo(actions, repository, base_ref, false),
+        |observation, target, runners| {
+            observe_dispatch_wedge_target_from_repository(actions, observation, target, runners)
+        },
+    )
+}
+
+fn observe_dispatch_wedge_targets_with<Shared, LoadRunners, LoadRepository, ObserveTarget>(
+    targets: &[DispatchWedgeTargetRequest],
+    mut load_runners: LoadRunners,
+    mut load_repository: LoadRepository,
+    mut observe_target: ObserveTarget,
+) -> Vec<DispatchWedgeTargetResult>
+where
+    LoadRunners: FnMut() -> Result<Vec<DispatchRunnerObservation>, String>,
+    LoadRepository: FnMut(&str) -> Result<Shared, String>,
+    ObserveTarget: FnMut(
+        &Shared,
+        &DispatchWedgeTargetRequest,
+        &[DispatchRunnerObservation],
+    ) -> Result<Vec<DispatchWedgeObservation>, String>,
+{
+    let runners = load_runners();
+    let mut observations_by_base = BTreeMap::new();
+    for target in targets {
+        observations_by_base
+            .entry(target.base_ref.clone())
+            .or_insert_with(|| load_repository(&target.base_ref));
+    }
+
+    targets
+        .iter()
+        .cloned()
+        .map(|target| {
+            let result = match (&runners, observations_by_base.get(&target.base_ref)) {
+                (Err(error), _) | (_, Some(Err(error))) => Err(error.clone()),
+                (Ok(runners), Some(Ok(observation))) => {
+                    observe_target(observation, &target, runners)
+                }
+                (_, None) => Err("dispatch-wedge repository observation was omitted".to_owned()),
+            };
+            DispatchWedgeTargetResult { target, result }
+        })
+        .collect()
+}
+
+fn observe_dispatch_wedge_target_from_repository(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    target: &DispatchWedgeTargetRequest,
+    runners: &[DispatchRunnerObservation],
+) -> Result<Vec<DispatchWedgeObservation>, String> {
+    let pull_request = target.pull_request;
+    let expected_head_sha = &target.expected_head_sha;
     let Some(pr) = observation.prs.iter().find(|candidate| {
         candidate.fact.number == pull_request
             && candidate
@@ -1199,7 +1290,6 @@ pub(crate) fn observe_dispatch_wedge_target(
     };
     let check_producers =
         observation::job_check_producers_for_head(actions, &observation.repo, merge_group_head)?;
-    let runners = dispatch_runner_observations(actions, &observation.repo)?;
     let mut results = Vec::new();
     for run in observation.runs.iter().filter(|run| {
         run.event.eq_ignore_ascii_case("merge_group")
@@ -1275,7 +1365,7 @@ pub(crate) fn observe_dispatch_wedge_target(
                     required_app_id: required.app_id,
                     producer_app_id,
                 },
-                runners: runners.clone(),
+                runners: runners.to_vec(),
                 observation_complete: true,
             });
         }
