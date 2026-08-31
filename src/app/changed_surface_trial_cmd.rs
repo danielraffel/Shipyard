@@ -2,10 +2,12 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use crate::changed_surface::trial::{
@@ -17,6 +19,7 @@ use crate::output::write_json_envelope;
 const ACTIVATION_RECEIPT: &str = "activation-shadow_compare.json";
 const STALE_ACTIVATION_RECEIPT: &str = "stale-activation-shadow_compare.json";
 const STALE_CLEANUP_RECEIPT: &str = "stale-cleanup-shadow_compare.json";
+const STALE_CURRENT_RECEIPT: &str = "stale-current.json";
 const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
 
 pub(super) struct ChangedSurfaceTrialStatusArgs {
@@ -24,6 +27,34 @@ pub(super) struct ChangedSurfaceTrialStatusArgs {
     pub(super) pull_request: u64,
     pub(super) target: String,
     pub(super) head_sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentStaleGeneration {
+    schema_version: u32,
+    repository: String,
+    pull_request: u64,
+    target: String,
+    head_sha: String,
+    live_base_sha: String,
+    context_digest: String,
+    stale_receipt_sha256: String,
+}
+
+struct SelectedStaleGeneration {
+    pointer_bytes: Vec<u8>,
+    result_dir: PathBuf,
+    stale_receipt_sha256: String,
+}
+
+#[derive(Clone, Copy)]
+struct StaleTrialInputs<'a> {
+    ordinary_evidence_present: bool,
+    activation: Option<&'a [u8]>,
+    cleanup: Option<&'a [u8]>,
+    results: &'a [(String, Vec<u8>)],
+    expected_receipt_sha256: Option<&'a str>,
 }
 
 pub(super) fn changed_surface_trial_status_command<W: Write>(
@@ -59,12 +90,27 @@ fn read_trial(identity: &TrialIdentity, result_dir: &Path) -> TrialStatus {
 #[allow(clippy::too_many_lines)]
 fn read_trial_with_final_snapshot_hook<F>(
     identity: &TrialIdentity,
-    result_dir: &Path,
+    result_root: &Path,
     mut before_final_snapshot: F,
 ) -> TrialStatus
 where
     F: FnMut(),
 {
+    let current_generation = match select_current_stale_generation(identity, result_root) {
+        Ok(selected) => selected,
+        Err(reason) => {
+            return rejected_trial(
+                identity,
+                Some(STALE_CURRENT_RECEIPT.to_owned()),
+                0,
+                None,
+                reason,
+            );
+        }
+    };
+    let result_dir = current_generation
+        .as_ref()
+        .map_or(result_root, |generation| generation.result_dir.as_path());
     let activation_path = result_dir.join(ACTIVATION_RECEIPT);
     let activation_bytes = match read_regular_receipt(&activation_path) {
         Ok(bytes) => bytes,
@@ -120,12 +166,29 @@ where
     if let Some(status) = read_stale_trial(
         identity,
         result_dir,
-        activation_bytes.is_some(),
-        stale_activation_bytes.as_deref(),
-        stale_cleanup_bytes.as_deref(),
-        &results,
+        StaleTrialInputs {
+            ordinary_evidence_present: activation_bytes.is_some(),
+            activation: stale_activation_bytes.as_deref(),
+            cleanup: stale_cleanup_bytes.as_deref(),
+            results: &results,
+            expected_receipt_sha256: current_generation
+                .as_ref()
+                .map(|generation| generation.stale_receipt_sha256.as_str()),
+        },
         &mut before_final_snapshot,
     ) {
+        if current_generation.as_ref().is_some_and(|generation| {
+            read_regular_receipt(&result_root.join(STALE_CURRENT_RECEIPT))
+                != Ok(Some(generation.pointer_bytes.clone()))
+        }) {
+            return rejected_trial(
+                identity,
+                Some(STALE_CURRENT_RECEIPT.to_owned()),
+                status.result_receipt_count,
+                status.result_receipt,
+                "stale_generation_changed_during_read",
+            );
+        }
         return status;
     }
     let activation = activation_bytes.as_deref().map(|bytes| ReceiptFile {
@@ -180,14 +243,49 @@ where
     status
 }
 
+fn select_current_stale_generation(
+    identity: &TrialIdentity,
+    result_root: &Path,
+) -> Result<Option<SelectedStaleGeneration>, &'static str> {
+    let bytes = read_regular_receipt(&result_root.join(STALE_CURRENT_RECEIPT))?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let generation: CurrentStaleGeneration =
+        serde_json::from_slice(&bytes).map_err(|_| "malformed_stale_generation")?;
+    if generation.schema_version != 1
+        || generation.repository != identity.repository
+        || generation.pull_request != identity.pull_request
+        || generation.target != identity.target
+        || generation.head_sha != identity.head_sha
+        || !canonical_hex(&generation.live_base_sha, 40)
+        || !canonical_hex(&generation.context_digest, 64)
+        || !canonical_hex(&generation.stale_receipt_sha256, 64)
+    {
+        return Err("stale_generation_identity_or_digest_mismatch");
+    }
+    let directory = result_root
+        .join("stale-generations")
+        .join(&generation.context_digest);
+    Ok(Some(SelectedStaleGeneration {
+        pointer_bytes: bytes,
+        result_dir: directory,
+        stale_receipt_sha256: generation.stale_receipt_sha256,
+    }))
+}
+
+fn canonical_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[allow(clippy::too_many_lines)]
 fn read_stale_trial<F>(
     identity: &TrialIdentity,
     result_dir: &Path,
-    ordinary_evidence_present: bool,
-    stale_activation: Option<&[u8]>,
-    stale_cleanup: Option<&[u8]>,
-    results: &[(String, Vec<u8>)],
+    inputs: StaleTrialInputs<'_>,
     before_final_snapshot: &mut F,
 ) -> Option<TrialStatus>
 where
@@ -218,7 +316,7 @@ where
             Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated);
         return Some(status);
     }
-    if ordinary_evidence_present && !stale.is_empty() {
+    if inputs.ordinary_evidence_present && !stale.is_empty() {
         let mut status = rejected_trial(
             identity,
             Some(ACTIVATION_RECEIPT.to_owned()),
@@ -232,8 +330,25 @@ where
         return Some(status);
     }
     let (name, bytes) = stale.first()?;
-    let status = if let (Some(activation), Some(cleanup)) = (stale_activation, stale_cleanup) {
-        let result_files = results
+    if inputs
+        .expected_receipt_sha256
+        .is_some_and(|expected| format!("{:x}", Sha256::digest(bytes)) != expected)
+    {
+        let mut status = rejected_trial(
+            identity,
+            Some(name.clone()),
+            stale.len(),
+            Some(name.clone()),
+            "stale_generation_receipt_digest_mismatch",
+        );
+        status.state = TrialState::Terminal;
+        status.shadow_disposition =
+            Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated);
+        return Some(status);
+    }
+    let status = if let (Some(activation), Some(cleanup)) = (inputs.activation, inputs.cleanup) {
+        let result_files = inputs
+            .results
             .iter()
             .map(|(name, bytes)| ReceiptFile { name, bytes })
             .collect::<Vec<_>>();
@@ -250,19 +365,22 @@ where
             },
             &result_files,
         )
-    } else if stale_activation.is_some() || stale_cleanup.is_some() || !results.is_empty() {
+    } else if inputs.activation.is_some() || inputs.cleanup.is_some() || !inputs.results.is_empty()
+    {
         let mut status = rejected_trial(
             identity,
-            stale_activation.map(|_| STALE_ACTIVATION_RECEIPT.to_owned()),
-            results.len(),
-            results.first().map(|(name, _)| name.clone()),
+            inputs
+                .activation
+                .map(|_| STALE_ACTIVATION_RECEIPT.to_owned()),
+            inputs.results.len(),
+            inputs.results.first().map(|(name, _)| name.clone()),
             "incomplete_stale_base_execution_generation",
         );
         status.state = TrialState::Terminal;
         status.shadow_disposition =
             Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated);
         status
-    } else if results.is_empty() {
+    } else if inputs.results.is_empty() {
         evaluate_stale_base_terminal(identity, ReceiptFile { name, bytes })
     } else {
         unreachable!()
@@ -280,9 +398,9 @@ where
             Ok(final_stale)
                 if final_stale == stale
                     && final_ordinary_evidence_absent
-                    && matches!(final_stale_activation, Ok(ref value) if value.as_deref() == stale_activation)
-                    && matches!(final_stale_cleanup, Ok(ref value) if value.as_deref() == stale_cleanup)
-                    && matches!(final_results, Ok(ref value) if value == results) =>
+                    && matches!(final_stale_activation, Ok(ref value) if value.as_deref() == inputs.activation)
+                    && matches!(final_stale_cleanup, Ok(ref value) if value.as_deref() == inputs.cleanup)
+                    && matches!(final_results, Ok(ref value) if value == inputs.results) =>
             {
                 status
             }
@@ -565,6 +683,29 @@ mod tests {
         })
     }
 
+    fn full_required_stale_receipt(live_base_sha: &str) -> Value {
+        json!({
+            "schema_version": 1,
+            "disposition": "full_required",
+            "merge_authority": "blocked_until_current_merge_tree",
+            "repository": "owner/repo",
+            "pull_request": 42,
+            "target": "mac",
+            "head_sha": SHA_A,
+            "head_tree_sha": SHA_B,
+            "old_protected_base_sha": SHA_A,
+            "live_protected_base_sha": live_base_sha,
+            "merge_base_sha": SHA_A,
+            "changed_paths_digest": DIGEST_C,
+            "protected_base_delta_digest": DIGEST_C,
+            "old_workflow_digest": DIGEST_C,
+            "live_workflow_digest": DIGEST_C,
+            "validation_contract_digest": DIGEST_C,
+            "integration_changed_paths_digest": DIGEST_C,
+            "reason": "test_topology_drift"
+        })
+    }
+
     #[test]
     fn missing_trial_is_collecting_and_does_not_create_state() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -670,26 +811,7 @@ mod tests {
         };
         let result_dir = result_directory(temp.path(), &identity);
         fs::create_dir_all(&result_dir).expect("result dir");
-        let receipt = json!({
-            "schema_version": 1,
-            "disposition": "full_required",
-            "merge_authority": "blocked_until_current_merge_tree",
-            "repository": "owner/repo",
-            "pull_request": 42,
-            "target": "mac",
-            "head_sha": SHA_A,
-            "head_tree_sha": SHA_B,
-            "old_protected_base_sha": SHA_A,
-            "live_protected_base_sha": SHA_B,
-            "merge_base_sha": SHA_A,
-            "changed_paths_digest": DIGEST_C,
-            "protected_base_delta_digest": DIGEST_C,
-            "old_workflow_digest": DIGEST_C,
-            "live_workflow_digest": DIGEST_C,
-            "validation_contract_digest": DIGEST_C,
-            "integration_changed_paths_digest": DIGEST_C,
-            "reason": "test_topology_drift"
-        });
+        let receipt = full_required_stale_receipt(SHA_B);
         fs::write(
             result_dir.join(format!("stale-base-shadow-{SHA_B}-{DIGEST_C}.json")),
             serde_json::to_vec(&receipt).expect("receipt"),
@@ -719,6 +841,104 @@ mod tests {
             status.reason,
             "ambiguous_stale_and_activated_trial_generations"
         );
+    }
+
+    #[test]
+    fn current_generation_selects_latest_base_without_ambiguity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let identity = TrialIdentity {
+            repository: "owner/repo".to_owned(),
+            pull_request: 42,
+            target: "mac".to_owned(),
+            head_sha: SHA_A.to_owned(),
+        };
+        let result_root = result_directory(temp.path(), &identity);
+        let first_context = "d".repeat(64);
+        let current_context = "e".repeat(64);
+        let first_dir = result_root.join("stale-generations").join(&first_context);
+        let current_dir = result_root.join("stale-generations").join(&current_context);
+        fs::create_dir_all(&first_dir).expect("first generation");
+        fs::create_dir_all(&current_dir).expect("current generation");
+        let first_bytes =
+            serde_json::to_vec(&full_required_stale_receipt(SHA_B)).expect("first stale receipt");
+        fs::write(
+            first_dir.join(format!("stale-base-shadow-{SHA_B}-{DIGEST_C}.json")),
+            first_bytes,
+        )
+        .expect("first receipt");
+        let current_live_base = "d".repeat(40);
+        let current_bytes = serde_json::to_vec(&full_required_stale_receipt(&current_live_base))
+            .expect("current stale receipt");
+        fs::write(
+            current_dir.join(format!(
+                "stale-base-shadow-{current_live_base}-{DIGEST_C}.json"
+            )),
+            &current_bytes,
+        )
+        .expect("current receipt");
+        fs::write(
+            result_root.join(STALE_CURRENT_RECEIPT),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "pull_request": 42,
+                "target": "mac",
+                "head_sha": SHA_A,
+                "live_base_sha": current_live_base,
+                "context_digest": current_context,
+                "stale_receipt_sha256": format!("{:x}", Sha256::digest(&current_bytes))
+            }))
+            .expect("generation pointer"),
+        )
+        .expect("write generation pointer");
+
+        let status = read_trial(&identity, &result_root);
+        assert_eq!(status.state, TrialState::Terminal);
+        assert_eq!(status.reason, "stale_base_full_required");
+        assert_eq!(status.result_receipt_count, 0);
+    }
+
+    #[test]
+    fn current_generation_refuses_receipt_digest_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let identity = TrialIdentity {
+            repository: "owner/repo".to_owned(),
+            pull_request: 42,
+            target: "mac".to_owned(),
+            head_sha: SHA_A.to_owned(),
+        };
+        let result_root = result_directory(temp.path(), &identity);
+        let context = "d".repeat(64);
+        let generation_dir = result_root.join("stale-generations").join(&context);
+        fs::create_dir_all(&generation_dir).expect("generation");
+        fs::write(
+            generation_dir.join(format!("stale-base-shadow-{SHA_B}-{DIGEST_C}.json")),
+            serde_json::to_vec(&full_required_stale_receipt(SHA_B)).expect("stale receipt"),
+        )
+        .expect("write stale receipt");
+        fs::write(
+            result_root.join(STALE_CURRENT_RECEIPT),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "pull_request": 42,
+                "target": "mac",
+                "head_sha": SHA_A,
+                "live_base_sha": SHA_B,
+                "context_digest": context,
+                "stale_receipt_sha256": "f".repeat(64)
+            }))
+            .expect("generation pointer"),
+        )
+        .expect("write generation pointer");
+
+        let status = read_trial(&identity, &result_root);
+        assert_eq!(status.state, TrialState::Terminal);
+        assert_eq!(
+            status.shadow_disposition,
+            Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated)
+        );
+        assert_eq!(status.reason, "stale_generation_receipt_digest_mismatch");
     }
 
     #[test]

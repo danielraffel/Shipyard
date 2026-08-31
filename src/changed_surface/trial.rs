@@ -422,12 +422,12 @@ pub fn evaluate_stale_base_execution(
         "malformed_stale_base_cleanup_receipt".clone_into(&mut status.reason);
         return status;
     };
-    let stale_digest = serde_json::to_vec(&stale).ok().map(|bytes| sha256(&bytes));
+    let stale_digest = sha256(stale_file.bytes);
     if activation.schema_version != activation.plan.schema_version
         || activation.machine_mode != "shadow_compare"
         || activation.merge_authority != super::MergeAuthority::BlockedUntilCurrentMergeTree
         || activation.stale_context_digest != super::stale_base_context_digest(&stale)
-        || stale_digest.as_deref() != Some(activation.stale_receipt_sha256.as_str())
+        || stale_digest != activation.stale_receipt_sha256
         || activation.plan.repository != stale.repository
         || activation.plan.pull_request != stale.pull_request
         || activation.plan.target != stale.target
