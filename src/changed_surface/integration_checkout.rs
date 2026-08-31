@@ -212,12 +212,32 @@ pub(crate) fn prepare_for_execution(checkout: &IntegrationCheckout) -> Result<fs
             .ok_or_else(|| "integration checkout has no parent".to_owned())?,
     )?;
     let lock = acquire_fence(&checkout.lock_path)?;
+    if cleanup_state_exists(checkout)? {
+        return Err(
+            "integration checkout cleanup is pending or complete; refusing replay".to_owned(),
+        );
+    }
     ensure_materialized(checkout)?;
     verify_checkout(&checkout.path, &checkout.marker)?;
     verify_marker(&checkout.path, &checkout.marker)?;
     restore_pristine_checkout(&checkout.path)?;
     verify_pristine(&checkout.path)?;
     Ok(lock)
+}
+
+fn cleanup_state_exists(checkout: &IntegrationCheckout) -> Result<bool, String> {
+    for name in [CLEANUP_PENDING_NAME, CLEANUP_RECEIPT_NAME] {
+        match fs::symlink_metadata(checkout.evidence_dir.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect integration checkout cleanup state {name}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn acquire_fence(path: &Path) -> Result<fs::File, String> {
@@ -1011,6 +1031,35 @@ mod tests {
         assert!(restored.path.exists());
         drop(guard);
         cleanup(&restored).unwrap();
+    }
+
+    #[test]
+    fn terminal_cleanup_prevents_snapshot_replay_and_rematerialization() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        let snapshot = checkout.snapshot();
+        cleanup(&checkout).unwrap();
+        assert!(!checkout.path.exists());
+
+        let restored = snapshot.restore().unwrap();
+        let error = prepare_for_execution(&restored).unwrap_err();
+        assert!(error.contains("cleanup is pending or complete"));
+        assert!(!restored.path.exists());
+    }
+
+    #[test]
+    fn pending_cleanup_prevents_execution_replay() {
+        let (repo, receipt) = fixture();
+        let parent = repo.path().join("isolated");
+        let checkout = materialize(repo.path(), &parent, &receipt).unwrap();
+        persist_cleanup_pending(&checkout).unwrap();
+
+        let error = prepare_for_execution(&checkout).unwrap_err();
+        assert!(error.contains("cleanup is pending or complete"));
+        assert!(checkout.path.exists());
+        assert!(reconcile_pending_cleanup(repo.path(), &parent, &receipt).unwrap());
+        assert!(!checkout.path.exists());
     }
 
     #[test]

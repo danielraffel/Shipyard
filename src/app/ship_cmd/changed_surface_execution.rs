@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +27,7 @@ const ACCEPTED_POLICY_DIGEST_KEY: &str = "changed_surface_execution.accepted_sha
 const ACCEPTED_POLICY_DIGESTS_KEY: &str =
     "changed_surface_execution.accepted_shadow_policy_digests";
 const MAX_DIAGNOSTIC_CHARS: usize = 512;
+const MAX_STALE_POINTER_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -764,14 +765,64 @@ pub(super) fn apply_changed_surface_execution(
 }
 
 fn read_current_stale_generation(path: &Path) -> Result<Option<Vec<u8>>, CliFailure> {
-    match fs::read(path.join("stale-current.json")) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(CliFailure::new(
+    read_bounded_stale_pointer(&path.join("stale-current.json"))
+}
+
+fn read_bounded_stale_pointer(path: &Path) -> Result<Option<Vec<u8>>, CliFailure> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliFailure::new(
+                1,
+                format!("inspect current stale generation: {error}"),
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_STALE_POINTER_BYTES
+    {
+        return Err(CliFailure::new(
             1,
-            format!("read current stale generation: {error}"),
-        )),
+            "current stale generation is not a bounded regular file",
+        ));
     }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| CliFailure::new(1, format!("open current stale generation: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| CliFailure::new(1, format!("inspect opened stale generation: {error}")))?;
+    if !opened.is_file() || opened.len() > MAX_STALE_POINTER_BYTES {
+        return Err(CliFailure::new(
+            1,
+            "opened stale generation is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_STALE_POINTER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| CliFailure::new(1, format!("read current stale generation: {error}")))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STALE_POINTER_BYTES {
+        return Err(CliFailure::new(
+            1,
+            "current stale generation exceeds size limit",
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 fn persist_stale_activation(
@@ -804,16 +855,7 @@ fn publish_current_stale_generation(
         .map_err(|error| CliFailure::new(1, format!("serialize stale generation: {error}")))?;
     payload.push(b'\n');
     let destination = path.join("stale-current.json");
-    let current = match fs::read(&destination) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(CliFailure::new(
-                1,
-                format!("read current stale generation under lease: {error}"),
-            ));
-        }
-    };
+    let current = read_bounded_stale_pointer(&destination)?;
     if current.as_deref() == Some(payload.as_slice()) {
         return Ok(());
     }
@@ -1123,10 +1165,11 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CurrentStaleGeneration, FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic,
-        persist_fallback_diagnostic, publish_current_stale_generation,
-        read_current_stale_generation, result_dir, selected_resume_block_reason, shell_quote,
-        stale_generation_has_execution_evidence, target_declares_changed_surface_selection,
+        CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES, MachineMode,
+        MachinePolicy, bounded_diagnostic, persist_fallback_diagnostic,
+        publish_current_stale_generation, read_current_stale_generation, result_dir,
+        selected_resume_block_reason, shell_quote, stale_generation_has_execution_evidence,
+        target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::collections::BTreeMap;
@@ -1220,6 +1263,31 @@ mod tests {
                 .unwrap()
                 .contains("newer-context")
         );
+    }
+
+    #[test]
+    fn current_stale_generation_refuses_oversized_pointer() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("stale-current.json"),
+            vec![b'x'; usize::try_from(MAX_STALE_POINTER_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        let error = read_current_stale_generation(temp.path()).unwrap_err();
+        assert!(error.message.contains("bounded regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_stale_generation_refuses_symlink_pointer() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.json");
+        fs::write(&target, b"{}\n").unwrap();
+        symlink(&target, temp.path().join("stale-current.json")).unwrap();
+        let error = read_current_stale_generation(temp.path()).unwrap_err();
+        assert!(error.message.contains("bounded regular file"));
     }
 
     #[test]
