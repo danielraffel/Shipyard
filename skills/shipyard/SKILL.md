@@ -462,6 +462,17 @@ generation count, total bytes, and free disk in each host receipt; any future
 reader-aware garbage collector remains a separately reviewed, dry-run-only
 operation.
 
+Machine-global `token_command[0]` must name the stable public `ghapp`
+trampoline, not a path inside `auth-generations`. To repair a v0.137-era direct
+generation binding, run `shipyard auth helper-argv --wrapper <public-ghapp>
+--repo <owner/repo>`. The repair is deliberately narrow: it validates the full
+manifest and every installed generation member, acquires the writer-domain
+lease, proves the live selector and configured generation still agree, re-reads
+the command, then atomically replaces only its first argument while preserving
+the owner-private 0600 TOML. Any selector/config disagreement, unmanifested or
+tampered member, public-trampoline mismatch, or concurrent command change
+refuses without mutation.
+
 Before any host can mutate, Shipyard resolves the exact annotated tag object,
 commit, tree, release ID, checksum-manifest asset, and macOS DMG asset. It
 streams both assets by immutable ID into owner-private hard-capped staging,
