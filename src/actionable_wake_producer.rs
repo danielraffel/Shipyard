@@ -875,7 +875,13 @@ impl ActionableWakeProducer {
                         | "dispatch_wedge_cleanup_failed"
                 )
             );
-            status = Some(observed);
+            let observed_priority = dispatch_cycle_status_priority(&observed);
+            if status
+                .as_ref()
+                .is_none_or(|current| observed_priority > dispatch_cycle_status_priority(current))
+            {
+                status = Some(observed);
+            }
             if terminal_dispatch {
                 break;
             }
@@ -1389,6 +1395,26 @@ fn dispatch_observation_key(authority: &crate::dispatch_wedge::DispatchJobAuthor
         authority.workflow_run_id,
         authority.job_id
     )
+}
+
+fn dispatch_cycle_status_priority(status: &ActionableWakeProducerStatus) -> u8 {
+    match status.reason_code.as_deref() {
+        Some(
+            "dispatch_wedge"
+            | "dispatch_wedge_unmatched"
+            | "dispatch_wedge_publication_refused"
+            | "dispatch_wedge_cleanup_failed",
+        ) => 3,
+        Some(
+            "matching_second_read_required"
+            | "dispatch_wedge_checkpoint_failed"
+            | "dispatch_wedge_pending_publication_failed"
+            | "dispatch_wedge_pending_publication_mismatch"
+            | "status_persistence_refused",
+        ) => 2,
+        Some("assignment_threshold_not_reached") => 1,
+        _ => 0,
+    }
 }
 
 fn dispatch_scope_prefix(repository: &str, pull_request: u64, head_sha: &str) -> String {
@@ -2660,6 +2686,42 @@ mod tests {
         assert!(!status.wake_enqueued);
         assert_eq!(
             status.reason_code.as_deref(),
+            Some("matching_second_read_required")
+        );
+    }
+
+    #[test]
+    fn later_non_followup_job_cannot_discard_an_earlier_second_read_requirement() {
+        let state = tempfile::tempdir().expect("state");
+        let mut no_capacity = dispatch_observation();
+        no_capacity.authority.workflow_run_id += 1;
+        no_capacity.authority.job_id += 1;
+        no_capacity.authority.job_name = "macos-secondary".to_owned();
+        no_capacity.authority.required_context = "macos-secondary".to_owned();
+        no_capacity.runners.clear();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        let primed = producer.process_dispatch_wedge_cycle(
+            &no_capacity.authority.repository,
+            no_capacity.authority.pull_request,
+            &no_capacity.authority.pull_request_head,
+            std::slice::from_ref(&no_capacity),
+            300,
+        );
+        assert_eq!(
+            primed.reason_code.as_deref(),
+            Some("matching_second_read_required")
+        );
+
+        let fresh_candidate = dispatch_observation();
+        let aggregate = producer.process_dispatch_wedge_cycle(
+            &fresh_candidate.authority.repository,
+            fresh_candidate.authority.pull_request,
+            &fresh_candidate.authority.pull_request_head,
+            &[fresh_candidate.clone(), no_capacity],
+            300,
+        );
+        assert_eq!(
+            aggregate.reason_code.as_deref(),
             Some("matching_second_read_required")
         );
     }
