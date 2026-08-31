@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01400"></a>
+## [0.140.0] - 2026-08-31
+
+- Add immutable local work-ledger inventory ([#522](https://github.com/danielraffel/Shipyard/pull/522))
+- fix(ghapp): admit `pr ready` to the privileged grammar ([#521](https://github.com/danielraffel/Shipyard/pull/521))
+
 <a id="v01391"></a>
 ## [0.139.1] - 2026-08-31
 
@@ -1226,6 +1232,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.140.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.140.0
 [0.139.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.139.1
 [0.139.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.139.0
 [0.138.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.138.0
