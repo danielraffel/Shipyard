@@ -1345,8 +1345,10 @@ if [ "$auth_previous_wrapper_needs_anchor" = 1 ]; then
   # avoids making that reader's opened pathname fail the wrapper's no-symlink
   # identity check; new readers immediately route through the anchor.
   auth_publish_link "$auth_selector" "$auth_anchor/ghapp"
-  auth_publish_file "$auth_wrapper" "$auth_generation/ghapp.public-trampoline"
-  auth_public_trampoline_active=1
+  if [ "$auth_public_trampoline_active" = 0 ]; then
+    auth_publish_file "$auth_wrapper" "$auth_generation/ghapp.public-trampoline"
+    auth_public_trampoline_active=1
+  fi
   auth_write_phase anchor-selected
   auth_old_reader_cohort=
   # A direct-wrapper exec can cross the atomic selector rename before it is

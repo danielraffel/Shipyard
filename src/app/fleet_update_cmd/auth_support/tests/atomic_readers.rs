@@ -467,7 +467,7 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
     let anchor_selected = fixture.root.path().join("anchor-selected");
     let transaction_release = fixture.root.path().join("transaction.release");
     let script = fixture.transaction_script();
-    let anchor_publish = "auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"\n  auth_public_trampoline_active=1\n";
+    let anchor_publish = "auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"\n    auth_public_trampoline_active=1\n";
     assert_eq!(script.matches(anchor_publish).count(), 1);
     let injected = format!(
         "{anchor_publish}/usr/bin/touch {}\nwhile [ ! -e {} ]; do /bin/sleep 0.02; done\n",
@@ -959,7 +959,7 @@ fn sigkill_checkpoint_matrix_never_exposes_an_unreadable_generation() {
         ),
         (
             "after-anchor-trampoline",
-            "auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"\n  auth_public_trampoline_active=1\n",
+            "auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"\n    auth_public_trampoline_active=1\n",
             false,
         ),
         (
