@@ -850,6 +850,7 @@ dependencies = [
  "tar",
  "tempfile",
  "toml",
+ "toml_edit",
  "wait-timeout",
  "winapi-util",
  "zstd",

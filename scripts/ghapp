@@ -137,6 +137,7 @@ if [[ -n "$opened_generation_root" && "$opened_wrapper_path" == "$opened_generat
         echo "ghapp: installed generation wrapper is malformed or unsafe" >&2
         exit 1
     fi
+    public_wrapper_path="$installed_public_wrapper_opened"
     generation_parent="${generation_store%/auth-generations}"
     generation_share="${generation_parent%/shipyard}"
     generation_local="${generation_share%/share}"

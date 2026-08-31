@@ -240,12 +240,18 @@ fn auth_support(verified: bool) -> AuthSupportEvidence {
             generation_contract: "auth-selector-v2".to_owned(),
             generation_id: "7".repeat(64),
             authority_identity: verified_source_identity(),
-            selector_path: PathBuf::from("/Users/ci/.local/bin/ghapp"),
+            selector_path: PathBuf::from("/Users/ci/.local/bin/ghapp.shipyard-generation"),
             selector_target: generation_dir.join("ghapp"),
             selector_recheck_target: generation_dir.join("ghapp"),
             manifest: generation_member(&generation_dir, "generation.manifest", '9', 0o600),
             helper: generation_member(&generation_dir, "shipyard-github-app-token", 'c', 0o700),
             wrapper: generation_member(&generation_dir, "ghapp", 'e', 0o700),
+            public_trampoline: generation_member(
+                &generation_dir,
+                "ghapp.public-trampoline",
+                'f',
+                0o700,
+            ),
             close_guard: generation_member(&generation_dir, "pr-close-guard", '0', 0o700),
             binary: generation_member(&generation_dir, "shipyard", 'a', 0o700),
             companion: Some(generation_member(
@@ -337,6 +343,17 @@ fn remote_evidence_is_typed_and_proves_repo_preservation() {
         auth_probe_sha = "5".repeat(64),
     );
     let stdout = stdout.replace(
+        &format!(
+            "{REMOTE_GENERATION_WRAPPER_SHA_PREFIX}{}\n",
+            "e".repeat(64)
+        ),
+        &format!(
+            "{REMOTE_GENERATION_WRAPPER_SHA_PREFIX}{}\n{REMOTE_GENERATION_PUBLIC_TRAMPOLINE_SHA_PREFIX}{}\n",
+            "e".repeat(64),
+            "f".repeat(64)
+        ),
+    );
+    let stdout = stdout.replace(
         "SHIPYARD_FLEET_GENERATION_CONTRACT=auth-selector-v1",
         "SHIPYARD_FLEET_GENERATION_CONTRACT=auth-selector-v2",
     );
@@ -358,6 +375,15 @@ fn evidence_rejects_version_repo_and_digest_drift() {
         .expect("generation")
         .close_guard
         .sha256 = "f".repeat(64);
+    assert!(validate_evidence(&plan, &observed).is_err());
+    observed = evidence("0.137.0");
+    observed
+        .auth_support_after
+        .generation
+        .as_mut()
+        .expect("generation")
+        .public_trampoline
+        .mode = 0o755;
     assert!(validate_evidence(&plan, &observed).is_err());
     observed = evidence("0.137.0");
     observed.daemon_version = "0.126.2".to_owned();

@@ -4,9 +4,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use toml::{Table, Value as TomlValue};
+use toml_edit::DocumentMut;
 
 use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::doctor::DoctorEntry;
@@ -59,16 +62,351 @@ struct HelperArgvOutput {
     credential_argv: Vec<String>,
 }
 
+const REQUIRED_GENERATION_MANIFEST_KEYS: &[&str] = &[
+    "schema_version",
+    "generation_contract",
+    "generation_id",
+    "authority_identity",
+    "helper_sha256",
+    "helper_mode",
+    "wrapper_sha256",
+    "wrapper_mode",
+    "public_trampoline_sha256",
+    "public_trampoline_mode",
+    "close_guard_sha256",
+    "close_guard_mode",
+    "binary_sha256",
+    "binary_mode",
+    "companion_sha256",
+    "context_sha256",
+    "context_template_sha256",
+];
+
 fn auth_helper_argv<W: Write>(
     global_dir: &Path,
     wrapper: &Path,
     repo: &str,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+    let mut config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if remediate_installed_generation_wrapper(global_dir, wrapper, repo, &config)? {
+        config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
     let output = resolve_helper_argv(&config, wrapper, repo)?;
     write_pretty_json(stdout, &output).map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+fn remediate_installed_generation_wrapper(
+    global_dir: &Path,
+    wrapper: &Path,
+    repo: &str,
+    config: &LoadedConfig,
+) -> Result<bool, CliFailure> {
+    let requested_wrapper = exact_absolute_path(wrapper, "--wrapper")?;
+    let Some(auth) = config.get("github.auth").and_then(TomlValue::as_table) else {
+        return Ok(false);
+    };
+    let Some(command) = auth.get("token_command").and_then(TomlValue::as_array) else {
+        return Ok(false);
+    };
+    let Some(configured_wrapper) = command.first().and_then(TomlValue::as_str) else {
+        return Ok(false);
+    };
+    if configured_wrapper == requested_wrapper {
+        return Ok(false);
+    }
+    let configured_path = Path::new(configured_wrapper);
+    resolve_helper_argv(config, configured_path, repo)?;
+    if !is_safe_installed_generation_alias(wrapper, configured_path)? {
+        return Ok(false);
+    }
+
+    let config_path = global_dir.join("config.toml");
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&config_path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let text =
+        fs::read_to_string(&config_path).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let mut document = text
+        .parse::<DocumentMut>()
+        .map_err(|error| CliFailure::new(1, format!("failed to parse config: {error}")))?;
+    let current_command = document
+        .get_mut("github")
+        .and_then(github_auth_token_command_mut)
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "machine-global github.auth.token_command changed during wrapper remediation",
+            )
+        })?;
+    if current_command.get(0).and_then(toml_edit::Value::as_str) != Some(configured_wrapper) {
+        return Err(CliFailure::new(
+            1,
+            "machine-global github.auth.token_command changed during wrapper remediation",
+        ));
+    }
+    let selector_path = wrapper.with_extension("shipyard-generation");
+    let selector_target = fs::read_link(&selector_path).map_err(|error| {
+        CliFailure::new(
+            1,
+            format!(
+                "failed to read installed auth generation selector {}: {error}",
+                selector_path.display()
+            ),
+        )
+    })?;
+    if selector_target != Path::new(configured_wrapper) {
+        return Err(CliFailure::new(
+            1,
+            "machine-global auth wrapper disagreed with the installed generation selector",
+        ));
+    }
+    current_command.replace(0, toml_edit::Value::from(requested_wrapper));
+    write_config_atomically(&config_path, &document.to_string())?;
+    Ok(true)
+}
+
+fn github_auth_token_command_mut(item: &mut toml_edit::Item) -> Option<&mut toml_edit::Array> {
+    match item {
+        toml_edit::Item::Table(github) => match github.get_mut("auth")? {
+            toml_edit::Item::Table(auth) => auth.get_mut("token_command")?.as_array_mut(),
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(auth)) => {
+                auth.get_mut("token_command")?.as_array_mut()
+            }
+            _ => None,
+        },
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(github)) => github
+            .get_mut("auth")?
+            .as_inline_table_mut()?
+            .get_mut("token_command")?
+            .as_array_mut(),
+        _ => None,
+    }
+}
+
+fn is_safe_installed_generation_alias(
+    public_wrapper: &Path,
+    configured_wrapper: &Path,
+) -> Result<bool, CliFailure> {
+    let configured_wrapper = configured_wrapper
+        .canonicalize()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let Some(bin_dir) = public_wrapper.parent() else {
+        return Ok(false);
+    };
+    let Some(local_dir) = bin_dir.parent() else {
+        return Ok(false);
+    };
+    let Some(home_dir) = local_dir.parent() else {
+        return Ok(false);
+    };
+    let public_metadata = public_wrapper
+        .symlink_metadata()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let public_source = fs::read_to_string(public_wrapper)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if public_wrapper.file_name().and_then(|name| name.to_str()) != Some("ghapp")
+        || bin_dir.file_name().and_then(|name| name.to_str()) != Some("bin")
+        || local_dir.file_name().and_then(|name| name.to_str()) != Some(".local")
+        || !public_metadata.is_file()
+        || !has_private_executable_mode(&public_metadata)
+        || public_source
+            .matches("# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1")
+            .count()
+            != 1
+    {
+        return Ok(false);
+    }
+    let generation_root = home_dir
+        .join(".local/share/shipyard/auth-generations")
+        .canonicalize()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let Ok(relative) = configured_wrapper.strip_prefix(&generation_root) else {
+        return Ok(false);
+    };
+    let components = relative.components().collect::<Vec<_>>();
+    let Some(generation_id) = components
+        .first()
+        .and_then(|part| part.as_os_str().to_str())
+    else {
+        return Ok(false);
+    };
+    if components.len() != 2
+        || generation_id.len() != 64
+        || !generation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || components[1].as_os_str() != "ghapp"
+    {
+        return Ok(false);
+    }
+    let metadata = configured_wrapper
+        .symlink_metadata()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !metadata.is_file() || !has_private_executable_mode(&metadata) {
+        return Ok(false);
+    }
+    is_valid_generation_manifest(
+        &configured_wrapper.with_file_name("generation.manifest"),
+        &configured_wrapper,
+        public_wrapper,
+        generation_id,
+    )
+}
+
+fn is_valid_generation_manifest(
+    manifest_path: &Path,
+    configured_wrapper: &Path,
+    public_wrapper: &Path,
+    generation_id: &str,
+) -> Result<bool, CliFailure> {
+    let manifest_metadata = manifest_path
+        .symlink_metadata()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !manifest_metadata.is_file() || !has_private_mode(&manifest_metadata, 0o600) {
+        return Ok(false);
+    }
+    let manifest =
+        fs::read_to_string(manifest_path).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let mut values = BTreeMap::new();
+    for line in manifest.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Ok(false);
+        };
+        if key.is_empty() || value.is_empty() || values.insert(key, value).is_some() {
+            return Ok(false);
+        }
+    }
+    if values.len() != REQUIRED_GENERATION_MANIFEST_KEYS.len()
+        || !REQUIRED_GENERATION_MANIFEST_KEYS
+            .iter()
+            .all(|key| values.contains_key(key))
+    {
+        return Ok(false);
+    }
+    let Some(generation_dir) = configured_wrapper.parent() else {
+        return Ok(false);
+    };
+    let member_matches = |name: &str, digest_key: &str, mode: u32| {
+        generation_member_matches(
+            &generation_dir.join(name),
+            values.get(digest_key).copied(),
+            mode,
+        )
+    };
+    let companion_matches = match values.get("companion_sha256").copied() {
+        Some("absent") => {
+            path_absent_no_follow(&generation_dir.join("shipyard-workstream-provider"))
+        }
+        digest => generation_member_matches(
+            &generation_dir.join("shipyard-workstream-provider"),
+            digest,
+            0o700,
+        )?,
+    };
+    let context_matches = match values.get("context_sha256").copied() {
+        Some("absent") => {
+            path_absent_no_follow(&generation_dir.join("ghapp.shipyard-context.json"))
+        }
+        digest => generation_member_matches(
+            &generation_dir.join("ghapp.shipyard-context.json"),
+            digest,
+            0o600,
+        )?,
+    };
+    let public_wrapper_matches = generation_member_matches(
+        public_wrapper,
+        values.get("public_trampoline_sha256").copied(),
+        0o700,
+    )?;
+    Ok(values.get("schema_version") == Some(&"1")
+        && values.get("generation_contract") == Some(&"auth-selector-v2")
+        && values.get("generation_id") == Some(&generation_id)
+        && values.get("wrapper_mode") == Some(&"700")
+        && values.get("helper_mode") == Some(&"700")
+        && values.get("public_trampoline_mode") == Some(&"700")
+        && values.get("close_guard_mode") == Some(&"700")
+        && values.get("binary_mode") == Some(&"700")
+        && values
+            .get("authority_identity")
+            .is_some_and(|value| valid_lower_sha256(value))
+        && values
+            .get("context_template_sha256")
+            .is_some_and(|value| valid_lower_sha256(value))
+        && member_matches("shipyard-github-app-token", "helper_sha256", 0o700)?
+        && member_matches("ghapp", "wrapper_sha256", 0o700)?
+        && member_matches("ghapp.public-trampoline", "public_trampoline_sha256", 0o700)?
+        && member_matches("pr-close-guard", "close_guard_sha256", 0o700)?
+        && member_matches("shipyard", "binary_sha256", 0o700)?
+        && companion_matches
+        && context_matches
+        && public_wrapper_matches)
+}
+
+fn has_private_executable_mode(metadata: &fs::Metadata) -> bool {
+    has_private_mode(metadata, 0o700)
+}
+
+fn has_private_mode(metadata: &fs::Metadata, expected: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o777 == expected
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (metadata, expected);
+        true
+    }
+}
+
+fn generation_member_matches(
+    path: &Path,
+    expected_digest: Option<&str>,
+    expected_mode: u32,
+) -> Result<bool, CliFailure> {
+    let Some(expected_digest) = expected_digest else {
+        return Ok(false);
+    };
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !metadata.is_file()
+        || !has_private_mode(&metadata, expected_mode)
+        || !valid_lower_sha256(expected_digest)
+    {
+        return Ok(false);
+    }
+    let observed = format!(
+        "{:x}",
+        Sha256::digest(fs::read(path).map_err(|error| CliFailure::new(1, error.to_string()))?)
+    );
+    Ok(observed == expected_digest)
+}
+
+fn valid_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn path_absent_no_follow(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn write_config_atomically(path: &Path, text: &str) -> Result<(), CliFailure> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    AtomicFile::new(path, AllowOverwrite)
+        .write_with_options(|file| file.write_all(text.as_bytes()), options)
+        .map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 fn resolve_helper_argv(

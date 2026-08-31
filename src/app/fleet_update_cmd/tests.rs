@@ -152,6 +152,16 @@ fn remote_daemon_auth_probe_executes_the_typed_parser_in_a_scrubbed_environment(
         .expect("decode exact remote script");
     assert!(decoded.status.success());
     let remote_script = String::from_utf8(decoded.stdout).expect("UTF-8 remote script");
+    for probe in [
+        "auth_generation_selector=\"$(/usr/bin/readlink /Users/ci/.local/bin/ghapp.shipyard-generation)\"",
+        "auth_generation_selector_recheck=\"$(/usr/bin/readlink /Users/ci/.local/bin/ghapp.shipyard-generation)\"",
+        "test \"$(/usr/bin/readlink /Users/ci/.local/bin/ghapp.shipyard-generation)\" = \"$auth_generation_selector\"",
+    ] {
+        assert!(
+            remote_script.contains(probe),
+            "remote generation and daemon receipt probes must read the stable trampoline selector",
+        );
+    }
     let parser_start = remote_script
         .find("DAEMON_AUTH_PROBE=\"$daemon_auth_probe\" /usr/bin/python3")
         .expect("remote daemon auth parser start");
@@ -1365,12 +1375,18 @@ fn auth_support(verified: bool) -> AuthSupportEvidence {
             generation_contract: "auth-selector-v2".to_owned(),
             generation_id: "7".repeat(64),
             authority_identity: "8".repeat(64),
-            selector_path: PathBuf::from("/Users/ci/.local/bin/ghapp"),
+            selector_path: PathBuf::from("/Users/ci/.local/bin/ghapp.shipyard-generation"),
             selector_target: generation_dir.join("ghapp"),
             selector_recheck_target: generation_dir.join("ghapp"),
             manifest: generation_member(&generation_dir, "generation.manifest", '9', 0o600),
             helper: generation_member(&generation_dir, "shipyard-github-app-token", 'c', 0o700),
             wrapper: generation_member(&generation_dir, "ghapp", 'e', 0o700),
+            public_trampoline: generation_member(
+                &generation_dir,
+                "ghapp.public-trampoline",
+                'f',
+                0o700,
+            ),
             close_guard: generation_member(&generation_dir, "pr-close-guard", '0', 0o700),
             binary: generation_member(&generation_dir, "shipyard", 'a', 0o700),
             companion: Some(generation_member(
