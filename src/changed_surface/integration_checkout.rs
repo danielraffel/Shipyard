@@ -8,7 +8,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -610,17 +609,13 @@ fn persist_or_verify_marker(path: &Path, marker: &CheckoutMarker) -> Result<(), 
     let mut payload = serde_json::to_vec_pretty(marker)
         .map_err(|error| format!("serialize integration marker: {error}"))?;
     payload.push(b'\n');
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker_path)
+    match atomicwrites::AtomicFile::new(&marker_path, atomicwrites::DisallowOverwrite)
+        .write(|file| file.write_all(&payload))
     {
-        Ok(mut file) => {
-            file.write_all(&payload)
-                .and_then(|()| file.sync_all())
-                .map_err(|error| format!("write integration marker: {error}"))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        Ok(()) => {}
+        Err(atomicwrites::Error::Internal(error))
+            if error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
             if fs::read(&marker_path)
                 .map_err(|error| format!("read integration marker: {error}"))?
                 != payload
@@ -630,11 +625,6 @@ fn persist_or_verify_marker(path: &Path, marker: &CheckoutMarker) -> Result<(), 
         }
         Err(error) => return Err(format!("create integration marker: {error}")),
     }
-    sync_directory(
-        marker_path
-            .parent()
-            .ok_or_else(|| "integration marker has no parent directory".to_owned())?,
-    )?;
     Ok(())
 }
 
@@ -688,27 +678,9 @@ fn persist_cleanup_pending(checkout: &IntegrationCheckout) -> Result<(), String>
         }
         return Ok(());
     }
-    let temporary = checkout.evidence_dir.join(format!(
-        ".stale-cleanup.{}.{}.tmp",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| format!("create cleanup intent temp: {error}"))?;
-    file.write_all(&payload)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("write cleanup intent temp: {error}"))?;
-    drop(file);
-    fs::rename(&temporary, &destination)
-        .map_err(|error| format!("publish pending cleanup intent: {error}"))?;
-    sync_directory(&checkout.evidence_dir)?;
-    Ok(())
+    atomicwrites::AtomicFile::new(&destination, atomicwrites::DisallowOverwrite)
+        .write(|file| file.write_all(&payload))
+        .map_err(|error| format!("publish pending cleanup intent: {error}"))
 }
 
 fn publish_cleanup_receipt(checkout: &IntegrationCheckout) -> Result<(), String> {
@@ -726,15 +698,25 @@ fn publish_cleanup_receipt(checkout: &IntegrationCheckout) -> Result<(), String>
         }
         return Ok(());
     }
-    fs::rename(&pending, &destination)
+    atomicwrites::move_atomic(&pending, &destination)
         .map_err(|error| format!("publish integration cleanup receipt: {error}"))?;
-    sync_directory(&checkout.evidence_dir)
+    Ok(())
 }
 
+#[cfg(not(windows))]
 fn sync_directory(path: &Path) -> Result<(), String> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("sync integration evidence directory: {error}"))
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Windows durable publication uses MoveFileExW with WRITE_THROUGH; only marker deletion reaches this recovery-safe barrier"
+)]
+fn sync_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn exact_git(cwd: &Path, args: &[&str], expected: &str) -> Result<(), String> {
