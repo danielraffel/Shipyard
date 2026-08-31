@@ -53,12 +53,18 @@ pub(crate) struct DaemonStewardRequest<'a> {
 }
 
 #[cfg(unix)]
+pub(crate) struct DaemonStewardCycleResult {
+    pub(crate) dispatch_observations:
+        Result<Vec<crate::dispatch_wedge::DispatchWedgeObservation>, String>,
+}
+
+#[cfg(unix)]
 pub(crate) fn daemon_steward_repository(
     mode: crate::identity::RuntimeMode,
     runtime_paths: &crate::paths::RuntimePaths,
     cwd: &std::path::Path,
     request: &DaemonStewardRequest<'_>,
-) -> Result<Vec<crate::dispatch_wedge::DispatchWedgeObservation>, String> {
+) -> Result<DaemonStewardCycleResult, String> {
     let actions = crate::cloud::GitHubActions::from_cwd(mode, cwd)
         .with_repo_override(request.repository)
         .with_absolute_deadline(std::time::Instant::now() + std::time::Duration::from_secs(60));
@@ -97,13 +103,15 @@ pub(crate) fn daemon_steward_repository(
     if code != std::process::ExitCode::SUCCESS {
         return Err("daemon exact steward cycle was unhealthy".to_owned());
     }
-    merge_steward_cmd::observe_dispatch_wedge_target(
-        &actions,
-        request.repository,
-        request.base_ref,
-        request.pull_request,
-        request.head_sha,
-    )
+    Ok(DaemonStewardCycleResult {
+        dispatch_observations: merge_steward_cmd::observe_dispatch_wedge_target(
+            &actions,
+            request.repository,
+            request.base_ref,
+            request.pull_request,
+            request.head_sha,
+        ),
+    })
 }
 
 #[cfg(unix)]

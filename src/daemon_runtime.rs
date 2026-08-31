@@ -397,63 +397,75 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             ) {
                 continue;
             }
-            let result_identity_valid = completed.result.is_ok()
-                && WorkLedger::open_existing(&config.state_dir)
-                    .and_then(|ledger| {
-                        ledger.map_or_else(
-                            || {
-                                Err(crate::work_ledger::WorkLedgerError::Refused(
-                                    "native work ledger is unavailable".to_owned(),
-                                ))
-                            },
-                            |_| {
-                                crate::work_ledger::verify_native_policy_binding_for_repository(
-                                    &config.state_dir,
-                                    &completed.repository_provider,
-                                    &completed.repository_id,
-                                    &completed.repository,
-                                    completed.pull_request,
-                                    &completed.head_sha,
-                                )
-                            },
-                        )
-                    })
-                    .is_ok();
+            let result_identity_valid = WorkLedger::open_existing(&config.state_dir)
+                .and_then(|ledger| {
+                    ledger.map_or_else(
+                        || {
+                            Err(crate::work_ledger::WorkLedgerError::Refused(
+                                "native work ledger is unavailable".to_owned(),
+                            ))
+                        },
+                        |_| {
+                            crate::work_ledger::verify_native_policy_binding_for_repository(
+                                &config.state_dir,
+                                &completed.repository_provider,
+                                &completed.repository_id,
+                                &completed.repository,
+                                completed.pull_request,
+                                &completed.head_sha,
+                            )
+                        },
+                    )
+                })
+                .is_ok();
             match (result_identity_valid, completed.result) {
                 (false, _) | (true, Err(_)) => {
-                    actionable_producer.invalidate_dispatch_wedge_scope_at_generation(
-                        &completed.repository,
-                        completed.pull_request,
-                        &completed.head_sha,
-                        completed.generation,
-                        "dispatch_wedge_observation_failed",
-                    );
-                    actionable_producer.mark_uncertain(
-                        &completed.repository,
-                        completed.pull_request,
-                        &completed.head_sha,
-                    );
-                }
-                (true, Ok(observations)) => {
-                    let status = actionable_producer.process_dispatch_wedge_cycle_at_generation(
-                        &completed.repository,
-                        completed.pull_request,
-                        &completed.head_sha,
-                        completed.generation,
-                        &observations,
-                        300,
-                    );
-                    schedule_dispatch_followup(
-                        &mut actionable_producer,
+                    actionable_producer.reschedule_dispatch_probe_after_failure_at_generation(
                         &completed.repository_provider,
                         &completed.repository_id,
                         &completed.repository,
                         completed.pull_request,
                         &completed.head_sha,
-                        &observations,
-                        &status,
+                        completed.generation,
+                        Utc::now() + chrono::Duration::seconds(60),
+                        "dispatch_wedge_observation_failed",
                     );
                 }
+                (true, Ok(cycle)) => match cycle.dispatch_observations {
+                    Ok(observations) => {
+                        let status = actionable_producer
+                            .process_dispatch_wedge_cycle_at_generation(
+                                &completed.repository,
+                                completed.pull_request,
+                                &completed.head_sha,
+                                completed.generation,
+                                &observations,
+                                300,
+                            );
+                        schedule_dispatch_followup(
+                            &mut actionable_producer,
+                            &completed.repository_provider,
+                            &completed.repository_id,
+                            &completed.repository,
+                            completed.pull_request,
+                            &completed.head_sha,
+                            &observations,
+                            &status,
+                        );
+                    }
+                    Err(_) => {
+                        actionable_producer
+                            .reschedule_dispatch_probe_after_auxiliary_failure_at_generation(
+                                &completed.repository_provider,
+                                &completed.repository_id,
+                                &completed.repository,
+                                completed.pull_request,
+                                &completed.head_sha,
+                                completed.generation,
+                                Utc::now() + chrono::Duration::seconds(60),
+                            );
+                    }
+                },
             }
         }
         while let Ok(completed) = dispatch_probe_rx.try_recv() {
@@ -543,33 +555,33 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                     );
                     continue;
                 }
-                let base_ref = WorkLedger::open_existing(&config.state_dir)
-                    .and_then(|ledger| {
-                        ledger.map_or_else(
-                            || Ok(None),
-                            |ledger| {
-                                ledger.native_steward_base_ref_for_repository(
-                                    Some(&schedule.repository_provider),
-                                    Some(&schedule.repository_id),
-                                    &schedule.repository,
-                                    schedule.pull_request,
-                                    &schedule.head_sha,
-                                )
-                            },
-                        )
-                    })
-                    .ok()
-                    .flatten();
-                if let Some(base_ref) = base_ref {
-                    if let Some(generation) = actionable_producer
-                        .begin_dispatch_wedge_cycle_for_repository(
-                            &schedule.repository_provider,
-                            &schedule.repository_id,
-                            &schedule.repository,
-                            schedule.pull_request,
-                            &schedule.head_sha,
-                        )
-                    {
+                let Some(generation) = actionable_producer
+                    .begin_dispatch_wedge_cycle_for_repository(
+                        &schedule.repository_provider,
+                        &schedule.repository_id,
+                        &schedule.repository,
+                        schedule.pull_request,
+                        &schedule.head_sha,
+                    )
+                else {
+                    continue;
+                };
+                let base_ref = WorkLedger::open_existing(&config.state_dir).and_then(|ledger| {
+                    ledger.map_or_else(
+                        || Ok(None),
+                        |ledger| {
+                            ledger.native_steward_base_ref_for_repository(
+                                Some(&schedule.repository_provider),
+                                Some(&schedule.repository_id),
+                                &schedule.repository,
+                                schedule.pull_request,
+                                &schedule.head_sha,
+                            )
+                        },
+                    )
+                });
+                match classify_native_base_ref_lookup(base_ref) {
+                    NativeBaseRefLookup::Available(base_ref) => {
                         dispatch_probes_in_flight.insert(normalized_dispatch_target(
                             &schedule.repository,
                             schedule.pull_request,
@@ -582,13 +594,27 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                             generation,
                         });
                     }
-                } else {
-                    actionable_producer.invalidate_dispatch_wedge_scope(
-                        &schedule.repository,
-                        schedule.pull_request,
-                        &schedule.head_sha,
-                        "dispatch_wedge_authority_unavailable",
-                    );
+                    NativeBaseRefLookup::Absent => {
+                        actionable_producer.invalidate_dispatch_wedge_scope_at_generation(
+                            &schedule.repository,
+                            schedule.pull_request,
+                            &schedule.head_sha,
+                            generation,
+                            "dispatch_wedge_authority_unavailable",
+                        );
+                    }
+                    NativeBaseRefLookup::Retry => {
+                        actionable_producer.reschedule_dispatch_probe_after_failure_at_generation(
+                            &schedule.repository_provider,
+                            &schedule.repository_id,
+                            &schedule.repository,
+                            schedule.pull_request,
+                            &schedule.head_sha,
+                            generation,
+                            Utc::now() + chrono::Duration::seconds(60),
+                            "dispatch_wedge_ledger_read_failed",
+                        );
+                    }
                 }
             }
             if !targets.is_empty() {
@@ -656,35 +682,32 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             if let Ok(mut published) = actionable_producer_status.lock() {
                 *published = status;
             }
-            let result = WorkLedger::open_existing(&config.state_dir)
-                .and_then(|ledger| {
-                    ledger.map_or_else(
-                        || Ok(None),
-                        |ledger| {
-                            ledger.native_steward_base_ref_for_repository(
-                                Some(&repository_provider),
-                                Some(&repository_id),
-                                &repository,
-                                pull_request,
-                                &head_sha,
-                            )
-                        },
-                    )
-                })
-                .map_err(|error| error.to_string())
-                .and_then(|base_ref| {
-                    base_ref.ok_or_else(|| "exact native steward target is unavailable".to_owned())
-                });
-            if let Ok(base_ref) = result {
-                if let Some(generation) = actionable_producer
-                    .begin_dispatch_wedge_cycle_for_repository(
-                        &repository_provider,
-                        &repository_id,
-                        &repository,
-                        pull_request,
-                        &head_sha,
-                    )
-                {
+            let Some(generation) = actionable_producer.begin_dispatch_wedge_cycle_for_repository(
+                &repository_provider,
+                &repository_id,
+                &repository,
+                pull_request,
+                &head_sha,
+            ) else {
+                actionable_producer.mark_uncertain(&repository, pull_request, &head_sha);
+                continue;
+            };
+            let result = WorkLedger::open_existing(&config.state_dir).and_then(|ledger| {
+                ledger.map_or_else(
+                    || Ok(None),
+                    |ledger| {
+                        ledger.native_steward_base_ref_for_repository(
+                            Some(&repository_provider),
+                            Some(&repository_id),
+                            &repository,
+                            pull_request,
+                            &head_sha,
+                        )
+                    },
+                )
+            });
+            match classify_native_base_ref_lookup(result) {
+                NativeBaseRefLookup::Available(base_ref) => {
                     steward_in_flight = true;
                     steward_repository_in_flight = Some(normalized_dispatch_repository(
                         &repository_provider,
@@ -707,11 +730,28 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                         base_ref,
                         steward_tx.clone(),
                     );
-                } else {
-                    actionable_producer.mark_uncertain(&repository, pull_request, &head_sha);
                 }
-            } else {
-                actionable_producer.mark_uncertain(&repository, pull_request, &head_sha);
+                NativeBaseRefLookup::Absent => {
+                    actionable_producer.invalidate_dispatch_wedge_scope_at_generation(
+                        &repository,
+                        pull_request,
+                        &head_sha,
+                        generation,
+                        "dispatch_wedge_authority_unavailable",
+                    );
+                }
+                NativeBaseRefLookup::Retry => {
+                    actionable_producer.reschedule_dispatch_probe_after_failure_at_generation(
+                        &repository_provider,
+                        &repository_id,
+                        &repository,
+                        pull_request,
+                        &head_sha,
+                        generation,
+                        Utc::now() + chrono::Duration::seconds(60),
+                        "dispatch_wedge_ledger_read_failed",
+                    );
+                }
             }
         }
         for evidence in shadow_transitions {
@@ -849,6 +889,28 @@ fn authoritative_native_steward_inventory(
 const MAX_CONCURRENT_DISPATCH_PROBES: usize = 2;
 
 #[cfg(unix)]
+const MAX_DISPATCH_TARGETS_PER_REPOSITORY_BATCH: usize = 4;
+
+#[cfg(unix)]
+#[derive(Debug, Eq, PartialEq)]
+enum NativeBaseRefLookup {
+    Available(String),
+    Absent,
+    Retry,
+}
+
+#[cfg(unix)]
+fn classify_native_base_ref_lookup(
+    result: Result<Option<String>, crate::work_ledger::WorkLedgerError>,
+) -> NativeBaseRefLookup {
+    match result {
+        Ok(Some(base_ref)) => NativeBaseRefLookup::Available(base_ref),
+        Ok(None) => NativeBaseRefLookup::Absent,
+        Err(_) => NativeBaseRefLookup::Retry,
+    }
+}
+
+#[cfg(unix)]
 #[derive(Debug)]
 struct DispatchProbeBatch {
     repository_provider: String,
@@ -880,7 +942,9 @@ fn select_due_dispatch_probe_batches(
             continue;
         }
         if let Some(index) = selected.get(&repository_key).copied() {
-            batches[index].schedules.push(schedule);
+            if batches[index].schedules.len() < MAX_DISPATCH_TARGETS_PER_REPOSITORY_BATCH {
+                batches[index].schedules.push(schedule);
+            }
         } else if batches.len() < limit {
             selected.insert(repository_key, batches.len());
             batches.push(DispatchProbeBatch {
@@ -943,7 +1007,7 @@ struct DaemonStewardResult {
     pull_request: u64,
     head_sha: String,
     generation: u64,
-    result: Result<Vec<crate::dispatch_wedge::DispatchWedgeObservation>, String>,
+    result: Result<crate::app::DaemonStewardCycleResult, String>,
 }
 
 #[cfg(unix)]
@@ -2581,8 +2645,9 @@ mod tests {
     use super::select_due_dispatch_probe_batches;
     #[cfg(unix)]
     use super::{
-        DaemonDispatchProbeTarget, join_dispatch_probe_batch_results, normalized_dispatch_target,
-        release_steward_ownership, schedule_dispatch_followup,
+        DaemonDispatchProbeTarget, NativeBaseRefLookup, classify_native_base_ref_lookup,
+        join_dispatch_probe_batch_results, normalized_dispatch_target, release_steward_ownership,
+        schedule_dispatch_followup,
     };
     #[cfg(unix)]
     use crate::actionable_wake_producer::{ActionableWakeProducer, ActionableWakeProducerStatus};
@@ -2619,6 +2684,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn ledger_lookup_error_is_retryable_but_confirmed_absence_is_terminal() {
+        assert_eq!(
+            classify_native_base_ref_lookup(Ok(Some("main".to_owned()))),
+            NativeBaseRefLookup::Available("main".to_owned())
+        );
+        assert_eq!(
+            classify_native_base_ref_lookup(Ok(None)),
+            NativeBaseRefLookup::Absent
+        );
+        assert_eq!(
+            classify_native_base_ref_lookup(Err(crate::work_ledger::WorkLedgerError::Refused(
+                "injected read failure".to_owned()
+            ))),
+            NativeBaseRefLookup::Retry
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn in_flight_probe_does_not_consume_fair_due_budget() {
         let schedule = |pull_request| crate::actionable_wake_producer::DispatchProbeSchedule {
             repository_provider: "github".to_owned(),
@@ -2643,7 +2727,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn one_hundred_same_repository_targets_share_one_worker_slot() {
+    fn same_repository_batch_is_bounded_without_consuming_more_worker_slots() {
         let due = (1..=100)
             .map(
                 |pull_request| crate::actionable_wake_producer::DispatchProbeSchedule {
@@ -2659,7 +2743,15 @@ mod tests {
         let selected =
             select_due_dispatch_probe_batches(due, &BTreeSet::new(), &BTreeSet::new(), 2);
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].schedules.len(), 100);
+        assert_eq!(selected[0].schedules.len(), 4);
+        assert_eq!(
+            selected[0]
+                .schedules
+                .iter()
+                .map(|schedule| schedule.pull_request)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
     }
 
     #[cfg(unix)]
@@ -2688,9 +2780,52 @@ mod tests {
         let selected =
             select_due_dispatch_probe_batches(due, &BTreeSet::new(), &BTreeSet::new(), 2);
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].schedules.len(), 100);
+        assert_eq!(selected[0].schedules.len(), 4);
         assert_eq!(selected[1].repository_id, "R_small");
         assert_eq!(selected[1].schedules.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retrying_selected_targets_rotates_untouched_due_targets_into_next_batch() {
+        let schedule =
+            |pull_request, due_at: &str| crate::actionable_wake_producer::DispatchProbeSchedule {
+                repository_provider: "github".to_owned(),
+                repository_id: "R_shared".to_owned(),
+                repository: "owner/repo".to_owned(),
+                pull_request,
+                head_sha: format!("{pull_request:040x}"),
+                due_at: due_at.to_owned(),
+            };
+        let first_due = (1..=8)
+            .map(|pull_request| schedule(pull_request, "2026-08-31T00:00:00+00:00"))
+            .collect();
+        let first =
+            select_due_dispatch_probe_batches(first_due, &BTreeSet::new(), &BTreeSet::new(), 2);
+        assert_eq!(
+            first[0]
+                .schedules
+                .iter()
+                .map(|schedule| schedule.pull_request)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+
+        let due = (5..=8)
+            .map(|pull_request| schedule(pull_request, "2026-08-31T00:00:00+00:00"))
+            .chain((1..=4).map(|pull_request| schedule(pull_request, "2026-08-31T00:01:00+00:00")))
+            .collect();
+        let selected =
+            select_due_dispatch_probe_batches(due, &BTreeSet::new(), &BTreeSet::new(), 2);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0]
+                .schedules
+                .iter()
+                .map(|schedule| schedule.pull_request)
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7, 8]
+        );
     }
 
     #[cfg(unix)]

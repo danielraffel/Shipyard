@@ -1085,6 +1085,56 @@ impl ActionableWakeProducer {
         due_at: chrono::DateTime<Utc>,
         reason: &str,
     ) -> ActionableWakeProducerStatus {
+        self.reschedule_dispatch_probe_at_generation(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+            generation,
+            due_at,
+            "uncertain",
+            reason,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reschedule_dispatch_probe_after_auxiliary_failure_at_generation(
+        &mut self,
+        repository_provider: &str,
+        repository_id: &str,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+        generation: u64,
+        due_at: chrono::DateTime<Utc>,
+    ) -> ActionableWakeProducerStatus {
+        self.reschedule_dispatch_probe_at_generation(
+            repository_provider,
+            repository_id,
+            repository,
+            pull_request,
+            head_sha,
+            generation,
+            due_at,
+            "ready",
+            "dispatch_wedge_observation_retry_scheduled",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reschedule_dispatch_probe_at_generation(
+        &mut self,
+        repository_provider: &str,
+        repository_id: &str,
+        repository: &str,
+        pull_request: u64,
+        head_sha: &str,
+        generation: u64,
+        due_at: chrono::DateTime<Utc>,
+        state: &str,
+        reason: &str,
+    ) -> ActionableWakeProducerStatus {
         if !self.dispatch_state_available {
             return self.record(
                 repository.to_owned(),
@@ -1122,7 +1172,7 @@ impl ActionableWakeProducer {
             repository.to_owned(),
             pull_request,
             head_sha.to_owned(),
-            "uncertain",
+            state,
             Some(reason.to_owned()),
             false,
         );
@@ -2849,6 +2899,48 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].pull_request, observation.authority.pull_request);
         assert_eq!(due[0].repository_id, test_repository_id());
+    }
+
+    #[test]
+    fn successful_steward_auxiliary_probe_failure_retries_without_marking_steward_uncertain() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now(),
+        );
+        let generation = producer
+            .begin_dispatch_wedge_cycle_for_repository(
+                test_repository_provider(),
+                test_repository_id(),
+                &observation.authority.repository,
+                observation.authority.pull_request,
+                &observation.authority.pull_request_head,
+            )
+            .expect("generation");
+        let retry_at = Utc::now() + chrono::Duration::seconds(60);
+        let status = producer.reschedule_dispatch_probe_after_auxiliary_failure_at_generation(
+            test_repository_provider(),
+            test_repository_id(),
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            generation,
+            retry_at,
+        );
+        assert_eq!(status.state, "ready");
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some("dispatch_wedge_observation_retry_scheduled")
+        );
+
+        let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        let due = restarted.due_dispatch_probes(retry_at + chrono::Duration::seconds(1), 10);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].pull_request, observation.authority.pull_request);
     }
 
     #[test]
