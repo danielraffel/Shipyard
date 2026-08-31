@@ -32,6 +32,33 @@ fn parses_both_check_rollup_shapes() {
 }
 
 #[test]
+fn run_parser_requires_explicit_positive_attempt_identity() {
+    let base = serde_json::json!({
+        "id": 1,
+        "workflow_id": 2,
+        "name": "Required",
+        "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "head_branch": "feature",
+        "status": "queued",
+        "event": "pull_request",
+        "created_at": "2026-08-31T19:00:00Z",
+        "pull_requests": []
+    });
+    assert!(crate::app::merge_steward_cmd::observation::parse_run(&base).is_none());
+    let mut zero = base.clone();
+    zero.as_object_mut()
+        .unwrap()
+        .insert("run_attempt".to_owned(), serde_json::json!(0));
+    assert!(crate::app::merge_steward_cmd::observation::parse_run(&zero).is_none());
+    let mut malformed = base;
+    malformed
+        .as_object_mut()
+        .unwrap()
+        .insert("run_attempt".to_owned(), serde_json::json!("1"));
+    assert!(crate::app::merge_steward_cmd::observation::parse_run(&malformed).is_none());
+}
+
+#[test]
 fn active_check_uses_started_at_when_completed_at_is_null() {
     let check = parse_check(&serde_json::json!({
         "__typename": "CheckRun",
@@ -736,7 +763,7 @@ fn active_run_transport_deduplicates_status_and_page_overlap() {
         r#"
 case "$*" in
   *"actions/runs?status=queued"*|*"actions/runs?status=waiting"*)
-    printf '%s' '{"workflow_runs":[{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}]}' ;;
+    printf '%s' '{"workflow_runs":[{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}]}' ;;
   *"actions/runs?status="*) printf '%s' '{"workflow_runs":[]}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac

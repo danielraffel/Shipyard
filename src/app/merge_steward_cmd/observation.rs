@@ -801,9 +801,9 @@ pub(super) fn parse_run(value: &Value) -> Option<StewardRun> {
         id: value.get("id")?.as_u64()?,
         workflow_id: value.get("workflow_id")?.as_u64()?,
         run_attempt: value
-            .get("run_attempt")
-            .and_then(Value::as_u64)
-            .unwrap_or(1),
+            .get("run_attempt")?
+            .as_u64()
+            .filter(|attempt| *attempt > 0)?,
         workflow: value.get("name")?.as_str()?.to_owned(),
         head_sha: value.get("head_sha")?.as_str()?.to_owned(),
         head_branch: value.get("head_branch")?.as_str()?.to_owned(),

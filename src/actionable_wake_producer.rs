@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
@@ -680,20 +680,24 @@ impl ActionableWakeProducer {
                     observations: BTreeMap::new(),
                     pending_publication: None,
                 });
+            let not_before = target
+                .observations
+                .get(&key)
+                .filter(|checkpoint| checkpoint.digest == digest)
+                .map_or_else(
+                    || {
+                        (now + chrono::Duration::seconds(
+                            assignment_threshold_secs.max(stability_delay_seconds()),
+                        ))
+                        .to_rfc3339()
+                    },
+                    |checkpoint| checkpoint.not_before.clone(),
+                );
             target.observations.insert(
                 key.clone(),
                 DispatchObservationCheckpoint {
                     digest,
-                    not_before: DateTime::parse_from_rfc3339(&authority.queued_at)
-                        .map_or_else(
-                            |_| now + chrono::Duration::seconds(stability_delay_seconds()),
-                            |queued| {
-                                (queued.with_timezone(&Utc)
-                                    + chrono::Duration::seconds(assignment_threshold_secs))
-                                .max(now + chrono::Duration::seconds(stability_delay_seconds()))
-                            },
-                        )
-                        .to_rfc3339(),
+                    not_before,
                     boot_epoch: self.boot_epoch.clone(),
                 },
             );
@@ -1976,6 +1980,28 @@ mod tests {
         }
     }
 
+    fn make_dispatch_observation_due(
+        producer: &mut ActionableWakeProducer,
+        observation: &DispatchWedgeObservation,
+    ) {
+        let scope = dispatch_scope_prefix(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+        );
+        producer
+            .status
+            .dispatch_targets
+            .get_mut(&scope)
+            .expect("dispatch target")
+            .observations
+            .values_mut()
+            .for_each(|checkpoint| {
+                checkpoint.not_before = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+            });
+        producer.persist_status().expect("persist due checkpoint");
+    }
+
     #[test]
     fn dispatch_wedge_requires_durable_second_cycle_and_wakes_once() {
         let state = tempfile::tempdir().expect("state");
@@ -1996,6 +2022,7 @@ mod tests {
             waiting.reason_code.as_deref(),
             Some("matching_second_read_required")
         );
+        make_dispatch_observation_due(&mut first, &observation);
 
         let mut restarted = ActionableWakeProducer::new(state.path().to_path_buf());
         let post_restart_first = restarted.process_dispatch_wedge_observation(&observation, 300);
@@ -2578,6 +2605,7 @@ mod tests {
                 first.reason_code.as_deref(),
                 Some("matching_second_read_required")
             );
+            make_dispatch_observation_due(&mut restarted, &observation);
             let second_generation = restarted
                 .begin_dispatch_wedge_cycle(
                     &observation.authority.repository,
@@ -2621,6 +2649,7 @@ mod tests {
             std::slice::from_ref(&observation),
             300,
         );
+        make_dispatch_observation_due(&mut producer, &observation);
         producer.process_dispatch_wedge_cycle(
             &observation.authority.repository,
             observation.authority.pull_request,
@@ -2674,6 +2703,7 @@ mod tests {
             first.reason_code.as_deref(),
             Some("matching_second_read_required")
         );
+        make_dispatch_observation_due(&mut producer, &observation);
         let refused = producer.process_dispatch_wedge_cycle(
             &observation.authority.repository,
             observation.authority.pull_request,
@@ -2727,6 +2757,7 @@ mod tests {
             std::slice::from_ref(&observation),
             300,
         );
+        make_dispatch_observation_due(&mut producer, &observation);
         let refused = producer.process_dispatch_wedge_cycle(
             &observation.authority.repository,
             observation.authority.pull_request,
@@ -2821,6 +2852,7 @@ mod tests {
                 .as_deref(),
             Some("matching_second_read_required")
         );
+        make_dispatch_observation_due(&mut producer, &observation);
 
         let scope = dispatch_scope_prefix(
             &observation.authority.repository,
@@ -2999,6 +3031,39 @@ mod tests {
             early.reason_code.as_deref(),
             Some("assignment_threshold_not_reached")
         );
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let mature = producer.process_dispatch_wedge_observation(&observation, 1);
+        assert_eq!(mature.reason_code.as_deref(), Some("dispatch_wedge"));
+        assert!(mature.wake_enqueued);
+    }
+
+    #[test]
+    fn old_workflow_clock_cannot_skip_first_observed_job_threshold() {
+        let state = tempfile::tempdir().expect("state");
+        let publication = request();
+        seed_repo_policy(state.path(), &publication.repository);
+        WorkLedger::plan_or_apply_native_continuation(
+            state.path(),
+            &publication,
+            &policy(vec![publication.repository.clone()]),
+            true,
+        )
+        .expect("publish managed handoff");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+
+        let first = producer.process_dispatch_wedge_observation(&observation, 1);
+        assert_eq!(
+            first.reason_code.as_deref(),
+            Some("matching_second_read_required")
+        );
+        let immediate_second = producer.process_dispatch_wedge_observation(&observation, 1);
+        assert!(!immediate_second.wake_enqueued);
+        assert_eq!(
+            immediate_second.reason_code.as_deref(),
+            Some("matching_second_read_required")
+        );
+
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         let mature = producer.process_dispatch_wedge_observation(&observation, 1);
         assert_eq!(mature.reason_code.as_deref(), Some("dispatch_wedge"));
