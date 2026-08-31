@@ -196,11 +196,14 @@ policy. The receipt binds repository/PR/head/tree, old and live base SHAs,
 merge base, integration tree, policy/workflow/validation-contract digests, and
 both changed-path digests. Harmless movement can therefore produce a bounded
 selection assessment, and an affected-family movement expands that selection.
-This release records the assessment but deliberately leaves the ordinary full
-validation unchanged: executing the bounded comparison requires a separately
-reviewed, exact integration-tree checkout boundary. Policy,
-topology, toolchain, producer-target, full-required, unmapped, conflicting, or
-incomplete movement remains full. This path always records
+When that assessment is bounded, Shipyard materializes a content-addressed,
+fenced checkout of the exact synthesized integration commit and runs the
+selected-versus-full comparison there. Checkout identity, submodules, tracked
+content, activation, result publication, cleanup intent, and daemon restart
+recovery are all receipt-bound; ambiguity preserves the checkout and leaves the
+ordinary full path authoritative. Policy, topology, toolchain,
+producer-target, full-required, unmapped, conflicting, or incomplete movement
+remains full. This path always records
 `merge_authority: blocked_until_current_merge_tree`; it is not accepted by the
 authoritative planner and cannot satisfy a merge gate.
 
