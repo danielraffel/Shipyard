@@ -29,7 +29,7 @@ pub(crate) struct CustodyStatus {
 
 use super::{
     WorkLedgerError, WorkLedgerResult, digest, opaque_ref, validate_control, validate_digest,
-    validate_opaque_ref, validate_token, validate_transfer,
+    validate_opaque_ref, validate_transfer,
 };
 
 const CUSTODY_SCHEMA_VERSION: u32 = 2;
@@ -443,7 +443,7 @@ impl CustodyEnvelope {
         validate_opaque_ref("work item ID", &work_item_id, "wi")?;
         validate_digest("custody content", &content_digest)?;
         validate_digest("custody work authority", &work_authority_digest)?;
-        validate_token("workstream handle", &workstream_handle)?;
+        super::super::validate_workstream_handle(&workstream_handle)?;
         validate_opaque_ref("source machine", &source_machine_ref, "machine")?;
         validate_opaque_ref("source incarnation", &source_incarnation_ref, "incarnation")?;
         if work_generation == 0 || owner_generation == 0 || workstream_revision == 0 {

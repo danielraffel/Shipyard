@@ -472,16 +472,8 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
             "--head must be a full 40-character SHA-1",
         ));
     }
-    let workstream = args.workstream_id.trim();
-    if workstream.is_empty()
-        || workstream.len() > 124
-        || workstream.chars().any(char::is_whitespace)
-    {
-        return Err(CliFailure::new(
-            1,
-            "--workstream-id must be 1-124 non-whitespace characters",
-        ));
-    }
+    crate::work_ledger::validate_workstream_handle(&args.workstream_id)
+        .map_err(|_| CliFailure::new(1, "--workstream-id must be a canonical GEN-style handle"))?;
     if let Some(url) = args.context_url.as_deref()
         && !(url.starts_with("https://") || url.starts_with("http://"))
     {
@@ -1002,6 +994,7 @@ fn handoff_path(directory: &Path, head: &str) -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)] // Explicit manual compatibility path; active stewardship requires v2 identity.
 pub(super) fn migrate_legacy_native_policy_authority(
     state_dir: &Path,
     repo: &str,
@@ -1075,7 +1068,7 @@ pub(crate) fn native_publication_request(
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .ok_or_else(|| CliFailure::new(1, "explicit repository policy is unavailable"))?;
     let repo_policy = ledger
-        .repo_policy(repo)
+        .repo_policy(&source_authority.canonical_repository)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .ok_or_else(|| CliFailure::new(1, "explicit repository policy is unavailable"))?;
     let receipt = load_handoff(&path)?
@@ -1150,7 +1143,11 @@ pub(crate) fn native_publication_request(
         .ok_or_else(|| CliFailure::new(1, "native resume wrapper is missing"))?;
 
     Ok(NativePublicationRequest {
-        repository: receipt.repo.to_ascii_lowercase(),
+        repository_provider: source_authority.repository_provider,
+        repository_id: source_authority.repository_id,
+        legacy_repository_alias: (source_authority.canonical_repository != receipt.repo)
+            .then(|| receipt.repo.to_ascii_lowercase()),
+        repository: source_authority.canonical_repository,
         pull_request: receipt.pr,
         head_sha: receipt.head_sha.to_ascii_lowercase(),
         base_ref: source_authority.base_ref,
@@ -1248,8 +1245,42 @@ fn test_terminal_authority() -> Option<TerminalCapabilityRequest> {
 
 struct NativeSourceAuthority {
     installation_id: u64,
+    repository_provider: String,
+    repository_id: String,
+    canonical_repository: String,
     base_ref: String,
     base_sha: String,
+}
+
+pub(crate) fn verify_native_repository_identity(
+    actions: &GitHubActions,
+    repository_provider: &str,
+    repository_id: &str,
+    repository: &str,
+) -> Result<(), String> {
+    if repository_provider != "github.com" {
+        return Err("native steward repository provider is unsupported".to_owned());
+    }
+    let observed = gh_json(
+        actions,
+        &[
+            "repo".into(),
+            "view".into(),
+            repository.to_owned(),
+            "--json".into(),
+            "id,nameWithOwner".into(),
+        ],
+        "authenticate native steward repository identity",
+    )?;
+    let observed_id = observed.get("id").and_then(Value::as_str);
+    let observed_repository = observed
+        .get("nameWithOwner")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    if observed_id != Some(repository_id) || observed_repository.as_deref() != Some(repository) {
+        return Err("native steward repository identity changed".to_owned());
+    }
+    Ok(())
 }
 
 fn observe_native_source_authority(
@@ -1261,6 +1292,30 @@ fn observe_native_source_authority(
     let installation_id = actions
         .app_installation_id()
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let repository = gh_json(
+        actions,
+        &[
+            "repo".into(),
+            "view".into(),
+            repo.to_owned(),
+            "--json".into(),
+            "id,nameWithOwner".into(),
+        ],
+        "observe immutable native publication repository identity",
+    )
+    .map_err(|error| CliFailure::new(1, error))?;
+    let repository_id = repository
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or_else(|| CliFailure::new(1, "native publication repository ID is unavailable"))?;
+    let canonical_coordinate = repository
+        .get("nameWithOwner")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let canonical_repository = canonical_coordinate.ok_or_else(|| {
+        CliFailure::new(1, "native publication canonical repository is unavailable")
+    })?;
     let snapshot = gh_json(
         actions,
         &[
@@ -1297,6 +1352,9 @@ fn observe_native_source_authority(
     }
     Ok(NativeSourceAuthority {
         installation_id,
+        repository_provider: "github.com".to_owned(),
+        repository_id: repository_id.to_owned(),
+        canonical_repository,
         base_ref: base_ref.expect("checked").to_owned(),
         base_sha: base_sha.expect("checked").to_ascii_lowercase(),
     })
@@ -3270,10 +3328,12 @@ fn main() {{
     }
 
     #[test]
-    fn workstream_identifier_is_small_and_single_token() {
-        let mut invalid = args();
-        invalid.workstream_id = "GEN 7".to_owned();
-        assert!(validate_args(&invalid).is_err());
+    fn workstream_identifier_requires_the_canonical_gen_style_grammar() {
+        for value in ["GEN 7", "gen-7", "GEN-07", "GEN-7\nspoof", "GEN-7-extra"] {
+            let mut invalid = args();
+            invalid.workstream_id = value.to_owned();
+            assert!(validate_args(&invalid).is_err(), "accepted {value:?}");
+        }
         assert!(validate_args(&args()).is_ok());
     }
 

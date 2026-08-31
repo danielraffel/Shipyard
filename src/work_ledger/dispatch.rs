@@ -408,7 +408,7 @@ fn stored_resume_expectation(
     )?;
     if value.projection_revision == 0
         || value.checkpoint_generation == 0
-        || !is_canonical_workstream_handle(value.workstream_handle)
+        || super::validate_workstream_handle(value.workstream_handle).is_err()
         || value.checkpoint_id.is_empty()
         || value.checkpoint_id.len() > 128
         || crate::evidence::canonical_repository(value.repository) != value.repository
@@ -438,18 +438,6 @@ fn stored_resume_expectation(
         success_continuation_digest: value.success_continuation_digest.to_owned(),
         failure_continuation_digest: value.failure_continuation_digest.to_owned(),
     })
-}
-
-fn is_canonical_workstream_handle(value: &str) -> bool {
-    let Some((team, number)) = value.split_once('-') else {
-        return false;
-    };
-    !team.is_empty()
-        && team.len() <= 16
-        && team.bytes().all(|byte| byte.is_ascii_uppercase())
-        && !number.is_empty()
-        && !number.starts_with('0')
-        && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn is_secret_free_context_url(value: &str) -> bool {

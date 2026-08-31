@@ -371,14 +371,36 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         }
         while let Ok(completed) = steward_rx.try_recv() {
             steward_in_flight = false;
-            if completed.result.is_err() {
-                actionable_producer.mark_uncertain(
+            let result_identity_valid = completed.result.is_ok()
+                && WorkLedger::open_existing(&config.state_dir)
+                    .and_then(|ledger| {
+                        ledger.map_or_else(
+                            || {
+                                Err(crate::work_ledger::WorkLedgerError::Refused(
+                                    "native work ledger is unavailable".to_owned(),
+                                ))
+                            },
+                            |_| {
+                                crate::work_ledger::verify_native_policy_binding_for_repository(
+                                    &config.state_dir,
+                                    &completed.repository_provider,
+                                    &completed.repository_id,
+                                    &completed.repository,
+                                    completed.pull_request,
+                                    &completed.head_sha,
+                                )
+                            },
+                        )
+                    })
+                    .is_ok();
+            if result_identity_valid {
+                actionable_producer.mark_ready(
                     &completed.repository,
                     completed.pull_request,
                     &completed.head_sha,
                 );
             } else {
-                actionable_producer.mark_ready(
+                actionable_producer.mark_uncertain(
                     &completed.repository,
                     completed.pull_request,
                     &completed.head_sha,
@@ -389,14 +411,23 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         let shadow_transitions = shadow_lane.tick(Instant::now());
         for observation in shadow_lane.take_completed_observations() {
             pending_steward_targets.insert((
+                observation.repository_provider,
+                observation.repository_id,
                 observation.repo,
                 observation.pr,
                 observation.expected_head_sha,
             ));
         }
         if !steward_in_flight
-            && let Some((repository, pull_request, head_sha)) = pending_steward_targets.pop_first()
+            && let Some((repository_provider, repository_id, repository, pull_request, head_sha)) =
+                pending_steward_targets.pop_first()
         {
+            let (Some(repository_provider), Some(repository_id)) =
+                (repository_provider, repository_id)
+            else {
+                actionable_producer.mark_uncertain(&repository, pull_request, &head_sha);
+                continue;
+            };
             let status = actionable_producer.mark_in_flight(&repository, pull_request, &head_sha);
             if let Ok(mut published) = actionable_producer_status.lock() {
                 *published = status;
@@ -406,7 +437,13 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                     ledger.map_or_else(
                         || Ok(None),
                         |ledger| {
-                            ledger.native_steward_base_ref(&repository, pull_request, &head_sha)
+                            ledger.native_steward_base_ref_for_repository(
+                                Some(&repository_provider),
+                                Some(&repository_id),
+                                &repository,
+                                pull_request,
+                                &head_sha,
+                            )
                         },
                     )
                 })
@@ -420,6 +457,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                     config.mode,
                     steward_paths.clone(),
                     steward_cwd.clone(),
+                    repository_provider,
+                    repository_id,
                     repository,
                     pull_request,
                     head_sha,
@@ -530,7 +569,10 @@ fn update_canary_runtime_health(
 }
 
 #[cfg(unix)]
-fn native_steward_inventory(state_dir: &Path) -> BTreeSet<(String, u64, String)> {
+#[allow(clippy::type_complexity)] // Preserve the complete durable repository target key.
+fn native_steward_inventory(
+    state_dir: &Path,
+) -> BTreeSet<(Option<String>, Option<String>, String, u64, String)> {
     WorkLedger::open_existing(state_dir)
         .and_then(|ledger| {
             ledger.map_or_else(|| Ok(Vec::new()), |ledger| ledger.native_steward_targets())
@@ -542,6 +584,8 @@ fn native_steward_inventory(state_dir: &Path) -> BTreeSet<(String, u64, String)>
 
 #[cfg(unix)]
 struct DaemonStewardResult {
+    repository_provider: String,
+    repository_id: String,
     repository: String,
     pull_request: u64,
     head_sha: String,
@@ -554,6 +598,8 @@ fn start_daemon_steward_worker(
     mode: RuntimeMode,
     runtime_paths: RuntimePaths,
     cwd: PathBuf,
+    repository_provider: String,
+    repository_id: String,
     repository: String,
     pull_request: u64,
     head_sha: String,
@@ -565,10 +611,14 @@ fn start_daemon_steward_worker(
             mode,
             &runtime_paths,
             &cwd,
+            &repository_provider,
+            &repository_id,
             &repository,
             &base_ref,
         );
         let _ = sender.send(DaemonStewardResult {
+            repository_provider,
+            repository_id,
             repository,
             pull_request,
             head_sha,

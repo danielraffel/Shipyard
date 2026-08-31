@@ -163,15 +163,19 @@ impl ActionableWakeProducer {
             );
             return;
         };
-        for (repository, pull_request, head_sha) in targets {
+        for (repository_provider, repository_id, repository, pull_request, head_sha) in targets {
             match crate::app::exact_steward_transition(
                 &self.state_dir,
+                repository_provider.as_deref(),
+                repository_id.as_deref(),
                 &repository,
                 pull_request,
                 &head_sha,
             ) {
                 Ok(crate::app::ExactStewardTransition::Terminal) => {
                     self.apply(
+                        repository_provider.as_deref(),
+                        repository_id.as_deref(),
                         &repository,
                         pull_request,
                         &head_sha,
@@ -181,6 +185,8 @@ impl ActionableWakeProducer {
                 }
                 Ok(crate::app::ExactStewardTransition::Actionable) => {
                     self.apply(
+                        repository_provider.as_deref(),
+                        repository_id.as_deref(),
                         &repository,
                         pull_request,
                         &head_sha,
@@ -209,16 +215,30 @@ impl ActionableWakeProducer {
     ) -> ActionableWakeProducerStatus {
         let transition = &evidence.transition;
         let Some(observation) = transition.observation.as_ref() else {
+            if transition.failure_class.as_deref() == Some("repository_identity") {
+                return self.record(
+                    transition.repo.clone(),
+                    transition.pr,
+                    transition.expected_head_sha.clone(),
+                    "error",
+                    Some("repository_identity_mismatch".to_owned()),
+                    false,
+                );
+            }
             // Fetch failure is not terminal authority. Only the steward's
             // durable resolved transition may suppress already queued work;
             // transient GitHub failures remain state-preserving.
             return match crate::app::exact_steward_transition(
                 &self.state_dir,
+                transition.repository_provider.as_deref(),
+                transition.repository_id.as_deref(),
                 &transition.repo,
                 transition.pr,
                 &transition.expected_head_sha,
             ) {
                 Ok(crate::app::ExactStewardTransition::Terminal) => self.apply(
+                    transition.repository_provider.as_deref(),
+                    transition.repository_id.as_deref(),
                     &transition.repo,
                     transition.pr,
                     &transition.expected_head_sha,
@@ -258,6 +278,8 @@ impl ActionableWakeProducer {
         );
         let Ok(steward) = crate::app::exact_steward_transition(
             &self.state_dir,
+            observation.repository_provider.as_deref(),
+            observation.repository_id.as_deref(),
             &observation.repo,
             observation.pr,
             &observation.expected_head_sha,
@@ -296,6 +318,8 @@ impl ActionableWakeProducer {
             }
         };
         self.apply(
+            observation.repository_provider.as_deref(),
+            observation.repository_id.as_deref(),
             &observation.repo,
             observation.pr,
             &observation.expected_head_sha,
@@ -304,8 +328,11 @@ impl ActionableWakeProducer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Exact repository identity is part of the mutation fence.
     fn apply(
         &mut self,
+        repository_provider: Option<&str>,
+        repository_id: Option<&str>,
         repository: &str,
         pull_request: u64,
         head_sha: &str,
@@ -323,7 +350,9 @@ impl ActionableWakeProducer {
                     })
                 },
                 |ledger| {
-                    ledger.apply_native_steward_disposition(
+                    ledger.apply_native_steward_disposition_for_repository(
+                        repository_provider,
+                        repository_id,
                         repository,
                         pull_request,
                         head_sha,
@@ -505,6 +534,8 @@ mod tests {
     fn evidence(failed_checks: u64) -> ShadowTransitionEvidence {
         let publication = request();
         let observation = ShadowObservation {
+            repository_provider: Some(publication.repository_provider.clone()),
+            repository_id: Some(publication.repository_id.clone()),
             repo: publication.repository.clone(),
             pr: publication.pull_request,
             expected_head_sha: publication.head_sha.clone(),
@@ -525,6 +556,8 @@ mod tests {
         ShadowTransitionEvidence {
             transition: ShadowObservationTransition {
                 kind: ShadowObservationTransitionKind::SnapshotChanged,
+                repository_provider: observation.repository_provider.clone(),
+                repository_id: observation.repository_id.clone(),
                 repo: observation.repo.clone(),
                 pr: observation.pr,
                 expected_head_sha: observation.expected_head_sha.clone(),
@@ -635,6 +668,33 @@ mod tests {
 
         let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
         assert_eq!(restarted.status(), terminal);
+    }
+
+    #[test]
+    fn repository_identity_failure_never_reaches_terminal_lookup_or_mutation() {
+        let state = tempfile::tempdir().expect("state");
+        let publication = request();
+        seed_repo_policy(state.path(), &publication.repository);
+        WorkLedger::plan_or_apply_native_continuation(
+            state.path(),
+            &publication,
+            &policy(vec![publication.repository.clone()]),
+            true,
+        )
+        .expect("publish managed handoff");
+        record_steward_transition(state.path(), "resolved");
+        let mut mismatched = evidence(1);
+        mismatched.transition.observation = None;
+        mismatched.transition.failure_class = Some("repository_identity".to_owned());
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        let status = producer.process(&mismatched);
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some("repository_identity_mismatch")
+        );
+        let ledger = WorkLedger::open_existing(state.path()).unwrap().unwrap();
+        assert_eq!(ledger.status().unwrap().pending_wakes, 0);
+        assert_eq!(ledger.native_steward_targets().unwrap().len(), 1);
     }
 
     #[test]

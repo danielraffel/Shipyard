@@ -10,16 +10,46 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 fn publication_actions(temp: &tempfile::TempDir, head: &str) -> GitHubActions {
-    let response = serde_json::json!({
+    let pull_response = serde_json::json!({
         "state": "OPEN",
         "headRefOid": head,
         "baseRefName": "main",
         "baseRefOid": "b".repeat(40),
     })
     .to_string();
-    let source = format!("fn main() {{ print!(\"{{}}\", {response:?}); }}");
+    let repository_response =
+        serde_json::json!({"id": "R_owner_repo", "nameWithOwner": "owner/repo"}).to_string();
+    let source = format!(
+        "fn main() {{ let repo = std::env::args().any(|arg| arg == \"repo\"); if repo {{ print!(\"{{}}\", {repository_response:?}); }} else {{ print!(\"{{}}\", {pull_response:?}); }} }}"
+    );
     let binary = crate::test_support::compile_native_test_program(temp.path(), "gh", &source);
     GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary)
+}
+
+#[test]
+fn native_steward_execution_requires_live_repository_id_and_coordinate() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = publication_actions(&temp, &"a".repeat(40));
+    verify_native_repository_identity(&actions, "github.com", "R_owner_repo", "owner/repo")
+        .expect("exact live identity");
+    assert!(
+        verify_native_repository_identity(
+            &actions,
+            "github.com",
+            "R_different_incarnation",
+            "owner/repo",
+        )
+        .is_err()
+    );
+    assert!(
+        verify_native_repository_identity(
+            &actions,
+            "github.com",
+            "R_owner_repo",
+            "owner/old-alias",
+        )
+        .is_err()
+    );
 }
 
 fn seed_repo_policy(paths: &RuntimePaths) {

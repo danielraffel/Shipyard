@@ -885,19 +885,8 @@ fn validate_launch_options(
 }
 
 fn validate_workstream_handle(value: &str) -> Result<(), ProviderWrapperRefusal> {
-    let Some((team, number)) = value.split_once('-') else {
-        return Err(refusal("fresh-resume workstream handle is invalid"));
-    };
-    if team.is_empty()
-        || team.len() > 16
-        || !team.bytes().all(|byte| byte.is_ascii_uppercase())
-        || number.is_empty()
-        || number.starts_with('0')
-        || !number.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(refusal("fresh-resume workstream handle is invalid"));
-    }
-    Ok(())
+    crate::work_ledger::validate_workstream_handle(value)
+        .map_err(|_| refusal("fresh-resume workstream handle is invalid"))
 }
 
 fn validate_repository(value: &str) -> Result<(), ProviderWrapperRefusal> {
@@ -1635,6 +1624,17 @@ mod tests {
             "outcome": {"status": "rejected", "launch_state": "not_accepted", "error_digest": digest("error"), "extra": true}
         });
         assert!(serde_json::from_value::<ProviderWrapperResponseV1>(response).is_err());
+    }
+
+    #[test]
+    fn resume_expectation_requires_canonical_gen_handle() {
+        for noncanonical in ["PULP-43", "GEN-0", "GEN-01", "GEN-43 "] {
+            assert!(
+                validate_workstream_handle(noncanonical).is_err(),
+                "{noncanonical}"
+            );
+        }
+        assert!(validate_workstream_handle("GEN-43").is_ok());
     }
 
     #[test]

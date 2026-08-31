@@ -183,6 +183,81 @@ fn policy_json_always_reports_shadow_activation_and_dispatch() {
 }
 
 #[test]
+fn inventory_command_emits_bounded_empty_json_without_creating_state() {
+    let temp = TempDir::new().expect("temp");
+    let state = temp.path().join("absent-state");
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Shipyard,
+        Some(temp.path().join("global")),
+        Some(state.clone()),
+    );
+    let mut output = Vec::new();
+
+    work_ledger_command(
+        &WorkLedgerCommand::Inventory,
+        &paths,
+        temp.path(),
+        true,
+        &mut output,
+    )
+    .expect("inventory command");
+
+    let value: Value = serde_json::from_slice(&output).expect("inventory JSON");
+    assert_eq!(value["complete"], true);
+    assert_eq!(value["truncated"], false);
+    assert_eq!(value["limit"], 256);
+    assert_eq!(value["items"], serde_json::json!([]));
+    assert!(!state.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn inventory_human_output_names_immutable_repository_and_canonical_workstream() {
+    let temp = TempDir::new().expect("temp");
+    let state = temp.path().join("state");
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Shipyard,
+        Some(temp.path().join("global")),
+        Some(state.clone()),
+    );
+    let request = crate::work_ledger::native_publication_test_request();
+    let policy =
+        crate::work_ledger::native_publication_test_policy(vec![request.repository.clone()]);
+    let ledger = WorkLedger::open(&state).expect("ledger");
+    ledger
+        .set_repo_policy(
+            &RepoPolicy {
+                repo: request.repository.clone(),
+                primary_platform: "macos".to_owned(),
+                compatibility_mode: "independent".to_owned(),
+                compatibility_lanes: vec!["linux".to_owned()],
+                blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                declared_dependency_lanes: Vec::new(),
+                revision: 0,
+            },
+            0,
+        )
+        .expect("repository policy");
+    WorkLedger::plan_or_apply_native_continuation(&state, &request, &policy, true)
+        .expect("native publication");
+    let mut output = Vec::new();
+
+    work_ledger_command(
+        &WorkLedgerCommand::Inventory,
+        &paths,
+        temp.path(),
+        false,
+        &mut output,
+    )
+    .expect("inventory command");
+
+    let rendered = String::from_utf8(output).expect("human inventory");
+    assert!(rendered.contains("github.com:R_test_repository:owner/repo#43"));
+    assert!(rendered.contains("workstream=GEN-43"));
+    assert_eq!(rendered.lines().count(), 2);
+}
+
+#[test]
 fn publication_json_is_stable_and_exposes_no_private_profile() {
     let report = NativePublicationReport {
         applied: false,

@@ -6,6 +6,27 @@ use super::route::{
 use super::*;
 use tempfile::TempDir;
 
+#[test]
+fn canonical_workstream_handle_is_exactly_gen_with_a_positive_decimal_number() {
+    for valid in ["GEN-1", "GEN-43", "GEN-999999999999999999"] {
+        validate_workstream_handle(valid).expect(valid);
+    }
+    for invalid in [
+        "GEN-0",
+        "GEN-01",
+        "gen-1",
+        "ABC-1",
+        "GEN1",
+        "GEN-1-extra",
+        "GEN-1\nspoof",
+    ] {
+        assert!(
+            validate_workstream_handle(invalid).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+}
+
 fn sample_candidate() -> ImportCandidate {
     candidate(
         "resume_record",

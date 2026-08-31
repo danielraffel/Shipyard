@@ -232,6 +232,9 @@ fn uncertain_submit_then_unavailable_reconcile_survives_reopen_on_one_fence() {
         }),
     };
     let publication = NativePublicationRequest {
+        repository_provider: "github.com".to_owned(),
+        repository_id: "R_test_shipyard".to_owned(),
+        legacy_repository_alias: None,
         repository: "generous-corp/shipyard".to_owned(),
         pull_request: 43,
         head_sha: "4".repeat(40),

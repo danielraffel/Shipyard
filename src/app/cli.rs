@@ -580,6 +580,8 @@ pub(super) enum Command {
 pub(super) enum WorkLedgerCommand {
     /// Show schema, integrity, and redacted lifecycle counts without creating storage.
     Status,
+    /// List a bounded immutable view of local work without taking writer custody.
+    Inventory,
     /// Show exact durable custody states; no state named "read" is inferred.
     #[command(name = "custody-status")]
     CustodyStatus,

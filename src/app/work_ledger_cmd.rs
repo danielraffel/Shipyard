@@ -15,7 +15,8 @@ use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
 use crate::work_ledger::{
     AgentReturnExpectation, CustodyStatus, NativePublicationReport, RepoPolicy, WorkLedger,
-    absent_status, apply_legacy_snapshot, plan_legacy_snapshot, validate_repo_policy,
+    absent_status, apply_legacy_snapshot, local_work_inventory, plan_legacy_snapshot,
+    validate_repo_policy,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 
@@ -87,6 +88,51 @@ pub(super) fn work_ledger_command<W: Write>(
                     writeln!(stdout, "Continuation runtime reason: {reason_code}")
                         .map_err(failure)?;
                 }
+            }
+        }
+        WorkLedgerCommand::Inventory => {
+            let inventory = local_work_inventory(state_dir).map_err(failure)?;
+            if json {
+                write_pretty_json(stdout, &inventory).map_err(failure)?;
+            } else {
+                for item in &inventory.items {
+                    let ownership = match (
+                        item.ownership_id.as_deref(),
+                        item.ownership_state.as_deref(),
+                        item.ownership_work_generation,
+                        item.ownership_owner_generation,
+                    ) {
+                        (Some(id), Some(state), Some(work), Some(owner)) => {
+                            format!("{id}:{state}:{work}/{owner}")
+                        }
+                        _ => "none".to_owned(),
+                    };
+                    writeln!(
+                        stdout,
+                        "{}:{}:{}#{} {} {} workstream={} work={} generation={}/{} owner={} ownership={}",
+                        item.repository_provider.as_deref().unwrap_or("unknown-provider"),
+                        item.repository_id.as_deref().unwrap_or("unknown-repository-id"),
+                        item.repository,
+                        item.pull_request,
+                        item.exact_head,
+                        item.state,
+                        item.workstream_handle,
+                        item.work_item_id,
+                        item.work_generation,
+                        item.owner_generation,
+                        item.owner_id.as_deref().unwrap_or("none"),
+                        ownership,
+                    )
+                    .map_err(failure)?;
+                }
+                writeln!(
+                    stdout,
+                    "Inventory: {} item(s), limit={}, complete={}",
+                    inventory.items.len(),
+                    inventory.limit,
+                    inventory.complete
+                )
+                .map_err(failure)?;
             }
         }
         WorkLedgerCommand::CustodyStatus => {

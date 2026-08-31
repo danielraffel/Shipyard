@@ -77,6 +77,10 @@ pub struct ShadowWebhookScope {
 /// One normalized, read-only GitHub snapshot for an exact ledger head.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ShadowObservation {
+    /// Authenticated repository provider carried from the ledger binding.
+    pub repository_provider: Option<String>,
+    /// Provider-scoped immutable repository identity carried from the ledger binding.
+    pub repository_id: Option<String>,
     /// Canonical repository.
     pub repo: String,
     /// Pull-request number.
@@ -128,6 +132,10 @@ pub enum ShadowObservationTransitionKind {
 pub struct ShadowObservationTransition {
     /// Transition classification.
     pub kind: ShadowObservationTransitionKind,
+    /// Authenticated repository provider carried from the selected target.
+    pub repository_provider: Option<String>,
+    /// Provider-scoped immutable repository identity carried from the selected target.
+    pub repository_id: Option<String>,
     /// Canonical repository.
     pub repo: String,
     /// Pull-request number.
@@ -147,6 +155,10 @@ pub struct ShadowObservationTransition {
 /// One failed read boundary, redacted to exact target and stable class.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ShadowFetchFailure {
+    /// Authenticated repository provider carried from the selected target.
+    pub repository_provider: Option<String>,
+    /// Provider-scoped immutable repository identity carried from the selected target.
+    pub repository_id: Option<String>,
     /// Canonical repository.
     pub repo: String,
     /// Pull-request number.
@@ -201,6 +213,7 @@ pub struct ShadowObservationReport {
 
 /// In-memory timing, debounce, and transition state for the shadow daemon lane.
 #[derive(Debug)]
+#[allow(clippy::type_complexity)] // Maps are keyed by complete immutable repository targets.
 pub struct ShadowScheduler {
     next_catch_up_at: Instant,
     webhook_due_at: Option<Instant>,
@@ -208,9 +221,9 @@ pub struct ShadowScheduler {
     pending_webhooks: BTreeSet<ShadowWebhookScope>,
     periodic_cursor: usize,
     in_flight: bool,
-    snapshots: BTreeMap<(String, u64, String), String>,
-    failed_targets: BTreeMap<(String, u64, String), (String, u64)>,
-    target_cooldowns: BTreeMap<(String, u64, String), Instant>,
+    snapshots: BTreeMap<(Option<String>, Option<String>, String, u64, String), String>,
+    failed_targets: BTreeMap<(Option<String>, Option<String>, String, u64, String), (String, u64)>,
+    target_cooldowns: BTreeMap<(Option<String>, Option<String>, String, u64, String), Instant>,
     api_window: VecDeque<(Instant, usize)>,
 }
 
@@ -513,7 +526,13 @@ impl ShadowScheduler {
                     .iter()
                     .filter(|target| scopes.iter().any(|scope| scope.matches(target)))
                 {
-                    let key = (target.repo.clone(), target.pr, target.head_sha.clone());
+                    let key = (
+                        target.repository_provider.clone(),
+                        target.repository_id.clone(),
+                        target.repo.clone(),
+                        target.pr,
+                        target.head_sha.clone(),
+                    );
                     if let Some(last) = self.target_cooldowns.get(&key)
                         && now.duration_since(*last) < SHADOW_TARGET_COOLDOWN
                     {
@@ -548,7 +567,13 @@ impl ShadowScheduler {
                     .collect::<Vec<_>>();
                 for target in &selected {
                     self.target_cooldowns.insert(
-                        (target.repo.clone(), target.pr, target.head_sha.clone()),
+                        (
+                            target.repository_provider.clone(),
+                            target.repository_id.clone(),
+                            target.repo.clone(),
+                            target.pr,
+                            target.head_sha.clone(),
+                        ),
                         now,
                     );
                 }
@@ -571,7 +596,13 @@ impl ShadowScheduler {
                 self.periodic_cursor = (self.periodic_cursor + count) % targets.len();
                 for target in &selected {
                     self.target_cooldowns.insert(
-                        (target.repo.clone(), target.pr, target.head_sha.clone()),
+                        (
+                            target.repository_provider.clone(),
+                            target.repository_id.clone(),
+                            target.repo.clone(),
+                            target.pr,
+                            target.head_sha.clone(),
+                        ),
                         now,
                     );
                 }
@@ -591,7 +622,15 @@ impl ShadowScheduler {
     fn retain_targets(&mut self, targets: &[ShadowPrTarget]) {
         let live = targets
             .iter()
-            .map(|target| (target.repo.clone(), target.pr, target.head_sha.clone()))
+            .map(|target| {
+                (
+                    target.repository_provider.clone(),
+                    target.repository_id.clone(),
+                    target.repo.clone(),
+                    target.pr,
+                    target.head_sha.clone(),
+                )
+            })
             .collect::<BTreeSet<_>>();
         self.snapshots.retain(|key, _| live.contains(key));
         self.failed_targets.retain(|key, _| live.contains(key));
@@ -619,6 +658,8 @@ impl ShadowScheduler {
         let mut transitions = Vec::new();
         for observation in &report.observations {
             let key = (
+                observation.repository_provider.clone(),
+                observation.repository_id.clone(),
                 observation.repo.clone(),
                 observation.pr,
                 observation.expected_head_sha.clone(),
@@ -630,9 +671,11 @@ impl ShadowScheduler {
             {
                 previous if recovered => transitions.push(ShadowObservationTransition {
                     kind: ShadowObservationTransitionKind::FetchRecovered,
-                    repo: key.0,
-                    pr: key.1,
-                    expected_head_sha: key.2,
+                    repository_provider: key.0,
+                    repository_id: key.1,
+                    repo: key.2,
+                    pr: key.3,
+                    expected_head_sha: key.4,
                     policy_revision: observation.policy_revision,
                     observation: Some(observation.clone()),
                     previous_snapshot_digest: previous,
@@ -641,9 +684,11 @@ impl ShadowScheduler {
                 Some(previous) if previous != observation.snapshot_digest => {
                     transitions.push(ShadowObservationTransition {
                         kind: ShadowObservationTransitionKind::SnapshotChanged,
-                        repo: key.0,
-                        pr: key.1,
-                        expected_head_sha: key.2,
+                        repository_provider: key.0,
+                        repository_id: key.1,
+                        repo: key.2,
+                        pr: key.3,
+                        expected_head_sha: key.4,
                         policy_revision: observation.policy_revision,
                         observation: Some(observation.clone()),
                         previous_snapshot_digest: Some(previous),
@@ -655,6 +700,8 @@ impl ShadowScheduler {
         }
         for failure in &report.failures {
             let key = (
+                failure.repository_provider.clone(),
+                failure.repository_id.clone(),
                 failure.repo.clone(),
                 failure.pr,
                 failure.expected_head_sha.clone(),
@@ -671,9 +718,11 @@ impl ShadowScheduler {
                 let previous_snapshot_digest = self.snapshots.get(&key).cloned();
                 transitions.push(ShadowObservationTransition {
                     kind: ShadowObservationTransitionKind::FetchFailed,
-                    repo: key.0,
-                    pr: key.1,
-                    expected_head_sha: key.2,
+                    repository_provider: key.0,
+                    repository_id: key.1,
+                    repo: key.2,
+                    pr: key.3,
+                    expected_head_sha: key.4,
                     policy_revision: failure.policy_revision,
                     observation: None,
                     previous_snapshot_digest,
@@ -800,7 +849,12 @@ pub fn observe_targets(
                 .into_iter()
                 .map(|handle| match handle.join() {
                     Ok(Ok(rollup)) => ShadowFetchResult {
-                        result: Ok((rollup.head_sha, rollup.checks)),
+                        result: Ok(AuthenticatedShadowSnapshot {
+                            repository_id: rollup.repository_id,
+                            repository: rollup.repository,
+                            head_sha: rollup.head_sha,
+                            checks: rollup.checks,
+                        }),
                         api_requests: rollup.api_requests,
                     },
                     Ok(Err(ProvenancedFetchError {
@@ -838,7 +892,12 @@ where
     let results = targets
         .iter()
         .map(|target| {
-            let result = fetch(target);
+            let result = fetch(target).map(|(head_sha, checks)| AuthenticatedShadowSnapshot {
+                repository_id: target.repository_id.clone().unwrap_or_default(),
+                repository: target.repo.clone(),
+                head_sha,
+                checks,
+            });
             let api_requests = usize::from(!matches!(
                 result,
                 Err(ReconcileFetchError::Prepare(_) | ReconcileFetchError::Spawn(_))
@@ -852,8 +911,46 @@ where
     observation_report(trigger, targets, results, started.elapsed())
 }
 
+/// Observe selected targets with an injected authenticated repository boundary.
+#[cfg(test)]
+fn observe_targets_with_repository_identity<F>(
+    trigger: ShadowTrigger,
+    targets: &[ShadowPrTarget],
+    mut fetch: F,
+) -> ShadowObservationReport
+where
+    F: FnMut(&ShadowPrTarget) -> Result<(String, String, String, Vec<Value>), ReconcileFetchError>,
+{
+    let started = Instant::now();
+    let results = targets
+        .iter()
+        .map(|target| {
+            let result = fetch(target).map(|(repository_id, repository, head_sha, checks)| {
+                AuthenticatedShadowSnapshot {
+                    repository_id,
+                    repository,
+                    head_sha,
+                    checks,
+                }
+            });
+            ShadowFetchResult {
+                result,
+                api_requests: 1,
+            }
+        })
+        .collect::<Vec<_>>();
+    observation_report(trigger, targets, results, started.elapsed())
+}
+
+struct AuthenticatedShadowSnapshot {
+    repository_id: String,
+    repository: String,
+    head_sha: String,
+    checks: Vec<Value>,
+}
+
 struct ShadowFetchResult {
-    result: Result<(String, Vec<Value>), ReconcileFetchError>,
+    result: Result<AuthenticatedShadowSnapshot, ReconcileFetchError>,
     api_requests: usize,
 }
 
@@ -868,10 +965,25 @@ fn observation_report(
     let mut failures = Vec::new();
     for (target, fetch) in targets.iter().zip(results) {
         match fetch.result {
-            Ok((observed_head, checks)) => {
-                observations.push(observation(target, observed_head, &checks));
+            Ok(snapshot)
+                if target.repository_provider.as_deref() == Some("github.com")
+                    && target.repository_id.as_deref() == Some(snapshot.repository_id.as_str())
+                    && target.repo == snapshot.repository =>
+            {
+                observations.push(observation(target, snapshot.head_sha, &snapshot.checks));
             }
+            Ok(_) => failures.push(ShadowFetchFailure {
+                repository_provider: target.repository_provider.clone(),
+                repository_id: target.repository_id.clone(),
+                repo: target.repo.clone(),
+                pr: target.pr,
+                expected_head_sha: target.head_sha.clone(),
+                policy_revision: target.policy.revision,
+                failure_class: "repository_identity".to_owned(),
+            }),
             Err(error) => failures.push(ShadowFetchFailure {
+                repository_provider: target.repository_provider.clone(),
+                repository_id: target.repository_id.clone(),
                 repo: target.repo.clone(),
                 pr: target.pr,
                 expected_head_sha: target.head_sha.clone(),
@@ -983,6 +1095,7 @@ fn fetch_failure_class(error: &ReconcileFetchError) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Digest construction stays adjacent to its normalized fields.
 fn observation(
     target: &ShadowPrTarget,
     observed_head_sha: String,
@@ -1027,6 +1140,16 @@ fn observation(
     }
     let mut ledger_hasher = Sha256::new();
     ledger_hasher.update(target.repo.as_bytes());
+    ledger_hasher.update(
+        target
+            .repository_provider
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    ledger_hasher.update([0]);
+    ledger_hasher.update(target.repository_id.as_deref().unwrap_or("").as_bytes());
+    ledger_hasher.update([0]);
     ledger_hasher.update(target.pr.to_le_bytes());
     ledger_hasher.update(target.head_sha.as_bytes());
     ledger_hasher.update(target.work_items.to_le_bytes());
@@ -1063,6 +1186,8 @@ fn observation(
     combined_hasher.update(ledger_digest.as_bytes());
     combined_hasher.update(github_digest.as_bytes());
     ShadowObservation {
+        repository_provider: target.repository_provider.clone(),
+        repository_id: target.repository_id.clone(),
         repo: target.repo.clone(),
         pr: target.pr,
         expected_head_sha: target.head_sha.clone(),
@@ -1141,6 +1266,8 @@ mod tests {
 
     fn target(repo: &str, pr: u64, head: char) -> ShadowPrTarget {
         ShadowPrTarget {
+            repository_provider: Some("github.com".to_owned()),
+            repository_id: Some(format!("R_{}", repo.replace('/', "_"))),
             repo: repo.to_owned(),
             pr,
             head_sha: head.to_string().repeat(40),
@@ -1430,6 +1557,44 @@ mod tests {
         );
         assert_eq!(report.model_calls, 0);
         assert!(!report.dispatch_enabled);
+    }
+
+    #[test]
+    fn stale_alias_with_different_repository_identity_produces_no_observation() {
+        let target = target("owner/old-name", 43, 'a');
+        let expected_id = target.repository_id.clone().expect("repository ID");
+        let wrong_id = observe_targets_with_repository_identity(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&target),
+            |_| {
+                Ok((
+                    "R_different_incarnation".to_owned(),
+                    target.repo.clone(),
+                    target.head_sha.clone(),
+                    Vec::new(),
+                ))
+            },
+        );
+        assert!(wrong_id.observations.is_empty());
+        assert_eq!(wrong_id.failures[0].failure_class, "repository_identity");
+
+        let redirected_coordinate = observe_targets_with_repository_identity(
+            ShadowTrigger::PeriodicCatchUp,
+            std::slice::from_ref(&target),
+            |_| {
+                Ok((
+                    expected_id.clone(),
+                    "owner/new-name".to_owned(),
+                    target.head_sha.clone(),
+                    Vec::new(),
+                ))
+            },
+        );
+        assert!(redirected_coordinate.observations.is_empty());
+        assert_eq!(
+            redirected_coordinate.failures[0].failure_class,
+            "repository_identity"
+        );
     }
 
     #[test]

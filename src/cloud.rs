@@ -956,12 +956,20 @@ impl GitHubActions {
             .gh
             .as_ref()
             .map_err(|error| GitHubError::new(error.clone()))?;
+        #[cfg(test)]
+        let auth_policy = if self.gh_binary_override.is_some() {
+            GhAuthPolicy::AmbientOnly
+        } else {
+            GhAuthPolicy::Default
+        };
+        #[cfg(not(test))]
+        let auth_policy = GhAuthPolicy::Default;
         client
             .prepare_command(
                 &self.cwd,
                 self.gh_binary_override.as_deref(),
                 GhSupervision::Unsupervised,
-                GhAuthPolicy::Default,
+                auth_policy,
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
@@ -974,12 +982,20 @@ impl GitHubActions {
             .gh
             .as_ref()
             .map_err(|error| GitHubError::new(error.clone()))?;
+        #[cfg(test)]
+        let auth_policy = if self.gh_binary_override.is_some() {
+            GhAuthPolicy::AmbientOnly
+        } else {
+            GhAuthPolicy::Default
+        };
+        #[cfg(not(test))]
+        let auth_policy = GhAuthPolicy::Default;
         client
             .prepare_command_with_auth_timeout(
                 &self.cwd,
                 self.gh_binary_override.as_deref(),
                 GhSupervision::Unsupervised,
-                GhAuthPolicy::Default,
+                auth_policy,
                 timeout,
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))

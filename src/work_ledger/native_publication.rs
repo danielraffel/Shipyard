@@ -32,6 +32,10 @@ use crate::workstream_continuation_config::WorkstreamContinuationConfig;
 /// Complete normalized authority needed to publish one native continuation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativePublicationRequest {
+    pub(crate) repository_provider: String,
+    pub(crate) repository_id: String,
+    /// Prior canonical coordinate authenticated by a provider stable-ID redirect.
+    pub(crate) legacy_repository_alias: Option<String>,
     pub(crate) repository: String,
     pub(crate) pull_request: u64,
     pub(crate) head_sha: String,
@@ -83,12 +87,42 @@ pub(crate) struct NativePublicationReport {
 #[serde(deny_unknown_fields)]
 struct NativePolicyBindingV1 {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_id: Option<String>,
     repository: String,
     pull_request: u64,
     head_sha: String,
     repo_policy_revision: u64,
     work_id: String,
 }
+
+type LegacyProjectionBinding = (
+    String,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
+type RepositoryCoordinateBinding = (
+    String,
+    String,
+    String,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    String,
+    String,
+);
 
 /// Exact protected-profile lookup used by the daemon's typed decoder.
 pub(crate) struct ExactProtectedProfileResolver<'a, D> {
@@ -177,11 +211,14 @@ impl WorkLedger {
             WorkLedgerError::Refused("explicit repository policy is unavailable".to_owned())
         })?;
         ledger.verify_repo_policy_revision(&request.repository, request.repo_policy_revision)?;
-        let report = ledger.publish_native_continuation(request, policy, apply)?;
         if apply {
-            persist_native_policy_binding(state_dir, request, &report)?;
+            let planned = ledger.publish_native_continuation(request, policy, false)?;
+            // The v2 policy authority must be durable before the SQLite identity can
+            // be enriched or moved. A crash can leave a harmless policy precursor,
+            // never an enriched database that lacks its policy fence.
+            persist_native_policy_binding(state_dir, request, &planned)?;
         }
-        Ok(report)
+        ledger.publish_native_continuation(request, policy, apply)
     }
 
     /// Plan or apply one exact native publication. Replays return the same IDs.
@@ -192,50 +229,267 @@ impl WorkLedger {
         apply: bool,
     ) -> WorkLedgerResult<NativePublicationReport> {
         validate_request(request, policy)?;
-        let identities = PublicationIdentities::new(request);
-        let replay = self.publication_is_exact(request, &identities)?;
-        let report = NativePublicationReport {
-            applied: apply && !replay,
-            replay,
-            work_id: identities.work_id.clone(),
-            route_ref: identities.route_ref.clone(),
-            wake_id: identities.wake_id.clone(),
-            profile_digest: request.profile_digest.clone(),
-            repo_policy_revision: request.repo_policy_revision,
-        };
+        let (identities, legacy_identity) = self.select_publication_identities(request)?;
+        let was_exact = self.publication_is_exact(request, &identities)?;
         if !apply {
-            return Ok(report);
-        }
-        if replay {
-            self.verify_exact_shadow_target(request)?;
-            return Ok(report);
+            return Ok(native_publication_report(
+                request,
+                &identities,
+                false,
+                was_exact,
+            ));
         }
 
-        self.ensure_native_work_item(request, &identities)?;
-        self.ensure_projection_binding(request, &identities.work_id)?;
-        self.ensure_continuations(request, &identities.work_id)?;
-        self.advance_to_managed(&identities.work_id, request.owner_generation)?;
+        if !was_exact {
+            self.ensure_native_work_item(request, &identities)?;
+            if !legacy_identity {
+                self.ensure_projection_binding(request, &identities.work_id)?;
+            }
+            self.ensure_continuations(request, &identities.work_id)?;
+            self.advance_to_managed(&identities.work_id, request.owner_generation)?;
 
-        let (route, adapters) = native_route(request, policy, &identities)?;
-        for adapter in &adapters {
-            self.ensure_adapter(adapter)?;
+            let (route, adapters) = native_route(request, policy, &identities)?;
+            for adapter in &adapters {
+                self.ensure_adapter(adapter)?;
+            }
+            self.ensure_route(&route)?;
+            self.put_protected_object(
+                &identities.work_id,
+                super::ProtectedObjectKind::LaunchProfile,
+                Some(&identities.profile_ref),
+                &request.profile_digest,
+                &request.protected_profile_bytes,
+            )?;
         }
-        self.ensure_route(&route)?;
-        self.put_protected_object(
-            &identities.work_id,
-            super::ProtectedObjectKind::LaunchProfile,
-            Some(&identities.profile_ref),
-            &request.profile_digest,
-            &request.protected_profile_bytes,
-        )?;
 
         if !self.publication_is_exact(request, &identities)? {
             return Err(WorkLedgerError::Refused(
                 "native publication was not exact after apply".to_owned(),
             ));
         }
+        let enriched = legacy_identity
+            && self.enrich_legacy_projection_repository_identity(
+                &identities.work_id,
+                &request.workstream_handle,
+                &request.plan_sha256,
+                request.root_revision,
+                request.issue_revision,
+                request.projection_revision,
+                request.material_event_revision,
+                &request.repository_provider,
+                &request.repository_id,
+                request
+                    .legacy_repository_alias
+                    .as_deref()
+                    .unwrap_or(&request.repository),
+                &request.repository,
+                &request.head_sha,
+                &identities.publication_digest,
+                &identities.route_ref,
+                &identities.profile_ref,
+                &request.profile_digest,
+                &request.success_continuation_digest,
+                &request.failure_continuation_digest,
+                request.pull_request,
+                request.owner_generation,
+            )?;
+        let coordinate_changed =
+            self.reconcile_projection_repository_coordinate(request, &identities.work_id)?;
         self.verify_exact_shadow_target(request)?;
-        Ok(report)
+        Ok(native_publication_report(
+            request,
+            &identities,
+            !was_exact || enriched || coordinate_changed,
+            was_exact && !enriched && !coordinate_changed,
+        ))
+    }
+
+    #[allow(clippy::too_many_lines)] // Legacy and immutable identity selection share one refusal boundary.
+    fn select_publication_identities(
+        &self,
+        request: &NativePublicationRequest,
+    ) -> WorkLedgerResult<(PublicationIdentities, bool)> {
+        let current = PublicationIdentities::new(request);
+        let mut legacy_request = request.clone();
+        if let Some(alias) = &request.legacy_repository_alias {
+            legacy_request.repository.clone_from(alias);
+        }
+        let requested_legacy = PublicationIdentities::legacy(&legacy_request);
+        let requested_legacy_work_id = requested_legacy.work_id.clone();
+        let connection = self.connect_read_only()?;
+        let current_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = ?1)",
+            [&current.work_id],
+            |row| row.get(0),
+        )?;
+        let requested_legacy_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = ?1)",
+            [&requested_legacy.work_id],
+            |row| row.get(0),
+        )?;
+        let mut identity_statement = connection.prepare(
+            "SELECT binding.work_item_id, import.source_ref, work.source_digest,
+                    route.route_ref, profile.profile_ref
+               FROM workstream_projection_bindings binding
+               JOIN work_items work ON work.id = binding.work_item_id
+               JOIN imports import
+                 ON import.work_item_id = work.id AND import.content_digest = work.source_digest
+               JOIN route_records route ON route.work_item_id = work.id
+               JOIN protected_objects profile
+                 ON profile.work_item_id = work.id AND profile.kind = 'launch_profile'
+              WHERE binding.repository_provider = ?1 AND binding.repository_id = ?2
+                AND binding.workstream_handle = ?3 AND work.pr = ?4
+                AND binding.exact_head = ?5 AND binding.work_item_id != ?6
+              ORDER BY binding.work_item_id LIMIT 2",
+        )?;
+        let identity_candidates = identity_statement
+            .query_map(
+                params![
+                    request.repository_provider,
+                    request.repository_id,
+                    request.workstream_handle,
+                    request.pull_request,
+                    request.head_sha,
+                    current.work_id,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if identity_candidates.len() > 1 {
+            return Err(WorkLedgerError::Refused(
+                "immutable repository identity resolves to multiple legacy publications".to_owned(),
+            ));
+        }
+        let legacy = if requested_legacy_exists {
+            Some(requested_legacy)
+        } else if let Some((work_id, source_ref, publication_digest, route_ref, profile_ref)) =
+            identity_candidates.first()
+        {
+            let expected_profile_ref =
+                OpaqueRef::derive("launch-profile", request.profile_digest.as_bytes())
+                    .as_str()
+                    .to_owned();
+            if profile_ref != &expected_profile_ref {
+                return Err(WorkLedgerError::Refused(
+                    "immutable repository identity resolves to different launch authority"
+                        .to_owned(),
+                ));
+            }
+            let wake_id = opaque_ref(
+                "wake",
+                &format!(
+                    "{}\n{}\n{}\n{}\n{}",
+                    work_id, 6, request.owner_generation, route_ref, request.profile_digest,
+                ),
+            );
+            Some(PublicationIdentities {
+                work_id: work_id.clone(),
+                source_ref: source_ref.clone(),
+                route_ref: route_ref.clone(),
+                profile_ref: profile_ref.clone(),
+                wake_id,
+                publication_digest: publication_digest.clone(),
+            })
+        } else {
+            None
+        };
+        if let Some(legacy) = &legacy {
+            let legacy_binding: Option<LegacyProjectionBinding> = connection
+                .query_row(
+                    "SELECT workstream_handle, plan_sha256, root_revision, issue_revision,
+                            projection_revision, material_event_revision, repository_provider,
+                            repository_id, repository, exact_head
+                       FROM workstream_projection_bindings WHERE work_item_id = ?1",
+                    [&legacy.work_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some(binding) = legacy_binding else {
+                return Err(WorkLedgerError::Refused(
+                    "legacy native publication lacks its projection identity".to_owned(),
+                ));
+            };
+            let repository_identity_matches = match (&binding.6, &binding.7) {
+                (None, None) => {
+                    binding.8
+                        == request
+                            .legacy_repository_alias
+                            .as_deref()
+                            .unwrap_or(&request.repository)
+                }
+                (Some(provider), Some(identity)) => {
+                    provider == &request.repository_provider && identity == &request.repository_id
+                }
+                _ => false,
+            };
+            if binding.0 != request.workstream_handle
+                || binding.1 != request.plan_sha256
+                || binding.2 != request.root_revision
+                || binding.3 != request.issue_revision
+                || binding.4 != request.projection_revision
+                || binding.5 != request.material_event_revision
+                || !repository_identity_matches
+                || binding.9 != request.head_sha
+            {
+                return Err(WorkLedgerError::Refused(
+                    "legacy native publication projection identity disagrees".to_owned(),
+                ));
+            }
+        }
+        let unproven_legacy_coordinate: bool = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM workstream_projection_bindings binding
+               JOIN work_items work ON work.id = binding.work_item_id
+                WHERE binding.repository_provider IS NULL AND binding.repository_id IS NULL
+                  AND binding.workstream_handle = ?1 AND work.pr = ?2
+                  AND binding.exact_head = ?3 AND binding.work_item_id != ?4
+             )",
+            params![
+                request.workstream_handle,
+                request.pull_request,
+                request.head_sha,
+                legacy
+                    .as_ref()
+                    .map_or(requested_legacy_work_id.as_str(), |value| {
+                        value.work_id.as_str()
+                    }),
+            ],
+            |row| row.get(0),
+        )?;
+        if unproven_legacy_coordinate {
+            return Err(WorkLedgerError::Refused(
+                "legacy native publication coordinate equivalence is unproven".to_owned(),
+            ));
+        }
+        match (current_exists, legacy) {
+            (true, Some(_)) => Err(WorkLedgerError::Refused(
+                "native publication has overlapping legacy and immutable repository identities"
+                    .to_owned(),
+            )),
+            (true | false, None) => Ok((current, false)),
+            (false, Some(legacy)) => Ok((legacy, true)),
+        }
     }
 
     pub(crate) fn protected_launch_profile_bytes(
@@ -320,6 +574,8 @@ impl WorkLedger {
             request.issue_revision,
             request.projection_revision,
             request.material_event_revision,
+            &request.repository_provider,
+            &request.repository_id,
             &request.repository,
             &request.head_sha,
         )
@@ -396,7 +652,7 @@ impl WorkLedger {
             .map_err(Into::into)
     }
 
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     fn ensure_adapter(&self, adapter: &AdapterBindingRecord) -> WorkLedgerResult<()> {
         let connection = self.connect_read_only()?;
         let existing: Option<(String, String, u64, u64, String, String, String, String)> =
@@ -457,7 +713,7 @@ impl WorkLedger {
         }
     }
 
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     fn publication_is_exact(
         &self,
         request: &NativePublicationRequest,
@@ -495,10 +751,37 @@ impl WorkLedger {
             || pr != Some(request.pull_request)
             || head.as_deref() != Some(request.head_sha.as_str())
             || owner_generation != request.owner_generation
-            || repo != request.repository
         {
             return Err(WorkLedgerError::Refused(
                 "native publication work identity collides".to_owned(),
+            ));
+        }
+        let binding: Option<(Option<String>, Option<String>, String, String)> = connection
+            .query_row(
+                "SELECT repository_provider, repository_id, repository, exact_head
+                   FROM workstream_projection_bindings WHERE work_item_id = ?1",
+                [&identities.work_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((repository_provider, repository_id, binding_repository, binding_head)) = binding
+        else {
+            return Ok(false);
+        };
+        let repository_identity_matches =
+            match (repository_provider.as_deref(), repository_id.as_deref()) {
+                (None, None) => true,
+                (Some(provider), Some(identity)) => {
+                    provider == request.repository_provider && identity == request.repository_id
+                }
+                _ => false,
+            };
+        if !repository_identity_matches
+            || binding_repository != repo
+            || binding_head != request.head_sha
+        {
+            return Err(WorkLedgerError::Refused(
+                "native publication repository identity collides".to_owned(),
             ));
         }
         if !matches!(
@@ -511,6 +794,22 @@ impl WorkLedger {
                 | "returned"
                 | "terminal"
         ) {
+            return Ok(false);
+        }
+        let exact_continuations: bool = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM continuation_contracts
+                WHERE work_item_id = ?1 AND success_contract_digest = ?2
+                  AND failure_contract_digest = ?3 AND revision = 1
+             )",
+            params![
+                identities.work_id,
+                request.success_continuation_digest,
+                request.failure_continuation_digest,
+            ],
+            |row| row.get(0),
+        )?;
+        if !exact_continuations {
             return Ok(false);
         }
         let exact_route: Option<bool> = connection
@@ -551,21 +850,125 @@ impl WorkLedger {
         Ok(exact_profile)
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_projection_repository_coordinate(
+        &self,
+        request: &NativePublicationRequest,
+        work_item_id: &str,
+    ) -> WorkLedgerResult<bool> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut connection = self.connect_read_write()?;
+        super::configure_durable(&connection)?;
+        super::verify_supported_schema(&connection)?;
+        let transaction =
+            connection.transaction_with_behavior(super::TransactionBehavior::Immediate)?;
+        let stored: RepositoryCoordinateBinding = transaction
+            .query_row(
+                "SELECT binding.repository_provider, binding.repository_id,
+                            binding.repository, binding.workstream_handle,
+                            binding.root_revision, binding.issue_revision,
+                            binding.projection_revision, binding.material_event_revision,
+                            binding.exact_head, work.repo
+                       FROM workstream_projection_bindings binding
+                       JOIN work_items work ON work.id = binding.work_item_id
+                      WHERE binding.work_item_id = ?1",
+                [work_item_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => WorkLedgerError::Refused(
+                    "repository coordinate reconciliation lacks an exact binding".to_owned(),
+                ),
+                other => WorkLedgerError::Sql(other),
+            })?;
+        if stored.0 != request.repository_provider
+            || stored.1 != request.repository_id
+            || stored.3 != request.workstream_handle
+            || stored.4 != request.root_revision
+            || stored.5 != request.issue_revision
+            || stored.6 != request.projection_revision
+            || stored.7 != request.material_event_revision
+            || stored.8 != request.head_sha
+            || stored.9 != stored.2
+        {
+            return Err(WorkLedgerError::Refused(
+                "repository coordinate reconciliation fence disagrees".to_owned(),
+            ));
+        }
+        if stored.2 == request.repository {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let binding_changed = transaction.execute(
+            "UPDATE workstream_projection_bindings SET repository = ?2
+              WHERE work_item_id = ?1 AND repository_provider = ?3 AND repository_id = ?4
+                AND repository = ?5 AND exact_head = ?6",
+            params![
+                work_item_id,
+                request.repository,
+                request.repository_provider,
+                request.repository_id,
+                stored.2,
+                request.head_sha,
+            ],
+        )?;
+        let work_changed = transaction.execute(
+            "UPDATE work_items SET repo = ?2
+              WHERE id = ?1 AND repo = ?3 AND pr = ?4 AND head_sha = ?5",
+            params![
+                work_item_id,
+                request.repository,
+                stored.9,
+                request.pull_request,
+                request.head_sha,
+            ],
+        )?;
+        if binding_changed != 1 || work_changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "repository coordinate reconciliation lost its compare-and-swap".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
     fn verify_exact_shadow_target(
         &self,
         request: &NativePublicationRequest,
     ) -> WorkLedgerResult<()> {
         self.verify_repo_policy_revision(&request.repository, request.repo_policy_revision)?;
-        let targets = self.shadow_pr_targets()?;
-        let matches = targets
-            .iter()
-            .filter(|target| {
-                target.repo == request.repository
-                    && target.pr == request.pull_request
-                    && target.head_sha == request.head_sha
-                    && target.policy.revision == request.repo_policy_revision
-            })
-            .count();
+        let matches: u64 = self.connect_read_only()?.query_row(
+            "SELECT COUNT(*)
+               FROM workstream_projection_bindings binding
+               JOIN work_items work ON work.id = binding.work_item_id
+              WHERE binding.repository_provider = ?1 AND binding.repository_id = ?2
+                AND binding.repository = ?3 AND work.pr = ?4 AND binding.exact_head = ?5",
+            params![
+                request.repository_provider,
+                request.repository_id,
+                request.repository,
+                request.pull_request,
+                request.head_sha,
+            ],
+            |row| row.get(0),
+        )?;
         if matches != 1 {
             return Err(WorkLedgerError::Refused(
                 "native publication is not visible as one exact shadow target".to_owned(),
@@ -581,11 +984,49 @@ pub(crate) fn verify_native_policy_binding(
     pull_request: u64,
     head_sha: &str,
 ) -> WorkLedgerResult<()> {
-    let binding = read_native_policy_binding(state_dir, repository, pull_request, head_sha)?
-        .ok_or_else(|| {
-            WorkLedgerError::Refused("native policy binding is unavailable".to_owned())
-        })?;
-    if binding.schema_version != 1
+    let ledger = WorkLedger::open_existing(state_dir)?
+        .ok_or_else(|| WorkLedgerError::Refused("native work ledger is unavailable".to_owned()))?;
+    let connection = ledger.connect_read_only()?;
+    let mut statement = connection.prepare(
+        "SELECT binding.repository_provider, binding.repository_id
+           FROM workstream_projection_bindings binding
+           JOIN work_items work ON work.id = binding.work_item_id
+          WHERE binding.repository = ?1 AND work.pr = ?2 AND binding.exact_head = ?3
+          ORDER BY binding.repository_provider, binding.repository_id LIMIT 2",
+    )?;
+    let candidates = statement
+        .query_map(params![repository, pull_request, head_sha], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let [(repository_provider, repository_id)] = candidates.as_slice() else {
+        return Err(WorkLedgerError::Refused(
+            "native policy binding repository identity is absent or ambiguous".to_owned(),
+        ));
+    };
+    let binding = read_native_policy_binding(
+        state_dir,
+        repository_provider.as_deref(),
+        repository_id.as_deref(),
+        repository,
+        pull_request,
+        head_sha,
+    )?
+    .ok_or_else(|| WorkLedgerError::Refused("native policy binding is unavailable".to_owned()))?;
+    let version_identity_valid = match binding.schema_version {
+        1 => binding.repository_provider.is_none() && binding.repository_id.is_none(),
+        2 => {
+            repository_provider.is_some()
+                && repository_id.is_some()
+                && binding.repository_provider.as_ref() == repository_provider.as_ref()
+                && binding.repository_id.as_ref() == repository_id.as_ref()
+        }
+        _ => false,
+    };
+    if !version_identity_valid
         || binding.repository != repository
         || binding.pull_request != pull_request
         || binding.head_sha != head_sha
@@ -595,13 +1036,77 @@ pub(crate) fn verify_native_policy_binding(
             "native policy binding is invalid".to_owned(),
         ));
     }
-    let ledger = WorkLedger::open_existing(state_dir)?
-        .ok_or_else(|| WorkLedgerError::Refused("native work ledger is unavailable".to_owned()))?;
     ledger.verify_repo_policy_revision(repository, binding.repo_policy_revision)?;
     Ok(())
 }
 
+pub(crate) fn verify_native_policy_binding_for_repository(
+    state_dir: &Path,
+    repository_provider: &str,
+    repository_id: &str,
+    repository: &str,
+    pull_request: u64,
+    head_sha: &str,
+) -> WorkLedgerResult<()> {
+    super::validate_token("repository provider", repository_provider)?;
+    super::validate_token("repository identity", repository_id)?;
+    let ledger = WorkLedger::open_existing(state_dir)?
+        .ok_or_else(|| WorkLedgerError::Refused("native work ledger is unavailable".to_owned()))?;
+    let connection = ledger.connect_read_only()?;
+    let mut statement = connection.prepare(
+        "SELECT binding.work_item_id
+           FROM workstream_projection_bindings binding
+           JOIN work_items work ON work.id = binding.work_item_id
+          WHERE binding.repository_provider = ?1 AND binding.repository_id = ?2
+            AND binding.repository = ?3 AND work.pr = ?4 AND binding.exact_head = ?5
+          ORDER BY binding.work_item_id LIMIT 2",
+    )?;
+    let work_ids = statement
+        .query_map(
+            params![
+                repository_provider,
+                repository_id,
+                repository,
+                pull_request,
+                head_sha,
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    let [work_id] = work_ids.as_slice() else {
+        return Err(WorkLedgerError::Refused(
+            "native policy binding immutable repository identity is absent or ambiguous".to_owned(),
+        ));
+    };
+    let binding = read_native_policy_binding(
+        state_dir,
+        Some(repository_provider),
+        Some(repository_id),
+        repository,
+        pull_request,
+        head_sha,
+    )?
+    .ok_or_else(|| WorkLedgerError::Refused("native policy binding is unavailable".to_owned()))?;
+    if binding.schema_version != 2
+        || binding.repository_provider.as_deref() != Some(repository_provider)
+        || binding.repository_id.as_deref() != Some(repository_id)
+        || binding.repository != repository
+        || binding.pull_request != pull_request
+        || binding.head_sha != head_sha
+        || binding.work_id != *work_id
+        || binding.repo_policy_revision == 0
+    {
+        return Err(WorkLedgerError::Refused(
+            "native policy binding is invalid".to_owned(),
+        ));
+    }
+    ledger
+        .verify_repo_policy_revision(repository, binding.repo_policy_revision)
+        .map(|_| ())
+}
+
 #[cfg(unix)]
+#[allow(dead_code)] // Explicit manual compatibility path; active stewardship requires v2 identity.
 pub(crate) fn bind_legacy_native_policy(
     state_dir: &Path,
     repository: &str,
@@ -614,17 +1119,8 @@ pub(crate) fn bind_legacy_native_policy(
     let policy = ledger.repo_policy(repository)?.ok_or_else(|| {
         WorkLedgerError::Refused("explicit repository policy is unavailable".to_owned())
     })?;
-    let exact_targets = ledger
-        .shadow_pr_targets()?
-        .into_iter()
-        .filter(|target| {
-            target.repo == repository
-                && target.pr == pull_request
-                && target.head_sha == head_sha
-                && target.policy.revision == policy.revision
-        })
-        .count();
-    let exact_work: bool = ledger.connect_read_only()?.query_row(
+    let connection = ledger.connect_read_only()?;
+    let exact_work: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = ?1
           AND kind = 'terminal_handoff' AND lower(repo) = lower(?2)
           AND pr = ?3 AND lower(head_sha) = lower(?4)
@@ -633,13 +1129,29 @@ pub(crate) fn bind_legacy_native_policy(
         params![work_id, repository, pull_request, head_sha],
         |row| row.get(0),
     )?;
-    if exact_targets != 1 || !exact_work {
+    let repository_identity: (Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT repository_provider, repository_id
+               FROM workstream_projection_bindings WHERE work_item_id = ?1
+                 AND repository = ?2 AND exact_head = ?3",
+            params![work_id, repository, head_sha],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            WorkLedgerError::Refused(
+                "legacy publication lacks one exact projection binding".to_owned(),
+            )
+        })?;
+    if !exact_work {
         return Err(WorkLedgerError::Refused(
             "legacy publication is not one exact managed shadow target".to_owned(),
         ));
     }
     let binding = NativePolicyBindingV1 {
-        schema_version: 1,
+        schema_version: u32::from(repository_identity.0.is_some()) + 1,
+        repository_provider: repository_identity.0,
+        repository_id: repository_identity.1,
         repository: repository.to_owned(),
         pull_request,
         head_sha: head_sha.to_owned(),
@@ -651,11 +1163,21 @@ pub(crate) fn bind_legacy_native_policy(
 
 fn native_policy_binding_path(
     state_dir: &Path,
+    repository_provider: Option<&str>,
+    repository_id: Option<&str>,
     repository: &str,
     pull_request: u64,
     head_sha: &str,
 ) -> PathBuf {
-    let key = digest(format!("{repository}\n{pull_request}\n{head_sha}").as_bytes());
+    let key = match (repository_provider, repository_id) {
+        (Some(provider), Some(identity)) => digest(
+            format!(
+                "shipyard-native-policy-binding-v2\n{provider}\n{identity}\n{repository}\n{pull_request}\n{head_sha}"
+            )
+            .as_bytes(),
+        ),
+        _ => digest(format!("{repository}\n{pull_request}\n{head_sha}").as_bytes()),
+    };
     state_dir
         .join("work-ledger")
         .join("native-policy-bindings")
@@ -668,7 +1190,9 @@ fn persist_native_policy_binding(
     report: &NativePublicationReport,
 ) -> WorkLedgerResult<()> {
     let binding = NativePolicyBindingV1 {
-        schema_version: 1,
+        schema_version: 2,
+        repository_provider: Some(request.repository_provider.clone()),
+        repository_id: Some(request.repository_id.clone()),
         repository: request.repository.clone(),
         pull_request: request.pull_request,
         head_sha: request.head_sha.clone(),
@@ -691,15 +1215,27 @@ fn persist_native_policy_binding_value(
     head_sha: &str,
     binding: &NativePolicyBindingV1,
 ) -> WorkLedgerResult<()> {
-    let path = native_policy_binding_path(state_dir, repository, pull_request, head_sha);
+    let path = native_policy_binding_path(
+        state_dir,
+        binding.repository_provider.as_deref(),
+        binding.repository_id.as_deref(),
+        repository,
+        pull_request,
+        head_sha,
+    );
     let directory = path.parent().ok_or_else(|| {
         WorkLedgerError::Refused("native policy binding has no parent".to_owned())
     })?;
     crate::writer_domain_lease::ensure_protected_dir_all(directory)?;
     let _writer = crate::writer_domain_lease::acquire_for_protected_path(directory)?;
-    if let Some(existing) =
-        read_native_policy_binding(state_dir, repository, pull_request, head_sha)?
-    {
+    if let Some(existing) = read_native_policy_binding(
+        state_dir,
+        binding.repository_provider.as_deref(),
+        binding.repository_id.as_deref(),
+        repository,
+        pull_request,
+        head_sha,
+    )? {
         return if existing == *binding {
             Ok(())
         } else {
@@ -725,11 +1261,20 @@ fn persist_native_policy_binding_value(
 #[cfg(unix)]
 fn read_native_policy_binding(
     state_dir: &Path,
+    repository_provider: Option<&str>,
+    repository_id: Option<&str>,
     repository: &str,
     pull_request: u64,
     head_sha: &str,
 ) -> WorkLedgerResult<Option<NativePolicyBindingV1>> {
-    let path = native_policy_binding_path(state_dir, repository, pull_request, head_sha);
+    let path = native_policy_binding_path(
+        state_dir,
+        repository_provider,
+        repository_id,
+        repository,
+        pull_request,
+        head_sha,
+    );
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
@@ -765,6 +1310,8 @@ fn read_native_policy_binding(
 #[cfg(not(unix))]
 fn read_native_policy_binding(
     _state_dir: &Path,
+    _repository_provider: Option<&str>,
+    _repository_id: Option<&str>,
     _repository: &str,
     _pull_request: u64,
     _head_sha: &str,
@@ -786,31 +1333,49 @@ struct PublicationIdentities {
 impl PublicationIdentities {
     fn new(request: &NativePublicationRequest) -> Self {
         let work_seed = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            request.repository_provider,
+            request.repository_id,
+            request.pull_request,
+            request.head_sha,
+            request.workstream_handle,
+        );
+        Self::from_work_seed(request, &work_seed, false)
+    }
+
+    fn legacy(request: &NativePublicationRequest) -> Self {
+        let work_seed = format!(
             "{}\n{}\n{}\n{}",
             request.repository, request.pull_request, request.head_sha, request.workstream_handle,
         );
+        Self::from_work_seed(request, &work_seed, true)
+    }
+
+    fn from_work_seed(request: &NativePublicationRequest, work_seed: &str, legacy: bool) -> Self {
         let authority_seed = format!(
             "{work_seed}\n{}\n{}",
             request.owner_generation, request.profile_digest,
         );
+        let identity_revision = if legacy { "v1" } else { "v2" };
         let work_id = opaque_ref(
             "wi",
-            &format!("shipyard-native-continuation-v1\n{work_seed}"),
+            &format!("shipyard-native-continuation-{identity_revision}\n{work_seed}"),
         );
         let source_ref = opaque_ref(
             "src",
-            &format!("shipyard-native-publication-v1\n{work_seed}"),
+            &format!("shipyard-native-publication-{identity_revision}\n{work_seed}"),
         );
         let route_ref = opaque_ref(
             "route",
-            &format!("shipyard-native-route-v1\n{authority_seed}"),
+            &format!("shipyard-native-route-{identity_revision}\n{authority_seed}"),
         );
         let profile_ref = OpaqueRef::derive("launch-profile", request.profile_digest.as_bytes())
             .as_str()
             .to_owned();
         let publication_digest = digest(
             format!(
-                "shipyard-native-publication-authority-v3\n{authority_seed}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                "shipyard-native-publication-authority-{}\n{authority_seed}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                if legacy { "v3" } else { "v4" },
                 request.context_url.as_deref().unwrap_or(""),
                 request.plan_sha256,
                 request.root_revision,
@@ -855,10 +1420,29 @@ impl PublicationIdentities {
     }
 }
 
+fn native_publication_report(
+    request: &NativePublicationRequest,
+    identities: &PublicationIdentities,
+    applied: bool,
+    replay: bool,
+) -> NativePublicationReport {
+    NativePublicationReport {
+        applied,
+        replay,
+        work_id: identities.work_id.clone(),
+        route_ref: identities.route_ref.clone(),
+        wake_id: identities.wake_id.clone(),
+        profile_digest: request.profile_digest.clone(),
+        repo_policy_revision: request.repo_policy_revision,
+    }
+}
+
 fn validate_request(
     request: &NativePublicationRequest,
     policy: &WorkstreamContinuationConfig,
 ) -> WorkLedgerResult<()> {
+    super::validate_workstream_handle(&request.workstream_handle)?;
+    super::validate_token("repository identity", &request.repository_id)?;
     let (terminal_provider, terminal_session) = match &request.terminal_authority {
         TerminalCapabilityRequest::Cmux {
             provider_kind,
@@ -872,6 +1456,19 @@ fn validate_request(
         } => (provider_kind, native_session_id),
     };
     if !policy.allows_repository(&request.repository)
+        || request.repository_provider != "github.com"
+        || request.repository_id.is_empty()
+        || request.repository_id.len() > 512
+        || !request
+            .repository_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+        || request
+            .legacy_repository_alias
+            .as_deref()
+            .is_some_and(|alias| {
+                !super::is_canonical_repo_slug(alias) || alias == request.repository
+            })
         || request.origin_machine != policy.origin_machine
         || request.pull_request == 0
         || request.github_installation_id == 0
@@ -885,7 +1482,6 @@ fn validate_request(
         || request.profile_digest != digest(&request.protected_profile_bytes)
         || request.protected_profile_bytes.is_empty()
         || request.protected_profile_bytes.len() > 1_048_576
-        || request.workstream_handle.is_empty()
         || request.workstream_handle.len() > 128
         || request.projection_revision == 0
         || request.owner_id.is_empty()
@@ -1234,6 +1830,9 @@ pub(crate) mod tests {
         let protected_profile_bytes =
             b"shipyard-launch-profile-v1\0{\"schema_version\":1}".to_vec();
         NativePublicationRequest {
+            repository_provider: "github.com".to_owned(),
+            repository_id: "R_test_repository".to_owned(),
+            legacy_repository_alias: None,
             repository: "owner/repo".to_owned(),
             pull_request: 43,
             head_sha: "a".repeat(40),
@@ -1317,6 +1916,43 @@ pub(crate) mod tests {
                 0,
             )
             .expect("repo policy");
+    }
+
+    #[cfg(unix)]
+    fn seed_unbound_legacy_v11(
+        state_dir: &std::path::Path,
+        request: &NativePublicationRequest,
+    ) -> PublicationIdentities {
+        seed_repo_policy(state_dir, &request.repository);
+        let ledger = WorkLedger::open(state_dir).expect("ledger");
+        let legacy = PublicationIdentities::legacy(request);
+        ledger
+            .ensure_native_work_item(request, &legacy)
+            .expect("legacy work item");
+        ledger
+            .connect_read_write()
+            .expect("legacy fixture")
+            .execute(
+                "INSERT INTO workstream_projection_bindings
+                 (work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
+                  projection_revision, material_event_revision, repository_provider,
+                  repository_id, repository, exact_head, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9,
+                         '2026-08-31T00:00:00Z')",
+                params![
+                    legacy.work_id,
+                    request.workstream_handle,
+                    request.plan_sha256,
+                    request.root_revision,
+                    request.issue_revision,
+                    request.projection_revision,
+                    request.material_event_revision,
+                    request.repository,
+                    request.head_sha,
+                ],
+            )
+            .expect("legacy NULL repository binding");
+        legacy
     }
 
     #[cfg(unix)]
@@ -1497,6 +2133,13 @@ pub(crate) mod tests {
                     ..request()
                 },
             ),
+            (
+                policy(vec!["owner/repo".to_owned()]),
+                NativePublicationRequest {
+                    workstream_handle: "GEN-43\nspoof".to_owned(),
+                    ..request()
+                },
+            ),
         ] {
             let temp = TempDir::new().expect("temp");
             assert!(
@@ -1587,6 +2230,541 @@ pub(crate) mod tests {
                 .resolve_exact::<TestProfile>(&report.work_id, &digest(b"other"))
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_repository_identity_preserves_rename_and_isolates_slug_reuse() {
+        let original = request();
+        let original_ids = PublicationIdentities::new(&original);
+
+        let renamed = NativePublicationRequest {
+            repository: "owner/renamed-repo".to_owned(),
+            ..original.clone()
+        };
+        let renamed_ids = PublicationIdentities::new(&renamed);
+        assert_eq!(original_ids.work_id, renamed_ids.work_id);
+        assert_eq!(original_ids.source_ref, renamed_ids.source_ref);
+        assert_eq!(original_ids.route_ref, renamed_ids.route_ref);
+        assert_eq!(
+            original_ids.publication_digest,
+            renamed_ids.publication_digest
+        );
+
+        let reused_slug = NativePublicationRequest {
+            repository_id: "R_different_repository".to_owned(),
+            ..original.clone()
+        };
+        let reused_ids = PublicationIdentities::new(&reused_slug);
+        assert_ne!(original_ids.work_id, reused_ids.work_id);
+        assert_ne!(original_ids.source_ref, reused_ids.source_ref);
+        assert_ne!(original_ids.route_ref, reused_ids.route_ref);
+        assert_ne!(
+            original_ids.publication_digest,
+            reused_ids.publication_digest
+        );
+
+        let legacy = PublicationIdentities::legacy(&original);
+        assert_ne!(legacy.work_id, original_ids.work_id);
+        assert_ne!(legacy.source_ref, original_ids.source_ref);
+        assert_ne!(legacy.route_ref, original_ids.route_ref);
+        assert_ne!(legacy.publication_digest, original_ids.publication_digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_rename_updates_coordinate_in_place_and_exact_replay_is_a_no_op() {
+        let temp = TempDir::new().expect("temp");
+        let original = request();
+        seed_repo_policy(temp.path(), &original.repository);
+        let original_policy = policy(vec![original.repository.clone()]);
+        let first = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &original,
+            &original_policy,
+            true,
+        )
+        .expect("original coordinate");
+        let renamed = NativePublicationRequest {
+            repository: "owner/renamed-repo".to_owned(),
+            ..original.clone()
+        };
+        seed_repo_policy(temp.path(), &renamed.repository);
+        let renamed_policy = policy(vec![renamed.repository.clone()]);
+
+        let moved = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &renamed,
+            &renamed_policy,
+            true,
+        )
+        .expect("renamed coordinate");
+        let replay = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &renamed,
+            &renamed_policy,
+            true,
+        )
+        .expect("renamed replay");
+
+        assert_eq!(moved.work_id, first.work_id);
+        assert!(moved.applied);
+        assert!(!moved.replay);
+        assert!(!replay.applied);
+        assert!(replay.replay);
+        let inventory = super::super::local_work_inventory(temp.path()).expect("inventory");
+        assert_eq!(inventory.items.len(), 1);
+        assert_eq!(inventory.items[0].repository, renamed.repository);
+        assert_eq!(
+            inventory.items[0].repository_id.as_deref(),
+            Some("R_test_repository")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_repository_identity_prevents_slug_reuse_dedup_collision() {
+        let temp = TempDir::new().expect("temp");
+        let original = request();
+        seed_repo_policy(temp.path(), &original.repository);
+        let policy = policy(vec![original.repository.clone()]);
+        let first =
+            WorkLedger::plan_or_apply_native_continuation(temp.path(), &original, &policy, true)
+                .expect("first repository incarnation");
+        let reused_slug = NativePublicationRequest {
+            repository_id: "R_different_repository".to_owned(),
+            ..original.clone()
+        };
+
+        let second =
+            WorkLedger::plan_or_apply_native_continuation(temp.path(), &reused_slug, &policy, true)
+                .expect("reused slug with distinct immutable repository");
+
+        assert_ne!(first.work_id, second.work_id);
+        assert_ne!(first.route_ref, second.route_ref);
+        assert_ne!(first.wake_id, second.wake_id);
+        let inventory = super::super::local_work_inventory(temp.path()).expect("inventory");
+        assert!(inventory.complete);
+        assert_eq!(inventory.items.len(), 2);
+        assert_ne!(
+            inventory.items[0].repository_id,
+            inventory.items[1].repository_id
+        );
+
+        let ledger = WorkLedger::open_existing(temp.path())
+            .expect("open")
+            .expect("ledger");
+        let targets = ledger.shadow_pr_targets().expect("shadow targets");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.repository_id.as_deref())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                Some("R_different_repository"),
+                Some("R_test_repository"),
+            ])
+        );
+        assert!(
+            ledger
+                .native_steward_base_ref(
+                    &original.repository,
+                    original.pull_request,
+                    &original.head_sha,
+                )
+                .is_err()
+        );
+        assert!(
+            ledger
+                .apply_native_steward_disposition(
+                    &original.repository,
+                    original.pull_request,
+                    &original.head_sha,
+                    NativeStewardDisposition::Waiting,
+                )
+                .is_err()
+        );
+        let selected = ledger
+            .apply_native_steward_disposition_for_repository(
+                Some(&original.repository_provider),
+                Some(&original.repository_id),
+                &original.repository,
+                original.pull_request,
+                &original.head_sha,
+                NativeStewardDisposition::Waiting,
+            )
+            .expect("identity-bound disposition");
+        assert!(selected.matched);
+        assert!(selected.changed);
+        let connection = ledger.connect_read_only().expect("read phases");
+        let mut statement = connection
+            .prepare(
+                "SELECT binding.repository_id, work.phase, COUNT(intent.work_item_id)
+                   FROM work_items work
+                   JOIN workstream_projection_bindings binding
+                     ON binding.work_item_id = work.id
+                   LEFT JOIN projection_intents intent ON intent.work_item_id = work.id
+                  WHERE work.repo = ?1 AND work.pr = ?2 AND work.head_sha = ?3
+                  GROUP BY binding.repository_id, work.phase
+                  ORDER BY binding.repository_id",
+            )
+            .expect("phase query");
+        let phases = statement
+            .query_map(
+                params![
+                    original.repository,
+                    original.pull_request,
+                    original.head_sha
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .expect("phase rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("phases");
+        assert_eq!(
+            phases,
+            vec![
+                ("R_different_repository".to_owned(), "managed".to_owned(), 1,),
+                ("R_test_repository".to_owned(), "managed".to_owned(), 2),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_legacy_redirect_is_policy_first_atomic_and_recoverable() {
+        let temp = TempDir::new().expect("temp");
+        let original = request();
+        let legacy = seed_unbound_legacy_v11(temp.path(), &original);
+        let redirected = NativePublicationRequest {
+            legacy_repository_alias: Some(original.repository.clone()),
+            repository: "new-owner/renamed-repo".to_owned(),
+            ..original.clone()
+        };
+        seed_repo_policy(temp.path(), &redirected.repository);
+        let redirected_policy = policy(vec![redirected.repository.clone()]);
+
+        let precursor = NativePolicyBindingV1 {
+            schema_version: 2,
+            repository_provider: Some(redirected.repository_provider.clone()),
+            repository_id: Some(redirected.repository_id.clone()),
+            repository: redirected.repository.clone(),
+            pull_request: redirected.pull_request,
+            head_sha: redirected.head_sha.clone(),
+            repo_policy_revision: redirected.repo_policy_revision,
+            work_id: legacy.work_id.clone(),
+        };
+        persist_native_policy_binding_value(
+            temp.path(),
+            &redirected.repository,
+            redirected.pull_request,
+            &redirected.head_sha,
+            &precursor,
+        )
+        .expect("simulate crash after policy precursor");
+        let before = super::super::local_work_inventory(temp.path()).expect("before recovery");
+        assert_eq!(before.items.len(), 1);
+        assert_eq!(before.items[0].repository, original.repository);
+        assert_eq!(before.items[0].repository_id, None);
+
+        let recovered = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &redirected,
+            &redirected_policy,
+            true,
+        )
+        .expect("recover redirect publication");
+        assert_eq!(recovered.work_id, legacy.work_id);
+        let after = super::super::local_work_inventory(temp.path()).expect("after recovery");
+        assert_eq!(after.items.len(), 1);
+        assert_eq!(after.items[0].repository, redirected.repository);
+        assert_eq!(
+            after.items[0].repository_id.as_deref(),
+            Some(redirected.repository_id.as_str())
+        );
+
+        let conflict = TempDir::new().expect("conflict temp");
+        let conflict_legacy = seed_unbound_legacy_v11(conflict.path(), &original);
+        seed_repo_policy(conflict.path(), &redirected.repository);
+        let conflicting = NativePolicyBindingV1 {
+            work_id: "wi_conflicting_policy_authority".to_owned(),
+            ..precursor
+        };
+        persist_native_policy_binding_value(
+            conflict.path(),
+            &redirected.repository,
+            redirected.pull_request,
+            &redirected.head_sha,
+            &conflicting,
+        )
+        .expect("conflicting policy fixture");
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                conflict.path(),
+                &redirected,
+                &redirected_policy,
+                true,
+            )
+            .is_err()
+        );
+        let refused = super::super::local_work_inventory(conflict.path()).expect("refused state");
+        assert_eq!(refused.items.len(), 1);
+        assert_eq!(refused.items[0].work_item_id, conflict_legacy.work_id);
+        assert_eq!(refused.items[0].repository, original.repository);
+        assert_eq!(refused.items[0].repository_id, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_native_identity_is_enriched_in_place_and_replays_without_duplication() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let publication_policy = policy(vec![request.repository.clone()]);
+        let ledger = WorkLedger::open(temp.path()).expect("ledger");
+        ledger
+            .set_repo_policy(
+                &crate::work_ledger::RepoPolicy {
+                    repo: request.repository.clone(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("repo policy");
+        let legacy = PublicationIdentities::legacy(&request);
+        ledger
+            .ensure_native_work_item(&request, &legacy)
+            .expect("legacy work item");
+        let connection = ledger.connect_read_write().expect("legacy fixture");
+        connection
+            .execute(
+                "INSERT INTO workstream_projection_bindings
+                 (work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
+                  projection_revision, material_event_revision, repository_provider,
+                  repository_id, repository, exact_head, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9,
+                         '2026-08-31T00:00:00Z')",
+                params![
+                    legacy.work_id,
+                    request.workstream_handle,
+                    request.plan_sha256,
+                    request.root_revision,
+                    request.issue_revision,
+                    request.projection_revision,
+                    request.material_event_revision,
+                    request.repository,
+                    request.head_sha,
+                ],
+            )
+            .expect("legacy NULL repository binding");
+        drop(connection);
+
+        let first = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &request,
+            &publication_policy,
+            true,
+        )
+        .expect("legacy continuation");
+        let replay = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &request,
+            &publication_policy,
+            true,
+        )
+        .expect("legacy continuation replay");
+
+        assert_eq!(first.work_id, legacy.work_id);
+        assert_eq!(replay.work_id, legacy.work_id);
+        assert!(replay.replay);
+        let inventory = super::super::local_work_inventory(temp.path()).expect("inventory");
+        assert!(inventory.complete);
+        assert_eq!(inventory.items.len(), 1);
+        assert_eq!(
+            inventory.items[0].repository_id.as_deref(),
+            Some(request.repository_id.as_str())
+        );
+        let renamed = NativePublicationRequest {
+            repository: "owner/renamed-repo".to_owned(),
+            ..request.clone()
+        };
+        seed_repo_policy(temp.path(), &renamed.repository);
+        let renamed_policy = policy(vec![renamed.repository.clone()]);
+        let moved = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &renamed,
+            &renamed_policy,
+            true,
+        )
+        .expect("enriched legacy rename");
+        let moved_replay = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &renamed,
+            &renamed_policy,
+            true,
+        )
+        .expect("enriched legacy rename replay");
+        assert_eq!(moved.work_id, legacy.work_id);
+        assert!(moved.applied);
+        assert!(!moved.replay);
+        assert!(moved_replay.replay);
+        let moved_inventory = super::super::local_work_inventory(temp.path()).expect("inventory");
+        assert_eq!(moved_inventory.items.len(), 1);
+        assert_eq!(moved_inventory.items[0].repository, renamed.repository);
+        let changed_profile_bytes = b"changed legacy launch authority".to_vec();
+        let changed_profile = NativePublicationRequest {
+            profile_digest: digest(&changed_profile_bytes),
+            protected_profile_bytes: changed_profile_bytes,
+            ..renamed.clone()
+        };
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                temp.path(),
+                &changed_profile,
+                &renamed_policy,
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            super::super::local_work_inventory(temp.path())
+                .expect("inventory after authority refusal")
+                .items
+                .len(),
+            1
+        );
+        let conflicting_identity = NativePublicationRequest {
+            repository_id: "R_conflicting_repository".to_owned(),
+            ..renamed.clone()
+        };
+        let reused = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &conflicting_identity,
+            &renamed_policy,
+            true,
+        )
+        .expect("slug reuse is a separate immutable repository");
+        assert_ne!(reused.work_id, legacy.work_id);
+        assert_eq!(
+            super::super::local_work_inventory(temp.path())
+                .expect("inventory after reuse")
+                .items
+                .len(),
+            2
+        );
+        let stale_revision = NativePublicationRequest {
+            projection_revision: request.projection_revision + 1,
+            ..renamed
+        };
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                temp.path(),
+                &stale_revision,
+                &renamed_policy,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_legacy_completion_does_not_permanently_mark_identity_complete() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let publication_policy = policy(vec![request.repository.clone()]);
+        let ledger = WorkLedger::open(temp.path()).expect("ledger");
+        ledger
+            .set_repo_policy(
+                &crate::work_ledger::RepoPolicy {
+                    repo: request.repository.clone(),
+                    primary_platform: "macos".to_owned(),
+                    compatibility_mode: "independent".to_owned(),
+                    compatibility_lanes: vec!["linux".to_owned()],
+                    blocking_rule: "declared_dependency_or_shared_integrity".to_owned(),
+                    declared_dependency_lanes: Vec::new(),
+                    revision: 0,
+                },
+                0,
+            )
+            .expect("repo policy");
+        let legacy = PublicationIdentities::legacy(&request);
+        ledger
+            .ensure_native_work_item(&request, &legacy)
+            .expect("legacy work item");
+        ledger
+            .connect_read_write()
+            .expect("legacy fixture")
+            .execute(
+                "INSERT INTO workstream_projection_bindings
+                 (work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
+                  projection_revision, material_event_revision, repository_provider,
+                  repository_id, repository, exact_head, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9,
+                         '2026-08-31T00:00:00Z')",
+                params![
+                    legacy.work_id,
+                    request.workstream_handle,
+                    request.plan_sha256,
+                    request.root_revision,
+                    request.issue_revision,
+                    request.projection_revision,
+                    request.material_event_revision,
+                    request.repository,
+                    request.head_sha,
+                ],
+            )
+            .expect("legacy NULL repository binding");
+        let changed_profile_bytes = b"different protected profile".to_vec();
+        let changed = NativePublicationRequest {
+            profile_digest: digest(&changed_profile_bytes),
+            protected_profile_bytes: changed_profile_bytes,
+            ..request
+        };
+
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                temp.path(),
+                &changed,
+                &publication_policy,
+                true,
+            )
+            .is_err()
+        );
+        let inventory = super::super::local_work_inventory(temp.path()).expect("inventory");
+        assert!(!inventory.complete);
+        assert_eq!(inventory.items[0].repository_provider, None);
+        assert_eq!(inventory.items[0].repository_id, None);
+
+        let renamed = NativePublicationRequest {
+            repository: "owner/renamed-repo".to_owned(),
+            ..changed
+        };
+        seed_repo_policy(temp.path(), &renamed.repository);
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                temp.path(),
+                &renamed,
+                &policy(vec![renamed.repository.clone()]),
+                true,
+            )
+            .is_err()
+        );
+        let after_refusal = super::super::local_work_inventory(temp.path()).expect("inventory");
+        assert_eq!(after_refusal.items.len(), 1);
+        assert_eq!(after_refusal.items[0].repository, "owner/repo");
+        assert!(!after_refusal.complete);
     }
 
     #[cfg(unix)]

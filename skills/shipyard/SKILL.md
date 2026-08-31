@@ -1439,7 +1439,12 @@ See [references/merge-steward.md](references/merge-steward.md) for the config,
 schema, limits, and exact authority boundary.
 
 Use `shipyard work-ledger status --json` to inspect whether the canonical
-lifecycle shadow exists without creating it. Use `shipyard work-ledger import
+lifecycle shadow exists without creating it. Use `shipyard work-ledger
+inventory --json` for a bounded, deterministically ordered immutable view of
+local work. Inventory opens only existing storage, never creates or migrates a
+database or takes writer custody. A valid migrated legacy `NULL,NULL`
+repository identity makes `complete=false`; malformed or half-bound identity
+and a noncanonical `GEN-N` handle refuse the whole snapshot. Use `shipyard work-ledger import
 --json` for the deterministic no-write plan, then `--apply` only when a shadow
 import is intended. Import is idempotent, redacted, and fail-closed: it selects
 canonical fields and opaque digests from legacy stores, leaves those stores
