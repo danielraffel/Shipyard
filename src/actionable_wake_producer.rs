@@ -16,6 +16,7 @@ use crate::dispatch_wedge::{
 };
 use crate::merge_steward::{StewardDecision, classify_shadow_summary};
 use crate::shadow_scheduler::{ShadowObservation, ShadowTransitionEvidence};
+use crate::work_ledger::MAX_DISPATCH_PROBE_TARGETS;
 use crate::work_ledger::{NativeStewardApplyReport, NativeStewardDisposition, WorkLedger};
 
 const MAX_STATUS_BYTES: usize = 64 * 1024;
@@ -40,7 +41,7 @@ pub(crate) struct ActionableWakeProducerStatus {
     /// One bounded durable record per exact native-steward target. Observations,
     /// the next probe deadline, and the monotonic observer generation are
     /// published together so none can be silently evicted or observed mixed.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub(crate) dispatch_targets: BTreeMap<String, DispatchTargetCheckpoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) updated_at: Option<String>,
@@ -133,11 +134,42 @@ pub(crate) struct ActionableWakeProducer {
     state_dir: PathBuf,
     status: ActionableWakeProducerStatus,
     boot_epoch: String,
+    dispatch_state_available: bool,
+    dispatch_state_digest: Option<String>,
 }
 
 impl ActionableWakeProducer {
     pub(crate) fn new(state_dir: PathBuf) -> Self {
-        let status = load_status(&state_dir).unwrap_or_default();
+        let mut status = load_status(&state_dir).unwrap_or_default();
+        let legacy_dispatch_targets = std::mem::take(&mut status.dispatch_targets);
+        let dispatch_state = WorkLedger::open(&state_dir)
+            .and_then(|ledger| ledger.load_dispatch_probe_targets())
+            .map_err(|error| error.to_string())
+            .and_then(|records| {
+                if records.is_empty() && !legacy_dispatch_targets.is_empty() {
+                    persist_dispatch_targets(&state_dir, &legacy_dispatch_targets)
+                        .map_err(|error| error.to_string())?;
+                    save_aggregate_status(&state_dir, &status)
+                        .map_err(|error| error.to_string())?;
+                    Ok(legacy_dispatch_targets)
+                } else {
+                    decode_dispatch_target_records(records)
+                }
+            });
+        let dispatch_state_available = if let Ok(targets) = dispatch_state {
+            status.dispatch_targets = targets;
+            true
+        } else {
+            "uncertain".clone_into(&mut status.state);
+            status.reason_code = Some("dispatch_probe_state_unreadable".to_owned());
+            status.dispatch_targets.clear();
+            false
+        };
+        let dispatch_state_digest = dispatch_state_available
+            .then(|| dispatch_targets_digest(&status.dispatch_targets))
+            .transpose()
+            .ok()
+            .flatten();
         let seed = format!(
             "{}:{}:{}",
             std::process::id(),
@@ -149,6 +181,8 @@ impl ActionableWakeProducer {
             state_dir,
             status,
             boot_epoch,
+            dispatch_state_available,
+            dispatch_state_digest,
         }
     }
 
@@ -415,12 +449,34 @@ impl ActionableWakeProducer {
         assignment_threshold_secs: i64,
     ) -> ActionableWakeProducerStatus {
         let authority = &observation.authority;
+        if !self.dispatch_state_available {
+            return self.record(
+                authority.repository.clone(),
+                authority.pull_request,
+                authority.pull_request_head.clone(),
+                "uncertain",
+                Some("dispatch_probe_state_unreadable".to_owned()),
+                false,
+            );
+        }
         let key = dispatch_observation_key(authority);
         let scope = dispatch_scope_prefix(
             &authority.repository,
             authority.pull_request,
             &authority.pull_request_head,
         );
+        if !self.status.dispatch_targets.contains_key(&scope)
+            && self.status.dispatch_targets.len() >= MAX_DISPATCH_PROBE_TARGETS
+        {
+            return self.record(
+                authority.repository.clone(),
+                authority.pull_request,
+                authority.pull_request_head.clone(),
+                "uncertain",
+                Some("dispatch_probe_capacity_exhausted".to_owned()),
+                false,
+            );
+        }
         let digest = dispatch_wedge_observation_digest(authority, &observation.runners);
         let now = Utc::now();
         let pending_digest = self
@@ -506,7 +562,7 @@ impl ActionableWakeProducer {
                 dedupe_key: evidence.dedupe_key,
                 evidence_digest: evidence.evidence_digest,
             });
-            if save_status(&self.state_dir, &self.status).is_err() {
+            if self.persist_status().is_err() {
                 if let Some(target) = self.status.dispatch_targets.get_mut(&scope) {
                     target.pending_publication = previous_pending;
                 }
@@ -540,7 +596,7 @@ impl ActionableWakeProducer {
             return match publication {
                 Ok(Some(receipt)) if receipt.matched => {
                     let pending = self.status.dispatch_targets.remove(&scope);
-                    if save_status(&self.state_dir, &self.status).is_err() {
+                    if self.persist_status().is_err() {
                         if let Some(pending) = pending {
                             self.status.dispatch_targets.insert(scope, pending);
                         }
@@ -587,8 +643,8 @@ impl ActionableWakeProducer {
                 .dispatch_targets
                 .entry(scope.clone())
                 .or_insert_with(|| DispatchTargetCheckpoint {
-                    repository_provider: String::new(),
-                    repository_id: String::new(),
+                    repository_provider: test_repository_provider().to_owned(),
+                    repository_id: test_repository_id().to_owned(),
                     repository: authority.repository.clone(),
                     pull_request: authority.pull_request,
                     head_sha: authority.pull_request_head.clone(),
@@ -614,7 +670,7 @@ impl ActionableWakeProducer {
                     boot_epoch: self.boot_epoch.clone(),
                 },
             );
-            if save_status(&self.state_dir, &self.status).is_err() {
+            if self.persist_status().is_err() {
                 if let Some(target) = self.status.dispatch_targets.get_mut(&scope) {
                     target.observations.remove(&key);
                 }
@@ -688,7 +744,13 @@ impl ActionableWakeProducer {
         pull_request: u64,
         head_sha: &str,
     ) -> Option<u64> {
-        self.begin_dispatch_wedge_cycle_for_repository("", "", repository, pull_request, head_sha)
+        self.begin_dispatch_wedge_cycle_for_repository(
+            test_repository_provider(),
+            test_repository_id(),
+            repository,
+            pull_request,
+            head_sha,
+        )
     }
 
     pub(crate) fn begin_dispatch_wedge_cycle_for_repository(
@@ -699,7 +761,31 @@ impl ActionableWakeProducer {
         pull_request: u64,
         head_sha: &str,
     ) -> Option<u64> {
+        if !self.dispatch_state_available {
+            self.record(
+                repository.to_owned(),
+                pull_request,
+                head_sha.to_owned(),
+                "uncertain",
+                Some("dispatch_probe_state_unreadable".to_owned()),
+                false,
+            );
+            return None;
+        }
         let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        if !self.status.dispatch_targets.contains_key(&key)
+            && self.status.dispatch_targets.len() >= MAX_DISPATCH_PROBE_TARGETS
+        {
+            self.record(
+                repository.to_owned(),
+                pull_request,
+                head_sha.to_owned(),
+                "uncertain",
+                Some("dispatch_probe_capacity_exhausted".to_owned()),
+                false,
+            );
+            return None;
+        }
         let previous = self.status.dispatch_targets.get(&key).cloned();
         let target = self
             .status
@@ -723,7 +809,7 @@ impl ActionableWakeProducer {
         }
         let generation = target.generation.checked_add(1)?;
         target.generation = generation;
-        if save_status(&self.state_dir, &self.status).is_err() {
+        if self.persist_status().is_err() {
             if let Some(previous) = previous {
                 self.status.dispatch_targets.insert(key, previous);
             } else {
@@ -813,6 +899,16 @@ impl ActionableWakeProducer {
         head_sha: &str,
         reason: &str,
     ) -> ActionableWakeProducerStatus {
+        if !self.dispatch_state_available {
+            return self.record(
+                repository.to_owned(),
+                pull_request,
+                head_sha.to_owned(),
+                "uncertain",
+                Some("dispatch_probe_state_unreadable".to_owned()),
+                false,
+            );
+        }
         let prefix = format!(
             "{}/{}/{}/",
             repository.to_ascii_lowercase(),
@@ -890,7 +986,7 @@ impl ActionableWakeProducer {
         match publication {
             Ok(receipt) if receipt.matched => {
                 let target = self.status.dispatch_targets.remove(&key);
-                if save_status(&self.state_dir, &self.status).is_err() {
+                if self.persist_status().is_err() {
                     if let Some(target) = target {
                         self.status.dispatch_targets.insert(key, target);
                     }
@@ -980,8 +1076,8 @@ impl ActionableWakeProducer {
         due_at: chrono::DateTime<Utc>,
     ) -> ActionableWakeProducerStatus {
         self.schedule_dispatch_probe_for_repository(
-            "",
-            "",
+            test_repository_provider(),
+            test_repository_id(),
             repository,
             pull_request,
             head_sha,
@@ -998,7 +1094,29 @@ impl ActionableWakeProducer {
         head_sha: &str,
         due_at: chrono::DateTime<Utc>,
     ) -> ActionableWakeProducerStatus {
+        if !self.dispatch_state_available {
+            return self.record(
+                repository.to_owned(),
+                pull_request,
+                head_sha.to_owned(),
+                "uncertain",
+                Some("dispatch_probe_state_unreadable".to_owned()),
+                false,
+            );
+        }
         let key = dispatch_scope_prefix(repository, pull_request, head_sha);
+        if !self.status.dispatch_targets.contains_key(&key)
+            && self.status.dispatch_targets.len() >= MAX_DISPATCH_PROBE_TARGETS
+        {
+            return self.record(
+                repository.to_owned(),
+                pull_request,
+                head_sha.to_owned(),
+                "uncertain",
+                Some("dispatch_probe_capacity_exhausted".to_owned()),
+                false,
+            );
+        }
         let previous = self.status.dispatch_targets.get(&key).cloned();
         let target = self
             .status
@@ -1052,9 +1170,12 @@ impl ActionableWakeProducer {
         pull_request: u64,
         head_sha: &str,
     ) -> bool {
+        if !self.dispatch_state_available {
+            return false;
+        }
         let key = dispatch_scope_prefix(repository, pull_request, head_sha);
         let previous = self.status.dispatch_targets.remove(&key);
-        if save_status(&self.state_dir, &self.status).is_ok() {
+        if self.persist_status().is_ok() {
             return true;
         }
         if let Some(previous) = previous {
@@ -1068,6 +1189,9 @@ impl ActionableWakeProducer {
         now: chrono::DateTime<Utc>,
         limit: usize,
     ) -> Vec<DispatchProbeSchedule> {
+        if !self.dispatch_state_available {
+            return Vec::new();
+        }
         let mut due = self
             .status
             .dispatch_targets
@@ -1094,6 +1218,9 @@ impl ActionableWakeProducer {
         &mut self,
         active: &std::collections::BTreeSet<(String, u64, String)>,
     ) {
+        if !self.dispatch_state_available {
+            return;
+        }
         let before = self.status.dispatch_targets.len();
         self.status.dispatch_targets.retain(|_, target| {
             active.iter().any(|(repository, pull_request, head_sha)| {
@@ -1103,7 +1230,7 @@ impl ActionableWakeProducer {
             })
         });
         if self.status.dispatch_targets.len() != before {
-            let _ = save_status(&self.state_dir, &self.status);
+            let _ = self.persist_status();
         }
     }
 
@@ -1181,6 +1308,15 @@ impl ActionableWakeProducer {
         wake_enqueued: bool,
     ) -> ActionableWakeProducerStatus {
         const MAX_REPOSITORIES: usize = 256;
+        let (state, reason_code, wake_enqueued) = if self.dispatch_state_available {
+            (state, reason_code, wake_enqueued)
+        } else {
+            (
+                "uncertain",
+                Some("dispatch_probe_state_unreadable".to_owned()),
+                false,
+            )
+        };
         let updated_at = Utc::now().to_rfc3339();
         if !self.status.repositories.contains_key(&repository)
             && self.status.repositories.len() >= MAX_REPOSITORIES
@@ -1219,13 +1355,27 @@ impl ActionableWakeProducer {
         self.status.wake_enqueued = wake_enqueued;
         self.status.model_calls = 0;
         self.status.updated_at = Some(updated_at);
-        if save_status(&self.state_dir, &self.status).is_err() {
+        if self.persist_status().is_err() {
             self.status.state.clear();
             self.status.state.push_str("status_persistence_error");
             self.status.reason_code = Some("status_persistence_refused".to_owned());
             self.status.wake_enqueued = false;
         }
         self.status.clone()
+    }
+
+    fn persist_status(&mut self) -> std::io::Result<()> {
+        save_aggregate_status(&self.state_dir, &self.status)?;
+        if !self.dispatch_state_available {
+            return Ok(());
+        }
+        let digest = dispatch_targets_digest(&self.status.dispatch_targets)?;
+        if self.dispatch_state_digest.as_deref() == Some(&digest) {
+            return Ok(());
+        }
+        persist_dispatch_targets(&self.state_dir, &self.status.dispatch_targets)?;
+        self.dispatch_state_digest = Some(digest);
+        Ok(())
     }
 }
 
@@ -1252,6 +1402,26 @@ fn dispatch_scope_prefix(repository: &str, pull_request: u64, head_sha: &str) ->
 
 fn nonempty_identity(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+const fn test_repository_provider() -> &'static str {
+    "github.com"
+}
+
+#[cfg(not(test))]
+const fn test_repository_provider() -> &'static str {
+    ""
+}
+
+#[cfg(test)]
+const fn test_repository_id() -> &'static str {
+    "R_test_repository"
+}
+
+#[cfg(not(test))]
+const fn test_repository_id() -> &'static str {
+    ""
 }
 
 const fn stability_delay_seconds() -> i64 {
@@ -1329,7 +1499,16 @@ fn load_status(state_dir: &Path) -> Option<ActionableWakeProducerStatus> {
     serde_json::from_slice(&bytes).ok()
 }
 
+#[cfg(test)]
 fn save_status(state_dir: &Path, status: &ActionableWakeProducerStatus) -> std::io::Result<()> {
+    save_aggregate_status(state_dir, status)
+        .and_then(|()| persist_dispatch_targets(state_dir, &status.dispatch_targets))
+}
+
+fn save_aggregate_status(
+    state_dir: &Path,
+    status: &ActionableWakeProducerStatus,
+) -> std::io::Result<()> {
     let directory = state_dir.join("daemon");
     crate::writer_domain_lease::ensure_protected_dir_all(&directory)?;
     let _writer = crate::writer_domain_lease::acquire_for_protected_path(&directory)?;
@@ -1349,6 +1528,73 @@ fn save_status(state_dir: &Path, status: &ActionableWakeProducerStatus) -> std::
     temporary.as_file_mut().write_all(&bytes)?;
     temporary.as_file_mut().sync_all()?;
     crate::queue::replace_file_with_windows_retry(temporary.path(), &path)
+}
+
+fn persist_dispatch_targets(
+    state_dir: &Path,
+    targets: &BTreeMap<String, DispatchTargetCheckpoint>,
+) -> std::io::Result<()> {
+    let records = targets
+        .iter()
+        .map(|(target_key, checkpoint)| {
+            Ok(crate::work_ledger::DispatchProbeTargetRecord {
+                target_key: target_key.clone(),
+                repository_provider: checkpoint.repository_provider.clone(),
+                repository_id: checkpoint.repository_id.clone(),
+                repository: checkpoint.repository.clone(),
+                pull_request: checkpoint.pull_request,
+                head_sha: checkpoint.head_sha.clone(),
+                generation: checkpoint.generation,
+                due_at: checkpoint
+                    .schedule
+                    .as_ref()
+                    .map(|schedule| schedule.due_at.clone()),
+                checkpoint_json: serde_json::to_vec(checkpoint).map_err(std::io::Error::other)?,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let ledger = WorkLedger::open_existing(state_dir)
+        .map_err(std::io::Error::other)?
+        .ok_or_else(|| std::io::Error::other("dispatch target WorkLedger is unavailable"))?;
+    ledger
+        .replace_dispatch_probe_targets(&records)
+        .map_err(std::io::Error::other)
+}
+
+fn dispatch_targets_digest(
+    targets: &BTreeMap<String, DispatchTargetCheckpoint>,
+) -> std::io::Result<String> {
+    let bytes = serde_json::to_vec(targets).map_err(std::io::Error::other)?;
+    Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+}
+
+fn decode_dispatch_target_records(
+    records: Vec<crate::work_ledger::DispatchProbeTargetRecord>,
+) -> Result<BTreeMap<String, DispatchTargetCheckpoint>, String> {
+    if records.len() > MAX_DISPATCH_PROBE_TARGETS {
+        return Err("dispatch_probe_capacity_exhausted".to_owned());
+    }
+    let mut targets = BTreeMap::new();
+    for record in records {
+        let checkpoint: DispatchTargetCheckpoint =
+            serde_json::from_slice(&record.checkpoint_json).map_err(|error| error.to_string())?;
+        if checkpoint.repository_provider != record.repository_provider
+            || checkpoint.repository_id != record.repository_id
+            || checkpoint.repository != record.repository
+            || checkpoint.pull_request != record.pull_request
+            || checkpoint.head_sha != record.head_sha
+            || checkpoint.generation != record.generation
+            || checkpoint
+                .schedule
+                .as_ref()
+                .map(|schedule| &schedule.due_at)
+                != record.due_at.as_ref()
+        {
+            return Err("dispatch target row and checkpoint payload disagree".to_owned());
+        }
+        targets.insert(record.target_key, checkpoint);
+    }
+    Ok(targets)
 }
 
 #[cfg(test)]
@@ -1717,6 +1963,7 @@ mod tests {
 
         std::fs::remove_file(&blocker).expect("remove blocker");
         std::fs::create_dir_all(&state_dir).expect("state");
+        let mut producer = ActionableWakeProducer::new(state_dir.clone());
         let retried = producer.process_dispatch_wedge_cycle(
             &observation.authority.repository,
             observation.authority.pull_request,
@@ -1790,10 +2037,10 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_probe_deadlines_do_not_silently_evict_after_sixty_four_targets() {
+    fn one_hundred_twenty_eight_dispatch_targets_restart_without_json_growth_or_eviction() {
         let state = tempfile::tempdir().expect("state");
         let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
-        for pull_request in 1..=65 {
+        for pull_request in 1..=128 {
             producer.schedule_dispatch_probe(
                 "owner/repo",
                 pull_request,
@@ -1804,7 +2051,161 @@ mod tests {
         let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
         assert_eq!(
             restarted.due_dispatch_probes(Utc::now(), usize::MAX).len(),
-            65
+            128
+        );
+        assert_eq!(
+            WorkLedger::open_existing(state.path())
+                .unwrap()
+                .unwrap()
+                .load_dispatch_probe_targets()
+                .unwrap()
+                .len(),
+            128
+        );
+        assert!(std::fs::metadata(status_path(state.path())).unwrap().len() < 16 * 1024);
+    }
+
+    #[test]
+    fn dispatch_target_capacity_is_durable_typed_backpressure_without_eviction() {
+        let state = tempfile::tempdir().expect("state");
+        let mut status = ActionableWakeProducerStatus::default();
+        let due_at = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        for pull_request in 1..=u64::try_from(MAX_DISPATCH_PROBE_TARGETS).unwrap() {
+            let head_sha = format!("{pull_request:040x}");
+            let key = dispatch_scope_prefix("owner/repo", pull_request, &head_sha);
+            status.dispatch_targets.insert(
+                key,
+                DispatchTargetCheckpoint {
+                    repository_provider: test_repository_provider().to_owned(),
+                    repository_id: test_repository_id().to_owned(),
+                    repository: "owner/repo".to_owned(),
+                    pull_request,
+                    head_sha: head_sha.clone(),
+                    generation: 1,
+                    schedule: Some(DispatchProbeSchedule {
+                        repository_provider: test_repository_provider().to_owned(),
+                        repository_id: test_repository_id().to_owned(),
+                        repository: "owner/repo".to_owned(),
+                        pull_request,
+                        head_sha,
+                        due_at: due_at.clone(),
+                    }),
+                    observations: BTreeMap::new(),
+                    pending_publication: None,
+                },
+            );
+        }
+        WorkLedger::open(state.path()).expect("ledger");
+        save_status(state.path(), &status).expect("capacity fixture");
+
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        let refused = producer.schedule_dispatch_probe(
+            "owner/repo",
+            u64::try_from(MAX_DISPATCH_PROBE_TARGETS).unwrap() + 1,
+            &"f".repeat(40),
+            Utc::now(),
+        );
+        assert_eq!(
+            refused.reason_code.as_deref(),
+            Some("dispatch_probe_capacity_exhausted")
+        );
+        let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        assert_eq!(
+            restarted.status.dispatch_targets.len(),
+            MAX_DISPATCH_PROBE_TARGETS
+        );
+        assert_eq!(
+            restarted.status.reason_code.as_deref(),
+            Some("dispatch_probe_capacity_exhausted")
+        );
+    }
+
+    #[test]
+    fn unreadable_dispatch_target_state_fails_closed_without_deleting_rows() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now(),
+        );
+        rusqlite::Connection::open(state.path().join("work-ledger").join("work-items.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE dispatch_probe_targets SET checkpoint_json = ?1",
+                [b"[]".as_slice()],
+            )
+            .expect("corrupt payload control");
+
+        let mut restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        assert_eq!(
+            restarted.status.reason_code.as_deref(),
+            Some("dispatch_probe_state_unreadable")
+        );
+        assert!(
+            restarted
+                .due_dispatch_probes(Utc::now(), usize::MAX)
+                .is_empty()
+        );
+        restarted.mark_ready("owner/repo", 43, &"a".repeat(40));
+        assert_eq!(
+            WorkLedger::open_existing(state.path())
+                .unwrap()
+                .unwrap()
+                .load_dispatch_probe_targets()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_json_dispatch_targets_migrate_once_into_work_ledger() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now() - chrono::Duration::seconds(1),
+        );
+        let mut legacy = serde_json::to_value(&producer.status).expect("legacy status");
+        legacy.as_object_mut().unwrap().insert(
+            "dispatch_targets".to_owned(),
+            serde_json::to_value(&producer.status.dispatch_targets).unwrap(),
+        );
+        WorkLedger::open_existing(state.path())
+            .unwrap()
+            .unwrap()
+            .replace_dispatch_probe_targets(&[])
+            .expect("pre-migration empty ledger");
+        std::fs::write(
+            status_path(state.path()),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .expect("legacy JSON fixture");
+
+        let restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+        assert_eq!(
+            restarted.due_dispatch_probes(Utc::now(), usize::MAX).len(),
+            1
+        );
+        assert_eq!(
+            WorkLedger::open_existing(state.path())
+                .unwrap()
+                .unwrap()
+                .load_dispatch_probe_targets()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !std::fs::read_to_string(status_path(state.path()))
+                .unwrap()
+                .contains("dispatch_targets")
         );
     }
 
@@ -1884,7 +2285,7 @@ mod tests {
             );
             assert_eq!(
                 terminal.reason_code.as_deref(),
-                Some("dispatch_wedge_publication_refused")
+                Some("dispatch_wedge_unmatched")
             );
         }
         assert_eq!(restarted.status.dispatch_targets.len(), 65);
@@ -1922,7 +2323,7 @@ mod tests {
         );
         assert_eq!(
             refused.reason_code.as_deref(),
-            Some("dispatch_wedge_publication_refused")
+            Some("dispatch_wedge_unmatched")
         );
         assert!(
             producer
@@ -1975,7 +2376,7 @@ mod tests {
         );
         assert_eq!(
             refused.reason_code.as_deref(),
-            Some("dispatch_wedge_publication_refused")
+            Some("dispatch_wedge_unmatched")
         );
 
         let publication = request();
@@ -2061,31 +2462,20 @@ mod tests {
             Some("matching_second_read_required")
         );
 
-        producer.status.repositories.insert(
-            "filler/repo".to_owned(),
-            ActionableRepositoryStatus {
-                state: "ready".to_owned(),
-                pull_request: Some(1),
-                head_sha: Some("f".repeat(40)),
-                reason_code: Some(String::new()),
-                wake_enqueued: false,
-                updated_at: Utc::now().to_rfc3339(),
-            },
+        let scope = dispatch_scope_prefix(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
         );
-        let empty_len = serde_json::to_vec(&producer.status).unwrap().len();
-        let desired_len = MAX_STATUS_BYTES - 8;
-        let filler_len = desired_len.checked_sub(empty_len).expect("filler capacity");
+        let original_repository_id = producer.status.dispatch_targets[&scope]
+            .repository_id
+            .clone();
         producer
             .status
-            .repositories
-            .get_mut("filler/repo")
-            .unwrap()
-            .reason_code = Some("x".repeat(filler_len));
-        assert_eq!(
-            serde_json::to_vec(&producer.status).unwrap().len(),
-            desired_len
-        );
-        save_status(state.path(), &producer.status).expect("persist near-limit checkpoint");
+            .dispatch_targets
+            .get_mut(&scope)
+            .expect("checkpoint")
+            .repository_id = "x".repeat(70_000);
 
         let failed = producer.process_dispatch_wedge_observation(&observation, 300);
         assert!(matches!(
@@ -2109,7 +2499,12 @@ mod tests {
             0
         );
 
-        producer.status.repositories.remove("filler/repo");
+        producer
+            .status
+            .dispatch_targets
+            .get_mut(&scope)
+            .expect("rolled-back checkpoint")
+            .repository_id = original_repository_id;
         save_status(state.path(), &producer.status).expect("persist rolled-back checkpoint");
         let mut restarted = ActionableWakeProducer::new(state.path().to_path_buf());
         let fresh_first = restarted.process_dispatch_wedge_observation(&observation, 300);

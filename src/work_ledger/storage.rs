@@ -188,6 +188,10 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     if version == 12 {
         migrate_v12_to_v13(connection)?;
+        version = 13;
+    }
+    if version == 13 {
+        migrate_v13_to_v14(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
@@ -704,6 +708,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     install_custody_successor_schema(&transaction)?;
     install_projection_intent_schema(&transaction)?;
     install_ownership_lease_schema(&transaction)?;
+    install_dispatch_probe_state_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -753,7 +758,7 @@ pub(super) fn verify_open_lineage(connection: &Connection, version: i64) -> Work
     if version == SCHEMA_VERSION {
         return verify_schema_identity(connection);
     }
-    if version == 8 || version == 9 || version == 10 || version == 11 || version == 12 {
+    if matches!(version, 8..=13) {
         verify_schema_identity(connection)?;
         if version == 11 {
             super::inventory::verify_legacy_inventory_schema(connection)?;
@@ -1058,7 +1063,7 @@ fn migrate_v12_to_v13(connection: &mut Connection) -> WorkLedgerResult<()> {
     validate_relational_integrity(&transaction)?;
     rebuild_legacy_custody_successor_schema(&transaction)?;
     install_ownership_lease_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.pragma_update(None, "user_version", 13)?;
     verify_schema_identity(&transaction)?;
     validate_relational_integrity(&transaction)?;
     transaction.commit()?;
@@ -1217,6 +1222,48 @@ fn install_ownership_lease_schema(transaction: &rusqlite::Transaction<'_>) -> Wo
               AND lease.owner_generation = NEW.owner_generation
          )
          BEGIN SELECT RAISE(ABORT, 'agent ownership generation advance is unauthorized'); END;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v13_to_v14(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 13 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the dispatch probe state migration fence"
+                .to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 13)?;
+    validate_relational_integrity(&transaction)?;
+    install_dispatch_probe_state_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn install_dispatch_probe_state_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE dispatch_probe_targets (
+           target_key TEXT PRIMARY KEY,
+           repository_provider TEXT NOT NULL CHECK(length(repository_provider) BETWEEN 3 AND 64),
+           repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 512),
+           repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
+           pull_request INTEGER NOT NULL CHECK(pull_request > 0),
+           head_sha TEXT NOT NULL CHECK(length(head_sha) = 40 AND head_sha NOT GLOB '*[^0-9a-f]*'),
+           generation INTEGER NOT NULL CHECK(generation >= 0),
+           due_at TEXT,
+           checkpoint_json BLOB NOT NULL CHECK(length(checkpoint_json) BETWEEN 2 AND 65536),
+           updated_at TEXT NOT NULL CHECK(length(updated_at) >= 20),
+           UNIQUE(repository_provider, repository_id, pull_request, head_sha)
+         );
+         CREATE INDEX dispatch_probe_targets_due
+           ON dispatch_probe_targets(due_at, generation, repository_provider, repository_id)
+           WHERE due_at IS NOT NULL;",
     )?;
     Ok(())
 }
