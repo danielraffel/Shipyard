@@ -3,13 +3,17 @@
 //! The ledger is a revocation and identity fence, never admission authority.
 //! Authority exists only while the exact inherited `queue.lock` file
 //! description remains open in the bound child process.
+//! The child transition is trusted to apply its declared aggregate scope; this
+//! hold proves custody and scope identity, not individual `launchctl` arguments.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_os = "macos")]
+use std::io::Read as _;
+#[cfg(target_os = "macos")]
 use std::io::Seek as _;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -35,8 +39,10 @@ use super::cli::QueueHoldCommand;
 const SCHEMA: u32 = 1;
 const KIND: &str = "shipyard.queue-admission-hold";
 const PURPOSE: &str = "tartci-pool-off";
+#[cfg(target_os = "macos")]
 const RETRY: Duration = Duration::from_millis(25);
 const REFUSED_EXIT: u8 = 3;
+#[cfg(target_os = "macos")]
 const TIMEOUT_EXIT: u8 = 124;
 const SETUP_EXIT: u8 = 125;
 
@@ -97,6 +103,7 @@ struct RevokeResponse {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
 struct Scope {
     purpose: String,
     host_id: String,
@@ -435,6 +442,9 @@ impl Scope {
         }
         validate_value("host id", &host_id)?;
         let services = canonical_set("service", services, true)?;
+        // Provider-only hosts still have exact services but may have no
+        // repository-scoped persistent runner. Keep those identities optional
+        // and bind every supplied value into the canonical scope digest.
         let repos = canonical_set("repository", repos, false)?;
         let runners = canonical_set("runner", runners, false)?;
         for repo in &repos {
@@ -551,6 +561,7 @@ fn validate_record(record: &HoldRecord, state_dir: &Path) -> Result<(), CliFailu
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn refuse_contradictory_live_owner(prior: Option<&HoldRecord>) -> Result<(), CliFailure> {
     let Some(record) = prior.filter(|record| record.status == HoldStatus::Held) else {
         return Ok(());
@@ -731,6 +742,7 @@ fn strictly_sorted(values: &[String]) -> bool {
             .all(|value| validate_value("scope", value).is_ok())
 }
 
+#[cfg(target_os = "macos")]
 fn random_hold_id() -> Result<String, CliFailure> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")
@@ -875,6 +887,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn exact_revoke_is_revision_fenced_and_stale_generation_refuses() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -925,5 +938,17 @@ mod tests {
         assert_eq!(revoked.revision, 2);
         let repeated = revoke_hold(&state_dir, "hold-1", 7, "test").expect("repeat");
         assert_eq!(repeated.reason, Some("revoked"));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_platform_refuses_process_birth_identity() {
+        let error = process_start_digest(std::process::id()).expect_err("unsupported identity");
+        assert_eq!(error.code, SETUP_EXIT);
+        assert!(
+            error
+                .message
+                .contains("process birth identity is unsupported on this platform")
+        );
     }
 }

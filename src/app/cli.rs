@@ -2346,8 +2346,7 @@ mod tests {
 
     use super::{
         AuthCommand, Cli, Command, DependencyCommand, PulpDependencyCommand, QueueHoldCommand,
-        RunnerCommand,
-        WorkLedgerCommand, WorkLedgerPolicyCommand,
+        RunnerCommand, WorkLedgerCommand, WorkLedgerPolicyCommand,
     };
 
     #[test]

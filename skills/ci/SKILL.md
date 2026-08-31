@@ -1802,9 +1802,13 @@ individual tests. Focused low-stack controls may still prove a particular test
 body, but they do not replace the shared CI worker-stack contract.
 
 **Fence local queue admission before a host-wide CI transition.** Use
-`shipyard queue-hold exec --host <id> --service <label> --repo <owner/repo>
---runner <name> --generation <n> -- <transition-command>` so the child inherits
-the live `queue.lock` open-file description. The transition must call
+`shipyard queue-hold exec --purpose tartci-pool-off --host-id <id> --service
+<label> [--repo <owner/repo>] [--runner <name>] -- <transition-command>` so the
+child inherits the live `queue.lock` open-file description. Supply every
+applicable repository and persistent-runner identity; provider-only hosts may
+have neither. Shipyard assigns
+the positive monotonic generation and exports it with the other exact hold
+identity fields. The transition must call
 `shipyard queue-hold verify` under its own transition lock immediately before
 each exact service mutation and again before publishing terminal participation
 state. Exit `3` is a typed refusal, `124` means bounded lock timeout/no child,

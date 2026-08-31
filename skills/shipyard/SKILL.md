@@ -2096,9 +2096,11 @@ offline/unhealthy, or when the workflow intentionally asks for hosted coverage.
 
 For a host-wide CI transition, wrap the exact transition command with
 `shipyard queue-hold exec` and bind the normalized host, service, repository,
-runner, and positive monotonic generation. The live child inherits the held
-queue-lock open-file description; `queue-hold verify` accepts only that exact
-owner PID/start identity, FD, lock inode, scope digest, generation, ledger
+and runner scope. Include every applicable identity; a provider-only host may
+have no repository-scoped persistent runner. Shipyard assigns and exports the
+positive monotonic generation; it is never a caller-selected `exec` argument. The live child
+inherits the held queue-lock open-file description; `queue-hold verify` accepts
+only that exact owner PID/start identity, FD, lock inode, scope digest, generation, ledger
 revision, non-revoked state, and independent contention proof. Re-verify under
 the downstream transition lock before every exact service mutation and before
 final participation-state publication. Never treat `queue-hold.json`, a PID,
