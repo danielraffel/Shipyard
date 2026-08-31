@@ -177,7 +177,6 @@ pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
     } else {
         verify_marker(&checkout.path, &checkout.marker)?;
     }
-    persist_cleanup_receipt(checkout)?;
     let marker_path = marker_path(&checkout.path);
     fs::remove_file(&marker_path)
         .map_err(|error| format!("remove completed integration marker: {error}"))?;
@@ -186,6 +185,7 @@ pub(crate) fn cleanup(checkout: &IntegrationCheckout) -> Result<(), String> {
             .parent()
             .ok_or_else(|| "integration marker has no parent directory".to_owned())?,
     )?;
+    persist_cleanup_receipt(checkout)?;
     Ok(())
 }
 

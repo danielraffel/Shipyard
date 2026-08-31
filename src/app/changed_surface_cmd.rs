@@ -82,6 +82,7 @@ pub(crate) fn observe_stale_base_shadow(
         ],
     )
     .map_or((Vec::new(), false), |paths| (paths, true));
+    let (live_head_merge_base_sha, old_base_is_live_ancestor) = observe_stale_lineage(cwd, exact);
     let (integration_tree_sha, integration_commit_sha, integration_conflicted) =
         synthesize_integration_tree(cwd, &exact.protected_ref_sha, &exact.pr_head_sha);
     let (integration_changed_paths, integration_changed_paths_complete) = integration_tree_sha
@@ -119,6 +120,8 @@ pub(crate) fn observe_stale_base_shadow(
         validation_contract_digest: validation_contract_digest.to_owned(),
         protected_base_delta_paths,
         protected_base_delta_status: observation_status(protected_base_delta_complete),
+        live_head_merge_base_sha,
+        old_base_is_live_ancestor,
         integration_changed_paths,
         integration_changed_paths_status: observation_status(integration_changed_paths_complete),
         integration_tree_sha: integration_tree_sha.unwrap_or_default(),
@@ -142,6 +145,24 @@ pub(crate) fn observe_stale_base_shadow(
         policy: live_policy,
         workflow_digest: stale_input.live_workflow_digest,
     })
+}
+
+fn observe_stale_lineage(cwd: &Path, exact: &ExactHeadInput) -> (String, bool) {
+    let live_head_merge_base_sha = git_optional(
+        cwd,
+        &["merge-base", &exact.protected_ref_sha, &exact.pr_head_sha],
+    )
+    .unwrap_or_default();
+    let old_base_is_live_ancestor = git_status_success(
+        cwd,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &exact.pr_base_sha,
+            &exact.protected_ref_sha,
+        ],
+    );
+    (live_head_merge_base_sha, old_base_is_live_ancestor)
 }
 
 fn observation_status(complete: bool) -> ObservationStatus {

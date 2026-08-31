@@ -490,6 +490,7 @@ pub(super) fn apply_changed_surface_execution(
                     })
                     .ok();
             if let Some(stale_receipt_sha256) = shadow_receipt_digest
+                && !stale_generation_has_execution_evidence(&evidence_dir)
                 && let (Some(integration_input), Ok(policy), Some(selection)) = (
                     assessment.integration_input.as_ref(),
                     assessment.policy.as_ref(),
@@ -651,9 +652,7 @@ pub(super) fn apply_changed_surface_execution(
             || result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
             |(_, _, evidence_dir)| evidence_dir.clone(),
         );
-        let compare = if stale_receipt.is_some() {
-            "0"
-        } else if machine.mode == MachineMode::ShadowCompare {
+        let compare = if machine.mode == MachineMode::ShadowCompare {
             "1"
         } else {
             "0"
@@ -775,6 +774,30 @@ fn publish_current_stale_generation(
     #[cfg(unix)]
     sync_directory(path)?;
     Ok(())
+}
+
+fn stale_generation_has_execution_evidence(path: &Path) -> bool {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return true;
+        };
+        if name == "stale-activation-shadow_compare.json"
+            || name == "stale-cleanup-shadow_compare.json"
+            || name.starts_with("result-")
+            || name.starts_with("fallback-")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn persist_named_receipt<T: Serialize>(
@@ -1030,7 +1053,7 @@ mod tests {
     use super::{
         FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic,
         persist_fallback_diagnostic, result_dir, selected_resume_block_reason, shell_quote,
-        target_declares_changed_surface_selection,
+        stale_generation_has_execution_evidence, target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::collections::BTreeMap;
@@ -1070,6 +1093,20 @@ mod tests {
             result_dir(state, "a/b", 1, "head", "mac")
         );
         assert_eq!(shell_quote(std::path::Path::new("a'b")), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn stale_generation_restart_refuses_duplicate_execution_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!stale_generation_has_execution_evidence(temp.path()));
+        fs::write(temp.path().join("stale-base-shadow-a.json"), b"{}").unwrap();
+        assert!(!stale_generation_has_execution_evidence(temp.path()));
+        fs::write(
+            temp.path().join("stale-activation-shadow_compare.json"),
+            b"{}",
+        )
+        .unwrap();
+        assert!(stale_generation_has_execution_evidence(temp.path()));
     }
 
     #[test]

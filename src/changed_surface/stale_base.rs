@@ -62,6 +62,10 @@ pub struct StaleBaseShadowInput<'a> {
     pub protected_base_delta_paths: Vec<String>,
     /// Completeness of the protected-base delta observation.
     pub protected_base_delta_status: ObservationStatus,
+    /// Merge base independently computed for current protected base and head.
+    pub live_head_merge_base_sha: String,
+    /// Whether git proves the old PR base remains an ancestor of current base.
+    pub old_base_is_live_ancestor: bool,
     /// Paths changed by `live_base..integration_tree`.
     pub integration_changed_paths: Vec<String>,
     /// Completeness of the integration-tree changed-path observation.
@@ -180,6 +184,8 @@ pub fn plan_stale_base_shadow(
     if !exact.merge_base_is_ancestor
         || exact.local_merge_base_sha != exact.remote_merge_base_sha
         || exact.local_merge_base_sha != exact.pr_base_sha
+        || input.live_head_merge_base_sha != exact.pr_base_sha
+        || !input.old_base_is_live_ancestor
         || normalized_paths(&exact.local_changed_paths)
             != normalized_paths(&exact.remote_changed_paths)
     {
@@ -426,6 +432,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::Utc;
+    use serde_json::Value;
 
     use super::*;
     use crate::changed_surface::trial::{
@@ -523,6 +530,8 @@ mod tests {
             validation_contract_digest: DIGEST.to_owned(),
             protected_base_delta_paths: vec!["docs/note.md".to_owned()],
             protected_base_delta_status: ObservationStatus::Complete,
+            live_head_merge_base_sha: OLD.to_owned(),
+            old_base_is_live_ancestor: true,
             integration_changed_paths: vec!["src/audio/change.cpp".to_owned()],
             integration_changed_paths_status: ObservationStatus::Complete,
             integration_tree_sha: INTEGRATION.to_owned(),
@@ -647,11 +656,11 @@ mod tests {
             "selected_build_target_count": plan.selected_build_target_count,
             "selected_returncode": 0,
             "selected_build_returncode": null,
-            "full_returncode": null,
+            "full_returncode": 0,
             "full_build_returncode": null,
-            "full_authoritative": false,
-            "comparison_verdict": "not_compared",
-            "graduation_eligible": false
+            "full_authoritative": true,
+            "comparison_verdict": "matched_pass",
+            "graduation_eligible": true
         });
         let activation_bytes = serde_json::to_vec(&activation).unwrap();
         let cleanup = serde_json::json!({
@@ -689,6 +698,42 @@ mod tests {
         );
         assert_eq!(status.state, TrialState::Terminal);
         assert_eq!(status.reason, "stale_base_recomputed_selected_pass");
+
+        let mut selection_drift_activation = activation.clone();
+        selection_drift_activation["plan"]["selected_count"] = Value::from(plan.selected_count + 1);
+        let mut selection_drift_result = result.clone();
+        selection_drift_result["selected_logical_count"] = Value::from(plan.selected_count + 1);
+        let selection_drift_activation_bytes =
+            serde_json::to_vec(&selection_drift_activation).unwrap();
+        let selection_drift_result_bytes = serde_json::to_vec(&selection_drift_result).unwrap();
+        let selection_drift = evaluate_stale_base_execution(
+            &TrialIdentity {
+                repository: "owner/repo".to_owned(),
+                pull_request: 42,
+                target: "mac".to_owned(),
+                head_sha: HEAD.to_owned(),
+            },
+            ReceiptFile {
+                name: "stale-base-shadow.json",
+                bytes: &stale_bytes,
+            },
+            ReceiptFile {
+                name: "stale-activation-shadow_compare.json",
+                bytes: &selection_drift_activation_bytes,
+            },
+            ReceiptFile {
+                name: "stale-cleanup-shadow_compare.json",
+                bytes: &cleanup_bytes,
+            },
+            &[ReceiptFile {
+                name: "result.json",
+                bytes: &selection_drift_result_bytes,
+            }],
+        );
+        assert_eq!(
+            selection_drift.reason,
+            "stale_base_activation_identity_or_link_mismatch"
+        );
 
         let mut invalid_outer = receipt.clone();
         invalid_outer.disposition = StaleBaseShadowDisposition::FullRequired;
@@ -805,6 +850,24 @@ mod tests {
         divergent.remote_merge_base_sha = LIVE.to_owned();
         assert_eq!(
             plan_stale_base_shadow(&divergent, &context())
+                .expect("assessment")
+                .reason,
+            "ambiguous_stale_base_lineage_or_diff"
+        );
+
+        let mut rewritten = context();
+        rewritten.live_head_merge_base_sha = LIVE.to_owned();
+        assert_eq!(
+            plan_stale_base_shadow(&exact(), &rewritten)
+                .expect("assessment")
+                .reason,
+            "ambiguous_stale_base_lineage_or_diff"
+        );
+
+        let mut non_descendant = context();
+        non_descendant.old_base_is_live_ancestor = false;
+        assert_eq!(
+            plan_stale_base_shadow(&exact(), &non_descendant)
                 .expect("assessment")
                 .reason,
             "ambiguous_stale_base_lineage_or_diff"

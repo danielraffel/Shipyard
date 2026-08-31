@@ -148,6 +148,7 @@ struct ActivationPlan {
     head_sha: String,
     tree_sha: String,
     policy_digest: String,
+    changed_paths_digest: String,
     validation_contract_digest: String,
     workflow_digest: String,
     selection_receipt_digest: String,
@@ -156,7 +157,29 @@ struct ActivationPlan {
     execution_payload_digest: String,
     selected_count: usize,
     selected_build_target_count: usize,
+    selection_tier: super::SelectionTier,
     stage: String,
+}
+
+#[derive(Serialize)]
+struct ExecutionPayloadBinding<'a> {
+    schema_version: u32,
+    repository: &'a str,
+    pull_request: u64,
+    target: &'a str,
+    base_sha: &'a str,
+    head_sha: &'a str,
+    tree_sha: &'a str,
+    policy_digest: &'a str,
+    selection_receipt_digest: &'a str,
+    validation_contract_digest: &'a str,
+    workflow_digest: &'a str,
+    selected_tests_digest: &'a str,
+    selected_tests: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_build_targets_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_build_targets: Option<&'a [String]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -436,6 +459,7 @@ pub fn evaluate_stale_base_execution(
         || activation.plan.base_sha != stale.live_protected_base_sha
         || activation.plan.validation_contract_digest != stale.validation_contract_digest
         || activation.plan.workflow_digest != stale.live_workflow_digest
+        || validate_stale_plan_selection(&activation.plan, &stale).is_err()
         || cleanup.schema_version != 1
         || cleanup.context_digest != activation.stale_context_digest
         || cleanup.integration_commit_sha != activation.plan.head_sha
@@ -462,19 +486,7 @@ pub fn evaluate_stale_base_execution(
         "malformed_stale_base_result".clone_into(&mut status.reason);
         return status;
     };
-    if validate_result_binding(&activation.plan, &result).is_err()
-        || result.full_authoritative
-        || result.full_returncode.is_some()
-        || result.full_build_returncode.is_some()
-        || result.selected_returncode != 0
-        || match activation.plan.schema_version {
-            1 => result.selected_build_returncode.is_some(),
-            2 => result.selected_build_returncode != Some(0),
-            _ => true,
-        }
-        || result.comparison_verdict != "not_compared"
-        || result.graduation_eligible
-    {
+    if validate_result(&activation.plan, &result).is_err() {
         status.shadow_disposition = Some(super::StaleBaseShadowDisposition::Invalidated);
         status.result_receipt = Some(result_file.name.to_owned());
         "stale_base_selected_result_mismatch".clone_into(&mut status.reason);
@@ -488,6 +500,91 @@ pub fn evaluate_stale_base_execution(
         disposition_name(stale.disposition)
     );
     status
+}
+
+fn validate_stale_plan_selection(
+    plan: &ActivationPlan,
+    stale: &super::StaleBaseShadowReceipt,
+) -> Result<(), &'static str> {
+    let mut selection = stale
+        .shadow_selection
+        .as_deref()
+        .cloned()
+        .ok_or("missing_stale_shadow_selection")?;
+    if selection.shadow_context_digest.as_deref()
+        != Some(super::stale_base_context_digest(stale).as_str())
+        || selection.repository != plan.repository
+        || selection.pull_request != plan.pull_request
+        || selection.target != plan.target
+        || selection.pr_base_sha != plan.base_sha
+        || selection.head_sha != plan.head_sha
+        || selection.tree_sha != plan.tree_sha
+        || selection.policy_digest.as_deref() != Some(plan.policy_digest.as_str())
+        || selection.changed_paths_digest != plan.changed_paths_digest
+        || selection.selection_tier != plan.selection_tier
+        || selection.selected_tests.len() != plan.selected_count
+        || selection.selected_build_targets.len() != plan.selected_build_target_count
+    {
+        return Err("stale_shadow_selection_plan_mismatch");
+    }
+    selection.shadow_context_digest = None;
+    let selection_bytes =
+        serde_json::to_vec(&selection).map_err(|_| "serialize_stale_shadow_selection_failed")?;
+    let selected_tests = literal_file_bytes(&selection.selected_tests)?;
+    let selected_build_targets = match plan.schema_version {
+        1 => None,
+        2 => Some(literal_file_bytes(&selection.selected_build_targets)?),
+        _ => return Err("unsupported_stale_activation_schema"),
+    };
+    let selected_build_targets_digest = selected_build_targets
+        .as_ref()
+        .map(|targets| sha256(targets));
+    if sha256(&selection_bytes) != plan.selection_receipt_digest
+        || sha256(&selected_tests) != plan.selected_tests_digest
+        || selected_build_targets_digest != plan.selected_build_targets_digest
+    {
+        return Err("stale_shadow_selection_digest_mismatch");
+    }
+    let payload = serde_json::to_vec(&ExecutionPayloadBinding {
+        schema_version: plan.schema_version,
+        repository: &plan.repository,
+        pull_request: plan.pull_request,
+        target: &plan.target,
+        base_sha: &plan.base_sha,
+        head_sha: &plan.head_sha,
+        tree_sha: &plan.tree_sha,
+        policy_digest: &plan.policy_digest,
+        selection_receipt_digest: &plan.selection_receipt_digest,
+        validation_contract_digest: &plan.validation_contract_digest,
+        workflow_digest: &plan.workflow_digest,
+        selected_tests_digest: &plan.selected_tests_digest,
+        selected_tests: &selection.selected_tests,
+        selected_build_targets_digest: plan.selected_build_targets_digest.as_deref(),
+        selected_build_targets: selected_build_targets
+            .as_ref()
+            .map(|_| selection.selected_build_targets.as_slice()),
+    })
+    .map_err(|_| "serialize_stale_execution_payload_failed")?;
+    if sha256(&payload) != plan.execution_payload_digest {
+        return Err("stale_execution_payload_digest_mismatch");
+    }
+    Ok(())
+}
+
+fn literal_file_bytes(values: &[String]) -> Result<Vec<u8>, &'static str> {
+    if values.is_empty()
+        || values
+            .iter()
+            .any(|value| value.is_empty() || value.contains('\n'))
+    {
+        return Err("invalid_stale_literal_file_value");
+    }
+    let mut bytes = Vec::new();
+    for value in values {
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
 }
 
 /// Construct a stable rejection when the command boundary cannot safely read

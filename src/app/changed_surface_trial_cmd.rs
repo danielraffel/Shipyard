@@ -45,6 +45,8 @@ struct CurrentStaleGeneration {
 struct SelectedStaleGeneration {
     pointer_bytes: Vec<u8>,
     result_dir: PathBuf,
+    live_base_sha: String,
+    context_digest: String,
     stale_receipt_sha256: String,
 }
 
@@ -54,6 +56,8 @@ struct StaleTrialInputs<'a> {
     activation: Option<&'a [u8]>,
     cleanup: Option<&'a [u8]>,
     results: &'a [(String, Vec<u8>)],
+    expected_live_base_sha: Option<&'a str>,
+    expected_context_digest: Option<&'a str>,
     expected_receipt_sha256: Option<&'a str>,
 }
 
@@ -171,6 +175,12 @@ where
             activation: stale_activation_bytes.as_deref(),
             cleanup: stale_cleanup_bytes.as_deref(),
             results: &results,
+            expected_live_base_sha: current_generation
+                .as_ref()
+                .map(|generation| generation.live_base_sha.as_str()),
+            expected_context_digest: current_generation
+                .as_ref()
+                .map(|generation| generation.context_digest.as_str()),
             expected_receipt_sha256: current_generation
                 .as_ref()
                 .map(|generation| generation.stale_receipt_sha256.as_str()),
@@ -270,6 +280,8 @@ fn select_current_stale_generation(
     Ok(Some(SelectedStaleGeneration {
         pointer_bytes: bytes,
         result_dir: directory,
+        live_base_sha: generation.live_base_sha,
+        context_digest: generation.context_digest,
         stale_receipt_sha256: generation.stale_receipt_sha256,
     }))
 }
@@ -330,6 +342,31 @@ where
         return Some(status);
     }
     let (name, bytes) = stale.first()?;
+    if let (Some(expected_live_base), Some(expected_context)) = (
+        inputs.expected_live_base_sha,
+        inputs.expected_context_digest,
+    ) {
+        let generation_matches = serde_json::from_slice::<
+            crate::changed_surface::StaleBaseShadowReceipt,
+        >(bytes)
+        .is_ok_and(|receipt| {
+            receipt.live_protected_base_sha == expected_live_base
+                && crate::changed_surface::stale_base_context_digest(&receipt) == expected_context
+        });
+        if !generation_matches {
+            let mut status = rejected_trial(
+                identity,
+                Some(name.clone()),
+                stale.len(),
+                Some(name.clone()),
+                "stale_generation_context_mismatch",
+            );
+            status.state = TrialState::Terminal;
+            status.shadow_disposition =
+                Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated);
+            return Some(status);
+        }
+    }
     if inputs
         .expected_receipt_sha256
         .is_some_and(|expected| format!("{:x}", Sha256::digest(bytes)) != expected)
@@ -854,11 +891,8 @@ mod tests {
         };
         let result_root = result_directory(temp.path(), &identity);
         let first_context = "d".repeat(64);
-        let current_context = "e".repeat(64);
         let first_dir = result_root.join("stale-generations").join(&first_context);
-        let current_dir = result_root.join("stale-generations").join(&current_context);
         fs::create_dir_all(&first_dir).expect("first generation");
-        fs::create_dir_all(&current_dir).expect("current generation");
         let first_bytes =
             serde_json::to_vec(&full_required_stale_receipt(SHA_B)).expect("first stale receipt");
         fs::write(
@@ -867,8 +901,13 @@ mod tests {
         )
         .expect("first receipt");
         let current_live_base = "d".repeat(40);
-        let current_bytes = serde_json::to_vec(&full_required_stale_receipt(&current_live_base))
-            .expect("current stale receipt");
+        let current_receipt = full_required_stale_receipt(&current_live_base);
+        let current_context = crate::changed_surface::stale_base_context_digest(
+            &serde_json::from_value(current_receipt.clone()).expect("typed current receipt"),
+        );
+        let current_dir = result_root.join("stale-generations").join(&current_context);
+        fs::create_dir_all(&current_dir).expect("current generation");
+        let current_bytes = serde_json::to_vec(&current_receipt).expect("current stale receipt");
         fs::write(
             current_dir.join(format!(
                 "stale-base-shadow-{current_live_base}-{DIGEST_C}.json"
@@ -908,12 +947,15 @@ mod tests {
             head_sha: SHA_A.to_owned(),
         };
         let result_root = result_directory(temp.path(), &identity);
-        let context = "d".repeat(64);
+        let receipt = full_required_stale_receipt(SHA_B);
+        let context = crate::changed_surface::stale_base_context_digest(
+            &serde_json::from_value(receipt.clone()).expect("typed receipt"),
+        );
         let generation_dir = result_root.join("stale-generations").join(&context);
         fs::create_dir_all(&generation_dir).expect("generation");
         fs::write(
             generation_dir.join(format!("stale-base-shadow-{SHA_B}-{DIGEST_C}.json")),
-            serde_json::to_vec(&full_required_stale_receipt(SHA_B)).expect("stale receipt"),
+            serde_json::to_vec(&receipt).expect("stale receipt"),
         )
         .expect("write stale receipt");
         fs::write(
