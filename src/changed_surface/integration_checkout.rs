@@ -843,7 +843,25 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn persist_valid_activation(evidence_dir: &Path, receipt: &mut StaleBaseShadowReceipt) {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            schema_version: u32,
+            repository: &'a str,
+            pull_request: u64,
+            target: &'a str,
+            base_sha: &'a str,
+            head_sha: &'a str,
+            tree_sha: &'a str,
+            policy_digest: &'a str,
+            selection_receipt_digest: &'a str,
+            validation_contract_digest: &'a str,
+            workflow_digest: &'a str,
+            selected_tests_digest: &'a str,
+            selected_tests: &'a [String],
+        }
+
         let context_digest = stale_base_context_digest(receipt);
         let mut selection = SelectionReceipt {
             schema_version: 1,
@@ -889,22 +907,6 @@ mod tests {
         let selected_tests_digest = sha(b"test-head\n");
         let policy_digest = receipt.live_policy_digest.clone().unwrap();
 
-        #[derive(Serialize)]
-        struct Payload<'a> {
-            schema_version: u32,
-            repository: &'a str,
-            pull_request: u64,
-            target: &'a str,
-            base_sha: &'a str,
-            head_sha: &'a str,
-            tree_sha: &'a str,
-            policy_digest: &'a str,
-            selection_receipt_digest: &'a str,
-            validation_contract_digest: &'a str,
-            workflow_digest: &'a str,
-            selected_tests_digest: &'a str,
-            selected_tests: &'a [String],
-        }
         let integration_commit = receipt.integration_commit_sha.as_deref().unwrap();
         let integration_tree = receipt.integration_tree_sha.as_deref().unwrap();
         let payload_digest = sha(&serde_json::to_vec(&Payload {

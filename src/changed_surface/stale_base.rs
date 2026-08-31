@@ -592,6 +592,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn recomputed_selection_can_only_execute_as_exact_integration_identity() {
         let mut input = context();
         let mut live_policy = policy();

@@ -26,6 +26,9 @@ use shipyard::warm_pool::WarmPool;
 fn local_target(name: &str, cwd: impl Into<PathBuf>) -> ResolvedTarget {
     let mut stages = BTreeMap::new();
     stages.insert("test".to_owned(), "true".to_owned());
+    let mut validation = LocalValidationConfig::default();
+    validation.stages = stages;
+    validation.prepared_state_enabled = true;
     ResolvedTarget {
         name: name.to_owned(),
         validation_build_type: None,
@@ -39,15 +42,7 @@ fn local_target(name: &str, cwd: impl Into<PathBuf>) -> ResolvedTarget {
             cwd: Some(cwd.into()),
             timeout_secs: 300,
         }),
-        validation: ResolvedValidation::Local(LocalValidationConfig {
-            command: None,
-            stages,
-            contract: None,
-            prepared_state_enabled: true,
-            allow_tree_drift: false,
-            machine_environment: Vec::new(),
-            environment: BTreeMap::new(),
-        }),
+        validation: ResolvedValidation::Local(validation),
         failure_parser: None,
     }
 }
