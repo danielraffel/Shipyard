@@ -45,6 +45,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                 lease_dir=str(root / "lease"),
                 production_pid_file=str(production_pid_file),
                 launchd_label="com.danielraffel.shipyard.sandbox-canary.123.1",
+                legacy_launchd_migration="report",
             )
         )
         # Unit tests never mutate the host launchd domain. Tests for the exact
@@ -57,6 +58,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                 "attempted": 0,
                 "removed": 0,
                 "legacy_migrated": 0,
+                "legacy_reported": 0,
                 "deferred": 0,
                 "skipped": 0,
                 "errors": [],
@@ -2592,6 +2594,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                     "attempted": 1,
                     "removed": 1,
                     "legacy_migrated": 0,
+                    "legacy_reported": 0,
                     "deferred": 0,
                     "skipped": 1,
                     "errors": [],
@@ -2610,6 +2613,7 @@ class GuardianLifecycleTests(unittest.TestCase):
     def test_next_run_migrates_only_authenticated_legacy_terminal_job(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
+            active.legacy_launchd_migration = "apply"
             _root, old_label = self.write_legacy_terminal_launchd_receipt(
                 active, 118, 1
             )
@@ -2627,7 +2631,77 @@ class GuardianLifecycleTests(unittest.TestCase):
 
             self.assertEqual(recovery["removed"], 1)
             self.assertEqual(recovery["legacy_migrated"], 1)
+            self.assertEqual(recovery["legacy_reported"], 1)
             self.assertEqual(recovery["errors"], [])
+
+    def test_next_run_only_reports_legacy_jobs_without_explicit_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            _root, old_label = self.write_legacy_terminal_launchd_receipt(
+                active, 117, 1
+            )
+            listed = subprocess.CompletedProcess(
+                ["/bin/launchctl", "list"],
+                0,
+                stdout=f"-\t1\t{old_label}\n",
+                stderr="",
+            )
+            with mock.patch.object(guardian, "_run", return_value=listed) as run:
+                recovery = guardian.Guardian.recover_terminal_launchd_jobs(active)
+
+            self.assertEqual(recovery["legacy_reported"], 1)
+            self.assertEqual(recovery["legacy_migrated"], 0)
+            self.assertEqual(recovery["attempted"], 0)
+            self.assertEqual(recovery["removed"], 0)
+            self.assertEqual(recovery["errors"], [])
+            run.assert_called_once()
+
+    def test_report_mode_rejects_malformed_current_schema_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            root, label = self.write_terminal_launchd_receipt(active, 116, 1)
+            receipt_path = root / "guardian-receipt.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["canary_root"] = "mismatched"
+            guardian._durable_atomic_json(receipt_path, receipt)
+            listed = subprocess.CompletedProcess(
+                ["/bin/launchctl", "list"],
+                0,
+                stdout=f"-\t1\t{label}\n",
+                stderr="",
+            )
+            with mock.patch.object(guardian, "_run", return_value=listed) as run:
+                recovery = guardian.Guardian.recover_terminal_launchd_jobs(active)
+
+            self.assertEqual(recovery["legacy_reported"], 0)
+            self.assertEqual(recovery["attempted"], 0)
+            self.assertEqual(recovery["removed"], 0)
+            self.assertEqual(recovery["skipped"], 1)
+            self.assertEqual(len(recovery["errors"]), 1)
+            self.assertIn("current terminal cleanup receipt", recovery["errors"][0])
+            run.assert_called_once()
+
+    def test_report_mode_rejects_present_null_terminal_schema_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            root, label = self.write_legacy_terminal_launchd_receipt(active, 115, 1)
+            receipt_path = root / "guardian-receipt.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["terminal_lifecycle_state"] = None
+            guardian._durable_atomic_json(receipt_path, receipt)
+            listed = subprocess.CompletedProcess(
+                ["/bin/launchctl", "list"],
+                0,
+                stdout=f"-\t1\t{label}\n",
+                stderr="",
+            )
+            with mock.patch.object(guardian, "_run", return_value=listed):
+                recovery = guardian.Guardian.recover_terminal_launchd_jobs(active)
+
+            self.assertEqual(recovery["legacy_reported"], 0)
+            self.assertEqual(recovery["removed"], 0)
+            self.assertEqual(len(recovery["errors"]), 1)
+            self.assertIn("current terminal cleanup receipt", recovery["errors"][0])
 
     def test_next_run_skips_active_or_unreceipted_launchd_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

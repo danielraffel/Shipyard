@@ -26,6 +26,11 @@ on:
         required: false
         default: ""
         type: string
+      migrate_legacy_launchd:
+        description: Explicitly migrate authenticated pre-receipt-schema sandbox registrations
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: sandbox-e2e-${{ github.ref }}
@@ -148,6 +153,7 @@ jobs:
               <string>--lease-dir</string><string>$lease_dir</string>
               <string>--production-pid-file</string><string>$HOME/Library/Application Support/shipyard/daemon/daemon.pid</string>
               <string>--launchd-label</string><string>$guardian_label</string>
+              <string>--legacy-launchd-migration</string><string>${{ github.event_name == 'workflow_dispatch' && inputs.migrate_legacy_launchd && 'apply' || 'report' }}</string>
             </array>
             <key>StandardOutPath</key><string>$canary_root/guardian.log</string>
             <key>StandardErrorPath</key><string>$canary_root/guardian.log</string>

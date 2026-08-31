@@ -1269,6 +1269,9 @@ class Guardian:
         )
         self.production_pid_file = Path(args.production_pid_file)
         self.launchd_label = args.launchd_label
+        self.legacy_launchd_migration = args.legacy_launchd_migration
+        if self.legacy_launchd_migration not in ("report", "apply"):
+            raise GuardianError("legacy launchd migration mode is invalid")
         label_match = SANDBOX_CANARY_LABEL_RE.fullmatch(self.launchd_label)
         if label_match is None:
             raise GuardianError("sandbox guardian launchd label is not canonical")
@@ -1319,6 +1322,7 @@ class Guardian:
             "attempted": 0,
             "removed": 0,
             "legacy_migrated": 0,
+            "legacy_reported": 0,
             "deferred": 0,
             "skipped": 0,
             "errors": [],
@@ -1347,7 +1351,7 @@ class Guardian:
         receipt: dict[str, object],
     ) -> bool:
         """Authenticate one pre-terminal-schema inert registration."""
-        if receipt.get("terminal_lifecycle_state") is not None:
+        if "terminal_lifecycle_state" in receipt:
             return False
         if not (
             receipt.get("schema_version") == 1
@@ -1401,6 +1405,7 @@ class Guardian:
             "attempted": 0,
             "removed": 0,
             "legacy_migrated": 0,
+            "legacy_reported": 0,
             "deferred": 0,
             "skipped": 0,
             "errors": [],
@@ -1448,6 +1453,15 @@ class Guardian:
                             _process_start(guardian_pid) == guardian_start
                         )
                 else:
+                    if "terminal_lifecycle_state" in receipt:
+                        raise GuardianError(
+                            "current terminal cleanup receipt identity mismatch"
+                        )
+                    recovery["legacy_reported"] = (
+                        int(recovery["legacy_reported"]) + 1
+                    )
+                    if self.legacy_launchd_migration != "apply":
+                        continue
                     is_legacy_receipt = (
                         self.legacy_terminal_launchd_receipt_is_authorized(
                             root=root,
@@ -2729,6 +2743,7 @@ class Guardian:
                 "attempted": 0,
                 "removed": 0,
                 "legacy_migrated": 0,
+                "legacy_reported": 0,
                 "deferred": 0,
                 "skipped": 0,
                 "errors": [f"{type(error).__name__}: {error}"],
@@ -2808,6 +2823,7 @@ class Guardian:
                     "launchd_cleanup_requested": True,
                     "launchd_cleanup_error": None,
                     "launchd_recovery": self.launchd_recovery,
+                    "legacy_launchd_migration": self.legacy_launchd_migration,
                     "reason": reason,
                     "failure": self.failure,
                     "candidate_stopped": self.candidate_stopped,
@@ -2880,6 +2896,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lease-dir", required=True)
     parser.add_argument("--production-pid-file", required=True)
     parser.add_argument("--launchd-label", required=True)
+    parser.add_argument(
+        "--legacy-launchd-migration",
+        choices=("report", "apply"),
+        default="report",
+    )
     return parser.parse_args(argv)
 
 

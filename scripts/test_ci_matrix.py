@@ -289,6 +289,12 @@ class CiMatrixTests(unittest.TestCase):
             '<string>--launchd-label</string><string>$guardian_label</string>',
             workflow,
         )
+        self.assertIn(
+            '<string>--legacy-launchd-migration</string><string>${{ '
+            "github.event_name == 'workflow_dispatch' && "
+            "inputs.migrate_legacy_launchd && 'apply' || 'report' }}</string>",
+            workflow,
+        )
         self.assertEqual(
             workflow.count(
                 "terminal sandbox guardian remained registered after self-bootout"
