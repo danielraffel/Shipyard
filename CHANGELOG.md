@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01380"></a>
+## [0.138.0] - 2026-08-31
+
+- docs: explain public ghapp binding recovery ([#519](https://github.com/danielraffel/Shipyard/pull/519))
+
 <a id="v01370"></a>
 ## [0.137.0] - 2026-08-31
 
@@ -1211,6 +1216,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.138.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.138.0
 [0.137.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.137.0
 [0.136.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.136.0
 [0.135.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.135.0
