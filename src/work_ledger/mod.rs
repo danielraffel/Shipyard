@@ -52,6 +52,7 @@ macro_rules! candidate_params {
 #[cfg(any(unix, test))]
 mod actionable_scheduler;
 mod canary_wake;
+mod custody_inventory;
 #[allow(dead_code)] // Live cmux/HerdR proof remains default-off until upstream contracts ship.
 mod delivery_authority;
 #[allow(dead_code)] // Some ownership lifecycle operations remain future-facing.
@@ -120,6 +121,12 @@ mod storage;
 pub(crate) use actionable_scheduler::NativeStewardApplyReport;
 #[cfg(any(unix, test))]
 pub(crate) use actionable_scheduler::NativeStewardDisposition;
+#[cfg(test)]
+pub(crate) use custody_inventory::CustodyInventoryBinding;
+pub(crate) use custody_inventory::{
+    CustodyInventoryResolution, CustodyInventoryWireRequest, custody_inventory_request,
+    verify_custody_inventory_inbox, verify_custody_inventory_response,
+};
 use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};

@@ -26,12 +26,14 @@ use sha2::{Digest, Sha256};
 
 #[cfg(any(unix, test))]
 use crate::identity::RuntimeMode;
+use crate::work_ledger::LocalWorkInventory;
 use crate::work_ledger::{
-    CustodyControl, CustodyControlReceipt, CustodyReceipt, CustodySuccessorRebind,
-    CustodySuccessorReceipt, CustodyTransfer, CustodyTransportAuthenticator, ProcessedReceipt,
-    WorkLedger, WorkLedgerError, WorkLedgerResult, authenticate_custody_control,
-    authenticate_custody_successor_rebind, authenticate_custody_transfer,
-    authenticate_processed_receipt,
+    CustodyControl, CustodyControlReceipt, CustodyInventoryResolution, CustodyInventoryWireRequest,
+    CustodyReceipt, CustodySuccessorRebind, CustodySuccessorReceipt, CustodyTransfer,
+    CustodyTransportAuthenticator, ProcessedReceipt, WorkLedger, WorkLedgerError, WorkLedgerResult,
+    authenticate_custody_control, authenticate_custody_successor_rebind,
+    authenticate_custody_transfer, authenticate_processed_receipt, custody_inventory_request,
+    verify_custody_inventory_inbox, verify_custody_inventory_response,
 };
 #[cfg(any(unix, test))]
 use crate::work_ledger::{
@@ -69,6 +71,10 @@ pub(crate) enum CustodyTransportRequest {
         schema_version: u32,
         receipt: ProcessedReceipt,
     },
+    Inventory {
+        schema_version: u32,
+        request: CustodyInventoryWireRequest,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -90,6 +96,18 @@ pub(crate) enum CustodyTransportResponse {
         schema_version: u32,
         receipt_digest: String,
     },
+    InventoryComplete {
+        schema_version: u32,
+        request_digest: String,
+        responding_machine_ref: String,
+        inventory: LocalWorkInventory,
+    },
+    InventoryPartial {
+        schema_version: u32,
+        request_digest: String,
+        responding_machine_ref: String,
+        inventory: LocalWorkInventory,
+    },
     Retryable {
         schema_version: u32,
         reason_code: String,
@@ -105,6 +123,31 @@ pub(crate) struct IncomingPeerEvidence {
     pub(crate) peer_machine_ref: String,
     pub(crate) ssh_connection_present: bool,
     pub(crate) ssh_auth_key_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum CustodyInventoryResult {
+    Complete {
+        message_id: String,
+        target_machine_ref: String,
+        request_digest: String,
+        inventory: LocalWorkInventory,
+    },
+    Partial {
+        message_id: String,
+        target_machine_ref: String,
+        request_digest: String,
+        inventory: LocalWorkInventory,
+    },
+    Refused {
+        message_id: String,
+        reason_code: String,
+    },
+    Uncertain {
+        message_id: String,
+        reason_code: String,
+    },
 }
 
 pub(crate) fn incoming_peer_evidence_from_environment(
@@ -166,9 +209,6 @@ fn handle_incoming_request_inner(
     }
     let request: CustodyTransportRequest =
         serde_json::from_slice(input).map_err(|_| "custody-request-malformed".to_owned())?;
-    let ledger = WorkLedger::open_existing(state_dir)
-        .map_err(|_| "custody-ledger-unavailable".to_owned())?
-        .ok_or_else(|| "custody-ledger-absent".to_owned())?;
     let mut authenticator = BoundAuthenticator::new(
         &evidence.peer_machine_ref,
         &policy.policy_digest,
@@ -181,6 +221,7 @@ fn handle_incoming_request_inner(
         } => {
             require_schema(schema_version)?;
             require_local_mutation_authority(policy)?;
+            let ledger = required_mutation_ledger(state_dir)?;
             if transfer.rebind_authority_digest != policy.authority_digest {
                 return Err("custody-transfer-authority-mismatch".to_owned());
             }
@@ -209,6 +250,7 @@ fn handle_incoming_request_inner(
         } => {
             require_schema(schema_version)?;
             require_local_mutation_authority(policy)?;
+            let ledger = required_mutation_ledger(state_dir)?;
             if rebind.new_authority_digest != policy.authority_digest
                 || rebind.successor_proof_digest != peer.successor_proof_digest
                 || rebind.new_target_route_ref != policy.local_route_ref
@@ -241,6 +283,7 @@ fn handle_incoming_request_inner(
         } => {
             require_schema(schema_version)?;
             require_local_mutation_authority(policy)?;
+            let ledger = required_mutation_ledger(state_dir)?;
             if control.authority_digest != policy.authority_digest {
                 return Err("custody-control-authority-mismatch".to_owned());
             }
@@ -267,6 +310,7 @@ fn handle_incoming_request_inner(
                 return Err("custody-processed-non-authority-peer".to_owned());
             }
             let receipt_digest = receipt.receipt_digest.clone();
+            let ledger = required_mutation_ledger(state_dir)?;
             let authenticated = authenticate_processed_receipt(
                 &mut authenticator,
                 &evidence.peer_machine_ref,
@@ -281,7 +325,47 @@ fn handle_incoming_request_inner(
                 receipt_digest,
             })
         }
+        CustodyTransportRequest::Inventory {
+            schema_version,
+            request,
+        } => {
+            require_schema(schema_version)?;
+            if request.binding.source_incarnation_ref != peer.incarnation_ref
+                || request.binding.target_machine_ref != policy.local_machine_ref
+                || request.binding.target_incarnation_ref != policy.local_incarnation_ref
+                || request.binding.target_route_ref != policy.local_route_ref
+                || request.binding.terminal_adapter != policy.local_terminal_adapter
+                || request.binding.authority_digest != policy.authority_digest
+            {
+                return Err("custody-inventory-target-mismatch".to_owned());
+            }
+            let request_digest = request.request_digest.clone();
+            let inventory =
+                verify_custody_inventory_inbox(state_dir, &evidence.peer_machine_ref, &request)
+                    .map_err(|_| "custody-inventory-inbox-refused".to_owned())?;
+            if inventory.complete {
+                Ok(CustodyTransportResponse::InventoryComplete {
+                    schema_version: SCHEMA_VERSION,
+                    request_digest,
+                    responding_machine_ref: policy.local_machine_ref.clone(),
+                    inventory,
+                })
+            } else {
+                Ok(CustodyTransportResponse::InventoryPartial {
+                    schema_version: SCHEMA_VERSION,
+                    request_digest,
+                    responding_machine_ref: policy.local_machine_ref.clone(),
+                    inventory,
+                })
+            }
+        }
     }
+}
+
+fn required_mutation_ledger(state_dir: &Path) -> Result<WorkLedger, String> {
+    WorkLedger::open_existing(state_dir)
+        .map_err(|_| "custody-ledger-unavailable".to_owned())?
+        .ok_or_else(|| "custody-ledger-absent".to_owned())
 }
 
 #[cfg(any(unix, test))]
@@ -292,7 +376,29 @@ trait CustodyCarrier {
         request: &CustodyTransportRequest,
         deadline: Instant,
         max_output_bytes: u64,
-    ) -> Result<(CustodyTransportResponse, String), String>;
+    ) -> Result<(CustodyTransportResponse, String), CustodyCarrierError>;
+}
+
+#[derive(Debug)]
+enum CustodyCarrierError {
+    Unavailable(String),
+    Refused(String),
+}
+
+impl From<CustodyCarrierError> for String {
+    fn from(error: CustodyCarrierError) -> Self {
+        match error {
+            CustodyCarrierError::Unavailable(reason) | CustodyCarrierError::Refused(reason) => {
+                reason
+            }
+        }
+    }
+}
+
+impl From<String> for CustodyCarrierError {
+    fn from(reason: String) -> Self {
+        Self::Refused(reason)
+    }
 }
 
 #[cfg(unix)]
@@ -306,12 +412,13 @@ impl CustodyCarrier for SshCustodyCarrier {
         request: &CustodyTransportRequest,
         deadline: Instant,
         max_output_bytes: u64,
-    ) -> Result<(CustodyTransportResponse, String), String> {
-        let known_hosts = read_bounded_authority(&peer.known_hosts_file, 64 * 1024)?;
-        validate_private_file(&peer.identity_file)?;
-        validate_executable(&peer.ssh_program)?;
-        let request =
-            serde_json::to_vec(request).map_err(|_| "custody-request-encode".to_owned())?;
+    ) -> Result<(CustodyTransportResponse, String), CustodyCarrierError> {
+        let known_hosts = read_bounded_authority(&peer.known_hosts_file, 64 * 1024)
+            .map_err(CustodyCarrierError::Refused)?;
+        validate_private_file(&peer.identity_file).map_err(CustodyCarrierError::Refused)?;
+        validate_executable(&peer.ssh_program).map_err(CustodyCarrierError::Refused)?;
+        let request = serde_json::to_vec(request)
+            .map_err(|_| CustodyCarrierError::Refused("custody-request-encode".to_owned()))?;
         let mut command = Command::new(&peer.ssh_program);
         command
             .env_clear()
@@ -358,15 +465,21 @@ impl CustodyCarrier for SshCustodyCarrier {
             deadline,
             "custody ssh transport",
         )
-        .map_err(|_| "custody-peer-unavailable".to_owned())?;
-        if !output.status.success()
-            || output.stdout.len() as u64 > max_output_bytes
+        .map_err(|_| CustodyCarrierError::Unavailable("custody-peer-unavailable".to_owned()))?;
+        if !output.status.success() {
+            return Err(CustodyCarrierError::Unavailable(
+                "custody-peer-unavailable".to_owned(),
+            ));
+        }
+        if output.stdout.len() as u64 > max_output_bytes
             || output.stderr.len() as u64 > max_output_bytes
         {
-            return Err("custody-peer-refused".to_owned());
+            return Err(CustodyCarrierError::Refused(
+                "custody-peer-refused".to_owned(),
+            ));
         }
         let response = serde_json::from_slice(&output.stdout)
-            .map_err(|_| "custody-response-malformed".to_owned())?;
+            .map_err(|_| CustodyCarrierError::Refused("custody-response-malformed".to_owned()))?;
         let host_witness = hex::encode(Sha256::digest(
             format!(
                 "custody-ssh-server-v1\n{}\n{}",
@@ -713,13 +826,259 @@ fn exchange<C: CustodyCarrier>(
     peer: &CustodyPeer,
     request: &CustodyTransportRequest,
     carrier: &mut C,
-) -> Result<(CustodyTransportResponse, String), String> {
+) -> Result<(CustodyTransportResponse, String), CustodyCarrierError> {
     carrier.exchange(
         peer,
         request,
         Instant::now() + Duration::from_secs(policy.deadline_seconds),
         policy.max_output_bytes,
     )
+}
+
+#[cfg(any(unix, test))]
+#[allow(clippy::too_many_lines)] // A linear fail-closed client keeps every refusal before SSH.
+fn custody_inventory_with_carrier<C: CustodyCarrier>(
+    policy: &CustodyTransportPolicy,
+    state_dir: &Path,
+    message_id: &str,
+    carrier: &mut C,
+) -> CustodyInventoryResult {
+    let Ok(resolution) = custody_inventory_request(state_dir, message_id) else {
+        return CustodyInventoryResult::Refused {
+            message_id: message_id.to_owned(),
+            reason_code: "custody-inventory-local-ledger-refused".to_owned(),
+        };
+    };
+    let binding = match resolution {
+        CustodyInventoryResolution::Query(binding) => *binding,
+        CustodyInventoryResolution::Uncertain(reason_code) => {
+            return CustodyInventoryResult::Uncertain {
+                message_id: message_id.to_owned(),
+                reason_code: reason_code.to_owned(),
+            };
+        }
+        CustodyInventoryResolution::Refused(reason_code) => {
+            return CustodyInventoryResult::Refused {
+                message_id: message_id.to_owned(),
+                reason_code: reason_code.to_owned(),
+            };
+        }
+    };
+    if binding.source_machine_ref != policy.local_machine_ref
+        || binding.source_incarnation_ref != policy.local_incarnation_ref
+    {
+        return CustodyInventoryResult::Refused {
+            message_id: message_id.to_owned(),
+            reason_code: "custody-inventory-source-mismatch".to_owned(),
+        };
+    }
+    let peer = match peer(policy, &binding.target_machine_ref) {
+        Ok(peer) => peer,
+        Err(reason_code) => {
+            return CustodyInventoryResult::Refused {
+                message_id: message_id.to_owned(),
+                reason_code,
+            };
+        }
+    };
+    if peer.incarnation_ref != binding.target_incarnation_ref
+        || peer.route_ref != binding.target_route_ref
+        || peer.terminal_adapter != binding.terminal_adapter
+    {
+        return CustodyInventoryResult::Refused {
+            message_id: message_id.to_owned(),
+            reason_code: "custody-inventory-policy-route-mismatch".to_owned(),
+        };
+    }
+    let Ok(request) = CustodyInventoryWireRequest::new(binding) else {
+        return CustodyInventoryResult::Refused {
+            message_id: message_id.to_owned(),
+            reason_code: "custody-inventory-request-refused".to_owned(),
+        };
+    };
+    let wire_request = CustodyTransportRequest::Inventory {
+        schema_version: SCHEMA_VERSION,
+        request: request.clone(),
+    };
+    let (response, _witness) = match exchange(policy, peer, &wire_request, carrier) {
+        Ok(value) => value,
+        Err(CustodyCarrierError::Unavailable(reason_code)) => {
+            return CustodyInventoryResult::Uncertain {
+                message_id: message_id.to_owned(),
+                reason_code,
+            };
+        }
+        Err(CustodyCarrierError::Refused(reason_code)) => {
+            return CustodyInventoryResult::Refused {
+                message_id: message_id.to_owned(),
+                reason_code,
+            };
+        }
+    };
+    match response {
+        CustodyTransportResponse::InventoryComplete {
+            schema_version,
+            request_digest,
+            responding_machine_ref,
+            inventory,
+        } => finish_inventory_response(
+            message_id,
+            state_dir,
+            peer,
+            &request,
+            schema_version,
+            &request_digest,
+            &responding_machine_ref,
+            inventory,
+            true,
+        ),
+        CustodyTransportResponse::InventoryPartial {
+            schema_version,
+            request_digest,
+            responding_machine_ref,
+            inventory,
+        } => finish_inventory_response(
+            message_id,
+            state_dir,
+            peer,
+            &request,
+            schema_version,
+            &request_digest,
+            &responding_machine_ref,
+            inventory,
+            false,
+        ),
+        CustodyTransportResponse::Refused {
+            schema_version,
+            reason_code,
+        } if valid_inventory_terminal_response(schema_version, &reason_code) => {
+            CustodyInventoryResult::Refused {
+                message_id: message_id.to_owned(),
+                reason_code,
+            }
+        }
+        CustodyTransportResponse::Retryable {
+            schema_version,
+            reason_code,
+        } if valid_inventory_terminal_response(schema_version, &reason_code) => {
+            CustodyInventoryResult::Uncertain {
+                message_id: message_id.to_owned(),
+                reason_code,
+            }
+        }
+        _ => CustodyInventoryResult::Refused {
+            message_id: message_id.to_owned(),
+            reason_code: "custody-inventory-response-kind-refused".to_owned(),
+        },
+    }
+}
+
+#[cfg(any(unix, test))]
+fn valid_inventory_terminal_response(schema_version: u32, reason_code: &str) -> bool {
+    require_schema(schema_version).is_ok()
+        && !reason_code.is_empty()
+        && reason_code.len() <= 128
+        && !reason_code.starts_with('-')
+        && reason_code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+#[cfg(any(unix, test))]
+#[allow(clippy::too_many_arguments)]
+fn finish_inventory_response(
+    message_id: &str,
+    state_dir: &Path,
+    peer: &CustodyPeer,
+    request: &CustodyInventoryWireRequest,
+    schema_version: u32,
+    request_digest: &str,
+    responding_machine_ref: &str,
+    inventory: LocalWorkInventory,
+    declared_complete: bool,
+) -> CustodyInventoryResult {
+    if declared_complete != inventory.complete
+        || require_schema(schema_version).is_err()
+        || !inventory_request_is_current(state_dir, message_id, request)
+        || verify_custody_inventory_response(
+            request,
+            &peer.machine_ref,
+            request_digest,
+            responding_machine_ref,
+            &inventory,
+        )
+        .is_err()
+    {
+        CustodyInventoryResult::Refused {
+            message_id: message_id.to_owned(),
+            reason_code: "custody-inventory-response-refused".to_owned(),
+        }
+    } else if inventory.complete {
+        CustodyInventoryResult::Complete {
+            message_id: request.binding.message_id.clone(),
+            target_machine_ref: request.binding.target_machine_ref.clone(),
+            request_digest: request.request_digest.clone(),
+            inventory,
+        }
+    } else {
+        CustodyInventoryResult::Partial {
+            message_id: request.binding.message_id.clone(),
+            target_machine_ref: request.binding.target_machine_ref.clone(),
+            request_digest: request.request_digest.clone(),
+            inventory,
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+fn inventory_request_is_current(
+    state_dir: &Path,
+    message_id: &str,
+    expected: &CustodyInventoryWireRequest,
+) -> bool {
+    let Ok(CustodyInventoryResolution::Query(binding)) =
+        custody_inventory_request(state_dir, message_id)
+    else {
+        return false;
+    };
+    CustodyInventoryWireRequest::new(*binding).is_ok_and(|current| current == *expected)
+}
+
+#[cfg(unix)]
+pub(crate) fn remote_custody_inventory(
+    policy: &CustodyTransportPolicy,
+    state_dir: &Path,
+    message_id: &str,
+) -> CustodyInventoryResult {
+    custody_inventory_with_carrier(policy, state_dir, message_id, &mut SshCustodyCarrier)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remote_custody_inventory(
+    _policy: &CustodyTransportPolicy,
+    state_dir: &Path,
+    message_id: &str,
+) -> CustodyInventoryResult {
+    match custody_inventory_request(state_dir, message_id) {
+        Ok(CustodyInventoryResolution::Query(_)) => CustodyInventoryResult::Uncertain {
+            message_id: message_id.to_owned(),
+            reason_code: "custody-inventory-ssh-unavailable".to_owned(),
+        },
+        Ok(CustodyInventoryResolution::Uncertain(reason_code)) => {
+            CustodyInventoryResult::Uncertain {
+                message_id: message_id.to_owned(),
+                reason_code: reason_code.to_owned(),
+            }
+        }
+        Ok(CustodyInventoryResolution::Refused(reason_code)) => CustodyInventoryResult::Refused {
+            message_id: message_id.to_owned(),
+            reason_code: reason_code.to_owned(),
+        },
+        Err(_) => CustodyInventoryResult::Refused {
+            message_id: message_id.to_owned(),
+            reason_code: "custody-inventory-local-ledger-refused".to_owned(),
+        },
+    }
 }
 
 #[cfg(any(unix, test))]

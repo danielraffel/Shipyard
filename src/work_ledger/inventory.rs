@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
@@ -29,7 +29,8 @@ enum InventorySchema {
 }
 
 /// A bounded local inventory response.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalWorkInventory {
     /// SHA-256 of the exact immutable database bytes inspected for this response.
     pub snapshot_sha256: Option<String>,
@@ -44,7 +45,8 @@ pub struct LocalWorkInventory {
 }
 
 /// Immutable identity and current local custody state for one workstream.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalWorkInventoryItem {
     /// Provider host that issued `repository_id`, absent only for migrated legacy rows.
     pub repository_provider: Option<String>,
@@ -109,7 +111,62 @@ fn local_work_inventory_with_preopen_hook(
     validate_inventory_rows_sql_side(&connection, schema)?;
     verify_integrity(&connection)?;
 
-    let mut selected = load_inventory_rows(&connection, schema)?;
+    let inventory =
+        materialize_inventory(&connection, source_before.database.sha256.clone(), schema)?;
+    if storage_snapshot(directory, &path)?.as_ref() != Some(&source_before) {
+        return Err(WorkLedgerError::Refused(
+            "work ledger changed during zero-write inventory".to_owned(),
+        ));
+    }
+    Ok(inventory)
+}
+
+/// Run a bounded query against the same immutable, race-checked snapshot used
+/// by local inventory. The closure cannot obtain a writable connection.
+pub(super) fn immutable_ledger_query<T>(
+    state_dir: &Path,
+    query: impl FnOnce(&Connection, &str) -> WorkLedgerResult<T>,
+) -> WorkLedgerResult<Option<T>> {
+    let path = WorkLedger::path_at(state_dir);
+    let directory = path
+        .parent()
+        .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+    let Some(source_before) = storage_snapshot(directory, &path)? else {
+        if storage_snapshot(directory, &path)?.is_some() {
+            return Err(WorkLedgerError::Refused(
+                "work ledger appeared during zero-write query".to_owned(),
+            ));
+        }
+        return Ok(None);
+    };
+    validate_storage_snapshot(&source_before)?;
+    let connection = connect_immutable(&path)?;
+    validate_database_resources(&connection)?;
+    verify_supported_schema(&connection)?;
+    verify_integrity(&connection)?;
+    let result = query(&connection, &source_before.database.sha256)?;
+    if storage_snapshot(directory, &path)?.as_ref() != Some(&source_before) {
+        return Err(WorkLedgerError::Refused(
+            "work ledger changed during zero-write query".to_owned(),
+        ));
+    }
+    Ok(Some(result))
+}
+
+pub(super) fn inventory_from_connection(
+    connection: &Connection,
+    snapshot_sha256: String,
+) -> WorkLedgerResult<LocalWorkInventory> {
+    validate_inventory_rows_sql_side(connection, InventorySchema::Current)?;
+    materialize_inventory(connection, snapshot_sha256, InventorySchema::Current)
+}
+
+fn materialize_inventory(
+    connection: &Connection,
+    snapshot_sha256: String,
+    schema: InventorySchema,
+) -> WorkLedgerResult<LocalWorkInventory> {
+    let mut selected = load_inventory_rows(connection, schema)?;
     let truncated = selected.len() > MAX_LOCAL_WORK_INVENTORY_ITEMS;
     selected.truncate(MAX_LOCAL_WORK_INVENTORY_ITEMS);
     let mut items = Vec::with_capacity(selected.len());
@@ -119,19 +176,60 @@ fn local_work_inventory_with_preopen_hook(
         has_legacy_repository_identity |= item.repository_provider.is_none();
         items.push(item);
     }
-    if storage_snapshot(directory, &path)?.as_ref() != Some(&source_before) {
-        return Err(WorkLedgerError::Refused(
-            "work ledger changed during zero-write inventory".to_owned(),
-        ));
-    }
-    let complete = !truncated && !has_legacy_repository_identity;
     Ok(LocalWorkInventory {
-        snapshot_sha256: Some(source_before.database.sha256),
-        complete,
+        snapshot_sha256: Some(snapshot_sha256),
+        complete: !truncated && !has_legacy_repository_identity,
         truncated,
         limit: MAX_LOCAL_WORK_INVENTORY_ITEMS,
         items,
     })
+}
+
+pub(super) fn validate_remote_inventory(inventory: &LocalWorkInventory) -> WorkLedgerResult<()> {
+    let has_legacy_repository_identity = inventory
+        .items
+        .iter()
+        .any(|item| item.repository_provider.is_none() || item.repository_id.is_none());
+    let expected_complete = !inventory.truncated && !has_legacy_repository_identity;
+    if inventory.limit != MAX_LOCAL_WORK_INVENTORY_ITEMS
+        || inventory.items.len() > inventory.limit
+        || (inventory.truncated && inventory.items.len() != inventory.limit)
+        || inventory.complete != expected_complete
+        || (inventory.snapshot_sha256.is_none()
+            && (!inventory.items.is_empty() || !inventory.complete || inventory.truncated))
+    {
+        return Err(WorkLedgerError::Refused(
+            "remote inventory bounds or completeness are contradictory".to_owned(),
+        ));
+    }
+    if let Some(snapshot) = &inventory.snapshot_sha256
+        && (snapshot.len() != 64
+            || !snapshot
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    {
+        return Err(WorkLedgerError::Refused(
+            "remote inventory snapshot identity is invalid".to_owned(),
+        ));
+    }
+    let mut previous: Option<(&str, u64, &str, &str, &str)> = None;
+    for item in &inventory.items {
+        validate_item(item, Some(&item.repository), Some(&item.exact_head))?;
+        let key = (
+            item.repository.as_str(),
+            item.pull_request,
+            item.exact_head.as_str(),
+            item.workstream_handle.as_str(),
+            item.work_item_id.as_str(),
+        );
+        if previous.is_some_and(|prior| prior >= key) {
+            return Err(WorkLedgerError::Refused(
+                "remote inventory ordering or item identity is contradictory".to_owned(),
+            ));
+        }
+        previous = Some(key);
+    }
+    Ok(())
 }
 
 type InventoryRow = (LocalWorkInventoryItem, Option<String>, Option<String>);
@@ -767,7 +865,12 @@ fn validate_item(
         (None, None, None, None) => {}
         (Some(ownership_id), Some(state), Some(work_generation), Some(owner_generation)) => {
             validate_opaque_ref("inventory agent ownership", ownership_id, "ao")?;
-            if work_generation == 0 || owner_generation == 0 {
+            if work_generation == 0
+                || owner_generation == 0
+                || work_generation != item.work_generation
+                || owner_generation != item.owner_generation
+                || item.owner_id.is_none()
+            {
                 return Err(WorkLedgerError::Refused(
                     "inventory agent ownership generation is invalid".to_owned(),
                 ));
@@ -1124,6 +1227,33 @@ CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
             inventory.items[0].work_item_id,
             inventory.items[1].work_item_id
         );
+    }
+
+    #[test]
+    fn remote_inventory_completeness_is_recomputed_from_bounded_items() {
+        let state = tempfile::tempdir().expect("state");
+        let ledger = WorkLedger::open(state.path()).expect("ledger");
+        seed(&ledger, "owner/repo", 8, "remote-completeness");
+        let inventory = local_work_inventory(state.path()).expect("inventory");
+        validate_remote_inventory(&inventory).expect("canonical complete inventory");
+
+        let mut short_truncation = inventory.clone();
+        short_truncation.complete = false;
+        short_truncation.truncated = true;
+        assert!(validate_remote_inventory(&short_truncation).is_err());
+
+        let mut false_partial = inventory.clone();
+        false_partial.complete = false;
+        assert!(validate_remote_inventory(&false_partial).is_err());
+
+        let mut legacy_complete = inventory.clone();
+        legacy_complete.items[0].repository_provider = None;
+        legacy_complete.items[0].repository_id = None;
+        assert!(validate_remote_inventory(&legacy_complete).is_err());
+
+        let mut noncanonical_empty = empty_inventory();
+        noncanonical_empty.complete = false;
+        assert!(validate_remote_inventory(&noncanonical_empty).is_err());
     }
 
     #[test]
