@@ -8,9 +8,6 @@ use std::time::{Duration, Instant};
 #[cfg(not(windows))]
 use std::process::Child;
 #[cfg(unix)]
-use wait_timeout::ChildExt;
-
-#[cfg(unix)]
 const TERMINATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(not(windows))]
 const TERMINATION_REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -362,11 +359,15 @@ impl ProcessTree {
                 return;
             };
             if !matches!(
-                terminator.wait_timeout(TERMINATION_COMMAND_TIMEOUT),
+                wait_child_until(
+                    &mut terminator,
+                    Instant::now() + TERMINATION_COMMAND_TIMEOUT,
+                ),
                 Ok(Some(_))
             ) {
                 let _ = terminator.kill();
-                let _ = terminator.wait_timeout(TERMINATION_REAP_TIMEOUT);
+                let _ =
+                    wait_child_until(&mut terminator, Instant::now() + TERMINATION_REAP_TIMEOUT);
             }
             let _ = self.child.kill();
             let _ = self.wait_timeout(TERMINATION_REAP_TIMEOUT);
@@ -399,7 +400,7 @@ impl ProcessTree {
             if let Ok(mut terminator) = termination_command(self.child.id()).spawn() {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if !remaining.is_zero()
-                    && !matches!(terminator.wait_timeout(remaining), Ok(Some(_)))
+                    && !matches!(wait_child_until(&mut terminator, deadline), Ok(Some(_)))
                 {
                     let _ = terminator.kill();
                 }
@@ -439,6 +440,20 @@ impl Drop for ProcessTree {
         // Match the Windows Job boundary when a caller returns before its
         // normal explicit cleanup path.
         self.terminate();
+    }
+}
+
+#[cfg(unix)]
+fn wait_child_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(WAIT_POLL_INTERVAL.min(deadline - now));
     }
 }
 
@@ -565,6 +580,37 @@ mod tests {
             Err(super::BoundedOutputError::TimedOut { .. })
         ));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_bounded_output_timeouts_keep_reaping_independent() {
+        use std::process::Command;
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        let barrier = Arc::new(Barrier::new(9));
+        let workers = (0..8)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::run_output_until(
+                        Command::new("sh").args(["-c", "sleep 30"]),
+                        Instant::now() + Duration::from_millis(200),
+                        "concurrent timeout probe",
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        for worker in workers {
+            assert!(matches!(
+                worker.join().expect("timeout worker must not panic"),
+                Err(super::BoundedOutputError::TimedOut { .. })
+            ));
+        }
     }
 
     #[cfg(unix)]
