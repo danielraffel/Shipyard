@@ -11,8 +11,7 @@ use std::time::{Duration, Instant};
 use super::*;
 
 const REAL_GHAPP: &[u8] = include_bytes!("../../../../../scripts/ghapp");
-const REAL_PR_CLOSE_GUARD: &[u8] =
-    include_bytes!("../../../../../scripts/ghapp_pr_close_guard.py");
+const REAL_PR_CLOSE_GUARD: &[u8] = include_bytes!("../../../../../scripts/ghapp_pr_close_guard.py");
 
 struct ReaderFixture {
     root: tempfile::TempDir,
@@ -52,10 +51,7 @@ impl ReaderFixture {
         let private_key = root.path().join("private-key.pem");
 
         Self::write_executable(&wrapper_source, REAL_GHAPP);
-        Self::write_executable(
-            &guards_dir.join("pr-close-guard"),
-            REAL_PR_CLOSE_GUARD,
-        );
+        Self::write_executable(&guards_dir.join("pr-close-guard"), REAL_PR_CLOSE_GUARD);
         Self::write_helper_source(&helper_source, "release-one");
         Self::write_binary_source(&binary_source, &private_key);
         Self::write_executable(
