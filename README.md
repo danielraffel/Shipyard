@@ -35,12 +35,26 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
 
 ## How it fits
 
-- People and development tools make changes and handle work that needs
-  judgment.
-- Shipyard keeps durable workflow state and policy, follows CI and queue
-  progress, takes bounded safe actions, and asks for intervention when needed.
-- GitHub owns merge ordering. When configured, TartCI turns compatible local
-  Macs into isolated execution capacity for Shipyard's validation work.
+Shipyard sits between the work and the machines that run it:
+
+1. **Work.** A person or coding tool decides what to change and writes the
+   code. Shipyard does not invent a product decision or silently edit code.
+2. **Coordination.** Shipyard records the exact change, its checks, handoff,
+   and allowed next steps. With the optional daemon enabled, verified GitHub
+   webhooks provide quick updates and periodic GitHub reconciliation repairs a
+   missed update or restart. Routine observation does not need a model; a
+   decision, ambiguous failure, or code repair is surfaced for one.
+3. **Execution.** GitHub remains the authority for merge order and hosted-job
+   assignment. Shipyard can ask configured machines to validate a change.
+   [TartCI](https://github.com/danielraffel/tartci) supplies isolated Mac VM
+   capacity; SSH targets, including independently managed Proxmox Linux VMs,
+   remain separate executors under the same evidence rules.
+
+All three layers are available now when their executors are configured. Durable
+continuation within the coordination layer is deliberately opt-in and
+policy-gated: it records a specific handoff and refuses when the record, route,
+or current code no longer agrees. It is not a promise that an unconfigured
+project will automatically recover or merge every PR.
 
 ## Common uses
 
@@ -52,12 +66,19 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   restarts without reconstructing its state from scratch.
 - Use the `ghapp` wrapper for scoped GitHub App authentication without putting
   short-lived credentials into unattended command lines.
+- Keep terminal delivery and model-provider routing separate. `cmux` is the
+  physically implemented terminal adapter today. HerdR endpoint shapes and
+  Subrouter provider routes are registered, but HerdR delivery remains
+  fail-closed until its own live capability checks pass. See [terminal and
+  provider adapters](docs/terminal-adapters.md).
 
 ## Highlights
 
-- **Built for unattended delivery.** Submit work once; Shipyard preserves its
-  exact state, watches the required systems, and takes the next authorized
-  action without exposing notarization keys or publishing accounts.
+- **Built for bounded unattended delivery.** With an explicit, authorized
+  handoff, Shipyard preserves exact state, watches the required systems, and
+  takes only its next allowed action. It records uncertainty rather than
+  guessing, and it never puts notarization keys or publishing accounts in a
+  command line.
 - **Evidence-based merge gate.** `shipyard ship` refuses to merge unless
   every required platform has passing evidence **for the exact HEAD SHA** —
   not the most-recent run, not the branch tip, the SHA.

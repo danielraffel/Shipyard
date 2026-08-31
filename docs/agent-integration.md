@@ -1,8 +1,14 @@
-# Agent Integration
+# Coding-tool integration
 
-Shipyard is designed for AI agents (Claude Code, Codex) that write code
-across parallel worktrees and need real cross-platform validation before
-merging.
+Shipyard works alongside coding tools such as Claude Code and Codex. The tool
+does the reasoning and changes the code; Shipyard records and watches the
+delivery work around it. That keeps a model from spending a long session
+repeatedly asking whether a test or merge queue changed.
+
+This integration is optional. A normal `shipyard run` or `shipyard ship` works
+without a long-lived daemon. The daemon-backed continuation path is explicitly
+enabled per trusted policy and handoff; it is designed to stop safely and ask
+for help when its evidence is incomplete or code judgment is needed.
 
 ## `shipyard init` handles this for you
 
@@ -36,19 +42,35 @@ for your choice. You can re-run `shipyard init` later to change the setup.
 
 ## How it works after setup
 
-Once configured, your agent handles CI end-to-end:
+For the basic setup, a coding tool can hand a change to Shipyard:
 
 1. You: "Implement the reverb effect and ship it"
 2. Agent writes code, commits to a feature branch
-3. Agent runs `shipyard ship` which:
+3. The tool runs `shipyard ship`, which:
    - Pushes the branch
    - Creates a PR
    - Validates on all configured platforms
    - If all green, merges automatically
-4. You come back, it's on main
+4. You come back to a merged change or a recorded reason it stopped
 
-This is how [Pulp](https://github.com/Generous-Corp/pulp) (the project
-Shipyard was extracted from) operates daily.
+Whether a PR is merged automatically remains your repository policy. GitHub
+keeps merge ordering; Shipyard only acts where its exact-head evidence and
+configured authority allow it.
+
+## Optional durable handoff
+
+For a long-running or restart-prone task, an explicit steward handoff stores
+the PR, exact commit, workstream context, and a bounded continuation route.
+The trusted daemon can then receive verified GitHub webhooks, reconcile with
+GitHub if an event is missed, and keep routine monitoring out of the coding
+tool's context window. It escalates only when a decision or repair is needed.
+
+This is deliberately not inferred from a terminal name or a chat transcript.
+If the handoff is missing, stale, or no longer matches the current PR,
+Shipyard refuses rather than guessing a replacement session. See
+[launch profiles](launch-profile.md) and
+[terminal and provider adapters](terminal-adapters.md) for the current
+capability and recovery boundaries.
 
 ## If you prefer manual merging
 

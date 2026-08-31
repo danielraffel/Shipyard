@@ -1,5 +1,21 @@
 # Terminal and provider adapter boundaries
 
+## In plain language
+
+Shipyard keeps two questions separate: **where can a coding tool be reached?**
+and **which provider route may receive the request?** A terminal adapter
+answers the first; a provider adapter answers the second. Keeping them
+separate means a familiar terminal label can never be mistaken for proof that
+the right person, session, account, or model is available.
+
+Today, cmux is the only terminal adapter that has completed physical delivery
+work. HerdR has a registered shape so it can be added without changing the
+durable handoff format, but it remains disabled until a live canary proves it.
+Subrouter routes can be validated for the supported providers, but route
+validation is not itself proof that a provider accepted a request. Shipyard
+therefore refuses an unproven route instead of falling back to a different
+terminal or direct provider.
+
 Shipyard treats terminal transport and provider routing as independent
 authorities. A terminal endpoint selects where a bounded operation may occur;
 the protected Subrouter route selects which provider, account, model, and native
