@@ -26,6 +26,11 @@ on:
         required: false
         default: ""
         type: string
+      migrate_legacy_launchd:
+        description: Explicitly migrate authenticated pre-receipt-schema sandbox registrations
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: sandbox-e2e-${{ github.ref }}
@@ -147,6 +152,8 @@ jobs:
               <string>--final-receipt</string><string>$canary_root/guardian-receipt.json</string>
               <string>--lease-dir</string><string>$lease_dir</string>
               <string>--production-pid-file</string><string>$HOME/Library/Application Support/shipyard/daemon/daemon.pid</string>
+              <string>--launchd-label</string><string>$guardian_label</string>
+              <string>--legacy-launchd-migration</string><string>${{ github.event_name == 'workflow_dispatch' && inputs.migrate_legacy_launchd && 'apply' || 'report' }}</string>
             </array>
             <key>StandardOutPath</key><string>$canary_root/guardian.log</string>
             <key>StandardErrorPath</key><string>$canary_root/guardian.log</string>
@@ -331,7 +338,29 @@ jobs:
                   "$canary_root/guardian-receipt.json"
                 test ! -e "$lease_dir"
                 test ! -e "$(jq -r .mutation_probe_output "$canary_root/admission-deferred.json")"
-                launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+                launchd_inventory="$canary_root/launchd-list-after-terminal.txt"
+                launchd_label="com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+                launchd_deadline=$((SECONDS + 10))
+                while true; do
+                  if ! launchctl list > "$launchd_inventory"; then
+                    echo "could not inventory launchd after terminal sandbox guardian" >&2
+                    exit 1
+                  fi
+                  if ! awk -v label="$launchd_label" '$3 == label { found=1 } END { exit !found }' "$launchd_inventory"; then
+                    break
+                  fi
+                  if [ "$SECONDS" -ge "$launchd_deadline" ]; then
+                    break
+                  fi
+                  sleep 1
+                done
+                if awk -v label="$launchd_label" '$3 == label { found=1 } END { exit !found }' "$launchd_inventory"; then
+                  launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+                  echo "terminal sandbox guardian remained registered after self-bootout" >&2
+                  exit 1
+                fi
+                jq -e '.launchd_cleanup_error == null and (.launchd_recovery.errors | length) == 0' \
+                  "$canary_root/guardian-receipt.json"
                 ;;
               retained-lease-awaiting-idle)
                 guardian_pid="$(jq -r .guardian_pid "$canary_root/admission-deferred.json")"
@@ -409,7 +438,29 @@ jobs:
             sleep 1
           done
           test -s "$status_file"
-          launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+          launchd_inventory="$canary_root/launchd-list-after-terminal.txt"
+          launchd_label="com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          launchd_deadline=$((SECONDS + 10))
+          while true; do
+            if ! launchctl list > "$launchd_inventory"; then
+              echo "could not inventory launchd after terminal sandbox guardian" >&2
+              exit 1
+            fi
+            if ! awk -v label="$launchd_label" '$3 == label { found=1 } END { exit !found }' "$launchd_inventory"; then
+              break
+            fi
+            if [ "$SECONDS" -ge "$launchd_deadline" ]; then
+              break
+            fi
+            sleep 1
+          done
+          if awk -v label="$launchd_label" '$3 == label { found=1 } END { exit !found }' "$launchd_inventory"; then
+            launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+            echo "terminal sandbox guardian remained registered after self-bootout" >&2
+            exit 1
+          fi
+          jq -e '.launchd_cleanup_error == null and (.launchd_recovery.errors | length) == 0' \
+            "$canary_root/guardian-receipt.json"
 
       - name: Upload sandbox tempdir on failure
         if: failure()
