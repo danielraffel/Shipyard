@@ -1709,6 +1709,7 @@ impl ActionableWakeProducer {
         repository: &str,
         pull_request: u64,
         head_sha: &str,
+        now: chrono::DateTime<Utc>,
     ) -> Option<chrono::DateTime<Utc>> {
         let key = dispatch_scope_prefix(
             repository_provider,
@@ -1727,6 +1728,7 @@ impl ActionableWakeProducer {
                     .ok()
                     .map(|due| due.with_timezone(&Utc))
             })
+            .filter(|due| *due > now)
             .min()
     }
 
@@ -2616,6 +2618,56 @@ mod tests {
         assert_eq!(due[0].repository, observation.authority.repository);
         assert_eq!(due[0].pull_request, observation.authority.pull_request);
         assert_eq!(due[0].head_sha, observation.authority.pull_request_head);
+    }
+
+    #[test]
+    fn second_read_deadline_ignores_mature_nonmatching_checkpoint() {
+        let state = tempfile::tempdir().expect("state");
+        let observation = dispatch_observation();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        producer.schedule_dispatch_probe(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            Utc::now(),
+        );
+        let now = Utc::now();
+        let future = now + chrono::Duration::minutes(5);
+        let boot_epoch = producer.boot_epoch.clone();
+        let target = producer
+            .status
+            .dispatch_targets
+            .values_mut()
+            .next()
+            .expect("scheduled target");
+        target.observations.insert(
+            "mature-nonmatching-job".to_owned(),
+            DispatchObservationCheckpoint {
+                digest: "old-digest".to_owned(),
+                not_before: (now - chrono::Duration::minutes(1)).to_rfc3339(),
+                boot_epoch: boot_epoch.clone(),
+            },
+        );
+        target.observations.insert(
+            "fresh-matching-job".to_owned(),
+            DispatchObservationCheckpoint {
+                digest: "new-digest".to_owned(),
+                not_before: future.to_rfc3339(),
+                boot_epoch,
+            },
+        );
+
+        assert_eq!(
+            producer.dispatch_second_read_due_at_for_repository(
+                test_repository_provider(),
+                test_repository_id(),
+                &observation.authority.repository,
+                observation.authority.pull_request,
+                &observation.authority.pull_request_head,
+                now,
+            ),
+            Some(future)
+        );
     }
 
     #[test]

@@ -1345,9 +1345,9 @@ fn schedule_dispatch_followup(
                 repository,
                 pull_request,
                 head_sha,
+                now,
             )
-            .map(|due| due.max(now + chrono::Duration::seconds(1)))
-            .or_else(|| Some(now + chrono::Duration::seconds(20))),
+            .or_else(|| Some(now + chrono::Duration::seconds(300))),
         Some(
             "dispatch_wedge_checkpoint_failed"
             | "dispatch_wedge_cleanup_failed"
@@ -2918,6 +2918,7 @@ mod tests {
                 "owner/repo",
                 42,
                 &"a".repeat(40),
+                Utc::now(),
             )
             .expect("durable checkpoint deadline");
         schedule_dispatch_followup(
@@ -2943,6 +2944,17 @@ mod tests {
                 .with_timezone(&Utc),
             expected
         );
+        producer.schedule_dispatch_probe_for_repository(
+            "github.com",
+            "R_other",
+            "owner/other",
+            43,
+            &"c".repeat(40),
+            Utc::now() - chrono::Duration::seconds(1),
+        );
+        let due = producer.due_dispatch_probes(Utc::now(), 1);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].repository_id, "R_other");
     }
 
     #[cfg(unix)]
