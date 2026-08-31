@@ -97,8 +97,13 @@ client does not target them.
 
 Targets v0.134.0 and newer publish machine-global auth as a private,
 content-addressed generation containing the release-matched Shipyard binary,
-helper, wrapper, and typed context. The public wrapper is the final atomic
-selector: a running reader binds the wrapper file it actually opened (Linux
+helper, wrapper, and typed context. Starting with v0.137.0, the generation also
+contains the mandatory release-matched `pr-close-guard` and uses the mutually
+exclusive `auth-selector-v2` contract. Fleet clients from v0.134-v0.136 must
+reject that target before publication; upgrade the controlling client through
+the supported exact-release path before the governed fleet transaction. The
+public wrapper is the final atomic selector: a running reader binds the wrapper
+file it actually opened (Linux
 `/proc` or macOS `lsof`) and resolves every sibling from that same generation,
 never from a second read of the mutable selector. Rollback reverses publication
 order, while crash recovery rolls back an unvalidated generation and rolls
