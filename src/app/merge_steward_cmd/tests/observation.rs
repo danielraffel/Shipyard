@@ -221,6 +221,142 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn dispatch_runner_inventory_is_paginated_and_preserves_registered_state() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"actions/runners?per_page=100&page=1"*)
+    printf '{"runners":['
+    i=1
+    while [ "$i" -le 100 ]; do
+      [ "$i" -eq 1 ] || printf ','
+      printf '{"id":%s,"name":"runner-%s","status":"online","busy":false,"labels":[{"name":"self-hosted"},{"name":"macOS"}]}' "$i" "$i"
+      i=$((i + 1))
+    done
+    printf ']}' ;;
+  *"actions/runners?per_page=100&page=2"*)
+    printf '%s' '{"runners":[{"id":101,"name":"runner-101","status":"offline","busy":true,"labels":[{"name":"self-hosted"}]}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let runners = dispatch_runner_observations(&actions, "owner/repo").expect("runner inventory");
+    assert_eq!(runners.len(), 101);
+    assert_eq!(runners[0].runner_id, 1);
+    assert_eq!(runners[0].status, "online");
+    assert!(!runners[0].busy);
+    assert_eq!(runners[100].runner_id, 101);
+    assert!(runners[100].busy);
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_runner_inventory_refuses_missing_envelope() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, "printf '%s' '{}'");
+    assert!(dispatch_runner_observations(&actions, "owner/repo").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_job_inventory_is_bound_to_exact_run_attempt() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"actions/runs/77/attempts/3/jobs?per_page=100&page=1"*)
+    printf '%s' '{"jobs":[{"id":303,"name":"macos","status":"queued","conclusion":null,"labels":["self-hosted","macos"],"runner_name":null}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let jobs = crate::app::merge_steward_cmd::observation::fetch_run_attempt_jobs(
+        &actions,
+        "owner/repo",
+        77,
+        3,
+    )
+    .expect("attempt jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, 303);
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_check_producer_inventory_binds_run_job_and_app() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"printf '%s' '{"check_runs":[{"name":"macos","app":{"id":42},"details_url":"https://github.com/owner/repo/actions/runs/77/job/303"}]}'"#,
+    );
+    let producers = crate::app::merge_steward_cmd::observation::job_check_producers_for_head(
+        &actions,
+        "owner/repo",
+        &"a".repeat(40),
+    )
+    .expect("producer inventory");
+    let producer = producers.get(&303).expect("job producer");
+    assert_eq!(producer.run_id, 77);
+    assert_eq!(producer.job_id, 303);
+    assert_eq!(producer.name, "macos");
+    assert_eq!(producer.app_id, Some(42));
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_job_detail_vetoes_assignment_or_completion_race() {
+    let listed = StewardJob {
+        id: 303,
+        name: "macos".to_owned(),
+        status: "queued".to_owned(),
+        conclusion: None,
+        labels: vec!["self-hosted".to_owned(), "macos".to_owned()],
+        runner_name: None,
+    };
+    let required = vec![RequiredCheck {
+        context: "macos".to_owned(),
+        app_id: Some(42),
+    }];
+    let producers = BTreeMap::from([(
+        303,
+        crate::app::merge_steward_cmd::observation::JobCheckProducer {
+            run_id: 77,
+            job_id: 303,
+            name: "macos".to_owned(),
+            app_id: Some(42),
+        },
+    )]);
+    assert!(current_required_dispatch_job(&listed, &listed, 77, &required, &producers).is_some());
+
+    let mut assigned = listed.clone();
+    assigned.status = "in_progress".to_owned();
+    assigned.runner_name = Some("m3-pulp-gate-01".to_owned());
+    assert!(current_required_dispatch_job(&listed, &assigned, 77, &required, &producers).is_none());
+
+    let mut completed = listed.clone();
+    completed.status = "completed".to_owned();
+    completed.conclusion = Some("success".to_owned());
+    assert!(
+        current_required_dispatch_job(&listed, &completed, 77, &required, &producers).is_none()
+    );
+
+    let wrong_app = BTreeMap::from([(
+        303,
+        crate::app::merge_steward_cmd::observation::JobCheckProducer {
+            run_id: 77,
+            job_id: 303,
+            name: "macos".to_owned(),
+            app_id: Some(7),
+        },
+    )]);
+    assert!(current_required_dispatch_job(&listed, &listed, 77, &required, &wrong_app).is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn required_context_transport_falls_back_from_admin_denial_to_evaluated_rules() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(

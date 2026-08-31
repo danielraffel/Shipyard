@@ -58,6 +58,8 @@ pub mod dependency;
 /// Fetches failing-job metadata + parses a bounded log tail so
 /// `Validation failed.` becomes an actionable, structured block.
 pub mod diagnostics;
+/// Read-only GitHub dispatch-wedge classification and durable wake publication.
+pub(crate) mod dispatch_wedge;
 /// Doctor report generation for machine and environment checks.
 pub mod doctor;
 /// Durable evidence records and cross-branch lookup helpers.

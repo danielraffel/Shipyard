@@ -6,7 +6,10 @@
 
 use serde::Serialize;
 
-use super::{LifecycleState, WakeIntent, WorkLedger, WorkLedgerError, WorkLedgerResult, params};
+use super::{
+    LifecycleState, WakeIntent, WorkLedger, WorkLedgerError, WorkLedgerResult, params,
+    validate_digest,
+};
 
 /// A zero-model steward disposition for one exact managed PR head.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,11 +41,19 @@ pub(crate) struct NativeStewardApplyReport {
 #[derive(Clone, Debug)]
 struct NativeWork {
     id: String,
+    base_ref: String,
     phase: String,
     work_generation: u64,
     owner_generation: u64,
     route_ref: String,
     profile_digest: String,
+}
+
+#[derive(Clone, Copy)]
+struct NativeActionableAudit<'a> {
+    expected_base_ref: &'a str,
+    evidence_event: (&'a str, &'a str),
+    identity_event: (&'a str, &'a str),
 }
 
 impl WorkLedger {
@@ -154,6 +165,44 @@ impl WorkLedger {
         )
     }
 
+    /// Publish one exact dispatch-wedge receipt through the existing native
+    /// actionable transition and wake outbox. The evidence event, generation
+    /// advance, and projection intent commit together; restart can therefore
+    /// finish the ordinary `actionable -> dispatching` path without a second
+    /// receipt store or a duplicate wake.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "provider, immutable repository ID, exact head, and receipt digests are one authority fence"
+    )]
+    pub(crate) fn publish_dispatch_wedge(
+        &self,
+        repository_provider: Option<&str>,
+        repository_id: Option<&str>,
+        repo: &str,
+        base_ref: &str,
+        pr: u64,
+        head_sha: &str,
+        identity_digest: &str,
+        evidence_digest: &str,
+    ) -> WorkLedgerResult<NativeStewardApplyReport> {
+        validate_digest("dispatch wedge identity", identity_digest)?;
+        validate_digest("dispatch wedge evidence", evidence_digest)?;
+        self.apply_native_steward_disposition_with(
+            repository_provider,
+            repository_id,
+            repo,
+            pr,
+            head_sha,
+            NativeStewardDisposition::Actionable,
+            Some(NativeActionableAudit {
+                expected_base_ref: base_ref,
+                evidence_event: ("dispatch_wedge_detected", evidence_digest),
+                identity_event: ("dispatch_wedge_identity", identity_digest),
+            }),
+            |_| {},
+        )
+    }
+
     pub(crate) fn apply_native_steward_disposition_for_repository(
         &self,
         repository_provider: Option<&str>,
@@ -170,6 +219,7 @@ impl WorkLedger {
             pr,
             head_sha,
             disposition,
+            None,
             |_| {},
         )
     }
@@ -183,6 +233,7 @@ impl WorkLedger {
         pr: u64,
         head_sha: &str,
         disposition: NativeStewardDisposition,
+        actionable_audit: Option<NativeActionableAudit<'_>>,
         mut crash_hook: F,
     ) -> WorkLedgerResult<NativeStewardApplyReport>
     where
@@ -200,6 +251,11 @@ impl WorkLedger {
                 phase: None,
             });
         };
+        if actionable_audit.is_some_and(|audit| work.base_ref != audit.expected_base_ref) {
+            return Err(WorkLedgerError::Refused(
+                "native steward base ref no longer matches exact authority".to_owned(),
+            ));
+        }
         let mut changed = false;
         let mut wake_enqueued = false;
 
@@ -252,6 +308,7 @@ impl WorkLedger {
                         projection,
                         Some(terminal_disposition),
                         None,
+                        None,
                     )?;
                     changed = advanced;
                     work = self
@@ -270,13 +327,27 @@ impl WorkLedger {
                 }
             }
             NativeStewardDisposition::Actionable => {
+                let actionable_audit_event = actionable_audit.map(|audit| audit.evidence_event);
+                let actionable_identity_event = actionable_audit.map(|audit| audit.identity_event);
+                if let Some((kind, payload_digest)) = actionable_identity_event
+                    && !matches!(work.phase.as_str(), "managed" | "waiting")
+                    && !self.has_actionable_audit_event(&work.id, kind, payload_digest)?
+                {
+                    return Err(WorkLedgerError::Refused(
+                        "actionable work is not bound to this dispatch-wedge receipt".to_owned(),
+                    ));
+                }
                 if matches!(work.phase.as_str(), "managed" | "waiting") {
-                    let transition = self.transition_with_wake(
+                    let transition = self.transition_with_wake_and_projection(
                         &work.id,
                         work.work_generation,
                         work.owner_generation,
                         LifecycleState::Actionable,
                         None,
+                        None,
+                        None,
+                        actionable_audit_event,
+                        actionable_identity_event,
                     );
                     if transition.is_ok() {
                         changed = true;
@@ -295,6 +366,14 @@ impl WorkLedger {
                                 "native work disappeared after actionable transition".to_owned(),
                             )
                         })?;
+                    if let Some((kind, payload_digest)) = actionable_identity_event
+                        && !self.has_actionable_audit_event(&work.id, kind, payload_digest)?
+                    {
+                        return Err(WorkLedgerError::Refused(
+                            "actionable work is not bound to this dispatch-wedge receipt"
+                                .to_owned(),
+                        ));
+                    }
                     if transition.is_err()
                         && !matches!(
                             work.phase.as_str(),
@@ -371,7 +450,7 @@ impl WorkLedger {
     ) -> WorkLedgerResult<Option<NativeWork>> {
         let connection = self.connect_read_only()?;
         let mut statement = connection.prepare(
-            "SELECT work.id, work.phase, work.work_generation,
+            "SELECT work.id, work.base_ref, work.phase, work.work_generation,
                         work.owner_generation, work.repair_route_ref,
                         object.content_digest
                    FROM work_items work
@@ -393,11 +472,12 @@ impl WorkLedger {
                 |row| {
                     Ok(NativeWork {
                         id: row.get(0)?,
-                        phase: row.get(1)?,
-                        work_generation: row.get(2)?,
-                        owner_generation: row.get(3)?,
-                        route_ref: row.get(4)?,
-                        profile_digest: row.get(5)?,
+                        base_ref: row.get(1)?,
+                        phase: row.get(2)?,
+                        work_generation: row.get(3)?,
+                        owner_generation: row.get(4)?,
+                        route_ref: row.get(5)?,
+                        profile_digest: row.get(6)?,
                     })
                 },
             )?
@@ -409,6 +489,21 @@ impl WorkLedger {
                 "native steward target repository identity is ambiguous".to_owned(),
             )),
         }
+    }
+
+    fn has_actionable_audit_event(
+        &self,
+        work_id: &str,
+        kind: &str,
+        payload_digest: &str,
+    ) -> WorkLedgerResult<bool> {
+        Ok(self.connect_read_only()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events
+               WHERE work_item_id = ?1 AND kind = ?2 AND to_state = 'actionable'
+                 AND payload_digest = ?3)",
+            params![work_id, kind, payload_digest],
+            |row| row.get(0),
+        )?)
     }
 }
 
@@ -529,6 +624,7 @@ mod tests {
                     43,
                     &"a".repeat(40),
                     NativeStewardDisposition::Actionable,
+                    None,
                     |point| assert_ne!(point, "after_actionable", "crash"),
                 )
                 .ok();
@@ -564,6 +660,147 @@ mod tests {
         assert!(!replay.changed);
         assert!(!replay.wake_enqueued);
         assert_eq!(counts(&ledger).1, 1);
+    }
+
+    #[test]
+    fn dispatch_wedge_receipt_restarts_after_actionable_commit_without_duplicate_wake() {
+        let (_state, ledger, repo, _wake) = published();
+        let receipt = "d".repeat(64);
+        let evidence = "f".repeat(64);
+        let crashed = catch_unwind(AssertUnwindSafe(|| {
+            ledger
+                .apply_native_steward_disposition_with(
+                    None,
+                    None,
+                    &repo,
+                    43,
+                    &"a".repeat(40),
+                    NativeStewardDisposition::Actionable,
+                    Some(NativeActionableAudit {
+                        expected_base_ref: "main",
+                        evidence_event: ("dispatch_wedge_detected", &evidence),
+                        identity_event: ("dispatch_wedge_identity", &receipt),
+                    }),
+                    |point| assert_ne!(point, "after_actionable", "crash"),
+                )
+                .ok();
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(counts(&ledger), ("actionable".to_owned(), 0));
+
+        let resumed = ledger
+            .publish_dispatch_wedge(
+                None,
+                None,
+                &repo,
+                "main",
+                43,
+                &"a".repeat(40),
+                &receipt,
+                &evidence,
+            )
+            .expect("resume receipt");
+        assert!(resumed.wake_enqueued);
+        let replay = ledger
+            .publish_dispatch_wedge(
+                None,
+                None,
+                &repo,
+                "main",
+                43,
+                &"a".repeat(40),
+                &receipt,
+                &evidence,
+            )
+            .expect("replay receipt");
+        assert!(!replay.changed);
+        assert!(!replay.wake_enqueued);
+        assert_eq!(counts(&ledger), ("dispatching".to_owned(), 1));
+    }
+
+    #[test]
+    fn dispatch_wedge_receipt_refuses_unrelated_actionable_transition() {
+        let (_state, ledger, repo, _wake) = published();
+        let crashed = catch_unwind(AssertUnwindSafe(|| {
+            ledger
+                .apply_native_steward_disposition_with(
+                    None,
+                    None,
+                    &repo,
+                    43,
+                    &"a".repeat(40),
+                    NativeStewardDisposition::Actionable,
+                    None,
+                    |point| assert_ne!(point, "after_actionable", "crash"),
+                )
+                .ok();
+        }));
+        assert!(crashed.is_err());
+
+        let refused = ledger.publish_dispatch_wedge(
+            None,
+            None,
+            &repo,
+            "main",
+            43,
+            &"a".repeat(40),
+            &"e".repeat(64),
+            &"f".repeat(64),
+        );
+        assert!(matches!(refused, Err(WorkLedgerError::Refused(_))));
+        assert_eq!(counts(&ledger), ("actionable".to_owned(), 0));
+    }
+
+    #[test]
+    fn concurrent_dispatch_wedge_receipts_cannot_publish_under_each_other() {
+        let (_state, ledger, repo, _wake) = published();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for (identity, evidence) in [('d', 'f'), ('e', 'a')] {
+            let ledger = ledger.clone();
+            let repo = repo.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                ledger.publish_dispatch_wedge(
+                    None,
+                    None,
+                    &repo,
+                    "main",
+                    43,
+                    &"a".repeat(40),
+                    &identity.to_string().repeat(64),
+                    &evidence.to_string().repeat(64),
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("join"))
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+            1
+        );
+        assert_eq!(counts(&ledger), ("dispatching".to_owned(), 1));
+        let connection = ledger.connect_read_only().expect("connection");
+        let identities: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind = 'dispatch_wedge_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("identity events");
+        let evidence: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind = 'dispatch_wedge_detected'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("evidence events");
+        assert_eq!((identities, evidence), (1, 1));
     }
 
     #[test]

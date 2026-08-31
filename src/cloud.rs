@@ -364,6 +364,11 @@ impl GitHubActions {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_absolute_deadline_for_tests(&self) -> bool {
+        self.absolute_deadline.is_some()
+    }
+
     /// Dispatch a workflow with optional repository and input fields.
     pub fn workflow_dispatch(
         &self,

@@ -183,6 +183,7 @@ impl WorkLedger {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -203,6 +204,7 @@ impl WorkLedger {
             None,
             None,
             Some(("canary_terminal_wake_delivery", delivery_receipt_digest)),
+            None,
         )
     }
 
@@ -217,6 +219,7 @@ impl WorkLedger {
         explicit_projection: Option<ProjectionIntentKind>,
         terminal_disposition: Option<&str>,
         audit_event: Option<(&str, &str)>,
+        supplemental_audit_event: Option<(&str, &str)>,
     ) -> WorkLedgerResult<bool> {
         validate_opaque_ref("work_id", work_id, "wi")?;
         let parent = self
@@ -306,6 +309,19 @@ impl WorkLedger {
             &event_payload,
             &now,
         )?;
+        if let Some((kind, payload_digest)) = supplemental_audit_event {
+            record_event(
+                &transaction,
+                work_id,
+                expected_work_generation + 1,
+                expected_owner_generation,
+                kind,
+                Some(current),
+                next,
+                payload_digest,
+                &now,
+            )?;
+        }
         let projection_kind = explicit_projection.or(match next {
             LifecycleState::Managed
             | LifecycleState::Dispatching

@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use crate::cloud::GitHubActions;
+use crate::dispatch_wedge::{
+    DispatchJobAuthority, DispatchRunnerObservation, DispatchWedgeObservation,
+};
 use crate::identity::RuntimeMode;
 use crate::merge_queue_control::{
     DurableMutationIntent, MergeQueueMutationGuard, authority_status, lock_is_contended,
@@ -1166,6 +1169,202 @@ pub(super) fn steward_command<W: Write>(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Read the exact queued merge-group jobs for one existing `WorkLedger` target.
+/// This deliberately performs no mutation. Registered runner capacity is read
+/// from GitHub; local admission holds remain a separate JIT/VM authority.
+pub(crate) fn observe_dispatch_wedge_target(
+    actions: &GitHubActions,
+    repository: &str,
+    base_ref: &str,
+    pull_request: u64,
+    expected_head_sha: &str,
+) -> Result<Vec<DispatchWedgeObservation>, String> {
+    let observation = observe_repo(actions, repository, base_ref, false)?;
+    let Some(pr) = observation.prs.iter().find(|candidate| {
+        candidate.fact.number == pull_request
+            && candidate
+                .fact
+                .head_sha
+                .eq_ignore_ascii_case(expected_head_sha)
+    }) else {
+        return Ok(Vec::new());
+    };
+    let Some(queue_position) = pr.fact.queue_position else {
+        return Ok(Vec::new());
+    };
+    let Some(merge_group_head) = observation.merge_group_heads.get(&pull_request) else {
+        return Ok(Vec::new());
+    };
+    let check_producers =
+        observation::job_check_producers_for_head(actions, &observation.repo, merge_group_head)?;
+    let runners = dispatch_runner_observations(actions, &observation.repo)?;
+    let mut results = Vec::new();
+    for run in observation.runs.iter().filter(|run| {
+        run.event.eq_ignore_ascii_case("merge_group")
+            && run.head_sha.eq_ignore_ascii_case(merge_group_head)
+    }) {
+        for job in observation::fetch_run_attempt_jobs(
+            actions,
+            &observation.repo,
+            run.id,
+            run.run_attempt,
+        )? {
+            if !job.status.eq_ignore_ascii_case("queued")
+                || job.conclusion.is_some()
+                || job
+                    .runner_name
+                    .as_deref()
+                    .is_some_and(|name| !name.is_empty())
+                || !observation
+                    .required_checks
+                    .iter()
+                    .any(|required| required.context.eq_ignore_ascii_case(&job.name))
+            {
+                continue;
+            }
+            let detail = observation::gh_json(
+                actions,
+                &[
+                    "api".to_owned(),
+                    format!("repos/{}/actions/jobs/{}", observation.repo, job.id),
+                ],
+                "queued workflow job detail",
+            )?;
+            let detail_job = observation::parse_job(&detail)?;
+            let Some(required) = current_required_dispatch_job(
+                &job,
+                &detail_job,
+                run.id,
+                &observation.required_checks,
+                &check_producers,
+            ) else {
+                continue;
+            };
+            let producer_app_id = check_producers
+                .get(&detail_job.id)
+                .and_then(|check| check.app_id);
+            let queued_at = detail
+                .get("started_at")
+                .and_then(Value::as_str)
+                .or_else(|| detail.get("created_at").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_owned();
+            results.push(DispatchWedgeObservation {
+                authority: DispatchJobAuthority {
+                    repository: observation.repo.clone(),
+                    base_ref: observation.base.clone(),
+                    pull_request,
+                    pull_request_head: pr.fact.head_sha.clone(),
+                    queue_position,
+                    merge_group_head: merge_group_head.clone(),
+                    workflow_run_id: run.id,
+                    workflow_id: run.workflow_id,
+                    run_attempt: run.run_attempt,
+                    run_event: run.event.clone(),
+                    run_head: run.head_sha.clone(),
+                    job_id: detail_job.id,
+                    job_name: detail_job.name.clone(),
+                    job_status: detail_job.status.clone(),
+                    job_conclusion: detail_job.conclusion.clone(),
+                    runner_name: detail_job.runner_name.clone(),
+                    labels: detail_job.labels.clone(),
+                    queued_at,
+                    required_context: detail_job.name,
+                    required_app_id: required.app_id,
+                    producer_app_id,
+                },
+                runners: runners.clone(),
+                observation_complete: true,
+            });
+        }
+    }
+    Ok(results)
+}
+
+fn current_required_dispatch_job<'a>(
+    listed: &StewardJob,
+    detail: &StewardJob,
+    run_id: u64,
+    required_checks: &'a [RequiredCheck],
+    check_producers: &BTreeMap<u64, observation::JobCheckProducer>,
+) -> Option<&'a RequiredCheck> {
+    if detail.id != listed.id
+        || !detail.name.eq_ignore_ascii_case(&listed.name)
+        || !detail.status.eq_ignore_ascii_case("queued")
+        || detail.conclusion.is_some()
+        || detail
+            .runner_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+    {
+        return None;
+    }
+    let producer = check_producers.get(&detail.id);
+    let mut matching = required_checks.iter().filter(|required| {
+        required.context.eq_ignore_ascii_case(&detail.name)
+            && required.app_id.is_none_or(|app_id| {
+                producer.is_some_and(|producer| {
+                    producer.run_id == run_id
+                        && producer.job_id == detail.id
+                        && producer.name.eq_ignore_ascii_case(&detail.name)
+                        && producer.app_id == Some(app_id)
+                })
+            })
+    });
+    let required = matching.next()?;
+    matching.next().is_none().then_some(required)
+}
+
+fn dispatch_runner_observations(
+    actions: &GitHubActions,
+    repository: &str,
+) -> Result<Vec<DispatchRunnerObservation>, String> {
+    let mut runners = Vec::new();
+    for page in 1..=10 {
+        let value = observation::gh_json(
+            actions,
+            &[
+                "api".to_owned(),
+                format!("repos/{repository}/actions/runners?per_page=100&page={page}"),
+            ],
+            "repository runner inventory",
+        )?;
+        let rows = value
+            .get("runners")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "repository runner inventory missing runners".to_owned())?;
+        let count = rows.len();
+        for row in rows {
+            runners.push(DispatchRunnerObservation {
+                runner_id: row.get("id").and_then(Value::as_u64).unwrap_or(0),
+                name: row
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                status: row
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                busy: row.get("busy").and_then(Value::as_bool).unwrap_or(true),
+                labels: row
+                    .get("labels")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|label| label.get("name").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect(),
+            });
+        }
+        if count < 100 {
+            return Ok(runners);
+        }
+    }
+    Err("repository runner inventory exceeds 1000; refusing partial scan".to_owned())
 }
 
 fn unreadable_repo_report(

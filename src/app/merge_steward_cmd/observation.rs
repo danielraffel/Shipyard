@@ -563,6 +563,66 @@ pub(super) fn check_runs_for_head(
     check_runs_for_head_with_deadline(actions, repo, head_sha, None)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct JobCheckProducer {
+    pub(super) run_id: u64,
+    pub(super) job_id: u64,
+    pub(super) name: String,
+    pub(super) app_id: Option<u64>,
+}
+
+pub(super) fn job_check_producers_for_head(
+    actions: &GitHubActions,
+    repo: &str,
+    head_sha: &str,
+) -> Result<BTreeMap<u64, JobCheckProducer>, String> {
+    let mut producers = BTreeMap::new();
+    for page in 1..=10 {
+        let value = gh_json(
+            actions,
+            &[
+                "api".to_owned(),
+                format!("repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}"),
+            ],
+            "merge-group check producer identities",
+        )?;
+        let rows = value
+            .get("check_runs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "merge-group check producer identities missing check_runs".to_owned())?;
+        let count = rows.len();
+        for row in rows {
+            let Some(name) = row.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(details_url) = row.get("details_url").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some((run_id, job_id)) = run_and_job_id_from_url(details_url) else {
+                continue;
+            };
+            let producer = JobCheckProducer {
+                run_id,
+                job_id,
+                name: name.to_owned(),
+                app_id: row.pointer("/app/id").and_then(Value::as_u64),
+            };
+            if producers
+                .insert(job_id, producer.clone())
+                .is_some_and(|prior| prior != producer)
+            {
+                return Err(format!(
+                    "merge-group job {job_id} has contradictory check producer identities"
+                ));
+            }
+        }
+        if count < 100 {
+            return Ok(producers);
+        }
+    }
+    Err("merge-group check runs exceed 1000; refusing partial producer scan".to_owned())
+}
+
 fn check_runs_for_head_with_deadline(
     actions: &GitHubActions,
     repo: &str,
@@ -693,6 +753,12 @@ pub(super) fn run_id_from_url(url: &str) -> Option<u64> {
     tail.split('/').next()?.parse().ok()
 }
 
+fn run_and_job_id_from_url(url: &str) -> Option<(u64, u64)> {
+    let run_id = run_id_from_url(url)?;
+    let job_id = url.split("/job/").nth(1)?.split('/').next()?.parse().ok()?;
+    Some((run_id, job_id))
+}
+
 pub(super) fn active_runs(actions: &GitHubActions, repo: &str) -> Result<Vec<StewardRun>, String> {
     let mut all = Vec::new();
     for status in ["queued", "waiting", "pending", "requested", "in_progress"] {
@@ -806,6 +872,41 @@ pub(super) fn fetch_run_jobs(
     }
     Err(format!(
         "workflow run {run_id} exceeds 1000 jobs; refusing partial scan"
+    ))
+}
+
+pub(super) fn fetch_run_attempt_jobs(
+    actions: &GitHubActions,
+    repo: &str,
+    run_id: u64,
+    run_attempt: u64,
+) -> Result<Vec<StewardJob>, String> {
+    let mut all = Vec::new();
+    for page in 1..=10 {
+        let value = gh_json(
+            actions,
+            &[
+                "api".to_owned(),
+                format!(
+                    "repos/{repo}/actions/runs/{run_id}/attempts/{run_attempt}/jobs?per_page=100&page={page}"
+                ),
+            ],
+            "workflow attempt jobs",
+        )?;
+        let rows = value
+            .get("jobs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("workflow run {run_id} attempt {run_attempt} missing jobs"))?;
+        let count = rows.len();
+        for row in rows {
+            all.push(parse_job(row)?);
+        }
+        if count < 100 {
+            return Ok(all);
+        }
+    }
+    Err(format!(
+        "workflow run {run_id} attempt {run_attempt} exceeds 1000 jobs; refusing partial scan"
     ))
 }
 

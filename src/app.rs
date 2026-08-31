@@ -41,25 +41,34 @@ pub(crate) use merge_steward_cmd::{ExactStewardTransition, exact_steward_transit
 pub(crate) use merge_steward_cmd::{LaunchProfileV1, decode_protected_launch_profile};
 
 #[cfg(unix)]
+pub(crate) struct DaemonStewardRequest<'a> {
+    pub(crate) repository_provider: &'a str,
+    pub(crate) repository_id: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) base_ref: &'a str,
+    pub(crate) pull_request: u64,
+    pub(crate) head_sha: &'a str,
+}
+
+#[cfg(unix)]
 pub(crate) fn daemon_steward_repository(
     mode: crate::identity::RuntimeMode,
     runtime_paths: &crate::paths::RuntimePaths,
     cwd: &std::path::Path,
-    repository_provider: &str,
-    repository_id: &str,
-    repository: &str,
-    base_ref: &str,
-) -> Result<(), String> {
-    let actions = crate::cloud::GitHubActions::from_cwd(mode, cwd).with_repo_override(repository);
+    request: &DaemonStewardRequest<'_>,
+) -> Result<Vec<crate::dispatch_wedge::DispatchWedgeObservation>, String> {
+    let actions = crate::cloud::GitHubActions::from_cwd(mode, cwd)
+        .with_repo_override(request.repository)
+        .with_absolute_deadline(std::time::Instant::now() + std::time::Duration::from_secs(60));
     merge_steward_cmd::verify_native_repository_identity(
         &actions,
-        repository_provider,
-        repository_id,
-        repository,
+        request.repository_provider,
+        request.repository_id,
+        request.repository,
     )?;
     let args = merge_steward_cmd::StewardCommandArgs {
-        repos: vec![repository.to_owned()],
-        base: base_ref.to_owned(),
+        repos: vec![request.repository.to_owned()],
+        base: request.base_ref.to_owned(),
         opt_out_label: "shipyard:no-auto-merge".to_owned(),
         provenance_blocking_labels: vec!["5·unresolved".to_owned()],
         managed_label: "shipyard:managed".to_owned(),
@@ -83,11 +92,49 @@ pub(crate) fn daemon_steward_repository(
         &mut sink,
     )
     .map_err(|error| error.message)?;
-    if code == std::process::ExitCode::SUCCESS {
-        Ok(())
-    } else {
-        Err("daemon exact steward cycle was unhealthy".to_owned())
+    if code != std::process::ExitCode::SUCCESS {
+        return Err("daemon exact steward cycle was unhealthy".to_owned());
     }
+    merge_steward_cmd::observe_dispatch_wedge_target(
+        &actions,
+        request.repository,
+        request.base_ref,
+        request.pull_request,
+        request.head_sha,
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn daemon_dispatch_wedge_observation(
+    mode: crate::identity::RuntimeMode,
+    cwd: &std::path::Path,
+    request: &DaemonStewardRequest<'_>,
+) -> Result<Vec<crate::dispatch_wedge::DispatchWedgeObservation>, String> {
+    let actions = daemon_dispatch_probe_actions(mode, cwd, request.repository);
+    merge_steward_cmd::verify_native_repository_identity(
+        &actions,
+        request.repository_provider,
+        request.repository_id,
+        request.repository,
+    )?;
+    merge_steward_cmd::observe_dispatch_wedge_target(
+        &actions,
+        request.repository,
+        request.base_ref,
+        request.pull_request,
+        request.head_sha,
+    )
+}
+
+#[cfg(unix)]
+fn daemon_dispatch_probe_actions(
+    mode: crate::identity::RuntimeMode,
+    cwd: &std::path::Path,
+    repository: &str,
+) -> crate::cloud::GitHubActions {
+    crate::cloud::GitHubActions::from_cwd(mode, cwd)
+        .with_repo_override(repository)
+        .with_absolute_deadline(std::time::Instant::now() + std::time::Duration::from_secs(60))
 }
 mod metrics_cmd;
 mod parallel_proof_canary_cmd;
@@ -4646,5 +4693,17 @@ mod tests {
             Some("danielraffel/Shipyard".to_owned())
         );
         assert_eq!(parse_github_repo_slug("file:///tmp/repo"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_dispatch_probe_constructor_always_has_deadline() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = crate::app::daemon_dispatch_probe_actions(
+            crate::identity::RuntimeMode::Shipyard,
+            temp.path(),
+            "owner/repo",
+        );
+        assert!(actions.has_absolute_deadline_for_tests());
     }
 }
