@@ -122,10 +122,13 @@ pub(crate) use actionable_scheduler::NativeStewardApplyReport;
 #[cfg(any(unix, test))]
 pub(crate) use actionable_scheduler::NativeStewardDisposition;
 #[cfg(test)]
+#[allow(unused_imports)] // Some target-specific test builds do not exercise the Unix carrier.
 pub(crate) use custody_inventory::CustodyInventoryBinding;
+#[cfg(any(unix, test))]
+pub(crate) use custody_inventory::verify_custody_inventory_response;
 pub(crate) use custody_inventory::{
     CustodyInventoryResolution, CustodyInventoryWireRequest, custody_inventory_request,
-    verify_custody_inventory_inbox, verify_custody_inventory_response,
+    verify_custody_inventory_inbox,
 };
 use importer::import_report;
 #[cfg(test)]

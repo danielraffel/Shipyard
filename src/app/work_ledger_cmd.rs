@@ -464,6 +464,7 @@ pub(super) fn work_ledger_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(unix)]
 const MAX_CORRELATION_HINT_BYTES: u64 = 16 * 1024;
 
 #[derive(Deserialize, serde::Serialize)]
@@ -474,102 +475,102 @@ struct CustodyCorrelationHints {
     provider_repository_id: String,
 }
 
-fn read_correlation_hints(path: &Path) -> Result<CustodyCorrelationHints, CliFailure> {
-    #[cfg(not(unix))]
-    return Err(CliFailure::new(
+#[cfg(not(unix))]
+fn read_correlation_hints(_path: &Path) -> Result<CustodyCorrelationHints, CliFailure> {
+    Err(CliFailure::new(
         1,
         "correlation hints owner-only access cannot be proven on this platform",
-    ));
+    ))
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+fn read_correlation_hints(path: &Path) -> Result<CustodyCorrelationHints, CliFailure> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let metadata = std::fs::symlink_metadata(path).map_err(failure)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_CORRELATION_HINT_BYTES
     {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-
-        let metadata = std::fs::symlink_metadata(path).map_err(failure)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() > MAX_CORRELATION_HINT_BYTES
-        {
-            return Err(CliFailure::new(
-                1,
-                "correlation hints must be a bounded regular file",
-            ));
-        }
-        if metadata.mode() & 0o077 != 0
-            || metadata.uid() != nix::unistd::Uid::effective().as_raw()
-            || metadata.nlink() != 1
-        {
-            return Err(CliFailure::new(1, "correlation hints must be owner-only"));
-        }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        options.custom_flags(nix::libc::O_NOFOLLOW);
-        let mut file = options.open(path).map_err(failure)?;
-        let opened = file.metadata().map_err(failure)?;
-        if !opened.is_file()
-            || opened.len() != metadata.len()
-            || opened.dev() != metadata.dev()
-            || opened.ino() != metadata.ino()
-            || opened.uid() != nix::unistd::Uid::effective().as_raw()
-            || opened.nlink() != 1
-            || opened.mode() & 0o077 != 0
-        {
-            return Err(CliFailure::new(
-                1,
-                "correlation hints changed while opening",
-            ));
-        }
-        let mut encoded = Vec::new();
-        std::io::Read::by_ref(&mut file)
-            .take(MAX_CORRELATION_HINT_BYTES + 1)
-            .read_to_end(&mut encoded)
-            .map_err(failure)?;
-        if encoded.len() as u64 > MAX_CORRELATION_HINT_BYTES {
-            return Err(CliFailure::new(
-                1,
-                "correlation hints exceed the size bound",
-            ));
-        }
-        let after = file.metadata().map_err(failure)?;
-        if after.dev() != opened.dev()
-            || after.ino() != opened.ino()
-            || after.uid() != opened.uid()
-            || after.nlink() != opened.nlink()
-            || after.mode() != opened.mode()
-            || after.len() != opened.len()
-            || after.mtime() != opened.mtime()
-            || after.mtime_nsec() != opened.mtime_nsec()
-            || after.ctime() != opened.ctime()
-            || after.ctime_nsec() != opened.ctime_nsec()
-        {
-            return Err(CliFailure::new(
-                1,
-                "correlation hints changed while reading",
-            ));
-        }
-        let hints: CustodyCorrelationHints = serde_json::from_slice(&encoded)
-            .map_err(|_| CliFailure::new(1, "correlation hints are malformed"))?;
-        for value in [&hints.linear_workspace_id, &hints.provider_repository_id] {
-            if value.is_empty()
-                || value.len() > 512
-                || !value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
-            {
-                return Err(CliFailure::new(1, "correlation hint identity is invalid"));
-            }
-        }
-        let root = hints.linear_root_uuid.as_bytes();
-        if root.len() != 36
-            || root.iter().enumerate().any(|(index, byte)| match index {
-                8 | 13 | 18 | 23 => *byte != b'-',
-                _ => !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase(),
-            })
-        {
-            return Err(CliFailure::new(1, "correlation hint root UUID is invalid"));
-        }
-        Ok(hints)
+        return Err(CliFailure::new(
+            1,
+            "correlation hints must be a bounded regular file",
+        ));
     }
+    if metadata.mode() & 0o077 != 0
+        || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+        || metadata.nlink() != 1
+    {
+        return Err(CliFailure::new(1, "correlation hints must be owner-only"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(failure)?;
+    let opened = file.metadata().map_err(failure)?;
+    if !opened.is_file()
+        || opened.len() != metadata.len()
+        || opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.uid() != nix::unistd::Uid::effective().as_raw()
+        || opened.nlink() != 1
+        || opened.mode() & 0o077 != 0
+    {
+        return Err(CliFailure::new(
+            1,
+            "correlation hints changed while opening",
+        ));
+    }
+    let mut encoded = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_CORRELATION_HINT_BYTES + 1)
+        .read_to_end(&mut encoded)
+        .map_err(failure)?;
+    if encoded.len() as u64 > MAX_CORRELATION_HINT_BYTES {
+        return Err(CliFailure::new(
+            1,
+            "correlation hints exceed the size bound",
+        ));
+    }
+    let after = file.metadata().map_err(failure)?;
+    if after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.uid() != opened.uid()
+        || after.nlink() != opened.nlink()
+        || after.mode() != opened.mode()
+        || after.len() != opened.len()
+        || after.mtime() != opened.mtime()
+        || after.mtime_nsec() != opened.mtime_nsec()
+        || after.ctime() != opened.ctime()
+        || after.ctime_nsec() != opened.ctime_nsec()
+    {
+        return Err(CliFailure::new(
+            1,
+            "correlation hints changed while reading",
+        ));
+    }
+    let hints: CustodyCorrelationHints = serde_json::from_slice(&encoded)
+        .map_err(|_| CliFailure::new(1, "correlation hints are malformed"))?;
+    for value in [&hints.linear_workspace_id, &hints.provider_repository_id] {
+        if value.is_empty()
+            || value.len() > 512
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+        {
+            return Err(CliFailure::new(1, "correlation hint identity is invalid"));
+        }
+    }
+    let root = hints.linear_root_uuid.as_bytes();
+    if root.len() != 36
+        || root.iter().enumerate().any(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte != b'-',
+            _ => !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase(),
+        })
+    {
+        return Err(CliFailure::new(1, "correlation hint root UUID is invalid"));
+    }
+    Ok(hints)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -33,12 +33,12 @@ use crate::work_ledger::{
     CustodyTransportAuthenticator, ProcessedReceipt, WorkLedger, WorkLedgerError, WorkLedgerResult,
     authenticate_custody_control, authenticate_custody_successor_rebind,
     authenticate_custody_transfer, authenticate_processed_receipt, custody_inventory_request,
-    verify_custody_inventory_inbox, verify_custody_inventory_response,
+    verify_custody_inventory_inbox,
 };
 #[cfg(any(unix, test))]
 use crate::work_ledger::{
     authenticate_custody_control_receipt, authenticate_custody_receipt,
-    authenticate_custody_successor_receipt,
+    authenticate_custody_successor_receipt, verify_custody_inventory_response,
 };
 
 mod policy;
@@ -128,12 +128,14 @@ pub(crate) struct IncomingPeerEvidence {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub(crate) enum CustodyInventoryResult {
+    #[cfg(any(unix, test))]
     Complete {
         message_id: String,
         target_machine_ref: String,
         request_digest: String,
         inventory: LocalWorkInventory,
     },
+    #[cfg(any(unix, test))]
     Partial {
         message_id: String,
         target_machine_ref: String,
@@ -379,12 +381,14 @@ trait CustodyCarrier {
     ) -> Result<(CustodyTransportResponse, String), CustodyCarrierError>;
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug)]
 enum CustodyCarrierError {
     Unavailable(String),
     Refused(String),
 }
 
+#[cfg(any(unix, test))]
 impl From<CustodyCarrierError> for String {
     fn from(error: CustodyCarrierError) -> Self {
         match error {
@@ -395,6 +399,7 @@ impl From<CustodyCarrierError> for String {
     }
 }
 
+#[cfg(any(unix, test))]
 impl From<String> for CustodyCarrierError {
     fn from(reason: String) -> Self {
         Self::Refused(reason)
