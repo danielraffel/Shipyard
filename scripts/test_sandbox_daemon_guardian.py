@@ -81,6 +81,74 @@ class GuardianLifecycleTests(unittest.TestCase):
             )
         return metadata, generation
 
+    def write_retained_deadline_evidence(
+        self,
+        active: guardian.Guardian,
+        *,
+        production_pid: int = 222,
+        ready_production_pid: int = 222,
+        active_runs: tuple[str, ...] = (),
+        receipt_generation: str | None = None,
+    ) -> tuple[Path, str]:
+        lease_stat, generation = self.create_generation_lease(active)
+        prior = active.lease_dir.with_name(f"{active.lease_dir.name}-1-1")
+        prior.mkdir(mode=0o700)
+        expected_lock = active.production_state_dir / ".sandbox-writer-domain.lock"
+        failure = (
+            "GuardianError: restore production: GuardianError: timed out inspecting "
+            "writer-domain "
+            f"holders for {expected_lock} after 2 attempt(s); restore production: "
+            f"TimeoutExpired: Command '['/bin/ps', '-p', '{production_pid}', '-o', "
+            "'lstart=']' timed out after 0.0005404999999996107 seconds"
+        )
+        objects = {
+            "guardian-receipt.json": {
+                "schema_version": 1,
+                "lease_retained": True,
+                "lease_removed": False,
+                "transition_path": guardian.CORRECTED_TRANSITION,
+                "candidate_stopped": True,
+                "production_quiesced": False,
+                "production_restored": False,
+                "mutation_fence_proved": True,
+                "old_lifetime_lock_owned": False,
+                "active_runs": list(active_runs),
+                "failure": failure,
+                "old_production_pid": production_pid,
+                "old_production_start_time": "new",
+                "installed_sha256": "b" * 64,
+                "candidate_sha256": "c" * 64,
+                "lease_device": lease_stat.st_dev,
+                "lease_inode": lease_stat.st_ino,
+                "lease_ctime_ns": lease_stat.st_ctime_ns,
+                "lease_generation": receipt_generation or generation,
+            },
+            "ready.json": {
+                "transition_path": guardian.CORRECTED_TRANSITION,
+                "candidate_pid": 333,
+                "candidate_sha256": "c" * 64,
+                "installed_sha256": "b" * 64,
+                "production_pid": ready_production_pid,
+                "production_start_time": "new",
+            },
+            "mutation-fence.json": {
+                "transition_path": guardian.CORRECTED_TRANSITION,
+                "returncode": guardian.WRITER_DOMAIN_OVERLAP_EXIT_CODE,
+                "overlap_classification": (
+                    guardian.WRITER_DOMAIN_OVERLAP_CLASSIFICATION
+                ),
+                "mutation_absent": True,
+                "selected_path_absent": True,
+                "production_pid": production_pid,
+                "production_start_time": "new",
+            },
+        }
+        for name, payload in objects.items():
+            path = prior / name
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+        return prior, generation
+
     def test_guardian_owns_cleanup_at_successful_atomic_acquisition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
@@ -571,16 +639,16 @@ class GuardianLifecycleTests(unittest.TestCase):
                 selected, _, _ = active.retained_legacy_evidence()
             self.assertEqual(selected, new)
 
-    def test_retained_worker_drift_failure_requires_exact_recovery_shape(self) -> None:
+    def test_retained_failure_requires_exact_recovery_shape(self) -> None:
         self.assertTrue(
-            guardian._is_reconcilable_worker_drift_failure(
+            guardian._is_reconcilable_retained_failure(
                 "GuardianError: production active workers changed during idle wait; "
                 "restore production: GuardianError: preserved active worker ownership "
                 "differs"
             )
         )
         self.assertTrue(
-            guardian._is_reconcilable_worker_drift_failure(
+            guardian._is_reconcilable_retained_failure(
                 "GuardianError: OwnerEnded: Actions owner ended before canary "
                 "completion; restore production: GuardianError: preserved active "
                 "worker ownership differs; restore production: GuardianError: "
@@ -588,7 +656,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             )
         )
         self.assertTrue(
-            guardian._is_reconcilable_worker_drift_failure(
+            guardian._is_reconcilable_retained_failure(
                 "GuardianError: OwnerEnded: Actions owner ended before canary "
                 "completion; restore production: GuardianError: foreign process "
                 "entered the production writer domain: (9138,); restore production: "
@@ -623,8 +691,146 @@ class GuardianLifecycleTests(unittest.TestCase):
         ):
             with self.subTest(failure=failure):
                 self.assertFalse(
-                    guardian._is_reconcilable_worker_drift_failure(failure)
+                    guardian._is_reconcilable_retained_failure(failure)
                 )
+
+    def test_retained_deadline_failure_matches_only_exact_lock_pid_and_budget(
+        self,
+    ) -> None:
+        lock_path = Path("/tmp/state/.sandbox-writer-domain.lock")
+        failure = (
+            "GuardianError: restore production: GuardianError: timed out inspecting "
+            "writer-domain "
+            f"holders for {lock_path} after 2 attempt(s); restore production: "
+            "TimeoutExpired: Command '['/bin/ps', '-p', '64441', '-o', 'lstart=']' "
+            "timed out after 0.0005404999999996107 seconds"
+        )
+        self.assertTrue(
+            guardian._is_reconcilable_retained_failure(
+                failure,
+                expected_lock_path=lock_path,
+                expected_production_pid=64441,
+            )
+        )
+        for expected_lock, expected_pid, candidate in (
+            (Path("/tmp/other.lock"), 64441, failure),
+            (lock_path, 64442, failure),
+            (
+                lock_path,
+                64441,
+                failure.replace("0.0005404999999996107", "0.02"),
+            ),
+            (
+                lock_path,
+                64441,
+                failure.replace("after 2 attempt(s)", "after 1 attempt(s)"),
+            ),
+        ):
+            with self.subTest(
+                expected_lock=expected_lock,
+                expected_pid=expected_pid,
+                candidate=candidate,
+            ):
+                self.assertFalse(
+                    guardian._is_reconcilable_retained_failure(
+                        candidate,
+                        expected_lock_path=expected_lock,
+                        expected_production_pid=expected_pid,
+                    )
+                )
+
+    def test_exact_deadline_receipt_is_eligible_only_with_bound_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            prior, _ = self.write_retained_deadline_evidence(active)
+            with mock.patch.object(guardian, "_pid_alive", return_value=False):
+                selected, receipt, _ = active.retained_legacy_evidence()
+            self.assertEqual(selected, prior)
+            self.assertEqual(receipt["active_runs"], [])
+
+    def test_exact_deadline_receipt_reconciles_only_after_idle_writer_fence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            self.write_retained_deadline_evidence(active)
+            original_generation = guardian._validate_lease_generation(
+                active.lease_dir
+            )[1]
+            snapshot = mock.Mock(pid=222, start_time="new")
+            active.snapshot = snapshot
+            active.installed_hash = "b" * 64
+            active.configured_repos = ()
+            active.lock_path = active.production_state_dir / ".sandbox-writer-domain.lock"
+            fence = contextlib.nullcontext(mock.Mock())
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                guardian, "_pid_alive", return_value=False
+            ), mock.patch.object(
+                active,
+                "snapshot_reconciliation_production",
+                return_value=(snapshot, ()),
+            ), mock.patch.object(
+                active,
+                "verify_reconciliation_production",
+                return_value=(),
+            ) as verify, mock.patch.object(
+                active,
+                "final_reconciliation_writer_fence",
+                return_value=fence,
+            ) as writer_fence, mock.patch.object(
+                guardian.time, "sleep"
+            ), mock.patch.object(
+                guardian, "_process_start", return_value=active.owner_start
+            ):
+                active.acquire()
+
+            self.assertGreaterEqual(verify.call_count, 4)
+            writer_fence.assert_called_once()
+            self.assertTrue(active.lease_owned)
+            self.assertNotEqual(active.lease_generation, original_generation)
+            active.production_preserved = True
+            active.production_identity_verified = True
+            active.release()
+
+    def test_exact_deadline_receipt_wrong_generation_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            self.write_retained_deadline_evidence(
+                active,
+                receipt_generation="0" * 64,
+            )
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "one unambiguous prior receipt"
+            ):
+                active.retained_legacy_evidence()
+
+    def test_exact_deadline_receipt_wrong_identity_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            self.write_retained_deadline_evidence(
+                active,
+                ready_production_pid=223,
+            )
+            with mock.patch.object(
+                guardian, "_pid_alive", return_value=False
+            ), self.assertRaisesRegex(
+                guardian.GuardianError, "production_pid evidence disagrees"
+            ):
+                active.retained_legacy_evidence()
+
+    def test_exact_deadline_receipt_with_active_run_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            self.write_retained_deadline_evidence(
+                active,
+                active_runs=("sy-active",),
+            )
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "not safely reconcilable"
+            ):
+                active.retained_legacy_evidence()
 
     def test_stale_retained_receipt_cannot_authorize_new_lease_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -837,7 +1043,8 @@ class GuardianLifecycleTests(unittest.TestCase):
         retry_deadline = revalidate.call_args.args[0]
         self.assertGreater(retry_deadline, time.monotonic())
         self.assertLessEqual(
-            retry_deadline - time.monotonic(), guardian.LOCK_HOLDER_TOTAL_TIMEOUT
+            retry_deadline - time.monotonic(),
+            guardian.PRODUCTION_IDENTITY_REVALIDATION_TIMEOUT,
         )
 
     def test_holder_probe_does_not_retry_when_revalidation_fails(self) -> None:
@@ -852,22 +1059,116 @@ class GuardianLifecycleTests(unittest.TestCase):
         run.assert_called_once()
         revalidate.assert_called_once()
 
-    def test_holder_probe_retry_uses_remaining_aggregate_deadline(self) -> None:
+    def test_holder_probe_identity_and_retry_stay_within_composite_budget(self) -> None:
         path = Path("/tmp/writer.lock")
         timeout = subprocess.TimeoutExpired(["lsof"], 7)
         success = mock.Mock(returncode=1, stdout="", stderr="")
         revalidate = mock.Mock()
         with mock.patch.object(
-            guardian.time, "monotonic", side_effect=[100.0, 100.0, 110.0]
+            guardian.time,
+            "monotonic",
+            side_effect=[100.0, 100.0, 107.0, 122.0],
         ), mock.patch.object(
             guardian.subprocess, "run", side_effect=[timeout, success]
         ) as run:
             self.assertEqual(
-                guardian._lock_holders(path, retry_after_timeout=revalidate), ()
+                guardian._lock_holders(
+                    path,
+                    retry_after_timeout=revalidate,
+                    refresh_retry_deadline_after_revalidation=True,
+                ),
+                (),
+            )
+        revalidate.assert_called_once_with(122.0)
+        self.assertEqual(run.call_args_list[0].kwargs["timeout"], 7.0)
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], 7.0)
+        self.assertLessEqual(
+            7.0
+            + guardian.PRODUCTION_IDENTITY_REVALIDATION_TIMEOUT
+            + run.call_args_list[1].kwargs["timeout"],
+            guardian.CORRECTED_HOLDER_COMPOSITE_TIMEOUT,
+        )
+
+    def test_holder_probe_explicit_deadline_is_not_refreshed(self) -> None:
+        path = Path("/tmp/writer.lock")
+        timeout = subprocess.TimeoutExpired(["lsof"], 7)
+        success = mock.Mock(returncode=1, stdout="", stderr="")
+        revalidate = mock.Mock()
+        with mock.patch.object(
+            guardian.time, "monotonic", side_effect=[100.0, 110.0, 110.0]
+        ), mock.patch.object(
+            guardian.subprocess, "run", side_effect=[timeout, success]
+        ) as run:
+            self.assertEqual(
+                guardian._lock_holders(
+                    path,
+                    deadline=115.0,
+                    retry_after_timeout=revalidate,
+                ),
+                (),
             )
         revalidate.assert_called_once_with(115.0)
         self.assertEqual(run.call_args_list[0].kwargs["timeout"], 7.0)
         self.assertEqual(run.call_args_list[1].kwargs["timeout"], 5.0)
+
+    def test_holder_probe_refresh_never_overruns_shorter_outer_deadline(self) -> None:
+        path = Path("/tmp/writer.lock")
+        timeout = subprocess.TimeoutExpired(["lsof"], 7)
+        revalidate = mock.Mock()
+        with mock.patch.object(
+            guardian.time,
+            "monotonic",
+            side_effect=[100.0, 100.0, 107.0, 115.0],
+        ), mock.patch.object(
+            guardian.subprocess, "run", side_effect=[timeout]
+        ) as run, self.assertRaisesRegex(
+            guardian.GuardianError, "deadline expired"
+        ):
+            guardian._lock_holders(
+                path,
+                deadline=115.0,
+                retry_after_timeout=revalidate,
+                refresh_retry_deadline_after_revalidation=True,
+            )
+        run.assert_called_once()
+        revalidate.assert_called_once_with(115.0)
+
+    def test_idle_wait_wrapper_forwards_capped_holder_deadline(self) -> None:
+        path = Path("/tmp/writer.lock")
+        holder_deadlines: list[float] = []
+
+        def observe_holders(
+            _path: Path,
+            *,
+            deadline: float,
+            retry_after_timeout,
+            **_kwargs,
+        ) -> tuple[int, ...]:
+            holder_deadlines.append(deadline)
+            retry_after_timeout(deadline + 100.0)
+            return ()
+
+        verify = mock.Mock()
+        with mock.patch.object(
+            guardian, "_production_identity_deadline", return_value=float("inf")
+        ), mock.patch.object(
+            guardian, "_lock_holders", side_effect=observe_holders
+        ), mock.patch.object(
+            guardian, "_exclusive_lock_is_contended", return_value=False
+        ):
+            guardian._wait_for_idle_writer_domain(
+                path,
+                4242,
+                timeout=10.0,
+                stable_observations=1,
+                verify_production=verify,
+            )
+
+        self.assertEqual(len(holder_deadlines), 1)
+        self.assertEqual(
+            [call.args[0] for call in verify.call_args_list],
+            [holder_deadlines[0], holder_deadlines[0], holder_deadlines[0]],
+        )
 
     def test_holder_probe_repeated_timeout_fails_closed_with_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1132,7 +1433,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                     guardian.GuardianError, "retained the writer-domain lock"
                 ):
                     guardian._wait_for_idle_writer_domain(
-                        path, 4242
+                        path, 4242, timeout=10.0
                     )
 
     def test_ambiguous_no_holder_wait_rejects_identity_drift(self) -> None:
@@ -1194,7 +1495,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     guardian.GuardianError, "retained the writer-domain lock"
                 ):
-                    guardian._wait_for_idle_writer_domain(path, 4242)
+                    guardian._wait_for_idle_writer_domain(path, 4242, timeout=10.0)
 
     def test_finalize_wait_rejects_a_foreign_holder_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
