@@ -1554,6 +1554,19 @@ exact-head fence, policy revision, API-request count, elapsed milliseconds, and
 Linear projection, model, activation, or dispatch capability. Fetch failure and
 recovery emit once per state change with a stable redacted class; repeated
 failures do not spam logs or expose command output.
+With trusted stewardship activation, a separate durable detector can escalate
+an assigned-capacity `dispatch_wedge`: two stable observations must prove the
+exact current merge-queue job is still queued without a runner while a
+compatible runner is online and idle. The receipt and final authority reread
+bind repository identity, PR/head, merge-group head, run attempt, job, labels,
+queue position, and policy. Restart preserves the first-seen deadline and any
+pending publication; transient or capacity-less observations schedule one
+bounded follow-up instead of being forgotten. Head movement, queue regeneration
+or removal, incomplete pagination, label mismatch, busy/offline capacity, and
+ambiguous evidence refuse. The resulting actionable wake is diagnosis only:
+it never cancels or requeues work, changes selectors or runners, reorders the
+GitHub queue, or authorizes a retry. The wake consumer must revalidate live
+state before recommending recovery.
 Treat `failed_checks` as observation only, never as permission to use
 `gh run rerun --failed`. Active rerun planning must first carry exact failed job
 IDs, preview the dependency closure, estimate worker-minutes against a
