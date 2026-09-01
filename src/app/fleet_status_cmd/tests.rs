@@ -14,6 +14,41 @@ fn executable_script(path: &Path, body: &str) {
 
 #[cfg(unix)]
 #[test]
+fn fleet_github_reads_share_one_absolute_deadline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let hanging_gh = temp.path().join("hanging-gh");
+    executable_script(&hanging_gh, "sleep 30");
+    let config = LoadedConfig {
+        data: toml::Table::new(),
+        global_dir: temp.path().join("global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: crate::config::LocalOverlaySource::None,
+    };
+    let actions = GitHubActions::from_loaded_config(temp.path(), &config)
+        .with_gh_binary_for_tests(&hanging_gh);
+    let bounded = fleet_github_actions_with_timeout(&actions, Duration::from_millis(150));
+    let started = Instant::now();
+
+    let error = bounded
+        .run_gh(&["api".to_owned(), "repos/example/project".to_owned()])
+        .expect_err("hung GitHub observation must time out");
+
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(error.to_string().contains("timed out"));
+    let retry_started = Instant::now();
+    let expired = bounded
+        .run_gh(&["api".to_owned(), "repos/example/project".to_owned()])
+        .expect_err("later reads must not receive a fresh timeout");
+    assert!(retry_started.elapsed() < Duration::from_secs(1));
+    assert!(
+        expired.to_string().contains("absolute deadline")
+            || expired.to_string().contains("timed out")
+    );
+}
+
+#[cfg(unix)]
+#[test]
 #[allow(clippy::too_many_lines)] // One end-to-end mixed-host observer fixture.
 fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
     let temp = tempfile::tempdir().expect("tempdir");

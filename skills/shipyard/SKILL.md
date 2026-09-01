@@ -1334,6 +1334,10 @@ unreadable/unhealthy, a merge-group Linux build requests `ubuntu-latest` while
 an online idle self-hosted Linux x64 runner exists, or queued macOS work is older
 than `--queued-age-threshold-secs` while routable capacity exists. Use
 `--queue-run-limit N` to keep live debugging snappy on a large queued backlog.
+That limit does not cover merge-queue, enrollment, or release calls, so every
+GitHub read in one fleet tick also shares a 30-second absolute deadline. An
+expired tick renders a fail-closed partial assessment; do not wrap the command
+in a longer retry loop or treat missing observations as idle capacity.
 
 The report retains optional workflows, finds queued jobs inside `in_progress`
 workflows, and compares exact merge-group SHAs. A tick spends at most two

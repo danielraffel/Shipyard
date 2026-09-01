@@ -232,7 +232,12 @@ workflow-job pages in total (`--queue-run-limit` can lower that cap), including
 queued macOS jobs inside an `in_progress` workflow. A reached bound emits
 `OBSERVATION_TRUNCATED` instead of consuming an unbounded API budget;
 durable enrollment reconciliation is separately capped at 25 PR lookups per
-tick and uses the same explicit truncation signal.
+tick and uses the same explicit truncation signal. All GitHub reads in one
+fleet tick additionally share one 30-second absolute deadline, including App
+credential preparation. Expiry fails the unfinished observations closed and
+still renders the fleet assessment; no later lookup receives a fresh timeout.
+This wall bound is independent of `--queue-run-limit`, because merge-queue,
+enrollment, and release observations also consume GitHub requests.
 Authentication and rate-limit failures use stable `GITHUB_*` codes.
 The optional open release-incident count does not require `Issues: read`;
 when unavailable it emits non-fatal `AUXILIARY_OBSERVATION_UNAVAILABLE`.
