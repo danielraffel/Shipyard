@@ -1463,6 +1463,42 @@ canonical fields and opaque digests from legacy stores, leaves those stores
 authoritative and untouched, and cannot schedule, wake, call a model, mutate
 GitHub, or project to Linear. Both activation and dispatch remain disabled.
 
+### Successor ownership recovery
+
+Normal context acknowledgement atomically mints the ledger-owned root, first
+lease, and holder material. `work-ledger ownership bootstrap` is only for an
+acknowledged pre-v13 ownership. Holder material is secret mutation authority:
+read it from an owner-only file or strict stdin and write every bootstrap,
+renew, or adoption result to a new owner-only `--holder-output`; never put the
+material in argv, public inventory, status, or logs.
+
+- `shipyard work-ledger ownership renew --ownership <ao_id>
+  --expected-generation <n> --expires-at <RFC3339> --holder <file-or-stdin>
+  --holder-output <new-file>` rotates both the lease generation and holder.
+  Replace the old holder; it cannot authorize later mutations.
+- `shipyard work-ledger ownership release --ownership <ao_id>
+  --expected-generation <n> --holder <file-or-stdin>` records the explicit durable
+  release while leaving the acknowledged ownership adoptable.
+- `shipyard work-ledger ownership adopt --ownership <ao_id>
+  --expected-generation <n> --expires-at <RFC3339> --proof <file-or-stdin>
+  --holder-output <new-file>` accepts only exact JSON proof
+  `{"kind":"expired","expected_expires_at":"<RFC3339>"}` or
+  `{"kind":"explicit_release","release_digest":"<64hex>"}`. Adoption is
+  atomic, increments `owner_generation`, and safely replays the same successor
+  generation and material into a new output file. Supplying `--holder
+  <private-file>` authenticates attachment to that exact already-active holder;
+  it cannot authorize a different successor.
+
+There is no confirmed-dead mode: do not invent issuer receipts, infer death
+from a missing session, or use Linear/correlation identifiers as the root UUID.
+For remote custody, run `work-ledger ownership custody-prepare` with the exact
+current lease generation and holder, then allow the daemon reconciler to drive
+prepare/acknowledge/finalize or authenticated abort. Adoption rotates the
+holder/session identity but does not rotate the static transport-daemon
+endpoint policy. Custody authorization binds repository provider/id, PR, head,
+workstream, root UUID, lease ID/generation/expiry, and re-reads the live tuple
+at each commit; never bypass the reconciler with direct database edits.
+
 Use `shipyard --json work-ledger custody-inventory --message wm_<64hex>` to
 query only the protected destination selected by the source ledger's exact
 active custody rebind. Accepted or processed custody returns a fully

@@ -1137,6 +1137,28 @@ An intentional replacement must use the explicit transfer option with the same
 immutable work identity; Shipyard increments the ownership generation and
 rejects ambiguous provider context, head drift, or competing route ownership.
 
+Acknowledging agent context also establishes the first ownership lease and
+writes its holder material to the requested new owner-only file. Treat that
+file as the mutation credential: pass it only with `--holder <private-file>` or
+strict stdin (`--holder -`), never in argv values, logs, status, or inventory.
+Use `work-ledger ownership renew` before expiry and replace the old holder file
+with the newly emitted generation; an old generation cannot authorize return,
+release, adoption, or custody. Use `work-ledger ownership release` for an
+intentional handoff. A successor then uses `work-ledger ownership adopt` with
+the exact expected generation and either the durable release digest or the
+exact expired timestamp. Adoption atomically advances `owner_generation` and
+writes replay-safe successor holder material to a new private output file.
+There is no inferred-death takeover mode; never synthesize a death receipt or
+reuse a Linear/correlation UUID as the ledger-minted ownership root.
+
+If protected remote custody exists, stage it with `work-ledger ownership
+custody-prepare` using the current holder and generation, then let the normal
+transport reconciler complete its two-phase rebind. Owner/session rotation is
+separate from the configured custody transport-daemon endpoint identity; do
+not rewrite fleet transport policy merely because ownership changed. Every
+prepare, acknowledgement, replay, abort, and final commit is bound to the exact
+repository/PR/head/root/lease tuple and revalidates live authority.
+
 An exact launch profile plus enabled trusted consumer publishes a zero-wake
 native ledger obligation before the command reports
 `monitoring_transferred=true`. Provider delivery is not part of that boundary.
