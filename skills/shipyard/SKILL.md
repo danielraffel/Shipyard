@@ -631,15 +631,19 @@ shipyard metrics import github --repo Generous-Corp/pulp --limit 50 --json
 tartci runtime export --repo Generous-Corp/pulp |
   shipyard metrics import tartci --json
 shipyard metrics summary --project pulp --json
+shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics watch --project pulp --since 14d --json
 shipyard metrics advise --project pulp --json
 shipyard metrics compare --project pulp --baseline github-hosted --candidate macstudio --json
 ```
 
-The agent-facing commands return conservative JSON findings. Low sample counts
-are a collection gap, not a regression. Prefer filing issues or changing
-profiles only when `watch`, `advise`, or `compare` reports enough samples and a
-material delta relative to that repo's baseline.
+The agent-facing commands return conservative JSON findings. Use `scorecard`
+for a compact project-level view of outcomes, worker-minutes, queue time,
+distinct-PR throughput, and cache reuse. Fields without durable source data are
+explicitly `unavailable`; never reinterpret them as zero. Low sample counts are
+a collection gap, not a regression. Prefer filing issues or changing profiles
+only when `watch`, `advise`, or `compare` reports enough samples and a material
+delta relative to that repo's baseline.
 
 When fixing GitHub importer bugs, keep Actions list endpoints absolute
 (`/repos/<owner>/<repo>/...`) and force `gh api -X GET` whenever `-f` supplies

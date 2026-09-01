@@ -157,6 +157,32 @@ pub(super) fn metrics_command<W: Write>(
                 findings,
             )?;
         }
+        MetricsCommand::Scorecard(args) => {
+            let since_days = parse_days(&args.since)?;
+            let scorecard = store
+                .stewardship_scorecard(&args.project, since_days)
+                .map_err(|error| {
+                    CliFailure::new(1, format!("metrics scorecard failed: {error}"))
+                })?;
+            write_output(stdout, json_output, &scorecard, || {
+                format!(
+                    "{}: {} jobs, {:.2} worker-minutes, {} PRs over {}d; worker-minutes coverage={} ({}); PR coverage={} ({}); submit-to-receipt={} ({}); model-tokens={} ({})",
+                    scorecard.project,
+                    scorecard.job_samples,
+                    scorecard.worker_minutes,
+                    scorecard.distinct_pull_requests,
+                    scorecard.since_days,
+                    scorecard.worker_minutes_coverage.status,
+                    scorecard.worker_minutes_coverage.reason,
+                    scorecard.pull_request_throughput.status,
+                    scorecard.pull_request_throughput.reason,
+                    scorecard.submit_to_receipt.status,
+                    scorecard.submit_to_receipt.reason,
+                    scorecard.model_token_use.status,
+                    scorecard.model_token_use.reason,
+                )
+            })?;
+        }
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -273,7 +299,11 @@ fn import_github(
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|run| run.get("id").and_then(Value::as_i64))
+        .filter_map(|run| {
+            let run_id = run.get("id").and_then(Value::as_i64)?;
+            let pr = workflow_run_single_pr(run);
+            Some((run_id, pr))
+        })
         .collect::<Vec<_>>();
     let project = args.project.clone().unwrap_or_else(|| {
         args.repo
@@ -283,7 +313,7 @@ fn import_github(
             .to_owned()
     });
     let mut imported = 0;
-    for run_id in run_ids {
+    for (run_id, pr) in run_ids {
         let jobs = gh_json(&[
             "api".to_owned(),
             "-X".to_owned(),
@@ -299,14 +329,26 @@ fn import_github(
             let mut job: GitHubRunJob = serde_json::from_value(value.clone())
                 .map_err(|error| CliFailure::new(1, format!("GitHub job parse failed: {error}")))?;
             job.run_id.get_or_insert(run_id);
-            let input = github_job_to_record(&args.repo, args.workflow.as_deref(), &project, &job);
-            store.record(&input).map_err(|error| {
+            if job.completed_at.is_none() {
+                continue;
+            }
+            let input =
+                github_job_to_record(&args.repo, args.workflow.as_deref(), &project, pr, &job);
+            store.record_terminal_observation(&input).map_err(|error| {
                 CliFailure::new(1, format!("GitHub metrics record failed: {error}"))
             })?;
             imported += 1;
         }
     }
     Ok(imported)
+}
+
+fn workflow_run_single_pr(run: &Value) -> Option<i64> {
+    let pull_requests = run.get("pull_requests")?.as_array()?;
+    let [pull_request] = pull_requests.as_slice() else {
+        return None;
+    };
+    pull_request.get("number").and_then(Value::as_i64)
 }
 
 fn github_runs_api_path(repo: &str, workflow: Option<&str>) -> String {
@@ -494,5 +536,40 @@ mod tests {
             github_jobs_api_path("danielraffel/pulp", 123),
             "/repos/danielraffel/pulp/actions/runs/123/jobs"
         );
+    }
+
+    #[test]
+    fn workflow_run_pr_identity_requires_exactly_one_pr() {
+        assert_eq!(
+            workflow_run_single_pr(&json!({"pull_requests": [{"number": 538}]})),
+            Some(538)
+        );
+        assert_eq!(
+            workflow_run_single_pr(&json!({"pull_requests": [{"number": 538}, {"number": 539}]})),
+            None
+        );
+        assert_eq!(workflow_run_single_pr(&json!({"pull_requests": []})), None);
+    }
+
+    #[test]
+    fn scorecard_human_output_surfaces_coverage_gaps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut output = Vec::new();
+        metrics_command(
+            MetricsCommand::Scorecard(crate::app::cli::MetricsWatchArgs {
+                project: "shipyard".to_owned(),
+                since: "14d".to_owned(),
+            }),
+            temp.path(),
+            false,
+            &mut output,
+        )
+        .expect("scorecard command");
+        let output = String::from_utf8(output).expect("UTF-8 output");
+
+        assert!(output.contains("PR coverage=unavailable"));
+        assert!(output.contains("worker-minutes coverage=unavailable"));
+        assert!(output.contains("submit-to-receipt=unavailable"));
+        assert!(output.contains("model-tokens=unavailable"));
     }
 }
