@@ -207,6 +207,20 @@ class CiMatrixTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("MACOS_ARM64_LOCAL_SELECTOR_JSON", text, path.name)
 
+    def test_rust_cache_never_runs_the_macos_save_hook(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for relative, expected in (
+            (".github/workflows/ci.yml", 2),
+            (".github/workflows/sandbox-e2e.yml", 1),
+            (".github/workflows/package-smoke.yml", 1),
+            (".github/workflows/release.yml", 2),
+        ):
+            workflow = (root / relative).read_text(encoding="utf-8")
+            self.assertEqual(workflow.count("uses: Swatinem/rust-cache@v2"), expected)
+            self.assertEqual(
+                workflow.count("save-if: ${{ runner.os != 'macOS' }}"), expected
+            )
+
     def test_ci_rust_tests_do_not_inherit_runner_shipyard_configuration(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")

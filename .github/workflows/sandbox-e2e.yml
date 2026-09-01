@@ -72,6 +72,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ runner.os != 'macOS' }}
 
       - name: Build release binary
         run: cargo build --release --locked --bin shipyard
