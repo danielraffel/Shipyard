@@ -3002,12 +3002,12 @@ mod tests {
 
     const EXPERIMENTAL_AUTHORITY_FEATURE: &str = "experimental-authority-v5";
     const EXPERIMENTAL_AUTHORITY_CI_WORKFLOW: &str = ".github/workflows/ci.yml";
-    const EXPERIMENTAL_AUTHORITY_CI_STEP: &str = r#"      - name: Run experimental authority refusal tests
+    const EXPERIMENTAL_AUTHORITY_CI_STEP: &str = r"      - name: Run experimental authority refusal tests
         if: runner.os == 'Linux'
         env:
           SHIPYARD_TEST_HOME: ${{ runner.temp }}
           RUST_MIN_STACK: 8388608
-        run: cargo test --all-targets --locked --features ci-test-home,experimental-authority-v5"#;
+        run: cargo test --all-targets --locked --features ci-test-home,experimental-authority-v5";
     const REFUSAL_ONLY_GUIDANCE: [&str; 4] = [
         "docs/pulp-mac-cache-readiness.md",
         "docs/ship-state-machine.md",
