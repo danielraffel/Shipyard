@@ -36,7 +36,7 @@ All three subcommands accept:
 |------|---------|
 | 0 | condition matched |
 | 1 | `--timeout` elapsed |
-| 4 | `wait run --success` hit a terminal-but-wrong conclusion |
+| 4 | A success condition became impossible: `wait run --success` failed, or every exact-head required PR check finished and at least one failed |
 | 5 | invalid input (PR/release/run not found, bad tag) |
 | 6 | daemon unreachable + snapshot didn't match + `--no-fallback` |
 | 7 | unsupported scope — rulesets / merge-queue detected |
@@ -80,11 +80,15 @@ SKIPPED}`.
 Conclusion mapping:
 
 - `SUCCESS`, `NEUTRAL`, `SKIPPED` → passing
-- `FAILURE`, `TIMED_OUT`, `CANCELLED`, `ACTION_REQUIRED`,
-  `STARTUP_FAILURE`, `STALE` → failing (not terminal-match; waiter
-  keeps reporting "not matched" until timeout, because a pending retry
-  could still flip the lane)
+- `FAILURE`, `ERROR`, `TIMED_OUT`, `CANCELLED`, `ACTION_REQUIRED`,
+  `STARTUP_FAILURE`, `STALE` → failing
 - `QUEUED`, `IN_PROGRESS`, `PENDING` → still waiting
+
+If every required check for the observed exact head is terminal and at least
+one failed, the waiter exits 4 immediately. It does not remain subscribed in
+case an external actor reruns a check. If any required check is still active,
+the waiter continues normally; if the PR head moves while it is waiting, the
+next authoritative snapshot is evaluated solely for the new head.
 
 Re-evaluated immediately on every `check_run` / `check_suite` /
 `workflow_run` / `reconcile_healed` event that pertains to this PR, and

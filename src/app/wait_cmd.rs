@@ -6,17 +6,17 @@ use std::process::ExitCode;
 use serde_json::Value;
 
 use super::{
-    CliFailure, RuntimeMode, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK,
-    WAIT_EXIT_RUN_TERMINAL_WRONG, WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
+    CliFailure, RuntimeMode, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
+    WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
     cli::{WaitCommand, WaitPrState},
 };
 use crate::config::LoadedConfig;
 use crate::output::write_json_envelope;
 use crate::wait as wait_logic;
 use crate::wait_transport::{
-    WaitOutcome, fetch_pr_snapshot_with_timeout, fetch_release_snapshot_with_timeout,
-    fetch_run_snapshot_with_timeout, pr_event_filter, read_snapshot_file, release_event_filter,
-    run_event_filter, wait_for_condition_with_timeout,
+    WaitOutcome, fetch_pr_green_snapshot_with_timeout, fetch_pr_snapshot_with_timeout,
+    fetch_release_snapshot_with_timeout, fetch_run_snapshot_with_timeout, pr_event_filter,
+    read_snapshot_file, release_event_filter, run_event_filter, wait_for_condition_with_timeout,
 };
 
 pub(super) fn wait_command<W: Write>(
@@ -160,9 +160,10 @@ fn wait_pr<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let repo = resolve_repo_slug(repo_override, cwd)?;
     let event_filter = pr_event_filter(pr_number, &repo);
-    let outcome = wait_for_condition_with_timeout(
+    let mut terminal_wrong = false;
+    let result = wait_for_condition_with_timeout(
         |snapshot| match state {
-            WaitPrState::Green => wait_logic::evaluate_pr_green(snapshot),
+            WaitPrState::Green => evaluate_pr_green_for_wait(snapshot, &mut terminal_wrong),
             WaitPrState::Merged => wait_logic::evaluate_pr_state(snapshot, "merged")
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
             WaitPrState::Closed => wait_logic::evaluate_pr_state(snapshot, "closed")
@@ -170,31 +171,104 @@ fn wait_pr<W: Write>(
         },
         |remaining| match snapshot_file {
             Some(path) => read_snapshot_file(path),
-            None => fetch_pr_snapshot_with_timeout(&repo, pr_number, cwd, remaining),
+            None => match state {
+                WaitPrState::Green => {
+                    fetch_pr_green_snapshot_with_timeout(&repo, pr_number, cwd, remaining)
+                }
+                WaitPrState::Merged | WaitPrState::Closed => {
+                    fetch_pr_snapshot_with_timeout(&repo, pr_number, cwd, remaining)
+                }
+            },
         },
         event_filter,
         timeout_seconds,
         poll_interval,
         no_fallback,
         socket_path,
-    )
-    .map_err(|error| wait_failure(error.as_ref()))?;
+    );
+    match result {
+        Ok(mut outcome) => {
+            if terminal_wrong {
+                outcome.matched = false;
+                if !json {
+                    render_pr_terminal_failure(stdout, &outcome)
+                        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+                    return Ok(ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
+                }
+            }
+            render_wait_outcome(
+                stdout,
+                json,
+                "wait:pr",
+                serde_json::json!({
+                    "type": format!("pr_{}", state.as_str()),
+                    "pr": pr_number,
+                    "repo": repo,
+                    "head_sha": outcome.observed.get("head_sha").cloned().unwrap_or(Value::Null),
+                }),
+                &outcome,
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            if terminal_wrong {
+                return Ok(ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
+            }
+            Ok(wait_exit_code(&outcome))
+        }
+        Err(error) => Err(wait_failure(error.as_ref())),
+    }
+}
 
-    render_wait_outcome(
+fn render_pr_terminal_failure<W: Write>(
+    stdout: &mut W,
+    outcome: &WaitOutcome,
+) -> std::io::Result<()> {
+    let head = outcome
+        .observed
+        .get("head_sha")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let failures = outcome
+        .observed
+        .get("checks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|check| {
+            ["conclusion", "state"].iter().any(|field| {
+                check
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| wait_logic::TERMINAL_FAILURE_CONCLUSIONS.contains(&value))
+            })
+        })
+        .filter_map(|check| check.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    writeln!(
         stdout,
-        json,
-        "wait:pr",
-        serde_json::json!({
-            "type": format!("pr_{}", state.as_str()),
-            "pr": pr_number,
-            "repo": repo,
-            "head_sha": outcome.observed.get("head_sha").cloned().unwrap_or(Value::Null),
-        }),
-        &outcome,
+        "required checks failed for head {head}: {} after {:.3}s (transport={})",
+        failures.join(", "),
+        outcome.elapsed_seconds,
+        outcome.transport
     )
-    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+}
 
-    Ok(wait_exit_code(&outcome))
+fn evaluate_pr_green_for_wait(
+    snapshot: Option<&Value>,
+    terminal_wrong: &mut bool,
+) -> crate::wait_transport::WaitResult<crate::wait::TruthResult> {
+    match wait_logic::evaluate_pr_green(snapshot) {
+        Ok(result) => Ok(result),
+        Err(error) => match error.downcast::<wait_logic::PrFailedFastError>() {
+            Ok(pr_failed) => {
+                *terminal_wrong = true;
+                Ok(crate::wait::TruthResult {
+                    matched: true,
+                    observed: pr_failed.observed,
+                })
+            }
+            Err(error) => Err(error),
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,7 +315,7 @@ fn wait_run<W: Write>(
             render_wait_outcome(stdout, json, "wait:run", condition, &outcome)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             if terminal_wrong {
-                return Ok(ExitCode::from(WAIT_EXIT_RUN_TERMINAL_WRONG));
+                return Ok(ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
             }
             Ok(wait_exit_code(&outcome))
         }
@@ -430,12 +504,12 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        RuntimeMode, WaitOutcome, WaitPrState, evaluate_run_for_wait, parse_github_repo_slug,
-        release_manifest, render_wait_outcome, resolve_repo_slug, wait_exit_code, wait_failure,
-        wait_pr, wait_release, wait_run,
+        RuntimeMode, WaitOutcome, WaitPrState, evaluate_pr_green_for_wait, evaluate_run_for_wait,
+        parse_github_repo_slug, release_manifest, render_wait_outcome, resolve_repo_slug,
+        wait_exit_code, wait_failure, wait_pr, wait_release, wait_run,
     };
     use crate::app::{
-        WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_RUN_TERMINAL_WRONG, WAIT_EXIT_TIMEOUT,
+        WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG, WAIT_EXIT_TIMEOUT,
         WAIT_EXIT_UNSUPPORTED,
     };
     use crate::gh::GhPrepareError;
@@ -751,6 +825,144 @@ artifacts = [
     }
 
     #[test]
+    fn wait_pr_green_terminal_failure_fast_returns_terminal_wrong_exit_code() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            serde_json::json!({
+                "number": 534,
+                "headRefOid": "terminal-red-head",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+                "statusCheckRollup": [
+                    {"name": "Linux", "conclusion": "SUCCESS", "state": "COMPLETED", "isRequired": true},
+                    {"name": "macOS", "conclusion": "FAILURE", "state": "COMPLETED", "isRequired": true}
+                ],
+                "_required_checks_known": true
+            })
+            .to_string(),
+        )
+        .expect("snapshot");
+        let mut out = Vec::new();
+
+        let code = wait_pr(
+            &temp.path().join("missing.sock"),
+            temp.path(),
+            true,
+            &mut out,
+            534,
+            WaitPrState::Green,
+            10.0,
+            10.0,
+            false,
+            Some("owner/repo".to_owned()),
+            Some(&snapshot),
+        )
+        .expect("terminal failure is an observed outcome");
+
+        let payload: Value = serde_json::from_slice(&out).expect("json payload");
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
+        assert_eq!(payload["matched"], false);
+        assert_eq!(payload["condition"]["head_sha"], "terminal-red-head");
+        assert_eq!(payload["observed"]["checks"][1]["conclusion"], "FAILURE");
+        assert!(payload["elapsed_seconds"].as_f64().expect("elapsed") < 1.0);
+    }
+
+    #[test]
+    fn wait_pr_green_terminal_failure_names_head_and_checks_for_humans() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            serde_json::json!({
+                "number": 534,
+                "headRefOid": "terminal-red-head",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+                "statusCheckRollup": [
+                    {"name": "Linux", "conclusion": "SUCCESS", "state": "COMPLETED", "isRequired": true},
+                    {"name": "macOS", "conclusion": "FAILURE", "state": "COMPLETED", "isRequired": true}
+                ],
+                "_required_checks_known": true
+            })
+            .to_string(),
+        )
+        .expect("snapshot");
+        let mut out = Vec::new();
+
+        let code = wait_pr(
+            &temp.path().join("missing.sock"),
+            temp.path(),
+            false,
+            &mut out,
+            534,
+            WaitPrState::Green,
+            10.0,
+            10.0,
+            false,
+            Some("owner/repo".to_owned()),
+            Some(&snapshot),
+        )
+        .expect("terminal failure is an observed outcome");
+
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
+        let output = String::from_utf8(out).expect("utf8");
+        assert!(
+            output.starts_with("required checks failed for head terminal-red-head: macOS after ")
+        );
+        assert!(output.ends_with(" (transport=polling)\n"));
+    }
+
+    #[test]
+    fn wait_pr_green_follows_head_movement_without_stale_terminal_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshots = [
+            serde_json::json!({
+                "number": 534,
+                "headRefOid": "old-head",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+                "statusCheckRollup": [
+                    {"name": "macOS", "conclusion": null, "state": "IN_PROGRESS", "isRequired": true}
+                ],
+                "_required_checks_known": true
+            }),
+            serde_json::json!({
+                "number": 534,
+                "headRefOid": "new-head",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "statusCheckRollup": [
+                    {"name": "macOS", "conclusion": "SUCCESS", "state": "COMPLETED", "isRequired": true}
+                ],
+                "_required_checks_known": true
+            }),
+        ];
+        let mut calls = 0;
+        let mut terminal_wrong = false;
+        let outcome = wait_for_condition_with_timeout(
+            |snapshot| evaluate_pr_green_for_wait(snapshot, &mut terminal_wrong),
+            |_| {
+                let snapshot = snapshots[calls.min(snapshots.len() - 1)].clone();
+                calls += 1;
+                Ok(Some(snapshot))
+            },
+            |_| true,
+            1.0,
+            0.01,
+            false,
+            &temp.path().join("missing.sock"),
+        )
+        .expect("new head should reach green");
+
+        assert!(!terminal_wrong);
+        assert!(outcome.matched);
+        assert_eq!(outcome.observed["head_sha"], "new-head");
+        assert!(calls >= 2);
+    }
+
+    #[test]
     fn wait_run_success_failure_fast_returns_terminal_wrong_exit_code() {
         let temp = tempfile::tempdir().expect("tempdir");
         let snapshot = temp.path().join("run.json");
@@ -782,7 +994,7 @@ artifacts = [
         .expect("wait run");
 
         let payload: Value = serde_json::from_slice(&out).expect("json payload");
-        assert_eq!(code, ExitCode::from(WAIT_EXIT_RUN_TERMINAL_WRONG));
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
         assert_eq!(payload["command"], "wait:run");
         assert_eq!(payload["matched"], false);
         assert_eq!(payload["observed"]["run_id"], 100);

@@ -260,7 +260,7 @@ pub(super) const SHIP_EXIT_VALIDATION_STATE_MISSING: u8 = 9;
 pub(super) const SHIP_EXIT_AUTOMATIC_MERGE_REFUSED: u8 = 10;
 
 pub(super) const WAIT_EXIT_TIMEOUT: u8 = 1;
-pub(super) const WAIT_EXIT_RUN_TERMINAL_WRONG: u8 = 4;
+pub(super) const WAIT_EXIT_TERMINAL_WRONG: u8 = 4;
 pub(super) const WAIT_EXIT_INVALID: u8 = 5;
 pub(super) const WAIT_EXIT_NO_FALLBACK: u8 = 6;
 pub(super) const WAIT_EXIT_UNSUPPORTED: u8 = 7;
@@ -1423,7 +1423,7 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        Cli, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_RUN_TERMINAL_WRONG, WAIT_EXIT_UNSUPPORTED, run_with,
+        Cli, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG, WAIT_EXIT_UNSUPPORTED, run_with,
         run_with_cwd_provider, wait_cmd::parse_github_repo_slug,
     };
     use crate::cloud_records::{CloudRecordStore, CloudRunRecord};
@@ -4695,7 +4695,7 @@ mod tests {
         let mut stderr = Vec::new();
         let code = run_with(cli, &mut stdout, &mut stderr);
 
-        assert_eq!(code, ExitCode::from(WAIT_EXIT_RUN_TERMINAL_WRONG));
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
         assert!(stderr.is_empty());
 
         let value: Value = serde_json::from_slice(&stdout).expect("json");

@@ -92,6 +92,25 @@ enum SnapshotFetch {
     TimedOut,
 }
 
+#[derive(Debug)]
+struct SnapshotHeadChanged {
+    captured_head: String,
+    live_head: Option<String>,
+}
+
+impl std::fmt::Display for SnapshotHeadChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PR head changed while assembling a snapshot: captured={}, live={}",
+            self.captured_head,
+            self.live_head.as_deref().unwrap_or("<unavailable>")
+        )
+    }
+}
+
+impl std::error::Error for SnapshotHeadChanged {}
+
 fn fetch_snapshot_resilient<F>(
     fetch_snapshot: &mut F,
     start: &Instant,
@@ -133,6 +152,7 @@ fn is_transient_snapshot_error(error: &(dyn std::error::Error + 'static)) -> boo
         .downcast_ref::<GhPrepareError>()
         .is_some_and(GhPrepareError::is_transient)
         || error.downcast_ref::<SnapshotCommandTimeout>().is_some()
+        || error.downcast_ref::<SnapshotHeadChanged>().is_some()
 }
 
 fn fetch_and_evaluate<F, E>(
@@ -438,7 +458,17 @@ pub(crate) fn fetch_pr_snapshot_with_timeout(
     timeout: Duration,
 ) -> WaitResult<Option<Value>> {
     let client = gh_client(cwd)?;
-    fetch_pr_snapshot_with_client(&client, repo, pr_number, cwd, timeout)
+    fetch_pr_snapshot_with_client_inner(&client, repo, pr_number, cwd, timeout, false)
+}
+
+pub(crate) fn fetch_pr_green_snapshot_with_timeout(
+    repo: &str,
+    pr_number: u64,
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Option<Value>> {
+    let client = gh_client(cwd)?;
+    fetch_pr_snapshot_with_client_inner(&client, repo, pr_number, cwd, timeout, true)
 }
 
 pub(crate) fn fetch_pr_snapshot_with_client(
@@ -447,6 +477,17 @@ pub(crate) fn fetch_pr_snapshot_with_client(
     pr_number: u64,
     cwd: &Path,
     timeout: Duration,
+) -> WaitResult<Option<Value>> {
+    fetch_pr_snapshot_with_client_inner(client, repo, pr_number, cwd, timeout, false)
+}
+
+fn fetch_pr_snapshot_with_client_inner(
+    client: &GhClient,
+    repo: &str,
+    pr_number: u64,
+    cwd: &Path,
+    timeout: Duration,
+    revalidate_head: bool,
 ) -> WaitResult<Option<Value>> {
     let started = Instant::now();
     match run_gh_capturing(
@@ -486,6 +527,12 @@ pub(crate) fn fetch_pr_snapshot_with_client(
                         &required,
                         materialized.as_deref().unwrap_or_default(),
                     );
+                    if revalidate_head {
+                        let remaining = remaining_snapshot_timeout(timeout, started.elapsed());
+                        let live_head =
+                            fetch_pr_head_sha_rest(client, repo, pr_number, cwd, remaining)?;
+                        ensure_snapshot_matches_live_head(&value, live_head.as_deref())?;
+                    }
                 }
                 None => {
                     value["_required_checks_known"] = Value::Bool(false);
@@ -505,6 +552,40 @@ pub(crate) fn fetch_pr_snapshot_with_client(
         }
         GhOutcome::OtherFailure => Ok(None),
     }
+}
+
+fn fetch_pr_head_sha_rest(
+    client: &GhClient,
+    repo: &str,
+    pr_number: u64,
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Option<String>> {
+    let endpoint = format!("repos/{repo}/pulls/{pr_number}");
+    let output = run_gh_output(client, &["api", endpoint.as_str()], cwd, timeout)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = serde_json::from_slice::<Value>(&output.stdout)?;
+    Ok(value
+        .get("head")
+        .and_then(|head| head.get("sha"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
+}
+
+fn ensure_snapshot_matches_live_head(snapshot: &Value, live_head: Option<&str>) -> WaitResult<()> {
+    let captured_head = snapshot
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    if Some(captured_head) == live_head {
+        return Ok(());
+    }
+    Err(Box::new(SnapshotHeadChanged {
+        captured_head: captured_head.to_owned(),
+        live_head: live_head.map(str::to_owned),
+    }))
 }
 
 // Keep this list limited to fields accepted by `gh pr view --json`. In
@@ -1100,7 +1181,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PR_CHECKS_JSON_FIELDS, PR_VIEW_JSON_FIELDS, WaitOutcome, annotate_required_checks,
+        PR_CHECKS_JSON_FIELDS, PR_VIEW_JSON_FIELDS, SnapshotHeadChanged, WaitOutcome,
+        annotate_required_checks, ensure_snapshot_matches_live_head, is_transient_snapshot_error,
         pr_event_filter, read_snapshot_file, release_event_filter, remaining_snapshot_timeout,
         run_event_filter, snapshot_command_timeout, synthesize_pr_snapshot_from_rest,
         wait_for_condition_with_timeout,
@@ -1738,6 +1820,24 @@ mod tests {
                 .split(',')
                 .any(|field| field == "merged")
         );
+    }
+
+    #[test]
+    fn pr_snapshot_head_revalidation_refuses_movement_and_missing_identity() {
+        let snapshot = serde_json::json!({"headRefOid": "captured-head"});
+
+        ensure_snapshot_matches_live_head(&snapshot, Some("captured-head"))
+            .expect("stable exact head");
+        for (snapshot, live_head) in [
+            (snapshot.clone(), Some("new-head")),
+            (snapshot, None),
+            (serde_json::json!({}), Some("captured-head")),
+        ] {
+            let error = ensure_snapshot_matches_live_head(&snapshot, live_head)
+                .expect_err("head drift must retry");
+            assert!(error.downcast_ref::<SnapshotHeadChanged>().is_some());
+            assert!(is_transient_snapshot_error(error.as_ref()));
+        }
     }
 
     #[test]

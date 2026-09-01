@@ -1885,6 +1885,16 @@ subprocess; no retry begins after the deadline. `wait run --success` preserves
 the accumulated retry count and transport metadata when a recovered snapshot
 ends in a terminal non-success conclusion (exit 4).
 
+`wait pr --state green` likewise exits 4 once every required check for the
+observed exact head is terminal and at least one failed. Before that terminal
+decision, re-read the live PR head through REST and retry the bounded snapshot
+when it moved or cannot be revalidated; never combine one head's identity with
+another head's check observations. Keep this extra exact-head fence scoped to
+the green/check path: `--state merged` and `--state closed` already have their
+answer in the authoritative PR snapshot and must not depend on another REST
+request. Human output names the failed head and checks; JSON retains the full
+observation with `matched:false`.
+
 GitHub App installation tokens can also be rejected by GitHub's GraphQL
 `createPullRequest` / `mergePullRequest` mutations even when the App token is
 otherwise the right auth source for inspection. PR creation first tries the

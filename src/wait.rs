@@ -6,6 +6,16 @@ use serde::Serialize;
 pub const PASSING_CONCLUSIONS: &[&str] = &["SUCCESS", "NEUTRAL", "SKIPPED"];
 /// Still-waiting states for GitHub checks.
 pub const STILL_WAITING_STATES: &[&str] = &["QUEUED", "IN_PROGRESS", "PENDING"];
+/// Terminal failing conclusions for `wait pr --state green`.
+pub const TERMINAL_FAILURE_CONCLUSIONS: &[&str] = &[
+    "FAILURE",
+    "ERROR",
+    "TIMED_OUT",
+    "CANCELLED",
+    "ACTION_REQUIRED",
+    "STARTUP_FAILURE",
+    "STALE",
+];
 /// Terminal run statuses for `wait run`.
 pub const RUN_TERMINAL_STATUSES: &[&str] = &["completed"];
 
@@ -32,6 +42,28 @@ impl std::fmt::Display for InvalidInputError {
 }
 
 impl std::error::Error for InvalidInputError {}
+
+/// Error raised when every exact-head required check is terminal and one failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrFailedFastError {
+    /// Observed PR snapshot, including the exact head SHA and required checks.
+    pub observed: BTreeMap<String, serde_json::Value>,
+}
+
+impl std::fmt::Display for PrFailedFastError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PR exact-head checks reached a terminal failing conclusion at {}",
+            self.observed
+                .get("head_sha")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unknown>")
+        )
+    }
+}
+
+impl std::error::Error for PrFailedFastError {}
 
 /// Error raised when `wait run --success` sees a terminal failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,21 +236,37 @@ pub fn evaluate_pr_green(
         .cloned()
         .unwrap_or_default();
 
-    let mut checks = evaluate_pr_check_rollup(rollup);
+    let checks = evaluate_pr_check_rollup(rollup);
 
-    if checks.required_entries.is_empty() {
-        checks.all_required_pass = snapshot
+    let matched = if checks.required_entries.is_empty() {
+        snapshot
             .get("mergeable")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .eq_ignore_ascii_case("MERGEABLE")
-            && merge_state == "CLEAN";
+            && merge_state == "CLEAN"
+    } else {
+        checks
+            .required_states
+            .iter()
+            .all(|state| *state == RequiredCheckState::Passing)
+    };
+    let terminal_failure = !checks.required_entries.is_empty()
+        && checks.required_states.iter().all(|state| {
+            matches!(
+                state,
+                RequiredCheckState::Passing | RequiredCheckState::TerminalFailure
+            )
+        })
+        && checks
+            .required_states
+            .contains(&RequiredCheckState::TerminalFailure);
+    let observed = pr_green_observed(snapshot, merge_state, checks);
+    if terminal_failure {
+        return Err(Box::new(PrFailedFastError { observed }));
     }
 
-    Ok(TruthResult {
-        matched: checks.all_required_pass && !checks.any_still_waiting,
-        observed: pr_green_observed(snapshot, merge_state, checks),
-    })
+    Ok(TruthResult { matched, observed })
 }
 
 /// Whether the PR is governed by a merge queue, derived from the
@@ -243,16 +291,14 @@ pub fn merge_queue_required(snapshot: &serde_json::Value) -> bool {
 struct PrGreenChecks {
     required_entries: Vec<serde_json::Value>,
     advisory_entries: Vec<serde_json::Value>,
-    all_required_pass: bool,
-    any_still_waiting: bool,
+    required_states: Vec<RequiredCheckState>,
 }
 
 fn evaluate_pr_check_rollup(rollup: Vec<serde_json::Value>) -> PrGreenChecks {
     let mut checks = PrGreenChecks {
         required_entries: Vec::new(),
         advisory_entries: Vec::new(),
-        all_required_pass: true,
-        any_still_waiting: false,
+        required_states: Vec::new(),
     };
 
     for entry in rollup {
@@ -265,12 +311,7 @@ fn evaluate_pr_check_rollup(rollup: Vec<serde_json::Value>) -> PrGreenChecks {
             continue;
         }
         checks.required_entries.push(observed.value);
-        if observed.waiting {
-            checks.any_still_waiting = true;
-            checks.all_required_pass = false;
-        } else if !observed.passing {
-            checks.all_required_pass = false;
-        }
+        checks.required_states.push(observed.state);
     }
     checks
 }
@@ -278,8 +319,15 @@ fn evaluate_pr_check_rollup(rollup: Vec<serde_json::Value>) -> PrGreenChecks {
 struct ObservedPrCheck {
     value: serde_json::Value,
     required: bool,
-    waiting: bool,
-    passing: bool,
+    state: RequiredCheckState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequiredCheckState {
+    Waiting,
+    Passing,
+    TerminalFailure,
+    Unknown,
 }
 
 fn observed_pr_check(entry: &serde_json::Map<String, serde_json::Value>) -> ObservedPrCheck {
@@ -289,8 +337,10 @@ fn observed_pr_check(entry: &serde_json::Map<String, serde_json::Value>) -> Obse
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let state = upper_entry_value(entry, "state");
-    let conclusion = upper_entry_value(entry, "conclusion");
+    let state = upper_entry_value(entry, "state")
+        .or_else(|| upper_entry_value(entry, "status"))
+        .unwrap_or_default();
+    let conclusion = upper_entry_value(entry, "conclusion").unwrap_or_default();
     let required = entry
         .get("isRequired")
         .and_then(serde_json::Value::as_bool)
@@ -299,6 +349,17 @@ fn observed_pr_check(entry: &serde_json::Map<String, serde_json::Value>) -> Obse
         && !PASSING_CONCLUSIONS.contains(&conclusion.as_str());
     let passing = PASSING_CONCLUSIONS.contains(&conclusion.as_str())
         || PASSING_CONCLUSIONS.contains(&state.as_str());
+    let terminal_failure = TERMINAL_FAILURE_CONCLUSIONS.contains(&conclusion.as_str())
+        || TERMINAL_FAILURE_CONCLUSIONS.contains(&state.as_str());
+    let check_state = if waiting {
+        RequiredCheckState::Waiting
+    } else if passing {
+        RequiredCheckState::Passing
+    } else if terminal_failure {
+        RequiredCheckState::TerminalFailure
+    } else {
+        RequiredCheckState::Unknown
+    };
 
     ObservedPrCheck {
         value: serde_json::json!({
@@ -308,17 +369,18 @@ fn observed_pr_check(entry: &serde_json::Map<String, serde_json::Value>) -> Obse
             "required": required,
         }),
         required,
-        waiting,
-        passing,
+        state: check_state,
     }
 }
 
-fn upper_entry_value(entry: &serde_json::Map<String, serde_json::Value>, key: &str) -> String {
+fn upper_entry_value(
+    entry: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
     entry
         .get(key)
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_ascii_uppercase()
+        .map(str::to_ascii_uppercase)
 }
 
 fn nullable_uppercase(value: String) -> serde_json::Value {
@@ -464,8 +526,8 @@ pub fn evaluate_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        InvalidInputError, RunFailedFastError, UnsupportedScopeError, evaluate_pr_green,
-        evaluate_pr_state, evaluate_release, evaluate_run, merge_queue_required,
+        InvalidInputError, PrFailedFastError, RunFailedFastError, UnsupportedScopeError,
+        evaluate_pr_green, evaluate_pr_state, evaluate_release, evaluate_run, merge_queue_required,
     };
 
     fn rollup_entry(
@@ -588,9 +650,11 @@ mod tests {
                 "conclusion": "FAILURE"
             }]
         });
-        let result = evaluate_pr_green(Some(&snapshot)).expect("green evaluation");
-        assert!(!result.matched);
-        assert_eq!(result.observed["checks"][0]["required"], true);
+        let error = evaluate_pr_green(Some(&snapshot)).expect_err("terminal required failure");
+        let error = error
+            .downcast::<PrFailedFastError>()
+            .expect("typed terminal-impossible result");
+        assert_eq!(error.observed["checks"][0]["required"], true);
     }
 
     #[test]
@@ -628,6 +692,47 @@ mod tests {
         assert_eq!(result.observed["checks"].as_array().unwrap().len(), 2);
         assert_eq!(result.observed["checks"][1]["name"], "missing");
         assert_eq!(result.observed["checks"][1]["state"], "PENDING");
+    }
+
+    #[test]
+    fn pr_green_active_required_check_still_waits_despite_terminal_failure() {
+        let snapshot = serde_json::json!({
+            "number": 534,
+            "headRefOid": "current-head",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "UNSTABLE",
+            "statusCheckRollup": [
+                rollup_entry("Linux", "FAILURE", "COMPLETED", true),
+                rollup_entry("macOS", "", "IN_PROGRESS", true)
+            ],
+            "_required_checks_known": true
+        });
+
+        let result = evaluate_pr_green(Some(&snapshot)).expect("active check must keep waiting");
+        assert!(!result.matched);
+        assert_eq!(result.observed["head_sha"], "current-head");
+    }
+
+    #[test]
+    fn pr_green_terminal_required_failure_is_typed_impossible() {
+        let snapshot = serde_json::json!({
+            "number": 534,
+            "headRefOid": "terminal-red-head",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "UNSTABLE",
+            "statusCheckRollup": [
+                rollup_entry("Linux", "SUCCESS", "COMPLETED", true),
+                rollup_entry("macOS", "FAILURE", "COMPLETED", true)
+            ],
+            "_required_checks_known": true
+        });
+
+        let error = evaluate_pr_green(Some(&snapshot)).expect_err("terminal red must stop waiting");
+        let error = error
+            .downcast::<PrFailedFastError>()
+            .expect("typed terminal-impossible result");
+        assert_eq!(error.observed["head_sha"], "terminal-red-head");
+        assert_eq!(error.observed["checks"][1]["conclusion"], "FAILURE");
     }
 
     #[test]

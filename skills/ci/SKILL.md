@@ -863,6 +863,13 @@ from the raw `gh pr view --json statusCheckRollup` payload or from the subset
 returned by `gh pr checks --required`. If the policy cannot be read, Shipyard
 exits 7 and does not report green.
 
+When every materialized required check for the observed exact head is terminal
+and at least one failed, `wait pr --state green` exits 4 immediately with that
+head and its check observations. It does not spend the rest of the timeout
+waiting for an external rerun. A still-active or unknown required check keeps
+the subscription open, and a moved PR head is evaluated only from its fresh
+authoritative snapshot.
+
 ### Before/after
 
 | Before | After |
@@ -886,7 +893,7 @@ If either check fails, fall back to `gh run watch` / `gh pr checks --watch`.
 |------|---------|
 | 0 | condition matched |
 | 1 | `--timeout` elapsed |
-| 4 | `wait run --success` reached a terminal-but-wrong conclusion |
+| 4 | A requested success became impossible: `wait run --success` reached a terminal failed conclusion, or `wait pr --state green` observed all exact-head required checks terminal with at least one failure |
 | 5 | invalid input (PR/release/run not found, bad tag) |
 | 6 | daemon unreachable + snapshot didn't match + `--no-fallback` |
 | 7 | unsupported scope — rulesets / merge-queue governance detected; switch lanes or do it manually |
@@ -895,7 +902,7 @@ If either check fails, fall back to `gh run watch` / `gh pr checks --watch`.
 Transient snapshot retries do not extend `--timeout`: credential preparation
 and the `gh` subprocess are bounded by the remaining overall budget, and no new
 attempt starts after the deadline. JSON `transient_errors` remains accurate
-when `wait run --success` stops early with exit 4 on a terminal failed run.
+when a run or PR wait stops early with exit 4 on a terminal failed result.
 
 ### JSON shape
 
