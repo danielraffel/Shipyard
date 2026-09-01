@@ -1462,6 +1462,18 @@ import is intended. Import is idempotent, redacted, and fail-closed: it selects
 canonical fields and opaque digests from legacy stores, leaves those stores
 authoritative and untouched, and cannot schedule, wake, call a model, mutate
 GitHub, or project to Linear. Both activation and dispatch remain disabled.
+
+Use `shipyard --json work-ledger custody-inventory --message wm_<64hex>` to
+query only the protected destination selected by the source ledger's exact
+active custody rebind. Accepted or processed custody returns a fully
+revalidated bounded `complete` or `partial` inventory. Pending or claimed
+custody returns `uncertain` without SSH; cancelled, superseded, missing, or
+contradictory custody returns `refused`. The request binds the complete
+source/target/rebind/transfer tuple and travels through the existing forced SSH
+subsystem with no host or shell argument. Optional `--correlation-hints` reads
+an owner-only no-follow file containing immutable Linear workspace/root UUID
+and provider repository IDs; hints appear only in local output and never cross
+the wire, affect the digest, or select authority.
 The daemon does run a subscriber-independent **read-only shadow observer** over
 policy-covered native nonterminal exact PR heads; inert `shadow_imported`
 history is never scheduled. Relevant webhooks debounce for two

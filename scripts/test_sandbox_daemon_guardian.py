@@ -587,6 +587,15 @@ class GuardianLifecycleTests(unittest.TestCase):
                 "preserved active worker ownership differs"
             )
         )
+        self.assertTrue(
+            guardian._is_reconcilable_worker_drift_failure(
+                "GuardianError: OwnerEnded: Actions owner ended before canary "
+                "completion; restore production: GuardianError: foreign process "
+                "entered the production writer domain: (9138,); restore production: "
+                "GuardianError: foreign process entered the production writer domain: "
+                "(9138,)"
+            )
+        )
         for failure in (
             None,
             "OwnerEnded: Actions owner ended before canary completion",
@@ -603,6 +612,14 @@ class GuardianLifecycleTests(unittest.TestCase):
             "restore production: GuardianError: preserved active worker ownership "
             "differs; restore production: GuardianError: preserved active worker "
             "ownership differs; unrelated cleanup failure",
+            "GuardianError: OwnerEnded: Actions owner ended before canary completion; "
+            "restore production: GuardianError: foreign process entered the production "
+            "writer domain: (9138,); restore production: GuardianError: foreign process "
+            "entered the production writer domain: (9140,)",
+            "GuardianError: OwnerEnded: Actions owner ended before canary completion; "
+            "restore production: GuardianError: foreign process entered the production "
+            "writer domain: (0,); restore production: GuardianError: foreign process "
+            "entered the production writer domain: (0,)",
         ):
             with self.subTest(failure=failure):
                 self.assertFalse(

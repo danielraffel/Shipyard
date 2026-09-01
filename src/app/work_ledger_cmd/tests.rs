@@ -323,3 +323,27 @@ fn receipt_reader_requires_private_regular_no_follow_file() {
     symlink(&receipt, &link).expect("symlink");
     assert!(read_private_file(&link).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn correlation_hints_are_private_bounded_and_client_only() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let temp = TempDir::new().expect("temp");
+    let hints = temp.path().join("hints.json");
+    std::fs::write(
+        &hints,
+        br#"{"linear_workspace_id":"ws_immutable","linear_root_uuid":"123e4567-e89b-12d3-a456-426614174000","provider_repository_id":"R_immutable"}"#,
+    )
+    .expect("write hints");
+    std::fs::set_permissions(&hints, std::fs::Permissions::from_mode(0o600)).expect("private");
+    let parsed = read_correlation_hints(&hints).expect("strict hints");
+    assert_eq!(parsed.linear_workspace_id, "ws_immutable");
+
+    std::fs::set_permissions(&hints, std::fs::Permissions::from_mode(0o644)).expect("public");
+    assert!(read_correlation_hints(&hints).is_err());
+    std::fs::set_permissions(&hints, std::fs::Permissions::from_mode(0o600)).expect("private");
+    let link = temp.path().join("hints-link.json");
+    symlink(&hints, &link).expect("symlink");
+    assert!(read_correlation_hints(&link).is_err());
+}

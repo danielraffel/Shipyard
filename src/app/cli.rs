@@ -35,6 +35,29 @@ pub(super) struct Cli {
     pub(super) command: Command,
 }
 
+#[cfg(test)]
+impl Cli {
+    /// Clap builds the complete, intentionally broad command graph while
+    /// parsing. Rust's default test-worker stack is smaller than the main
+    /// thread used by the real CLI, so exercise that same parser on a bounded
+    /// main-thread-sized stack instead of making every parser test depend on
+    /// `RUST_MIN_STACK` in its environment.
+    fn try_parse_from<I, T>(arguments: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .name("shipyard-cli-parser-test".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || <Self as Parser>::try_parse_from(arguments))
+            .expect("spawn CLI parser test thread")
+            .join()
+            .expect("CLI parser test thread")
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(super) enum Command {
     /// Internal one-shot Linux provider descendant supervisor.
@@ -582,6 +605,9 @@ pub(super) enum WorkLedgerCommand {
     Status,
     /// List a bounded immutable view of local work without taking writer custody.
     Inventory,
+    /// Query the exact protected custody host for one accepted message.
+    #[command(name = "custody-inventory")]
+    CustodyInventory(Box<CustodyInventoryArgs>),
     /// Show exact durable custody states; no state named "read" is inferred.
     #[command(name = "custody-status")]
     CustodyStatus,
@@ -652,6 +678,16 @@ pub(super) enum WorkLedgerCommand {
         #[command(subcommand)]
         command: WorkLedgerPolicyCommand,
     },
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CustodyInventoryArgs {
+    /// Exact durable custody message identity.
+    #[arg(long)]
+    pub(super) message: String,
+    /// Optional owner-only client-side correlation metadata; never sent remotely.
+    #[arg(long = "correlation-hints")]
+    pub(super) correlation_hints: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2364,8 +2400,6 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use clap::Parser;
-
     use super::{
         AuthCommand, Cli, Command, DependencyCommand, PulpDependencyCommand, QueueHoldCommand,
         RunnerCommand, WorkLedgerCommand, WorkLedgerPolicyCommand,
@@ -2767,6 +2801,7 @@ mod tests {
                 command: WorkLedgerCommand::CustodyStatus
             }
         ));
+        drop(status);
         let receive = Cli::try_parse_from(["shipyard", "work-ledger", "custody-receive"])
             .expect("custody SSH subsystem receiver");
         assert!(matches!(
@@ -2775,6 +2810,7 @@ mod tests {
                 command: WorkLedgerCommand::CustodyReceive
             }
         ));
+        drop(receive);
         assert!(
             Cli::try_parse_from([
                 "shipyard",
@@ -2782,6 +2818,42 @@ mod tests {
                 "custody-receive",
                 "--peer",
                 "machine_untrusted",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn work_ledger_custody_inventory_cli_is_exact_and_has_no_host_argument() {
+        let message = format!("wm_{}", "a".repeat(64));
+        let inventory = Cli::try_parse_from([
+            "shipyard",
+            "--json",
+            "work-ledger",
+            "custody-inventory",
+            "--message",
+            &message,
+            "--correlation-hints",
+            "/owner-only/private.json",
+        ])
+        .expect("custody inventory exact CLI");
+        assert!(matches!(
+            inventory.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::CustodyInventory(ref arguments)
+            } if arguments.message == message
+                && arguments.correlation_hints.as_deref()
+                    == Some(Path::new("/owner-only/private.json"))
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "work-ledger",
+                "custody-inventory",
+                "--message",
+                &message,
+                "--host",
+                "current-machine",
             ])
             .is_err()
         );
