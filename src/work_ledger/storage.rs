@@ -180,10 +180,14 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     if version == 10 {
         migrate_v10_to_v12(connection)?;
-        return Ok(());
+        version = 12;
     }
     if version == 11 {
         migrate_v11_to_v12(connection)?;
+        version = 12;
+    }
+    if version == 12 {
+        migrate_v12_to_v13(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
@@ -699,6 +703,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     install_custody_schema(&transaction)?;
     install_custody_successor_schema(&transaction)?;
     install_projection_intent_schema(&transaction)?;
+    install_ownership_lease_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -748,8 +753,12 @@ pub(super) fn verify_open_lineage(connection: &Connection, version: i64) -> Work
     if version == SCHEMA_VERSION {
         return verify_schema_identity(connection);
     }
-    if version == 8 || version == 9 || version == 10 || version == 11 {
-        return verify_schema_identity(connection);
+    if version == 8 || version == 9 || version == 10 || version == 11 || version == 12 {
+        verify_schema_identity(connection)?;
+        if version == 11 {
+            super::inventory::verify_legacy_inventory_schema(connection)?;
+        }
+        return Ok(());
     }
     if version == 7 {
         return Err(WorkLedgerError::Refused(
@@ -896,7 +905,7 @@ fn migrate_v9_to_v10(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     verify_open_lineage(&transaction, 9)?;
     validate_relational_integrity(&transaction)?;
-    install_custody_successor_schema(&transaction)?;
+    install_legacy_custody_successor_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", 10)?;
     verify_schema_identity(&transaction)?;
     validate_relational_integrity(&transaction)?;
@@ -915,7 +924,7 @@ fn migrate_v10_to_v12(connection: &mut Connection) -> WorkLedgerResult<()> {
     verify_open_lineage(&transaction, 10)?;
     validate_relational_integrity(&transaction)?;
     install_projection_intent_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.pragma_update(None, "user_version", 12)?;
     verify_schema_identity(&transaction)?;
     validate_relational_integrity(&transaction)?;
     transaction.commit()?;
@@ -932,6 +941,7 @@ fn migrate_v11_to_v12(connection: &mut Connection) -> WorkLedgerResult<()> {
         ));
     }
     verify_open_lineage(&transaction, 11)?;
+    super::inventory::verify_legacy_custody_migration_schema(&transaction)?;
     validate_relational_integrity(&transaction)?;
     transaction.execute_batch(
         "DROP TRIGGER workstream_projection_binding_no_delete;
@@ -966,8 +976,8 @@ fn migrate_v11_to_v12(connection: &mut Connection) -> WorkLedgerResult<()> {
             projection_revision, material_event_revision, repository_provider, repository_id,
             repository, exact_head, created_at)
          SELECT work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
-                projection_revision, material_event_revision, NULL, NULL, repository,
-                exact_head, created_at
+                projection_revision, material_event_revision, NULL, NULL,
+                repository, exact_head, created_at
            FROM workstream_projection_bindings_v11;
          DROP TABLE workstream_projection_bindings_v11;
          CREATE TRIGGER workstream_projection_binding_identity_immutable
@@ -1029,10 +1039,185 @@ fn migrate_v11_to_v12(connection: &mut Connection) -> WorkLedgerResult<()> {
          )
          BEGIN SELECT RAISE(ABORT, 'legacy and immutable repository bindings cannot overlap'); END;",
     )?;
+    transaction.pragma_update(None, "user_version", 12)?;
+    verify_schema_identity(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v12_to_v13(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 12 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the ownership lease migration fence".to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 12)?;
+    super::inventory::verify_legacy_custody_migration_schema(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+    rebuild_legacy_custody_successor_schema(&transaction)?;
+    install_ownership_lease_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     verify_schema_identity(&transaction)?;
     validate_relational_integrity(&transaction)?;
     transaction.commit()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // One auditable atomic Gate 0B.3 schema installation.
+fn install_ownership_lease_schema(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE ownership_roots (
+           root_uuid TEXT PRIMARY KEY
+             CHECK(length(root_uuid) = 36
+                   AND substr(root_uuid, 9, 1) = '-'
+                   AND substr(root_uuid, 14, 1) = '-'
+                   AND substr(root_uuid, 19, 1) = '-'
+                   AND substr(root_uuid, 24, 1) = '-'
+                   AND replace(root_uuid, '-', '') NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL UNIQUE REFERENCES work_items(id) ON DELETE RESTRICT,
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20)
+         );
+         INSERT INTO ownership_roots(root_uuid, work_item_id, created_at)
+         SELECT lower(substr(hex(randomblob(16)),1,8) || '-' ||
+                      substr(hex(randomblob(16)),1,4) || '-' ||
+                      substr(hex(randomblob(16)),1,4) || '-' ||
+                      substr(hex(randomblob(16)),1,4) || '-' ||
+                      substr(hex(randomblob(16)),1,12)), work_item_id, created_at
+           FROM workstream_projection_bindings;
+         CREATE TRIGGER workstream_projection_binding_mint_ownership_root
+         AFTER INSERT ON workstream_projection_bindings
+         BEGIN
+           INSERT INTO ownership_roots(root_uuid, work_item_id, created_at)
+           VALUES(lower(substr(hex(randomblob(16)),1,8) || '-' ||
+                        substr(hex(randomblob(16)),1,4) || '-' ||
+                        substr(hex(randomblob(16)),1,4) || '-' ||
+                        substr(hex(randomblob(16)),1,4) || '-' ||
+                        substr(hex(randomblob(16)),1,12)), NEW.work_item_id, NEW.created_at);
+         END;
+         CREATE TRIGGER ownership_root_identity_immutable BEFORE UPDATE ON ownership_roots
+         BEGIN SELECT RAISE(ABORT, 'ownership root identity is immutable'); END;
+         CREATE TRIGGER ownership_root_no_delete BEFORE DELETE ON ownership_roots
+         BEGIN SELECT RAISE(ABORT, 'ownership root cannot be deleted'); END;
+         CREATE TABLE ownership_holder_materials (
+           ownership_id TEXT NOT NULL
+             CHECK(length(ownership_id) = 67 AND substr(ownership_id, 1, 3) = 'ao_'
+                   AND substr(ownership_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           lease_generation INTEGER NOT NULL CHECK(lease_generation > 0),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           object_ref TEXT NOT NULL UNIQUE REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           PRIMARY KEY (ownership_id, lease_generation)
+         );
+         CREATE TRIGGER ownership_holder_material_immutable BEFORE UPDATE ON ownership_holder_materials
+         BEGIN SELECT RAISE(ABORT, 'ownership holder material is immutable'); END;
+         CREATE TRIGGER ownership_holder_material_no_delete BEFORE DELETE ON ownership_holder_materials
+         BEGIN SELECT RAISE(ABORT, 'ownership holder material cannot be deleted'); END;
+         CREATE TABLE ownership_lease_bootstrap_eligibility (
+           ownership_id TEXT PRIMARY KEY REFERENCES agent_ownership(ownership_id) ON DELETE RESTRICT,
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20)
+         );
+         INSERT INTO ownership_lease_bootstrap_eligibility(ownership_id, created_at)
+         SELECT ownership_id, updated_at FROM agent_ownership WHERE state = 'acknowledged';
+         CREATE TRIGGER ownership_lease_bootstrap_eligibility_immutable
+         BEFORE UPDATE ON ownership_lease_bootstrap_eligibility
+         BEGIN SELECT RAISE(ABORT, 'ownership lease bootstrap eligibility is immutable'); END;
+         CREATE TRIGGER ownership_lease_bootstrap_eligibility_no_delete
+         BEFORE DELETE ON ownership_lease_bootstrap_eligibility
+         BEGIN SELECT RAISE(ABORT, 'ownership lease bootstrap eligibility cannot be deleted'); END;
+         CREATE TRIGGER ownership_lease_bootstrap_eligibility_no_insert
+         BEFORE INSERT ON ownership_lease_bootstrap_eligibility
+         BEGIN SELECT RAISE(ABORT, 'ownership lease bootstrap eligibility is migration-only'); END;
+         CREATE TABLE ownership_leases (
+           lease_id TEXT PRIMARY KEY
+             CHECK(length(lease_id) = 67 AND substr(lease_id, 1, 3) = 'ol_'
+                   AND substr(lease_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           ownership_id TEXT NOT NULL REFERENCES agent_ownership(ownership_id) ON DELETE RESTRICT,
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           work_generation INTEGER NOT NULL CHECK(work_generation > 0),
+           owner_generation INTEGER NOT NULL CHECK(owner_generation > 0),
+           lease_generation INTEGER NOT NULL CHECK(lease_generation > 0),
+           holder_ref TEXT NOT NULL CHECK(length(holder_ref) BETWEEN 65 AND 128),
+           holder_incarnation_ref TEXT NOT NULL CHECK(length(holder_incarnation_ref) BETWEEN 65 AND 128),
+           holder_credential_digest TEXT NOT NULL
+             CHECK(length(holder_credential_digest) = 64
+                   AND holder_credential_digest NOT GLOB '*[^0-9a-f]*'),
+           repository_provider TEXT NOT NULL CHECK(length(repository_provider) BETWEEN 3 AND 64),
+           repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 512),
+           repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
+           pull_request INTEGER NOT NULL CHECK(pull_request > 0),
+           exact_head TEXT NOT NULL
+             CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
+           workstream_handle TEXT NOT NULL
+             CHECK(length(workstream_handle) BETWEEN 5 AND 128
+                   AND substr(workstream_handle, 1, 4) = 'GEN-'),
+           root_uuid TEXT NOT NULL REFERENCES ownership_roots(root_uuid) ON DELETE RESTRICT,
+           state TEXT NOT NULL CHECK(state IN ('active', 'released', 'superseded')),
+           predecessor_lease_id TEXT REFERENCES ownership_leases(lease_id) ON DELETE RESTRICT,
+           transition_kind TEXT NOT NULL
+             CHECK(transition_kind IN ('established', 'renewed', 'expired', 'released')),
+           proof_digest TEXT NOT NULL
+             CHECK(length(proof_digest) = 64 AND proof_digest NOT GLOB '*[^0-9a-f]*'),
+           release_digest TEXT
+             CHECK(release_digest IS NULL OR
+                   (length(release_digest) = 64 AND release_digest NOT GLOB '*[^0-9a-f]*')),
+           acquired_at TEXT NOT NULL CHECK(length(acquired_at) >= 20),
+           expires_at TEXT NOT NULL CHECK(length(expires_at) >= 20),
+           updated_at TEXT NOT NULL CHECK(length(updated_at) >= 20),
+           UNIQUE(ownership_id, lease_generation),
+           CHECK(expires_at > acquired_at),
+           CHECK(updated_at >= acquired_at),
+           CHECK((state = 'released') = (release_digest IS NOT NULL)),
+           CHECK((lease_generation = 1 AND predecessor_lease_id IS NULL
+                  AND transition_kind = 'established')
+              OR (lease_generation > 1 AND predecessor_lease_id IS NOT NULL
+                  AND transition_kind IN ('renewed', 'expired', 'released')))
+         );
+         CREATE UNIQUE INDEX ownership_leases_one_active
+           ON ownership_leases(ownership_id) WHERE state = 'active';
+         CREATE INDEX ownership_leases_fence
+           ON ownership_leases(repository_provider, repository_id, pull_request, exact_head,
+                               workstream_handle, root_uuid, state);
+         CREATE UNIQUE INDEX ownership_leases_one_successor
+           ON ownership_leases(predecessor_lease_id)
+           WHERE predecessor_lease_id IS NOT NULL;
+         CREATE TRIGGER ownership_lease_identity_immutable
+         BEFORE UPDATE OF lease_id, ownership_id, work_item_id, work_generation,
+                          owner_generation, lease_generation, holder_ref,
+                          holder_incarnation_ref, holder_credential_digest,
+                          repository_provider, repository_id,
+                          repository, pull_request, exact_head, workstream_handle,
+                          root_uuid, predecessor_lease_id, transition_kind,
+                          proof_digest, acquired_at, expires_at
+         ON ownership_leases
+         BEGIN SELECT RAISE(ABORT, 'ownership lease identity is immutable'); END;
+         CREATE TRIGGER ownership_lease_state_fence
+         BEFORE UPDATE OF state, release_digest, updated_at ON ownership_leases
+         WHEN (OLD.state != 'active'
+               AND (NEW.state != OLD.state OR NEW.release_digest IS NOT OLD.release_digest))
+           OR (OLD.state = 'active' AND NEW.state NOT IN ('released', 'superseded'))
+           OR (NEW.state = 'released' AND NEW.release_digest IS NULL)
+           OR (NEW.state = 'superseded' AND NEW.release_digest IS NOT NULL)
+         BEGIN SELECT RAISE(ABORT, 'ownership lease transition is invalid'); END;
+         CREATE TRIGGER ownership_lease_no_delete
+         BEFORE DELETE ON ownership_leases
+         BEGIN SELECT RAISE(ABORT, 'ownership leases cannot be deleted'); END;
+         DROP TRIGGER agent_ownership_identity_immutable;
+         CREATE TRIGGER agent_ownership_identity_immutable
+         BEFORE UPDATE OF ownership_id, work_item_id, work_generation,
+                          delivery_id, launch_profile_object_ref, created_at ON agent_ownership
+         BEGIN SELECT RAISE(ABORT, 'agent ownership identity is immutable'); END;
+         CREATE TRIGGER agent_ownership_generation_advance_fence
+         BEFORE UPDATE OF owner_generation ON agent_ownership
+         WHEN NEW.owner_generation != OLD.owner_generation + 1 OR NOT EXISTS (
+           SELECT 1 FROM ownership_leases lease
+            WHERE lease.ownership_id = OLD.ownership_id
+              AND lease.state = 'active'
+              AND lease.owner_generation = NEW.owner_generation
+         )
+         BEGIN SELECT RAISE(ABORT, 'agent ownership generation advance is unauthorized'); END;",
+    )?;
     Ok(())
 }
 
@@ -1174,10 +1359,185 @@ fn install_projection_intent_schema(
     Ok(())
 }
 
+fn rebuild_legacy_custody_successor_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> WorkLedgerResult<()> {
+    let legacy_rebinds: i64 = transaction.query_row(
+        "SELECT count(*) FROM custody_successor_rebinds",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy_rebinds != 0 {
+        return Err(WorkLedgerError::Refused(
+            "schema v12 has active legacy successor authority; complete it before v13 migration"
+                .to_owned(),
+        ));
+    }
+    transaction.execute_batch(
+        "DROP INDEX custody_successor_message;
+         DROP TRIGGER custody_successor_identity_immutable;
+         DROP TRIGGER custody_successor_receipt_immutable;
+         DROP TRIGGER custody_successor_no_delete;
+         DROP TRIGGER custody_processed_ack_immutable;
+         DROP TRIGGER custody_processed_ack_no_delete;
+         ALTER TABLE custody_successor_rebinds RENAME TO custody_successor_rebinds_v12;
+         ALTER TABLE custody_processed_acknowledgements
+           RENAME TO custody_processed_acknowledgements_v12;",
+    )?;
+    install_custody_successor_schema(transaction)?;
+    transaction.execute_batch(
+        "INSERT INTO custody_processed_acknowledgements
+           (receipt_digest, message_id, source_machine_ref, created_at)
+         SELECT receipt_digest, message_id, source_machine_ref, created_at
+           FROM custody_processed_acknowledgements_v12;
+         DROP TABLE custody_successor_rebinds_v12;
+         DROP TABLE custody_processed_acknowledgements_v12;",
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Keep the complete successor state/history DDL auditable together.
 fn install_custody_successor_schema(
     transaction: &rusqlite::Transaction<'_>,
 ) -> WorkLedgerResult<()> {
     transaction.execute_batch(
+        "CREATE TABLE custody_successor_rebinds (
+           rebind_id TEXT NOT NULL,
+           message_id TEXT NOT NULL,
+           side TEXT NOT NULL CHECK(side IN ('sender', 'receiver')),
+           rebind_json BLOB NOT NULL,
+           rebind_digest TEXT NOT NULL
+             CHECK(length(rebind_digest) = 64 AND rebind_digest NOT GLOB '*[^0-9a-f]*'),
+           authority_epoch INTEGER NOT NULL CHECK(authority_epoch > 0),
+           state TEXT NOT NULL CHECK(state IN ('prepared', 'committed', 'acknowledged', 'finalized', 'aborted')),
+           receipt_json BLOB,
+           receipt_digest TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           PRIMARY KEY(rebind_id, side),
+           UNIQUE(message_id, side, rebind_digest),
+           CHECK((receipt_json IS NULL AND receipt_digest IS NULL) OR
+                 (receipt_json IS NOT NULL AND length(receipt_digest) = 64 AND
+                  receipt_digest NOT GLOB '*[^0-9a-f]*')),
+           CHECK((side = 'sender' AND state IN ('prepared', 'acknowledged', 'finalized', 'aborted'))
+              OR (side = 'receiver' AND state IN ('prepared', 'committed', 'aborted'))),
+           CHECK((side = 'sender' AND state IN ('prepared', 'aborted')
+                  AND receipt_json IS NULL AND receipt_digest IS NULL)
+              OR (side = 'sender' AND state IN ('acknowledged', 'finalized')
+                  AND receipt_json IS NOT NULL AND receipt_digest IS NOT NULL)
+              OR (side = 'receiver' AND receipt_json IS NOT NULL AND receipt_digest IS NOT NULL))
+         );
+         CREATE INDEX custody_successor_message
+           ON custody_successor_rebinds(message_id, side, state, updated_at);
+         CREATE UNIQUE INDEX custody_successor_active_epoch
+           ON custody_successor_rebinds(message_id, side, authority_epoch)
+           WHERE state != 'aborted';
+         CREATE TRIGGER custody_successor_initial_state_fence
+         BEFORE INSERT ON custody_successor_rebinds
+         WHEN NEW.state != 'prepared'
+         BEGIN SELECT RAISE(ABORT, 'custody successor must be inserted prepared'); END;
+         CREATE TRIGGER custody_successor_identity_immutable
+         BEFORE UPDATE OF message_id, side, rebind_json, rebind_digest, authority_epoch
+         ON custody_successor_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody successor identity is immutable'); END;
+         CREATE TRIGGER custody_successor_receipt_immutable
+         BEFORE UPDATE OF receipt_json, receipt_digest ON custody_successor_rebinds
+         WHEN OLD.receipt_digest IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'custody successor receipt is immutable'); END;
+         CREATE TRIGGER custody_successor_no_delete
+         BEFORE DELETE ON custody_successor_rebinds
+         BEGIN SELECT RAISE(ABORT, 'custody successor rebinds cannot be deleted'); END;
+         CREATE TRIGGER custody_successor_state_transition_fence
+         BEFORE UPDATE OF state ON custody_successor_rebinds
+         WHEN NOT ((OLD.side = 'sender' AND OLD.state = 'prepared'
+                    AND NEW.state IN ('acknowledged', 'aborted'))
+                OR (OLD.side = 'sender' AND OLD.state = 'acknowledged'
+                    AND NEW.state = 'finalized')
+                OR (OLD.side = 'receiver' AND OLD.state = 'prepared'
+                    AND NEW.state IN ('committed', 'aborted')))
+         BEGIN SELECT RAISE(ABORT, 'custody successor state transition is invalid'); END;
+         CREATE TABLE custody_successor_events (
+           rebind_id TEXT NOT NULL,
+           side TEXT NOT NULL CHECK(side IN ('sender', 'receiver')),
+           sequence INTEGER NOT NULL CHECK(sequence > 0),
+           from_state TEXT,
+           to_state TEXT NOT NULL CHECK(to_state IN ('prepared', 'committed', 'acknowledged', 'finalized', 'aborted')),
+           evidence_digest TEXT NOT NULL
+             CHECK(length(evidence_digest) = 64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           PRIMARY KEY(rebind_id, side, sequence)
+         );
+         CREATE TRIGGER custody_successor_event_immutable BEFORE UPDATE ON custody_successor_events
+         BEGIN SELECT RAISE(ABORT, 'custody successor events are immutable'); END;
+         CREATE TRIGGER custody_successor_event_no_delete BEFORE DELETE ON custody_successor_events
+         BEGIN SELECT RAISE(ABORT, 'custody successor events cannot be deleted'); END;
+         CREATE TRIGGER custody_successor_event_insert_fence
+         BEFORE INSERT ON custody_successor_events
+         WHEN NOT EXISTS (
+           SELECT 1 FROM custody_successor_rebinds rebind
+            WHERE rebind.rebind_id = NEW.rebind_id AND rebind.side = NEW.side
+              AND rebind.state = NEW.to_state
+              AND coalesce(rebind.receipt_digest, rebind.rebind_digest) = NEW.evidence_digest
+              AND NEW.sequence = coalesce((
+                    SELECT max(previous.sequence) + 1 FROM custody_successor_events previous
+                     WHERE previous.rebind_id = NEW.rebind_id AND previous.side = NEW.side
+                  ), 1)
+              AND ((NEW.sequence = 1 AND NEW.from_state IS NULL
+                    AND NEW.to_state = 'prepared')
+                OR (NEW.sequence > 1 AND EXISTS (
+                      SELECT 1 FROM custody_successor_events previous
+                       WHERE previous.rebind_id = NEW.rebind_id AND previous.side = NEW.side
+                         AND previous.sequence = NEW.sequence - 1
+                         AND previous.to_state = NEW.from_state
+                         AND ((NEW.side = 'sender' AND NEW.from_state = 'prepared'
+                               AND NEW.to_state IN ('acknowledged', 'aborted'))
+                           OR (NEW.side = 'sender' AND NEW.from_state = 'acknowledged'
+                               AND NEW.to_state = 'finalized')
+                           OR (NEW.side = 'receiver' AND NEW.from_state = 'prepared'
+                               AND NEW.to_state IN ('committed', 'aborted')))
+                    )))
+         )
+         BEGIN SELECT RAISE(ABORT, 'custody successor event is not an exact state transition'); END;
+         CREATE TRIGGER custody_successor_insert_history
+         AFTER INSERT ON custody_successor_rebinds
+         BEGIN
+           INSERT INTO custody_successor_events
+             (rebind_id, side, sequence, from_state, to_state, evidence_digest, created_at)
+           VALUES(NEW.rebind_id, NEW.side, 1, NULL, NEW.state,
+                  coalesce(NEW.receipt_digest, NEW.rebind_digest), NEW.created_at);
+         END;
+         CREATE TRIGGER custody_successor_transition_history
+         AFTER UPDATE OF state ON custody_successor_rebinds
+         WHEN NEW.state != OLD.state
+         BEGIN
+           INSERT INTO custody_successor_events
+             (rebind_id, side, sequence, from_state, to_state, evidence_digest, created_at)
+           VALUES(NEW.rebind_id, NEW.side,
+                  (SELECT coalesce(max(sequence), 0) + 1 FROM custody_successor_events
+                    WHERE rebind_id = NEW.rebind_id AND side = NEW.side),
+                  OLD.state, NEW.state, coalesce(NEW.receipt_digest, NEW.rebind_digest), NEW.updated_at);
+         END;
+         CREATE TABLE custody_processed_acknowledgements (
+           receipt_digest TEXT PRIMARY KEY
+             CHECK(length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'),
+           message_id TEXT NOT NULL REFERENCES custody_inbox(message_id) ON DELETE RESTRICT,
+           source_machine_ref TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           UNIQUE(message_id)
+         );
+         CREATE TRIGGER custody_processed_ack_immutable
+         BEFORE UPDATE ON custody_processed_acknowledgements
+         BEGIN SELECT RAISE(ABORT, 'custody processed acknowledgements are immutable'); END;
+         CREATE TRIGGER custody_processed_ack_no_delete
+         BEFORE DELETE ON custody_processed_acknowledgements
+         BEGIN SELECT RAISE(ABORT, 'custody processed acknowledgements cannot be deleted'); END;",
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // This is the exact immutable schema installed by v9 -> v10.
+fn install_legacy_custody_successor_schema(connection: &Connection) -> WorkLedgerResult<()> {
+    connection.execute_batch(
         "CREATE TABLE custody_successor_rebinds (
            rebind_id TEXT NOT NULL,
            message_id TEXT NOT NULL,
@@ -1225,6 +1585,118 @@ fn install_custody_successor_schema(
          CREATE TRIGGER custody_processed_ack_no_delete
          BEFORE DELETE ON custody_processed_acknowledgements
          BEGIN SELECT RAISE(ABORT, 'custody processed acknowledgements cannot be deleted'); END;",
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_lines)] // Exact historical v12 DDL is intentionally reconstructed intact.
+pub(super) fn reconstruct_authentic_v12_schema_for_test(
+    connection: &Connection,
+) -> WorkLedgerResult<()> {
+    connection.execute_batch(
+        "DROP TRIGGER workstream_projection_binding_mint_ownership_root;
+         DROP TRIGGER agent_ownership_generation_advance_fence;
+         DROP TABLE ownership_leases;
+         DROP TRIGGER ownership_lease_bootstrap_eligibility_no_insert;
+         DROP TRIGGER ownership_lease_bootstrap_eligibility_no_delete;
+         DROP TRIGGER ownership_lease_bootstrap_eligibility_immutable;
+         DROP TABLE ownership_lease_bootstrap_eligibility;
+         DROP TABLE ownership_holder_materials;
+         DROP TABLE ownership_roots;
+         DROP TRIGGER custody_successor_transition_history;
+         DROP TRIGGER custody_successor_insert_history;
+         DROP TRIGGER custody_successor_event_no_delete;
+         DROP TRIGGER custody_successor_event_immutable;
+         DROP TABLE custody_successor_events;
+         DROP TRIGGER custody_successor_state_transition_fence;
+         DROP TRIGGER custody_successor_no_delete;
+         DROP TRIGGER custody_successor_receipt_immutable;
+         DROP TRIGGER custody_successor_identity_immutable;
+         DROP INDEX custody_successor_active_epoch;
+         DROP INDEX custody_successor_message;
+         DROP TABLE custody_successor_rebinds;
+         DROP TRIGGER custody_processed_ack_no_delete;
+         DROP TRIGGER custody_processed_ack_immutable;
+         DROP TABLE custody_processed_acknowledgements;",
+    )?;
+    install_legacy_custody_successor_schema(connection)?;
+    connection.pragma_update(None, "user_version", 12)?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_lines)] // Exact deployed v11 table and trigger bytes are the migration oracle.
+pub(super) fn reconstruct_authentic_v11_schema_for_test(
+    connection: &Connection,
+) -> WorkLedgerResult<()> {
+    reconstruct_authentic_v12_schema_for_test(connection)?;
+    connection.execute_batch(
+        "DROP TRIGGER workstream_projection_binding_no_second_insert;
+         DROP TRIGGER workstream_projection_binding_no_delete;
+         DROP TRIGGER workstream_projection_binding_repository_identity_enrichment;
+         DROP TRIGGER workstream_projection_binding_repository_coordinate_update;
+         DROP TRIGGER workstream_projection_binding_exact_head_transition;
+         DROP TRIGGER workstream_projection_binding_identity_immutable;
+         ALTER TABLE workstream_projection_bindings RENAME TO workstream_projection_bindings_v12;
+         CREATE TABLE workstream_projection_bindings (
+           work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT,
+           workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
+           plan_sha256 TEXT NOT NULL
+             CHECK(length(plan_sha256) = 64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+           root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
+           issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
+           projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
+           material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
+           repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
+           exact_head TEXT NOT NULL
+             CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           UNIQUE(workstream_handle, repository, exact_head)
+         );
+         INSERT INTO workstream_projection_bindings
+           (work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
+            projection_revision, material_event_revision, repository, exact_head, created_at)
+         SELECT work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
+                projection_revision, material_event_revision, repository, exact_head, created_at
+           FROM workstream_projection_bindings_v12;
+         DROP TABLE workstream_projection_bindings_v12;
+         CREATE TRIGGER workstream_projection_binding_identity_immutable
+         BEFORE UPDATE OF work_item_id, workstream_handle, plan_sha256, root_revision,
+                          issue_revision, projection_revision, material_event_revision,
+                          repository, created_at
+         ON workstream_projection_bindings
+         BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
+         CREATE TRIGGER workstream_projection_binding_no_delete
+         BEFORE DELETE ON workstream_projection_bindings
+         BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
+         DROP TRIGGER agent_ownership_identity_immutable;
+         CREATE TRIGGER agent_ownership_identity_immutable
+         BEFORE UPDATE OF ownership_id, work_item_id, work_generation, owner_generation,
+                          delivery_id, launch_profile_object_ref, created_at ON agent_ownership
+         BEGIN SELECT RAISE(ABORT, 'agent ownership identity is immutable'); END;
+         PRAGMA user_version = 11;",
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn reconstruct_authentic_v10_schema_for_test(
+    connection: &Connection,
+) -> WorkLedgerResult<()> {
+    reconstruct_authentic_v12_schema_for_test(connection)?;
+    connection.execute_batch(
+        "DROP TRIGGER workstream_projection_binding_no_second_insert;
+         DROP TRIGGER workstream_projection_binding_no_delete;
+         DROP TRIGGER workstream_projection_binding_repository_identity_enrichment;
+         DROP TRIGGER workstream_projection_binding_repository_coordinate_update;
+         DROP TRIGGER workstream_projection_binding_exact_head_transition;
+         DROP TRIGGER workstream_projection_binding_identity_immutable;
+         DROP TABLE workstream_projection_bindings;
+         DROP TRIGGER projection_intent_no_delete;
+         DROP TRIGGER projection_intent_identity_immutable;
+         DROP TABLE projection_intents;
+         PRAGMA user_version = 10;",
     )?;
     Ok(())
 }
@@ -2049,6 +2521,9 @@ fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()
     if schema_version(connection)? >= 11 {
         validate_persisted_workstream_handles(connection)?;
     }
+    if schema_version(connection)? >= 13 {
+        super::ownership_lease::validate_persisted_ownership_leases(connection)?;
+    }
     if schema_version(connection)? >= 9 {
         super::durable_custody::validate_persisted_custody(connection)?;
     }
@@ -2132,7 +2607,16 @@ fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()
             "provider delivery is not bound to its exact work and request".to_owned(),
         ));
     }
-    let invalid_ownership: i64 = connection.query_row(
+    let ownership_generation_binding = if schema_version(connection)? >= 13 {
+        "(wake.owner_generation != ownership.owner_generation AND NOT EXISTS (
+            SELECT 1 FROM ownership_leases lease
+             WHERE lease.ownership_id = ownership.ownership_id
+               AND lease.owner_generation = ownership.owner_generation
+         ))"
+    } else {
+        "wake.owner_generation != ownership.owner_generation"
+    };
+    let invalid_ownership_sql = format!(
         "SELECT COUNT(*)
            FROM agent_ownership ownership
            JOIN provider_deliveries delivery
@@ -2149,14 +2633,14 @@ fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()
              OR profile.content_digest != wake.payload_digest
              OR wake.work_item_id != ownership.work_item_id
              OR wake.work_generation != ownership.work_generation
-             OR wake.owner_generation != ownership.owner_generation
+             OR {ownership_generation_binding}
              OR (ownership.state IN ('acknowledged', 'returned')
                  AND (context_receipt.kind != 'agent_receipt'
                       OR context_receipt.work_item_id != ownership.work_item_id
-                      OR context_receipt.content_digest != ownership.context_receipt_digest))",
-        [],
-        |row| row.get(0),
-    )?;
+                      OR context_receipt.content_digest != ownership.context_receipt_digest))"
+    );
+    let invalid_ownership: i64 =
+        connection.query_row(&invalid_ownership_sql, [], |row| row.get(0))?;
     if invalid_ownership != 0 {
         return Err(WorkLedgerError::Refused(
             "agent ownership is not bound to a delivered launch profile".to_owned(),

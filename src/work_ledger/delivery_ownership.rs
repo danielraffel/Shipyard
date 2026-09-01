@@ -320,6 +320,51 @@ impl WorkLedger {
         wake_id: &str,
         receipt_bytes: &[u8],
     ) -> WorkLedgerResult<AgentOwnershipReceipt> {
+        self.acknowledge_agent_context_internal(wake_id, receipt_bytes, None)
+    }
+
+    pub(crate) fn acknowledge_agent_context_with_lease(
+        &self,
+        wake_id: &str,
+        receipt_bytes: &[u8],
+    ) -> WorkLedgerResult<(AgentOwnershipReceipt, Vec<u8>)> {
+        let authority = self.delivered_authority(wake_id)?;
+        let (_, request_bytes) = self.open_protected_object(&authority.request_object_ref)?;
+        let request: StoredProviderRequest =
+            serde_json::from_slice(&request_bytes).map_err(|_| {
+                WorkLedgerError::Refused("provider request authority is malformed".to_owned())
+            })?;
+        if request.schema_version != 2 {
+            return Err(WorkLedgerError::Refused(
+                "provider request authority has an unsupported schema".to_owned(),
+            ));
+        }
+        let receipt: AgentContextReceipt = serde_json::from_slice(receipt_bytes).map_err(|_| {
+            WorkLedgerError::Refused("agent context receipt is malformed".to_owned())
+        })?;
+        validate_context_receipt(&authority, &request.resume, &receipt)?;
+        let receipt_digest = digest(receipt_bytes);
+        let ownership_id = opaque_ref(
+            "ao",
+            &format!(
+                "shipyard-agent-ownership-v1\n{}\n{}\n{}",
+                authority.delivery_id, authority.work_generation, receipt_digest
+            ),
+        );
+        let (_object_ref, material_bytes, holder) =
+            self.ownership_holder_material(&authority.work_item_id, &ownership_id, 1)?;
+        let ownership =
+            self.acknowledge_agent_context_internal(wake_id, receipt_bytes, Some(&holder))?;
+        Ok((ownership, material_bytes))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn acknowledge_agent_context_internal(
+        &self,
+        wake_id: &str,
+        receipt_bytes: &[u8],
+        lease_holder: Option<&super::OwnershipLeaseHolder>,
+    ) -> WorkLedgerResult<AgentOwnershipReceipt> {
         let authority = self.delivered_authority(wake_id)?;
         let (_, request_bytes) = self.open_protected_object(&authority.request_object_ref)?;
         let request: StoredProviderRequest =
@@ -365,6 +410,13 @@ impl WorkLedger {
             .optional()?;
         if let Some(existing) = existing {
             if existing.0 == ownership_id && existing.2 == receipt_digest {
+                if let Some(holder) = lease_holder {
+                    super::ownership_lease::require_exact_holder_lease(
+                        &transaction,
+                        &ownership_id,
+                        holder,
+                    )?;
+                }
                 return Ok(AgentOwnershipReceipt {
                     ownership_id,
                     receipt_object_ref: existing.1,
@@ -405,6 +457,13 @@ impl WorkLedger {
                     receipt_digest.clone(),
                 )
             {
+                if let Some(holder) = lease_holder {
+                    super::ownership_lease::require_exact_holder_lease(
+                        &transaction,
+                        &ownership_id,
+                        holder,
+                    )?;
+                }
                 return Ok(AgentOwnershipReceipt {
                     ownership_id,
                     receipt_object_ref: receipt_object.object_ref,
@@ -493,6 +552,20 @@ impl WorkLedger {
                 &now,
             )?;
         }
+        if let Some(holder) = lease_holder {
+            let fence = super::ownership_lease::ownership_lease_fence_from_connection(
+                &transaction,
+                &ownership_id,
+            )?;
+            let lease_now = Utc::now();
+            super::ownership_lease::establish_ownership_lease_in_transaction(
+                &transaction,
+                &fence,
+                holder,
+                lease_now + chrono::Duration::minutes(5),
+                lease_now,
+            )?;
+        }
         transaction.commit()?;
         Ok(AgentOwnershipReceipt {
             ownership_id,
@@ -509,6 +582,47 @@ impl WorkLedger {
         expected_work_generation: u64,
         expected: &AgentReturnExpectation,
         receipt_bytes: &[u8],
+    ) -> WorkLedgerResult<AgentOwnershipReceipt> {
+        self.return_agent_ownership_internal(
+            ownership_id,
+            expected_delivery_id,
+            expected_work_generation,
+            expected,
+            receipt_bytes,
+            None,
+        )
+    }
+
+    pub(crate) fn return_agent_ownership_with_holder(
+        &self,
+        ownership_id: &str,
+        expected_delivery_id: &str,
+        expected_work_generation: u64,
+        expected: &AgentReturnExpectation,
+        receipt_bytes: &[u8],
+        holder_bytes: &[u8],
+    ) -> WorkLedgerResult<AgentOwnershipReceipt> {
+        let (generation, holder) =
+            super::ownership_lease::holder_from_material(holder_bytes, ownership_id)?;
+        self.return_agent_ownership_internal(
+            ownership_id,
+            expected_delivery_id,
+            expected_work_generation,
+            expected,
+            receipt_bytes,
+            Some((generation, &holder)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn return_agent_ownership_internal(
+        &self,
+        ownership_id: &str,
+        expected_delivery_id: &str,
+        expected_work_generation: u64,
+        expected: &AgentReturnExpectation,
+        receipt_bytes: &[u8],
+        lease_holder: Option<(u64, &super::OwnershipLeaseHolder)>,
     ) -> WorkLedgerResult<AgentOwnershipReceipt> {
         validate_return_expectation(expected)?;
         let receipt: AgentReturnReceipt = serde_json::from_slice(receipt_bytes).map_err(|_| {
@@ -662,6 +776,11 @@ impl WorkLedger {
                 "agent ownership changed before return".to_owned(),
             ));
         }
+        if let Some((_generation, holder)) = lease_holder {
+            super::ownership_lease::require_exact_holder_lease(&transaction, ownership_id, holder)?;
+        } else {
+            super::ownership_lease::require_no_active_ownership_lease(&transaction, ownership_id)?;
+        }
         transaction.commit()?;
         let receipt_object = self.put_protected_object_with_writer_domain(
             &authority.0,
@@ -720,6 +839,21 @@ impl WorkLedger {
             return Err(WorkLedgerError::Refused(
                 "agent ownership changed before return".to_owned(),
             ));
+        }
+        if let Some((generation, holder)) = lease_holder {
+            let fence = super::ownership_lease::ownership_lease_fence_from_connection(
+                &transaction,
+                ownership_id,
+            )?;
+            super::ownership_lease::release_ownership_lease_in_transaction(
+                &transaction,
+                &fence,
+                holder,
+                generation,
+                Utc::now(),
+            )?;
+        } else {
+            super::ownership_lease::require_no_active_ownership_lease(&transaction, ownership_id)?;
         }
         let now = Utc::now().to_rfc3339();
         let ownership_changed = transaction.execute(

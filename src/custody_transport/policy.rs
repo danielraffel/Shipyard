@@ -46,7 +46,8 @@ struct RawPeer {
     port: u16,
     remote_subsystem: String,
     ssh_auth_key_sha256: String,
-    successor_proof_digest: String,
+    #[serde(default)]
+    successor_proof_digest: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,7 +94,6 @@ pub(super) struct CustodyPeer {
     pub(super) port: u16,
     pub(super) remote_subsystem: String,
     pub(super) ssh_auth_key_sha256: String,
-    pub(super) successor_proof_digest: String,
 }
 
 struct LocalCustodyPolicy {
@@ -150,7 +150,9 @@ pub(crate) fn load_custody_transport_policy(
         validate_opaque(&peer.incarnation_ref, "incarnation")?;
         validate_opaque(&peer.route_ref, "route")?;
         validate_digest(&peer.ssh_auth_key_sha256)?;
-        validate_digest(&peer.successor_proof_digest)?;
+        if let Some(legacy_successor_proof_digest) = &peer.successor_proof_digest {
+            validate_digest(legacy_successor_proof_digest)?;
+        }
         let ssh_program = absolute_path(&peer.ssh_program)?;
         let known_hosts_file = absolute_path(&peer.known_hosts_file)?;
         let identity_file = absolute_path(&peer.identity_file)?;
@@ -180,7 +182,6 @@ pub(crate) fn load_custody_transport_policy(
                     port: peer.port,
                     remote_subsystem: peer.remote_subsystem,
                     ssh_auth_key_sha256: peer.ssh_auth_key_sha256,
-                    successor_proof_digest: peer.successor_proof_digest,
                 },
             )
             .is_some()

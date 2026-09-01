@@ -589,7 +589,7 @@ pub(super) enum Command {
     WorkLedger {
         /// Work-ledger subcommand.
         #[command(subcommand)]
-        command: WorkLedgerCommand,
+        command: Box<WorkLedgerCommand>,
     },
     /// Self-hosted runner watchdog: detect and recover stuck runner state.
     Runner {
@@ -651,6 +651,9 @@ pub(super) enum WorkLedgerCommand {
         /// Bounded private receipt file, or `-` for strict stdin.
         #[arg(long)]
         receipt: PathBuf,
+        /// New owner-only file receiving daemon-minted holder material.
+        #[arg(long = "holder-output")]
+        holder_output: PathBuf,
     },
     /// Inspect the exact redacted checkpoint floor for acknowledged ownership.
     #[command(name = "return-challenge")]
@@ -671,12 +674,20 @@ pub(super) enum WorkLedgerCommand {
         /// Independently produced return receipt file, or `-` for strict stdin.
         #[arg(long)]
         receipt: PathBuf,
+        /// Owner-only holder material file, or `-` for strict stdin.
+        #[arg(long)]
+        holder: PathBuf,
+    },
+    /// Mutate ownership leases through protected holder material.
+    Ownership {
+        #[command(subcommand)]
+        command: Box<OwnershipLeaseCommand>,
     },
     /// Inspect or revise repository lane policy in the shadow ledger.
     Policy {
         /// Policy subcommand.
         #[command(subcommand)]
-        command: WorkLedgerPolicyCommand,
+        command: Box<WorkLedgerPolicyCommand>,
     },
 }
 
@@ -688,6 +699,46 @@ pub(super) struct CustodyInventoryArgs {
     /// Optional owner-only client-side correlation metadata; never sent remotely.
     #[arg(long = "correlation-hints")]
     pub(super) correlation_hints: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum OwnershipLeaseCommand {
+    /// Bootstrap a protected holder for an acknowledged pre-v13 ownership.
+    Bootstrap {
+        #[command(flatten)]
+        request: OwnershipBootstrapArgs,
+    },
+    /// Renew the exact active ownership lease using protected holder material.
+    Renew {
+        #[command(flatten)]
+        request: OwnershipRenewArgs,
+    },
+    /// Explicitly release an active lease while ownership remains adoptable.
+    Release {
+        #[command(flatten)]
+        request: OwnershipReleaseArgs,
+    },
+    /// Atomically adopt an expired/released lease and mint successor material.
+    Adopt {
+        #[command(flatten)]
+        request: OwnershipAdoptArgs,
+    },
+    /// Stage a lease-fenced custody migration for the transport reconciler.
+    CustodyPrepare {
+        #[command(flatten)]
+        request: OwnershipCustodyPrepareArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+pub(super) struct OwnershipBootstrapArgs {
+    #[arg(long)]
+    pub(super) ownership: String,
+    #[arg(long = "expires-at")]
+    pub(super) expires_at: String,
+    /// New owner-only file receiving bootstrapped holder material.
+    #[arg(long = "holder-output")]
+    pub(super) holder_output: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -721,6 +772,75 @@ pub(super) enum WorkLedgerPolicyCommand {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[derive(Debug, Args)]
+pub(super) struct OwnershipRenewArgs {
+    #[arg(long)]
+    pub(super) ownership: String,
+    #[arg(long = "expected-generation")]
+    pub(super) expected_generation: u64,
+    #[arg(long = "expires-at")]
+    pub(super) expires_at: String,
+    /// Owner-only holder material file, or `-` for strict stdin.
+    #[arg(long)]
+    pub(super) holder: PathBuf,
+    /// New owner-only file receiving rotated holder material.
+    #[arg(long = "holder-output")]
+    pub(super) holder_output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct OwnershipReleaseArgs {
+    #[arg(long)]
+    pub(super) ownership: String,
+    #[arg(long = "expected-generation")]
+    pub(super) expected_generation: u64,
+    /// Owner-only holder material file, or `-` for strict stdin.
+    #[arg(long)]
+    pub(super) holder: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct OwnershipAdoptArgs {
+    #[arg(long)]
+    pub(super) ownership: String,
+    #[arg(long = "expected-generation")]
+    pub(super) expected_generation: u64,
+    #[arg(long = "expires-at")]
+    pub(super) expires_at: String,
+    /// Private exact adoption proof JSON, or `-` for strict stdin.
+    #[arg(long)]
+    pub(super) proof: PathBuf,
+    /// Existing owner-only holder material for authenticated attach.
+    #[arg(long)]
+    pub(super) holder: Option<PathBuf>,
+    /// New owner-only file receiving successor holder material.
+    #[arg(long = "holder-output")]
+    pub(super) holder_output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct OwnershipCustodyPrepareArgs {
+    #[arg(long)]
+    pub(super) message: String,
+    #[arg(long = "expected-old-incarnation")]
+    pub(super) expected_old_incarnation: String,
+    #[arg(long = "new-target-incarnation")]
+    pub(super) new_target_incarnation: String,
+    #[arg(long = "new-target-route")]
+    pub(super) new_target_route: String,
+    #[arg(long = "terminal-adapter")]
+    pub(super) terminal_adapter: String,
+    #[arg(long = "new-authority-digest")]
+    pub(super) new_authority_digest: String,
+    #[arg(long)]
+    pub(super) ownership: String,
+    #[arg(long = "expected-generation")]
+    pub(super) expected_generation: u64,
+    /// Owner-only holder material file, or `-` for strict stdin.
+    #[arg(long)]
+    pub(super) holder: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2401,9 +2521,30 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        AuthCommand, Cli, Command, DependencyCommand, PulpDependencyCommand, QueueHoldCommand,
-        RunnerCommand, WorkLedgerCommand, WorkLedgerPolicyCommand,
+        AuthCommand, Cli, Command, DependencyCommand, OwnershipLeaseCommand, PulpDependencyCommand,
+        QueueHoldCommand, RunnerCommand, WorkLedgerCommand, WorkLedgerPolicyCommand,
     };
+
+    fn parsed_work_ledger(cli: Cli) -> WorkLedgerCommand {
+        match cli.command {
+            Command::WorkLedger { command } => *command,
+            _ => panic!("expected work-ledger command"),
+        }
+    }
+
+    fn parsed_work_ledger_policy(cli: Cli) -> WorkLedgerPolicyCommand {
+        match parsed_work_ledger(cli) {
+            WorkLedgerCommand::Policy { command } => *command,
+            _ => panic!("expected policy or ownership command"),
+        }
+    }
+
+    fn parsed_ownership_lease(cli: Cli) -> OwnershipLeaseCommand {
+        match parsed_work_ledger(cli) {
+            WorkLedgerCommand::Ownership { command } => *command,
+            _ => panic!("expected ownership lease command"),
+        }
+    }
 
     #[test]
     fn doctor_repo_overrides_are_available_on_both_auth_surfaces() {
@@ -2776,18 +2917,14 @@ mod tests {
         let cli = Cli::try_parse_from(["shipyard", "work-ledger", "import"])
             .expect("work-ledger dry run");
         assert!(matches!(
-            cli.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::Import { apply: false }
-            }
+            parsed_work_ledger(cli),
+            WorkLedgerCommand::Import { apply: false }
         ));
         let cli = Cli::try_parse_from(["shipyard", "work-ledger", "import", "--apply"])
             .expect("work-ledger apply");
         assert!(matches!(
-            cli.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::Import { apply: true }
-            }
+            parsed_work_ledger(cli),
+            WorkLedgerCommand::Import { apply: true }
         ));
     }
 
@@ -2796,21 +2933,15 @@ mod tests {
         let status = Cli::try_parse_from(["shipyard", "work-ledger", "custody-status"])
             .expect("custody status");
         assert!(matches!(
-            status.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::CustodyStatus
-            }
+            parsed_work_ledger(status),
+            WorkLedgerCommand::CustodyStatus
         ));
-        drop(status);
         let receive = Cli::try_parse_from(["shipyard", "work-ledger", "custody-receive"])
             .expect("custody SSH subsystem receiver");
         assert!(matches!(
-            receive.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::CustodyReceive
-            }
+            parsed_work_ledger(receive),
+            WorkLedgerCommand::CustodyReceive
         ));
-        drop(receive);
         assert!(
             Cli::try_parse_from([
                 "shipyard",
@@ -2837,14 +2968,14 @@ mod tests {
             "/owner-only/private.json",
         ])
         .expect("custody inventory exact CLI");
-        assert!(matches!(
-            inventory.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::CustodyInventory(ref arguments)
-            } if arguments.message == message
-                && arguments.correlation_hints.as_deref()
-                    == Some(Path::new("/owner-only/private.json"))
-        ));
+        let WorkLedgerCommand::CustodyInventory(arguments) = parsed_work_ledger(inventory) else {
+            panic!("expected custody inventory command")
+        };
+        assert_eq!(arguments.message, message);
+        assert_eq!(
+            arguments.correlation_hints.as_deref(),
+            Some(Path::new("/owner-only/private.json"))
+        );
         assert!(
             Cli::try_parse_from([
                 "shipyard",
@@ -2875,14 +3006,12 @@ mod tests {
         ])
         .expect("publication plan");
         assert!(matches!(
-            cli.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::Publish {
-                    repo,
-                    pr: 43,
-                    head: parsed_head,
-                    apply: false,
-                }
+            parsed_work_ledger(cli),
+            WorkLedgerCommand::Publish {
+                repo,
+                pr: 43,
+                head: parsed_head,
+                apply: false,
             } if repo == "generous-corp/shipyard" && parsed_head == head
         ));
 
@@ -2900,15 +3029,13 @@ mod tests {
         ])
         .expect("publication apply");
         assert!(matches!(
-            cli.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::Publish { apply: true, .. }
-            }
+            parsed_work_ledger(cli),
+            WorkLedgerCommand::Publish { apply: true, .. }
         ));
     }
 
     #[test]
-    fn work_ledger_agent_handshake_uses_file_or_stdin_receipt_inputs() {
+    fn gate_0b_3_work_ledger_agent_handshake_uses_protected_file_or_stdin_inputs() {
         let challenge = Cli::try_parse_from([
             "shipyard",
             "work-ledger",
@@ -2918,10 +3045,8 @@ mod tests {
         ])
         .expect("context challenge");
         assert!(matches!(
-            challenge.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::ContextChallenge { wake }
-            } if wake == "wake:gen43:1"
+            parsed_work_ledger(challenge),
+            WorkLedgerCommand::ContextChallenge { wake } if wake == "wake:gen43:1"
         ));
 
         let acknowledge = Cli::try_parse_from([
@@ -2932,13 +3057,13 @@ mod tests {
             "wake:gen43:1",
             "--receipt",
             "-",
+            "--holder-output",
+            "/tmp/holder.json",
         ])
         .expect("context acknowledgement");
         assert!(matches!(
-            acknowledge.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::AcknowledgeContext { receipt, .. }
-            } if receipt == Path::new("-")
+            parsed_work_ledger(acknowledge),
+            WorkLedgerCommand::AcknowledgeContext { receipt, .. } if receipt == Path::new("-")
         ));
 
         let return_challenge = Cli::try_parse_from([
@@ -2950,10 +3075,8 @@ mod tests {
         ])
         .expect("return challenge");
         assert!(matches!(
-            return_challenge.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::ReturnChallenge { ownership }
-            } if ownership == "ao:gen43"
+            parsed_work_ledger(return_challenge),
+            WorkLedgerCommand::ReturnChallenge { ownership } if ownership == "ao:gen43"
         ));
 
         let returned = Cli::try_parse_from([
@@ -2966,13 +3089,160 @@ mod tests {
             "/tmp/expectation.json",
             "--receipt",
             "/tmp/receipt.json",
+            "--holder",
+            "/tmp/holder.json",
         ])
         .expect("ownership return");
         assert!(matches!(
-            returned.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::ReturnOwnership { ownership, .. }
-            } if ownership == "ao:gen43"
+            parsed_work_ledger(returned),
+            WorkLedgerCommand::ReturnOwnership { ownership, .. } if ownership == "ao:gen43"
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One Gate0B.3 proof covers every secret-free ownership verb.
+    fn gate_0b_3_lease_commands_keep_holder_material_off_argv() {
+        let bootstrap = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "ownership",
+            "bootstrap",
+            "--ownership",
+            "ao_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--expires-at",
+            "2026-09-01T00:00:00Z",
+            "--holder-output",
+            "/tmp/bootstrap-holder.json",
+        ])
+        .expect("protected bootstrap command");
+        assert!(matches!(
+            parsed_ownership_lease(bootstrap),
+            OwnershipLeaseCommand::Bootstrap { request }
+                if request.holder_output == Path::new("/tmp/bootstrap-holder.json")
+        ));
+
+        let renew = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "ownership",
+            "renew",
+            "--ownership",
+            "ao_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--expected-generation",
+            "1",
+            "--expires-at",
+            "2026-09-01T00:00:00Z",
+            "--holder",
+            "-",
+            "--holder-output",
+            "/tmp/renewed-holder.json",
+        ])
+        .expect("protected renew command");
+        assert!(matches!(
+            parsed_ownership_lease(renew),
+            OwnershipLeaseCommand::Renew { request }
+                if request.holder == Path::new("-")
+                    && request.holder_output == Path::new("/tmp/renewed-holder.json")
+        ));
+
+        let release = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "ownership",
+            "release",
+            "--ownership",
+            "ao_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--expected-generation",
+            "2",
+            "--holder",
+            "-",
+        ])
+        .expect("protected release command");
+        assert!(matches!(
+            parsed_ownership_lease(release),
+            OwnershipLeaseCommand::Release { request }
+                if request.holder == Path::new("-") && request.expected_generation == 2
+        ));
+
+        let adopt = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "ownership",
+            "adopt",
+            "--ownership",
+            "ao_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--expected-generation",
+            "1",
+            "--expires-at",
+            "2026-09-01T00:00:00Z",
+            "--proof",
+            "-",
+            "--holder-output",
+            "/tmp/successor-holder.json",
+        ])
+        .expect("protected adopt command");
+        assert!(matches!(
+            parsed_ownership_lease(adopt),
+            OwnershipLeaseCommand::Adopt { request }
+                if request.proof == Path::new("-")
+                    && request.holder.is_none()
+                    && request.holder_output == Path::new("/tmp/successor-holder.json")
+        ));
+
+        let attach = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "ownership",
+            "adopt",
+            "--ownership",
+            "ao_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--expected-generation",
+            "1",
+            "--expires-at",
+            "2026-09-01T00:00:00Z",
+            "--proof",
+            "-",
+            "--holder",
+            "/tmp/existing-holder.json",
+            "--holder-output",
+            "/tmp/attached-holder.json",
+        ])
+        .expect("protected attach command");
+        assert!(matches!(
+            parsed_ownership_lease(attach),
+            OwnershipLeaseCommand::Adopt { request }
+                if request.holder.as_deref() == Some(Path::new("/tmp/existing-holder.json"))
+        ));
+
+        let custody = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "ownership",
+            "custody-prepare",
+            "--message",
+            "wm_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--expected-old-incarnation",
+            "incarnation_old",
+            "--new-target-incarnation",
+            "incarnation_new",
+            "--new-target-route",
+            "route_new",
+            "--terminal-adapter",
+            "cmux",
+            "--new-authority-digest",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--ownership",
+            "ao_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--expected-generation",
+            "2",
+            "--holder",
+            "-",
+        ])
+        .expect("protected custody prepare command");
+        assert!(matches!(
+            parsed_ownership_lease(custody),
+            OwnershipLeaseCommand::CustodyPrepare { request }
+                if request.holder == Path::new("-") && request.expected_generation == 2
         ));
     }
 
@@ -2992,18 +3262,14 @@ mod tests {
         ])
         .expect("policy plan");
         assert!(matches!(
-            cli.command,
-            Command::WorkLedger {
-                command: WorkLedgerCommand::Policy {
-                    command: WorkLedgerPolicyCommand::Set {
-                        primary_platform,
-                        compatibility_mode,
-                        blocking_rule,
-                        expected_revision: 0,
-                        apply: false,
-                        ..
-                    }
-                }
+            parsed_work_ledger_policy(cli),
+            WorkLedgerPolicyCommand::Set {
+                primary_platform,
+                compatibility_mode,
+                blocking_rule,
+                expected_revision: 0,
+                apply: false,
+                ..
             } if primary_platform == "macos"
                 && compatibility_mode == "independent"
                 && blocking_rule == "declared_dependency_or_shared_integrity"

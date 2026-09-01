@@ -1,9 +1,15 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use super::*;
 use crate::work_ledger::{
-    NativeStewardDisposition, RepoPolicy, WakeConsumerPolicy, WorkLedger,
-    native_publication_test_policy, native_publication_test_request,
+    CustodyEnvelope, CustodyRelation, NativeStewardDisposition, OwnershipAdoptionResult,
+    OwnershipLeaseFence, RepoPolicy, WakeConsumerPolicy, WorkLedger, authenticate_custody_receipt,
+    authenticate_custody_successor_receipt, authenticate_custody_transfer,
+    native_publication_test_policy, native_publication_test_request, ownership_lease_fixture,
 };
 
 #[test]
@@ -176,6 +182,643 @@ fn production_path_recovers_after_offline_send_and_receiver_claim_restart() {
         .unwrap();
     assert_eq!(source.custody_status().unwrap().outgoing_processed, 1);
     assert_eq!(authority.custody_status().unwrap().incoming_processed, 1);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One Gate0B.3 proof covers delivered and offline abort recovery.
+fn gate_0b_3_transport_aborts_expired_receiver_prepare_before_retry() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let authority_dir = tempfile::tempdir().unwrap();
+    seed_native_wake(source_dir.path(), 143);
+    seed_native_wake(authority_dir.path(), 143);
+    let (source_policy, authority_policy) = policy_pair(source_dir.path(), authority_dir.path());
+    let mut carrier = LoopbackCarrier::new(
+        &authority_policy,
+        authority_dir.path(),
+        source_policy.local_machine_ref.clone(),
+    );
+    reconcile_once(&source_policy, source_dir.path(), &mut carrier).unwrap();
+    let source = WorkLedger::open_existing(source_dir.path())
+        .unwrap()
+        .unwrap();
+    let message_id: String = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path()))
+        .unwrap()
+        .query_row(
+            "SELECT message_id FROM custody_outbox WHERE state = 'custody_accepted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let successor_incarnation = opaque("incarnation", "Gate0B.3 successor one");
+    let successor_proof = "c".repeat(64);
+    let rebind = source
+        .prepare_custody_successor_rebind_for_test(
+            &message_id,
+            &authority_policy.local_incarnation_ref,
+            &successor_incarnation,
+            &authority_policy.local_route_ref,
+            &authority_policy.local_terminal_adapter,
+            &authority_policy.authority_digest,
+            &successor_proof,
+            Utc::now() + ChronoDuration::seconds(1),
+        )
+        .unwrap();
+    let mut successor_policy = authority_policy.clone();
+    successor_policy.local_incarnation_ref = successor_incarnation;
+    let prepared = deliver_request(
+        &successor_policy,
+        authority_dir.path(),
+        &source_policy.local_machine_ref,
+        &CustodyTransportRequest::SuccessorRebind {
+            schema_version: SUCCESSOR_SCHEMA_VERSION,
+            rebind: rebind.clone(),
+        },
+    );
+    assert!(matches!(
+        prepared,
+        CustodyTransportResponse::SuccessorPrepared { .. }
+    ));
+    std::thread::sleep(Duration::from_millis(1_100));
+
+    successor_policy.local_incarnation_ref =
+        opaque("incarnation", "Gate0B.3 replacement after prepared expiry");
+    successor_policy.local_route_ref = opaque("route", "Gate0B.3 replacement route");
+    successor_policy.local_terminal_adapter = "replacement-adapter".to_owned();
+    successor_policy.authority_digest = sha256(b"Gate0B.3 replacement authority");
+    let mut abort_carrier = LoopbackCarrier::new(
+        &successor_policy,
+        authority_dir.path(),
+        source_policy.local_machine_ref.clone(),
+    );
+    for refused_version in [1, 3] {
+        abort_carrier.successor_response_schema_override =
+            Some(SuccessorResponseSchemaOverride::Aborted(refused_version));
+        assert!(reconcile_once(&source_policy, source_dir.path(), &mut abort_carrier).is_err());
+        let source_state: String =
+            rusqlite::Connection::open(WorkLedger::path_at(source_dir.path()))
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM custody_successor_rebinds
+                      WHERE rebind_id = ?1 AND side = 'sender'",
+                    [&rebind.rebind_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(source_state, "prepared");
+    }
+    abort_carrier.successor_response_schema_override = None;
+    reconcile_once(&source_policy, source_dir.path(), &mut abort_carrier).unwrap();
+    for root in [source_dir.path(), authority_dir.path()] {
+        let connection = rusqlite::Connection::open(WorkLedger::path_at(root)).unwrap();
+        let (state, last_state): (String, String) = connection
+            .query_row(
+                "SELECT rebind.state, event.to_state
+                   FROM custody_successor_rebinds rebind
+                   JOIN custody_successor_events event
+                     ON event.rebind_id = rebind.rebind_id AND event.side = rebind.side
+                  WHERE rebind.rebind_id = ?1
+                  ORDER BY event.sequence DESC LIMIT 1",
+                [&rebind.rebind_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), last_state.as_str()),
+            ("aborted", "aborted")
+        );
+    }
+    let offline_incarnation = opaque("incarnation", "Gate0B.3 offline successor");
+    let offline_rebind = source
+        .prepare_custody_successor_rebind_for_test(
+            &message_id,
+            &authority_policy.local_incarnation_ref,
+            &offline_incarnation,
+            &authority_policy.local_route_ref,
+            &authority_policy.local_terminal_adapter,
+            &authority_policy.authority_digest,
+            &successor_proof,
+            Utc::now() + ChronoDuration::seconds(1),
+        )
+        .expect("first aborted epoch permits an offline successor attempt");
+    std::thread::sleep(Duration::from_millis(1_100));
+    let mut absent_abort_carrier = LoopbackCarrier::new(
+        &successor_policy,
+        authority_dir.path(),
+        source_policy.local_machine_ref.clone(),
+    );
+    reconcile_once(&source_policy, source_dir.path(), &mut absent_abort_carrier)
+        .expect("authenticated absent prepare creates receiver abort tombstone");
+    let mut delayed_policy = authority_policy.clone();
+    delayed_policy.local_incarnation_ref = offline_incarnation;
+    assert!(matches!(
+        deliver_request(
+            &delayed_policy,
+            authority_dir.path(),
+            &source_policy.local_machine_ref,
+            &CustodyTransportRequest::SuccessorRebind {
+                schema_version: SUCCESSOR_SCHEMA_VERSION,
+                rebind: offline_rebind,
+            },
+        ),
+        CustodyTransportResponse::Refused { .. }
+    ));
+    source
+        .prepare_custody_successor_rebind_for_test(
+            &message_id,
+            &authority_policy.local_incarnation_ref,
+            &opaque("incarnation", "Gate0B.3 successor retry"),
+            &authority_policy.local_route_ref,
+            &authority_policy.local_terminal_adapter,
+            &authority_policy.authority_digest,
+            &successor_proof,
+            Utc::now() + ChronoDuration::seconds(30),
+        )
+        .expect("absent aborted epoch no longer strands its successor");
+}
+
+#[allow(clippy::too_many_arguments)] // The helper preserves every production custody fence.
+fn gate_0b_3_stage_and_accept_ordinary_custody(
+    source_dir: &Path,
+    source: &WorkLedger,
+    receiver: &WorkLedger,
+    source_policy: &CustodyTransportPolicy,
+    authority_policy: &CustodyTransportPolicy,
+    fence: &OwnershipLeaseFence,
+    label: &str,
+) -> String {
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(source_dir)).unwrap();
+    let (work_generation, owner_generation, source_digest): (u64, u64, String) = connection
+        .query_row(
+            "SELECT ownership.work_generation, ownership.owner_generation, work.source_digest
+               FROM agent_ownership ownership
+               JOIN work_items work ON work.id = ownership.work_item_id
+              WHERE ownership.ownership_id = ?1",
+            [&fence.ownership_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let wake_id = opaque("wake", label);
+    let payload_digest = sha256(label.as_bytes());
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO outbox
+             (wake_id, work_item_id, work_generation, owner_generation, state,
+              route_ref, payload_digest, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?7)",
+            rusqlite::params![
+                wake_id,
+                fence.work_item_id,
+                work_generation,
+                owner_generation,
+                opaque("route", label),
+                payload_digest,
+                now
+            ],
+        )
+        .unwrap();
+    let envelope = CustodyEnvelope::new(
+        wake_id,
+        fence.work_item_id.clone(),
+        work_generation,
+        owner_generation,
+        payload_digest,
+        source_digest,
+        fence.workstream_handle.clone(),
+        1,
+        source_policy.local_machine_ref.clone(),
+        source_policy.local_incarnation_ref.clone(),
+        CustodyRelation::wake(),
+    )
+    .unwrap();
+    let message_id = envelope.message_id.clone();
+    source
+        .stage_cross_machine_custody(
+            &envelope,
+            &authority_policy.local_machine_ref,
+            &authority_policy.local_incarnation_ref,
+            &authority_policy.local_route_ref,
+            &authority_policy.local_terminal_adapter,
+            &authority_policy.authority_digest,
+        )
+        .unwrap();
+    let claim = source
+        .claim_custody_send(
+            &message_id,
+            &source_policy.sender_owner_ref,
+            Utc::now() + ChronoDuration::seconds(30),
+        )
+        .unwrap();
+    let transfer = source.custody_transfer(&claim).unwrap();
+    let receipt = receiver
+        .accept_custody(
+            &authenticate_custody_transfer(
+                &mut WitnessAuthenticator::new(&source_policy.local_machine_ref, &"1".repeat(64)),
+                transfer,
+            )
+            .unwrap(),
+            &authority_policy.local_machine_ref,
+            &authority_policy.local_incarnation_ref,
+        )
+        .unwrap();
+    source
+        .acknowledge_remote_custody(
+            &claim,
+            &authenticate_custody_receipt(
+                &mut WitnessAuthenticator::new(
+                    &authority_policy.local_machine_ref,
+                    &"1".repeat(64),
+                ),
+                &authority_policy.local_machine_ref,
+                receipt,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    message_id
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One Gate0B.3 proof follows the complete production transport boundary.
+fn gate_0b_3_production_transport_accepts_dynamic_current_lease_proof() {
+    let (source_dir, source, fence, _holder, _delivery, _receipt) = ownership_lease_fixture();
+    let authority_dir = tempfile::tempdir().unwrap();
+    let receiver = WorkLedger::open(authority_dir.path()).unwrap();
+    let (source_policy, authority_policy) = policy_pair(source_dir.path(), authority_dir.path());
+    let message_id = gate_0b_3_stage_and_accept_ordinary_custody(
+        source_dir.path(),
+        &source,
+        &receiver,
+        &source_policy,
+        &authority_policy,
+        &fence,
+        "Gate0B.3 production dynamic lease proof",
+    );
+
+    let (_object, initial_material, initial_holder) = source
+        .ownership_holder_material(&fence.work_item_id, &fence.ownership_id, 1)
+        .unwrap();
+    let initial = source
+        .establish_ownership_lease(
+            &fence,
+            &initial_holder,
+            Utc::now() + ChronoDuration::seconds(60),
+        )
+        .unwrap();
+    let release_digest = source
+        .release_ownership_lease_with_material(
+            &fence.ownership_id,
+            &initial_material,
+            initial.lease_generation,
+        )
+        .unwrap();
+    let proof = serde_json::to_vec(&serde_json::json!({
+        "kind": "explicit_release",
+        "release_digest": release_digest,
+    }))
+    .unwrap();
+    let (adopted, successor_material) = source
+        .adopt_ownership_with_protected_holder(
+            &fence.ownership_id,
+            initial.lease_generation,
+            Utc::now() + ChronoDuration::seconds(60),
+            &proof,
+            None,
+        )
+        .unwrap();
+    let OwnershipAdoptionResult::SuccessorCreated(successor) = adopted else {
+        panic!("expected dynamic successor")
+    };
+    assert_ne!(
+        successor.proof_digest,
+        "c".repeat(64),
+        "the daemon's legacy static policy proof is not the dynamic current lease proof"
+    );
+    assert_ne!(
+        authority_policy.local_incarnation_ref,
+        successor.holder.incarnation_ref
+    );
+    assert!(
+        source
+            .prepare_custody_successor_rebind_with_holder(
+                &message_id,
+                &authority_policy.local_incarnation_ref,
+                &authority_policy.local_incarnation_ref,
+                &authority_policy.local_route_ref,
+                &authority_policy.local_terminal_adapter,
+                &authority_policy.authority_digest,
+                &fence.ownership_id,
+                successor.lease_generation,
+                &initial_material,
+            )
+            .is_err(),
+        "the predecessor holder session cannot authorize adopted custody"
+    );
+    let rebind = source
+        .prepare_custody_successor_rebind_with_holder(
+            &message_id,
+            &authority_policy.local_incarnation_ref,
+            &authority_policy.local_incarnation_ref,
+            &authority_policy.local_route_ref,
+            &authority_policy.local_terminal_adapter,
+            &authority_policy.authority_digest,
+            &fence.ownership_id,
+            successor.lease_generation,
+            &successor_material,
+        )
+        .unwrap();
+    assert_eq!(
+        rebind.old_target_incarnation_ref, rebind.new_target_incarnation_ref,
+        "adoption does not rewrite the custody daemon endpoint"
+    );
+    assert_eq!(rebind.successor_holder_ref, successor.holder.holder_ref);
+    assert_eq!(
+        rebind.successor_session_incarnation_ref,
+        successor.holder.incarnation_ref
+    );
+    let mut successor_policy = authority_policy.clone();
+    let response = deliver_request(
+        &successor_policy,
+        authority_dir.path(),
+        &source_policy.local_machine_ref,
+        &CustodyTransportRequest::SuccessorRebind {
+            schema_version: SUCCESSOR_SCHEMA_VERSION,
+            rebind: rebind.clone(),
+        },
+    );
+    let CustodyTransportResponse::SuccessorPrepared { receipt, .. } = response else {
+        panic!("dynamic current lease proof was refused")
+    };
+    gate_0b_3_stage_and_accept_ordinary_custody(
+        source_dir.path(),
+        &source,
+        &receiver,
+        &source_policy,
+        &authority_policy,
+        &fence,
+        "Gate0B.3 ordinary transfer after adopted holder",
+    );
+    source
+        .acknowledge_custody_successor_rebind(
+            &authenticate_custody_successor_receipt(
+                &mut WitnessAuthenticator::new(
+                    &authority_policy.local_machine_ref,
+                    &"1".repeat(64),
+                ),
+                &authority_policy.local_machine_ref,
+                receipt.clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    successor_policy.local_incarnation_ref = opaque("incarnation", "Gate0B.3 post-ack replacement");
+    successor_policy.local_route_ref = opaque("route", "Gate0B.3 post-ack replacement");
+    successor_policy.local_terminal_adapter = "post-ack-replacement".to_owned();
+    successor_policy.authority_digest = sha256(b"Gate0B.3 post-ack replacement");
+    let mut replacement_carrier = LoopbackCarrier::new(
+        &successor_policy,
+        authority_dir.path(),
+        source_policy.local_machine_ref.clone(),
+    );
+    let source_rebind_state = || -> String {
+        rusqlite::Connection::open(WorkLedger::path_at(source_dir.path()))
+            .unwrap()
+            .query_row(
+                "SELECT state FROM custody_successor_rebinds
+                  WHERE rebind_id = ?1 AND side = 'sender'",
+                [&rebind.rebind_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    for refused_version in [1, 3] {
+        replacement_carrier.successor_response_schema_override =
+            Some(SuccessorResponseSchemaOverride::Prepared(refused_version));
+        assert!(
+            reconcile_once(&source_policy, source_dir.path(), &mut replacement_carrier).is_err()
+        );
+        assert_eq!(source_rebind_state(), "acknowledged");
+    }
+    for refused_version in [1, 3] {
+        replacement_carrier.successor_response_schema_override =
+            Some(SuccessorResponseSchemaOverride::Finalized(refused_version));
+        assert!(
+            reconcile_once(&source_policy, source_dir.path(), &mut replacement_carrier).is_err()
+        );
+        assert_eq!(source_rebind_state(), "acknowledged");
+    }
+    replacement_carrier.successor_response_schema_override = None;
+    reconcile_once(&source_policy, source_dir.path(), &mut replacement_carrier)
+        .expect("post-ack source restart replays prepare and finalizes against replacement");
+    let source_state: String = rusqlite::Connection::open(WorkLedger::path_at(source_dir.path()))
+        .unwrap()
+        .query_row(
+            "SELECT state FROM custody_successor_rebinds
+              WHERE rebind_id = ?1 AND side = 'sender'",
+            [&rebind.rebind_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let receiver_state: String =
+        rusqlite::Connection::open(WorkLedger::path_at(authority_dir.path()))
+            .unwrap()
+            .query_row(
+                "SELECT state FROM custody_successor_rebinds
+                  WHERE rebind_id = ?1 AND side = 'receiver'",
+                [&rebind.rebind_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        (source_state.as_str(), receiver_state.as_str()),
+        ("finalized", "committed")
+    );
+}
+
+#[test]
+fn gate_0b_3_successor_wire_v2_refuses_both_rolling_upgrade_directions_safely() {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)] // Deserialization itself is the legacy rolling-upgrade oracle.
+    #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+    enum LegacyRequest {
+        SuccessorRebind {
+            schema_version: u32,
+            rebind: serde_json::Value,
+        },
+    }
+
+    let authority_dir = tempfile::tempdir().unwrap();
+    WorkLedger::open(authority_dir.path()).unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let (source_policy, authority_policy) = policy_pair(source_dir.path(), authority_dir.path());
+    let old_request = serde_json::json!({
+        "operation": "successor_rebind",
+        "schema_version": 1,
+        "rebind": {},
+    });
+    let parsed: CustodyTransportRequest = serde_json::from_value(old_request).unwrap();
+    assert!(matches!(
+        deliver_request(
+            &authority_policy,
+            authority_dir.path(),
+            &source_policy.local_machine_ref,
+            &parsed,
+        ),
+        CustodyTransportResponse::Refused { ref reason_code, .. }
+            if reason_code == "custody-successor-schema-version-refused"
+    ));
+
+    let v2_operation = serde_json::json!({
+        "operation": "successor_rebind_v2",
+        "schema_version": 2,
+        "rebind": {},
+    });
+    assert!(serde_json::from_value::<LegacyRequest>(v2_operation).is_err());
+}
+
+#[cfg(unix)]
+#[derive(Debug, Eq, PartialEq)]
+struct Gate0B3FilesystemEntry {
+    bytes: Option<Vec<u8>>,
+    mode: u32,
+    modified: std::time::SystemTime,
+}
+
+#[cfg(unix)]
+fn gate_0b_3_filesystem_snapshot(root: &Path) -> BTreeMap<PathBuf, Gate0B3FilesystemEntry> {
+    fn visit(root: &Path, path: &Path, snapshot: &mut BTreeMap<PathBuf, Gate0B3FilesystemEntry>) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        snapshot.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            Gate0B3FilesystemEntry {
+                bytes: metadata.is_file().then(|| fs::read(path).unwrap()),
+                mode: metadata.permissions().mode() & 0o777,
+                modified: metadata.modified().unwrap(),
+            },
+        );
+        if metadata.is_dir() {
+            let mut children = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                visit(root, &child, snapshot);
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)] // One Gate0B.3 proof snapshots every protected persistence surface.
+fn gate_0b_3_incompatible_successor_wire_refuses_before_opening_protected_ledger() {
+    let state_dir = tempfile::tempdir().unwrap();
+    seed_native_wake(state_dir.path(), 146);
+    let policy = test_policy(state_dir.path(), true);
+    let evidence = IncomingPeerEvidence {
+        peer_machine_ref: policy.peers.keys().next().unwrap().clone(),
+        ssh_connection_present: true,
+        ssh_auth_key_sha256: policy
+            .peers
+            .values()
+            .next()
+            .unwrap()
+            .ssh_auth_key_sha256
+            .clone(),
+    };
+    let database = WorkLedger::path_at(state_dir.path());
+    let live_connection = rusqlite::Connection::open(&database).unwrap();
+    live_connection
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
+    live_connection
+        .execute(
+            "UPDATE repo_policies SET revision = revision + 1 WHERE repo = 'owner/repo'",
+            [],
+        )
+        .unwrap();
+    let wal = database.with_extension("sqlite3-wal");
+    let shm = database.with_extension("sqlite3-shm");
+    assert!(wal.is_file() && shm.is_file());
+    for path in [&database, &wal, &shm] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let object_directory = state_dir.path().join("work-ledger/protected-objects");
+    fs::create_dir_all(&object_directory).unwrap();
+    fs::set_permissions(&object_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let pending = object_directory.join(".pending-Gate0B.3-incompatible-successor");
+    fs::write(&pending, b"Gate0B.3 pending protected object").unwrap();
+    fs::set_permissions(&pending, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let ledger_root = state_dir.path().join("work-ledger");
+    let before = gate_0b_3_filesystem_snapshot(&ledger_root);
+    let incompatible = [
+        serde_json::json!({
+            "operation": "successor_rebind",
+            "schema_version": 1,
+            "rebind": {},
+        }),
+        serde_json::json!({
+            "operation": "successor_rebind_v2",
+            "schema_version": 3,
+            "rebind": {
+                "rebind_id": "cr_Gate0B.3-future",
+                "message_id": "wm_Gate0B.3-future",
+                "identity_digest": "0".repeat(64),
+                "workstream_revision": 1,
+                "source_machine_ref": "machine_Gate0B.3-source",
+                "target_machine_ref": policy.local_machine_ref,
+                "old_target_incarnation_ref": policy.local_incarnation_ref,
+                "new_target_incarnation_ref": policy.local_incarnation_ref,
+                "old_authority_epoch": 1,
+                "new_authority_epoch": 2,
+                "old_transfer_digest": "1".repeat(64),
+                "old_custody_receipt_digest": "2".repeat(64),
+                "new_target_route_ref": policy.local_route_ref,
+                "terminal_adapter": policy.local_terminal_adapter,
+                "new_authority_digest": policy.authority_digest,
+                "ownership_lease_id": "ol_Gate0B.3-future",
+                "ownership_lease_generation": 2,
+                "ownership_lease_expires_at": "2026-08-31T23:59:59Z",
+                "ownership_root_uuid": "00000000-0000-0000-0000-000000000001",
+                "repository_provider": "github.com",
+                "repository_id": "R_Gate0B.3",
+                "repository": "owner/repo",
+                "pull_request": 146,
+                "exact_head": "3".repeat(40),
+                "workstream_handle": "GEN-37",
+                "successor_holder_ref": "owner_Gate0B.3-successor",
+                "successor_session_incarnation_ref": "incarnation_Gate0B.3-successor",
+                "successor_proof_digest": "4".repeat(64),
+                "rebind_digest": "5".repeat(64),
+            },
+        }),
+    ];
+    for request in incompatible {
+        let response = handle_incoming_request(
+            &policy,
+            state_dir.path(),
+            &evidence,
+            &serde_json::to_vec(&request).unwrap(),
+        );
+        assert!(matches!(
+            response,
+            CustodyTransportResponse::Refused { ref reason_code, .. }
+                if reason_code == "custody-successor-schema-version-refused"
+        ));
+        assert_eq!(
+            gate_0b_3_filesystem_snapshot(&ledger_root),
+            before,
+            "schema refusal must precede DB/WAL/SHM or protected-object reconciliation"
+        );
+        assert!(pending.is_file());
+    }
+    drop(live_connection);
 }
 
 #[test]
@@ -700,7 +1343,6 @@ fn test_policy(root: &Path, local_is_authority: bool) -> CustodyTransportPolicy 
         port: 22,
         remote_subsystem: "shipyard-custody-v1".to_owned(),
         ssh_auth_key_sha256: "b".repeat(64),
-        successor_proof_digest: "c".repeat(64),
     };
     CustodyTransportPolicy {
         local_machine_ref: local.clone(),
@@ -790,7 +1432,6 @@ fn peer(root: &Path, machine: &str, incarnation: &str, key: String) -> CustodyPe
         port: 22,
         remote_subsystem: "shipyard-custody-v1".to_owned(),
         ssh_auth_key_sha256: key,
-        successor_proof_digest: "c".repeat(64),
     }
 }
 
@@ -858,7 +1499,15 @@ struct LoopbackCarrier<'a> {
     refuse_first_transfer: bool,
     refused_transfer: bool,
     last_request: Option<CustodyTransportRequest>,
+    successor_response_schema_override: Option<SuccessorResponseSchemaOverride>,
     mutate_inventory_response: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SuccessorResponseSchemaOverride {
+    Prepared(u32),
+    Finalized(u32),
+    Aborted(u32),
 }
 
 struct RebindingAfterResponseCarrier<'a> {
@@ -918,6 +1567,7 @@ impl<'a> LoopbackCarrier<'a> {
             refuse_first_transfer: false,
             refused_transfer: false,
             last_request: None,
+            successor_response_schema_override: None,
             mutate_inventory_response: false,
         }
     }
@@ -947,6 +1597,21 @@ impl CustodyCarrier for LoopbackCarrier<'_> {
             &self.source_machine_ref,
             request,
         );
+        match (self.successor_response_schema_override, &mut response) {
+            (
+                Some(SuccessorResponseSchemaOverride::Prepared(version)),
+                CustodyTransportResponse::SuccessorPrepared { schema_version, .. },
+            )
+            | (
+                Some(SuccessorResponseSchemaOverride::Finalized(version)),
+                CustodyTransportResponse::SuccessorFinalized { schema_version, .. },
+            )
+            | (
+                Some(SuccessorResponseSchemaOverride::Aborted(version)),
+                CustodyTransportResponse::SuccessorAborted { schema_version, .. },
+            ) => *schema_version = version,
+            _ => {}
+        }
         if self.mutate_inventory_response {
             match &mut response {
                 CustodyTransportResponse::InventoryComplete {

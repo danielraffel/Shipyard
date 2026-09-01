@@ -48,6 +48,8 @@ pub struct LocalWorkInventory {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalWorkInventoryItem {
+    /// Ledger-minted local ownership root; never a caller-selected Linear issue ID.
+    pub root_uuid: Option<String>,
     /// Provider host that issued `repository_id`, absent only for migrated legacy rows.
     pub repository_provider: Option<String>,
     /// Provider-scoped immutable repository identity, absent only for migrated legacy rows.
@@ -251,28 +253,61 @@ fn verify_inventory_schema(connection: &Connection) -> WorkLedgerResult<Inventor
     }
 }
 
-fn verify_legacy_inventory_schema(connection: &Connection) -> WorkLedgerResult<()> {
+pub(super) fn verify_legacy_inventory_schema(connection: &Connection) -> WorkLedgerResult<()> {
     // Exact sqlite_schema object sets produced by Shipyard v0.139.1 schema v11.
     // This binds table constraints, automatic/named indexes, and every trigger
     // owned by each table, rather than trusting column metadata alone.
-    for (table, expected) in [
-        (
-            "workstream_projection_bindings",
-            "93ad7a2dfb12e804a7589013803975e5f54a73eb413f5c999cfc24d34f512b52",
-        ),
-        (
-            "work_items",
-            "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9",
-        ),
-        (
-            "agent_ownership",
-            "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d",
-        ),
+    for table in [
+        "workstream_projection_bindings",
+        "work_items",
+        "agent_ownership",
     ] {
         let actual = schema_objects_digest(connection, table)?;
-        if actual != expected {
+        if !legacy_v11_schema_digest_allowed(table, &actual) {
             return Err(WorkLedgerError::Refused(format!(
                 "schema v11 inventory table {table} is missing or altered"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn legacy_v11_schema_digest_allowed(table: &str, actual: &str) -> bool {
+    match table {
+        // Both exact digests are released v0.139.1 representations of the
+        // same original v11 constraints/triggers. The second was observed on
+        // the governed M5 production ledger during the v0.142 canary.
+        "workstream_projection_bindings" => matches!(
+            actual,
+            "93ad7a2dfb12e804a7589013803975e5f54a73eb413f5c999cfc24d34f512b52"
+                | "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
+        ),
+        "work_items" => {
+            actual == "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9"
+        }
+        "agent_ownership" => {
+            actual == "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d"
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn verify_legacy_custody_migration_schema(
+    connection: &Connection,
+) -> WorkLedgerResult<()> {
+    for (table, expected) in [
+        (
+            "custody_successor_rebinds",
+            "dcaf9f13d20c9f0f0b9ce3ff283576a1a5d5841bc1f08871eb2ef3a10b1ce79c",
+        ),
+        (
+            "custody_processed_acknowledgements",
+            "044d3f50e64c18a49e5e86d47e4e598293d789f6c920b3e95797db573faa80b4",
+        ),
+    ] {
+        if schema_objects_digest(connection, table)? != expected {
+            return Err(WorkLedgerError::Refused(format!(
+                "legacy custody table {table} is missing or altered"
             )));
         }
     }
@@ -324,8 +359,14 @@ fn load_inventory_rows(
     schema: InventorySchema,
 ) -> WorkLedgerResult<Vec<InventoryRow>> {
     let repository_identity = match schema {
-        InventorySchema::Current => "binding.repository_provider, binding.repository_id",
-        InventorySchema::LegacyV11 => "NULL, NULL",
+        InventorySchema::Current => {
+            "binding.repository_provider, binding.repository_id, root.root_uuid"
+        }
+        InventorySchema::LegacyV11 => "NULL, NULL, NULL",
+    };
+    let root_join = match schema {
+        InventorySchema::Current => "LEFT JOIN ownership_roots root ON root.work_item_id = work.id",
+        InventorySchema::LegacyV11 => "",
     };
     let mut statement = connection.prepare(&format!(
         "SELECT {repository_identity},
@@ -336,6 +377,7 @@ fn load_inventory_rows(
                 ownership.owner_generation, work.repo, work.head_sha
            FROM workstream_projection_bindings binding
            JOIN work_items work ON work.id = binding.work_item_id
+           {root_join}
            LEFT JOIN agent_ownership ownership
              ON ownership.work_item_id = work.id
             AND ownership.work_generation = work.work_generation
@@ -351,22 +393,23 @@ fn load_inventory_rows(
             LocalWorkInventoryItem {
                 repository_provider: row.get(0)?,
                 repository_id: row.get(1)?,
-                repository: row.get(2)?,
-                pull_request: row.get(3)?,
-                exact_head: row.get(4)?,
-                state: row.get(5)?,
-                workstream_handle: row.get(6)?,
-                work_item_id: row.get(7)?,
-                work_generation: row.get(8)?,
-                owner_id: row.get(9)?,
-                owner_generation: row.get(10)?,
-                ownership_id: row.get(11)?,
-                ownership_state: row.get(12)?,
-                ownership_work_generation: row.get(13)?,
-                ownership_owner_generation: row.get(14)?,
+                root_uuid: row.get(2)?,
+                repository: row.get(3)?,
+                pull_request: row.get(4)?,
+                exact_head: row.get(5)?,
+                state: row.get(6)?,
+                workstream_handle: row.get(7)?,
+                work_item_id: row.get(8)?,
+                work_generation: row.get(9)?,
+                owner_id: row.get(10)?,
+                owner_generation: row.get(11)?,
+                ownership_id: row.get(12)?,
+                ownership_state: row.get(13)?,
+                ownership_work_generation: row.get(14)?,
+                ownership_owner_generation: row.get(15)?,
             },
-            row.get::<_, Option<String>>(15)?,
             row.get::<_, Option<String>>(16)?,
+            row.get::<_, Option<String>>(17)?,
         ))
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1004,36 +1047,8 @@ mod tests {
         let work_id = imported.work_id.clone();
         ledger.import(&[imported]).expect("v11 work item");
         let connection = ledger.connect_read_write().expect("v11 fixture connection");
-        connection
-            .execute_batch(
-                "DROP TABLE workstream_projection_bindings;
-                 CREATE TABLE workstream_projection_bindings (
-                   work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT,
-                   workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
-                   plan_sha256 TEXT NOT NULL
-                     CHECK(length(plan_sha256) = 64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
-                   root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
-                   issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
-                   projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
-                   material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
-                   repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
-                   exact_head TEXT NOT NULL
-                     CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
-                   created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
-                   UNIQUE(workstream_handle, repository, exact_head)
-                 );
-                 CREATE TRIGGER workstream_projection_binding_identity_immutable
-                 BEFORE UPDATE OF work_item_id, workstream_handle, plan_sha256, root_revision,
-                                  issue_revision, projection_revision, material_event_revision,
-                                  repository, created_at
-                 ON workstream_projection_bindings
-                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
-                 CREATE TRIGGER workstream_projection_binding_no_delete
-                 BEFORE DELETE ON workstream_projection_bindings
-                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
-                 PRAGMA user_version = 11;",
-            )
-            .expect("production v11 binding schema");
+        super::super::storage::reconstruct_authentic_v11_schema_for_test(&connection)
+            .expect("authentic production v11 schema");
         connection
             .execute(
                 "INSERT INTO workstream_projection_bindings
@@ -1098,6 +1113,26 @@ mod tests {
         assert!(error.to_string().contains("missing or altered"));
         #[cfg(unix)]
         assert_eq!(snapshot(state.path()), before);
+    }
+
+    #[test]
+    fn gate_0b_1_live_v11_projection_representation_is_exactly_allowlisted() {
+        assert!(legacy_v11_schema_digest_allowed(
+            "workstream_projection_bindings",
+            "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
+        ));
+        assert!(legacy_v11_schema_digest_allowed(
+            "work_items",
+            "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9"
+        ));
+        assert!(legacy_v11_schema_digest_allowed(
+            "agent_ownership",
+            "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d"
+        ));
+        assert!(!legacy_v11_schema_digest_allowed(
+            "workstream_projection_bindings",
+            "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c80"
+        ));
     }
 
     #[test]
@@ -1381,6 +1416,17 @@ CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
                  CREATE TABLE agent_ownership (
                    ownership_id TEXT PRIMARY KEY, work_item_id TEXT, state TEXT,
                    work_generation INTEGER, owner_generation INTEGER
+                 );
+                 CREATE TABLE ownership_roots (
+                   root_uuid TEXT PRIMARY KEY
+                     CHECK(length(root_uuid) = 36
+                           AND substr(root_uuid, 9, 1) = '-'
+                           AND substr(root_uuid, 14, 1) = '-'
+                           AND substr(root_uuid, 19, 1) = '-'
+                           AND substr(root_uuid, 24, 1) = '-'
+                           AND replace(root_uuid, '-', '') NOT GLOB '*[^0-9a-f]*'),
+                   work_item_id TEXT NOT NULL UNIQUE REFERENCES work_items(id) ON DELETE RESTRICT,
+                   created_at TEXT NOT NULL CHECK(length(created_at) >= 20)
                  );",
             )
             .expect("fixture schema");
@@ -1407,6 +1453,13 @@ CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
                 rusqlite::params![ownership_id, work_id],
             )
             .expect("historical ownership");
+        connection
+            .execute(
+                "INSERT INTO ownership_roots VALUES
+                 ('00000000-0000-0000-0000-000000000001', ?1, '2026-08-31T00:00:00Z')",
+                [&work_id],
+            )
+            .expect("current ownership root");
 
         let rows =
             load_inventory_rows(&connection, InventorySchema::Current).expect("inventory rows");

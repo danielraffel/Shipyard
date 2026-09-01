@@ -4,6 +4,7 @@ use crate::work_ledger::dispatch::{
     ProviderLaunchRequest, ProviderOutcome, WakeConsumerPolicy, WakeDeliveryResult, WakeEnvelope,
     WakeProfileResolver, reconciliation_fence_digest,
 };
+use chrono::Duration as ChronoDuration;
 
 #[derive(Clone)]
 struct TestProfile {
@@ -505,6 +506,939 @@ fn deliver_wake(ledger: &WorkLedger, profile: TestProfile) -> (String, String) {
     );
     let fence = adapter.launch_fences.pop().expect("delivery fence");
     (fence.wake_id, fence.delivery_id)
+}
+
+pub(crate) fn ownership_lease_fixture() -> (
+    TempDir,
+    WorkLedger,
+    OwnershipLeaseFence,
+    OwnershipLeaseHolder,
+    String,
+    String,
+) {
+    let (temp, ledger, profile, work_id, _wake_id) = setup_wake();
+    ledger
+        .bind_workstream_projection(
+            &work_id,
+            "GEN-43",
+            &"a".repeat(64),
+            0,
+            0,
+            4,
+            0,
+            "github.com",
+            "R_test_pulp",
+            "danielraffel/pulp",
+            "0123456789012345678901234567890123456789",
+        )
+        .expect("projection binding");
+    let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
+    let context = context_receipt(&ledger, &wake_id);
+    let ownership = ledger
+        .acknowledge_agent_context(
+            &wake_id,
+            &serde_json::to_vec(&context).expect("context receipt"),
+        )
+        .expect("acknowledged ownership");
+    let root_uuid: String = ledger
+        .connect_read_only()
+        .expect("lease database")
+        .query_row(
+            "SELECT root_uuid FROM ownership_roots WHERE work_item_id = ?1",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("ledger-minted ownership root");
+    (
+        temp,
+        ledger,
+        OwnershipLeaseFence {
+            ownership_id: ownership.ownership_id.clone(),
+            work_item_id: work_id,
+            repository_provider: "github.com".to_owned(),
+            repository_id: "R_test_pulp".to_owned(),
+            repository: "danielraffel/pulp".to_owned(),
+            pull_request: 42,
+            exact_head: "0123456789012345678901234567890123456789".to_owned(),
+            workstream_handle: "GEN-43".to_owned(),
+            root_uuid,
+        },
+        OwnershipLeaseHolder {
+            holder_ref: opaque_ref("owner", "predecessor agent"),
+            incarnation_ref: opaque_ref("incarnation", "predecessor process"),
+            credential_digest: digest(
+                b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
+        },
+        delivery_id,
+        ownership.receipt_digest,
+    )
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One Gate0B.3 production lifecycle proves ack, rotate, and return.
+fn gate_0b_3_context_acknowledgement_atomically_mints_root_lease_and_holder() {
+    let (_temp, ledger, profile, work_id, _wake_id) = setup_wake();
+    ledger
+        .bind_workstream_projection(
+            &work_id,
+            "GEN-43",
+            &"a".repeat(64),
+            0,
+            0,
+            4,
+            0,
+            "github.com",
+            "R_test_pulp",
+            "danielraffel/pulp",
+            "0123456789012345678901234567890123456789",
+        )
+        .expect("projection binding");
+    let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
+    let context = context_receipt(&ledger, &wake_id);
+    let bytes = serde_json::to_vec(&context).expect("context receipt");
+    let (ownership, holder_bytes) = ledger
+        .acknowledge_agent_context_with_lease(&wake_id, &bytes)
+        .expect("atomic acknowledged lease");
+    let (replay, replay_holder) = ledger
+        .acknowledge_agent_context_with_lease(&wake_id, &bytes)
+        .expect("lost acknowledgement response replay");
+    assert_eq!(replay, ownership);
+    assert_eq!(replay_holder, holder_bytes);
+    let material: crate::work_ledger::ownership_lease::OwnershipHolderMaterial =
+        serde_json::from_slice(&holder_bytes).expect("protected holder material");
+    assert_eq!(material.ownership_id, ownership.ownership_id);
+    assert_eq!(material.lease_generation, 1);
+    let connection = ledger.connect_read_only().expect("lease database");
+    let exact: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM ownership_leases lease
+               JOIN ownership_roots root ON root.root_uuid = lease.root_uuid
+              WHERE lease.ownership_id = ?1 AND lease.state = 'active'
+                AND lease.lease_generation = 1
+                AND lease.holder_credential_digest = ?2)",
+            params![
+                ownership.ownership_id,
+                digest(material.credential.as_bytes())
+            ],
+            |row| row.get(0),
+        )
+        .expect("atomic root and lease");
+    assert!(exact);
+    drop(connection);
+    let attach_proof = serde_json::to_vec(&serde_json::json!({
+        "kind": "explicit_release",
+        "release_digest": "0".repeat(64),
+    }))
+    .expect("attach proof envelope");
+    let (attached, attached_material) = ledger
+        .adopt_ownership_with_protected_holder(
+            &ownership.ownership_id,
+            1,
+            Utc::now() + ChronoDuration::seconds(60),
+            &attach_proof,
+            Some(&holder_bytes),
+        )
+        .expect("production authenticated attach");
+    assert!(matches!(attached, OwnershipAdoptionResult::Attached(_)));
+    assert_eq!(attached_material, holder_bytes);
+    let (renewed, renewed_material) = ledger
+        .renew_ownership_lease_with_material(
+            &ownership.ownership_id,
+            &holder_bytes,
+            1,
+            Utc::now() + ChronoDuration::seconds(90),
+        )
+        .expect("production protected-holder renewal");
+    assert_eq!(renewed.lease_generation, 2);
+    assert_ne!(renewed_material, holder_bytes);
+    let expected = return_expectation(
+        &work_id,
+        &ownership.ownership_id,
+        &ownership.receipt_digest,
+        &delivery_id,
+    );
+    let return_bytes = serde_json::to_vec(&return_receipt(&expected)).expect("return receipt");
+    assert!(
+        ledger
+            .return_agent_ownership_with_holder(
+                &ownership.ownership_id,
+                &delivery_id,
+                expected.work_generation,
+                &expected,
+                &return_bytes,
+                &holder_bytes,
+            )
+            .is_err(),
+        "Gate0B.3 predecessor material must not return a renewed lease"
+    );
+    ledger
+        .return_agent_ownership_with_holder(
+            &ownership.ownership_id,
+            &delivery_id,
+            expected.work_generation,
+            &expected,
+            &return_bytes,
+            &renewed_material,
+        )
+        .expect("Gate0B.3 rotated material returns renewed ownership");
+}
+
+#[test]
+fn gate_0b_3_production_release_keeps_acknowledged_ownership_adoptable() {
+    let (_temp, ledger, profile, work_id, _wake_id) = setup_wake();
+    ledger
+        .bind_workstream_projection(
+            &work_id,
+            "GEN-43",
+            &"a".repeat(64),
+            0,
+            0,
+            4,
+            0,
+            "github.com",
+            "R_test_pulp",
+            "danielraffel/pulp",
+            "0123456789012345678901234567890123456789",
+        )
+        .expect("projection binding");
+    let (wake_id, _delivery_id) = deliver_wake(&ledger, profile);
+    let context = context_receipt(&ledger, &wake_id);
+    let (ownership, holder_bytes) = ledger
+        .acknowledge_agent_context_with_lease(
+            &wake_id,
+            &serde_json::to_vec(&context).expect("context receipt"),
+        )
+        .expect("acknowledged ownership");
+    let release_digest = ledger
+        .release_ownership_lease_with_material(&ownership.ownership_id, &holder_bytes, 1)
+        .expect("production explicit release");
+    let proof = serde_json::to_vec(&serde_json::json!({
+        "kind": "explicit_release",
+        "release_digest": release_digest,
+    }))
+    .expect("release proof");
+    let (adopted, successor_material) = ledger
+        .adopt_ownership_with_protected_holder(
+            &ownership.ownership_id,
+            1,
+            Utc::now() + ChronoDuration::seconds(60),
+            &proof,
+            None,
+        )
+        .expect("released ownership remains adoptable");
+    assert!(matches!(
+        adopted,
+        OwnershipAdoptionResult::SuccessorCreated(_)
+    ));
+    let successor: crate::work_ledger::ownership_lease::OwnershipHolderMaterial =
+        serde_json::from_slice(&successor_material).expect("successor material");
+    assert_eq!(successor.lease_generation, 2);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One Gate0B.3 test proves authentic v11 enrichment and bootstrap.
+fn gate_0b_3_upgraded_acknowledged_ownership_bootstraps_exact_holder_once() {
+    let (temp, ledger, fence, _holder, _delivery, _receipt) = ownership_lease_fixture();
+    assert!(
+        ledger
+            .bootstrap_legacy_ownership_with_protected_holder(
+                &fence.ownership_id,
+                Utc::now() + ChronoDuration::seconds(60),
+            )
+            .is_err(),
+        "fresh v13 ownership is not legacy-bootstrap eligible"
+    );
+    let connection = ledger.connect_read_write().expect("v13 connection");
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO ownership_lease_bootstrap_eligibility(ownership_id, created_at)
+                 VALUES (?1, ?2)",
+                params![fence.ownership_id, Utc::now().to_rfc3339()],
+            )
+            .is_err(),
+        "direct SQL cannot bless a nonmigration ownership for bootstrap"
+    );
+    reconstruct_authentic_v11_schema_for_test(&connection)
+        .expect("authentic reconstructed deployed-v11 ownership schema");
+    for absent_column in ["repository_provider", "repository_id"] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('workstream_projection_bindings')
+                                WHERE name = ?1)",
+                [absent_column],
+                |row| row.get(0),
+            )
+            .expect("deployed-v11 repository identity shape");
+        assert!(!present, "deployed v11 has no {absent_column} column");
+    }
+    drop(connection);
+    drop(ledger);
+
+    let migrated = WorkLedger::open(temp.path()).expect("migrate acknowledged v11 ownership");
+    let migrated_identity: (Option<String>, Option<String>) = migrated
+        .connect_read_only()
+        .expect("migrated identity connection")
+        .query_row(
+            "SELECT repository_provider, repository_id
+               FROM workstream_projection_bindings WHERE work_item_id = ?1",
+            [&fence.work_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("preserved legacy repository identity");
+    assert_eq!(migrated_identity, (None, None));
+    let expires_at = Utc::now() + ChronoDuration::seconds(60);
+    assert!(
+        migrated
+            .bootstrap_legacy_ownership_with_protected_holder(&fence.ownership_id, expires_at)
+            .is_err(),
+        "legacy ownership cannot bootstrap before authenticated repository enrichment"
+    );
+    let connection = migrated.connect_read_only().expect("legacy publication");
+    let binding: (String, String, u64, u64, u64, u64, String, String) = connection
+        .query_row(
+            "SELECT workstream_handle, plan_sha256, root_revision, issue_revision,
+                    projection_revision, material_event_revision, repository, exact_head
+               FROM workstream_projection_bindings WHERE work_item_id = ?1",
+            [&fence.work_item_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .expect("legacy binding");
+    let publication: (String, u64, u64) = connection
+        .query_row(
+            "SELECT source_digest, pr, owner_generation FROM work_items WHERE id = ?1",
+            [&fence.work_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("legacy publication identity");
+    let continuations: (String, String) = connection
+        .query_row(
+            "SELECT success_contract_digest, failure_contract_digest
+               FROM continuation_contracts WHERE work_item_id = ?1",
+            [&fence.work_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("legacy continuation binding");
+    let route_ref: String = connection
+        .query_row(
+            "SELECT route_ref FROM route_records
+              WHERE work_item_id = ?1 AND owner_generation = ?2 LIMIT 1",
+            params![fence.work_item_id, publication.2],
+            |row| row.get(0),
+        )
+        .expect("legacy route binding");
+    let profile: (String, String) = connection
+        .query_row(
+            "SELECT profile_ref, content_digest FROM protected_objects
+              WHERE work_item_id = ?1 AND kind = 'launch_profile' LIMIT 1",
+            [&fence.work_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("legacy protected launch profile");
+    drop(connection);
+    assert!(
+        migrated
+            .enrich_legacy_projection_repository_identity(
+                &fence.work_item_id,
+                &binding.0,
+                &binding.1,
+                binding.2,
+                binding.3,
+                binding.4,
+                binding.5,
+                &fence.repository_provider,
+                &fence.repository_id,
+                &binding.6,
+                &binding.6,
+                &binding.7,
+                &publication.0,
+                &route_ref,
+                &profile.0,
+                &profile.1,
+                &continuations.0,
+                &continuations.1,
+                publication.1,
+                publication.2,
+            )
+            .expect("authenticated complete publication enriches legacy repository identity")
+    );
+    let (lease, material) = migrated
+        .bootstrap_legacy_ownership_with_protected_holder(&fence.ownership_id, expires_at)
+        .expect("bootstrap upgraded acknowledged ownership");
+    assert_eq!(lease.lease_generation, 1);
+    let (replayed, replay_material) = migrated
+        .bootstrap_legacy_ownership_with_protected_holder(&fence.ownership_id, expires_at)
+        .expect("bootstrap lost-response replay");
+    assert_eq!(replayed, lease);
+    assert_eq!(replay_material, material);
+}
+
+#[test]
+fn gate_0b_3_v11_same_name_schema_mutation_refuses_before_migration() {
+    let (temp, ledger, _fence, _holder, _delivery, _receipt) = ownership_lease_fixture();
+    let connection = ledger.connect_read_write().expect("v11 mutation fixture");
+    reconstruct_authentic_v11_schema_for_test(&connection).expect("authentic deployed v11");
+    connection
+        .execute_batch(
+            "DROP TRIGGER workstream_projection_binding_identity_immutable;
+             CREATE TRIGGER workstream_projection_binding_identity_immutable
+             BEFORE UPDATE OF work_item_id ON workstream_projection_bindings
+             BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;",
+        )
+        .expect("plant same-name weaker trigger");
+    drop(connection);
+    drop(ledger);
+
+    assert!(
+        WorkLedger::open(temp.path()).is_err(),
+        "altered same-name v11 schema must refuse before migration"
+    );
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(temp.path()))
+        .expect("refused ledger remains inspectable");
+    assert_eq!(schema_version(&connection).expect("preserved version"), 11);
+    let migrated: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+              WHERE type = 'table' AND name = 'ownership_leases')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("migration side-effect query");
+    assert!(!migrated);
+
+    let (custody_temp, custody_ledger, ..) = ownership_lease_fixture();
+    let custody_connection = custody_ledger
+        .connect_read_write()
+        .expect("v11 custody mutation fixture");
+    reconstruct_authentic_v11_schema_for_test(&custody_connection)
+        .expect("authentic deployed v11 custody schema");
+    custody_connection
+        .execute_batch(
+            "DROP TRIGGER custody_successor_receipt_immutable;
+             CREATE TRIGGER custody_successor_receipt_immutable
+             BEFORE UPDATE OF receipt_digest ON custody_successor_rebinds
+             WHEN OLD.receipt_digest IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'custody successor receipt is immutable'); END;",
+        )
+        .expect("plant same-name weaker custody trigger");
+    drop(custody_connection);
+    drop(custody_ledger);
+    assert!(
+        WorkLedger::open(custody_temp.path()).is_err(),
+        "altered same-name v11 custody schema must refuse before migration"
+    );
+    let custody_connection = rusqlite::Connection::open(WorkLedger::path_at(custody_temp.path()))
+        .expect("refused custody ledger remains inspectable");
+    assert_eq!(
+        schema_version(&custody_connection).expect("preserved custody version"),
+        11
+    );
+    let migrated: bool = custody_connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+              WHERE type = 'table' AND name = 'ownership_leases')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("custody migration side-effect query");
+    assert!(!migrated);
+}
+
+#[test]
+fn gate_0b_3_ownership_lease_renews_by_generation_and_refuses_identity_drift() {
+    let (_temp, ledger, fence, holder, _delivery_id, _context_digest) = ownership_lease_fixture();
+    let now = Utc::now();
+    let first_expiry = now + ChronoDuration::seconds(60);
+    let first = ledger
+        .establish_ownership_lease_at_for_test(&fence, &holder, first_expiry, now)
+        .expect("establish lease");
+    assert_eq!(first.lease_generation, 1);
+
+    let renewed_expiry = now + ChronoDuration::seconds(120);
+    let renewed_holder = OwnershipLeaseHolder {
+        holder_ref: holder.holder_ref.clone(),
+        incarnation_ref: opaque_ref("incarnation", "renewed process"),
+        credential_digest: digest(b"renewed protected holder credential"),
+    };
+    let renewed = ledger
+        .renew_ownership_lease_at_for_test(&fence, &holder, &renewed_holder, 1, renewed_expiry, now)
+        .expect("renew lease");
+    assert_eq!(renewed.lease_generation, 2);
+    assert_eq!(
+        renewed.predecessor_lease_id.as_deref(),
+        Some(first.lease_id.as_str())
+    );
+    assert_eq!(
+        ledger
+            .renew_ownership_lease_at_for_test(
+                &fence,
+                &holder,
+                &renewed_holder,
+                1,
+                renewed_expiry,
+                now,
+            )
+            .expect("renew replay"),
+        renewed
+    );
+
+    let mut wrong_head = fence.clone();
+    wrong_head.exact_head = "1234567890123456789012345678901234567890".to_owned();
+    assert!(
+        ledger
+            .renew_ownership_lease_at_for_test(
+                &wrong_head,
+                &renewed_holder,
+                &OwnershipLeaseHolder {
+                    holder_ref: renewed_holder.holder_ref.clone(),
+                    incarnation_ref: opaque_ref("incarnation", "third process"),
+                    credential_digest: digest(b"third protected holder credential"),
+                },
+                2,
+                now + ChronoDuration::seconds(180),
+                now,
+            )
+            .is_err(),
+        "repository/head drift must refuse before renewal"
+    );
+}
+
+#[test]
+fn gate_0b_3_active_ownership_lease_fences_return_until_explicit_release() {
+    let (_temp, ledger, fence, holder, delivery_id, context_digest) = ownership_lease_fixture();
+    let lease = ledger
+        .establish_ownership_lease(&fence, &holder, Utc::now() + ChronoDuration::seconds(60))
+        .expect("establish lease");
+    let expected = return_expectation(
+        &fence.work_item_id,
+        &fence.ownership_id,
+        &context_digest,
+        &delivery_id,
+    );
+    let return_bytes = serde_json::to_vec(&return_receipt(&expected)).expect("return receipt");
+    assert!(
+        ledger
+            .return_agent_ownership(
+                &fence.ownership_id,
+                &delivery_id,
+                7,
+                &expected,
+                &return_bytes,
+            )
+            .is_err(),
+        "the pre-existing return path must not bypass active lease custody"
+    );
+
+    let holder_material = serde_json::to_vec(
+        &crate::work_ledger::ownership_lease::OwnershipHolderMaterial {
+            schema_version: 1,
+            ownership_id: fence.ownership_id.clone(),
+            lease_generation: lease.lease_generation,
+            holder_ref: holder.holder_ref.clone(),
+            incarnation_ref: holder.incarnation_ref.clone(),
+            credential: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+        },
+    )
+    .expect("holder material");
+    ledger
+        .return_agent_ownership_with_holder(
+            &fence.ownership_id,
+            &delivery_id,
+            7,
+            &expected,
+            &return_bytes,
+            &holder_material,
+        )
+        .expect("exact return atomically releases its active ownership lease");
+    let state: String = ledger
+        .connect_read_only()
+        .expect("lease database")
+        .query_row(
+            "SELECT state FROM ownership_leases WHERE lease_id = ?1",
+            [&lease.lease_id],
+            |row| row.get(0),
+        )
+        .expect("released lease row");
+    assert_eq!(state, "released");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One end-to-end atomic-adoption race proof.
+fn gate_0b_3_successor_adoption_is_atomic_idempotent_without_a_death_mode() {
+    let (_temp, ledger, fence, predecessor, _delivery_id, _context_digest) =
+        ownership_lease_fixture();
+    let now = Utc::now();
+    let lease = ledger
+        .establish_ownership_lease_at_for_test(
+            &fence,
+            &predecessor,
+            now + ChronoDuration::seconds(60),
+            now,
+        )
+        .expect("establish lease");
+    {
+        let mut connection = ledger.connect_read_write().expect("lease database");
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("lease transaction");
+        assert!(
+            crate::work_ledger::ownership_lease::validate_active_successor_lease_for_custody(
+                &tx,
+                &lease,
+                &fence.work_item_id,
+                lease.work_generation,
+                lease.owner_generation,
+                &fence.workstream_handle,
+            )
+            .is_err(),
+            "an initial holder lease must not authorize a custody successor rebind"
+        );
+    }
+    let successor = OwnershipLeaseHolder {
+        holder_ref: opaque_ref("owner", "successor agent"),
+        incarnation_ref: opaque_ref("incarnation", "successor process"),
+        credential_digest: digest(b"successor protected holder credential"),
+    };
+    let successor_expiry = now + ChronoDuration::seconds(90);
+    let adopted = ledger
+        .adopt_ownership_at_for_test(
+            &fence,
+            &successor,
+            1,
+            successor_expiry,
+            OwnershipAdoptionProof::Expired {
+                expected_expires_at: lease.expires_at,
+            },
+            lease.expires_at,
+        )
+        .expect("atomic successor");
+    let OwnershipAdoptionResult::SuccessorCreated(successor_lease) = adopted else {
+        panic!("expected successor creation")
+    };
+    assert_eq!(successor_lease.lease_generation, 2);
+    assert_eq!(successor_lease.owner_generation, lease.owner_generation + 1);
+    assert_eq!(successor_lease.transition_kind, "expired");
+    {
+        let mut connection = ledger.connect_read_write().expect("lease database");
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("lease transaction");
+        crate::work_ledger::ownership_lease::validate_active_successor_lease_for_custody(
+            &tx,
+            &successor_lease,
+            &fence.work_item_id,
+            successor_lease.work_generation,
+            lease.owner_generation,
+            &fence.workstream_handle,
+        )
+        .expect("adopted lease is the sole custody successor authority");
+    }
+
+    let replay = ledger
+        .adopt_ownership_at_for_test(
+            &fence,
+            &successor,
+            1,
+            successor_expiry,
+            OwnershipAdoptionProof::Expired {
+                expected_expires_at: lease.expires_at,
+            },
+            lease.expires_at,
+        )
+        .expect("lost-response replay attaches existing successor");
+    assert_eq!(
+        replay,
+        OwnershipAdoptionResult::SuccessorCreated(successor_lease)
+    );
+    assert!(
+        ledger
+            .adopt_ownership_at_for_test(
+                &fence,
+                &successor,
+                1,
+                successor_expiry,
+                OwnershipAdoptionProof::Expired {
+                    expected_expires_at: lease.expires_at,
+                },
+                successor_expiry,
+            )
+            .is_err(),
+        "a delayed replay cannot reauthorize an expired successor lease"
+    );
+
+    let conflicting = OwnershipLeaseHolder {
+        holder_ref: opaque_ref("owner", "competing successor agent"),
+        incarnation_ref: opaque_ref("incarnation", "competing successor process"),
+        credential_digest: digest(b"competing protected holder credential"),
+    };
+    assert!(
+        ledger
+            .adopt_ownership_at_for_test(
+                &fence,
+                &conflicting,
+                1,
+                successor_expiry,
+                OwnershipAdoptionProof::Expired {
+                    expected_expires_at: lease.expires_at,
+                },
+                lease.expires_at,
+            )
+            .is_err(),
+        "a competing successor must lose after the atomic generation transition"
+    );
+}
+
+#[test]
+fn gate_0b_3_custody_accepts_renewed_and_later_successor_generations() {
+    let (_temp, ledger, fence, predecessor, _delivery, _receipt) = ownership_lease_fixture();
+    let now = Utc::now();
+    let initial_expiry = now + ChronoDuration::seconds(30);
+    let initial = ledger
+        .establish_ownership_lease_at_for_test(&fence, &predecessor, initial_expiry, now)
+        .expect("initial lease");
+    let first_holder = OwnershipLeaseHolder {
+        holder_ref: opaque_ref("owner", "first successor"),
+        incarnation_ref: opaque_ref("incarnation", "first successor"),
+        credential_digest: digest(b"first successor credential"),
+    };
+    let first = match ledger
+        .adopt_ownership_at_for_test(
+            &fence,
+            &first_holder,
+            1,
+            initial_expiry + ChronoDuration::seconds(60),
+            OwnershipAdoptionProof::Expired {
+                expected_expires_at: initial_expiry,
+            },
+            initial_expiry,
+        )
+        .expect("first successor")
+    {
+        OwnershipAdoptionResult::SuccessorCreated(lease) => lease,
+        OwnershipAdoptionResult::Attached(_) => panic!("expected successor"),
+    };
+    let renewed_holder = OwnershipLeaseHolder {
+        holder_ref: first_holder.holder_ref.clone(),
+        incarnation_ref: opaque_ref("incarnation", "renewed first successor"),
+        credential_digest: digest(b"renewed first successor credential"),
+    };
+    let renewed_expiry = initial_expiry + ChronoDuration::seconds(120);
+    let renewed = ledger
+        .renew_ownership_lease_at_for_test(
+            &fence,
+            &first_holder,
+            &renewed_holder,
+            first.lease_generation,
+            renewed_expiry,
+            initial_expiry,
+        )
+        .expect("renew adopted successor");
+    let connection = ledger.connect_read_write().expect("custody validation");
+    let tx = connection
+        .unchecked_transaction()
+        .expect("validation transaction");
+    crate::work_ledger::ownership_lease::validate_active_successor_lease_for_custody(
+        &tx,
+        &renewed,
+        &fence.work_item_id,
+        renewed.work_generation,
+        initial.owner_generation,
+        &fence.workstream_handle,
+    )
+    .expect("renewed first successor remains current custody authority");
+    tx.commit().expect("validation commit");
+    drop(connection);
+
+    let later_holder = OwnershipLeaseHolder {
+        holder_ref: opaque_ref("owner", "later successor"),
+        incarnation_ref: opaque_ref("incarnation", "later successor"),
+        credential_digest: digest(b"later successor credential"),
+    };
+    let later = match ledger
+        .adopt_ownership_at_for_test(
+            &fence,
+            &later_holder,
+            renewed.lease_generation,
+            renewed_expiry + ChronoDuration::seconds(60),
+            OwnershipAdoptionProof::Expired {
+                expected_expires_at: renewed_expiry,
+            },
+            renewed_expiry,
+        )
+        .expect("later successor")
+    {
+        OwnershipAdoptionResult::SuccessorCreated(lease) => lease,
+        OwnershipAdoptionResult::Attached(_) => panic!("expected later successor"),
+    };
+    let connection = ledger
+        .connect_read_write()
+        .expect("later custody validation");
+    let tx = connection
+        .unchecked_transaction()
+        .expect("later validation transaction");
+    crate::work_ledger::ownership_lease::validate_active_successor_lease_for_custody(
+        &tx,
+        &later,
+        &fence.work_item_id,
+        later.work_generation,
+        initial.owner_generation,
+        &fence.workstream_handle,
+    )
+    .expect("later successor remains current custody authority");
+    tx.commit().expect("later validation commit");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One Gate 0B.3 refusal/replay proof keeps one custody history.
+fn gate_0b_3_successor_accepts_only_exact_expiry_or_durable_release_receipt() {
+    let (_temp, ledger, fence, predecessor, _delivery_id, _context_digest) =
+        ownership_lease_fixture();
+    let now = Utc::now();
+    let expiry = now + ChronoDuration::seconds(30);
+    let initial = ledger
+        .establish_ownership_lease_at_for_test(&fence, &predecessor, expiry, now)
+        .expect("establish lease");
+    let successor = OwnershipLeaseHolder {
+        holder_ref: opaque_ref("owner", "expiry successor"),
+        incarnation_ref: opaque_ref("incarnation", "expiry successor"),
+        credential_digest: digest(b"expiry successor protected holder credential"),
+    };
+    assert!(
+        ledger
+            .adopt_ownership_at_for_test(
+                &fence,
+                &successor,
+                1,
+                now + ChronoDuration::seconds(90),
+                OwnershipAdoptionProof::Expired {
+                    expected_expires_at: expiry,
+                },
+                now,
+            )
+            .is_err(),
+        "an unexpired lease must refuse"
+    );
+    assert!(
+        ledger
+            .adopt_ownership_at_for_test(
+                &fence,
+                &predecessor,
+                1,
+                now + ChronoDuration::seconds(90),
+                OwnershipAdoptionProof::Expired {
+                    expected_expires_at: expiry,
+                },
+                expiry,
+            )
+            .is_err(),
+        "an expired holder incarnation cannot reattach itself"
+    );
+    let adopted = ledger
+        .adopt_ownership_at_for_test(
+            &fence,
+            &successor,
+            1,
+            now + ChronoDuration::seconds(90),
+            OwnershipAdoptionProof::Expired {
+                expected_expires_at: expiry,
+            },
+            expiry,
+        )
+        .expect("exact expiry permits successor");
+    assert!(matches!(
+        adopted,
+        OwnershipAdoptionResult::SuccessorCreated(_)
+    ));
+    let authoritative_generations: (u64, u64) = ledger
+        .connect_read_only()
+        .expect("authoritative generations")
+        .query_row(
+            "SELECT ownership.owner_generation, work.owner_generation
+               FROM agent_ownership ownership
+               JOIN work_items work ON work.id = ownership.work_item_id
+              WHERE ownership.ownership_id = ?1",
+            [&fence.ownership_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("advanced ownership generations");
+    assert_eq!(
+        authoritative_generations,
+        (initial.owner_generation + 1, initial.owner_generation + 1)
+    );
+
+    let (_temp, ledger, fence, predecessor, _delivery_id, _context_digest) =
+        ownership_lease_fixture();
+    let released = ledger
+        .establish_ownership_lease(
+            &fence,
+            &predecessor,
+            Utc::now() + ChronoDuration::seconds(60),
+        )
+        .expect("establish release lease");
+    let release_digest = ledger
+        .release_ownership_lease(&fence, &predecessor, released.lease_generation)
+        .expect("explicit release");
+    assert!(
+        ledger
+            .adopt_ownership(
+                &fence,
+                &successor,
+                released.lease_generation,
+                Utc::now() + ChronoDuration::seconds(60),
+                OwnershipAdoptionProof::ExplicitRelease {
+                    release_digest: digest(b"forged release"),
+                },
+            )
+            .is_err(),
+        "a digest without the durable release row must refuse"
+    );
+    let proof = serde_json::to_vec(&serde_json::json!({
+        "kind": "explicit_release",
+        "release_digest": release_digest,
+    }))
+    .expect("release proof");
+    let successor_expires_at = Utc::now() + ChronoDuration::seconds(60);
+    let (adopted, successor_material) = ledger
+        .adopt_ownership_with_protected_holder(
+            &fence.ownership_id,
+            released.lease_generation,
+            successor_expires_at,
+            &proof,
+            None,
+        )
+        .expect("production released successor");
+    assert!(matches!(
+        adopted,
+        OwnershipAdoptionResult::SuccessorCreated(_)
+    ));
+    let (replay, replay_material) = ledger
+        .adopt_ownership_with_protected_holder(
+            &fence.ownership_id,
+            released.lease_generation,
+            successor_expires_at,
+            &proof,
+            None,
+        )
+        .expect("production adoption replay");
+    assert!(matches!(
+        replay,
+        OwnershipAdoptionResult::SuccessorCreated(_)
+    ));
+    assert_eq!(replay_material, successor_material);
 }
 
 #[test]

@@ -22,7 +22,7 @@ use crate::work_ledger::{
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 
 use super::CliFailure;
-use super::cli::{WorkLedgerCommand, WorkLedgerPolicyCommand};
+use super::cli::{OwnershipLeaseCommand, WorkLedgerCommand, WorkLedgerPolicyCommand};
 use super::merge_steward_cmd::native_publication_request;
 
 const MAX_AGENT_RECEIPT_BYTES: u64 = 64 * 1024;
@@ -360,7 +360,12 @@ pub(super) fn work_ledger_command<W: Write>(
                 .map_err(failure)?;
             }
         }
-        WorkLedgerCommand::AcknowledgeContext { wake, receipt } => {
+        WorkLedgerCommand::AcknowledgeContext {
+            wake,
+            receipt,
+            holder_output,
+        } => {
+            let mut holder_file = reserve_private_output(holder_output)?;
             let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
             let (bytes, ready) =
                 read_then_revalidate(&mut activation, || read_private_input(receipt))?;
@@ -373,9 +378,10 @@ pub(super) fn work_ledger_command<W: Write>(
                 .agent_context_challenge(wake, &ready.config.repositories)
                 .map_err(failure)?;
             activation.revalidate()?;
-            let ownership = ledger
-                .acknowledge_agent_context(wake, &bytes)
+            let (ownership, holder_material) = ledger
+                .acknowledge_agent_context_with_lease(wake, &bytes)
                 .map_err(failure)?;
+            write_private_output(&mut holder_file, &holder_material)?;
             let return_challenge = ledger
                 .agent_return_challenge(&ownership.ownership_id, &ready.config.repositories)
                 .map_err(failure)?;
@@ -412,19 +418,25 @@ pub(super) fn work_ledger_command<W: Write>(
             ownership,
             expectation,
             receipt,
+            holder,
         } => {
-            if expectation == Path::new("-") && receipt == Path::new("-") {
+            let stdin_count = [expectation, receipt, holder]
+                .into_iter()
+                .filter(|path| path.as_path() == Path::new("-"))
+                .count();
+            if stdin_count > 1 {
                 return Err(CliFailure::new(
                     1,
-                    "expectation and receipt cannot both read from stdin",
+                    "only one return input may read from stdin",
                 ));
             }
             let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
-            let ((expectation_bytes, receipt_bytes), ready) =
+            let ((expectation_bytes, receipt_bytes, holder_bytes), ready) =
                 read_then_revalidate(&mut activation, || {
                     Ok((
                         read_private_input(expectation)?,
                         read_private_input(receipt)?,
+                        read_private_input(holder)?,
                     ))
                 })?;
             let expected: AgentReturnExpectation = serde_json::from_slice(&expectation_bytes)
@@ -447,21 +459,249 @@ pub(super) fn work_ledger_command<W: Write>(
                 .map_err(failure)?;
             activation.revalidate()?;
             let returned = ledger
-                .return_agent_ownership(
+                .return_agent_ownership_with_holder(
                     ownership,
                     &expected.delivery_id,
                     expected.work_generation,
                     &expected,
                     &receipt_bytes,
+                    &holder_bytes,
                 )
                 .map_err(failure)?;
             write_agent_transition(stdout, json, "ownership_returned", &returned, None)?;
         }
+        WorkLedgerCommand::Ownership { command } => match command.as_ref() {
+            OwnershipLeaseCommand::Bootstrap { .. } => ownership_bootstrap_command(
+                command.as_ref(),
+                runtime_paths,
+                state_dir,
+                json,
+                stdout,
+            )?,
+            OwnershipLeaseCommand::Renew { .. } => {
+                ownership_renew_command(command.as_ref(), runtime_paths, state_dir, json, stdout)?;
+            }
+            OwnershipLeaseCommand::Release { .. } => {
+                ownership_release_command(
+                    command.as_ref(),
+                    runtime_paths,
+                    state_dir,
+                    json,
+                    stdout,
+                )?;
+            }
+            OwnershipLeaseCommand::Adopt { .. } => {
+                ownership_adopt_command(command.as_ref(), runtime_paths, state_dir, json, stdout)?;
+            }
+            OwnershipLeaseCommand::CustodyPrepare { .. } => ownership_custody_prepare_command(
+                command.as_ref(),
+                runtime_paths,
+                state_dir,
+                json,
+                stdout,
+            )?,
+        },
         WorkLedgerCommand::Policy { command } => {
-            policy_command(command, state_dir, json, stdout)?;
+            policy_command(command.as_ref(), state_dir, json, stdout)?;
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn parse_lease_expiry(value: &str) -> Result<chrono::DateTime<chrono::Utc>, CliFailure> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&chrono::Utc))
+        .map_err(|_| CliFailure::new(1, "lease expiry must be exact RFC3339"))
+}
+
+fn ownership_bootstrap_command<W: Write>(
+    command: &OwnershipLeaseCommand,
+    runtime_paths: &RuntimePaths,
+    state_dir: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let OwnershipLeaseCommand::Bootstrap { request } = command else {
+        unreachable!("bootstrap helper requires bootstrap command")
+    };
+    let expires_at = parse_lease_expiry(&request.expires_at)?;
+    let mut holder_file = reserve_private_output(&request.holder_output)?;
+    let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
+    let ledger = required_ledger(state_dir)?;
+    activation.revalidate()?;
+    let (lease, holder_material) = ledger
+        .bootstrap_legacy_ownership_with_protected_holder(&request.ownership, expires_at)
+        .map_err(failure)?;
+    write_private_output(&mut holder_file, &holder_material)?;
+    if json {
+        write_pretty_json(stdout, &lease).map_err(failure)?;
+    } else {
+        writeln!(stdout, "Ownership lease: bootstrapped").map_err(failure)?;
+        writeln!(stdout, "Lease: {}", lease.lease_id).map_err(failure)?;
+        writeln!(stdout, "Generation: {}", lease.lease_generation).map_err(failure)?;
+    }
+    Ok(())
+}
+
+fn ownership_renew_command<W: Write>(
+    command: &OwnershipLeaseCommand,
+    runtime_paths: &RuntimePaths,
+    state_dir: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let OwnershipLeaseCommand::Renew { request } = command else {
+        unreachable!("renew helper requires renew command")
+    };
+    let expires_at = parse_lease_expiry(&request.expires_at)?;
+    let mut successor_file = reserve_private_output(&request.holder_output)?;
+    let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
+    let (holder_bytes, _) =
+        read_then_revalidate(&mut activation, || read_private_input(&request.holder))?;
+    let ledger = required_ledger(state_dir)?;
+    activation.revalidate()?;
+    let (renewed, successor_material) = ledger
+        .renew_ownership_lease_with_material(
+            &request.ownership,
+            &holder_bytes,
+            request.expected_generation,
+            expires_at,
+        )
+        .map_err(failure)?;
+    write_private_output(&mut successor_file, &successor_material)?;
+    if json {
+        write_pretty_json(stdout, &renewed).map_err(failure)?;
+    } else {
+        writeln!(stdout, "Ownership lease: renewed").map_err(failure)?;
+        writeln!(stdout, "Lease: {}", renewed.lease_id).map_err(failure)?;
+        writeln!(stdout, "Generation: {}", renewed.lease_generation).map_err(failure)?;
+    }
+    Ok(())
+}
+
+fn ownership_release_command<W: Write>(
+    command: &OwnershipLeaseCommand,
+    runtime_paths: &RuntimePaths,
+    state_dir: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let OwnershipLeaseCommand::Release { request } = command else {
+        unreachable!("release helper requires release command")
+    };
+    let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
+    let (holder_bytes, _) =
+        read_then_revalidate(&mut activation, || read_private_input(&request.holder))?;
+    let ledger = required_ledger(state_dir)?;
+    activation.revalidate()?;
+    let release_digest = ledger
+        .release_ownership_lease_with_material(
+            &request.ownership,
+            &holder_bytes,
+            request.expected_generation,
+        )
+        .map_err(failure)?;
+    if json {
+        write_pretty_json(
+            stdout,
+            &serde_json::json!({
+                "ownership_id": request.ownership,
+                "lease_generation": request.expected_generation,
+                "release_digest": release_digest,
+            }),
+        )
+        .map_err(failure)?;
+    } else {
+        writeln!(stdout, "Ownership lease: released").map_err(failure)?;
+        writeln!(stdout, "Release digest: {release_digest}").map_err(failure)?;
+    }
+    Ok(())
+}
+
+fn ownership_adopt_command<W: Write>(
+    command: &OwnershipLeaseCommand,
+    runtime_paths: &RuntimePaths,
+    state_dir: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let OwnershipLeaseCommand::Adopt { request } = command else {
+        unreachable!("adopt helper requires adopt command")
+    };
+    let expires_at = parse_lease_expiry(&request.expires_at)?;
+    let mut holder_file = reserve_private_output(&request.holder_output)?;
+    let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
+    let (proof_bytes, _) =
+        read_then_revalidate(&mut activation, || read_private_input(&request.proof))?;
+    let holder_bytes = request
+        .holder
+        .as_ref()
+        .map(|holder| read_then_revalidate(&mut activation, || read_private_input(holder)))
+        .transpose()?
+        .map(|(bytes, _)| bytes);
+    let ledger = required_ledger(state_dir)?;
+    activation.revalidate()?;
+    let (adopted, holder_material) = ledger
+        .adopt_ownership_with_protected_holder(
+            &request.ownership,
+            request.expected_generation,
+            expires_at,
+            &proof_bytes,
+            holder_bytes.as_deref(),
+        )
+        .map_err(failure)?;
+    write_private_output(&mut holder_file, &holder_material)?;
+    if json {
+        write_pretty_json(stdout, &adopted).map_err(failure)?;
+    } else {
+        let lease = match &adopted {
+            crate::work_ledger::OwnershipAdoptionResult::Attached(lease)
+            | crate::work_ledger::OwnershipAdoptionResult::SuccessorCreated(lease) => lease,
+        };
+        writeln!(stdout, "Ownership lease: adopted").map_err(failure)?;
+        writeln!(stdout, "Lease: {}", lease.lease_id).map_err(failure)?;
+        writeln!(stdout, "Generation: {}", lease.lease_generation).map_err(failure)?;
+    }
+    Ok(())
+}
+
+fn ownership_custody_prepare_command<W: Write>(
+    command: &OwnershipLeaseCommand,
+    runtime_paths: &RuntimePaths,
+    state_dir: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let OwnershipLeaseCommand::CustodyPrepare { request } = command else {
+        unreachable!("custody prepare helper requires custody prepare command")
+    };
+    let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
+    let (holder_bytes, _) =
+        read_then_revalidate(&mut activation, || read_private_input(&request.holder))?;
+    let ledger = required_ledger(state_dir)?;
+    activation.revalidate()?;
+    let rebind = ledger
+        .prepare_custody_successor_rebind_with_holder(
+            &request.message,
+            &request.expected_old_incarnation,
+            &request.new_target_incarnation,
+            &request.new_target_route,
+            &request.terminal_adapter,
+            &request.new_authority_digest,
+            &request.ownership,
+            request.expected_generation,
+            &holder_bytes,
+        )
+        .map_err(failure)?;
+    if json {
+        write_pretty_json(stdout, &rebind).map_err(failure)?;
+    } else {
+        writeln!(stdout, "Custody successor: prepared").map_err(failure)?;
+        writeln!(stdout, "Rebind: {}", rebind.rebind_id).map_err(failure)?;
+        writeln!(stdout, "Lease: {}", rebind.ownership_lease_id).map_err(failure)?;
+        writeln!(stdout, "Generation: {}", rebind.ownership_lease_generation).map_err(failure)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -782,6 +1022,31 @@ fn read_private_input(path: &Path) -> Result<Vec<u8>, CliFailure> {
         return Ok(bytes);
     }
     read_private_file(path)
+}
+
+fn reserve_private_output(path: &Path) -> Result<std::fs::File, CliFailure> {
+    if path == Path::new("-") {
+        return Err(CliFailure::new(
+            1,
+            "protected holder material cannot be written to stdout",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .map_err(|_| CliFailure::new(1, "holder output must be a new owner-only file"))
+}
+
+fn write_private_output(file: &mut std::fs::File, bytes: &[u8]) -> Result<(), CliFailure> {
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| CliFailure::new(1, "holder output could not be durably written"))
 }
 
 fn read_private_file(path: &Path) -> Result<Vec<u8>, CliFailure> {
