@@ -1050,9 +1050,6 @@ mod tests {
         super::super::storage::reconstruct_authentic_v11_schema_for_test(&connection)
             .expect("authentic production v11 schema");
         connection
-            .execute_batch("DROP TABLE dispatch_probe_targets;")
-            .expect("production v11 has no dispatch probe state");
-        connection
             .execute(
                 "INSERT INTO workstream_projection_bindings
                  (work_item_id, workstream_handle, plan_sha256, root_revision, issue_revision,
