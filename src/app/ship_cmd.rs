@@ -9,7 +9,8 @@ use super::daemon_cmd::ensure_execution_daemon;
 #[cfg(not(test))]
 use super::merge_steward_cmd::steward_handoff_command;
 use super::{
-    CliFailure, SHIP_EXIT_MERGE_CLIENT_DEFECT, SHIP_EXIT_VALIDATION_STATE_MISSING,
+    CliFailure, SHIP_EXIT_AUTOMATIC_MERGE_REFUSED, SHIP_EXIT_MERGE_CLIENT_DEFECT,
+    SHIP_EXIT_VALIDATION_STATE_MISSING,
     auto_merge_cmd::{
         AutoMergeOutcome, AutoMergeRequest, execute_auto_merge, is_graphql_malformed_query_error,
         supervise_merge_queue,

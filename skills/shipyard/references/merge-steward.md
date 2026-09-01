@@ -17,7 +17,7 @@ reruns durably, and live-revalidates queued state plus immutable head before
 cancelling a run whose PR or merge-group head is provably superseded.
 Same-head duplicate runs are never cancelled because their unobserved inputs
 may differ. Repositories without a server-owned
-merge queue receive a typed `direct_merge_refused` decision: the REST merge
+merge queue receive a typed `automatic-merge-refused` decision (exit 10): the REST merge
 endpoint cannot atomically prove complete required-check materialization or
 bind the validated base revision. Use manual merge or enable a native merge
 queue.

@@ -110,6 +110,9 @@ pub(super) fn render_human<W: Write>(
         ShipRenderState::GreenNotMergedClientDefect(error) => {
             render_green_not_merged_client_defect(stdout, pr, error)
         }
+        ShipRenderState::GreenAutomaticMergeRefused(detail) => {
+            render_green_automatic_merge_refused(stdout, pr, detail)
+        }
         ShipRenderState::GreenNotMergedHeadSuperseded { validated, current } => {
             render_green_not_merged_head_superseded(stdout, pr, validated, current)
         }
@@ -119,6 +122,19 @@ pub(super) fn render_human<W: Write>(
         } => render_green_not_merged_flaky(stdout, pr, error, red_contexts),
     };
     result.map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+pub(super) fn render_green_automatic_merge_refused<W: Write>(
+    stdout: &mut W,
+    pr: u64,
+    detail: &str,
+) -> std::io::Result<()> {
+    writeln!(stdout, "Shipyard-validated targets passed for PR #{pr}.")?;
+    writeln!(stdout, "  automatic merge unavailable: {detail}")?;
+    writeln!(
+        stdout,
+        "Use the native merge queue, or perform a manual maintainer exact-head merge. Retrying Shipyard will not change this policy result."
+    )
 }
 
 /// Issue #301 (2/3). The previous render claimed "All green but

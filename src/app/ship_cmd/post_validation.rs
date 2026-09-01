@@ -7,10 +7,10 @@ use std::process::ExitCode;
 
 use super::{
     AutoMergeOutcome, AutoMergeRequest, CliFailure, LoadedConfig, MergeMethod, MergeResult,
-    RuntimeMode, SHIP_EXIT_MERGE_CLIENT_DEFECT, SHIP_EXIT_VALIDATION_STATE_MISSING, ShipStateStore,
-    WedgeClass, WedgeInputs, classify_wedge, execute_auto_merge,
-    fetch_head_and_status_check_rollup_with_cwd, is_graphql_malformed_query_error, sha_matches,
-    supervise_merge_queue, validated_green_contexts,
+    RuntimeMode, SHIP_EXIT_AUTOMATIC_MERGE_REFUSED, SHIP_EXIT_MERGE_CLIENT_DEFECT,
+    SHIP_EXIT_VALIDATION_STATE_MISSING, ShipStateStore, WedgeClass, WedgeInputs, classify_wedge,
+    execute_auto_merge, fetch_head_and_status_check_rollup_with_cwd,
+    is_graphql_malformed_query_error, sha_matches, supervise_merge_queue, validated_green_contexts,
 };
 use crate::app::auto_merge_cmd::ValidatedShipIdentity;
 use crate::queue_request::{QueuedShipDisposition, QueuedShipDispositionKind};
@@ -39,6 +39,8 @@ pub(super) enum ShipRenderState {
     },
     /// Shipyard sent GitHub a malformed merge request; the PR is not at fault.
     GreenNotMergedClientDefect(String),
+    /// Automatic merge cannot safely proceed; retrying cannot change this state.
+    GreenAutomaticMergeRefused(String),
     /// The live PR head advanced past the SHA Shipyard validated.
     GreenNotMergedHeadSuperseded {
         validated: String,
@@ -58,6 +60,7 @@ impl ShipRenderState {
             | Self::GreenPendingMergeReadiness(error)
             | Self::GreenValidationStateMissing(error)
             | Self::GreenNotMergedClientDefect(error)
+            | Self::GreenAutomaticMergeRefused(error)
             | Self::GreenNotMergedFlakyRequired { error, .. } => Some(Cow::Borrowed(error)),
             Self::GreenNotMergedHeadSuperseded { validated, current } => Some(Cow::Owned(format!(
                 "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
@@ -74,6 +77,7 @@ impl ShipRenderState {
             Self::GreenValidationStateMissing(_) => "green_validation_state_missing",
             Self::GreenNotMergedFlakyRequired { .. } => "green_not_merged_flaky_required",
             Self::GreenNotMergedClientDefect(_) => "green_not_merged_client_defect",
+            Self::GreenAutomaticMergeRefused(_) => "green_automatic_merge_refused",
             Self::GreenNotMergedHeadSuperseded { .. } => "green_not_merged_head_superseded",
         }
     }
@@ -82,6 +86,9 @@ impl ShipRenderState {
         match self {
             Self::ValidationFailed => ExitCode::from(1),
             Self::GreenNotMergedClientDefect(_) => ExitCode::from(SHIP_EXIT_MERGE_CLIENT_DEFECT),
+            Self::GreenAutomaticMergeRefused(_) => {
+                ExitCode::from(SHIP_EXIT_AUTOMATIC_MERGE_REFUSED)
+            }
             Self::GreenValidationStateMissing(_) => {
                 ExitCode::from(SHIP_EXIT_VALIDATION_STATE_MISSING)
             }
@@ -110,6 +117,9 @@ impl ShipRenderState {
             Self::GreenNotMergedClientDefect(_) => {
                 QueuedShipDispositionKind::GreenNotMergedClientDefect
             }
+            Self::GreenAutomaticMergeRefused(_) => {
+                QueuedShipDispositionKind::GreenAutomaticMergeRefused
+            }
             Self::GreenNotMergedHeadSuperseded { .. } => {
                 QueuedShipDispositionKind::GreenNotMergedHeadSuperseded
             }
@@ -117,6 +127,7 @@ impl ShipRenderState {
         let exit_code = match self {
             Self::ValidationFailed => 1,
             Self::GreenNotMergedClientDefect(_) => SHIP_EXIT_MERGE_CLIENT_DEFECT,
+            Self::GreenAutomaticMergeRefused(_) => SHIP_EXIT_AUTOMATIC_MERGE_REFUSED,
             Self::GreenValidationStateMissing(_) => SHIP_EXIT_VALIDATION_STATE_MISSING,
             Self::Merged
             | Self::GreenNotMerged(_)
@@ -186,6 +197,9 @@ pub(super) fn post_run_merge_state(
                 // Queue supervision re-runs the merge-queue poll query, so it
                 // can surface the same malformed-query defect as admission.
                 AutoMergeOutcome::MergeFailed { error } => Ok(green_not_merged(error)),
+                AutoMergeOutcome::AutomaticMergeRefused { detail } => {
+                    Ok(ShipRenderState::GreenAutomaticMergeRefused(detail))
+                }
                 AutoMergeOutcome::PrNotFound => Ok(green_validation_state_missing(pr)),
                 pending @ (AutoMergeOutcome::InFlight { .. }
                 | AutoMergeOutcome::Enqueued
@@ -196,6 +210,9 @@ pub(super) fn post_run_merge_state(
         }
         AutoMergeOutcome::MergeFailed { error } => {
             Ok(classify_merge_failure(store, config, cwd, repo, pr, error))
+        }
+        AutoMergeOutcome::AutomaticMergeRefused { detail } => {
+            Ok(ShipRenderState::GreenAutomaticMergeRefused(detail))
         }
         AutoMergeOutcome::SupersededSha { validated, current } => {
             Ok(ShipRenderState::GreenNotMergedHeadSuperseded { validated, current })
@@ -376,5 +393,21 @@ mod tests {
         assert!(output.contains("Recover the durable scoped ship state"));
         assert!(!output.contains("shipyard wait pr"));
         assert!(!output.contains("shipyard ship --pr"));
+    }
+
+    #[test]
+    fn automatic_merge_refusal_is_nonretryable_in_process_and_queue_receipts() {
+        let state = ShipRenderState::GreenAutomaticMergeRefused("manual action required".into());
+        assert_eq!(state.status(), "green_automatic_merge_refused");
+        assert_eq!(
+            state.exit_code(),
+            ExitCode::from(SHIP_EXIT_AUTOMATIC_MERGE_REFUSED)
+        );
+        let disposition = state.queued_disposition();
+        assert_eq!(
+            disposition.kind,
+            QueuedShipDispositionKind::GreenAutomaticMergeRefused
+        );
+        assert_eq!(disposition.exit_code, SHIP_EXIT_AUTOMATIC_MERGE_REFUSED);
     }
 }
