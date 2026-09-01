@@ -13,25 +13,17 @@ isolated Mac execution capacity.
 ```bash
 curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
 cd my-project
-shipyard init              # detects your project, probes your machines
+shipyard init              # detects your project and writes a starting config
 shipyard run               # validates on every platform you configured
 shipyard ship              # validate, open PR, merge on green
-shipyard watch             # live-tail an in-flight ship
-shipyard queue-observe     # read-only GitHub queue deltas with adaptive backoff
-shipyard changed-surface-plan --pr 123 --target mac  # fail-closed shadow test plan
-shipyard changed-surface-trial-status --repo owner/repo --pr 123 --target mac --head "$HEAD_SHA"  # verify shadow comparison
-shipyard wait pr 151 --state green  # wait on release / PR / run conditions
-shipyard auto-merge <pr>   # cron-friendly one-shot merge-on-green
-shipyard merge-queue status  # inspect the local queue-mutation hold
-shipyard rescue <pr>       # cancel + redispatch every stuck queued run on a PR
-shipyard runner watch --kill-hung-workers  # daemon-mode prevent + auto-kill hung Workers
-shipyard update            # self-update the CLI (or `--check` to peek)
-shipyard doctor --rate-limit  # inspect REST + GraphQL buckets separately
-shipyard release-bot setup # guided RELEASE_BOT_TOKEN setup
-shipyard cloud retarget    # switch one target's runner mid-flight
-shipyard cloud add-lane    # append a new lane to an in-flight PR
-shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
+shipyard status            # show the current queue, targets, and evidence
 ```
+
+`shipyard init` detects the project and writes a starting configuration; it
+does not probe or enroll machines. Review the generated targets and configure
+only the machines and services you intend to use. See the
+[CLI reference](docs/cli-reference.md) for monitoring, recovery, fleet,
+governance, and release commands.
 
 ## How it fits
 
@@ -50,6 +42,9 @@ Shipyard sits between the work and the machines that run it:
    capacity; SSH targets, including independently managed Proxmox Linux VMs,
    remain separate executors under the same evidence rules.
 
+Shipyard coordinates these systems; it does not replace GitHub or your build
+system.
+
 All three layers are available now when their executors are configured. Durable
 continuation within the coordination layer is deliberately opt-in and
 policy-gated: it records a specific handoff and refuses when the record, route,
@@ -62,8 +57,9 @@ project will automatically recover or merge every PR.
   Proxmox-hosted VMs over SSH, Windows, and hosted runners.
 - Submit a change and, when stewardship is enabled, let Shipyard watch the
   required tests and merge progress until the work finishes or needs help.
-- Keep long-running work understandable across terminal, daemon, and machine
-  restarts without reconstructing its state from scratch.
+- Keep long-running work understandable across terminal and daemon restarts
+  without reconstructing its local state from scratch. Moving custody to
+  another machine is a separate, explicit, authenticated setup.
 - Use the `ghapp` wrapper for scoped GitHub App authentication without putting
   short-lived credentials into unattended command lines.
 - Keep terminal delivery and model-provider routing separate. `cmux` is the
@@ -95,6 +91,11 @@ project will automatically recover or merge every PR.
   than a client polling loop, owns bounded monitoring and continuation across
   process restarts. Activation is explicit and default-off; every transition
   is generation-fenced and revalidates the protected route before dispatch.
+- **Optional cross-machine custody.** A separately configured, authenticated
+  transport can hand an accepted work item between trusted machines while
+  preserving its exact identity and restart-safe receipt. It is disabled by
+  default and does not infer custody from a hostname, terminal label, or shared
+  folder. See [durable custody transport](docs/durable-custody-transport.md).
 - **Declarative security & governance.** One TOML line picks a profile
   (`solo` or `multi`); one CLI command makes GitHub branch protection,
   tag protection, and workflow token permissions match.
@@ -124,8 +125,8 @@ project will automatically recover or merge every PR.
   `github-hosted` (or any provider via `--to`). `--rerun-failed`
   dispatches fresh replacements for terminal failed/cancelled runs without
   re-arming the originals; `--all-stuck` is the
-  repo-wide variant. Pairs with the watchdog to form a complete
-  prevent → recover toolkit.
+  repo-wide variant. It complements the watchdog for explicitly supported
+  recovery cases.
 - **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
   operator reason and terminates an active local or SSH validation process tree
   on its next progress event, including descendant build processes.
@@ -158,7 +159,7 @@ for the base-owned schema, receipt fields, and hard-fail/fallback boundary.
 
 ## Installation
 
-### Claude Code (recommended)
+### Claude Code plugin
 
 Two commands to register the marketplace and install the plugin:
 
@@ -185,7 +186,7 @@ Plugin + CLI are independently versioned; the plugin's version
 covers slash commands / skills / hooks, while the CLI's version
 covers the binary. It's safe to have both.
 
-### Codex / CLI
+### CLI (including Codex)
 
 ```bash
 curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
@@ -241,10 +242,9 @@ are serialized across local processes. During an incident,
 `shipyard merge-queue resume` removes the hold while retaining the machine
 authority check.
 
-Shipyard is not a [CI service](https://en.wikipedia.org/wiki/Continuous_integration),
-not a [build system](https://en.wikipedia.org/wiki/Build_automation),
-not a [workflow engine](https://en.wikipedia.org/wiki/Workflow_engine).
-It calls your build commands and cares about one thing: did they pass?
+Shipyard does not replace GitHub or your build system. It calls the build and
+test commands you already use, coordinates where they run, and records what
+passed for the exact change.
 
 ## Documentation
 
