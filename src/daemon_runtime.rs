@@ -331,6 +331,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut steward_repository_in_flight = None;
     let mut dispatch_probes_in_flight = BTreeSet::new();
     let mut dispatch_probe_repositories_in_flight = BTreeSet::new();
+    let mut dispatch_repository_cursor: Option<(String, String)> = None;
     let mut next_dispatch_scan_at = Instant::now();
     if let Ok(mut published) = custody_transport_error.lock() {
         *published = custody_transport_runtime.diagnostic_error();
@@ -594,11 +595,18 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 actionable_producer.due_dispatch_probes(Utc::now(), usize::MAX),
                 &occupied_dispatch_targets,
                 &occupied_dispatch_repositories,
+                dispatch_repository_cursor.as_ref(),
                 available_dispatch_probes,
             )
         } else {
             Vec::new()
         };
+        if let Some(batch) = due_dispatch_probe_batches.last() {
+            dispatch_repository_cursor = Some(normalized_dispatch_repository(
+                &batch.repository_provider,
+                &batch.repository_id,
+            ));
+        }
         for batch in due_dispatch_probe_batches {
             let mut targets = Vec::new();
             for schedule in batch.schedules {
@@ -1086,10 +1094,13 @@ fn select_due_dispatch_probe_batches(
     due: Vec<crate::actionable_wake_producer::DispatchProbeSchedule>,
     targets_in_flight: &BTreeSet<NormalizedDispatchTarget>,
     repositories_in_flight: &BTreeSet<(String, String)>,
+    repository_cursor: Option<&(String, String)>,
     limit: usize,
 ) -> Vec<DispatchProbeBatch> {
-    let mut batches: Vec<DispatchProbeBatch> = Vec::new();
-    let mut selected: BTreeMap<(String, String), usize> = BTreeMap::new();
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut candidates: BTreeMap<(String, String), DispatchProbeBatch> = BTreeMap::new();
     for schedule in due {
         if targets_in_flight.contains(&normalized_dispatch_target(
             &schedule.repository_provider,
@@ -1105,21 +1116,36 @@ fn select_due_dispatch_probe_batches(
         if repositories_in_flight.contains(&repository_key) {
             continue;
         }
-        if let Some(index) = selected.get(&repository_key).copied() {
-            if batches[index].schedules.len() < MAX_DISPATCH_TARGETS_PER_REPOSITORY_BATCH {
-                batches[index].schedules.push(schedule);
+        if let Some(batch) = candidates.get_mut(&repository_key) {
+            if batch.schedules.len() < MAX_DISPATCH_TARGETS_PER_REPOSITORY_BATCH {
+                batch.schedules.push(schedule);
             }
-        } else if batches.len() < limit {
-            selected.insert(repository_key, batches.len());
-            batches.push(DispatchProbeBatch {
-                repository_provider: schedule.repository_provider.clone(),
-                repository_id: schedule.repository_id.clone(),
-                repository: schedule.repository.clone(),
-                schedules: vec![schedule],
-            });
+        } else {
+            candidates.insert(
+                repository_key,
+                DispatchProbeBatch {
+                    repository_provider: schedule.repository_provider.clone(),
+                    repository_id: schedule.repository_id.clone(),
+                    repository: schedule.repository.clone(),
+                    schedules: vec![schedule],
+                },
+            );
         }
     }
-    batches
+    let mut after_cursor = Vec::new();
+    let mut through_cursor = Vec::new();
+    for (key, batch) in candidates {
+        if repository_cursor.is_some_and(|cursor| key <= *cursor) {
+            through_cursor.push(batch);
+        } else {
+            after_cursor.push(batch);
+        }
+    }
+    after_cursor
+        .into_iter()
+        .chain(through_cursor)
+        .take(limit)
+        .collect()
 }
 
 #[cfg(unix)]
@@ -2831,8 +2857,9 @@ mod tests {
     #[cfg(unix)]
     use super::{
         DaemonDispatchProbeTarget, NativeBaseRefLookup, classify_native_base_ref_lookup,
-        join_dispatch_probe_batch_results, normalized_dispatch_target, release_steward_ownership,
-        schedule_dispatch_followup, steward_retry_required,
+        join_dispatch_probe_batch_results, normalized_dispatch_repository,
+        normalized_dispatch_target, release_steward_ownership, schedule_dispatch_followup,
+        steward_retry_required,
     };
     #[cfg(unix)]
     use crate::actionable_wake_producer::{ActionableWakeProducer, ActionableWakeProducerStatus};
@@ -3063,7 +3090,8 @@ mod tests {
             1,
             &format!("{:040x}", 1),
         )]);
-        let selected = select_due_dispatch_probe_batches(due, &in_flight, &BTreeSet::new(), 2);
+        let selected =
+            select_due_dispatch_probe_batches(due, &in_flight, &BTreeSet::new(), None, 2);
         assert_eq!(
             selected
                 .iter()
@@ -3090,7 +3118,7 @@ mod tests {
             )
             .collect();
         let selected =
-            select_due_dispatch_probe_batches(due, &BTreeSet::new(), &BTreeSet::new(), 2);
+            select_due_dispatch_probe_batches(due, &BTreeSet::new(), &BTreeSet::new(), None, 2);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].schedules.len(), 4);
         assert_eq!(
@@ -3127,11 +3155,61 @@ mod tests {
             due_at: "2026-08-31T00:00:00+00:00".to_owned(),
         });
         let selected =
-            select_due_dispatch_probe_batches(due, &BTreeSet::new(), &BTreeSet::new(), 2);
+            select_due_dispatch_probe_batches(due, &BTreeSet::new(), &BTreeSet::new(), None, 2);
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].schedules.len(), 4);
         assert_eq!(selected[1].repository_id, "R_small");
         assert_eq!(selected[1].schedules.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_cursor_rotates_deep_backlogs_across_worker_slots() {
+        let due = || {
+            ["R_a", "R_b", "R_c"]
+                .into_iter()
+                .flat_map(|repository_id| {
+                    (1..=8).map(move |pull_request| {
+                        crate::actionable_wake_producer::DispatchProbeSchedule {
+                            repository_provider: "github".to_owned(),
+                            repository_id: repository_id.to_owned(),
+                            repository: format!("owner/{}", repository_id.to_ascii_lowercase()),
+                            pull_request,
+                            head_sha: format!("{pull_request:040x}"),
+                            due_at: "2026-08-31T00:00:00+00:00".to_owned(),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let first =
+            select_due_dispatch_probe_batches(due(), &BTreeSet::new(), &BTreeSet::new(), None, 2);
+        assert_eq!(
+            first
+                .iter()
+                .map(|batch| batch.repository_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["R_a", "R_b"]
+        );
+        let cursor = normalized_dispatch_repository(
+            &first.last().expect("second batch").repository_provider,
+            &first.last().expect("second batch").repository_id,
+        );
+
+        let second = select_due_dispatch_probe_batches(
+            due(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            Some(&cursor),
+            2,
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|batch| batch.repository_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["R_c", "R_a"]
+        );
     }
 
     #[cfg(unix)]
@@ -3149,8 +3227,13 @@ mod tests {
         let first_due = (1..=8)
             .map(|pull_request| schedule(pull_request, "2026-08-31T00:00:00+00:00"))
             .collect();
-        let first =
-            select_due_dispatch_probe_batches(first_due, &BTreeSet::new(), &BTreeSet::new(), 2);
+        let first = select_due_dispatch_probe_batches(
+            first_due,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            2,
+        );
         assert_eq!(
             first[0]
                 .schedules
@@ -3165,7 +3248,7 @@ mod tests {
             .chain((1..=4).map(|pull_request| schedule(pull_request, "2026-08-31T00:01:00+00:00")))
             .collect();
         let selected =
-            select_due_dispatch_probe_batches(due, &BTreeSet::new(), &BTreeSet::new(), 2);
+            select_due_dispatch_probe_batches(due, &BTreeSet::new(), &BTreeSet::new(), None, 2);
         assert_eq!(selected.len(), 1);
         assert_eq!(
             selected[0]
@@ -3191,8 +3274,14 @@ mod tests {
         let repositories_in_flight = BTreeSet::from([("github".to_owned(), "R_exact".to_owned())]);
 
         assert!(
-            select_due_dispatch_probe_batches(due, &BTreeSet::new(), &repositories_in_flight, 2,)
-                .is_empty()
+            select_due_dispatch_probe_batches(
+                due,
+                &BTreeSet::new(),
+                &repositories_in_flight,
+                None,
+                2,
+            )
+            .is_empty()
         );
     }
 
@@ -3246,7 +3335,10 @@ mod tests {
             42,
             &"a".repeat(40),
         )]);
-        assert!(select_due_dispatch_probe_batches(due, &in_flight, &BTreeSet::new(), 1).is_empty());
+        assert!(
+            select_due_dispatch_probe_batches(due, &in_flight, &BTreeSet::new(), None, 1)
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -3267,7 +3359,8 @@ mod tests {
             42,
             &"a".repeat(40),
         )]);
-        let selected = select_due_dispatch_probe_batches(due, &in_flight, &BTreeSet::new(), 1);
+        let selected =
+            select_due_dispatch_probe_batches(due, &in_flight, &BTreeSet::new(), None, 1);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].repository_id, "R_second");
     }

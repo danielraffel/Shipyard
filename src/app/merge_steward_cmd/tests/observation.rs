@@ -681,6 +681,167 @@ fn pull_request_transport_preserves_fresh_queue_position() {
 
 #[cfg(unix)]
 #[test]
+fn open_pull_request_transport_supports_more_than_one_hundred_rows() {
+    let temp = tempfile::tempdir().expect("temp");
+    let rows = (1..=101)
+        .map(|number| {
+            serde_json::json!({
+                "id": format!("PR_{number}"),
+                "number": number,
+                "isDraft": false,
+                "baseRefName": "main",
+                "headRefOid": format!("{number:040x}"),
+                "headRefName": format!("feature-{number}"),
+                "mergeStateStatus": "CLEAN",
+                "autoMergeRequest": null,
+                "labels": [],
+                "statusCheckRollup": []
+            })
+        })
+        .collect::<Vec<_>>();
+    let rows_path = temp.path().join("prs.json");
+    fs::write(&rows_path, serde_json::to_vec(&rows).expect("rows JSON")).expect("write rows");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+test "$9" = --limit
+test "${{10}}" = 1000
+cat '{}'
+"#,
+            rows_path.display()
+        ),
+    );
+
+    let prs = pull_requests(&actions, "owner/repo", "main", &BTreeMap::new())
+        .expect("complete open PR inventory");
+    assert_eq!(prs.len(), 101);
+    assert_eq!(prs.last().map(|pr| pr.fact.number), Some(101));
+}
+
+#[cfg(unix)]
+#[test]
+fn open_pull_request_transport_refuses_the_bounded_limit() {
+    let temp = tempfile::tempdir().expect("temp");
+    let rows = (1..=1000)
+        .map(|number| {
+            serde_json::json!({
+                "id": format!("PR_{number}"),
+                "number": number,
+                "isDraft": false,
+                "baseRefName": "main",
+                "headRefOid": format!("{number:040x}"),
+                "headRefName": format!("feature-{number}"),
+                "mergeStateStatus": "CLEAN",
+                "autoMergeRequest": null,
+                "labels": [],
+                "statusCheckRollup": []
+            })
+        })
+        .collect::<Vec<_>>();
+    let rows_path = temp.path().join("prs.json");
+    fs::write(&rows_path, serde_json::to_vec(&rows).expect("rows JSON")).expect("write rows");
+    let actions = fake_gh(&temp, &format!("cat '{}'", rows_path.display()));
+
+    let error = pull_requests(&actions, "owner/repo", "main", &BTreeMap::new())
+        .expect_err("bounded inventory");
+    assert!(error.contains("reached 1000"), "{error}");
+}
+
+#[test]
+fn dispatch_wedge_final_read_orders_pr_before_exact_queue_authority() {
+    use std::cell::RefCell;
+
+    let mut observed = ready_pr();
+    observed.fact.queue_position = Some(3);
+    let target = DispatchWedgeTargetRequest {
+        base_ref: "main".to_owned(),
+        pull_request: 42,
+        expected_head_sha: "a".repeat(40),
+    };
+    let calls = RefCell::new(Vec::new());
+    revalidate_dispatch_wedge_authority_with(
+        &observed,
+        &target,
+        3,
+        &"b".repeat(40),
+        || {
+            calls.borrow_mut().push("pr");
+            Ok(Some(observed.clone()))
+        },
+        || {
+            calls.borrow_mut().push("queue");
+            Ok((
+                true,
+                BTreeMap::from([(42, 3)]),
+                BTreeMap::from([(42, "b".repeat(40))]),
+                BTreeMap::new(),
+            ))
+        },
+    )
+    .expect("stable final authority");
+    assert_eq!(*calls.borrow(), vec!["pr", "queue"]);
+}
+
+#[test]
+fn dispatch_wedge_final_read_refuses_dequeue_or_regenerated_group() {
+    let observed = ready_pr();
+    let target = DispatchWedgeTargetRequest {
+        base_ref: "main".to_owned(),
+        pull_request: 42,
+        expected_head_sha: "a".repeat(40),
+    };
+    for (positions, heads) in [
+        (BTreeMap::new(), BTreeMap::new()),
+        (
+            BTreeMap::from([(42, 3)]),
+            BTreeMap::from([(42, "c".repeat(40))]),
+        ),
+    ] {
+        let error = revalidate_dispatch_wedge_authority_with(
+            &observed,
+            &target,
+            3,
+            &"b".repeat(40),
+            || Ok(Some(observed.clone())),
+            || Ok((true, positions.clone(), heads.clone(), BTreeMap::new())),
+        )
+        .expect_err("stale queue authority");
+        assert!(error.contains("queue authority changed"), "{error}");
+    }
+}
+
+#[test]
+fn dispatch_wedge_final_read_refuses_pull_request_head_movement() {
+    let observed = ready_pr();
+    let mut moved = observed.clone();
+    moved.fact.head_sha = "d".repeat(40);
+    let target = DispatchWedgeTargetRequest {
+        base_ref: "main".to_owned(),
+        pull_request: 42,
+        expected_head_sha: "a".repeat(40),
+    };
+    let error = revalidate_dispatch_wedge_authority_with(
+        &observed,
+        &target,
+        3,
+        &"b".repeat(40),
+        || Ok(Some(moved.clone())),
+        || {
+            Ok((
+                true,
+                BTreeMap::from([(42, 3)]),
+                BTreeMap::from([(42, "b".repeat(40))]),
+                BTreeMap::new(),
+            ))
+        },
+    )
+    .expect_err("moved PR head");
+    assert!(error.contains("PR authority changed"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
 fn merge_queue_transport_paginates_beyond_one_hundred_entries() {
     let temp = tempfile::tempdir().expect("temp");
     let nodes = |range: std::ops::RangeInclusive<u64>| {

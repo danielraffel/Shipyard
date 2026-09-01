@@ -1288,6 +1288,46 @@ fn observe_dispatch_wedge_target_from_repository(
     let Some(merge_group_head) = observation.merge_group_heads.get(&pull_request) else {
         return Ok(Vec::new());
     };
+    let mut results = collect_dispatch_wedge_job_observations(
+        actions,
+        observation,
+        pr,
+        queue_position,
+        merge_group_head,
+        runners,
+    )?;
+    if !results.is_empty() {
+        revalidate_dispatch_wedge_authority_with(
+            pr,
+            target,
+            queue_position,
+            merge_group_head,
+            || {
+                cancellation_revalidation::pull_request(
+                    actions,
+                    &observation.repo,
+                    pull_request,
+                    &observation.base,
+                    &BTreeMap::new(),
+                )
+            },
+            || merge_queue_snapshot(actions, &observation.repo, &observation.base),
+        )?;
+        for result in &mut results {
+            result.observation_complete = true;
+        }
+    }
+    Ok(results)
+}
+
+fn collect_dispatch_wedge_job_observations(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    queue_position: u64,
+    merge_group_head: &str,
+    runners: &[DispatchRunnerObservation],
+) -> Result<Vec<DispatchWedgeObservation>, String> {
     let check_producers =
         observation::job_check_producers_for_head(actions, &observation.repo, merge_group_head)?;
     let mut results = Vec::new();
@@ -1339,10 +1379,10 @@ fn observe_dispatch_wedge_target_from_repository(
                 authority: DispatchJobAuthority {
                     repository: observation.repo.clone(),
                     base_ref: observation.base.clone(),
-                    pull_request,
+                    pull_request: pr.fact.number,
                     pull_request_head: pr.fact.head_sha.clone(),
                     queue_position,
-                    merge_group_head: merge_group_head.clone(),
+                    merge_group_head: merge_group_head.to_owned(),
                     workflow_run_id: run.id,
                     workflow_id: run.workflow_id,
                     run_attempt: run.run_attempt,
@@ -1363,13 +1403,56 @@ fn observe_dispatch_wedge_target_from_repository(
                     producer_app_id,
                 },
                 runners: runners.to_vec(),
-                observation_complete: true,
+                observation_complete: false,
                 #[cfg(test)]
                 first_observed_unassigned_at_seed: None,
             });
         }
     }
     Ok(results)
+}
+
+fn revalidate_dispatch_wedge_authority_with<ReadPullRequest, ReadQueue>(
+    observed_pr: &ObservedPr,
+    target: &DispatchWedgeTargetRequest,
+    observed_queue_position: u64,
+    observed_merge_group_head: &str,
+    mut read_pull_request: ReadPullRequest,
+    mut read_queue: ReadQueue,
+) -> Result<(), String>
+where
+    ReadPullRequest: FnMut() -> Result<Option<ObservedPr>, String>,
+    ReadQueue: FnMut() -> Result<MergeQueueSnapshot, String>,
+{
+    let live_pr = read_pull_request()?
+        .ok_or_else(|| "dispatch-wedge PR authority changed before final read".to_owned())?;
+    if live_pr.fact.number != target.pull_request
+        || !live_pr
+            .fact
+            .head_sha
+            .eq_ignore_ascii_case(&target.expected_head_sha)
+        || !live_pr
+            .fact
+            .head_sha
+            .eq_ignore_ascii_case(&observed_pr.fact.head_sha)
+    {
+        return Err("dispatch-wedge PR authority changed before final read".to_owned());
+    }
+
+    // This is deliberately the last remote read before an observation becomes
+    // complete. A dequeue, reinsertion, or regenerated merge group therefore
+    // refuses the stale observation instead of publishing a wake from it.
+    let (enabled, positions, heads, _) = read_queue()?;
+    let live_position = positions.get(&target.pull_request).copied();
+    let live_merge_group_head = heads.get(&target.pull_request);
+    if !enabled
+        || live_position != Some(observed_queue_position)
+        || !live_merge_group_head
+            .is_some_and(|head| head.eq_ignore_ascii_case(observed_merge_group_head))
+    {
+        return Err("dispatch-wedge queue authority changed before final read".to_owned());
+    }
+    Ok(())
 }
 
 fn current_required_dispatch_job<'a>(

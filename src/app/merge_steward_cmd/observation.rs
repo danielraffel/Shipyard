@@ -435,7 +435,7 @@ pub(super) fn pull_requests(
         "--base".to_owned(),
         base.to_owned(),
         "--limit".to_owned(),
-        "100".to_owned(),
+        "1000".to_owned(),
         "--json".to_owned(),
         "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
     ];
@@ -443,8 +443,8 @@ pub(super) fn pull_requests(
     let rows = value
         .as_array()
         .ok_or_else(|| "open PR list was not an array".to_owned())?;
-    if rows.len() == 100 {
-        return Err("open PR list reached 100; refusing a possibly partial snapshot".to_owned());
+    if rows.len() == 1000 {
+        return Err("open PR list reached 1000; refusing a possibly partial snapshot".to_owned());
     }
     rows.iter().map(|row| parse_pr(row, positions)).collect()
 }
