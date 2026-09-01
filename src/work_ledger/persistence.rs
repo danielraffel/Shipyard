@@ -24,6 +24,14 @@ impl WorkLedger {
         reject_symlink_if_present(state_dir, &dir, "ledger directory")?;
         let _writer_domain =
             crate::writer_domain_lease::acquire_exclusive_for_protected_path(&dir)?;
+        Self::open_under_writer_domain(state_dir)
+    }
+
+    /// Open and migrate while the caller retains the exclusive writer-domain
+    /// fence across a larger exact-snapshot reconciliation transaction.
+    pub(super) fn open_under_writer_domain(state_dir: &Path) -> WorkLedgerResult<Self> {
+        let dir = state_dir.join("work-ledger");
+        reject_symlink_if_present(state_dir, &dir, "ledger directory")?;
         crate::writer_domain_lease::ensure_protected_dir_all(&dir)?;
         let ledger = Self {
             path: dir.join(DATABASE_NAME),
@@ -39,6 +47,13 @@ impl WorkLedger {
             protect_database_file(&ledger.path)?;
         }
         let mut connection = ledger.connect_read_write()?;
+        // Schema-v11 startup is itself a migration authority. Authenticate the
+        // complete bounded protected store before generic daemon/CLI open can
+        // advance the schema, even when no native-publication request exists.
+        if schema_version(&connection)? == 11 {
+            ledger.reconcile_protected_object_storage()?;
+            ledger.verify_protected_object_storage(&connection)?;
+        }
         configure_durable(&connection)?;
         migrate(&mut connection)?;
         verify_integrity(&connection)?;

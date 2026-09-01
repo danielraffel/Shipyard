@@ -117,6 +117,8 @@ shipyard runner recovery-worker --apply             # run one bounded read-only 
 shipyard runner recovery-worker --drain --apply     # process one bounded pending snapshot (maximum 32)
 shipyard work-ledger status                         # inspect canonical shadow storage; does not create it
 shipyard work-ledger inventory                      # bounded immutable local-work view; does not create storage
+shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" # authentic-v11 exact-row reconciliation plan; no writes
+shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" --apply # writer-fenced migrate/bind/publication
 shipyard work-ledger import                         # deterministic redacted legacy-import plan; no writes
 shipyard work-ledger import --apply                 # idempotently populate shadow storage; no activation/dispatch
 shipyard work-ledger policy list                    # list revision-fenced per-repository lane policy
@@ -143,6 +145,17 @@ session is unavailable. It preserves the exact head/workstream/context and
 increments a private ownership generation; ambient sessions cannot silently
 adopt a receipt. Machine identity is persisted privately on first use rather
 than recomputed from mutable host environment variables.
+
+`work-ledger status` supports an authentic schema-v11 ledger through the same
+immutable, race-checked snapshot boundary as inventory; it does not migrate or
+open a WAL. When native publication encounters that released schema, dry-run
+returns a typed disposition for every bound row. Exactly one row must match the
+authenticated work ID, repository, PR, head, and workstream. Apply reacquires
+the exact snapshot under the exclusive writer domain, migrates schema 11 to
+schema 14, enriches only that row with immutable repository identity, and
+requires an exact reread/replay. Foreign lineage, ambiguous or changed
+snapshots, coordinate drift, and any unbound row refuse the operation.
+
 Semantic blockers receive one deduplicated `shipyard:needs-agent` label and
 failed `shipyard/steward-recovery` status, which are cleared after recovery.
 The current PR's case-insensitive `5·unresolved` label blocks every steward

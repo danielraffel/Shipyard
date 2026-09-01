@@ -16,8 +16,8 @@ use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
 use crate::work_ledger::{
     AgentReturnExpectation, CustodyStatus, NativePublicationReport, RepoPolicy, WorkLedger,
-    absent_status, apply_legacy_snapshot, local_work_inventory, plan_legacy_snapshot,
-    validate_repo_policy,
+    absent_status, apply_legacy_snapshot, immutable_legacy_status, local_work_inventory,
+    plan_legacy_snapshot, validate_repo_policy,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 
@@ -38,10 +38,13 @@ pub(super) fn work_ledger_command<W: Write>(
     let state_dir = &runtime_paths.state_dir;
     match command {
         WorkLedgerCommand::Status => {
-            let status = WorkLedger::open_existing(state_dir)
-                .map_err(failure)?
-                .map_or_else(|| Ok(absent_status()), |ledger| ledger.status())
-                .map_err(failure)?;
+            let status = match immutable_legacy_status(state_dir).map_err(failure)? {
+                Some(status) => status,
+                None => WorkLedger::open_existing(state_dir)
+                    .map_err(failure)?
+                    .map_or_else(|| Ok(absent_status()), |ledger| ledger.status())
+                    .map_err(failure)?,
+            };
             let operational = work_ledger_operational_status(runtime_paths);
             if json {
                 let rendered = work_ledger_status_json(&status, &operational)?;
@@ -1151,7 +1154,31 @@ fn write_publication_report<W: Write>(
         writeln!(stdout, "Work item: {}", report.work_id).map_err(failure)?;
         writeln!(stdout, "Route: {}", report.route_ref).map_err(failure)?;
         writeln!(stdout, "Wake: {}", report.wake_id).map_err(failure)?;
-        writeln!(stdout, "Profile digest: {}", report.profile_digest).map_err(failure)
+        writeln!(stdout, "Profile digest: {}", report.profile_digest).map_err(failure)?;
+        if let Some(reconciliation) = &report.schema11_reconciliation {
+            writeln!(
+                stdout,
+                "Schema reconciliation: {} -> {} (snapshot={})",
+                reconciliation.schema_before,
+                reconciliation.schema_after,
+                reconciliation.snapshot_sha256,
+            )
+            .map_err(failure)?;
+            for item in &reconciliation.items {
+                writeln!(
+                    stdout,
+                    "  {} {}#{} {} workstream={} work={}",
+                    item.disposition.as_str(),
+                    item.repository,
+                    item.pull_request,
+                    item.exact_head,
+                    item.workstream_handle,
+                    item.work_id,
+                )
+                .map_err(failure)?;
+            }
+        }
+        Ok(())
     }
 }
 

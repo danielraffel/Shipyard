@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::Duration;
 
@@ -11,21 +11,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    WorkLedger, WorkLedgerError, WorkLedgerResult, is_canonical_repo_slug, validate_opaque_ref,
-    validate_workstream_handle, verify_integrity, verify_open_lineage, verify_supported_schema,
+    LedgerStatus, WorkLedger, WorkLedgerError, WorkLedgerResult, count, count_where,
+    is_canonical_repo_slug, synchronous_name, validate_opaque_ref, validate_workstream_handle,
+    verify_integrity, verify_open_lineage, verify_supported_schema,
 };
 
 /// Maximum number of local work records returned by one inventory call.
 pub const MAX_LOCAL_WORK_INVENTORY_ITEMS: usize = 256;
 
 const MAX_LEDGER_DATABASE_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_SQLITE_SIDECAR_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const MAX_SQLITE_SIDECAR_BYTES: u64 = 4 * 1024 * 1024;
 const LEGACY_INVENTORY_SCHEMA_VERSION: i64 = 11;
 
 #[derive(Clone, Copy)]
 enum InventorySchema {
     Current,
     LegacyV11,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ImmutableInventoryInspection {
+    pub(super) schema_version: i64,
+    pub(super) inventory: LocalWorkInventory,
 }
 
 /// A bounded local inventory response.
@@ -85,13 +92,349 @@ pub struct LocalWorkInventoryItem {
 /// Read a bounded local inventory without creating storage, taking a writer-domain
 /// lease, reconciling protected objects, or opening the database read-write.
 pub fn local_work_inventory(state_dir: &Path) -> WorkLedgerResult<LocalWorkInventory> {
-    local_work_inventory_with_preopen_hook(state_dir, || Ok(()))
+    Ok(local_work_inventory_inspection(state_dir)?.inventory)
 }
 
+pub(super) fn local_work_inventory_inspection(
+    state_dir: &Path,
+) -> WorkLedgerResult<ImmutableInventoryInspection> {
+    local_work_inventory_inspection_with_preopen_hook(state_dir, || Ok(()))
+}
+
+pub(super) fn database_effective_schema_version(state_dir: &Path) -> WorkLedgerResult<Option<i64>> {
+    let path = WorkLedger::path_at(state_dir);
+    let Some((database_before, mut database)) = open_regular_file_for_schema_probe(&path)? else {
+        return Ok(None);
+    };
+    let mut database_header = [0_u8; 64];
+    database.read_exact(&mut database_header)?;
+    let main_schema = database_schema_from_header(&database_header)?;
+    if main_schema != LEGACY_INVENTORY_SCHEMA_VERSION {
+        return Ok(Some(main_schema));
+    }
+    let wal_path = sqlite_sidecar(&path, "-wal");
+    let Some((wal_before, mut wal)) = open_regular_file_for_schema_probe(&wal_path)? else {
+        return Ok(Some(main_schema));
+    };
+    if wal_before.len == 0 {
+        return Ok(Some(main_schema));
+    }
+    if wal_before.len > MAX_SQLITE_SIDECAR_BYTES {
+        return Err(WorkLedgerError::Refused(format!(
+            "work ledger WAL exceeds the bounded schema-probe limit of {MAX_SQLITE_SIDECAR_BYTES} bytes"
+        )));
+    }
+    let database_page_size = database_page_size(&database_header)?;
+    let schema =
+        committed_schema_from_wal(&mut wal, wal_before.len, main_schema, database_page_size)?;
+    if regular_file_metadata(&wal_path)?.as_ref() != Some(&wal_before)
+        || regular_file_metadata(&path)?.as_ref() != Some(&database_before)
+    {
+        return Err(WorkLedgerError::Refused(
+            "work ledger changed while determining its effective schema".to_owned(),
+        ));
+    }
+    Ok(Some(schema))
+}
+
+fn committed_schema_from_wal(
+    wal: &mut fs::File,
+    wal_len: u64,
+    main_schema: i64,
+    database_page_size: u64,
+) -> WorkLedgerResult<i64> {
+    const WAL_HEADER_BYTES: u64 = 32;
+    const WAL_HEADER_LEN: usize = 32;
+    const FRAME_HEADER_BYTES: u64 = 24;
+    const FRAME_HEADER_LEN: usize = 24;
+    if wal_len < WAL_HEADER_BYTES {
+        return Err(WorkLedgerError::Refused(
+            "work ledger WAL header is truncated".to_owned(),
+        ));
+    }
+    let mut header = [0_u8; WAL_HEADER_LEN];
+    wal.read_exact(&mut header)?;
+    let magic = be_u32(&header, 0)?;
+    if !matches!(magic, 0x377f_0682 | 0x377f_0683) || be_u32(&header, 4)? != 3_007_000 {
+        return Err(WorkLedgerError::Refused(
+            "work ledger WAL header is invalid".to_owned(),
+        ));
+    }
+    let checksum_big_endian = magic == 0x377f_0683;
+    let mut checksum = wal_checksum(&header[..24], checksum_big_endian, [0, 0])?;
+    if checksum != [be_u32(&header, 24)?, be_u32(&header, 28)?] {
+        return Err(WorkLedgerError::Refused(
+            "work ledger WAL header checksum is invalid".to_owned(),
+        ));
+    }
+    let page_size = match be_u32(&header, 8)? {
+        1 => 65_536_u64,
+        value if value.is_power_of_two() && (512..=65_536).contains(&value) => u64::from(value),
+        _ => {
+            return Err(WorkLedgerError::Refused(
+                "work ledger WAL page size is invalid".to_owned(),
+            ));
+        }
+    };
+    if page_size != database_page_size {
+        return Err(WorkLedgerError::Refused(
+            "work ledger WAL page size disagrees with its database".to_owned(),
+        ));
+    }
+    let frame_size = FRAME_HEADER_BYTES
+        .checked_add(page_size)
+        .ok_or_else(|| WorkLedgerError::Refused("work ledger WAL size overflowed".to_owned()))?;
+    let salt = &header[16..24];
+    let mut schema = main_schema;
+    let mut transaction_schema = None;
+    let mut offset = WAL_HEADER_BYTES;
+    let mut frame_header = [0_u8; FRAME_HEADER_LEN];
+    let page_capacity = usize::try_from(page_size)
+        .map_err(|_| WorkLedgerError::Refused("work ledger WAL page is too large".to_owned()))?;
+    let mut page = vec![0_u8; page_capacity];
+    while offset
+        .checked_add(frame_size)
+        .is_some_and(|end| end <= wal_len)
+    {
+        wal.seek(SeekFrom::Start(offset))?;
+        wal.read_exact(&mut frame_header)?;
+        // SQLite may reset and reuse a WAL without truncating its old physical
+        // tail. A salt or rolling-checksum disagreement terminates the valid
+        // current-generation prefix; bytes after that boundary are stale, not
+        // part of the logical WAL.
+        if &frame_header[8..16] != salt {
+            break;
+        }
+        let page_number = be_u32(&frame_header, 0)?;
+        if page_number == 0 || page_number == u32::MAX {
+            return Err(WorkLedgerError::Refused(
+                "work ledger WAL frame page number is invalid".to_owned(),
+            ));
+        }
+        wal.read_exact(&mut page)?;
+        checksum = wal_checksum(&frame_header[..8], checksum_big_endian, checksum)?;
+        checksum = wal_checksum(&page, checksum_big_endian, checksum)?;
+        if checksum != [be_u32(&frame_header, 16)?, be_u32(&frame_header, 20)?] {
+            break;
+        }
+        if page_number == 1 {
+            validate_database_page_header(&page, page_size)?;
+            transaction_schema = Some(database_schema_from_header(&page)?);
+        }
+        let commit_database_pages = be_u32(&frame_header, 4)?;
+        if commit_database_pages == u32::MAX {
+            return Err(WorkLedgerError::Refused(
+                "work ledger WAL commit database size is invalid".to_owned(),
+            ));
+        }
+        if commit_database_pages != 0
+            && let Some(committed) = transaction_schema.take()
+        {
+            schema = committed;
+        }
+        offset += frame_size;
+    }
+    // A partial final frame is likewise outside SQLite's valid frame prefix.
+    Ok(schema)
+}
+
+fn validate_database_page_header(page: &[u8], expected_page_size: u64) -> WorkLedgerResult<()> {
+    if database_page_size(page)? != expected_page_size
+        || page.get(18) != Some(&2)
+        || page.get(19) != Some(&2)
+        || page.get(21..24) != Some(&[64, 32, 32])
+    {
+        return Err(WorkLedgerError::Refused(
+            "work ledger WAL page-one header is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn database_page_size(header: &[u8]) -> WorkLedgerResult<u64> {
+    let encoded = u16::from_be_bytes(
+        header
+            .get(16..18)
+            .ok_or_else(|| WorkLedgerError::Refused("database header is truncated".to_owned()))?
+            .try_into()
+            .map_err(|_| WorkLedgerError::Refused("database header is truncated".to_owned()))?,
+    );
+    match encoded {
+        1 => Ok(65_536),
+        value if value.is_power_of_two() && (512..=32_768).contains(&value) => Ok(u64::from(value)),
+        _ => Err(WorkLedgerError::Refused(
+            "work ledger database page size is invalid".to_owned(),
+        )),
+    }
+}
+
+fn wal_checksum(
+    bytes: &[u8],
+    big_endian: bool,
+    mut checksum: [u32; 2],
+) -> WorkLedgerResult<[u32; 2]> {
+    if bytes.len() < 8 || !bytes.len().is_multiple_of(8) {
+        return Err(WorkLedgerError::Refused(
+            "work ledger WAL checksum input is invalid".to_owned(),
+        ));
+    }
+    for words in bytes.as_chunks::<8>().0 {
+        let first = wal_checksum_word(&words[..4], big_endian)?;
+        let second = wal_checksum_word(&words[4..], big_endian)?;
+        checksum[0] = checksum[0].wrapping_add(first).wrapping_add(checksum[1]);
+        checksum[1] = checksum[1].wrapping_add(second).wrapping_add(checksum[0]);
+    }
+    Ok(checksum)
+}
+
+fn wal_checksum_word(bytes: &[u8], big_endian: bool) -> WorkLedgerResult<u32> {
+    let word: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| WorkLedgerError::Refused("work ledger WAL word is truncated".to_owned()))?;
+    Ok(if big_endian {
+        u32::from_be_bytes(word)
+    } else {
+        u32::from_le_bytes(word)
+    })
+}
+
+fn be_u32(bytes: &[u8], offset: usize) -> WorkLedgerResult<u32> {
+    Ok(u32::from_be_bytes(
+        bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| WorkLedgerError::Refused("work ledger WAL is truncated".to_owned()))?
+            .try_into()
+            .map_err(|_| WorkLedgerError::Refused("work ledger WAL is truncated".to_owned()))?,
+    ))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SchemaProbeFileMetadata {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn open_regular_file_for_schema_probe(
+    path: &Path,
+) -> WorkLedgerResult<Option<(SchemaProbeFileMetadata, fs::File)>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let Some(before) = regular_file_metadata(path)? else {
+        return Ok(None);
+    };
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    if metadata_identity(&file.metadata()?)? != before {
+        return Err(WorkLedgerError::Refused(
+            "work ledger sidecar changed while opening".to_owned(),
+        ));
+    }
+    Ok(Some((before, file)))
+}
+
+fn regular_file_metadata(path: &Path) -> WorkLedgerResult<Option<SchemaProbeFileMetadata>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(WorkLedgerError::Refused(
+            "work ledger sidecar is not a regular file".to_owned(),
+        ));
+    }
+    Ok(Some(metadata_identity(&metadata)?))
+}
+
+fn metadata_identity(metadata: &fs::Metadata) -> WorkLedgerResult<SchemaProbeFileMetadata> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(SchemaProbeFileMetadata {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    Ok(SchemaProbeFileMetadata {
+        len: metadata.len(),
+        modified: metadata.modified()?,
+    })
+}
+
+pub(super) fn database_schema_from_header(header: &[u8]) -> WorkLedgerResult<i64> {
+    if header.len() < 64 || &header[..16] != b"SQLite format 3\0" {
+        return Err(WorkLedgerError::Refused(
+            "work ledger database header is invalid".to_owned(),
+        ));
+    }
+    Ok(i64::from(u32::from_be_bytes(
+        header[60..64]
+            .try_into()
+            .map_err(|_| WorkLedgerError::Refused("schema header is invalid".to_owned()))?,
+    )))
+}
+
+pub(super) fn immutable_schema11_query<T>(
+    state_dir: &Path,
+    query: impl FnOnce(&Connection) -> WorkLedgerResult<T>,
+) -> WorkLedgerResult<(String, T)> {
+    let path = WorkLedger::path_at(state_dir);
+    let directory = path
+        .parent()
+        .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+    let source_before = storage_snapshot(directory, &path)?.ok_or_else(|| {
+        WorkLedgerError::Refused("schema-v11 query requires an existing ledger".to_owned())
+    })?;
+    validate_storage_snapshot(&source_before)?;
+    let connection = connect_immutable(&path)?;
+    validate_database_resources(&connection)?;
+    if super::schema_version(&connection)? != LEGACY_INVENTORY_SCHEMA_VERSION {
+        return Err(WorkLedgerError::Refused(
+            "schema-v11 query observed a different schema".to_owned(),
+        ));
+    }
+    verify_open_lineage(&connection, LEGACY_INVENTORY_SCHEMA_VERSION)?;
+    verify_legacy_inventory_schema(&connection)?;
+    validate_inventory_rows_sql_side(&connection, InventorySchema::LegacyV11)?;
+    verify_integrity(&connection)?;
+    let result = query(&connection)?;
+    if storage_snapshot(directory, &path)?.as_ref() != Some(&source_before) {
+        return Err(WorkLedgerError::Refused(
+            "work ledger changed during zero-write schema-v11 query".to_owned(),
+        ));
+    }
+    Ok((source_before.database.sha256, result))
+}
+
+#[cfg(all(test, unix))]
 fn local_work_inventory_with_preopen_hook(
     state_dir: &Path,
     preopen_hook: impl FnOnce() -> WorkLedgerResult<()>,
 ) -> WorkLedgerResult<LocalWorkInventory> {
+    Ok(local_work_inventory_inspection_with_preopen_hook(state_dir, preopen_hook)?.inventory)
+}
+
+fn local_work_inventory_inspection_with_preopen_hook(
+    state_dir: &Path,
+    preopen_hook: impl FnOnce() -> WorkLedgerResult<()>,
+) -> WorkLedgerResult<ImmutableInventoryInspection> {
     let path = WorkLedger::path_at(state_dir);
     let directory = path
         .parent()
@@ -102,7 +445,10 @@ fn local_work_inventory_with_preopen_hook(
                 "work ledger appeared during zero-write inventory".to_owned(),
             ));
         }
-        return Ok(empty_inventory());
+        return Ok(ImmutableInventoryInspection {
+            schema_version: 0,
+            inventory: empty_inventory(),
+        });
     };
     validate_storage_snapshot(&source_before)?;
     preopen_hook()?;
@@ -120,7 +466,77 @@ fn local_work_inventory_with_preopen_hook(
             "work ledger changed during zero-write inventory".to_owned(),
         ));
     }
-    Ok(inventory)
+    Ok(ImmutableInventoryInspection {
+        schema_version: match schema {
+            InventorySchema::Current => super::SCHEMA_VERSION,
+            InventorySchema::LegacyV11 => LEGACY_INVENTORY_SCHEMA_VERSION,
+        },
+        inventory,
+    })
+}
+
+/// Read schema-v11 status through the same immutable snapshot boundary used by
+/// inventory. Current schemas deliberately continue through `WorkLedger` so
+/// protected-object reconciliation retains its existing ownership.
+pub(crate) fn immutable_legacy_status(state_dir: &Path) -> WorkLedgerResult<Option<LedgerStatus>> {
+    if database_effective_schema_version(state_dir)? != Some(LEGACY_INVENTORY_SCHEMA_VERSION) {
+        return Ok(None);
+    }
+    let path = WorkLedger::path_at(state_dir);
+    let directory = path
+        .parent()
+        .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+    let Some(source_before) = storage_snapshot(directory, &path)? else {
+        return Ok(None);
+    };
+    validate_storage_snapshot(&source_before)?;
+    let connection = connect_immutable(&path)?;
+    validate_database_resources(&connection)?;
+    if super::schema_version(&connection)? != LEGACY_INVENTORY_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    verify_open_lineage(&connection, LEGACY_INVENTORY_SCHEMA_VERSION)?;
+    verify_legacy_inventory_schema(&connection)?;
+    validate_inventory_rows_sql_side(&connection, InventorySchema::LegacyV11)?;
+    let integrity = verify_integrity(&connection)?;
+    let snapshot_ledger = WorkLedger { path: path.clone() };
+    snapshot_ledger.verify_protected_object_storage(&connection)?;
+    let status = LedgerStatus {
+        exists: true,
+        schema_version: LEGACY_INVENTORY_SCHEMA_VERSION,
+        journal_mode: connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?,
+        synchronous: synchronous_name(&connection)?,
+        foreign_keys: "enabled".to_owned(),
+        integrity,
+        work_items: count(&connection, "work_items")?,
+        pending_wakes: count_where(&connection, "outbox", "state", "pending")?,
+        uncertain_wakes: count_where(&connection, "outbox", "state", "uncertain")?,
+        pending_projection_intents: count_where(
+            &connection,
+            "projection_intents",
+            "state",
+            "pending",
+        )?,
+        quarantined_projection_intents: count_where(
+            &connection,
+            "projection_intents",
+            "state",
+            "quarantined",
+        )?,
+        imports: count(&connection, "imports")?,
+        protected_objects: count(&connection, "protected_objects")?,
+        provider_deliveries: count(&connection, "provider_deliveries")?,
+        agent_ownership: count(&connection, "agent_ownership")?,
+        activation_epochs: count(&connection, "activation_epochs")?,
+        activation_enabled: false,
+        dispatch_enabled: false,
+    };
+    if storage_snapshot(directory, &path)?.as_ref() != Some(&source_before) {
+        return Err(WorkLedgerError::Refused(
+            "work ledger changed during zero-write status".to_owned(),
+        ));
+    }
+    Ok(Some(status))
 }
 
 /// Run a bounded query against the same immutable, race-checked snapshot used
@@ -255,42 +671,160 @@ fn verify_inventory_schema(connection: &Connection) -> WorkLedgerResult<Inventor
 
 pub(super) fn verify_legacy_inventory_schema(connection: &Connection) -> WorkLedgerResult<()> {
     // Exact sqlite_schema object sets produced by Shipyard v0.139.1 schema v11.
-    // This binds table constraints, automatic/named indexes, and every trigger
-    // owned by each table, rather than trusting column metadata alone.
-    for table in [
-        "workstream_projection_bindings",
-        "work_items",
-        "agent_ownership",
-    ] {
+    // This is intentionally the complete schema-v11 manifest, not only the
+    // tables read directly by inventory. Publication migrates the whole ledger
+    // and then trusts policy, route, protected-object, continuation, import,
+    // adapter, delivery, and custody invariants. Every table, automatic/named
+    // index, constraint, and trigger therefore has to be authenticated first.
+    let actual_tables = connection
+        .prepare("SELECT DISTINCT tbl_name FROM sqlite_schema ORDER BY tbl_name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_tables = LEGACY_V11_SCHEMA_MANIFEST
+        .iter()
+        .map(|(table, _)| (*table).to_owned())
+        .collect::<Vec<_>>();
+    if actual_tables != expected_tables {
+        return Err(WorkLedgerError::Refused(
+            "schema v11 object inventory is missing, altered, or contains foreign objects"
+                .to_owned(),
+        ));
+    }
+    for (table, expected) in LEGACY_V11_SCHEMA_MANIFEST {
         let actual = schema_objects_digest(connection, table)?;
-        if !legacy_v11_schema_digest_allowed(table, &actual) {
+        let allowed = if *table == "workstream_projection_bindings" {
+            matches!(
+                actual.as_str(),
+                "93ad7a2dfb12e804a7589013803975e5f54a73eb413f5c999cfc24d34f512b52"
+                    | "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
+            )
+        } else {
+            actual == *expected
+        };
+        if !allowed {
             return Err(WorkLedgerError::Refused(format!(
-                "schema v11 inventory table {table} is missing or altered"
+                "schema v11 object set for {table} is missing or altered"
             )));
         }
     }
     Ok(())
 }
 
-fn legacy_v11_schema_digest_allowed(table: &str, actual: &str) -> bool {
-    match table {
-        // Both exact digests are released v0.139.1 representations of the
-        // same original v11 constraints/triggers. The second was observed on
-        // the governed M5 production ledger during the v0.142 canary.
-        "workstream_projection_bindings" => matches!(
-            actual,
-            "93ad7a2dfb12e804a7589013803975e5f54a73eb413f5c999cfc24d34f512b52"
-                | "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
-        ),
-        "work_items" => {
-            actual == "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9"
-        }
-        "agent_ownership" => {
-            actual == "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d"
-        }
-        _ => false,
-    }
-}
+const LEGACY_V11_SCHEMA_MANIFEST: &[(&str, &str)] = &[
+    (
+        "activation_epochs",
+        "5ed25cec7bdfd4913ce44eb39e9849978311d34f60e5f6d163552ec3b7a148fd",
+    ),
+    (
+        "adapter_registry",
+        "59764fdec7b777347b94e1125a793857905cc710c7ed78180d1dbd9a3a61aab5",
+    ),
+    (
+        "agent_ownership",
+        "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d",
+    ),
+    (
+        "continuation_contracts",
+        "9f6976425cbb06a36ffdc52cd8788b7c3e4c6502d578c014e6bbc4b4d35333ca",
+    ),
+    (
+        "custody_controls",
+        "a75a41e35ce99ac0cffd26661ea222e0aab47cc0aef82c55f568c3ce2103e5b0",
+    ),
+    (
+        "custody_effects",
+        "2c5b10b4f0c30dad20d612a2ba7b51749192d5d119325c273e967a3f79b5294b",
+    ),
+    (
+        "custody_events",
+        "96ff74461dd2c2e12b75e0938906b67154adc4858e89e7ca26245bee91b7038b",
+    ),
+    (
+        "custody_inbox",
+        "3d27f6ee672f9be9a350f1ae3326aea24d7138ab8ba28657eb4b62ee361a3663",
+    ),
+    (
+        "custody_inbox_claims",
+        "2f2b5d0eb9e7b15410474aca234541682ed4ef361d2301b6444d9aad388786f1",
+    ),
+    (
+        "custody_outbox",
+        "58776108fc676eda7fd76284e322a6fdd06906c7b6d9d86967f7cac21a47f99b",
+    ),
+    (
+        "custody_processed_acknowledgements",
+        "044d3f50e64c18a49e5e86d47e4e598293d789f6c920b3e95797db573faa80b4",
+    ),
+    (
+        "custody_rebinds",
+        "be92bb09004ef840165d2de5e72dab6e525c8066521fba180757e2cd9ab3585b",
+    ),
+    (
+        "custody_sender_claims",
+        "61a0f8b2d3690a0de3281040e33d553fb8e87e06b05fa7b5d090944b752c49ac",
+    ),
+    (
+        "custody_successor_rebinds",
+        "dcaf9f13d20c9f0f0b9ce3ff283576a1a5d5841bc1f08871eb2ef3a10b1ce79c",
+    ),
+    (
+        "events",
+        "4ccc356df6153ad9bcf6cce804d8de5ebedd76d63226adc270fc092068481690",
+    ),
+    (
+        "imports",
+        "b104e8365a7d17bd0ce8257c510da9af43f8aec349af34f8945add2738025c3c",
+    ),
+    (
+        "ledger_schema_identity",
+        "72257bf40fb374dd91eadeac9ee60cb24bf847d49daa542bf5025b9f6694cda7",
+    ),
+    (
+        "outbox",
+        "d2d1d289a7c5a2b6433dcb7be9e78d866bd0c121287ec670a1103a5445b19565",
+    ),
+    (
+        "projection_intents",
+        "c08bf11b61930305e070937531456cfd1c058df56e879bded9e4f3bc33443cec",
+    ),
+    (
+        "protected_objects",
+        "858ac7c24cf017c101f8f5318c4ecf354a839a4469ec6458cd0d02fbb80c272b",
+    ),
+    (
+        "provider_deliveries",
+        "9aa46de98feef623687cb2eef94c868e4cec11c3ce2ce9482b2d09071662e8a7",
+    ),
+    (
+        "provider_delivery_observations",
+        "4bc7270639d1ec95527c2caf53a4425a118f2177776122110f72a7afc9177924",
+    ),
+    (
+        "repo_policies",
+        "04b3cd4a480d6287b0231e048a89eb111af7cc787209503cafc57c60837a5696",
+    ),
+    (
+        "route_records",
+        "2c8951a5085ab7ae42e6a27786831d0e06d695ff6e5d2db1016843b70ad6b9e3",
+    ),
+    (
+        "wake_attempts",
+        "a553d438eb15c398bd01dd855343b6d29e309bd6ef0440cc3f97f240d1915177",
+    ),
+    (
+        "wake_claim_epochs",
+        "233ef3dbe2c386df3ea51f958e0df090c5b5bee0a08bea2cab6c99e914d1e78f",
+    ),
+    (
+        "work_items",
+        "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9",
+    ),
+    // The exact production representation is separately allowlisted above.
+    (
+        "workstream_projection_bindings",
+        "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8",
+    ),
+];
 
 pub(super) fn verify_legacy_custody_migration_schema(
     connection: &Connection,
@@ -603,7 +1137,7 @@ fn file_identity(path: &Path, max_bytes: u64) -> WorkLedgerResult<Option<FileIde
 
 fn digest_bounded_file(file: &mut fs::File, max_bytes: u64) -> WorkLedgerResult<(String, Vec<u8>)> {
     let mut digest = Sha256::new();
-    let mut header = Vec::with_capacity(20);
+    let mut header = Vec::with_capacity(100);
     let mut total = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -619,8 +1153,8 @@ fn digest_bounded_file(file: &mut fs::File, max_bytes: u64) -> WorkLedgerResult<
                 "zero-write inventory storage exceeds its resource bound".to_owned(),
             ));
         }
-        if header.len() < 20 {
-            let take = (20 - header.len()).min(read);
+        if header.len() < 100 {
+            let take = (100 - header.len()).min(read);
             header.extend_from_slice(&buffer[..take]);
         }
         digest.update(&buffer[..read]);
@@ -1110,29 +1644,25 @@ mod tests {
 
         let error = local_work_inventory(state.path()).expect_err("schema drift must refuse");
 
-        assert!(error.to_string().contains("missing or altered"));
+        let message = error.to_string();
+        assert!(
+            message.contains("missing or altered")
+                || message.contains("object inventory is missing, altered, or contains foreign")
+        );
         #[cfg(unix)]
         assert_eq!(snapshot(state.path()), before);
     }
 
     #[test]
     fn gate_0b_1_live_v11_projection_representation_is_exactly_allowlisted() {
-        assert!(legacy_v11_schema_digest_allowed(
-            "workstream_projection_bindings",
-            "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
-        ));
-        assert!(legacy_v11_schema_digest_allowed(
-            "work_items",
-            "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9"
-        ));
-        assert!(legacy_v11_schema_digest_allowed(
-            "agent_ownership",
-            "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d"
-        ));
-        assert!(!legacy_v11_schema_digest_allowed(
-            "workstream_projection_bindings",
-            "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c80"
-        ));
+        assert_eq!(LEGACY_V11_SCHEMA_MANIFEST.len(), 28);
+        assert_eq!(
+            LEGACY_V11_SCHEMA_MANIFEST.last(),
+            Some(&(
+                "workstream_projection_bindings",
+                "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
+            ))
+        );
     }
 
     #[test]
@@ -1156,6 +1686,25 @@ mod tests {
         assert_eq!(inventory.items[0].repository, "alpha/repo");
         assert_eq!(inventory.items[0].pull_request, 7);
         assert_eq!(inventory.items[0].workstream_handle, "GEN-7");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_v11_status_is_immutable_and_supported() {
+        let state = tempfile::tempdir().expect("state");
+        let ledger = WorkLedger::open(state.path()).expect("ledger");
+        seed_production_v11(&ledger, "alpha/repo", 7, "GEN-7", "status-v11");
+        drop(ledger);
+        let before = snapshot(state.path());
+
+        let status = immutable_legacy_status(state.path())
+            .expect("v11 status")
+            .expect("present v11 status");
+
+        assert_eq!(status.schema_version, 11);
+        assert_eq!(status.work_items, 1);
+        assert_eq!(status.integrity, "ok");
+        assert_eq!(snapshot(state.path()), before);
     }
 
     #[test]
@@ -1238,6 +1787,21 @@ CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
                      CREATE INDEX work_items_nonterminal ON work_items(phase, id);",
                 )
                 .expect("alter index");
+        });
+        assert_v11_schema_mutation_refuses("policy-constraint-drift", |connection| {
+            connection
+                .execute_batch("ALTER TABLE repo_policies ADD COLUMN unauthenticated_policy TEXT;")
+                .expect("alter policy schema");
+        });
+        assert_v11_schema_mutation_refuses("route-index-drift", |connection| {
+            connection
+                .execute_batch("CREATE INDEX unauthenticated_route ON route_records(work_item_id);")
+                .expect("alter route schema");
+        });
+        assert_v11_schema_mutation_refuses("foreign-schema-object", |connection| {
+            connection
+                .execute_batch("CREATE TABLE unauthenticated_table(value TEXT);")
+                .expect("add foreign table");
         });
     }
 
@@ -1622,6 +2186,12 @@ CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
         assert!(sqlite_sidecar(&database, "-wal").exists());
         assert!(sqlite_sidecar(&database, "-shm").exists());
         let before = snapshot(state.path());
+
+        assert_eq!(
+            immutable_legacy_status(state.path()).expect("current status routing"),
+            None
+        );
+        assert_eq!(snapshot(state.path()), before);
 
         let error = local_work_inventory(state.path()).expect_err("live WAL must refuse");
 

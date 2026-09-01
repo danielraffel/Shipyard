@@ -144,6 +144,7 @@ pub(crate) use custody_inventory::{
 use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};
+pub(crate) use inventory::immutable_legacy_status;
 pub use inventory::{LocalWorkInventory, LocalWorkInventoryItem, local_work_inventory};
 pub(crate) use lifecycle::deterministic_wake_id;
 pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};

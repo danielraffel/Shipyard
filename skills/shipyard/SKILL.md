@@ -1469,7 +1469,13 @@ See [references/merge-steward.md](references/merge-steward.md) for the config,
 schema, limits, and exact authority boundary.
 
 Use `shipyard work-ledger status --json` to inspect whether the canonical
-lifecycle shadow exists without creating it. Use `shipyard work-ledger
+lifecycle shadow exists without creating it. Authentic schema v11 is inspected
+through the same immutable snapshot boundary as inventory, without migration or
+WAL creation. Native publication dry-run returns a typed disposition for every
+bound v11 row; apply revalidates the exact snapshot under the exclusive writer
+domain, migrates and binds only the authenticated work ID/repository/PR/head/
+workstream tuple, then requires exact reread/replay. Foreign lineage, ambiguity,
+TOCTOU drift, or any unrelated unbound work row refuses. Use `shipyard work-ledger
 inventory --json` for a bounded, deterministically ordered immutable view of
 local work. Inventory opens only existing storage, never creates or migrates a
 database or takes writer custody. A valid migrated legacy `NULL,NULL`
