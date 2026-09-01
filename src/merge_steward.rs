@@ -21,9 +21,6 @@ pub struct StewardCheck {
     /// GitHub App database ID that produced this check run. Legacy commit
     /// statuses and observations whose producer is unavailable have no ID.
     pub app_id: Option<u64>,
-    /// GitHub's immutable check-run database ID. Commit statuses and GraphQL
-    /// observations that do not expose it have no ID.
-    pub check_run_id: Option<u64>,
     /// GitHub state (`QUEUED`, `IN_PROGRESS`, or `COMPLETED`).
     pub status: String,
     /// Terminal conclusion, when any.

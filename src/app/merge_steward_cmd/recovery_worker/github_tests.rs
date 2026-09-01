@@ -195,7 +195,7 @@ fn app_bound_failure_uses_bounded_rest_identity_hydration() {
 set -eu
 case "$*" in
   *"check-runs?per_page=100&page=1"*)
-    printf '%s' '{"check_runs":[{"id":901,"name":"macos","app":{"id":42},"status":"completed","conclusion":"failure","completed_at":"2026-08-21T08:00:00Z"}]}' ;;
+    printf '%s' '{"check_runs":[{"name":"macos","app":{"id":42},"status":"completed","conclusion":"failure","completed_at":"2026-08-21T08:00:00Z"}]}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
@@ -254,7 +254,7 @@ case "$*" in
   *"pr view"*)
     printf '%s' '{}' ;;
   *"check-runs?per_page=100&page=1"*)
-    printf '%s' '{{"check_runs":[{{"id":901,"name":"macos","app":{{"id":42}},"status":"completed","conclusion":"failure","completed_at":"2026-08-21T08:00:00Z"}}]}}' ;;
+    printf '%s' '{{"check_runs":[{{"name":"macos","app":{{"id":42}},"status":"completed","conclusion":"failure","completed_at":"2026-08-21T08:00:00Z"}}]}}' ;;
   *"statuses?per_page=100&page=1"*)
     printf '%s' '[{{"id":1,"context":"{}","state":"success","created_at":"2026-08-21T08:00:00Z"}},{{"id":2,"context":"{}","state":"failure","created_at":"2026-08-21T08:00:01Z"}}]' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;

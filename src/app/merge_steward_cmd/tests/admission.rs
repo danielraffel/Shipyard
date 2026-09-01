@@ -16,7 +16,6 @@ fn managed_pr(head: &str) -> ObservedPr {
                 name: HANDOFF_CONTEXT.to_owned(),
                 source: crate::merge_steward::StewardCheckSource::StatusContext,
                 app_id: None,
-                check_run_id: None,
                 status: "COMPLETED".to_owned(),
                 conclusion: Some("SUCCESS".to_owned()),
                 run_id: None,

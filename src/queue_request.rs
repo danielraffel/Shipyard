@@ -1449,6 +1449,8 @@ pub enum QueuedShipDispositionKind {
     GreenNotMergedFlakyRequired,
     /// Validation passed but Shipyard's merge client produced an invalid request.
     GreenNotMergedClientDefect,
+    /// Automatic merge is unavailable under the live governance boundary.
+    GreenAutomaticMergeRefused,
     /// Validation passed for an immutable head that the live PR superseded.
     GreenNotMergedHeadSuperseded,
     /// Validation completed, but deterministic post-validation handling failed.

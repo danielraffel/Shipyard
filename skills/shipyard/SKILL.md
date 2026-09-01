@@ -236,9 +236,13 @@ one-shot `shipyard auto-merge` returns exit 3 while queued and retains
 ship-state for later ticks.
 
 For private-free repositories, GitHub may return an explicit null live queue
-and its exact plan-entitlement 403 from evaluated rules. That one combination
-selects classic merge while retaining the validated-head preflight,
-`--match-head-commit`, and REST `sha=` guard. Generic 401/403 responses,
+and its exact plan-entitlement 403 from evaluated rules. That combination can
+classify the branch as non-queue-governed, but Shipyard still refuses automatic
+classic direct merge. `admin=false` does not prove the authenticated mutation
+credential is excluded from every admin, custom-role, ruleset, or GitHub App
+bypass path, so a client-side check snapshot cannot become mechanical merge
+authority. Use the native merge queue for automatic merging. A manual
+maintainer exact-head merge remains outside Shipyard. Generic 401/403 responses,
 malformed authority, and a non-null queue still stop or select the queue path.
 
 Never treat queue absence alone as permission to rearm. The PR must first have
@@ -430,9 +434,10 @@ Invalid values, unreadable policy, partial stack metadata, or an observed head
 different from the validated head fail closed before GitHub mutation. Ordinary
 unstacked PRs retain the existing merge path in all three modes. Validate each
 stack layer, then use `gh stack merge <pr> --merge` for the manual pilot. A
-classic-boundary GraphQL exhaustion retains the exact-head REST fallback because
-GitHub requires the asynchronous endpoint for formal stacks; queue admission
-and re-enqueue inspections remain fail-closed.
+classic-boundary GraphQL exhaustion permits read-only REST identity recovery,
+but never REST merge mutation; automatic classic merge returns exit 10. GitHub
+requires the asynchronous endpoint for formal stacks, and queue admission plus
+re-enqueue inspections remain fail-closed.
 
 For fleets, configure exactly one mutation host in the trusted machine-global
 `config.toml` reported by `shipyard paths` (never in tracked project config):
@@ -1879,9 +1884,10 @@ GitHub App installation tokens can also be rejected by GitHub's GraphQL
 otherwise the right auth source for inspection. PR creation first tries the
 existing GraphQL path, then REST with the same configured token. If both are
 blocked with `Resource not accessible by integration`, Shipyard prints a second
-explicit notice and falls back to ambient `gh` auth for PR creation only. PR
-merge falls back from GraphQL to the existing REST merge path with the same
-configured token. Do not apply ambient-auth fallback to polling, watch,
+explicit notice and falls back to ambient `gh` auth for PR creation only.
+Automatic PR merge uses the native merge queue; classic direct merge and its
+former REST mutation fallback are disabled with `automatic-merge-refused`
+(exit 10). Do not apply ambient-auth fallback to polling, watch,
 retarget, diagnostics, merge, or other high-volume operations.
 
 `GitHubActions::pr_head_ref` also falls back from `gh pr view` to
@@ -1889,13 +1895,11 @@ retarget, diagnostics, merge, or other high-volume operations.
 attempts must use the same configured `GhClient` so GitHub App quota is
 preserved.
 
-The REST merge path (`merge_pr_rest`) passes the original head SHA
-as `-f sha=<oid>` on the PUT so GitHub enforces the merge race-guard
-server-side. On a `405 Base branch was modified` response, it
-refetches head info via `pr_head_info_rest` and retries exactly once
-if and only if the head SHA is unchanged. A changed head SHA means
-a new commit landed during the merge attempt — the retry is refused
-because the prior green evidence may no longer apply.
+The legacy REST merge implementation remains non-authoritative code;
+automatic classic direct merge never reaches it. A classic branch returns the
+typed nonretryable `automatic-merge-refused` outcome (exit 10), retains ship
+state, and directs the operator to a native merge queue or manual maintainer
+exact-head merge.
 
 Before that merge ever runs, `execute_auto_merge` does a **client-side
 superseded-SHA preflight** (#321): it fetches the live PR head via

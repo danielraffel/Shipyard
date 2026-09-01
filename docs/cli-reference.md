@@ -158,7 +158,7 @@ the trusted machine-global `[merge_queue].mutation_machine`, rejects the
 central merge-queue `HOLD`, and serializes plus write-ahead audits every
 enqueue, rerun, and cancellation through the shared mutation guard. A
 repository without a GitHub-native merge queue receives a typed
-`direct_merge_refused` decision; Shipyard does not issue a client-side REST
+`automatic-merge-refused` decision (exit 10); Shipyard does not issue a client-side REST
 merge because that endpoint cannot atomically enforce complete check
 materialization and the validated base revision.
 

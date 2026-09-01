@@ -25,8 +25,6 @@ use crate::ship_state::{ShipState, ShipStatePrLock, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
 use crate::writer_domain_lease::ProductionWriterDomainLease;
 
-mod direct_merge_readiness;
-
 pub(super) struct AutoMergeRequest {
     pub(super) mode: RuntimeMode,
     pub(super) global_dir: PathBuf,
@@ -83,6 +81,10 @@ pub(super) enum AutoMergeOutcome {
     },
     MergeFailed {
         error: String,
+    },
+    /// Automatic merge is mechanically unavailable and must not be retried.
+    AutomaticMergeRefused {
+        detail: String,
     },
     /// Native GitHub queue admission is pending or active for a governed base.
     /// The ship state remains active until GitHub's merge queue lands the PR.
@@ -187,10 +189,12 @@ pub(super) fn execute_auto_merge(
                 request.admin,
                 request.merge_command.as_deref(),
                 request.merge_result,
-                request.pr_snapshot_file.as_deref(),
             ) {
                 Ok(disposition) => disposition,
                 Err(error) => {
+                    if is_automatic_merge_refusal(&error) {
+                        return Ok(AutoMergeOutcome::AutomaticMergeRefused { detail: error });
+                    }
                     if merge_error_confirms_merged(&error)
                         || pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref())
                     {
@@ -425,6 +429,15 @@ fn render_auto_merge_outcome<W: Write>(
             )?;
             Ok(ExitCode::from(1))
         }
+        AutoMergeOutcome::AutomaticMergeRefused { detail } => {
+            render_event(
+                stdout,
+                json,
+                "automatic-merge-refused",
+                fields([("pr", Value::from(pr)), ("detail", Value::from(detail))]),
+            )?;
+            Ok(ExitCode::from(super::SHIP_EXIT_AUTOMATIC_MERGE_REFUSED))
+        }
         AutoMergeOutcome::Enqueued => {
             render_event(stdout, json, "enqueued", fields([("pr", Value::from(pr))]))?;
             Ok(ExitCode::from(3))
@@ -619,19 +632,11 @@ fn merge_pr(
     admin: bool,
     merge_command: Option<&Path>,
     merge_result: Option<MergeResult>,
-    pr_snapshot_file: Option<&Path>,
 ) -> Result<MergeDisposition, String> {
-    if merge_result == Some(MergeResult::Success)
-        && pr_snapshot_file.is_some_and(direct_merge_readiness::snapshot_declares_readiness)
-    {
-        let first = direct_merge_readiness::fetch(cwd, state, pr_snapshot_file)?;
-        let immediate = direct_merge_readiness::fetch(cwd, state, pr_snapshot_file)?;
-        if first != immediate {
-            return Err(format!(
-                "injected GitHub exact-head check readiness changed before merge for PR #{}; refusing merge",
-                state.pr
-            ));
-        }
+    if (merge_command.is_some() || merge_result.is_some()) && mode != RuntimeMode::Isolated {
+        return Err(format!(
+            "{AUTOMATIC_MERGE_REFUSAL_PREFIX} synthetic --merge-command and --merge-result hooks are restricted to isolated test mode; production must use native merge-queue governance"
+        ));
     }
     match merge_result {
         Some(MergeResult::Success) => {
@@ -649,12 +654,7 @@ fn merge_pr(
     } else {
         Some(gh_client(cwd)?)
     };
-    let mut isolated_branch_cleanup = false;
-    if let Some(client) = client.as_mut()
-        && delete_branch
-    {
-        isolated_branch_cleanup = require_branch_cleanup_git(client, cwd, global_dir)?;
-    }
+    let isolated_branch_cleanup = false;
     let mut command = if let Some(merge_command) = merge_command {
         Command::new(merge_command)
     } else {
@@ -681,6 +681,11 @@ fn merge_pr(
         )?
     };
     if queue_required {
+        if let Some(client) = client.as_mut()
+            && delete_branch
+        {
+            let _ = require_branch_cleanup_git(client, cwd, global_dir)?;
+        }
         if admin {
             return Err(
                 "`--admin` cannot be used on a merge-queue-governed branch because it bypasses the queue"
@@ -807,7 +812,7 @@ fn merge_pr(
             command.arg("--admin");
         }
     } else {
-        let readiness = direct_merge_readiness::fetch(cwd, state, pr_snapshot_file)?;
+        require_proven_constrained_classic_merge_identity(admin, state.pr)?;
         verify_live_merge_target(
             client
                 .as_ref()
@@ -823,24 +828,6 @@ fn merge_pr(
             cwd,
             state,
             global_dir,
-        )?;
-        if repository_requires_merge_queue(
-            client
-                .as_ref()
-                .expect("built-in merge should have gh client"),
-            cwd,
-            &state.repo,
-            &state.base_branch,
-        )? {
-            return Err(format!(
-                "GitHub merge governance changed before classic merge mutation for PR #{}; refusing direct merge",
-                state.pr
-            ));
-        }
-        direct_merge_readiness::confirm_at_mutation_boundary(
-            &readiness,
-            || direct_merge_readiness::fetch_at_mutation_boundary(cwd, state, pr_snapshot_file),
-            state.pr,
         )?;
         command.args(classic_merge_args(
             state,
@@ -911,6 +898,23 @@ fn merge_pr(
     Err(message)
 }
 
+const AUTOMATIC_MERGE_REFUSAL_PREFIX: &str = "automatic_merge_refused:";
+
+fn is_automatic_merge_refusal(error: &str) -> bool {
+    error.starts_with(AUTOMATIC_MERGE_REFUSAL_PREFIX)
+}
+
+fn require_proven_constrained_classic_merge_identity(admin: bool, pr: u64) -> Result<(), String> {
+    if admin {
+        return Err(format!(
+            "{AUTOMATIC_MERGE_REFUSAL_PREFIX} `--admin` cannot be used for classic direct merge of PR #{pr} because it bypasses server-enforced merge policy"
+        ));
+    }
+    Err(format!(
+        "{AUTOMATIC_MERGE_REFUSAL_PREFIX} automatic classic direct merge of PR #{pr} is disabled because Shipyard cannot prove that the authenticated mutation identity is excluded from every admin, custom-role, ruleset, and GitHub App bypass path; use the native merge queue or perform a manual maintainer exact-head merge"
+    ))
+}
+
 fn ensure_unstacked(
     client: &GhClient,
     cwd: &Path,
@@ -958,7 +962,7 @@ fn allow_classic_rest_fallback(
             // independent REST quota fallback when this last read exhausts
             // GraphQL, while retaining the exact validated-head REST guard.
             let _ = crate::writer_domain_lease::write_stderr(format_args!(
-                "shipyard: stack inspection exhausted GraphQL at the classic merge boundary; continuing to the server-enforced exact-head merge path"
+                "shipyard: stack inspection exhausted GraphQL at the classic merge boundary; using read-only REST identity fallback before the automatic direct-merge refusal"
             ));
             Ok(())
         }
@@ -2216,7 +2220,7 @@ fn repository_requires_merge_queue(
             MergeQueueRequirement::Classic => Ok(false),
             MergeQueueRequirement::PrivateFreeClassicFallback => {
                 let _ = crate::writer_domain_lease::write_stderr(format_args!(
-                    "shipyard: evaluated branch rules are unavailable on this private-free repository; the authoritative mergeQueue query returned null, so continuing with classic exact-head merge"
+                    "shipyard: evaluated branch rules are unavailable on this private-free repository; the authoritative mergeQueue query returned null, so classifying the branch as classic before refusing automatic direct merge"
                 ));
                 Ok(false)
             }
@@ -2829,6 +2833,11 @@ fn render_event<W: Write>(
             stdout,
             "PR #{pr}: merge attempt failed - {}",
             data.get("error").and_then(Value::as_str).unwrap_or("")
+        ),
+        "automatic-merge-refused" => writeln!(
+            stdout,
+            "PR #{pr}: automatic merge unavailable - {}",
+            data.get("detail").and_then(Value::as_str).unwrap_or("")
         ),
         "enqueued" => writeln!(
             stdout,
@@ -3866,5 +3875,299 @@ mod tests {
         assert_eq!(encode_path_segment("main"), "main");
         assert_eq!(encode_path_segment("release/1.2"), "release%2F1.2");
         assert_eq!(encode_path_segment("topic name"), "topic%20name");
+    }
+
+    #[test]
+    fn classic_direct_merge_refuses_bypass_and_unproven_non_bypass_identity() {
+        let no_proof = require_proven_constrained_classic_merge_identity(false, 533)
+            .expect_err("admin=false does not prove the credential lacks bypass authority");
+        assert!(no_proof.contains("cannot prove"));
+        assert!(no_proof.contains("native merge queue"));
+
+        let bypass = require_proven_constrained_classic_merge_identity(true, 533)
+            .expect_err("admin bypass must remain unavailable");
+        assert!(bypass.contains("--admin"));
+        assert!(bypass.contains("server-enforced merge policy"));
+    }
+
+    #[test]
+    fn automatic_merge_refusal_has_stable_json_status_and_exit() {
+        let mut output = Vec::new();
+        let exit = render_auto_merge_outcome(
+            AutoMergeOutcome::AutomaticMergeRefused {
+                detail: "native queue or manual exact-head required".to_owned(),
+            },
+            533,
+            true,
+            &mut output,
+        )
+        .expect("render");
+        assert_eq!(
+            exit,
+            ExitCode::from(super::super::SHIP_EXIT_AUTOMATIC_MERGE_REFUSED)
+        );
+        let json: Value = serde_json::from_slice(&output).expect("JSON");
+        assert_eq!(
+            json.pointer("/event"),
+            Some(&Value::from("automatic-merge-refused"))
+        );
+        assert_eq!(json.pointer("/pr"), Some(&Value::from(533)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_merge_hook_is_production_refused_and_isolated_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hook = temp.path().join("merge-hook");
+        let marker = temp.path().join("executed");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\n/usr/bin/touch {}\n", marker.display()),
+        )
+        .expect("hook");
+        let mut permissions = std::fs::metadata(&hook).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).expect("chmod");
+        let store = ShipStateStore::new(temp.path().join("state")).expect("store");
+        let mut state = ShipState::new(534, "owner/repo", "feature/x", "main", "abc", "policy");
+        store.save(&state).expect("state");
+        let lock = store.lock_pr_scoped(&state.repo, state.pr).expect("lock");
+
+        let error = merge_pr(
+            &store,
+            &lock,
+            temp.path(),
+            &mut state,
+            RuntimeMode::Shipyard,
+            temp.path(),
+            MergeMethod::Squash,
+            false,
+            false,
+            Some(&hook),
+            None,
+        )
+        .expect_err("production custom hook must refuse");
+        assert!(is_automatic_merge_refusal(&error));
+        assert!(
+            !marker.exists(),
+            "production refusal must precede hook execution"
+        );
+
+        let disposition = merge_pr(
+            &store,
+            &lock,
+            temp.path(),
+            &mut state,
+            RuntimeMode::Isolated,
+            temp.path(),
+            MergeMethod::Squash,
+            false,
+            false,
+            Some(&hook),
+            None,
+        )
+        .expect("isolated test hook");
+        assert!(matches!(disposition, MergeDisposition::Merged { .. }));
+        assert!(
+            marker.exists(),
+            "isolated positive control must execute hook"
+        );
+    }
+
+    #[test]
+    fn synthetic_merge_result_is_production_refused_without_archiving() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("state")).expect("store");
+        let mut state = ShipState::new(535, "owner/repo", "feature/x", "main", "abc", "policy");
+        state.update_evidence("local", "pass");
+        store.save(&state).expect("state");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            r#"{"state":"OPEN","headRefOid":"abc","baseRefName":"main"}"#,
+        )
+        .expect("snapshot");
+        let request = AutoMergeRequest {
+            mode: RuntimeMode::Shipyard,
+            global_dir: temp.path().join("global"),
+            pr: state.pr,
+            merge_method: MergeMethod::Squash,
+            delete_branch: true,
+            admin: false,
+            pr_snapshot_file: Some(snapshot),
+            merge_command: None,
+            merge_result: Some(MergeResult::Success),
+            expected_validation: Some(ValidatedShipIdentity::from(&state)),
+        };
+        assert!(matches!(
+            execute_auto_merge(&store, temp.path(), &request).expect("merge phase"),
+            AutoMergeOutcome::AutomaticMergeRefused { .. }
+        ));
+        assert!(store.get_scoped(&state.repo, state.pr).is_some());
+        assert!(store.list_archived().is_empty());
+
+        let isolated = AutoMergeRequest {
+            mode: RuntimeMode::Isolated,
+            ..request
+        };
+        assert!(matches!(
+            execute_auto_merge(&store, temp.path(), &isolated).expect("isolated synthetic result"),
+            AutoMergeOutcome::Merged { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)] // The isolated child fixture proves the real command boundary.
+    fn classic_merge_command_refuses_before_any_merge_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn includes_merge_mutation(calls: &str) -> bool {
+            calls
+                .lines()
+                .any(|line| line.starts_with("pr merge ") || line.contains("/merge"))
+        }
+
+        const CHILD: &str = "SHIPYARD_CLASSIC_REFUSAL_TEST_CHILD";
+        const LOG: &str = "SHIPYARD_CLASSIC_REFUSAL_TEST_LOG";
+        let temp = tempfile::tempdir().expect("tempdir");
+        if std::env::var_os(CHILD).is_none() {
+            let fake = temp.path().join("gh");
+            let log = temp.path().join("gh.log");
+            let script = format!(
+                r#"
+echo "$@" >> {log}
+if [ "$1 $2" = "pr view" ]; then
+  echo '{{"headRefOid":"{head}","baseRefName":"main"}}'
+  exit 0
+fi
+if [ "$1 $2" = "api repos/owner/repo/pulls/533" ]; then
+  echo '{{"merged":false,"state":"open","head":{{"sha":"{head}","ref":"feature/direct"}},"base":{{"ref":"main"}}}}'
+  exit 0
+fi
+if [ "$1 $2" = "api graphql" ]; then
+  echo '{{"data":{{"repository":{{"mergeQueue":null}}}}}}'
+  exit 0
+fi
+if [ "$1 $2" = "api --paginate" ]; then
+  echo '[[]]'
+  exit 0
+fi
+echo "unexpected gh mutation: $@" >&2
+exit 91
+"#,
+                log = log.display(),
+                head = "a".repeat(40),
+            );
+            std::fs::write(&fake, format!("#!/bin/sh\n{script}\n")).expect("fake gh");
+            let mut permissions = std::fs::metadata(&fake).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake, permissions).expect("chmod");
+            let path = format!(
+                "{}:{}",
+                temp.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "app::auto_merge_cmd::tests::classic_merge_command_refuses_before_any_merge_mutation",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(LOG, &log)
+                .env("PATH", path)
+                .output()
+                .expect("isolated child test");
+            assert!(
+                output.status.success(),
+                "child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let log = std::path::PathBuf::from(std::env::var_os(LOG).expect("child log path"));
+        let project = temp.path().join(".shipyard");
+        std::fs::create_dir_all(&project).expect("project config dir");
+        std::fs::write(
+            project.join("config.toml"),
+            "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/echo\", \"ghs_test\"]\n",
+        )
+        .expect("project auth config");
+
+        let store = ShipStateStore::new(temp.path().join("state")).expect("store");
+        let mut state = ShipState::new(
+            533,
+            "owner/repo",
+            "feature/direct",
+            "main",
+            "a".repeat(40),
+            "policy",
+        );
+        state.update_evidence("local", "pass");
+        store.save(&state).expect("state");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            format!(
+                r#"{{"state":"OPEN","headRefOid":"{}","baseRefName":"main"}}"#,
+                "a".repeat(40)
+            ),
+        )
+        .expect("snapshot");
+        let request = AutoMergeRequest {
+            mode: RuntimeMode::Shipyard,
+            global_dir: temp.path().join("global"),
+            pr: state.pr,
+            merge_method: MergeMethod::Squash,
+            delete_branch: true,
+            admin: false,
+            pr_snapshot_file: Some(snapshot),
+            merge_command: None,
+            merge_result: None,
+            expected_validation: Some(ValidatedShipIdentity::from(&state)),
+        };
+        for _ in 0..2 {
+            let outcome = execute_auto_merge(&store, temp.path(), &request).expect("merge phase");
+            assert!(matches!(
+                outcome,
+                AutoMergeOutcome::AutomaticMergeRefused { ref detail }
+                    if detail.contains("automatic classic direct merge")
+            ));
+            assert!(store.get_scoped(&state.repo, state.pr).is_some());
+        }
+        let calls = std::fs::read_to_string(log).expect("gh call log");
+        assert!(
+            calls
+                .lines()
+                .any(|line| line.starts_with("api repos/owner/repo/pulls/533")),
+            "fixture did not complete exact PR identity reads:\n{calls}"
+        );
+        assert!(
+            calls.lines().any(|line| line.starts_with("api graphql ")),
+            "fixture did not inspect the live merge queue:\n{calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|line| line.starts_with("api --paginate ")),
+            "fixture did not reach the classic/null-queue path:\n{calls}"
+        );
+        assert!(
+            !includes_merge_mutation(&calls),
+            "mutation observed:\n{calls}"
+        );
+        assert!(
+            includes_merge_mutation("pr merge 533 --repo owner/repo\n"),
+            "negative control must detect a classic merge mutation"
+        );
+        assert!(
+            includes_merge_mutation("api -X PUT repos/owner/repo/pulls/533/merge\n"),
+            "negative control must detect a REST merge mutation"
+        );
     }
 }

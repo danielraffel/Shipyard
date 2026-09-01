@@ -5,7 +5,7 @@ use crate::app::merge_steward_cmd::observation::{
 };
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::observation::{
-    check_runs_for_head, exact_pr_merge_identity, hydrate_preemption_jobs, required_checks,
+    check_runs_for_head, hydrate_preemption_jobs, required_checks,
 };
 
 #[test]
@@ -546,7 +546,6 @@ exit 1
 #[test]
 fn rest_check_parser_preserves_app_identity_and_unavailable_identity() {
     let check = parse_rest_check(&serde_json::json!({
-        "id": 999,
         "name": "macos",
         "app": {"id": 42},
         "status": "completed",
@@ -556,11 +555,9 @@ fn rest_check_parser_preserves_app_identity_and_unavailable_identity() {
     }))
     .expect("check");
     assert_eq!(check.app_id, Some(42));
-    assert_eq!(check.check_run_id, Some(999));
     assert_eq!(check.run_id, Some(123));
 
     let unavailable = parse_rest_check(&serde_json::json!({
-        "id": 1000,
         "name": "macos",
         "app": null,
         "status": "completed",
@@ -576,96 +573,12 @@ fn current_head_check_transport_preserves_producer_identity() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(
         &temp,
-        r#"
-case "$*" in
-  *"check-runs?per_page=100&page=1&filter=all"*)
-    printf '%s' '{"total_count":1,"check_runs":[{"id":999,"name":"macos","app":{"id":42},"status":"completed","conclusion":"success","details_url":"https://github.com/o/r/actions/runs/123","completed_at":"2026-07-26T02:00:00Z"}]}' ;;
-  *) echo "missing filter=all: $*" >&2; exit 2 ;;
-esac
-"#,
+        r#"printf '%s' '{"check_runs":[{"name":"macos","app":{"id":42},"status":"completed","conclusion":"success","details_url":"https://github.com/o/r/actions/runs/123","completed_at":"2026-07-26T02:00:00Z"}]}'"#,
     );
     let checks = check_runs_for_head(&actions, "owner/repo", &"a".repeat(40))
         .expect("current-head check identities");
     assert_eq!(checks.len(), 1);
     assert_eq!(checks[0].app_id, Some(42));
-}
-
-#[cfg(unix)]
-#[test]
-fn exact_pr_merge_identity_requires_full_head_and_base() {
-    let temp = tempfile::tempdir().expect("temp");
-    let actions = fake_gh(
-        &temp,
-        r#"printf '%s' '{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefName":"main"}'"#,
-    );
-    assert_eq!(
-        exact_pr_merge_identity(&actions, "owner/repo", 42).expect("identity"),
-        ("a".repeat(40), "main".to_owned())
-    );
-
-    let malformed = fake_gh(
-        &temp,
-        r#"printf '%s' '{"headRefOid":"short","baseRefName":"main"}'"#,
-    );
-    assert!(exact_pr_merge_identity(&malformed, "owner/repo", 42).is_err());
-}
-
-#[cfg(unix)]
-#[test]
-fn current_head_check_transport_refuses_malformed_rows() {
-    let temp = tempfile::tempdir().expect("temp");
-    let actions = fake_gh(
-        &temp,
-        r#"printf '%s' '{"total_count":1,"check_runs":[{"id":999,"name":"Windows","app":{"id":42},"conclusion":null}]}'"#,
-    );
-    let error = check_runs_for_head(&actions, "owner/repo", &"a".repeat(40))
-        .expect_err("missing check status must not disappear");
-    assert!(error.contains("malformed row 0"));
-}
-
-#[cfg(unix)]
-#[test]
-fn current_head_check_transport_refuses_short_page_before_total_count() {
-    let temp = tempfile::tempdir().expect("temp");
-    let actions = fake_gh(
-        &temp,
-        r#"printf '%s' '{"total_count":101,"check_runs":[{"id":999,"name":"Windows","app":{"id":42},"status":"in_progress","conclusion":null}]}'"#,
-    );
-    let error = check_runs_for_head(&actions, "owner/repo", &"a".repeat(40))
-        .expect_err("a short page cannot conceal the declared remaining attempts");
-    assert!(error.contains("ended early after 1 of total_count=101"));
-}
-
-#[cfg(unix)]
-#[test]
-fn current_head_check_transport_refuses_duplicate_immutable_ids() {
-    let temp = tempfile::tempdir().expect("temp");
-    let actions = fake_gh(
-        &temp,
-        r#"printf '%s' '{"total_count":2,"check_runs":[{"id":999,"name":"Windows","status":"completed","conclusion":"success"},{"id":999,"name":"Windows","status":"in_progress","conclusion":null}]}'"#,
-    );
-    let error = check_runs_for_head(&actions, "owner/repo", &"a".repeat(40))
-        .expect_err("duplicate immutable identity");
-    assert!(error.contains("repeated immutable check-run ID 999"));
-}
-
-#[cfg(unix)]
-#[test]
-fn complete_current_head_transport_refuses_malformed_status_rows() {
-    let temp = tempfile::tempdir().expect("temp");
-    let actions = fake_gh(
-        &temp,
-        r#"
-case "$*" in
-  *"check-runs"*) printf '%s' '{"total_count":0,"check_runs":[]}' ;;
-  *"/statuses"*) printf '%s' '[{"context":"legacy-without-state"}]' ;;
-  *) echo "unexpected: $*" >&2; exit 2 ;;
-esac
-"#,
-    );
-    let error = complete_checks_for_head(&actions, "owner/repo", &"a".repeat(40))
-        .expect_err("malformed status must not disappear");
-    assert!(error.contains("malformed row 0"));
 }
 
 #[cfg(unix)]
@@ -679,7 +592,7 @@ case "$*" in
   *"pr view"*)
     printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS"}]}' ;;
   *"commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs"*)
-    printf '%s' '{"total_count":1,"check_runs":[{"id":999,"name":"macos","app":{"id":42},"status":"completed","conclusion":"success"}]}' ;;
+    printf '%s' '{"check_runs":[{"name":"macos","app":{"id":42},"status":"completed","conclusion":"success"}]}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
@@ -734,10 +647,8 @@ fn truncated_rollup_fetches_complete_head_checks_before_merge_classification() {
         "statusCheckRollup": rollup
     });
     let first_page = serde_json::json!({
-        "total_count": 101,
         "check_runs": (0..100)
             .map(|index| serde_json::json!({
-                "id": 10_000 + index,
                 "name": format!("check-{index}"),
                 "status": "completed",
                 "conclusion": "success"
@@ -745,9 +656,7 @@ fn truncated_rollup_fetches_complete_head_checks_before_merge_classification() {
             .collect::<Vec<_>>()
     });
     let second_page = serde_json::json!({
-        "total_count": 101,
         "check_runs": [{
-            "id": 20_000,
             "name": "omitted-failure",
             "status": "completed",
             "conclusion": "failure"

@@ -256,6 +256,8 @@ pub(super) const SHIP_EXIT_MERGE_CLIENT_DEFECT: u8 = 8;
 /// Local validation passed, but its durable scoped ship state disappeared, so
 /// deterministic stewardship cannot safely own merge readiness.
 pub(super) const SHIP_EXIT_VALIDATION_STATE_MISSING: u8 = 9;
+/// Automatic merge is safely unavailable; operator action is required.
+pub(super) const SHIP_EXIT_AUTOMATIC_MERGE_REFUSED: u8 = 10;
 
 pub(super) const WAIT_EXIT_TIMEOUT: u8 = 1;
 pub(super) const WAIT_EXIT_RUN_TERMINAL_WRONG: u8 = 4;
