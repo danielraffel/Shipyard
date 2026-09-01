@@ -785,7 +785,7 @@ const LEGACY_V11_SCHEMA_MANIFEST: &[(&str, &str)] = &[
     ),
     (
         "projection_intents",
-        "c08bf11b61930305e070937531456cfd1c058df56e879bded9e4f3bc33443cec",
+        "e053347b4d391f4d51271fc6b33a4ee78b3262b56ab4676902bc2d66a739aca7",
     ),
     (
         "protected_objects",
@@ -1657,6 +1657,15 @@ mod tests {
     fn gate_0b_1_live_v11_projection_representation_is_exactly_allowlisted() {
         assert_eq!(LEGACY_V11_SCHEMA_MANIFEST.len(), 28);
         assert_eq!(
+            LEGACY_V11_SCHEMA_MANIFEST
+                .iter()
+                .find(|(table, _)| *table == "projection_intents"),
+            Some(&(
+                "projection_intents",
+                "e053347b4d391f4d51271fc6b33a4ee78b3262b56ab4676902bc2d66a739aca7"
+            ))
+        );
+        assert_eq!(
             LEGACY_V11_SCHEMA_MANIFEST.last(),
             Some(&(
                 "workstream_projection_bindings",
@@ -1787,6 +1796,40 @@ CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
                      CREATE INDEX work_items_nonterminal ON work_items(phase, id);",
                 )
                 .expect("alter index");
+        });
+        assert_v11_schema_mutation_refuses("projection-constraint-drift", |connection| {
+            connection
+                .execute_batch(
+                    "PRAGMA writable_schema = ON;
+                     UPDATE sqlite_schema
+                        SET sql = replace(
+                          sql,
+                          'CHECK(length(workstream_handle) BETWEEN 1 AND 128)',
+                          'CHECK(length(workstream_handle) BETWEEN 5 AND 128)'
+                        )
+                      WHERE type = 'table' AND name = 'projection_intents';
+                     PRAGMA writable_schema = OFF;",
+                )
+                .expect("alter projection constraint");
+        });
+        assert_v11_schema_mutation_refuses("projection-index-drift", |connection| {
+            connection
+                .execute_batch(
+                    "DROP INDEX projection_intents_drain;
+                     CREATE INDEX projection_intents_drain
+                       ON projection_intents(state, workstream_handle, sequence);",
+                )
+                .expect("alter projection index");
+        });
+        assert_v11_schema_mutation_refuses("projection-identity-trigger-drift", |connection| {
+            connection
+                .execute_batch("DROP TRIGGER projection_intent_identity_immutable;")
+                .expect("remove projection identity trigger");
+        });
+        assert_v11_schema_mutation_refuses("projection-delete-trigger-drift", |connection| {
+            connection
+                .execute_batch("DROP TRIGGER projection_intent_no_delete;")
+                .expect("remove projection delete trigger");
         });
         assert_v11_schema_mutation_refuses("policy-constraint-drift", |connection| {
             connection

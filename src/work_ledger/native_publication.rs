@@ -3188,6 +3188,51 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn authentic_v11_reconciliation_refuses_malformed_persisted_handle_before_migration() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        let connection = rusqlite::Connection::open(WorkLedger::path_at(temp.path()))
+            .expect("v11 fixture connection");
+        let inserted = connection
+            .execute(
+                "INSERT INTO projection_intents
+                   (intent_id, work_item_id, workstream_handle, sequence, kind, source_revision,
+                    exact_head, receipt_snapshot, receipt_sha256, transition_id,
+                    supersedes_transition_id, state, attempts, retry_at_unix_ms, failure_class,
+                    created_at, updated_at)
+                 SELECT ?1, work_item_id, 'legacy-handle', 999, kind, source_revision,
+                        exact_head, receipt_snapshot, receipt_sha256, ?2,
+                        supersedes_transition_id, state, attempts, retry_at_unix_ms, failure_class,
+                        created_at, updated_at
+                   FROM projection_intents LIMIT 1",
+                params![digest(b"malformed intent"), digest(b"malformed transition")],
+            )
+            .expect("plant historically permitted malformed handle");
+        assert_eq!(inserted, 1);
+        drop(connection);
+        let before = state_tree_bytes(temp.path());
+
+        let error = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &request,
+            &continuation_policy,
+            true,
+        )
+        .expect_err("malformed persisted handle must refuse");
+
+        assert!(error.to_string().contains("workstream handle"));
+        assert_eq!(
+            super::super::inventory::database_effective_schema_version(temp.path())
+                .expect("schema header"),
+            Some(11)
+        );
+        assert_eq!(state_tree_bytes(temp.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn authentic_v11_reconciliation_refuses_unbound_rows() {
         let unbound = TempDir::new().expect("unbound temp");
         let request = request();

@@ -1745,6 +1745,63 @@ pub(super) fn reconstruct_authentic_v11_schema_for_test(
          CREATE TRIGGER workstream_projection_binding_no_delete
          BEFORE DELETE ON workstream_projection_bindings
          BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
+         DROP TRIGGER projection_intent_no_delete;
+         DROP TRIGGER projection_intent_identity_immutable;
+         DROP INDEX projection_intents_drain;
+         ALTER TABLE projection_intents RENAME TO projection_intents_current;
+         CREATE TABLE projection_intents (
+           intent_id TEXT PRIMARY KEY
+             CHECK(length(intent_id) = 64 AND intent_id NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
+           sequence INTEGER NOT NULL CHECK(sequence > 0),
+           kind TEXT NOT NULL CHECK(kind IN ('handoff', 'waiting', 'actionable', 'new_head',
+                                              'merge', 'configured_closure')),
+           source_revision TEXT NOT NULL
+             CHECK(length(source_revision) = 64 AND source_revision NOT GLOB '*[^0-9a-f]*'),
+           exact_head TEXT
+             CHECK(exact_head IS NULL OR
+                   (length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*')),
+           receipt_snapshot BLOB NOT NULL CHECK(length(receipt_snapshot) BETWEEN 2 AND 1048576),
+           receipt_sha256 TEXT NOT NULL
+             CHECK(length(receipt_sha256) = 64 AND receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+           transition_id TEXT NOT NULL UNIQUE
+             CHECK(length(transition_id) = 64 AND transition_id NOT GLOB '*[^0-9a-f]*'),
+           supersedes_transition_id TEXT
+             CHECK(supersedes_transition_id IS NULL OR
+                   (length(supersedes_transition_id) = 64 AND
+                    supersedes_transition_id NOT GLOB '*[^0-9a-f]*')),
+           state TEXT NOT NULL CHECK(state IN ('pending', 'projected', 'quarantined')),
+           attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+           retry_at_unix_ms INTEGER NOT NULL DEFAULT 0 CHECK(retry_at_unix_ms >= 0),
+           failure_class TEXT,
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           updated_at TEXT NOT NULL CHECK(length(updated_at) >= 20),
+           UNIQUE(workstream_handle, sequence),
+           CHECK(length(receipt_sha256) = 64)
+         );
+         INSERT INTO projection_intents
+           (intent_id, work_item_id, workstream_handle, sequence, kind, source_revision,
+            exact_head, receipt_snapshot, receipt_sha256, transition_id,
+            supersedes_transition_id, state, attempts, retry_at_unix_ms, failure_class,
+            created_at, updated_at)
+         SELECT intent_id, work_item_id, workstream_handle, sequence, kind, source_revision,
+                exact_head, receipt_snapshot, receipt_sha256, transition_id,
+                supersedes_transition_id, state, attempts, retry_at_unix_ms, failure_class,
+                created_at, updated_at
+           FROM projection_intents_current;
+         DROP TABLE projection_intents_current;
+         CREATE INDEX projection_intents_drain
+           ON projection_intents(state, retry_at_unix_ms, workstream_handle, sequence);
+         CREATE TRIGGER projection_intent_identity_immutable
+         BEFORE UPDATE OF intent_id, work_item_id, workstream_handle, sequence, kind,
+                          source_revision, exact_head, receipt_snapshot, receipt_sha256,
+                          transition_id, supersedes_transition_id, created_at
+         ON projection_intents
+         BEGIN SELECT RAISE(ABORT, 'projection intent identity is immutable'); END;
+         CREATE TRIGGER projection_intent_no_delete
+         BEFORE DELETE ON projection_intents
+         BEGIN SELECT RAISE(ABORT, 'projection intent cannot be deleted'); END;
          DROP TRIGGER agent_ownership_identity_immutable;
          CREATE TRIGGER agent_ownership_identity_immutable
          BEFORE UPDATE OF ownership_id, work_item_id, work_generation, owner_generation,
