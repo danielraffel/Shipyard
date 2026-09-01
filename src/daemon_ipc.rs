@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
+use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 #[cfg(unix)]
@@ -10,13 +12,13 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 #[cfg(unix)]
 use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use crate::actionable_wake_producer::ActionableWakeProducerStatus;
@@ -29,6 +31,26 @@ use serde_json::json;
 pub const IPC_PROTOCOL_VERSION: u32 = 3;
 /// Number of historical events replayed to new subscribers.
 pub const RING_BUFFER_SIZE: usize = 100;
+/// Maximum number of concurrent wait subscribers served by one daemon.
+pub const MAX_SUBSCRIBERS: usize = 64;
+/// Maximum number of concurrent IPC clients, including short status requests.
+pub const MAX_IPC_CLIENTS: usize = 128;
+/// Per-client outbound frame capacity before the daemon closes a slow client.
+pub const CLIENT_WRITER_QUEUE_CAPACITY: usize = RING_BUFFER_SIZE + 16;
+/// Maximum bytes accepted for one newline-delimited client request.
+pub const MAX_IPC_FRAME_BYTES: usize = 64 * 1024;
+/// Maximum serialized bytes retained for one outbound IPC frame.
+pub const MAX_IPC_OUTBOUND_FRAME_BYTES: usize = 64 * 1024;
+/// Typed retryable refusal when all daemon IPC client slots are occupied.
+pub const IPC_ERROR_CLIENT_CAPACITY: &str = "ipc_client_capacity_exceeded";
+/// Typed retryable refusal when all daemon wait subscriber slots are occupied.
+pub const IPC_ERROR_SUBSCRIBER_CAPACITY: &str = "subscriber_capacity_exceeded";
+/// Typed non-retryable refusal for duplicate subscription on one connection.
+pub const IPC_ERROR_ALREADY_SUBSCRIBED: &str = "already_subscribed";
+/// Typed non-retryable refusal for an oversized inbound request frame.
+pub const IPC_ERROR_FRAME_TOO_LARGE: &str = "ipc_frame_too_large";
+/// Typed non-retryable refusal for an oversized daemon response or event.
+pub const IPC_ERROR_RESPONSE_TOO_LARGE: &str = "ipc_response_frame_too_large";
 
 /// Wire prefix that marks a `last_error` string as a GitHub-auth-degraded
 /// pause reason for the menu-bar app.
@@ -125,23 +147,50 @@ type StopRequestCallback = Arc<dyn Fn() + Send + Sync>;
 type ShipStateListProvider = Arc<dyn Fn() -> Vec<Value> + Send + Sync>;
 
 #[cfg(unix)]
-#[derive(Clone)]
 struct Subscriber {
-    sender: Sender<WriterMessage>,
+    sender: SyncSender<Arc<[u8]>>,
+    shutdown: Arc<UnixStream>,
 }
 
 #[cfg(unix)]
-enum WriterMessage {
-    Json(Value),
-    Goodbye,
+enum FrameRead {
+    Complete,
+    Pending,
+    End,
+    TooLarge,
+    Failed,
 }
 
 #[cfg(unix)]
 #[derive(Default)]
 struct SharedState {
-    ring: VecDeque<Value>,
+    ring: VecDeque<Arc<[u8]>>,
     subscribers: std::collections::BTreeMap<usize, Subscriber>,
     next_id: usize,
+    clients: std::collections::BTreeMap<usize, Arc<UnixStream>>,
+    next_client_id: usize,
+}
+
+#[cfg(unix)]
+struct ClientSlot {
+    shared: Arc<Mutex<SharedState>>,
+    id: usize,
+    shutdown: Arc<UnixStream>,
+}
+
+#[cfg(unix)]
+enum SubscribeError {
+    AtCapacity,
+    WriterUnavailable,
+}
+
+#[cfg(unix)]
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.clients.remove(&self.id);
+        }
+    }
 }
 
 /// Owns the Unix socket listener and fans out events to subscribers.
@@ -222,12 +271,23 @@ impl IpcServer {
             while running.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        let Ok(shutdown) = stream.try_clone() else {
+                            continue;
+                        };
+                        let Some(client_slot) =
+                            try_acquire_client(&shared, MAX_IPC_CLIENTS, Arc::new(shutdown))
+                        else {
+                            reject_client_at_capacity(stream);
+                            continue;
+                        };
                         let shared = Arc::clone(&shared);
                         let running = Arc::clone(&running);
                         let status_provider = Arc::clone(&status_provider);
                         let on_stop_request = on_stop_request.clone();
                         let ship_state_list_provider = ship_state_list_provider.clone();
                         thread::spawn(move || {
+                            let shutdown = Arc::clone(&client_slot.shutdown);
+                            let _client_slot = client_slot;
                             handle_client(
                                 stream,
                                 &shared,
@@ -235,6 +295,7 @@ impl IpcServer {
                                 &status_provider,
                                 on_stop_request.as_ref(),
                                 ship_state_list_provider.as_ref(),
+                                &shutdown,
                             );
                         });
                     }
@@ -259,14 +320,17 @@ impl IpcServer {
     /// Stop the listener, drop subscribers, and remove the socket.
     pub fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.running.store(false, Ordering::Release);
-        if let Ok(shared) = self.shared.lock() {
-            for subscriber in shared.subscribers.values() {
-                let _ = subscriber.sender.send(WriterMessage::Goodbye);
-            }
+        let clients = self.shared.lock().map_or_else(
+            |_| Vec::new(),
+            |shared| shared.clients.values().cloned().collect::<Vec<_>>(),
+        );
+        for client in &clients {
+            let _ = client.shutdown(Shutdown::Read);
         }
         if let Some(thread) = self.listener_thread.take() {
             let _ = thread.join();
         }
+        close_lingering_clients(&self.shared, Duration::from_secs(1));
         if self.socket_path.exists() || self.socket_path.is_symlink() {
             let _writer_domain =
                 crate::writer_domain_lease::acquire_for_protected_path(&self.socket_path)?;
@@ -277,22 +341,39 @@ impl IpcServer {
 
     /// Broadcast an event to connected subscribers and append it to the ring buffer.
     pub fn broadcast_event(&self, event: Value) {
-        let frame = event_frame(&event);
-        let subscribers = {
-            let mut shared = self.shared.lock().expect("shared lock");
-            shared.ring.push_back(event);
-            while shared.ring.len() > RING_BUFFER_SIZE {
-                let _ = shared.ring.pop_front();
+        let frame = encode_json_line(event_frame(event));
+        let mut shared = self.shared.lock().expect("shared lock");
+        let Some(frame) = frame else {
+            let error = encoded_error_frame(
+                IPC_ERROR_RESPONSE_TOO_LARGE,
+                "daemon IPC event exceeds 65536 serialized bytes",
+                false,
+            );
+            for (_, subscriber) in std::mem::take(&mut shared.subscribers) {
+                if subscriber.sender.try_send(error.clone()).is_ok() {
+                    let _ = subscriber.shutdown.shutdown(Shutdown::Read);
+                } else {
+                    let _ = subscriber.shutdown.shutdown(Shutdown::Both);
+                }
             }
-            shared
-                .subscribers
-                .values()
-                .cloned()
-                .collect::<Vec<Subscriber>>()
+            return;
         };
+        shared.ring.push_back(frame.clone());
+        while shared.ring.len() > RING_BUFFER_SIZE {
+            let _ = shared.ring.pop_front();
+        }
 
-        for subscriber in subscribers {
-            let _ = subscriber.sender.send(WriterMessage::Json(frame.clone()));
+        let evicted = shared
+            .subscribers
+            .iter()
+            .filter_map(|(id, subscriber)| {
+                subscriber.sender.try_send(frame.clone()).err().map(|_| *id)
+            })
+            .collect::<Vec<_>>();
+        for id in evicted {
+            if let Some(subscriber) = shared.subscribers.remove(&id) {
+                let _ = subscriber.shutdown.shutdown(Shutdown::Both);
+            }
         }
     }
 
@@ -306,6 +387,67 @@ impl IpcServer {
 }
 
 #[cfg(unix)]
+fn try_acquire_client(
+    shared: &Arc<Mutex<SharedState>>,
+    max_clients: usize,
+    shutdown: Arc<UnixStream>,
+) -> Option<ClientSlot> {
+    let mut state = shared.lock().ok()?;
+    if state.clients.len() >= max_clients {
+        return None;
+    }
+    let id = state.next_client_id;
+    state.next_client_id = state.next_client_id.wrapping_add(1);
+    state.clients.insert(id, Arc::clone(&shutdown));
+    drop(state);
+    Some(ClientSlot {
+        shared: Arc::clone(shared),
+        id,
+        shutdown,
+    })
+}
+
+#[cfg(unix)]
+fn close_lingering_clients(shared: &Arc<Mutex<SharedState>>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let clients = shared.lock().map_or_else(
+            |_| Vec::new(),
+            |shared| shared.clients.values().cloned().collect::<Vec<_>>(),
+        );
+        if clients.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let clients = shared.lock().map_or_else(
+                |_| clients,
+                |mut shared| std::mem::take(&mut shared.clients).into_values().collect(),
+            );
+            for client in clients {
+                let _ = client.shutdown(Shutdown::Both);
+            }
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn reject_client_at_capacity(mut stream: UnixStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+    let _ = write_json_line(
+        &mut stream,
+        &error_frame(
+            IPC_ERROR_CLIENT_CAPACITY,
+            "daemon IPC client capacity reached",
+            true,
+        ),
+    );
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)] // Linear protocol dispatch stays visible in one bounded loop.
 fn handle_client(
     stream: UnixStream,
     shared: &Arc<Mutex<SharedState>>,
@@ -313,87 +455,116 @@ fn handle_client(
     status_provider: &StatusProvider,
     on_stop_request: Option<&StopRequestCallback>,
     ship_state_list_provider: Option<&ShipStateListProvider>,
+    shutdown: &Arc<UnixStream>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-    let (sender, receiver) = mpsc::channel::<WriterMessage>();
+    let (sender, receiver) = mpsc::sync_channel(CLIENT_WRITER_QUEUE_CAPACITY);
     let writer_stream = stream.try_clone().ok();
-    let writer_thread = writer_stream
-        .map(|writer_stream| thread::spawn(move || writer_loop(writer_stream, receiver)));
-    let _ = sender.send(WriterMessage::Json(json!({
-        "type": "hello",
-        "protocol": IPC_PROTOCOL_VERSION,
-        "shipyard_version": env!("CARGO_PKG_VERSION"),
-    })));
+    let writer_thread = writer_stream.map(|writer_stream| {
+        let _ = writer_stream.set_write_timeout(Some(Duration::from_millis(250)));
+        thread::spawn(move || writer_loop(writer_stream, receiver))
+    });
+    if !send_json(
+        &sender,
+        Some(shutdown),
+        json!({
+            "type": "hello",
+            "protocol": IPC_PROTOCOL_VERSION,
+            "shipyard_version": env!("CARGO_PKG_VERSION"),
+        }),
+    ) {
+        return;
+    }
 
     let mut subscriber_id = None;
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    let mut frame = Vec::new();
 
     while running.load(Ordering::Acquire) {
-        line.clear();
-        let bytes_read = match reader.read_line(&mut line) {
-            Ok(bytes_read) => bytes_read,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
+        match read_bounded_frame(&mut reader, &mut frame) {
+            FrameRead::Pending => {
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }
-            Err(_) => break,
-        };
-        if bytes_read == 0 {
-            break;
+            FrameRead::TooLarge => {
+                let _ = send_json(
+                    &sender,
+                    Some(shutdown),
+                    error_frame(
+                        IPC_ERROR_FRAME_TOO_LARGE,
+                        "daemon IPC request frame exceeds 65536 bytes",
+                        false,
+                    ),
+                );
+                break;
+            }
+            FrameRead::End | FrameRead::Failed => break,
+            FrameRead::Complete => {}
         }
-        let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
+        let Ok(message) = serde_json::from_slice::<Value>(&frame) else {
+            frame.clear();
             continue;
         };
+        frame.clear();
         let Some(msg_type) = message.get("type").and_then(Value::as_str) else {
             continue;
         };
 
         match msg_type {
             "subscribe" => {
-                let (id, backlog) = {
-                    let mut shared = shared.lock().expect("shared lock");
-                    let id = shared.next_id;
-                    shared.next_id += 1;
-                    shared.subscribers.insert(
-                        id,
-                        Subscriber {
-                            sender: sender.clone(),
-                        },
+                if subscriber_id.is_some() {
+                    let _ = send_json(
+                        &sender,
+                        Some(shutdown),
+                        error_frame(
+                            IPC_ERROR_ALREADY_SUBSCRIBED,
+                            "IPC connection is already subscribed",
+                            false,
+                        ),
                     );
-                    let backlog = shared.ring.iter().cloned().collect::<Vec<_>>();
-                    (id, backlog)
-                };
-                subscriber_id = Some(id);
-                for event in backlog {
-                    let _ = sender.send(WriterMessage::Json(event_frame(&event)));
+                    break;
+                }
+                match register_subscriber(shared, &sender, Some(shutdown)) {
+                    Ok(id) => subscriber_id = Some(id),
+                    Err(SubscribeError::AtCapacity) => {
+                        let _ = send_json(
+                            &sender,
+                            Some(shutdown),
+                            error_frame(
+                                IPC_ERROR_SUBSCRIBER_CAPACITY,
+                                "daemon wait subscriber capacity reached",
+                                true,
+                            ),
+                        );
+                        break;
+                    }
+                    Err(SubscribeError::WriterUnavailable) => break,
                 }
             }
             "status" => {
                 let subscribers = shared.lock().expect("shared lock").subscribers.len();
                 let mut state = status_provider();
                 state.subscribers = subscribers;
-                let _ = sender.send(WriterMessage::Json(status_frame(&state)));
+                if !send_json(&sender, Some(shutdown), status_frame(&state)) {
+                    break;
+                }
             }
             "stop" => {
-                if let Some(callback) = &on_stop_request {
+                if let Some(callback) = on_stop_request {
                     callback();
                 }
             }
             "ship-state-list" => {
                 let states = ship_state_list_provider
-                    .as_ref()
                     .map(|provider| provider())
                     .unwrap_or_default();
-                let _ = sender.send(WriterMessage::Json(json!({
-                    "type": "ship-state-list",
-                    "states": states,
-                })));
+                if !send_json(
+                    &sender,
+                    Some(shutdown),
+                    json!({"type": "ship-state-list", "states": states}),
+                ) {
+                    break;
+                }
             }
             _ => {}
         }
@@ -404,25 +575,143 @@ fn handle_client(
             .lock()
             .map(|mut shared| shared.subscribers.remove(&id));
     }
-    let _ = sender.send(WriterMessage::Goodbye);
+    if enqueue_writer(&sender, goodbye_frame()).is_err() {
+        close_stream(Some(shutdown));
+    }
+    drop(sender);
     if let Some(writer_thread) = writer_thread {
         let _ = writer_thread.join();
     }
 }
 
 #[cfg(unix)]
-fn writer_loop(mut stream: UnixStream, receiver: mpsc::Receiver<WriterMessage>) {
-    for message in receiver {
-        match message {
-            WriterMessage::Json(value) => {
-                if write_json_line(&mut stream, &value).is_err() {
-                    break;
-                }
+fn register_subscriber(
+    shared: &Arc<Mutex<SharedState>>,
+    sender: &SyncSender<Arc<[u8]>>,
+    shutdown: Option<&Arc<UnixStream>>,
+) -> Result<usize, SubscribeError> {
+    let mut shared = shared.lock().expect("shared lock");
+    if shared.subscribers.len() >= MAX_SUBSCRIBERS {
+        return Err(SubscribeError::AtCapacity);
+    }
+    let id = shared.next_id;
+    shared.next_id = shared.next_id.wrapping_add(1);
+    if !shared
+        .ring
+        .iter()
+        .all(|event| enqueue_writer(sender, Arc::clone(event)).is_ok())
+    {
+        close_stream(shutdown.map(Arc::as_ref));
+        return Err(SubscribeError::WriterUnavailable);
+    }
+    let shutdown = shutdown.cloned().ok_or(SubscribeError::WriterUnavailable)?;
+    shared.subscribers.insert(
+        id,
+        Subscriber {
+            sender: sender.clone(),
+            shutdown,
+        },
+    );
+    Ok(id)
+}
+
+#[cfg(unix)]
+fn send_json(sender: &SyncSender<Arc<[u8]>>, shutdown: Option<&UnixStream>, value: Value) -> bool {
+    let Some(frame) = encode_json_line(value) else {
+        if enqueue_writer(
+            sender,
+            encoded_error_frame(
+                IPC_ERROR_RESPONSE_TOO_LARGE,
+                "daemon IPC response exceeds 65536 serialized bytes",
+                false,
+            ),
+        )
+        .is_err()
+        {
+            close_stream(shutdown);
+        }
+        return false;
+    };
+    if enqueue_writer(sender, frame).is_ok() {
+        true
+    } else {
+        close_stream(shutdown);
+        false
+    }
+}
+
+#[cfg(unix)]
+fn read_bounded_frame(reader: &mut BufReader<UnixStream>, frame: &mut Vec<u8>) -> FrameRead {
+    loop {
+        let available = match reader.fill_buf() {
+            Ok([]) if frame.is_empty() => return FrameRead::End,
+            Ok([]) => return FrameRead::Complete,
+            Ok(available) => available,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return FrameRead::Pending;
             }
-            WriterMessage::Goodbye => {
-                let _ = write_json_line(&mut stream, &json!({"type": "goodbye"}));
-                break;
-            }
+            Err(_) => return FrameRead::Failed,
+        };
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        if frame.len().saturating_add(consumed) > MAX_IPC_FRAME_BYTES {
+            return FrameRead::TooLarge;
+        }
+        frame.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return FrameRead::Complete;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn enqueue_writer(
+    sender: &SyncSender<Arc<[u8]>>,
+    message: Arc<[u8]>,
+) -> Result<(), TrySendError<Arc<[u8]>>> {
+    sender.try_send(message)
+}
+
+#[cfg(unix)]
+fn encode_json_line(value: Value) -> Option<Arc<[u8]>> {
+    let mut frame = serde_json::to_vec(&value).ok()?;
+    drop(value);
+    frame.push(b'\n');
+    (frame.len() <= MAX_IPC_OUTBOUND_FRAME_BYTES).then(|| Arc::from(frame.into_boxed_slice()))
+}
+
+#[cfg(unix)]
+fn encoded_error_frame(code: &str, message: &str, retryable: bool) -> Arc<[u8]> {
+    encode_json_line(error_frame(code, message, retryable)).expect("small IPC error frame")
+}
+
+#[cfg(unix)]
+fn goodbye_frame() -> Arc<[u8]> {
+    Arc::from(&b"{\"type\":\"goodbye\"}\n"[..])
+}
+
+#[cfg(unix)]
+fn close_stream(stream: Option<&UnixStream>) {
+    if let Some(stream) = stream {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+#[cfg(unix)]
+fn writer_loop(mut stream: UnixStream, receiver: mpsc::Receiver<Arc<[u8]>>) {
+    for frame in receiver {
+        if stream.write_all(&frame).is_err() || stream.flush().is_err() {
+            break;
+        }
+        if frame.as_ref() == b"{\"type\":\"goodbye\"}\n" {
+            break;
         }
     }
 }
@@ -458,17 +747,27 @@ fn status_frame(state: &IpcState) -> Value {
 }
 
 #[cfg(unix)]
-fn event_frame(event: &Value) -> Value {
-    if let Value::Object(map) = event {
-        let mut frame = map.clone();
-        frame.insert("type".to_owned(), Value::from("event"));
-        Value::Object(frame)
-    } else {
-        json!({
+fn event_frame(event: Value) -> Value {
+    match event {
+        Value::Object(mut frame) => {
+            frame.insert("type".to_owned(), Value::from("event"));
+            Value::Object(frame)
+        }
+        event => json!({
             "type": "event",
             "payload": event,
-        })
+        }),
     }
+}
+
+#[cfg(unix)]
+fn error_frame(code: &str, message: &str, retryable: bool) -> Value {
+    json!({
+        "type": "error",
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+    })
 }
 
 /// Read daemon status from the IPC socket. Returns `None` if the daemon
@@ -556,7 +855,8 @@ mod tests {
 
     #[cfg(unix)]
     use super::{
-        IPC_PROTOCOL_VERSION, IpcServer, IpcState, read_daemon_ship_state_list, read_daemon_status,
+        IPC_PROTOCOL_VERSION, IpcServer, IpcState, Subscriber, read_daemon_ship_state_list,
+        read_daemon_status,
     };
 
     #[test]
@@ -750,6 +1050,194 @@ mod tests {
         assert_eq!(lines[0]["type"], "hello");
         assert_eq!(lines[1]["payload"]["id"], 1);
         assert_eq!(lines[2]["payload"]["id"], 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscriber_capacity_is_typed_and_fail_closed() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(super::SharedState::default()));
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let (shutdown, _peer) = UnixStream::pair().expect("socket pair");
+        for id in 0..super::MAX_SUBSCRIBERS {
+            shared.lock().expect("shared").subscribers.insert(
+                id,
+                Subscriber {
+                    sender: sender.clone(),
+                    shutdown: std::sync::Arc::new(shutdown.try_clone().expect("clone shutdown")),
+                },
+            );
+        }
+
+        let shutdown = std::sync::Arc::new(shutdown);
+        let result = super::register_subscriber(&shared, &sender, Some(&shutdown));
+        assert!(matches!(result, Err(super::SubscribeError::AtCapacity)));
+        let error = super::error_frame(super::IPC_ERROR_SUBSCRIBER_CAPACITY, "capacity", true);
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["code"], "subscriber_capacity_exceeded");
+        assert_eq!(error["retryable"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_client_capacity_rejects_before_spawning_another_handler() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(super::SharedState::default()));
+        let (shutdown, _peer) = UnixStream::pair().expect("slot socket");
+        let shutdown = std::sync::Arc::new(shutdown);
+        let first = super::try_acquire_client(&shared, 1, shutdown.clone()).expect("first slot");
+        assert!(super::try_acquire_client(&shared, 1, shutdown.clone()).is_none());
+
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        super::reject_client_at_capacity(server);
+        let mut line = String::new();
+        BufReader::new(client)
+            .read_line(&mut line)
+            .expect("capacity error");
+        let error: Value = serde_json::from_str(line.trim()).expect("json");
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["code"], "ipc_client_capacity_exceeded");
+        assert_eq!(error["retryable"], true);
+        drop(first);
+        assert!(super::try_acquire_client(&shared, 1, shutdown).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_subscribe_does_not_allocate_another_slot() {
+        let socket_path = short_socket_path();
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state);
+        server.start().expect("start");
+
+        let mut stream = UnixStream::connect(&socket_path).expect("connect");
+        stream
+            .write_all(b"{\"type\":\"subscribe\"}\n{\"type\":\"subscribe\"}\n")
+            .expect("duplicate subscribe");
+        let lines = read_lines(stream, 3);
+
+        assert_eq!(lines[0]["type"], "hello");
+        assert_eq!(lines[1]["type"], "error");
+        assert_eq!(lines[1]["code"], "already_subscribed");
+        assert_eq!(lines[1]["retryable"], false);
+        assert_eq!(lines[2]["type"], "goodbye");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.subscriber_count() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(server.subscriber_count(), 0);
+
+        server.stop().expect("stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_subscriber_queue_evicts_and_closes_the_client() {
+        let socket_path = short_socket_path();
+        let server = IpcServer::new(socket_path, dummy_state);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        sender
+            .try_send(super::encode_json_line(json!({"type":"occupied"})).expect("frame"))
+            .expect("fill queue");
+        let (shutdown, mut peer) = UnixStream::pair().expect("socket pair");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout");
+        server.shared.lock().expect("shared").subscribers.insert(
+            7,
+            Subscriber {
+                sender,
+                shutdown: std::sync::Arc::new(shutdown),
+            },
+        );
+
+        server.broadcast_event(json!({"kind":"workflow_run"}));
+
+        assert_eq!(server.subscriber_count(), 0);
+        let mut byte = [0_u8; 1];
+        assert_eq!(std::io::Read::read(&mut peer, &mut byte).expect("read"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_event_is_not_retained_and_closes_subscriber_with_typed_error() {
+        let socket_path = short_socket_path();
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state);
+        server.start().expect("start");
+
+        let client = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("connect");
+            stream
+                .write_all(b"{\"type\":\"subscribe\"}\n")
+                .expect("subscribe");
+            read_lines(stream, 3)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.subscriber_count() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        server.broadcast_event(json!({
+            "payload": "x".repeat(super::MAX_IPC_OUTBOUND_FRAME_BYTES),
+        }));
+        let lines = client.join().expect("join");
+
+        assert_eq!(lines[0]["type"], "hello");
+        assert_eq!(lines[1]["type"], "error");
+        assert_eq!(lines[1]["code"], "ipc_response_frame_too_large");
+        assert_eq!(lines[1]["retryable"], false);
+        assert_eq!(lines[2]["type"], "goodbye");
+        assert!(server.shared.lock().expect("shared").ring.is_empty());
+        server.stop().expect("stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_closes_idle_admitted_client_after_goodbye() {
+        let socket_path = short_socket_path();
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state);
+        server.start().expect("start");
+
+        let stream = UnixStream::connect(socket_path).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("hello");
+        assert_eq!(
+            serde_json::from_str::<Value>(line.trim()).expect("hello json")["type"],
+            "hello"
+        );
+
+        server.stop().expect("stop");
+        line.clear();
+        reader.read_line(&mut line).expect("goodbye");
+        assert_eq!(
+            serde_json::from_str::<Value>(line.trim()).expect("goodbye json")["type"],
+            "goodbye"
+        );
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).expect("closed"), 0);
+        assert!(server.shared.lock().expect("shared").clients.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_inbound_frame_is_typed_and_closed() {
+        let socket_path = short_socket_path();
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state);
+        server.start().expect("start");
+
+        let mut stream = UnixStream::connect(&socket_path).expect("connect");
+        let mut oversized = vec![b'x'; super::MAX_IPC_FRAME_BYTES + 1];
+        oversized.push(b'\n');
+        stream.write_all(&oversized).expect("oversized frame");
+        let lines = read_lines(stream, 3);
+
+        assert_eq!(lines[0]["type"], "hello");
+        assert_eq!(lines[1]["type"], "error");
+        assert_eq!(lines[1]["code"], "ipc_frame_too_large");
+        assert_eq!(lines[1]["retryable"], false);
+        assert_eq!(lines[2]["type"], "goodbye");
+
+        server.stop().expect("stop");
     }
 
     #[cfg(unix)]
