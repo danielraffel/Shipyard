@@ -32,13 +32,13 @@ use crate::work_ledger::{
     CustodyReceipt, CustodySuccessorRebind, CustodySuccessorReceipt, CustodyTransfer,
     CustodyTransportAuthenticator, ProcessedReceipt, WorkLedger, WorkLedgerError, WorkLedgerResult,
     authenticate_custody_control, authenticate_custody_successor_rebind,
-    authenticate_custody_transfer, authenticate_processed_receipt, custody_inventory_request,
-    verify_custody_inventory_inbox,
+    authenticate_custody_successor_receipt, authenticate_custody_transfer,
+    authenticate_processed_receipt, custody_inventory_request, verify_custody_inventory_inbox,
 };
 #[cfg(any(unix, test))]
 use crate::work_ledger::{
     authenticate_custody_control_receipt, authenticate_custody_receipt,
-    authenticate_custody_successor_receipt, verify_custody_inventory_response,
+    verify_custody_inventory_response,
 };
 
 mod policy;
