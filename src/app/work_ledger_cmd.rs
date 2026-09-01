@@ -600,6 +600,7 @@ pub(super) fn work_ledger_command<W: Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // One fail-closed GitHub + local ledger reconciliation protocol.
 fn reconcile_terminal_target<W: Write>(
     state_dir: &Path,
     repo: &str,
@@ -654,6 +655,7 @@ fn reconcile_terminal_target<W: Write>(
         source_digest: candidate.source_digest.clone(),
         route_ref: candidate.route_ref.clone(),
         wake_id: candidate.wake_id.clone(),
+        delivery_id: candidate.delivery_id.clone(),
         profile_digest: candidate.profile_digest.clone(),
         workstream_handle: expectation.workstream_handle.to_owned(),
         plan_sha256: expectation.plan_sha256.to_owned(),
@@ -666,8 +668,8 @@ fn reconcile_terminal_target<W: Write>(
     };
     if apply && candidate.phase == "dispatching" {
         let expected_authority = authority.clone();
-        ledger
-            .finalize_uncertain_dispatch_with_authority(&candidate, || {
+        request = ledger
+            .finalize_uncertain_dispatch_with_authority(&request, || {
                 let observed = observe_terminal_merge_authority(actions, repo, pr, head)
                     .map_err(|error| WorkLedgerError::Refused(error.message().to_owned()))?;
                 if observed != expected_authority {
@@ -682,7 +684,12 @@ fn reconcile_terminal_target<W: Write>(
         candidate = ledger
             .terminal_reconciliation_target(repo, pr, head)
             .map_err(failure)?;
-        request.work_generation = candidate.work_generation;
+        if request.work_generation != candidate.work_generation {
+            return Err(CliFailure::new(
+                1,
+                "terminal reconciliation projected generation disagrees after terminalization",
+            ));
+        }
     }
     if !apply && candidate.phase == "dispatching" {
         let report = ledger
