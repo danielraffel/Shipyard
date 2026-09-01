@@ -3301,6 +3301,20 @@ class GuardianLifecycleTests(unittest.TestCase):
         self.assertEqual(guardian._mode_arg(argv), "shipyard")
         self.assertEqual(guardian._repo_args(argv), ("owner/a", "owner/z"))
 
+    def test_workflow_ready_wait_covers_bounded_guardian_preflight(self) -> None:
+        workflow = (
+            Path(__file__).parent.parent / ".github/workflows/sandbox-e2e.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("guardian_ready_timeout_seconds=180", workflow)
+        self.assertIn(
+            "deadline=$((SECONDS + guardian_ready_timeout_seconds))", workflow
+        )
+        self.assertNotIn(
+            'launchctl bootstrap "gui/$(id -u)" "$guardian_plist"\n'
+            "          deadline=$((SECONDS + 30))",
+            workflow,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

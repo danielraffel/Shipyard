@@ -163,7 +163,12 @@ jobs:
           PLIST
           plutil -lint "$guardian_plist"
           launchctl bootstrap "gui/$(id -u)" "$guardian_plist"
-          deadline=$((SECONDS + 30))
+          # This outer observer must not expire before the guardian's bounded
+          # pre-ready protocol. A corrected holder probe alone may consume 30s;
+          # transition classification, legacy compatibility, retained-lease
+          # reconciliation, and candidate startup add their own bounded windows.
+          guardian_ready_timeout_seconds=180
+          deadline=$((SECONDS + guardian_ready_timeout_seconds))
           while [ ! -s "$canary_root/ready.json" ] && [ ! -s "$canary_root/guardian-receipt.json" ] && [ ! -s "$canary_root/retained-reconciliation.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
           if [ -s "$canary_root/retained-reconciliation.json" ]; then
             python3 "$GITHUB_WORKSPACE/scripts/sandbox_admission_deferral.py" \
