@@ -191,12 +191,10 @@ impl TerminalLogManifest {
     }
 }
 
-/// Write the terminal manifest atomically if this job has a log directory.
+/// Write the terminal manifest atomically, independent of target log creation.
 pub fn write_terminal_manifest(state_dir: &Path, job: &Job) -> io::Result<()> {
     let job_dir = state_dir.join("logs").join(&job.id);
-    if !job_dir.is_dir() {
-        return Ok(());
-    }
+    crate::writer_domain_lease::ensure_protected_dir_all(&job_dir)?;
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&job_dir)?;
     let destination = job_dir.join(TERMINAL_MANIFEST_FILE);
     let bytes = serde_json::to_vec_pretty(&TerminalLogManifest::from_job(job))?;

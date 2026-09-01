@@ -167,11 +167,20 @@ pub(crate) fn acquire_for_protected_stdio() -> io::Result<Option<ProductionWrite
 /// protected-log marker. Callers intentionally ignore failures: writing after
 /// an exclusive audit wins would contaminate evidence, so silence is safer.
 pub(crate) fn write_stderr(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
-    let _writer_domain = acquire_for_protected_stdio()?;
+    let lease = acquire_for_protected_stdio();
     let mut stderr = io::stderr().lock();
-    stderr.write_fmt(arguments)?;
-    stderr.write_all(b"\n")?;
-    stderr.flush()
+    write_diagnostic_with_lease(arguments, lease, &mut stderr)
+}
+
+fn write_diagnostic_with_lease<T>(
+    arguments: std::fmt::Arguments<'_>,
+    lease: io::Result<T>,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let _lease = lease?;
+    writer.write_fmt(arguments)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 /// Wrap an external command in a Shipyard process that acquires its own lease
@@ -570,6 +579,49 @@ mod tests {
             !is_protected_path(&home.join("Code/Shipyard"), home, &runtime_paths)
                 .expect("classify unrelated root")
         );
+    }
+
+    #[test]
+    fn detached_daemon_sources_never_bypass_protected_stdio_fence() {
+        for (name, source) in [
+            ("daemon_runtime.rs", include_str!("daemon_runtime.rs")),
+            ("shadow_scheduler.rs", include_str!("shadow_scheduler.rs")),
+        ] {
+            for raw_macro in ["eprintln!", "eprint!", "println!", "print!"] {
+                assert!(
+                    !source.contains(raw_macro),
+                    "{name} must route {raw_macro} diagnostics through writer_domain_lease::write_stderr"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_diagnostic_writes_only_after_its_writer_lease_is_acquired() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let domain_path = temp.path().join(WRITER_DOMAIN_LOCK_NAME);
+        let exclusive = open_lock_file(&domain_path).expect("exclusive handle");
+        FileExt::lock_exclusive(&exclusive).expect("exclusive lock");
+
+        let mut blocked = Vec::new();
+        let error = write_diagnostic_with_lease(
+            format_args!("must remain absent"),
+            acquire_at(temp.path(), Duration::from_millis(30)),
+            &mut blocked,
+        )
+        .expect_err("diagnostic must not bypass the exclusive audit");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(blocked.is_empty());
+
+        FileExt::unlock(&exclusive).expect("unlock exclusive");
+        let mut written = Vec::new();
+        write_diagnostic_with_lease(
+            format_args!("written after release"),
+            acquire_at(temp.path(), Duration::from_millis(30)),
+            &mut written,
+        )
+        .expect("diagnostic after release");
+        assert_eq!(written, b"written after release\n");
     }
 
     #[test]

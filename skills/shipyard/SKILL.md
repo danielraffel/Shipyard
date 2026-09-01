@@ -1895,6 +1895,13 @@ answer in the authoritative PR snapshot and must not depend on another REST
 request. Human output names the failed head and checks; JSON retains the full
 observation with `matched:false`.
 
+Durable queue jobs use `shipyard wait job <sy-id> [--success]`, backed only by
+the machine-global queue state. Never pass a `sy-*` ID to `wait run`; the CLI
+rejects that class before GitHub lookup. A pending/running queue job plus a
+missing run or log observation is still pending/unknown, never success.
+`shipyard --json logs <sy-id>` emits typed job lifecycle and log-availability
+metadata without raw log content; nonterminal observations exit 3.
+
 GitHub App installation tokens can also be rejected by GitHub's GraphQL
 `createPullRequest` / `mergePullRequest` mutations even when the App token is
 otherwise the right auth source for inspection. PR creation first tries the

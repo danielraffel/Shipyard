@@ -47,6 +47,8 @@ shipyard watch local --target linux-vm --command '<cmd>' --milestone-regex '<re>
 shipyard queue                 # show all jobs with priorities
 shipyard logs <id>             # per-target logs
 shipyard logs <id> --target windows
+shipyard --json logs <id>      # typed availability/lifecycle metadata, not log content
+shipyard wait job <id> --success --json  # durable queue terminal/pass wait
 shipyard evidence              # last-good SHA per platform
 shipyard evidence command      # latest workload-agnostic command-evidence bundle
 shipyard evidence command --list

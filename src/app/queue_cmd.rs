@@ -12,6 +12,7 @@ use crate::evidence::EvidenceStore;
 use crate::executor::dispatch::{ExecutorDispatcher, resolve_targets};
 use crate::identity::RuntimeMode;
 use crate::job::{Job, JobStatus, Priority, ValidationMode};
+use crate::log_retention::read_terminal_manifest;
 use crate::output::write_json_envelope;
 use crate::queue::{Queue, QueueError};
 
@@ -182,21 +183,87 @@ pub(super) fn evidence_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+#[allow(clippy::too_many_lines)] // Keeps legacy human log streaming and typed JSON state together.
 pub(super) fn logs_command<W: Write>(
     job_id: &str,
-    target: Option<String>,
+    target: Option<&str>,
     state_dir: &Path,
+    json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let mut queue = open_queue(state_dir)?;
     let Some(job) = queue.get(job_id)? else {
+        if json_mode {
+            if !is_plain_component(job_id) {
+                return Err(CliFailure::new(2, "job id must be one path component"));
+            }
+            let job_dir = state_dir.join("logs").join(job_id);
+            let manifest = read_terminal_manifest(&job_dir);
+            let target_available = target
+                .map(|name| retained_target_exists(&job_dir, name))
+                .transpose()?
+                .unwrap_or(retained_log_exists(&job_dir)?);
+            let retained = manifest.is_some() && target_available;
+            let data = BTreeMap::from([
+                ("job_id".to_owned(), Value::String(job_id.to_owned())),
+                (
+                    "job_status".to_owned(),
+                    manifest.as_ref().map_or(Value::Null, |item| {
+                        Value::String(
+                            if item.reason == "cancelled" {
+                                "cancelled"
+                            } else {
+                                "completed"
+                            }
+                            .to_owned(),
+                        )
+                    }),
+                ),
+                (
+                    "terminal".to_owned(),
+                    manifest.as_ref().map_or(Value::Null, |_| Value::Bool(true)),
+                ),
+                (
+                    "passed".to_owned(),
+                    manifest
+                        .as_ref()
+                        .map_or(Value::Null, |item| Value::Bool(!item.failed)),
+                ),
+                (
+                    "observation".to_owned(),
+                    Value::String(
+                        if retained {
+                            "retained"
+                        } else if manifest.is_some() {
+                            "not_materialized"
+                        } else {
+                            "not_found"
+                        }
+                        .to_owned(),
+                    ),
+                ),
+                (
+                    "requested_target".to_owned(),
+                    target.map_or(Value::Null, |name| Value::String(name.to_owned())),
+                ),
+            ]);
+            write_json_envelope(stdout, "logs", data)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            return Ok(if retained {
+                ExitCode::SUCCESS
+            } else if manifest.is_some() {
+                ExitCode::from(1)
+            } else {
+                ExitCode::from(5)
+            });
+        }
         let target = target.ok_or_else(|| {
             CliFailure::new(
                 1,
                 format!("Job {job_id} is retained; specify --target to read its log"),
             )
         })?;
-        if !is_plain_component(job_id) || !is_plain_component(&target) {
+        if !is_plain_component(job_id) || !is_plain_component(target) {
             return Err(CliFailure::new(2, "target must be one path component"));
         }
         let job_dir = state_dir.join("logs").join(job_id);
@@ -206,22 +273,124 @@ pub(super) fn logs_command<W: Write>(
         if !job_kind.is_some_and(|kind| kind.is_dir() && !kind.is_symlink()) {
             return Err(CliFailure::new(1, format!("Job {job_id} not found")));
         }
-        write_retained_target_logs(stdout, &job_dir, &target)?;
+        write_retained_target_logs(stdout, &job_dir, target)?;
         return Ok(ExitCode::SUCCESS);
     };
+
+    if json_mode {
+        let terminal = matches!(job.status, JobStatus::Completed | JobStatus::Cancelled);
+        if let Some(target) = target
+            && !job.target_names.iter().any(|name| name == target)
+        {
+            let data = BTreeMap::from([
+                ("job_id".to_owned(), Value::String(job.id.clone())),
+                (
+                    "job_status".to_owned(),
+                    serde_json::to_value(job.status)
+                        .map_err(|error| CliFailure::new(1, error.to_string()))?,
+                ),
+                ("terminal".to_owned(), Value::Bool(terminal)),
+                ("passed".to_owned(), Value::Null),
+                (
+                    "observation".to_owned(),
+                    Value::String("invalid_target".to_owned()),
+                ),
+                (
+                    "requested_target".to_owned(),
+                    Value::String(target.to_owned()),
+                ),
+            ]);
+            write_json_envelope(stdout, "logs", data)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            return Ok(ExitCode::from(2));
+        }
+        let available_targets = target.map_or_else(
+            || {
+                job.results
+                    .iter()
+                    .filter_map(|(name, result)| {
+                        result
+                            .log_path
+                            .as_deref()
+                            .filter(|path| log_available(path))
+                            .map(|_| name.as_str())
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |target| {
+                job.results
+                    .get(target)
+                    .and_then(|result| result.log_path.as_deref())
+                    .filter(|path| log_available(path))
+                    .map_or_else(Vec::new, |_| vec![target])
+            },
+        );
+        let data = BTreeMap::from([
+            ("job_id".to_owned(), Value::String(job.id.clone())),
+            (
+                "job_status".to_owned(),
+                serde_json::to_value(job.status)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
+            ),
+            ("terminal".to_owned(), Value::Bool(terminal)),
+            (
+                "passed".to_owned(),
+                if terminal {
+                    Value::Bool(job.passed())
+                } else {
+                    Value::Null
+                },
+            ),
+            (
+                "observation".to_owned(),
+                Value::String(
+                    if available_targets.is_empty() {
+                        "not_materialized"
+                    } else {
+                        "available"
+                    }
+                    .to_owned(),
+                ),
+            ),
+            (
+                "requested_target".to_owned(),
+                target.map_or(Value::Null, |name| Value::String(name.to_owned())),
+            ),
+            (
+                "available_targets".to_owned(),
+                serde_json::to_value(&available_targets)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
+            ),
+        ]);
+        write_json_envelope(stdout, "logs", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return Ok(if !terminal {
+            ExitCode::from(3)
+        } else if available_targets.is_empty() {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+
     if let Some(target) = target {
         let result = job
             .results
-            .get(&target)
+            .get(target)
             .ok_or_else(|| CliFailure::new(1, format!("No log for target {target}")))?;
         let log_path = result
             .log_path
             .as_ref()
             .ok_or_else(|| CliFailure::new(1, format!("No log for target {target}")))?;
         write_log(stdout, log_path)?;
-        return Ok(ExitCode::SUCCESS);
+        return Ok(
+            if matches!(job.status, JobStatus::Pending | JobStatus::Running) {
+                ExitCode::from(3)
+            } else {
+                ExitCode::SUCCESS
+            },
+        );
     }
-
     for name in &job.target_names {
         if let Some(result) = job.results.get(name)
             && let Some(log_path) = result.log_path.as_ref()
@@ -231,7 +400,73 @@ pub(super) fn logs_command<W: Write>(
             write_log(stdout, log_path)?;
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(
+        if matches!(job.status, JobStatus::Pending | JobStatus::Running) {
+            ExitCode::from(3)
+        } else {
+            ExitCode::SUCCESS
+        },
+    )
+}
+
+fn log_available(path: &str) -> bool {
+    let base = PathBuf::from(path);
+    base.is_file()
+        || PathBuf::from(format!("{path}.gz")).is_file()
+        || (1..=32).any(|index| {
+            PathBuf::from(format!("{path}.{index}")).is_file()
+                || PathBuf::from(format!("{path}.{index}.gz")).is_file()
+        })
+}
+
+fn retained_target_exists(job_dir: &Path, target: &str) -> Result<bool, CliFailure> {
+    if !is_plain_component(target) {
+        return Ok(false);
+    }
+    let base_name = format!("{target}.log");
+    let entries = match fs::read_dir(job_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(CliFailure::new(1, error.to_string())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| retained_log_root(name, &base_name).is_some())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn retained_log_exists(job_dir: &Path) -> Result<bool, CliFailure> {
+    let entries = match fs::read_dir(job_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(CliFailure::new(1, error.to_string())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
+            && name
+                .match_indices(".log")
+                .any(|(index, _)| retained_log_root(&name, &name[..index + 4]).is_some())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn is_plain_component(value: &str) -> bool {

@@ -1,11 +1,12 @@
 # Waiting on conditions (`shipyard wait`)
 
-`shipyard wait` is the primitive for "I need to block until something
-on GitHub is true." Three truth conditions:
+`shipyard wait` is the primitive for "I need to block until durable work or
+something on GitHub reaches a known state." Four truth conditions:
 
 - **`wait release <version>`** — release tag exists, artifacts uploaded.
 - **`wait pr <N> --state {green|merged|closed}`** — PR reached a state.
 - **`wait run <id> [--success]`** — workflow run reached terminal.
+- **`wait job <sy-id> [--success]`** — durable Shipyard queue job reached terminal.
 
 It replaces hand-rolled `gh`-polling loops. With a running daemon, relevant
 webhook events trigger immediate authoritative snapshots, and periodic
@@ -19,15 +20,18 @@ shipyard wait release v0.23.0 --timeout 900 --json
 shipyard wait pr 151 --state green --timeout 1800 --json
 shipyard wait pr 151 --state merged --timeout 3600 --json
 shipyard wait run 22345678 --success --timeout 1200 --json
+shipyard wait job sy-20260901-example --success --timeout 1200 --json
 ```
 
-All three subcommands accept:
+All four subcommands accept `--timeout`, `--poll-interval`, and `--json`.
+GitHub-backed release/PR/run waits also accept `--no-fallback`; queue-backed
+job waits do not need a network fallback.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--timeout SECONDS` | 600 (release), 1800 (pr/run) | Hard deadline. |
-| `--poll-interval SECONDS` | 2 (release), 30 (pr), 15 (run) | Authoritative snapshot reconciliation cadence. |
-| `--no-fallback` | off | Exit 6 if the daemon isn't available and the snapshot doesn't already match. |
+| `--timeout SECONDS` | 600 (release), 1800 (pr/run/job) | Hard deadline. |
+| `--poll-interval SECONDS` | 2 (release/job), 30 (pr), 15 (run) | Authoritative reconciliation cadence. |
+| `--no-fallback` | off | GitHub waits only: exit 6 if the daemon isn't available and the snapshot doesn't already match. |
 | `--json` | off | Emit a structured envelope. |
 
 ## Exit codes
@@ -36,8 +40,8 @@ All three subcommands accept:
 |------|---------|
 | 0 | condition matched |
 | 1 | `--timeout` elapsed |
-| 4 | A success condition became impossible: `wait run --success` failed, or every exact-head required PR check finished and at least one failed |
-| 5 | invalid input (PR/release/run not found, bad tag) |
+| 4 | A success condition became impossible: `wait run/job --success` failed, or every exact-head required PR check finished and at least one failed |
+| 5 | invalid input (PR/release/run/job not found, bad tag, wrong ID class) |
 | 6 | daemon unreachable + snapshot didn't match + `--no-fallback` |
 | 7 | unsupported scope — rulesets / merge-queue detected |
 | 130 | SIGINT / SIGTERM |
@@ -114,7 +118,24 @@ requires `conclusion == "success"`. Any other terminal conclusion
 out the timeout — there's no point waiting on a run that's already
 decided.
 
-## Transport model
+`wait run` accepts GitHub numeric run IDs only. A `sy-*` identifier is rejected
+before repository or GitHub lookup with guidance to use `wait job`; this keeps
+a durable queue ID from being misread as an absent GitHub run.
+
+### `wait job <sy-id> [--success]`
+
+Reads the durable Shipyard queue under `--state-dir` until the job is
+`completed` or `cancelled`. Without `--success`, either terminal state matches.
+With `--success`, only `completed` with every configured target passed matches;
+a failed or cancelled terminal job exits 4 immediately.
+
+Pending and running jobs remain nonterminal even when their log is absent or a
+log lookup cannot find a GitHub run. A missing queue record exits 5 with
+`terminal:null` and `passed:null` in JSON. This waiter uses
+`transport:"queue"`; it makes no GitHub request and survives a CLI restart
+because the queue is durable.
+
+## GitHub transport model
 
 The subscription-open / snapshot / fallback order is fixed:
 

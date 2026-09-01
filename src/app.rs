@@ -641,6 +641,7 @@ where
                 command,
                 cli.mode.into(),
                 &runtime_paths.daemon_socket,
+                &runtime_paths.state_dir,
                 &cwd,
                 cli.json,
                 stdout,
@@ -809,7 +810,9 @@ fn handle_state_command<W: Write>(
             }
             None => evidence_command(branch, cwd, state_dir, json, stdout),
         },
-        Command::Logs { job_id, target } => logs_command(&job_id, target, state_dir, stdout),
+        Command::Logs { job_id, target } => {
+            logs_command(&job_id, target.as_deref(), state_dir, json, stdout)
+        }
         Command::Cancel { job_id, reason } => {
             cancel_command(&job_id, reason.as_deref(), state_dir, json, stdout)
         }
@@ -921,11 +924,12 @@ fn handle_wait_command<W: Write>(
     command: self::cli::WaitCommand,
     mode: RuntimeMode,
     daemon_socket: &Path,
+    state_dir: &Path,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    wait_command(command, mode, daemon_socket, cwd, json, stdout)
+    wait_command(command, mode, daemon_socket, state_dir, cwd, json, stdout)
 }
 
 fn handle_runner_command<W: Write>(
@@ -2455,7 +2459,7 @@ mod tests {
         let mut stderr = Vec::new();
         let code = run_with(cli, &mut stdout, &mut stderr);
 
-        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(code, ExitCode::from(3));
         assert!(stderr.is_empty());
         assert_eq!(String::from_utf8(stdout).expect("utf8"), "target log\n");
     }
