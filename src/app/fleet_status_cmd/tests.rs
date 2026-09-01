@@ -94,10 +94,10 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
         },
     ];
 
-    // The contract is one shared deadline, not a two-second scheduler-latency
-    // budget. Leave enough slack for healthy probes in the fully parallel test
-    // suite while the 30-second fixture still proves bounded cancellation.
-    let timeout = std::time::Duration::from_secs(10);
+    // Exercise the production host-observation contract. A shorter test-only
+    // deadline makes a healthy shell probe race the fully parallel test suite
+    // even though production would still accept it.
+    let timeout = FLEET_HOST_PROBE_TIMEOUT;
     let started = std::time::Instant::now();
     let mut probes = probe_hosts_concurrently_with_timeout(&classes, timeout);
 
