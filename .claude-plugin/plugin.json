@@ -1,8 +1,8 @@
 {
   "name": "shipyard",
-  "version": "0.59.3",
+  "version": "0.59.4",
   "description": "Cross-platform CI coordination",
-  "min_shipyard_version": "0.148.0",
+  "min_shipyard_version": "0.148.1",
   "commands": "./commands",
   "skills": "./skills",
   "hooks": "./hooks/hooks.json"
