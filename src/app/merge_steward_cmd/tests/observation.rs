@@ -280,6 +280,51 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn dispatch_runner_inventory_accepts_exact_bound_and_refuses_overflow() {
+    for overflow in [false, true] {
+        let temp = tempfile::tempdir().expect("temp");
+        let page_eleven = if overflow {
+            r#"printf '%s' '{"runners":[{"id":1001,"name":"runner-1001","status":"online","busy":false,"labels":[]}]}'"#
+        } else {
+            r#"printf '%s' '{"runners":[]}'"#
+        };
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+query="$*"
+page="${{query##*page=}}"
+if [ "$page" -eq 11 ]; then
+  {page_eleven}
+  exit 0
+fi
+start=$(( (page - 1) * 100 + 1 ))
+printf '{{"runners":['
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$i" -eq 0 ] || printf ','
+  id=$(( start + i ))
+  printf '{{"id":%s,"name":"runner-%s","status":"online","busy":false,"labels":[]}}' "$id" "$id"
+  i=$(( i + 1 ))
+done
+printf ']}}'
+"#
+            ),
+        );
+        let result = dispatch_runner_observations(&actions, "owner/repo");
+        if overflow {
+            assert_eq!(
+                result.expect_err("overflow refusal"),
+                "repository runner inventory exceeds 1000; refusing partial scan"
+            );
+        } else {
+            assert_eq!(result.expect("exact bound").len(), 1_000);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn dispatch_runner_inventory_refuses_missing_envelope() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(&temp, "printf '%s' '{}'");

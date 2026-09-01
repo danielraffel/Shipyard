@@ -1510,7 +1510,7 @@ fn dispatch_runner_observations(
     repository: &str,
 ) -> Result<Vec<DispatchRunnerObservation>, String> {
     let mut runners = Vec::new();
-    for page in 1..=10 {
+    for page in 1..=11 {
         let value = observation::gh_json(
             actions,
             &[
@@ -1523,6 +1523,13 @@ fn dispatch_runner_observations(
             .get("runners")
             .and_then(Value::as_array)
             .ok_or_else(|| "repository runner inventory missing runners".to_owned())?;
+        if page == 11 {
+            return if rows.is_empty() {
+                Ok(runners)
+            } else {
+                Err("repository runner inventory exceeds 1000; refusing partial scan".to_owned())
+            };
+        }
         let count = rows.len();
         for row in rows {
             runners.push(DispatchRunnerObservation {
