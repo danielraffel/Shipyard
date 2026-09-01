@@ -1687,7 +1687,13 @@ mod tests {
                 .write_all(b"{\"type\":\"goodbye\"}\n")
                 .expect("write goodbye");
             stream.flush().expect("flush goodbye");
-            stream.shutdown(Shutdown::Both).expect("shutdown");
+            if let Err(error) = stream.shutdown(Shutdown::Both) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotConnected,
+                    "unexpected shutdown failure: {error}"
+                );
+            }
         });
 
         let calls = Arc::new(AtomicUsize::new(0));

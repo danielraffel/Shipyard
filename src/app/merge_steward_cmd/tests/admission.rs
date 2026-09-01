@@ -244,6 +244,9 @@ fn admission_observation_lock_child() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn cross_process_contender_defers_and_owner_death_forces_fresh_observation() {
+    let _process_fixture = crate::test_support::PROCESS_TREE_TEST_LOCK
+        .lock()
+        .expect("process fixture lock");
     let temp = tempfile::tempdir().expect("temp");
     let control = mutation_control(&temp, "studio", "studio");
     let paths = RuntimePaths::current_with_overrides(
