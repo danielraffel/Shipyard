@@ -2115,43 +2115,49 @@ pub(crate) mod tests {
         delivered_at: Option<String>,
     }
 
+    type WorkMutationSnapshot = (String, u64, u64, String, String, String, String);
+    type EventMutationSnapshot = (
+        String,
+        u64,
+        u64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+    );
+    type WakeMutationSnapshot = (
+        String,
+        u64,
+        u64,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    type ActivationMutationSnapshot = (
+        String,
+        u64,
+        u64,
+        u64,
+        String,
+        String,
+        String,
+        Option<String>,
+    );
+
     #[derive(Debug, Eq, PartialEq)]
     struct ReconciliationMutationSnapshot {
-        work: (String, u64, u64, String, String, String, String),
-        events: Vec<(
-            String,
-            u64,
-            u64,
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-        )>,
-        wake: (
-            String,
-            u64,
-            u64,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-        ),
+        work: WorkMutationSnapshot,
+        events: Vec<EventMutationSnapshot>,
+        wake: WakeMutationSnapshot,
         delivery: DeliveryMutationSnapshot,
-        activation: (
-            String,
-            u64,
-            u64,
-            u64,
-            String,
-            String,
-            String,
-            Option<String>,
-        ),
+        activation: ActivationMutationSnapshot,
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the immutable snapshot schema in one auditable query order.
     fn reconciliation_mutation_snapshot(
         ledger: &WorkLedger,
         request: &TerminalReconciliationRequest,
