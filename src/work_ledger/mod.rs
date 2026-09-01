@@ -50,6 +50,13 @@ macro_rules! candidate_params {
 }
 
 #[cfg(any(unix, test))]
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "the actionable scheduler is Unix-daemon production code retained in Windows test builds for type checking"
+    )
+)]
 mod actionable_scheduler;
 mod canary_wake;
 mod custody_inventory;

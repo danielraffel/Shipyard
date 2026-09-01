@@ -771,11 +771,10 @@ impl ActionableWakeProducer {
                         let threshold_due = chrono::DateTime::parse_from_rfc3339(
                             &effective_authority.first_observed_unassigned_at,
                         )
-                        .map(|first_observed| {
+                        .map_or(stability_due, |first_observed| {
                             first_observed.with_timezone(&Utc)
                                 + chrono::Duration::seconds(assignment_threshold_secs)
-                        })
-                        .unwrap_or(stability_due);
+                        });
                         std::cmp::max(stability_due, threshold_due).to_rfc3339()
                     },
                     |checkpoint| checkpoint.not_before.clone(),

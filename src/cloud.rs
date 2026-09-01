@@ -367,6 +367,13 @@ impl GitHubActions {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "absolute-deadline injection is exercised by the Unix daemon adapter"
+        )
+    )]
     pub(crate) fn has_absolute_deadline_for_tests(&self) -> bool {
         self.absolute_deadline.is_some()
     }

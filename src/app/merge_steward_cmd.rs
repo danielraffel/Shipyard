@@ -1174,6 +1174,10 @@ pub(super) fn steward_command<W: Write>(
 /// Read the exact queued merge-group jobs for one existing `WorkLedger` target.
 /// This deliberately performs no mutation. Registered runner capacity is read
 /// from GitHub; local admission holds remain a separate JIT/VM authority.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "Unix daemon observation entrypoint")
+)]
 pub(crate) fn observe_dispatch_wedge_target(
     actions: &GitHubActions,
     repository: &str,
@@ -1194,6 +1198,7 @@ pub(crate) fn observe_dispatch_wedge_target(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation request"))]
 pub(crate) struct DispatchWedgeTargetRequest {
     pub(crate) base_ref: String,
     pub(crate) pull_request: u64,
@@ -1201,6 +1206,7 @@ pub(crate) struct DispatchWedgeTargetRequest {
 }
 
 #[derive(Debug)]
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation result"))]
 pub(crate) struct DispatchWedgeTargetResult {
     pub(crate) target: DispatchWedgeTargetRequest,
     pub(crate) result: Result<Vec<DispatchWedgeObservation>, String>,
@@ -1211,6 +1217,10 @@ pub(crate) struct DispatchWedgeTargetResult {
 /// and the registered-runner inventory is shared for the whole repository;
 /// merge-head, run-attempt, job-detail, and producer identity remain exact to
 /// each target. There is deliberately no cache across cycles.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "Unix daemon observation entrypoint")
+)]
 pub(crate) fn observe_dispatch_wedge_targets(
     actions: &GitHubActions,
     repository: &str,
@@ -1226,6 +1236,7 @@ pub(crate) fn observe_dispatch_wedge_targets(
     )
 }
 
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
 fn observe_dispatch_wedge_targets_with<Shared, LoadRunners, LoadRepository, ObserveTarget>(
     targets: &[DispatchWedgeTargetRequest],
     mut load_runners: LoadRunners,
@@ -1265,6 +1276,7 @@ where
         .collect()
 }
 
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
 fn observe_dispatch_wedge_target_from_repository(
     actions: &GitHubActions,
     observation: &RepoObservation,
@@ -1320,6 +1332,7 @@ fn observe_dispatch_wedge_target_from_repository(
     Ok(results)
 }
 
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
 fn collect_dispatch_wedge_job_observations(
     actions: &GitHubActions,
     observation: &RepoObservation,
@@ -1412,6 +1425,7 @@ fn collect_dispatch_wedge_job_observations(
     Ok(results)
 }
 
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
 fn revalidate_dispatch_wedge_authority_with<ReadPullRequest, ReadQueue>(
     observed_pr: &ObservedPr,
     target: &DispatchWedgeTargetRequest,
@@ -1455,6 +1469,7 @@ where
     Ok(())
 }
 
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
 fn current_required_dispatch_job<'a>(
     listed: &StewardJob,
     detail: &StewardJob,
@@ -1489,6 +1504,7 @@ fn current_required_dispatch_job<'a>(
     matching.next().is_none().then_some(required)
 }
 
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
 fn dispatch_runner_observations(
     actions: &GitHubActions,
     repository: &str,
