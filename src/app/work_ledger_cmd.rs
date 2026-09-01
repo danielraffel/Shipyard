@@ -15,15 +15,19 @@ use crate::daemon_ipc::read_daemon_status;
 use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
 use crate::work_ledger::{
-    AgentReturnExpectation, CustodyStatus, NativePublicationReport, RepoPolicy, WorkLedger,
-    absent_status, apply_legacy_snapshot, immutable_legacy_status, local_work_inventory,
-    plan_legacy_snapshot, validate_repo_policy,
+    AgentReturnExpectation, CustodyStatus, ExactProtectedProfileResolver, FreshAgentLaunchProfile,
+    NativePublicationReport, RepoPolicy, TerminalReconciliationRequest, WorkLedger,
+    WorkLedgerError, absent_status, apply_legacy_snapshot, immutable_legacy_status,
+    local_work_inventory, plan_legacy_snapshot, validate_repo_policy,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 
 use super::CliFailure;
 use super::cli::{OwnershipLeaseCommand, WorkLedgerCommand, WorkLedgerPolicyCommand};
-use super::merge_steward_cmd::native_publication_request;
+use super::merge_steward_cmd::{
+    LaunchProfileV1, decode_protected_launch_profile, native_publication_request,
+    observe_terminal_merge_authority,
+};
 
 const MAX_AGENT_RECEIPT_BYTES: u64 = 64 * 1024;
 
@@ -341,6 +345,67 @@ pub(super) fn work_ledger_command<W: Write>(
             .map_err(failure)?;
             write_publication_report(stdout, &report, json)?;
         }
+        WorkLedgerCommand::ReconcileTerminal {
+            repo,
+            pr,
+            head,
+            apply,
+        } => {
+            let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+            if runtime_paths != &production_paths {
+                return Err(CliFailure::new(
+                    1,
+                    "terminal reconciliation is available only against canonical production roots",
+                ));
+            }
+            let target = match (repo.as_deref(), pr, head.as_deref()) {
+                (None, None, None) if !apply => {
+                    let inventory = required_ledger(state_dir)?
+                        .terminal_reconciliation_inventory()
+                        .map_err(failure)?;
+                    if json {
+                        write_pretty_json(stdout, &inventory).map_err(failure)?;
+                    } else {
+                        for item in &inventory.items {
+                            writeln!(
+                                stdout,
+                                "{}#{} {} phase={} work={} generation={}/{} profile={}",
+                                item.repository,
+                                item.pull_request,
+                                item.exact_head,
+                                item.phase,
+                                item.work_id,
+                                item.work_generation,
+                                item.owner_generation,
+                                item.profile_digest,
+                            )
+                            .map_err(failure)?;
+                        }
+                        writeln!(
+                            stdout,
+                            "Terminal reconciliation inventory: {} item(s), limit={}, complete={}",
+                            inventory.items.len(),
+                            inventory.limit,
+                            inventory.complete,
+                        )
+                        .map_err(failure)?;
+                        writeln!(stdout, "Snapshot digest: {}", inventory.snapshot_sha256)
+                            .map_err(failure)?;
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                (Some(repo), Some(pr), Some(head)) => (repo, *pr, head),
+                _ => {
+                    return Err(CliFailure::new(
+                        1,
+                        "terminal reconciliation requires either no target or the complete --repo/--pr/--head target",
+                    ));
+                }
+            };
+            let (repo, pr, head) = target;
+            let actions = GitHubActions::new(cwd).with_repo_override(repo);
+            reconcile_terminal_target(state_dir, repo, pr, head, *apply, json, stdout, &actions)?;
+        }
         WorkLedgerCommand::ContextChallenge { wake } => {
             let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
             let ready = activation.revalidate()?;
@@ -509,6 +574,112 @@ pub(super) fn work_ledger_command<W: Write>(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_terminal_target<W: Write>(
+    state_dir: &Path,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    apply: bool,
+    json: bool,
+    stdout: &mut W,
+    actions: &GitHubActions,
+) -> Result<(), CliFailure> {
+    let ledger = required_ledger(state_dir)?;
+    let candidate = ledger
+        .terminal_reconciliation_target(repo, pr, head)
+        .map_err(failure)?;
+    let mut resolver = ExactProtectedProfileResolver::new(&ledger, decode_protected_launch_profile);
+    let profile: LaunchProfileV1 = resolver
+        .resolve_exact(&candidate.work_id, &candidate.profile_digest)
+        .map_err(failure)?;
+    let expectation = profile.resume_expectation().ok_or_else(|| {
+        CliFailure::new(
+            1,
+            "terminal reconciliation launch profile lacks authenticated continuation authority",
+        )
+    })?;
+    if expectation.repository != repo || expectation.head_sha != head {
+        return Err(CliFailure::new(
+            1,
+            "terminal reconciliation launch profile target disagrees",
+        ));
+    }
+    let authority = observe_terminal_merge_authority(actions, repo, pr, head)?;
+    if authority.canonical_repository != repo || authority.base_ref != candidate.base_ref {
+        return Err(CliFailure::new(
+            1,
+            "terminal reconciliation repository/base authority disagrees",
+        ));
+    }
+    let request = TerminalReconciliationRequest {
+        repository_provider: authority.repository_provider.clone(),
+        repository_id: authority.repository_id.clone(),
+        repository: authority.canonical_repository.clone(),
+        pull_request_node_id: authority.pull_request_node_id.clone(),
+        pull_request: authority.pull_request,
+        head_sha: authority.head_sha.clone(),
+        base_ref: authority.base_ref.clone(),
+        merge_sha: authority.merge_sha.clone(),
+        merged_at: authority.merged_at.clone(),
+        github_installation_id: authority.installation_id,
+        work_id: candidate.work_id.clone(),
+        work_generation: candidate.work_generation,
+        owner_generation: candidate.owner_generation,
+        source_digest: candidate.source_digest.clone(),
+        route_ref: candidate.route_ref.clone(),
+        wake_id: candidate.wake_id.clone(),
+        profile_digest: candidate.profile_digest.clone(),
+        workstream_handle: expectation.workstream_handle.to_owned(),
+        plan_sha256: expectation.plan_sha256.to_owned(),
+        root_revision: expectation.root_revision,
+        issue_revision: expectation.issue_revision,
+        projection_revision: expectation.projection_revision,
+        material_event_revision: expectation.material_event_revision,
+        success_continuation_digest: expectation.success_continuation_digest.to_owned(),
+        failure_continuation_digest: expectation.failure_continuation_digest.to_owned(),
+    };
+    drop(profile);
+    drop(ledger);
+    let expected_authority = authority.clone();
+    let report =
+        WorkLedger::plan_or_apply_terminal_reconciliation(state_dir, &request, apply, || {
+            let observed = observe_terminal_merge_authority(actions, repo, pr, head)
+                .map_err(|error| WorkLedgerError::Refused(error.message().to_owned()))?;
+            if observed != expected_authority {
+                return Err(WorkLedgerError::Refused(
+                    "terminal reconciliation GitHub authority changed before apply".to_owned(),
+                ));
+            }
+            Ok(())
+        })
+        .map_err(failure)?;
+    if json {
+        write_pretty_json(stdout, &report).map_err(failure)?;
+    } else {
+        writeln!(
+            stdout,
+            "Terminal reconciliation: {}{}",
+            if report.applied { "applied" } else { "dry-run" },
+            if report.replay { " (exact replay)" } else { "" },
+        )
+        .map_err(failure)?;
+        writeln!(stdout, "Work: {}", report.work_id).map_err(failure)?;
+        writeln!(stdout, "Workstream: {}", report.workstream_handle).map_err(failure)?;
+        writeln!(
+            stdout,
+            "Target: {}#{}",
+            report.repository, report.pull_request
+        )
+        .map_err(failure)?;
+        writeln!(stdout, "Head: {}", report.exact_head).map_err(failure)?;
+        writeln!(stdout, "Merge: {}", report.merge_sha).map_err(failure)?;
+        writeln!(stdout, "Receipt digest: {}", report.receipt_sha256).map_err(failure)?;
+        writeln!(stdout, "Plan digest: {}", report.plan_sha256).map_err(failure)?;
+    }
+    Ok(())
 }
 
 fn parse_lease_expiry(value: &str) -> Result<chrono::DateTime<chrono::Utc>, CliFailure> {

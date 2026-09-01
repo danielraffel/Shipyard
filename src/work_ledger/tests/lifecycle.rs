@@ -66,6 +66,45 @@ fn repeated_import_is_idempotent_and_redacted() {
 }
 
 #[test]
+fn projection_bound_legacy_row_cannot_be_refreshed() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("ledger");
+    let candidate = sample_candidate();
+    let work_id = candidate.work_id.clone();
+    let repository = candidate.repo.clone().expect("repository");
+    let head = candidate.head_sha.clone().expect("head");
+    ledger
+        .import(std::slice::from_ref(&candidate))
+        .expect("initial import");
+    ledger
+        .bind_workstream_projection(
+            &work_id,
+            "GEN-14",
+            &digest(b"projection plan"),
+            1,
+            1,
+            1,
+            1,
+            "github.com",
+            "R_test_repository",
+            &repository,
+            &head,
+        )
+        .expect("projection binding");
+    let mut changed = candidate;
+    changed.lane = Some("stale-legacy-refresh".to_owned());
+    changed.content_digest = digest(b"changed after projection binding");
+    let planned = ledger
+        .plan_import(std::slice::from_ref(&changed))
+        .expect_err("projection-bound legacy dry-run must refuse");
+    assert!(planned.to_string().contains("projection state"));
+    let error = ledger
+        .import(&[changed])
+        .expect_err("projection-bound legacy row must be immutable");
+    assert!(error.to_string().contains("projection state"));
+}
+
+#[test]
 fn transition_and_wake_commit_together_with_generation_fence() {
     let temp = TempDir::new().expect("temp");
     let ledger = WorkLedger::open(temp.path()).expect("ledger");

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use super::*;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 use crate::workstream_activation_loader::ReadyWorkstreamActivation;
@@ -208,6 +209,97 @@ fn inventory_command_emits_bounded_empty_json_without_creating_state() {
     assert_eq!(value["limit"], 256);
     assert_eq!(value["items"], serde_json::json!([]));
     assert!(!state.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_reconciliation_cli_apply_is_reachable_as_exact_replay() {
+    let temp = TempDir::new().expect("temp");
+    let state = temp.path().join("state");
+    let mut publication = crate::work_ledger::native_publication_test_request();
+    let profile_bytes =
+        crate::app::merge_steward_cmd::terminal_reconciliation_test_profile_bytes(&publication);
+    publication.profile_digest = hex::encode(Sha256::digest(&profile_bytes));
+    publication.protected_profile_bytes = profile_bytes;
+    let (request, _ledger) =
+        crate::work_ledger::terminal_reconciliation_test_fixture_with_request(&state, publication);
+    let repository_json = serde_json::json!({
+        "id": request.repository_id,
+        "nameWithOwner": request.repository,
+    })
+    .to_string();
+    let pull_json = serde_json::json!({
+        "id": request.pull_request_node_id,
+        "state": "MERGED",
+        "headRefOid": request.head_sha,
+        "baseRefName": request.base_ref,
+        "mergeCommit": {"oid": request.merge_sha},
+        "mergedAt": request.merged_at,
+    })
+    .to_string();
+    let source = format!(
+        r#"
+use std::io::Write as _;
+
+fn main() {{
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let bytes = if args.first().map(String::as_str) == Some("repo") {{
+        {repository_json:?}.as_bytes()
+    }} else if args.first().map(String::as_str) == Some("pr") {{
+        {pull_json:?}.as_bytes()
+    }} else {{
+        eprintln!("unexpected gh argv: {{}}", args.join(" "));
+        std::process::exit(2);
+    }};
+    std::io::stdout().write_all(bytes).expect("write response");
+}}
+"#,
+    );
+    let gh = crate::test_support::compile_native_test_program(temp.path(), "terminal-gh", &source);
+    let config = crate::config::LoadedConfig {
+        data: "[github.auth]\nsource = 'gh-cli'"
+            .parse()
+            .expect("ambient test auth config"),
+        global_dir: temp.path().join("global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: crate::config::LocalOverlaySource::None,
+    };
+    let actions = GitHubActions::from_loaded_config(temp.path(), &config)
+        .with_repo_override(&request.repository)
+        .with_gh_binary_for_tests(gh);
+
+    let mut applied_output = Vec::new();
+    reconcile_terminal_target(
+        &state,
+        &request.repository,
+        request.pull_request,
+        &request.head_sha,
+        true,
+        true,
+        &mut applied_output,
+        &actions,
+    )
+    .expect("targeted CLI apply");
+    let applied: Value = serde_json::from_slice(&applied_output).expect("apply JSON");
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["replay"], true);
+
+    let mut replay_output = Vec::new();
+    reconcile_terminal_target(
+        &state,
+        &request.repository,
+        request.pull_request,
+        &request.head_sha,
+        true,
+        true,
+        &mut replay_output,
+        &actions,
+    )
+    .expect("targeted CLI exact replay");
+    let replay: Value = serde_json::from_slice(&replay_output).expect("replay JSON");
+    assert_eq!(replay["applied"], false);
+    assert_eq!(replay["replay"], true);
 }
 
 #[cfg(unix)]

@@ -518,6 +518,69 @@ fn launch_profile_protected_bytes(profile: &LaunchProfileV1) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+#[cfg(test)]
+pub(crate) fn terminal_reconciliation_test_profile_bytes(
+    request: &crate::work_ledger::NativePublicationRequest,
+) -> Vec<u8> {
+    let checkpoint_id = "terminal-reconciliation-checkpoint".to_owned();
+    let checkpoint_digest = "a".repeat(64);
+    let profile = LaunchProfileV1 {
+        schema_version: 1,
+        launch_argv: vec!["provider-router".into(), "agent".into(), "--new".into()],
+        resume_argv: vec![
+            "provider-router".into(),
+            "agent".into(),
+            "--resume".into(),
+            request.agent_session_id.clone(),
+        ],
+        subrouter_executable_sha256: Some("9".repeat(64)),
+        route_environment: BTreeMap::new(),
+        provider: ProviderMetadataV1 {
+            provider: request.agent_provider.clone(),
+            account: None,
+            model: None,
+            reasoning_effort: None,
+        },
+        session: Some(SessionProvenanceV1 {
+            agent_provider: request.agent_provider.clone(),
+            provider_session_id: request.agent_session_id.clone(),
+        }),
+        checkpoint: CheckpointProvenanceV1 {
+            checkpoint_id: checkpoint_id.clone(),
+            generation: 1,
+            digest: checkpoint_digest.clone(),
+        },
+        worktree: WorktreeProvenanceV1 {
+            repository: request.repository.clone(),
+            path: std::env::temp_dir()
+                .join("shipyard-terminal-reconciliation-test")
+                .to_string_lossy()
+                .into_owned(),
+            head_sha: request.head_sha.clone(),
+            lineage_id: "terminal-reconciliation-lineage".to_owned(),
+        },
+        continuation_bootstrap: Some(ContinuationBootstrapV1 {
+            workstream_handle: request.workstream_handle.clone(),
+            context_url: request.context_url.clone(),
+            plan_sha256: request.plan_sha256.clone(),
+            root_revision: request.root_revision,
+            issue_revision: request.issue_revision,
+            projection_revision: request.projection_revision,
+            material_event_revision: request.material_event_revision,
+            checkpoint_id,
+            checkpoint_generation: 1,
+            checkpoint_digest,
+            repository: request.repository.clone(),
+            head_sha: request.head_sha.clone(),
+            expected_resume_context_digest: request.native_resume_digest.clone(),
+            success_continuation_digest: request.success_continuation_digest.clone(),
+            failure_continuation_digest: request.failure_continuation_digest.clone(),
+        }),
+        recovery_policy: RecoveryPolicyV1::ExactSessionThenFreshCheckpoint,
+    };
+    launch_profile_protected_bytes(&profile).expect("valid terminal reconciliation test profile")
+}
+
 /// Decode only the canonical domain-separated bytes protected by the ledger.
 #[allow(dead_code)] // Activated by the daemon wake-loop integration slice.
 pub(crate) fn decode_protected_launch_profile(

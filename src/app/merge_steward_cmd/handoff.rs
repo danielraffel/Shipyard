@@ -1310,6 +1310,139 @@ struct NativeSourceAuthority {
     base_sha: String,
 }
 
+/// Exact GitHub evidence for an already-merged native work-ledger row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TerminalMergeAuthority {
+    pub(crate) installation_id: u64,
+    pub(crate) repository_provider: String,
+    pub(crate) repository_id: String,
+    pub(crate) canonical_repository: String,
+    pub(crate) pull_request_node_id: String,
+    pub(crate) pull_request: u64,
+    pub(crate) head_sha: String,
+    pub(crate) base_ref: String,
+    pub(crate) merge_sha: String,
+    pub(crate) merged_at: String,
+}
+
+/// Observe immutable terminal PR authority without consulting mutable handoff prose.
+pub(crate) fn observe_terminal_merge_authority(
+    actions: &GitHubActions,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<TerminalMergeAuthority, CliFailure> {
+    if pr == 0 || !is_full_sha(head) || head != head.to_ascii_lowercase() {
+        return Err(CliFailure::new(1, "terminal merge target is invalid"));
+    }
+    let installation_id = actions
+        .app_installation_id()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let repository = gh_json(
+        actions,
+        &[
+            "repo".into(),
+            "view".into(),
+            repo.to_owned(),
+            "--json".into(),
+            "id,nameWithOwner".into(),
+        ],
+        "observe terminal reconciliation repository identity",
+    )
+    .map_err(|error| CliFailure::new(1, error))?;
+    let snapshot = gh_json(
+        actions,
+        &[
+            "pr".into(),
+            "view".into(),
+            pr.to_string(),
+            "--repo".into(),
+            repo.to_owned(),
+            "--json".into(),
+            "id,state,headRefOid,baseRefName,mergeCommit,mergedAt".into(),
+        ],
+        "observe terminal reconciliation merge authority",
+    )
+    .map_err(|error| CliFailure::new(1, error))?;
+    terminal_merge_authority_from_snapshots(installation_id, repo, pr, head, &repository, &snapshot)
+}
+
+fn terminal_merge_authority_from_snapshots(
+    installation_id: u64,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    repository: &Value,
+    snapshot: &Value,
+) -> Result<TerminalMergeAuthority, CliFailure> {
+    if installation_id == 0 || pr == 0 || !is_full_sha(head) || head != head.to_ascii_lowercase() {
+        return Err(CliFailure::new(1, "terminal merge target is invalid"));
+    }
+    let repository_id = repository
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or_else(|| {
+            CliFailure::new(1, "terminal reconciliation repository ID is unavailable")
+        })?;
+    let canonical_repository = repository
+        .get("nameWithOwner")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .filter(|value| value == repo)
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "terminal reconciliation canonical repository is unavailable or changed",
+            )
+        })?;
+    let pull_request_node_id = snapshot
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512);
+    let observed_head = snapshot
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .filter(|value| is_full_sha(value));
+    let base_ref = snapshot
+        .get("baseRefName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 255);
+    let merge_sha = snapshot
+        .get("mergeCommit")
+        .and_then(|value| value.get("oid"))
+        .and_then(Value::as_str)
+        .filter(|value| is_full_sha(value));
+    let merged_at = snapshot
+        .get("mergedAt")
+        .and_then(Value::as_str)
+        .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok());
+    if snapshot.get("state").and_then(Value::as_str) != Some("MERGED")
+        || observed_head != Some(head)
+        || pull_request_node_id.is_none()
+        || base_ref.is_none()
+        || merge_sha.is_none()
+        || merged_at.is_none()
+    {
+        return Err(CliFailure::new(
+            1,
+            "terminal reconciliation merge authority is incomplete or changed",
+        ));
+    }
+    Ok(TerminalMergeAuthority {
+        installation_id,
+        repository_provider: "github.com".to_owned(),
+        repository_id: repository_id.to_owned(),
+        canonical_repository,
+        pull_request_node_id: pull_request_node_id.expect("checked").to_owned(),
+        pull_request: pr,
+        head_sha: head.to_owned(),
+        base_ref: base_ref.expect("checked").to_owned(),
+        merge_sha: merge_sha.expect("checked").to_ascii_lowercase(),
+        merged_at: merged_at.expect("checked").to_owned(),
+    })
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn verify_native_repository_identity(
     actions: &GitHubActions,
@@ -3206,6 +3339,101 @@ fn render_json_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_snapshots(state: &str, head: &str) -> (Value, Value) {
+        let repository = serde_json::json!({
+            "id": "R_test_repository",
+            "nameWithOwner": "Owner/Repo",
+        });
+        let pull = serde_json::json!({
+            "id": "PR_test_terminal",
+            "state": state,
+            "headRefOid": head,
+            "baseRefName": "main",
+            "mergeCommit": {"oid": "c".repeat(40)},
+            "mergedAt": "2026-09-01T12:00:00Z",
+        });
+        (repository, pull)
+    }
+
+    #[test]
+    fn terminal_merge_authority_requires_exact_merged_identity() {
+        let head = "a".repeat(40);
+        let (repository, merged) = terminal_snapshots("MERGED", &head);
+        let authority = terminal_merge_authority_from_snapshots(
+            42,
+            "owner/repo",
+            74,
+            &head,
+            &repository,
+            &merged,
+        )
+        .expect("exact merged authority");
+        assert_eq!(authority.installation_id, 42);
+        assert_eq!(authority.repository_id, "R_test_repository");
+        assert_eq!(authority.canonical_repository, "owner/repo");
+        assert_eq!(authority.pull_request_node_id, "PR_test_terminal");
+        assert_eq!(authority.merge_sha, "c".repeat(40));
+
+        let (_, open_snapshot) = terminal_snapshots("OPEN", &head);
+        let open = terminal_merge_authority_from_snapshots(
+            42,
+            "owner/repo",
+            74,
+            &head,
+            &repository,
+            &open_snapshot,
+        )
+        .expect_err("open PR is not terminal authority");
+        assert!(open.message().contains("incomplete or changed"));
+        let wrong_head = "d".repeat(40);
+        let (_, moved_snapshot) = terminal_snapshots("MERGED", &wrong_head);
+        let moved = terminal_merge_authority_from_snapshots(
+            42,
+            "owner/repo",
+            74,
+            &head,
+            &repository,
+            &moved_snapshot,
+        )
+        .expect_err("moved head is not exact authority");
+        assert!(moved.message().contains("incomplete or changed"));
+
+        let wrong_repository = serde_json::json!({
+            "id": "R_test_repository",
+            "nameWithOwner": "Other/Repo",
+        });
+        let repository_error = terminal_merge_authority_from_snapshots(
+            42,
+            "owner/repo",
+            74,
+            &head,
+            &wrong_repository,
+            &merged,
+        )
+        .expect_err("canonical repository movement must refuse");
+        assert!(repository_error.message().contains("canonical repository"));
+
+        for (label, key, value) in [
+            ("base", "baseRefName", Value::Null),
+            ("merge commit", "mergeCommit", Value::Null),
+            ("merge timestamp", "mergedAt", Value::Null),
+            ("pull request identity", "id", Value::Null),
+        ] {
+            let mut incomplete = merged.clone();
+            incomplete[key] = value;
+            let error = terminal_merge_authority_from_snapshots(
+                42,
+                "owner/repo",
+                74,
+                &head,
+                &repository,
+                &incomplete,
+            )
+            .expect_err(label);
+            assert!(error.message().contains("incomplete or changed"));
+        }
+    }
 
     #[cfg(unix)]
     fn sequenced_gh(

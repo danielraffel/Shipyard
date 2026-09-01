@@ -1480,7 +1480,24 @@ inventory --json` for a bounded, deterministically ordered immutable view of
 local work. Inventory opens only existing storage, never creates or migrates a
 database or takes writer custody. A valid migrated legacy `NULL,NULL`
 repository identity makes `complete=false`; malformed or half-bound identity
-and a noncanonical `GEN-N` handle refuse the whole snapshot. Use `shipyard work-ledger import
+and a noncanonical `GEN-N` handle refuse the whole snapshot.
+
+Use `shipyard work-ledger reconcile-terminal --json` to inventory only native
+`terminal_handoff` rows that are already terminal but lack their immutable
+projection binding. The inventory is bounded, redacted, and no-write. Select
+one exact repository/PR/head for a dry-run; add `--apply` only after reviewing
+the authenticated merged-head/base proof. Apply re-reads GitHub under exclusive
+writer custody and may add only the immutable provider receipt, projection
+binding, its schema-required inert ownership-root identity, and the
+terminal-to-terminal audit event. The root is not ownership authority: apply
+creates no agent ownership, holder material, bootstrap eligibility, or lease.
+It never creates or changes a route, wake, continuation, custody record,
+activation epoch, or projection intent. Historical unrelated wakes remain unchanged. Ambiguous
+targets, incomplete local authority, GitHub movement, an orphan ownership root,
+or any receipt/binding/event disagreement refuse. The same exact targeted
+command after success is a write-free replay; do not use direct SQL.
+
+Use `shipyard work-ledger import
 --json` for the deterministic no-write plan, then `--apply` only when a shadow
 import is intended. Import is idempotent, redacted, and fail-closed: it selects
 canonical fields and opaque digests from legacy stores, leaves those stores

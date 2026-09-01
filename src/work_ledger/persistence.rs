@@ -203,12 +203,16 @@ impl WorkLedger {
                            )
                            AND NOT EXISTS (
                              SELECT 1 FROM route_records WHERE work_item_id = work_items.id
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1 FROM workstream_projection_bindings
+                             WHERE work_item_id = work_items.id
                            )",
                         candidate_params!(candidate, &now),
                     )?;
                     if changed != 1 {
                         return Err(WorkLedgerError::Refused(
-                            "legacy refresh conflicts with native lifecycle, route, or wake state"
+                            "legacy refresh conflicts with native lifecycle, route, wake, or projection state"
                                 .to_owned(),
                         ));
                     }
@@ -262,6 +266,8 @@ impl WorkLedger {
                                       WHERE work_item_id = work_items.id)
                             OR EXISTS(SELECT 1 FROM route_records
                                       WHERE work_item_id = work_items.id)
+                            OR EXISTS(SELECT 1 FROM workstream_projection_bindings
+                                      WHERE work_item_id = work_items.id)
                      FROM work_items WHERE id = ?1",
                     [&candidate.work_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -273,7 +279,7 @@ impl WorkLedger {
                 Some((_, 1, false)) => updated += 1,
                 Some(_) => {
                     return Err(WorkLedgerError::Refused(
-                        "legacy refresh conflicts with native lifecycle, route, or wake state"
+                        "legacy refresh conflicts with native lifecycle, route, wake, or projection state"
                             .to_owned(),
                     ));
                 }
