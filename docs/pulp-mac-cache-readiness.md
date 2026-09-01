@@ -1,5 +1,18 @@
 # Pulp macOS cache-readiness foundation
 
+## Experimental authority vocabulary is refusal-only
+
+Shipyard's future schema-v5 `experimental_authority` request vocabulary is
+source-only and compile-disabled in every official build. An explicit test
+build with `experimental-authority-v5` may validate one exact
+`trusted_native_advisory` request shape from its original JSON bytes, but its
+only result is a typed refusal before projection. It cannot write a v5 request
+or outcome, create or mutate a queue job, select a backend, execute work, or
+promote cache/artifact bytes. Content identity and cache integrity never turn
+advisory-native evidence into Tart-required, merge, signing, or release
+authority. All ordinary and official binaries remain schema-v4 writers and
+readers.
+
 The default-off Pulp macOS canary treats a cache generation as immutable
 content, not as a mutable directory name or a claimed byte saving. Shipyard
 produces a portable manifest by opening a configured local cache root through

@@ -39,6 +39,8 @@ pub(super) use projection::import_report;
 use projection::legacy_is_newer;
 #[cfg(any(unix, test))]
 pub(super) use validation::validate_legacy_record;
+#[cfg(unix)]
+use validation::validate_legacy_record_bytes_before_projection;
 
 #[cfg(any(unix, test))]
 use super::opaque_ref;
@@ -322,6 +324,7 @@ fn scan_pinned_tree(
                 let mut bytes = Vec::new();
                 child.read_to_end(&mut bytes)?;
                 let source = opaque_path_ref(state_dir, &path, None);
+                validate_legacy_record_bytes_before_projection(kind, &source, &path, &bytes)?;
                 let value: Value =
                     serde_json::from_slice(&bytes).map_err(|error| WorkLedgerError::Json {
                         source: source.clone(),
@@ -610,5 +613,238 @@ fn ship_collision_marker_present(state_dir: &Path, pr: u64) -> WorkLedgerResult<
         )),
         Err(rustix::io::Errno::NOENT) => Ok(false),
         Err(error) => Err(std::io::Error::from(error).into()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod authority_v5_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::{ImportReport, WorkLedgerError, WorkLedgerResult};
+    use crate::work_ledger::{WorkLedger, apply_legacy_snapshot, plan_legacy_snapshot};
+
+    type ImportEntryPoint = fn(&Path) -> WorkLedgerResult<ImportReport>;
+
+    fn import_entry_points() -> [(&'static str, ImportEntryPoint); 2] {
+        [
+            ("plan", plan_legacy_snapshot),
+            ("apply", apply_legacy_snapshot),
+        ]
+    }
+
+    fn experimental_v5_request_value() -> Value {
+        json!({
+            "schema_version": 5,
+            "job_id": "experimental-import",
+            "kind": "run",
+            "cwd": "/work/pulp",
+            "created_at": "2026-09-01T12:00:00Z",
+            "execution_owner": "foreground",
+            "resource_plan": {
+                "targets": [],
+                "exclusive_claims": [],
+                "cloud_targets": [],
+                "host_pools": [],
+                "vm_slots": []
+            },
+            "request": {
+                "type": "run",
+                "branch": "main",
+                "sha": "a".repeat(40),
+                "mode": "full",
+                "priority": "normal",
+                "warm_disabled": false,
+                "fail_fast": true,
+                "resume_from": null,
+                "targets": []
+            },
+            "experimental_authority": {
+                "backend_policy": "trusted_native_advisory",
+                "authority_class": "advisory",
+                "output_disposition": "quarantined_non_promotable",
+                "trust_proof": {
+                    "kind": "protected_main_ancestor",
+                    "repository": "Generous-Corp/pulp",
+                    "head_sha": "a".repeat(40),
+                    "protected_ref": "refs/heads/main",
+                    "observed_protected_ref_sha": "b".repeat(40)
+                }
+            }
+        })
+    }
+
+    fn write_queue_record(temp: &TempDir, store: &str, job_id: &str, contents: &[u8]) {
+        let directory = temp.path().join("queue").join(store);
+        fs::create_dir_all(&directory).expect("queue store");
+        fs::write(directory.join(format!("{job_id}.json")), contents).expect("queue record");
+    }
+
+    fn assert_request_refused_by_both_entry_points(
+        contents: &[u8],
+        expected_fragment: &str,
+        expect_json_error: bool,
+    ) {
+        for (name, entry_point) in import_entry_points() {
+            let temp = TempDir::new().expect("tempdir");
+            write_queue_record(&temp, "requests", "experimental-import", contents);
+
+            let error = entry_point(temp.path()).expect_err(name);
+            if expect_json_error {
+                assert!(
+                    matches!(error, WorkLedgerError::Json { .. }),
+                    "{name} returned the wrong error class: {error}"
+                );
+            } else {
+                assert!(
+                    matches!(error, WorkLedgerError::Refused(_)),
+                    "{name} returned the wrong error class: {error}"
+                );
+            }
+            assert!(
+                error.to_string().contains(expected_fragment),
+                "{name} returned an unexpected refusal: {error}"
+            );
+            assert!(
+                !WorkLedger::path_at(temp.path()).exists(),
+                "{name} projected a refused request into ledger storage"
+            );
+        }
+    }
+
+    #[test]
+    fn both_import_entry_points_preserve_v4_queue_request_compatibility() {
+        let mut value = experimental_v5_request_value();
+        value["schema_version"] = json!(4);
+        value
+            .as_object_mut()
+            .expect("request envelope")
+            .remove("experimental_authority");
+        let contents = serde_json::to_vec(&value).expect("v4 request");
+
+        for (name, entry_point) in import_entry_points() {
+            let temp = TempDir::new().expect("tempdir");
+            write_queue_record(&temp, "requests", "experimental-import", &contents);
+
+            let report = entry_point(temp.path()).expect(name);
+            assert_eq!(report.candidates, 1, "{name}");
+            assert_eq!(report.by_kind.get("queue_request"), Some(&1), "{name}");
+            assert!(!report.activation_enabled, "{name}");
+            assert!(!report.dispatch_enabled, "{name}");
+            assert_eq!(report.applied, name == "apply", "{name}");
+        }
+    }
+
+    #[cfg(not(feature = "experimental-authority-v5"))]
+    #[test]
+    fn both_default_import_entry_points_keep_v5_unsupported() {
+        let contents = serde_json::to_vec(&experimental_v5_request_value()).expect("v5 request");
+        assert_request_refused_by_both_entry_points(
+            &contents,
+            "unsupported queue request schema version 5",
+            false,
+        );
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn both_experimental_import_entry_points_return_typed_v5_refusal() {
+        let contents = serde_json::to_vec(&experimental_v5_request_value()).expect("v5 request");
+        assert_request_refused_by_both_entry_points(
+            &contents,
+            "experimental authority request refused",
+            false,
+        );
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn both_experimental_import_entry_points_reject_mismatched_v5_filename_before_refusal() {
+        let contents = serde_json::to_vec(&experimental_v5_request_value()).expect("v5 request");
+        for (name, entry_point) in import_entry_points() {
+            let temp = TempDir::new().expect("tempdir");
+            write_queue_record(&temp, "requests", "different-job", &contents);
+
+            let error = entry_point(temp.path()).expect_err(name);
+            assert!(matches!(error, WorkLedgerError::Refused(_)), "{name}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("authoritative queue filename disagrees with embedded job_id"),
+                "{name} returned an unexpected refusal: {error}"
+            );
+            assert!(
+                !error
+                    .to_string()
+                    .contains("experimental authority request refused"),
+                "{name} returned typed refusal before filename validation: {error}"
+            );
+            assert!(
+                !WorkLedger::path_at(temp.path()).exists(),
+                "{name} projected a mismatched request into ledger storage"
+            );
+        }
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn both_experimental_import_entry_points_fail_closed_before_v5_projection() {
+        let fixture = experimental_v5_request_value();
+        let encoded = serde_json::to_string(&fixture).expect("v5 request");
+        let duplicate = encoded.replacen("\"request\":{", "\"request\":{\"type\":\"run\",", 1);
+        assert_request_refused_by_both_entry_points(
+            duplicate.as_bytes(),
+            "duplicate JSON object key",
+            true,
+        );
+
+        let mut unknown = fixture.clone();
+        unknown["request"]["unknown_field"] = json!(true);
+        assert_request_refused_by_both_entry_points(
+            &serde_json::to_vec(&unknown).expect("unknown field"),
+            "unknown or misplaced key",
+            false,
+        );
+
+        let mut misplaced = fixture.clone();
+        misplaced["request"]["trust_proof"] = json!({});
+        assert_request_refused_by_both_entry_points(
+            &serde_json::to_vec(&misplaced).expect("misplaced authority"),
+            "unknown or misplaced key",
+            false,
+        );
+
+        let mut nonadvisory = fixture;
+        nonadvisory["experimental_authority"]["backend_policy"] = json!("tart_required");
+        assert_request_refused_by_both_entry_points(
+            &serde_json::to_vec(&nonadvisory).expect("nonadvisory request"),
+            "backend_policy must be exactly",
+            false,
+        );
+    }
+
+    #[test]
+    fn both_import_entry_points_keep_every_v5_outcome_unsupported() {
+        let contents = serde_json::to_vec(&json!({
+            "type": "run",
+            "schema_version": 5,
+            "job_id": "future-outcome"
+        }))
+        .expect("v5 outcome");
+
+        for (name, entry_point) in import_entry_points() {
+            let temp = TempDir::new().expect("tempdir");
+            write_queue_record(&temp, "outcomes", "future-outcome", &contents);
+
+            let error = entry_point(temp.path()).expect_err(name);
+            assert!(matches!(error, WorkLedgerError::Refused(_)), "{name}");
+            assert!(
+                !WorkLedger::path_at(temp.path()).exists(),
+                "{name} projected a v5 outcome into ledger storage"
+            );
+        }
     }
 }

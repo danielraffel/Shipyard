@@ -22,6 +22,9 @@ path = "src/bin/shipyard-workstream-provider.rs"
 # CI-only path isolation for production-shaped integration-test binaries.
 # Official release builds never enable this feature.
 ci-test-home = []
+# Source-only compatibility decoder for the future advisory-authority request
+# vocabulary. Official builds and releases deliberately omit this feature.
+experimental-authority-v5 = []
 
 [dependencies]
 atomicwrites = "0.4.4"

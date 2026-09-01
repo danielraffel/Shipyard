@@ -7,6 +7,8 @@ use super::{
     WorkLedgerError, WorkLedgerResult, validate_queued_execution_envelope,
     validate_queued_execution_outcome, validate_record, validate_recovery_record,
 };
+#[cfg(unix)]
+use crate::queue_request::{QueueRequestError, decode_queued_execution_request_bytes_for_import};
 
 #[derive(Deserialize)]
 struct LegacyTerminalHandoff {
@@ -30,6 +32,37 @@ struct LegacyResumeRecord {
     head_sha: String,
     dispatch_enabled: bool,
     phase: String,
+}
+
+#[cfg(unix)]
+pub(super) fn validate_legacy_record_bytes_before_projection(
+    kind: &str,
+    source: &str,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> WorkLedgerResult<()> {
+    if kind != "queue_request" {
+        return Ok(());
+    }
+    let authoritative_filename =
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                WorkLedgerError::Refused(format!(
+                    "legacy source {source} has a non-UTF-8 authoritative queue filename"
+                ))
+            })?;
+    decode_queued_execution_request_bytes_for_import(bytes, authoritative_filename)
+        .map(|_| ())
+        .map_err(|error| match error {
+            QueueRequestError::Json(error) => WorkLedgerError::Json {
+                source: source.to_owned(),
+                error,
+            },
+            error => WorkLedgerError::Refused(format!(
+                "legacy source {source} has invalid queue-request authority: {error}"
+            )),
+        })
 }
 
 pub(in crate::work_ledger) fn validate_legacy_record(

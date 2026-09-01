@@ -91,6 +91,14 @@ credentials, private paths, or raw prompts.
 
 ## First Steps
 
+Schema v5 experimental-authority support is not an operational feature. Every
+official Shipyard build remains v4-only. The default-off
+`experimental-authority-v5` source-test feature can only validate the reserved
+request bytes and return `ExperimentalAuthorityRefused` before projection; it
+has no request or outcome writer, queue mutation, backend, executor, promotion,
+merge, signing, or release authority. Never tell an operator or agent to seed,
+submit, repair, or execute a v5 record.
+
 1. Confirm the active repo and dirty state with `git status --short`.
 2. Use RepoPrompt for code analysis across Shipyard, historical shipyard-rust,
    and the macOS GUI before declaring parity or implementation gaps.
