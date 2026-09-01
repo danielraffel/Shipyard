@@ -13,6 +13,27 @@ fn executable_script(path: &Path, body: &str) {
 }
 
 #[cfg(unix)]
+fn isolated_storage_probe_until(class: &HostClassConfig, deadline: Instant) -> StorageProbe {
+    let disk_path = class.tart_home.as_deref().unwrap_or(".");
+    let script = storage_probe_script(disk_path);
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", &script])
+        // Keep this concurrency control independent of the host's live ccache.
+        // Dedicated tests below cover ccache discovery and parsing.
+        .env("PATH", "/usr/bin:/bin");
+    match run_output_until(&mut command, deadline, "isolated storage probe") {
+        Ok(output) => storage_probe_from_output(&output, disk_path),
+        Err(error) => StorageProbe {
+            source: error.to_string(),
+            disk_path: disk_path.to_owned(),
+            disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
+            ..StorageProbe::default()
+        },
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn fleet_github_reads_share_one_absolute_deadline() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -99,7 +120,11 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
     // even though production would still accept it.
     let timeout = FLEET_HOST_PROBE_TIMEOUT;
     let started = std::time::Instant::now();
-    let mut probes = probe_hosts_concurrently_with_timeout(&classes, timeout);
+    let mut probes = probe_hosts_concurrently_with_timeout_using(
+        &classes,
+        timeout,
+        isolated_storage_probe_until,
+    );
 
     assert!(started.elapsed() < timeout + std::time::Duration::from_secs(5));
     assert_eq!(probes.len(), 2);
