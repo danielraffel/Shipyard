@@ -267,7 +267,9 @@ impl ShadowDaemonLane {
                 (entries, requests)
             }
             Err(error) => {
-                eprintln!("shipyard daemon: shadow request budget unavailable: {error}");
+                let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                    "shipyard daemon: shadow request budget unavailable: {error}"
+                ));
                 (Vec::new(), SHADOW_HOURLY_API_CEILING)
             }
         };
@@ -332,7 +334,9 @@ impl ShadowDaemonLane {
         }
         let reservation = selected.len() * SHADOW_MAX_REQUESTS_PER_TARGET;
         if let Err(error) = self.reserve_requests(reservation) {
-            eprintln!("shipyard daemon: shadow request reservation failed: {error}");
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                "shipyard daemon: shadow request reservation failed: {error}"
+            ));
             self.scheduler
                 .api_window
                 .push_back((now, SHADOW_HOURLY_API_CEILING));
@@ -401,7 +405,9 @@ impl ShadowDaemonLane {
         if had_reservation || report.api_requests > 0 {
             prune_budget_entries(&mut self.budget_entries, epoch_seconds());
             if let Err(error) = save_request_budget(&self.budget_path, &self.budget_entries) {
-                eprintln!("shipyard daemon: shadow request budget persistence failed: {error}");
+                let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                    "shipyard daemon: shadow request budget persistence failed: {error}"
+                ));
                 self.scheduler
                     .api_window
                     .push_back((now, SHADOW_HOURLY_API_CEILING));
@@ -436,14 +442,18 @@ impl ShadowDaemonLane {
     fn log_ledger_error(&mut self, error: &crate::work_ledger::WorkLedgerError) {
         let message = error.to_string();
         if self.ledger_error.as_deref() != Some(&message) {
-            eprintln!("shipyard daemon: shadow ledger observation unavailable: {message}");
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                "shipyard daemon: shadow ledger observation unavailable: {message}"
+            ));
             self.ledger_error = Some(message);
         }
     }
 
     fn log_recovery(&mut self) {
         if self.ledger_error.take().is_some() {
-            eprintln!("shipyard daemon: shadow ledger observation recovered");
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                "shipyard daemon: shadow ledger observation recovered"
+            ));
         }
     }
 }

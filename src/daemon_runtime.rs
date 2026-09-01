@@ -1565,7 +1565,10 @@ fn publish_shadow_transition(
     // IPC remains a convenience; the daemon's supervised stderr sink is the
     // retained, subscriber-independent audit trail for transition-only shadow
     // evidence. The payload is redacted before it reaches this boundary.
-    eprintln!("{}", serde_json::to_string(&event).unwrap_or_default());
+    let _ = crate::writer_domain_lease::write_stderr(format_args!(
+        "{}",
+        serde_json::to_string(&event).unwrap_or_default()
+    ));
     publish_daemon_event(server, last_event_at, event);
 }
 
