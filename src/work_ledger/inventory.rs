@@ -1047,42 +1047,8 @@ mod tests {
         let work_id = imported.work_id.clone();
         ledger.import(&[imported]).expect("v11 work item");
         let connection = ledger.connect_read_write().expect("v11 fixture connection");
-        connection
-            .execute_batch(
-                "DROP TRIGGER agent_ownership_generation_advance_fence;
-                 DROP TRIGGER agent_ownership_identity_immutable;
-                 CREATE TRIGGER agent_ownership_identity_immutable
-         BEFORE UPDATE OF ownership_id, work_item_id, work_generation, owner_generation,
-                          delivery_id, launch_profile_object_ref, created_at ON agent_ownership
-         BEGIN SELECT RAISE(ABORT, 'agent ownership identity is immutable'); END;
-                 DROP TABLE workstream_projection_bindings;
-                 CREATE TABLE workstream_projection_bindings (
-                   work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE RESTRICT,
-                   workstream_handle TEXT NOT NULL CHECK(length(workstream_handle) BETWEEN 1 AND 128),
-                   plan_sha256 TEXT NOT NULL
-                     CHECK(length(plan_sha256) = 64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
-                   root_revision INTEGER NOT NULL CHECK(root_revision >= 0),
-                   issue_revision INTEGER NOT NULL CHECK(issue_revision >= 0),
-                   projection_revision INTEGER NOT NULL CHECK(projection_revision > 0),
-                   material_event_revision INTEGER NOT NULL CHECK(material_event_revision >= 0),
-                   repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 255),
-                   exact_head TEXT NOT NULL
-                     CHECK(length(exact_head) = 40 AND exact_head NOT GLOB '*[^0-9a-f]*'),
-                   created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
-                   UNIQUE(workstream_handle, repository, exact_head)
-                 );
-                 CREATE TRIGGER workstream_projection_binding_identity_immutable
-                 BEFORE UPDATE OF work_item_id, workstream_handle, plan_sha256, root_revision,
-                                  issue_revision, projection_revision, material_event_revision,
-                                  repository, created_at
-                 ON workstream_projection_bindings
-                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding identity is immutable'); END;
-                 CREATE TRIGGER workstream_projection_binding_no_delete
-                 BEFORE DELETE ON workstream_projection_bindings
-                 BEGIN SELECT RAISE(ABORT, 'workstream projection binding cannot be deleted'); END;
-                 PRAGMA user_version = 11;",
-            )
-            .expect("production v11 binding schema");
+        super::super::storage::reconstruct_authentic_v11_schema_for_test(&connection)
+            .expect("authentic production v11 schema");
         connection
             .execute(
                 "INSERT INTO workstream_projection_bindings
@@ -1450,6 +1416,17 @@ CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
                  CREATE TABLE agent_ownership (
                    ownership_id TEXT PRIMARY KEY, work_item_id TEXT, state TEXT,
                    work_generation INTEGER, owner_generation INTEGER
+                 );
+                 CREATE TABLE ownership_roots (
+                   root_uuid TEXT PRIMARY KEY
+                     CHECK(length(root_uuid) = 36
+                           AND substr(root_uuid, 9, 1) = '-'
+                           AND substr(root_uuid, 14, 1) = '-'
+                           AND substr(root_uuid, 19, 1) = '-'
+                           AND substr(root_uuid, 24, 1) = '-'
+                           AND replace(root_uuid, '-', '') NOT GLOB '*[^0-9a-f]*'),
+                   work_item_id TEXT NOT NULL UNIQUE REFERENCES work_items(id) ON DELETE RESTRICT,
+                   created_at TEXT NOT NULL CHECK(length(created_at) >= 20)
                  );",
             )
             .expect("fixture schema");
@@ -1476,6 +1453,13 @@ CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
                 rusqlite::params![ownership_id, work_id],
             )
             .expect("historical ownership");
+        connection
+            .execute(
+                "INSERT INTO ownership_roots VALUES
+                 ('00000000-0000-0000-0000-000000000001', ?1, '2026-08-31T00:00:00Z')",
+                [&work_id],
+            )
+            .expect("current ownership root");
 
         let rows =
             load_inventory_rows(&connection, InventorySchema::Current).expect("inventory rows");
