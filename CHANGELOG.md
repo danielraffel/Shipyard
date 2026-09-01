@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01510"></a>
+## [0.151.0] - 2026-09-01
+
+- feat(metrics): add stewardship scorecard ([#539](https://github.com/danielraffel/Shipyard/pull/539))
+
 <a id="v01500"></a>
 ## [0.150.0] - 2026-09-01
 
@@ -1299,6 +1304,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.151.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.151.0
 [0.150.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.150.0
 [0.149.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.149.0
 [0.148.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.148.1
