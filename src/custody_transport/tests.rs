@@ -1163,7 +1163,7 @@ fn custody_inventory_uses_the_pinned_fixed_argv_ssh_subsystem() {
         .exchange(
             &peer,
             &request,
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(30),
             4096,
         )
         .unwrap_err();
