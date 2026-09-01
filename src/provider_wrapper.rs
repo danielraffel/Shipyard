@@ -1884,6 +1884,57 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn assert_exact_process_eventually_not_running(
+        receipt: &str,
+        timeout: Duration,
+        failure_message: &str,
+    ) {
+        let mut lines = receipt.lines();
+        let pid = lines
+            .next()
+            .expect("fixture wrote a PID")
+            .parse::<u32>()
+            .expect("fixture wrote a valid PID");
+        let expected_start = lines
+            .next()
+            .expect("fixture wrote a process start identity")
+            .as_bytes();
+        assert!(
+            !expected_start.is_empty(),
+            "fixture start identity is empty"
+        );
+        assert!(lines.next().is_none(), "fixture receipt has extra fields");
+        let deadline = Instant::now() + timeout;
+        loop {
+            let output = Command::new("/bin/ps")
+                .args(["-o", "state=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8(output.stdout).unwrap();
+            let state = state.trim();
+            if !output.status.success() && state.is_empty() && output.stderr.is_empty() {
+                return;
+            }
+            assert!(output.status.success(), "malformed process-state probe");
+            let Some(state) = state.chars().next() else {
+                panic!("process-state probe returned no state");
+            };
+            if state == 'Z' {
+                return;
+            }
+            let observed_start = crate::worker_process_custody::process_start_identity(pid)
+                .expect("process start identity probe succeeds");
+            if observed_start.as_deref() != Some(expected_start) {
+                // The original generation is gone. A reused numeric PID must
+                // not make the teardown fixture fail under a loaded suite.
+                return;
+            }
+            assert!(Instant::now() < deadline, "{failure_message}");
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
     fn response_program(request: &ProviderWrapperRequestV1, status: &str) -> String {
         let outcome = match status {
             "delivered" => ProviderWrapperOutcomeV1::Delivered {
@@ -2127,7 +2178,7 @@ mod tests {
     fn timeout_terminates_setsid_descendant_without_pipe_reader_threads() {
         let request = request(ProviderWrapperOperationV1::Submit);
         let (directory, path, sha) = wrapper_c(
-            "pid_t child = fork(); if (child == 0) { setsid(); const char *home = getenv(\"HOME\"); char path[4096]; snprintf(path, sizeof(path), \"%s/detached.pid\", home); FILE *file = fopen(path, \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; } waitpid(child, 0, 0); return 0;",
+            "pid_t child = fork(); if (child == 0) { setsid(); char command[128]; snprintf(command, sizeof(command), \"/bin/ps -p %d -o lstart=\", getpid()); FILE *probe = popen(command, \"r\"); char start[256] = {0}; if (probe == NULL || fgets(start, sizeof(start), probe) == NULL || pclose(probe) != 0) return 2; start[strcspn(start, \"\\r\\n\")] = 0; const char *home = getenv(\"HOME\"); char path[4096]; snprintf(path, sizeof(path), \"%s/detached.pid\", home); FILE *file = fopen(path, \"w\"); if (file == NULL) return 3; fprintf(file, \"%d\\n%s\\n\", getpid(), start); fclose(file); sleep(30); return 0; } waitpid(child, 0, 0); return 0;",
         );
         let mut timeout_config = config(&path, sha);
         timeout_config.deadline_seconds = 15;
@@ -2145,8 +2196,30 @@ mod tests {
             started.elapsed() < Duration::from_secs(45),
             "timeout cleanup plus serialized fixture admission wedged"
         );
-        let child_pid = fs::read_to_string(directory.path().join("detached.pid")).unwrap();
-        assert_pid_eventually_not_running(&child_pid, "setsid descendant survived timeout");
+        let child_receipt = fs::read_to_string(directory.path().join("detached.pid")).unwrap();
+        assert_exact_process_eventually_not_running(
+            &child_receipt,
+            Duration::from_secs(5),
+            "setsid descendant survived timeout",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_process_teardown_probe_rejects_a_live_matching_generation() {
+        let pid = std::process::id();
+        let start = crate::worker_process_custody::process_start_identity(pid)
+            .unwrap()
+            .expect("test process is live");
+        let receipt = format!("{pid}\n{}\n", String::from_utf8(start).unwrap());
+        let result = std::panic::catch_unwind(|| {
+            assert_exact_process_eventually_not_running(
+                &receipt,
+                Duration::from_millis(20),
+                "live exact generation accepted",
+            );
+        });
+        assert!(result.is_err(), "live exact generation must be rejected");
     }
 
     #[cfg(unix)]

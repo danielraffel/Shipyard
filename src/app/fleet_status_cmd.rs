@@ -314,11 +314,21 @@ fn probe_hosts_concurrently_with_timeout(
     classes: &[HostClassConfig],
     timeout: Duration,
 ) -> Vec<HostProbeBundle> {
+    probe_hosts_concurrently_with_timeout_using(classes, timeout, probe_storage_until)
+}
+
+fn probe_hosts_concurrently_with_timeout_using(
+    classes: &[HostClassConfig],
+    timeout: Duration,
+    storage_probe: fn(&HostClassConfig, Instant) -> StorageProbe,
+) -> Vec<HostProbeBundle> {
     let deadline = Instant::now() + timeout;
     thread::scope(|scope| {
         let handles = classes
             .iter()
-            .map(|class| scope.spawn(move || probe_host_until(class, deadline)))
+            .map(|class| {
+                scope.spawn(move || probe_host_until_using(class, deadline, storage_probe))
+            })
             .collect::<Vec<_>>();
         handles
             .into_iter()
@@ -332,11 +342,15 @@ fn probe_hosts_concurrently_with_timeout(
     })
 }
 
-fn probe_host_until(class: &HostClassConfig, deadline: Instant) -> HostProbeBundle {
+fn probe_host_until_using(
+    class: &HostClassConfig,
+    deadline: Instant,
+    storage_probe: fn(&HostClassConfig, Instant) -> StorageProbe,
+) -> HostProbeBundle {
     thread::scope(|scope| {
         let capacity = scope.spawn(|| probe_host_capacity_until(class, deadline));
         let doctor = scope.spawn(|| probe_doctor_until(class, deadline));
-        let storage = scope.spawn(|| probe_storage_until(class, deadline));
+        let storage = scope.spawn(|| storage_probe(class, deadline));
         HostProbeBundle {
             capacity: capacity.join().unwrap_or_else(|_| HostCapacity {
                 class: class.class.clone(),

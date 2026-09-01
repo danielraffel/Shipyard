@@ -164,7 +164,10 @@ fn gate_0b_3_accepted_custody_uses_two_phase_authenticated_successor_commit() {
             "herdr",
             &new_authority,
             &successor_proof,
-            Utc::now() + ChronoDuration::seconds(1),
+            // This is a positive crash/reopen fixture, not an expiry-boundary
+            // test. Full Windows CI can spend more than a second between the
+            // durable prepare and authenticated receiver acceptance.
+            Utc::now() + ChronoDuration::seconds(30),
         )
         .expect("durably prepare successor");
     drop(delivered.source.ledger);
