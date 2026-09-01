@@ -1020,23 +1020,11 @@ impl ActionableWakeProducer {
                 matching_second_read_due_at: None,
             };
         }
-        if self
+        let had_pending_publication = self
             .status
             .dispatch_targets
             .get(&prefix)
-            .is_some_and(|target| target.pending_publication.is_some())
-        {
-            return DispatchWedgeCycleResult {
-                status: self.publish_pending_dispatch_wedge(
-                    repository_provider,
-                    repository_id,
-                    repository,
-                    pull_request,
-                    head_sha,
-                ),
-                matching_second_read_due_at: None,
-            };
-        }
+            .is_some_and(|target| target.pending_publication.is_some());
         let present = observations
             .iter()
             .map(|observation| dispatch_observation_key(&observation.authority))
@@ -1047,6 +1035,7 @@ impl ActionableWakeProducer {
         let mut status = None;
         let mut matching_second_read_due_at: Option<chrono::DateTime<Utc>> = None;
         let mut processed = std::collections::BTreeSet::new();
+        let mut fresh_dispatch_terminal = false;
         for observation in observations {
             if !processed.insert(dispatch_observation_key(&observation.authority)) {
                 continue;
@@ -1089,7 +1078,37 @@ impl ActionableWakeProducer {
                 status = Some(observed);
             }
             if terminal_dispatch {
+                fresh_dispatch_terminal = true;
                 break;
+            }
+        }
+        if had_pending_publication
+            && !fresh_dispatch_terminal
+            && (observations.is_empty()
+                || observations
+                    .iter()
+                    .all(|observation| observation.observation_complete))
+        {
+            let previous_pending = self
+                .status
+                .dispatch_targets
+                .get_mut(&prefix)
+                .and_then(|target| target.pending_publication.take());
+            if previous_pending.is_some() && self.persist_status().is_err() {
+                if let Some(target) = self.status.dispatch_targets.get_mut(&prefix) {
+                    target.pending_publication = previous_pending;
+                }
+                return DispatchWedgeCycleResult {
+                    status: self.record(
+                        repository.to_owned(),
+                        pull_request,
+                        head_sha.to_owned(),
+                        "uncertain",
+                        Some("dispatch_wedge_pending_invalidation_failed".to_owned()),
+                        false,
+                    ),
+                    matching_second_read_due_at: None,
+                };
             }
         }
         DispatchWedgeCycleResult {
@@ -1155,20 +1174,6 @@ impl ActionableWakeProducer {
             pull_request,
             head_sha,
         );
-        if self
-            .status
-            .dispatch_targets
-            .get(&prefix)
-            .is_some_and(|target| target.pending_publication.is_some())
-        {
-            return self.publish_pending_dispatch_wedge(
-                repository_provider,
-                repository_id,
-                repository,
-                pull_request,
-                head_sha,
-            );
-        }
         let previous = self.status.dispatch_targets.remove(&prefix);
         let status = self.record(
             repository.to_owned(),
@@ -1202,116 +1207,6 @@ impl ActionableWakeProducer {
             head_sha,
             reason,
         )
-    }
-
-    fn publish_pending_dispatch_wedge(
-        &mut self,
-        repository_provider: &str,
-        repository_id: &str,
-        repository: &str,
-        pull_request: u64,
-        head_sha: &str,
-    ) -> ActionableWakeProducerStatus {
-        let key = dispatch_scope_prefix(
-            repository_provider,
-            repository_id,
-            repository,
-            pull_request,
-            head_sha,
-        );
-        let Some(pending) = self
-            .status
-            .dispatch_targets
-            .get(&key)
-            .and_then(|target| target.pending_publication.clone())
-        else {
-            return self.record(
-                repository.to_owned(),
-                pull_request,
-                head_sha.to_owned(),
-                "uncertain",
-                Some("dispatch_wedge_pending_publication_missing".to_owned()),
-                false,
-            );
-        };
-        if !pending
-            .repository_provider
-            .eq_ignore_ascii_case(repository_provider)
-            || pending.repository_id != repository_id
-        {
-            return self.record(
-                repository.to_owned(),
-                pull_request,
-                head_sha.to_owned(),
-                "uncertain",
-                Some("dispatch_wedge_pending_publication_identity_mismatch".to_owned()),
-                false,
-            );
-        }
-        let publication = WorkLedger::open_existing(&self.state_dir).and_then(|ledger| {
-            ledger.map_or_else(
-                || {
-                    Err(crate::work_ledger::WorkLedgerError::Refused(
-                        "dispatch wedge has no existing work ledger".to_owned(),
-                    ))
-                },
-                |ledger| {
-                    ledger.publish_dispatch_wedge(
-                        nonempty_identity(&pending.repository_provider),
-                        nonempty_identity(&pending.repository_id),
-                        repository,
-                        &pending.base_ref,
-                        pull_request,
-                        head_sha,
-                        &pending.dedupe_key,
-                        &pending.evidence_digest,
-                    )
-                },
-            )
-        });
-        match publication {
-            Ok(receipt) if receipt.matched => {
-                let target = self.status.dispatch_targets.remove(&key);
-                if self.persist_status().is_err() {
-                    if let Some(target) = target {
-                        self.status.dispatch_targets.insert(key, target);
-                    }
-                    self.record(
-                        repository.to_owned(),
-                        pull_request,
-                        head_sha.to_owned(),
-                        "uncertain",
-                        Some("dispatch_wedge_cleanup_failed".to_owned()),
-                        false,
-                    )
-                } else {
-                    self.record(
-                        repository.to_owned(),
-                        pull_request,
-                        head_sha.to_owned(),
-                        "ready",
-                        Some("dispatch_wedge".to_owned()),
-                        receipt.wake_enqueued,
-                    )
-                }
-            }
-            Ok(_) => self.record(
-                repository.to_owned(),
-                pull_request,
-                head_sha.to_owned(),
-                "uncertain",
-                Some("dispatch_wedge_unmatched".to_owned()),
-                false,
-            ),
-            Err(_) => self.record(
-                repository.to_owned(),
-                pull_request,
-                head_sha.to_owned(),
-                "uncertain",
-                Some("dispatch_wedge_publication_refused".to_owned()),
-                false,
-            ),
-        }
     }
 
     #[allow(
@@ -1351,26 +1246,6 @@ impl ActionableWakeProducer {
             );
         }
         self.status()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn invalidate_dispatch_wedge_scope_at_generation(
-        &mut self,
-        repository: &str,
-        pull_request: u64,
-        head_sha: &str,
-        generation: u64,
-        reason: &str,
-    ) -> ActionableWakeProducerStatus {
-        self.invalidate_dispatch_wedge_scope_at_generation_for_repository(
-            test_repository_provider(),
-            test_repository_id(),
-            repository,
-            pull_request,
-            head_sha,
-            generation,
-            reason,
-        )
     }
 
     pub(crate) fn dispatch_cycle_generation_current_for_repository(
@@ -1495,15 +1370,6 @@ impl ActionableWakeProducer {
         if target.generation != generation {
             return self.status();
         }
-        if target.pending_publication.is_some() {
-            return self.publish_pending_dispatch_wedge(
-                repository_provider,
-                repository_id,
-                repository,
-                pull_request,
-                head_sha,
-            );
-        }
         target.observations.clear();
         target.schedule = None;
         let status = self.record(
@@ -1579,15 +1445,6 @@ impl ActionableWakeProducer {
             || target.repository_id != repository_id
         {
             return self.status();
-        }
-        if target.pending_publication.is_some() {
-            return self.publish_pending_dispatch_wedge(
-                repository_provider,
-                repository_id,
-                repository,
-                pull_request,
-                head_sha,
-            );
         }
         target.observations.clear();
         target.schedule = Some(DispatchProbeSchedule {
@@ -3619,7 +3476,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_publication_survives_restart_and_assigned_or_absent_probe() {
+    fn pending_publication_is_invalidated_by_fresh_absence_after_restart() {
         let state = tempfile::tempdir().expect("state");
         let observation = dispatch_observation();
         let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
@@ -3671,13 +3528,25 @@ mod tests {
             &[],
             300,
         );
-        assert_eq!(recovered.reason_code.as_deref(), Some("dispatch_wedge"));
-        assert!(recovered.wake_enqueued);
+        assert_eq!(
+            recovered.reason_code.as_deref(),
+            Some("dispatch_wedge_candidate_absent")
+        );
+        assert!(!recovered.wake_enqueued);
         assert!(restarted.status.dispatch_targets.is_empty());
+        assert_eq!(
+            WorkLedger::open_existing(state.path())
+                .unwrap()
+                .unwrap()
+                .status()
+                .unwrap()
+                .pending_wakes,
+            0
+        );
     }
 
     #[test]
-    fn pending_publication_survives_failed_probe_and_wakes_once() {
+    fn pending_publication_requires_fresh_matching_evidence_after_failed_probe() {
         let state = tempfile::tempdir().expect("state");
         let observation = dispatch_observation();
         let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
@@ -3718,22 +3587,130 @@ mod tests {
                 &observation.authority.pull_request_head,
             )
             .expect("error probe generation");
-        let recovered = restarted.invalidate_dispatch_wedge_scope_at_generation(
+        let failed = restarted.reschedule_dispatch_probe_after_failure_at_generation(
+            test_repository_provider(),
+            test_repository_id(),
             &observation.authority.repository,
             observation.authority.pull_request,
             &observation.authority.pull_request_head,
             generation,
+            Utc::now() + chrono::Duration::seconds(60),
             "dispatch_wedge_observation_failed",
         );
-        assert_eq!(recovered.reason_code.as_deref(), Some("dispatch_wedge"));
-        assert!(recovered.wake_enqueued);
-        let duplicate = restarted.invalidate_dispatch_wedge_scope(
+        assert_eq!(
+            failed.reason_code.as_deref(),
+            Some("dispatch_wedge_observation_failed")
+        );
+        assert!(!failed.wake_enqueued);
+        assert!(
+            restarted.status.dispatch_targets.values().any(|target| {
+                target.pending_publication.is_some() && target.schedule.is_some()
+            })
+        );
+
+        let fresh_first = restarted.process_dispatch_wedge_cycle(
             &observation.authority.repository,
             observation.authority.pull_request,
             &observation.authority.pull_request_head,
-            "dispatch_wedge_observation_failed",
+            std::slice::from_ref(&observation),
+            300,
         );
-        assert!(!duplicate.wake_enqueued);
+        assert_eq!(
+            fresh_first.reason_code.as_deref(),
+            Some("matching_second_read_required")
+        );
+        assert!(!fresh_first.wake_enqueued);
+        make_dispatch_observation_due(&mut restarted, &observation);
+        let recovered = restarted.process_dispatch_wedge_cycle(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            std::slice::from_ref(&observation),
+            300,
+        );
+        assert_eq!(recovered.reason_code.as_deref(), Some("dispatch_wedge"));
+        assert!(recovered.wake_enqueued);
+        let replay = restarted.process_dispatch_wedge_cycle(
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+            std::slice::from_ref(&observation),
+            300,
+        );
+        assert!(!replay.wake_enqueued);
+    }
+
+    #[test]
+    fn pending_publication_is_invalidated_by_assignment_or_regenerated_group() {
+        for assigned in [true, false] {
+            let state = tempfile::tempdir().expect("state");
+            let observation = dispatch_observation();
+            let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+            producer.process_dispatch_wedge_cycle(
+                &observation.authority.repository,
+                observation.authority.pull_request,
+                &observation.authority.pull_request_head,
+                std::slice::from_ref(&observation),
+                300,
+            );
+            make_dispatch_observation_due(&mut producer, &observation);
+            let refused = producer.process_dispatch_wedge_cycle(
+                &observation.authority.repository,
+                observation.authority.pull_request,
+                &observation.authority.pull_request_head,
+                std::slice::from_ref(&observation),
+                300,
+            );
+            assert_eq!(
+                refused.reason_code.as_deref(),
+                Some("dispatch_wedge_unmatched")
+            );
+
+            let publication = request();
+            seed_repo_policy(state.path(), &publication.repository);
+            WorkLedger::plan_or_apply_native_continuation(
+                state.path(),
+                &publication,
+                &policy(vec![publication.repository.clone()]),
+                true,
+            )
+            .expect("recover ledger");
+            let mut restarted = ActionableWakeProducer::new(state.path().to_path_buf());
+            let mut current = observation.clone();
+            if assigned {
+                current.authority.job_status = "in_progress".to_owned();
+                current.authority.runner_name = Some("compatible-idle".to_owned());
+            } else {
+                current.authority.merge_group_head = "c".repeat(40);
+                current.authority.run_head = "c".repeat(40);
+                current.authority.workflow_run_id += 1;
+                current.authority.job_id += 1;
+            }
+            let current_result = restarted.process_dispatch_wedge_cycle(
+                &current.authority.repository,
+                current.authority.pull_request,
+                &current.authority.pull_request_head,
+                std::slice::from_ref(&current),
+                300,
+            );
+            assert!(!current_result.wake_enqueued);
+            assert!(
+                restarted
+                    .status
+                    .dispatch_targets
+                    .values()
+                    .all(|target| target.pending_publication.is_none())
+            );
+            assert_eq!(
+                WorkLedger::open_existing(state.path())
+                    .unwrap()
+                    .unwrap()
+                    .status()
+                    .unwrap()
+                    .pending_wakes,
+                0
+            );
+        }
     }
 
     #[test]
