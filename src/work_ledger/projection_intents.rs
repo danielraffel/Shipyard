@@ -869,14 +869,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_v12_installs_immutable_projection_tables() {
+    fn latest_schema_installs_immutable_projection_tables() {
         let state = tempfile::tempdir().expect("state");
         let ledger = WorkLedger::open(state.path()).expect("ledger");
         let connection = ledger.connect_read_only().expect("connection");
         let version: u64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 12);
+        assert_eq!(version, super::super::SCHEMA_VERSION as u64);
         for table in ["workstream_projection_bindings", "projection_intents"] {
             let exists: bool = connection
                 .query_row(
@@ -890,24 +890,18 @@ mod tests {
     }
 
     #[test]
-    fn schema_v10_migrates_atomically_to_v12() {
+    fn schema_v10_migrates_atomically_to_latest() {
         let state = tempfile::tempdir().expect("state");
         let ledger = WorkLedger::open(state.path()).expect("ledger");
         let connection = ledger.connect_read_write().expect("connection");
-        connection
-            .execute_batch(
-                "DROP TRIGGER projection_intent_no_delete;
-                 DROP TRIGGER projection_intent_identity_immutable;
-                 DROP TABLE projection_intents;
-                 DROP TRIGGER workstream_projection_binding_no_delete;
-                 DROP TRIGGER workstream_projection_binding_identity_immutable;
-                 DROP TABLE workstream_projection_bindings;
-                 PRAGMA user_version = 10;",
-            )
-            .expect("v10 fixture");
+        super::super::reconstruct_authentic_v10_schema_for_test(&connection)
+            .expect("authentic v10 fixture");
         drop(connection);
         let reopened = WorkLedger::open(state.path()).expect("migrated ledger");
-        assert_eq!(reopened.status().expect("status").schema_version, 12);
+        assert_eq!(
+            reopened.status().expect("status").schema_version,
+            super::super::SCHEMA_VERSION
+        );
     }
 
     #[test]

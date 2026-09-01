@@ -15,6 +15,8 @@ fn test_schema_object_exists(connection: &Connection, object_type: &str, name: &
 }
 
 fn strip_schema_identity(connection: &Connection) {
+    reconstruct_authentic_v12_schema_for_test(connection)
+        .expect("remove the complete v13 ownership and successor schema");
     connection
         .execute_batch(
             "DROP TRIGGER IF EXISTS projection_intent_no_delete;

@@ -164,7 +164,8 @@ use storage::{
 };
 #[cfg(test)]
 use storage::{
-    reconstruct_authentic_v11_schema_for_test, reconstruct_authentic_v12_schema_for_test,
+    reconstruct_authentic_v10_schema_for_test, reconstruct_authentic_v11_schema_for_test,
+    reconstruct_authentic_v12_schema_for_test,
 };
 #[cfg(test)]
 pub(crate) use tests::ownership_lease_fixture;

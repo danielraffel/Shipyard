@@ -905,7 +905,7 @@ fn migrate_v9_to_v10(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     verify_open_lineage(&transaction, 9)?;
     validate_relational_integrity(&transaction)?;
-    install_custody_successor_schema(&transaction)?;
+    install_legacy_custody_successor_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", 10)?;
     verify_schema_identity(&transaction)?;
     validate_relational_integrity(&transaction)?;
@@ -1535,34 +1535,10 @@ fn install_custody_successor_schema(
     Ok(())
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_lines)] // Exact historical v12 DDL is intentionally reconstructed intact.
-pub(super) fn reconstruct_authentic_v12_schema_for_test(
-    connection: &Connection,
-) -> WorkLedgerResult<()> {
+#[allow(clippy::too_many_lines)] // This is the exact immutable schema installed by v9 -> v10.
+fn install_legacy_custody_successor_schema(connection: &Connection) -> WorkLedgerResult<()> {
     connection.execute_batch(
-        "DROP TRIGGER workstream_projection_binding_mint_ownership_root;
-         DROP TRIGGER agent_ownership_generation_advance_fence;
-         DROP TABLE ownership_leases;
-         DROP TRIGGER ownership_lease_bootstrap_eligibility_no_insert;
-         DROP TRIGGER ownership_lease_bootstrap_eligibility_no_delete;
-         DROP TRIGGER ownership_lease_bootstrap_eligibility_immutable;
-         DROP TABLE ownership_lease_bootstrap_eligibility;
-         DROP TABLE ownership_holder_materials;
-         DROP TABLE ownership_roots;
-         DROP TRIGGER custody_successor_transition_history;
-         DROP TRIGGER custody_successor_insert_history;
-         DROP TRIGGER custody_successor_event_no_delete;
-         DROP TRIGGER custody_successor_event_immutable;
-         DROP TABLE custody_successor_events;
-         DROP TRIGGER custody_successor_state_transition_fence;
-         DROP TRIGGER custody_successor_no_delete;
-         DROP TRIGGER custody_successor_receipt_immutable;
-         DROP TRIGGER custody_successor_identity_immutable;
-         DROP INDEX custody_successor_active_epoch;
-         DROP INDEX custody_successor_message;
-         DROP TABLE custody_successor_rebinds;
-         CREATE TABLE custody_successor_rebinds (
+        "CREATE TABLE custody_successor_rebinds (
            rebind_id TEXT NOT NULL,
            message_id TEXT NOT NULL,
            side TEXT NOT NULL CHECK(side IN ('sender', 'receiver')),
@@ -1595,8 +1571,57 @@ pub(super) fn reconstruct_authentic_v12_schema_for_test(
          CREATE TRIGGER custody_successor_no_delete
          BEFORE DELETE ON custody_successor_rebinds
          BEGIN SELECT RAISE(ABORT, 'custody successor rebinds cannot be deleted'); END;
-         PRAGMA user_version = 12;",
+         CREATE TABLE custody_processed_acknowledgements (
+           receipt_digest TEXT PRIMARY KEY
+             CHECK(length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'),
+           message_id TEXT NOT NULL REFERENCES custody_inbox(message_id) ON DELETE RESTRICT,
+           source_machine_ref TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           UNIQUE(message_id)
+         );
+         CREATE TRIGGER custody_processed_ack_immutable
+         BEFORE UPDATE ON custody_processed_acknowledgements
+         BEGIN SELECT RAISE(ABORT, 'custody processed acknowledgements are immutable'); END;
+         CREATE TRIGGER custody_processed_ack_no_delete
+         BEFORE DELETE ON custody_processed_acknowledgements
+         BEGIN SELECT RAISE(ABORT, 'custody processed acknowledgements cannot be deleted'); END;",
     )?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_lines)] // Exact historical v12 DDL is intentionally reconstructed intact.
+pub(super) fn reconstruct_authentic_v12_schema_for_test(
+    connection: &Connection,
+) -> WorkLedgerResult<()> {
+    connection.execute_batch(
+        "DROP TRIGGER workstream_projection_binding_mint_ownership_root;
+         DROP TRIGGER agent_ownership_generation_advance_fence;
+         DROP TABLE ownership_leases;
+         DROP TRIGGER ownership_lease_bootstrap_eligibility_no_insert;
+         DROP TRIGGER ownership_lease_bootstrap_eligibility_no_delete;
+         DROP TRIGGER ownership_lease_bootstrap_eligibility_immutable;
+         DROP TABLE ownership_lease_bootstrap_eligibility;
+         DROP TABLE ownership_holder_materials;
+         DROP TABLE ownership_roots;
+         DROP TRIGGER custody_successor_transition_history;
+         DROP TRIGGER custody_successor_insert_history;
+         DROP TRIGGER custody_successor_event_no_delete;
+         DROP TRIGGER custody_successor_event_immutable;
+         DROP TABLE custody_successor_events;
+         DROP TRIGGER custody_successor_state_transition_fence;
+         DROP TRIGGER custody_successor_no_delete;
+         DROP TRIGGER custody_successor_receipt_immutable;
+         DROP TRIGGER custody_successor_identity_immutable;
+         DROP INDEX custody_successor_active_epoch;
+         DROP INDEX custody_successor_message;
+         DROP TABLE custody_successor_rebinds;
+         DROP TRIGGER custody_processed_ack_no_delete;
+         DROP TRIGGER custody_processed_ack_immutable;
+         DROP TABLE custody_processed_acknowledgements;",
+    )?;
+    install_legacy_custody_successor_schema(connection)?;
+    connection.pragma_update(None, "user_version", 12)?;
     Ok(())
 }
 
@@ -1651,6 +1676,27 @@ pub(super) fn reconstruct_authentic_v11_schema_for_test(
                           delivery_id, launch_profile_object_ref, created_at ON agent_ownership
          BEGIN SELECT RAISE(ABORT, 'agent ownership identity is immutable'); END;
          PRAGMA user_version = 11;",
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn reconstruct_authentic_v10_schema_for_test(
+    connection: &Connection,
+) -> WorkLedgerResult<()> {
+    reconstruct_authentic_v12_schema_for_test(connection)?;
+    connection.execute_batch(
+        "DROP TRIGGER workstream_projection_binding_no_second_insert;
+         DROP TRIGGER workstream_projection_binding_no_delete;
+         DROP TRIGGER workstream_projection_binding_repository_identity_enrichment;
+         DROP TRIGGER workstream_projection_binding_repository_coordinate_update;
+         DROP TRIGGER workstream_projection_binding_exact_head_transition;
+         DROP TRIGGER workstream_projection_binding_identity_immutable;
+         DROP TABLE workstream_projection_bindings;
+         DROP TRIGGER projection_intent_no_delete;
+         DROP TRIGGER projection_intent_identity_immutable;
+         DROP TABLE projection_intents;
+         PRAGMA user_version = 10;",
     )?;
     Ok(())
 }
