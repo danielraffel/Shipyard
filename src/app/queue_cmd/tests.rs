@@ -6,7 +6,8 @@ use super::orphan_reconciliation::{
 use super::{logs_command, write_log};
 use crate::host_pool::{HostPoolLeaseRequest, HostPoolLeaseStore, default_lease_path};
 use crate::job::{
-    CancellationCause, CancellationProof, Job, JobKind, JobStatus, Priority, ValidationMode,
+    CancellationCause, CancellationProof, Job, JobKind, JobStatus, Priority, TargetResult,
+    TargetStatus, ValidationMode,
 };
 use crate::log_retention::{TERMINAL_MANIFEST_FILE, TerminalLogManifest};
 use crate::queue::Queue;
@@ -605,8 +606,34 @@ fn trimmed_terminal_job_log_is_readable_by_target() {
         serde_json::to_vec(&manifest).expect("manifest"),
     )
     .expect("manifest");
+    let mut lifecycle = Vec::new();
+    assert_eq!(
+        logs_command("job", None, temp.path(), true, &mut lifecycle).expect("lifecycle"),
+        std::process::ExitCode::SUCCESS
+    );
+    let lifecycle: serde_json::Value = serde_json::from_slice(&lifecycle).expect("json");
+    assert_eq!(lifecycle["job_status"], "completed");
+    assert_eq!(lifecycle["terminal"], true);
+    assert_eq!(lifecycle["passed"], true);
+    assert_eq!(lifecycle["observation"], "retained");
+
+    let mut target_state = Vec::new();
+    logs_command("job", Some("macos"), temp.path(), true, &mut target_state)
+        .expect("retained target state");
+    let target_state: serde_json::Value = serde_json::from_slice(&target_state).expect("json");
+    assert_eq!(target_state["requested_target"], "macos");
+    assert_eq!(target_state["observation"], "retained");
+    let mut absent = Vec::new();
+    assert_eq!(
+        logs_command("job", Some("windows"), temp.path(), true, &mut absent)
+            .expect("absent retained target"),
+        std::process::ExitCode::from(1)
+    );
+    let absent: serde_json::Value = serde_json::from_slice(&absent).expect("json");
+    assert_eq!(absent["observation"], "not_materialized");
+
     let mut stdout = Vec::new();
-    logs_command("job", Some("macos".to_owned()), temp.path(), &mut stdout).expect("retained log");
+    logs_command("job", Some("macos"), temp.path(), false, &mut stdout).expect("retained log");
     assert_eq!(
         stdout,
         b"first attempt\nfirst failover\nterminal retry\nterminal failover\n"
@@ -614,21 +641,177 @@ fn trimmed_terminal_job_log_is_readable_by_target() {
 
     std::fs::remove_file(job_dir.join(TERMINAL_MANIFEST_FILE)).expect("remove manifest");
     let mut unclassified = Vec::new();
-    logs_command(
-        "job",
-        Some("macos".to_owned()),
-        temp.path(),
-        &mut unclassified,
-    )
-    .expect("unclassified retained log");
+    logs_command("job", Some("macos"), temp.path(), false, &mut unclassified)
+        .expect("unclassified retained log");
     assert_eq!(unclassified, stdout);
 
-    let error = logs_command(
-        "../job",
-        Some("macos".to_owned()),
-        temp.path(),
-        &mut Vec::new(),
-    )
-    .expect_err("job traversal rejected");
+    let error = logs_command("../job", Some("macos"), temp.path(), false, &mut Vec::new())
+        .expect_err("job traversal rejected");
     assert_eq!(error.code, 2);
+}
+
+#[test]
+fn logs_json_keeps_pending_without_materialized_logs_nonterminal() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut queue = Queue::new(temp.path()).expect("queue");
+    let job = queue
+        .enqueue(Job::create(
+            "pending-head",
+            "feature/pending-logs",
+            vec!["macos".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        ))
+        .expect("enqueue");
+    let mut stdout = Vec::new();
+
+    let code = logs_command(&job.id, None, temp.path(), true, &mut stdout).expect("logs json");
+    let payload: serde_json::Value = serde_json::from_slice(&stdout).expect("json");
+
+    assert_eq!(code, std::process::ExitCode::from(3));
+    assert_eq!(payload["command"], "logs");
+    assert_eq!(payload["job_status"], "pending");
+    assert_eq!(payload["observation"], "not_materialized");
+    assert_eq!(payload["terminal"], false);
+    assert!(payload["passed"].is_null());
+    assert_eq!(payload["available_targets"], serde_json::json!([]));
+}
+
+#[test]
+fn logs_json_keeps_manifest_only_terminal_job_not_materialized() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut queue = Queue::new(temp.path()).expect("queue");
+    let pending = queue
+        .enqueue(Job::create(
+            "cancelled-head",
+            "feature/no-logs",
+            vec!["macos".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        ))
+        .expect("enqueue");
+    let cancelled = pending.cancel().expect("cancel");
+    queue.update(&cancelled).expect("update");
+    let mut stdout = Vec::new();
+
+    let code =
+        logs_command(&cancelled.id, None, temp.path(), true, &mut stdout).expect("terminal json");
+    let payload: serde_json::Value = serde_json::from_slice(&stdout).expect("json");
+
+    assert_eq!(code, std::process::ExitCode::from(1));
+    assert_eq!(payload["observation"], "not_materialized");
+    assert_eq!(payload["terminal"], true);
+    assert_eq!(payload["passed"], false);
+}
+
+#[test]
+fn logs_json_reports_available_running_log_without_printing_or_implying_success() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log_path = temp.path().join("macos.log");
+    std::fs::write(&log_path, "secret-ish raw log content\n").expect("log");
+    let mut queue = Queue::new(temp.path()).expect("queue");
+    let pending = queue
+        .enqueue(Job::create(
+            "running-head",
+            "feature/running-logs",
+            vec!["macos".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        ))
+        .expect("enqueue");
+    let mut result = TargetResult::new("macos", "macos", TargetStatus::Running, "local");
+    result.log_path = Some(log_path.to_string_lossy().into_owned());
+    let running = pending.start().expect("start").with_result(result);
+    queue.update(&running).expect("running");
+    let mut stdout = Vec::new();
+
+    let code = logs_command(&running.id, Some("macos"), temp.path(), true, &mut stdout)
+        .expect("logs json");
+    let payload: serde_json::Value = serde_json::from_slice(&stdout).expect("json");
+
+    assert_eq!(code, std::process::ExitCode::from(3));
+    assert_eq!(payload["job_status"], "running");
+    assert_eq!(payload["observation"], "available");
+    assert_eq!(payload["terminal"], false);
+    assert!(payload["passed"].is_null());
+    assert_eq!(payload["available_targets"], serde_json::json!(["macos"]));
+    assert!(
+        !String::from_utf8(stdout)
+            .expect("utf8")
+            .contains("raw log content")
+    );
+
+    std::fs::remove_file(log_path).expect("remove log");
+    let mut missing = Vec::new();
+    logs_command(&running.id, Some("macos"), temp.path(), true, &mut missing)
+        .expect("missing log state");
+    let missing: serde_json::Value = serde_json::from_slice(&missing).expect("json");
+    assert_eq!(missing["observation"], "not_materialized");
+    assert_eq!(missing["available_targets"], serde_json::json!([]));
+}
+
+#[test]
+fn logs_json_distinguishes_terminal_without_log_missing_job_and_invalid_target() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut queue = Queue::new(temp.path()).expect("queue");
+    let pending = queue
+        .enqueue(Job::create(
+            "terminal-head",
+            "feature/terminal-logs",
+            vec!["linux".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        ))
+        .expect("enqueue");
+    let running = pending
+        .start()
+        .expect("start")
+        .with_result(TargetResult::new(
+            "linux",
+            "linux",
+            TargetStatus::Pass,
+            "local",
+        ));
+    queue.update(&running).expect("running");
+    let completed = running.complete().expect("complete");
+    queue.update(&completed).expect("complete");
+
+    let mut terminal_out = Vec::new();
+    assert_eq!(
+        logs_command(&completed.id, None, temp.path(), true, &mut terminal_out)
+            .expect("terminal json"),
+        std::process::ExitCode::from(1)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&terminal_out).expect("terminal json");
+    assert_eq!(terminal["terminal"], true);
+    assert_eq!(terminal["passed"], true);
+    assert_eq!(terminal["observation"], "not_materialized");
+
+    let mut missing_out = Vec::new();
+    assert_eq!(
+        logs_command("sy-missing", None, temp.path(), true, &mut missing_out)
+            .expect("missing json"),
+        std::process::ExitCode::from(5)
+    );
+    let missing: serde_json::Value = serde_json::from_slice(&missing_out).expect("missing json");
+    assert!(missing["job_status"].is_null());
+    assert!(missing["terminal"].is_null());
+    assert!(missing["passed"].is_null());
+    assert_eq!(missing["observation"], "not_found");
+
+    let mut invalid_out = Vec::new();
+    assert_eq!(
+        logs_command(
+            &completed.id,
+            Some("windows"),
+            temp.path(),
+            true,
+            &mut invalid_out,
+        )
+        .expect("invalid target json"),
+        std::process::ExitCode::from(2)
+    );
+    let invalid: serde_json::Value = serde_json::from_slice(&invalid_out).expect("invalid json");
+    assert_eq!(invalid["observation"], "invalid_target");
+    assert_eq!(invalid["terminal"], true);
 }

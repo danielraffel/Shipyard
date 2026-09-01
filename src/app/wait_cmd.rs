@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -11,7 +13,9 @@ use super::{
     cli::{WaitCommand, WaitPrState},
 };
 use crate::config::LoadedConfig;
+use crate::log_retention::{TerminalLogManifest, read_terminal_manifest};
 use crate::output::write_json_envelope;
+use crate::queue::Queue;
 use crate::wait as wait_logic;
 use crate::wait_transport::{
     WaitOutcome, fetch_pr_green_snapshot_with_timeout, fetch_pr_snapshot_with_timeout,
@@ -23,6 +27,7 @@ pub(super) fn wait_command<W: Write>(
     command: WaitCommand,
     mode: RuntimeMode,
     daemon_socket: &Path,
+    state_dir: &Path,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
@@ -89,6 +94,20 @@ pub(super) fn wait_command<W: Write>(
             no_fallback,
             repo,
             snapshot_file.as_deref(),
+        ),
+        WaitCommand::Job {
+            job_id,
+            success,
+            timeout,
+            poll_interval,
+        } => wait_job(
+            state_dir,
+            json,
+            stdout,
+            &job_id,
+            success,
+            timeout,
+            poll_interval,
         ),
     }
 }
@@ -285,6 +304,14 @@ fn wait_run<W: Write>(
     repo_override: Option<String>,
     snapshot_file: Option<&Path>,
 ) -> Result<ExitCode, CliFailure> {
+    if run_id.starts_with("sy-") {
+        return Err(CliFailure::new(
+            WAIT_EXIT_INVALID,
+            format!(
+                "{run_id} is a Shipyard queue job ID; use `shipyard wait job {run_id}` instead"
+            ),
+        ));
+    }
     let repo = resolve_repo_slug(repo_override, cwd)?;
     let event_filter = run_event_filter(run_id, &repo);
     let condition = serde_json::json!({
@@ -321,6 +348,272 @@ fn wait_run<W: Write>(
         }
         Err(error) => Err(wait_failure(error.as_ref())),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_job<W: Write>(
+    state_dir: &Path,
+    json: bool,
+    stdout: &mut W,
+    job_id: &str,
+    require_success: bool,
+    timeout_seconds: f64,
+    poll_interval_seconds: f64,
+) -> Result<ExitCode, CliFailure> {
+    if !is_queue_job_id(job_id) {
+        return Err(CliFailure::new(
+            WAIT_EXIT_INVALID,
+            "job id must be one sy-* path component",
+        ));
+    }
+    if !timeout_seconds.is_finite()
+        || timeout_seconds < 0.0
+        || !poll_interval_seconds.is_finite()
+        || poll_interval_seconds <= 0.0
+    {
+        return Err(CliFailure::new(
+            WAIT_EXIT_INVALID,
+            "timeout must be finite and non-negative; poll interval must be finite and positive",
+        ));
+    }
+    let timeout = Duration::try_from_secs_f64(timeout_seconds)
+        .map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, error.to_string()))?;
+    let poll_interval = Duration::try_from_secs_f64(poll_interval_seconds)
+        .map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, error.to_string()))?;
+    let mut queue = Queue::new(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let start = Instant::now();
+    let Some(mut job) = queue
+        .get(job_id)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+    else {
+        return render_absent_job(
+            stdout,
+            json,
+            state_dir,
+            job_id,
+            require_success,
+            start.elapsed(),
+        );
+    };
+    loop {
+        let terminal = matches!(
+            job.status,
+            crate::job::JobStatus::Completed | crate::job::JobStatus::Cancelled
+        );
+        if terminal {
+            let passed = job.passed();
+            return render_job_wait(
+                stdout,
+                json,
+                job_id,
+                require_success,
+                Some(&job),
+                !require_success || passed,
+                false,
+                start.elapsed(),
+            );
+        }
+        if start.elapsed() >= timeout {
+            return render_job_wait(
+                stdout,
+                json,
+                job_id,
+                require_success,
+                Some(&job),
+                false,
+                true,
+                start.elapsed(),
+            );
+        }
+        thread::sleep(poll_interval.min(timeout.saturating_sub(start.elapsed())));
+        if start.elapsed() >= timeout {
+            return render_job_wait(
+                stdout,
+                json,
+                job_id,
+                require_success,
+                Some(&job),
+                false,
+                true,
+                start.elapsed(),
+            );
+        }
+        let Some(next) = queue
+            .get(job_id)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?
+        else {
+            return render_absent_job(
+                stdout,
+                json,
+                state_dir,
+                job_id,
+                require_success,
+                start.elapsed(),
+            );
+        };
+        job = next;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_absent_job<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    state_dir: &Path,
+    job_id: &str,
+    require_success: bool,
+    elapsed: Duration,
+) -> Result<ExitCode, CliFailure> {
+    if let Some(manifest) = read_terminal_manifest(&state_dir.join("logs").join(job_id))
+        .filter(|manifest| manifest.job_id == job_id)
+    {
+        return render_retained_job_wait(
+            stdout,
+            json,
+            job_id,
+            require_success,
+            &manifest,
+            false,
+            elapsed,
+        );
+    }
+    render_job_wait(
+        stdout,
+        json,
+        job_id,
+        require_success,
+        None,
+        false,
+        false,
+        elapsed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_retained_job_wait<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    job_id: &str,
+    require_success: bool,
+    manifest: &TerminalLogManifest,
+    timed_out: bool,
+    elapsed: Duration,
+) -> Result<ExitCode, CliFailure> {
+    let passed = !manifest.failed;
+    let outcome = WaitOutcome {
+        matched: !timed_out && (!require_success || passed),
+        observed: BTreeMap::from([
+            ("job_id".to_owned(), Value::String(job_id.to_owned())),
+            (
+                "status".to_owned(),
+                Value::String(
+                    if manifest.reason == "cancelled" {
+                        "cancelled"
+                    } else {
+                        "completed"
+                    }
+                    .to_owned(),
+                ),
+            ),
+            ("terminal".to_owned(), Value::Bool(true)),
+            ("passed".to_owned(), Value::Bool(passed)),
+        ]),
+        transport: "queue".to_owned(),
+        timed_out,
+        elapsed_seconds: elapsed.as_secs_f64(),
+        ..WaitOutcome::default()
+    };
+    render_wait_outcome(
+        stdout,
+        json,
+        "wait:job",
+        job_wait_condition(job_id, require_success),
+        &outcome,
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(if timed_out {
+        ExitCode::from(WAIT_EXIT_TIMEOUT)
+    } else if require_success && !passed {
+        ExitCode::from(WAIT_EXIT_TERMINAL_WRONG)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn render_job_wait<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    job_id: &str,
+    require_success: bool,
+    job: Option<&crate::job::Job>,
+    matched: bool,
+    timed_out: bool,
+    elapsed: Duration,
+) -> Result<ExitCode, CliFailure> {
+    let terminal = job.is_some_and(|job| {
+        matches!(
+            job.status,
+            crate::job::JobStatus::Completed | crate::job::JobStatus::Cancelled
+        )
+    });
+    let outcome = WaitOutcome {
+        matched,
+        observed: BTreeMap::from([
+            ("job_id".to_owned(), Value::String(job_id.to_owned())),
+            (
+                "status".to_owned(),
+                job.map_or(Value::String("not_found".to_owned()), |job| {
+                    serde_json::to_value(job.status).expect("job status serializes")
+                }),
+            ),
+            (
+                "terminal".to_owned(),
+                job.map_or(Value::Null, |_| Value::Bool(terminal)),
+            ),
+            (
+                "passed".to_owned(),
+                job.filter(|_| terminal)
+                    .map_or(Value::Null, |job| Value::Bool(job.passed())),
+            ),
+        ]),
+        transport: "queue".to_owned(),
+        timed_out,
+        elapsed_seconds: elapsed.as_secs_f64(),
+        ..WaitOutcome::default()
+    };
+    render_wait_outcome(
+        stdout,
+        json,
+        "wait:job",
+        job_wait_condition(job_id, require_success),
+        &outcome,
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(if job.is_none() {
+        ExitCode::from(WAIT_EXIT_INVALID)
+    } else if timed_out {
+        ExitCode::from(WAIT_EXIT_TIMEOUT)
+    } else if require_success && !matched {
+        ExitCode::from(WAIT_EXIT_TERMINAL_WRONG)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn is_queue_job_id(job_id: &str) -> bool {
+    let mut components = Path::new(job_id).components();
+    job_id.starts_with("sy-")
+        && matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
+fn job_wait_condition(job_id: &str, require_success: bool) -> Value {
+    serde_json::json!({
+        "type": "job",
+        "job_id": job_id,
+        "require_success": require_success,
+    })
 }
 
 fn evaluate_run_for_wait(
@@ -500,19 +793,23 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::process::{Command, ExitCode};
+    use std::thread;
+    use std::time::Duration;
 
     use serde_json::Value;
 
     use super::{
         RuntimeMode, WaitOutcome, WaitPrState, evaluate_pr_green_for_wait, evaluate_run_for_wait,
         parse_github_repo_slug, release_manifest, render_wait_outcome, resolve_repo_slug,
-        wait_exit_code, wait_failure, wait_pr, wait_release, wait_run,
+        wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
     };
     use crate::app::{
         WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG, WAIT_EXIT_TIMEOUT,
         WAIT_EXIT_UNSUPPORTED,
     };
     use crate::gh::GhPrepareError;
+    use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
+    use crate::queue::{KEEP_COMPLETED, Queue};
     use crate::wait as wait_logic;
     use crate::wait_transport::wait_for_condition_with_timeout;
 
@@ -999,6 +1296,327 @@ artifacts = [
         assert_eq!(payload["matched"], false);
         assert_eq!(payload["observed"]["run_id"], 100);
         assert_eq!(payload["observed"]["conclusion"], "failure");
+    }
+
+    #[test]
+    fn wait_run_rejects_shipyard_job_id_before_repository_or_github_lookup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let error = wait_run(
+            &temp.path().join("missing.sock"),
+            temp.path(),
+            true,
+            &mut Vec::new(),
+            "sy-20260901-example",
+            false,
+            0.01,
+            0.01,
+            false,
+            None,
+            None,
+        )
+        .expect_err("queue job ID must not reach GitHub resolution");
+
+        assert_eq!(error.code, WAIT_EXIT_INVALID);
+        assert!(error.message.contains("wait job sy-20260901-example"));
+    }
+
+    #[test]
+    fn wait_job_pending_timeout_is_typed_unknown_not_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let job = queue.enqueue(test_job()).expect("enqueue");
+        let mut out = Vec::new();
+
+        let code = wait_job(temp.path(), true, &mut out, &job.id, true, 0.0, 0.01)
+            .expect("pending timeout");
+        let payload: Value = serde_json::from_slice(&out).expect("json");
+
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_TIMEOUT));
+        assert_eq!(payload["command"], "wait:job");
+        assert_eq!(payload["transport"], "queue");
+        assert_eq!(payload["matched"], false);
+        assert_eq!(payload["observed"]["status"], "pending");
+        assert_eq!(payload["observed"]["terminal"], false);
+        assert!(payload["observed"]["passed"].is_null());
+    }
+
+    #[test]
+    fn wait_job_rejects_nonfinite_and_zero_poll_durations_without_panicking() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (timeout, poll_interval) in [
+            (f64::INFINITY, 1.0),
+            (1.0, f64::INFINITY),
+            (1e300, 1.0),
+            (1.0, 1e300),
+            (1.0, 0.0),
+            (-1.0, 1.0),
+        ] {
+            let error = wait_job(
+                temp.path(),
+                true,
+                &mut Vec::new(),
+                "sy-duration-control",
+                true,
+                timeout,
+                poll_interval,
+            )
+            .expect_err("invalid duration must refuse");
+            assert_eq!(error.code, WAIT_EXIT_INVALID);
+        }
+    }
+
+    #[test]
+    fn wait_job_rejects_path_shaped_ids_before_queue_or_manifest_lookup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let error = wait_job(
+            temp.path(),
+            true,
+            &mut Vec::new(),
+            "sy-/../../other-job",
+            true,
+            1.0,
+            0.01,
+        )
+        .expect_err("invalid ID must refuse");
+        assert_eq!(error.code, WAIT_EXIT_INVALID);
+        assert!(!temp.path().join("queue.json").exists());
+    }
+
+    #[test]
+    fn wait_job_terminal_success_and_failure_obey_success_requirement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let passed = terminal_job(&mut queue, TargetStatus::Pass);
+        let failed = terminal_job(&mut queue, TargetStatus::Fail);
+
+        let mut passed_out = Vec::new();
+        assert_eq!(
+            wait_job(
+                temp.path(),
+                true,
+                &mut passed_out,
+                &passed.id,
+                true,
+                1.0,
+                0.01,
+            )
+            .expect("passed"),
+            ExitCode::SUCCESS
+        );
+        let passed_payload: Value = serde_json::from_slice(&passed_out).expect("passed json");
+        assert_eq!(passed_payload["matched"], true);
+        assert_eq!(passed_payload["observed"]["passed"], true);
+
+        let mut failed_out = Vec::new();
+        assert_eq!(
+            wait_job(
+                temp.path(),
+                true,
+                &mut failed_out,
+                &failed.id,
+                true,
+                1.0,
+                0.01,
+            )
+            .expect("failed"),
+            ExitCode::from(WAIT_EXIT_TERMINAL_WRONG)
+        );
+        let failed_payload: Value = serde_json::from_slice(&failed_out).expect("failed json");
+        assert_eq!(failed_payload["matched"], false);
+        assert_eq!(failed_payload["observed"]["status"], "completed");
+        assert_eq!(failed_payload["observed"]["passed"], false);
+
+        assert_eq!(
+            wait_job(
+                temp.path(),
+                true,
+                &mut Vec::new(),
+                &failed.id,
+                false,
+                1.0,
+                0.01,
+            )
+            .expect("terminal without success requirement"),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn wait_job_cancelled_and_missing_states_never_imply_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let pending = queue.enqueue(test_job()).expect("enqueue");
+        let cancelled = pending.cancel().expect("cancel");
+        queue.update(&cancelled).expect("update");
+
+        assert_eq!(
+            wait_job(
+                temp.path(),
+                true,
+                &mut Vec::new(),
+                &cancelled.id,
+                false,
+                1.0,
+                0.01,
+            )
+            .expect("cancelled terminal"),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            wait_job(
+                temp.path(),
+                true,
+                &mut Vec::new(),
+                &cancelled.id,
+                true,
+                1.0,
+                0.01,
+            )
+            .expect("cancelled is not success"),
+            ExitCode::from(WAIT_EXIT_TERMINAL_WRONG)
+        );
+
+        let mut missing_out = Vec::new();
+        assert_eq!(
+            wait_job(
+                temp.path(),
+                true,
+                &mut missing_out,
+                "sy-missing",
+                true,
+                1.0,
+                0.01,
+            )
+            .expect("missing is typed"),
+            ExitCode::from(WAIT_EXIT_INVALID)
+        );
+        let missing: Value = serde_json::from_slice(&missing_out).expect("missing json");
+        assert_eq!(missing["matched"], false);
+        assert_eq!(missing["observed"]["status"], "not_found");
+        assert!(missing["observed"]["terminal"].is_null());
+        assert!(missing["observed"]["passed"].is_null());
+    }
+
+    #[test]
+    fn wait_job_observes_durable_pending_to_completed_transition() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let pending = queue.enqueue(test_job()).expect("enqueue");
+        let state_dir = temp.path().to_path_buf();
+        let job_id = pending.id.clone();
+        let updater = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            let mut queue = Queue::new(&state_dir).expect("updater queue");
+            let pending = queue.get(&job_id).expect("get").expect("job");
+            let running = pending
+                .start()
+                .expect("start")
+                .with_result(TargetResult::new(
+                    "linux",
+                    "linux",
+                    TargetStatus::Pass,
+                    "local",
+                ));
+            queue.update(&running).expect("running");
+            queue
+                .update(&running.complete().expect("complete"))
+                .expect("completed");
+        });
+
+        let mut out = Vec::new();
+        let code = wait_job(temp.path(), true, &mut out, &pending.id, true, 1.0, 0.01)
+            .expect("transition observed");
+        updater.join().expect("updater");
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let payload: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(payload["observed"]["status"], "completed");
+        assert_eq!(payload["observed"]["passed"], true);
+    }
+
+    #[test]
+    fn wait_job_observes_one_initial_terminal_snapshot_at_zero_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let pending = queue.enqueue(test_job()).expect("enqueue");
+        let running = pending
+            .start()
+            .expect("start")
+            .with_result(TargetResult::new(
+                "linux",
+                "linux",
+                TargetStatus::Pass,
+                "local",
+            ));
+        queue.update(&running).expect("running");
+        let completed = running.complete().expect("complete");
+        queue.update(&completed).expect("complete");
+
+        let mut out = Vec::new();
+        let code = wait_job(temp.path(), true, &mut out, &completed.id, true, 0.0, 0.01)
+            .expect("terminal");
+        let payload: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["matched"], true);
+    }
+
+    #[test]
+    fn wait_job_reads_cancelled_no_log_manifest_after_queue_eviction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let pending = queue.enqueue(test_job()).expect("enqueue");
+        let cancelled = pending.cancel().expect("cancel");
+        queue.update(&cancelled).expect("cancelled");
+
+        for index in 0..=KEEP_COMPLETED {
+            let mut job = test_job();
+            job.sha = format!("newer-{index}");
+            let pending = queue.enqueue(job).expect("enqueue newer");
+            let running = pending
+                .start()
+                .expect("start")
+                .with_result(TargetResult::new(
+                    "linux",
+                    "linux",
+                    TargetStatus::Pass,
+                    "local",
+                ));
+            queue.update(&running).expect("running");
+            queue
+                .update(&running.complete().expect("complete"))
+                .expect("completed");
+        }
+        assert!(queue.get(&cancelled.id).expect("get").is_none());
+
+        let mut out = Vec::new();
+        let code = wait_job(temp.path(), true, &mut out, &cancelled.id, false, 1.0, 0.01)
+            .expect("retained terminal");
+        let payload: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["observed"]["status"], "cancelled");
+        assert_eq!(payload["observed"]["passed"], false);
+    }
+
+    fn test_job() -> Job {
+        Job::create(
+            "abc123",
+            "feature/wait-job",
+            vec!["linux".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        )
+    }
+
+    fn terminal_job(queue: &mut Queue, status: TargetStatus) -> Job {
+        let pending = queue.enqueue(test_job()).expect("enqueue");
+        let running = pending
+            .start()
+            .expect("start")
+            .with_result(TargetResult::new("linux", "linux", status, "local"));
+        queue.update(&running).expect("running");
+        let completed = running.complete().expect("complete");
+        queue.update(&completed).expect("completed");
+        completed
     }
 
     #[test]

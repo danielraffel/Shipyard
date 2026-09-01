@@ -191,6 +191,7 @@ identity; static labels and HerdR environment metadata do not grant authority.
 | Wait for a release to fully upload | `shipyard wait release v0.23.0 --timeout 900 --json` |
 | Wait for a PR's required checks to go green | `shipyard wait pr 151 --state green --timeout 1800 --json` |
 | Wait for a workflow run to finish | `shipyard wait run 223344 --success --timeout 1200 --json` |
+| Wait for a durable Shipyard job to pass | `shipyard wait job sy-20260901-example --success --timeout 1200 --json` |
 | Mark a target advisory | `[targets.<n>] advisory = true` in `.shipyard/config.toml` (see "Advisory lanes" below) |
 | Flip lane policy for one PR | `Lane-Policy: <target>=required\|advisory` trailer on the tip commit |
 | List quarantined targets | `shipyard quarantine list --json` |
@@ -875,6 +876,7 @@ authoritative snapshot.
 | Before | After |
 |---|---|
 | `for i in {1..60}; do status=$(gh run view 22345 --json status -q .status); [ "$status" = "completed" ] && break; sleep 20; done` | `shipyard wait run 22345 --success --timeout 1200 --json` |
+| Treating a missing queue-job log or GitHub run as completion | `shipyard wait job sy-20260901-example --success --timeout 1200 --json` |
 | `while ! gh release view v0.23.0 --json assets -q '.assets\|length' \| grep -q '^5$'; do sleep 10; done` | `shipyard wait release v0.23.0 --timeout 900 --json` |
 | `gh pr checks 151 --watch` (blocking; no structured output) | `shipyard wait pr 151 --state green --timeout 1800 --json` |
 
@@ -893,8 +895,8 @@ If either check fails, fall back to `gh run watch` / `gh pr checks --watch`.
 |------|---------|
 | 0 | condition matched |
 | 1 | `--timeout` elapsed |
-| 4 | A requested success became impossible: `wait run --success` reached a terminal failed conclusion, or `wait pr --state green` observed all exact-head required checks terminal with at least one failure |
-| 5 | invalid input (PR/release/run not found, bad tag) |
+| 4 | A requested success became impossible: `wait run/job --success` reached a terminal failed conclusion, or `wait pr --state green` observed all exact-head required checks terminal with at least one failure |
+| 5 | invalid input (PR/release/run/job not found, bad tag, wrong ID class) |
 | 6 | daemon unreachable + snapshot didn't match + `--no-fallback` |
 | 7 | unsupported scope — rulesets / merge-queue governance detected; switch lanes or do it manually |
 | 130 | SIGINT / SIGTERM |
@@ -903,6 +905,12 @@ Transient snapshot retries do not extend `--timeout`: credential preparation
 and the `gh` subprocess are bounded by the remaining overall budget, and no new
 attempt starts after the deadline. JSON `transient_errors` remains accurate
 when a run or PR wait stops early with exit 4 on a terminal failed result.
+
+For a `sy-*` queue identity, use `wait job`, never `wait run`. Durable queue
+state is authoritative: pending/running plus a missing run or log observation
+remains pending/unknown and must never be summarized as terminal success.
+`shipyard --json logs <sy-id>` reports typed lifecycle and availability only;
+run `shipyard logs <sy-id>` without `--json` when raw log content is needed.
 
 ### JSON shape
 

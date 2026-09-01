@@ -2449,6 +2449,20 @@ pub(super) enum WaitCommand {
         #[arg(long, hide = true)]
         snapshot_file: Option<PathBuf>,
     },
+    /// Wait for a durable Shipyard queue job to finish.
+    Job {
+        /// Shipyard queue job identifier (`sy-*`).
+        job_id: String,
+        /// Require the completed job to have passed every target.
+        #[arg(long)]
+        success: bool,
+        /// Give up after N seconds.
+        #[arg(long, default_value_t = 1800.0)]
+        timeout: f64,
+        /// Durable queue reconciliation cadence.
+        #[arg(long = "poll-interval", default_value_t = 2.0)]
+        poll_interval: f64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -2522,7 +2536,7 @@ mod tests {
 
     use super::{
         AuthCommand, Cli, Command, DependencyCommand, OwnershipLeaseCommand, PulpDependencyCommand,
-        QueueHoldCommand, RunnerCommand, WorkLedgerCommand, WorkLedgerPolicyCommand,
+        QueueHoldCommand, RunnerCommand, WaitCommand, WorkLedgerCommand, WorkLedgerPolicyCommand,
     };
 
     fn parsed_work_ledger(cli: Cli) -> WorkLedgerCommand {
@@ -2573,6 +2587,36 @@ mod tests {
             Command::Auth {
                 command: AuthCommand::Doctor { repo: Some(repo) }
             } if repo == "Generous-Corp/pulp"
+        ));
+    }
+
+    #[test]
+    fn wait_job_parses_durable_queue_identity_and_success_requirement() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "wait",
+            "job",
+            "sy-20260901-example",
+            "--success",
+            "--timeout",
+            "42",
+            "--poll-interval",
+            "0.25",
+        ])
+        .expect("wait job");
+
+        assert!(matches!(
+            cli.command,
+            Command::Wait {
+                command: WaitCommand::Job {
+                    job_id,
+                    success: true,
+                    timeout,
+                    poll_interval,
+                }
+            } if job_id == "sy-20260901-example"
+                && (timeout - 42.0).abs() < f64::EPSILON
+                && (poll_interval - 0.25).abs() < f64::EPSILON
         ));
     }
 
