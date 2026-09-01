@@ -423,7 +423,15 @@ def _validate_private_directory(path: Path) -> os.stat_result:
     return metadata
 
 
-def _is_reconcilable_worker_drift_failure(failure: object) -> bool:
+EXHAUSTED_IDENTITY_TIMEOUT_MAX_SECONDS = 0.01
+
+
+def _is_reconcilable_retained_failure(
+    failure: object,
+    *,
+    expected_lock_path: Optional[Path] = None,
+    expected_production_pid: Optional[int] = None,
+) -> bool:
     if not isinstance(failure, str):
         return False
     preserved_drift = (
@@ -445,7 +453,27 @@ def _is_reconcilable_worker_drift_failure(failure: object) -> bool:
         f"restore production: {foreign}; restore production: {foreign}",
         failure,
     )
-    return match is not None and match.group(1) == match.group(2)
+    if match is not None and match.group(1) == match.group(2):
+        return True
+
+    if expected_lock_path is None or expected_production_pid is None:
+        return False
+    deadline_exhaustion = re.fullmatch(
+        r"GuardianError: restore production: GuardianError: timed out inspecting writer-domain "
+        r"holders for (?P<lock>.+) after 2 attempt\(s\); restore production: "
+        r"TimeoutExpired: Command '\['/bin/ps', '-p', '(?P<pid>[1-9][0-9]*)', "
+        r"'-o', 'lstart='\]' timed out after (?P<seconds>[0-9]+(?:\.[0-9]+)?) "
+        r"seconds",
+        failure,
+    )
+    if deadline_exhaustion is None:
+        return False
+    timeout_seconds = float(deadline_exhaustion.group("seconds"))
+    return (
+        Path(deadline_exhaustion.group("lock")) == expected_lock_path
+        and int(deadline_exhaustion.group("pid")) == expected_production_pid
+        and 0.0 < timeout_seconds <= EXHAUSTED_IDENTITY_TIMEOUT_MAX_SECONDS
+    )
 
 
 def _lease_generation_state(path: Path) -> tuple[os.stat_result, str, str]:
@@ -703,7 +731,14 @@ def _bounded_timeout(deadline: Optional[float], default: float = 15.0) -> float:
 
 LOCK_HOLDER_ATTEMPT_TIMEOUT = 7.0
 LOCK_HOLDER_TOTAL_TIMEOUT = 15.0
+CORRECTED_HOLDER_COMPOSITE_TIMEOUT = 30.0
+PRODUCTION_IDENTITY_REVALIDATION_TIMEOUT = 15.0
 LOCK_HOLDER_KERNEL_TIMEOUT = "2"
+
+
+def _production_identity_deadline() -> float:
+    """Give exact identity proof a full budget independent of holder scans."""
+    return time.monotonic() + PRODUCTION_IDENTITY_REVALIDATION_TIMEOUT
 
 
 def _process_start(pid: int, *, deadline: Optional[float] = None) -> Optional[str]:
@@ -723,6 +758,7 @@ def _lock_holders(
     *,
     deadline: Optional[float] = None,
     retry_after_timeout: Optional[Callable[[float], object]] = None,
+    refresh_retry_deadline_after_revalidation: bool = False,
     diagnostic_root: Optional[Path] = None,
 ) -> tuple[int, ...]:
     argv = [
@@ -735,7 +771,19 @@ def _lock_holders(
         "--",
         str(path),
     ]
-    operation_deadline = deadline or (time.monotonic() + LOCK_HOLDER_TOTAL_TIMEOUT)
+    if refresh_retry_deadline_after_revalidation:
+        composite_deadline = (
+            time.monotonic() + CORRECTED_HOLDER_COMPOSITE_TIMEOUT
+        )
+        operation_deadline = (
+            min(deadline, composite_deadline)
+            if deadline is not None
+            else composite_deadline
+        )
+    else:
+        operation_deadline = deadline or (
+            time.monotonic() + LOCK_HOLDER_TOTAL_TIMEOUT
+        )
     attempts = 2 if retry_after_timeout is not None else 1
     result: Optional[subprocess.CompletedProcess[str]] = None
     for attempt in range(1, attempts + 1):
@@ -790,7 +838,12 @@ def _lock_holders(
             # process, start time, installed binary, argv, environment, and
             # repository/worker authority have all been revalidated.
             assert retry_after_timeout is not None
-            retry_after_timeout(operation_deadline)
+            revalidation_deadline = (
+                min(_production_identity_deadline(), operation_deadline)
+                if refresh_retry_deadline_after_revalidation
+                else operation_deadline
+            )
+            retry_after_timeout(revalidation_deadline)
 
     assert result is not None
     diagnostic = result.stderr.strip()
@@ -846,7 +899,7 @@ def _wait_for_idle_writer_domain(
     path: Path,
     production_pid: int,
     *,
-    timeout: float = 10.0,
+    timeout: float = 45.0,
     poll_interval: float = 0.1,
     stable_observations: int = 3,
     initial_holders: Optional[tuple[int, ...]] = None,
@@ -869,6 +922,13 @@ def _wait_for_idle_writer_domain(
         initial_holders == (production_pid,) if initial_holders is not None else True
     )
 
+    def revalidate_production(holder_deadline: Optional[float] = None) -> None:
+        if verify_production is not None:
+            identity_deadline = min(_production_identity_deadline(), deadline)
+            if holder_deadline is not None:
+                identity_deadline = min(identity_deadline, holder_deadline)
+            verify_production(identity_deadline)
+
     def fail_if_expired() -> None:
         if time.monotonic() >= deadline:
             raise RetainedWriterDomain(
@@ -879,17 +939,15 @@ def _wait_for_idle_writer_domain(
 
     while True:
         fail_if_expired()
-        if verify_production is not None:
-            verify_production(deadline)
+        revalidate_production()
         fail_if_expired()
         holders = _lock_holders(
             path,
             deadline=deadline,
             retry_after_timeout=(
-                (lambda retry_deadline: verify_production(retry_deadline))
-                if verify_production is not None
-                else None
+                revalidate_production if verify_production is not None else None
             ),
+            refresh_retry_deadline_after_revalidation=True,
             diagnostic_root=diagnostic_root,
         )
         last_holders = holders
@@ -905,8 +963,7 @@ def _wait_for_idle_writer_domain(
             continuously_contended = False
             stable += 1
             if stable >= stable_observations:
-                if verify_production is not None:
-                    verify_production(deadline)
+                revalidate_production()
                 fail_if_expired()
                 return
         else:
@@ -1635,7 +1692,19 @@ class Guardian:
         ready = _json_object(prior_root / "ready.json")
         mutation = _json_object(prior_root / "mutation-fence.json")
         failure = receipt.get("failure")
-        allowed_failure = _is_reconcilable_worker_drift_failure(failure)
+        production_pid = receipt.get("old_production_pid")
+        allowed_failure = _is_reconcilable_retained_failure(
+            failure,
+            expected_lock_path=(
+                self.production_state_dir / ".sandbox-writer-domain.lock"
+            ),
+            expected_production_pid=(
+                production_pid
+                if isinstance(production_pid, int)
+                and not isinstance(production_pid, bool)
+                else None
+            ),
+        )
         required = (
             receipt.get("schema_version") == 1,
             receipt.get("transition_path") == CORRECTED_TRANSITION,
@@ -2005,6 +2074,7 @@ class Guardian:
         old_holders = _lock_holders(
             self.lock_path,
             retry_after_timeout=self.verify_unchanged_production,
+            refresh_retry_deadline_after_revalidation=True,
             diagnostic_root=self.root,
         )
         old_contended = _exclusive_lock_is_contended(self.lock_path)
@@ -2271,6 +2341,7 @@ class Guardian:
         holders = _lock_holders(
             self.lock_path,
             retry_after_timeout=self.verify_unchanged_production,
+            refresh_retry_deadline_after_revalidation=True,
             diagnostic_root=self.root,
         )
         audit_holders = tuple(pid for pid in holders if pid != snapshot.pid)

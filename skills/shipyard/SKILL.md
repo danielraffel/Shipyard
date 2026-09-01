@@ -159,7 +159,16 @@ quiesce/restore path, and the current installed artifact must independently
 report that same exact version before a destructive stop so restoration is
 possible. The post-observation peer, disk-version, identity, and final-holder
 proofs share one aggregate deadline so guardian readiness remains within the
-workflow receipt budget. Known-corrected, unknown, or running/disk-mismatched versions fail closed under
+workflow receipt budget. Holder observation has its own bound: every exact
+production-identity revalidation receives a fresh bounded budget that a slow
+`lsof` call cannot consume, while both holder attempts and that identity proof
+remain inside one 30-second composite maximum and any shorter caller deadline.
+A retained corrected-path lease from the historical
+double-`lsof`/near-zero-`ps` timeout may be reconciled only when the failure has
+that exact typed shape and the existing lease generation, dead candidate,
+mutation fence, unchanged production identity, stable queue idle, and final
+writer-lock fence all revalidate. Do not delete such a lease manually or admit
+other timeout shapes. Known-corrected, unknown, or running/disk-mismatched versions fail closed under
 persistent contention and are never stopped on duration alone. Any
 foreign/additional or missing holder sample, identity drift, new worker,
 changing or ambiguous ownership, or deadline that does not prove one of those
