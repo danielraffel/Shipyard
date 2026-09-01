@@ -3183,6 +3183,8 @@ mod tests {
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
+            "--mode",
+            "isolated",
             "--state-dir",
             temp.path().to_str().expect("temp path"),
             "auto-merge",
@@ -3230,6 +3232,8 @@ mod tests {
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
+            "--mode",
+            "isolated",
             "--state-dir",
             temp.path().to_str().expect("temp path"),
             "auto-merge",
@@ -3282,6 +3286,8 @@ mod tests {
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
+            "--mode",
+            "isolated",
             "--state-dir",
             temp.path().to_str().expect("temp path"),
             "auto-merge",
@@ -3329,6 +3335,8 @@ mod tests {
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
+            "--mode",
+            "isolated",
             "--state-dir",
             temp.path().to_str().expect("temp path"),
             "auto-merge",
@@ -3386,6 +3394,8 @@ mod tests {
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
+            "--mode",
+            "isolated",
             "--state-dir",
             temp.path().to_str().expect("temp path"),
             "auto-merge",
@@ -3439,6 +3449,8 @@ mod tests {
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
+            "--mode",
+            "isolated",
             "--state-dir",
             temp.path().to_str().expect("temp path"),
             "auto-merge",

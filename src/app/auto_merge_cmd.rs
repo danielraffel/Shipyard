@@ -136,6 +136,13 @@ pub(super) fn execute_auto_merge(
     cwd: &Path,
     request: &AutoMergeRequest,
 ) -> Result<AutoMergeOutcome, AutoMergeOperationError> {
+    if let Some(detail) = synthetic_merge_hooks_production_refusal(
+        request.mode,
+        request.merge_command.is_some(),
+        request.merge_result.is_some(),
+    ) {
+        return Ok(AutoMergeOutcome::AutomaticMergeRefused { detail });
+    }
     let repository = super::branch_cmd::detect_repo_from_remote(cwd, None);
     let discovered = repository.as_ref().map_or_else(
         || store.get(request.pr),
@@ -633,10 +640,12 @@ fn merge_pr(
     merge_command: Option<&Path>,
     merge_result: Option<MergeResult>,
 ) -> Result<MergeDisposition, String> {
-    if (merge_command.is_some() || merge_result.is_some()) && mode != RuntimeMode::Isolated {
-        return Err(format!(
-            "{AUTOMATIC_MERGE_REFUSAL_PREFIX} synthetic --merge-command and --merge-result hooks are restricted to isolated test mode; production must use native merge-queue governance"
-        ));
+    if let Some(error) = synthetic_merge_hooks_production_refusal(
+        mode,
+        merge_command.is_some(),
+        merge_result.is_some(),
+    ) {
+        return Err(error);
     }
     match merge_result {
         Some(MergeResult::Success) => {
@@ -899,6 +908,18 @@ fn merge_pr(
 }
 
 const AUTOMATIC_MERGE_REFUSAL_PREFIX: &str = "automatic_merge_refused:";
+
+fn synthetic_merge_hooks_production_refusal(
+    mode: RuntimeMode,
+    has_merge_command: bool,
+    has_merge_result: bool,
+) -> Option<String> {
+    ((has_merge_command || has_merge_result) && mode != RuntimeMode::Isolated).then(|| {
+        format!(
+            "{AUTOMATIC_MERGE_REFUSAL_PREFIX} synthetic --merge-command and --merge-result hooks are restricted to isolated test mode; production must use native merge-queue governance"
+        )
+    })
+}
 
 fn is_automatic_merge_refusal(error: &str) -> bool {
     error.starts_with(AUTOMATIC_MERGE_REFUSAL_PREFIX)
@@ -4015,6 +4036,32 @@ mod tests {
         assert!(matches!(
             execute_auto_merge(&store, temp.path(), &isolated).expect("isolated synthetic result"),
             AutoMergeOutcome::Merged { .. }
+        ));
+    }
+
+    #[test]
+    fn synthetic_hooks_production_refusal_precedes_state_and_pr_reads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("state")).expect("store");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(&snapshot, r#"{"state":"OPEN"}"#).expect("snapshot");
+        let request = AutoMergeRequest {
+            mode: RuntimeMode::Shipyard,
+            global_dir: temp.path().join("global"),
+            pr: 536,
+            merge_method: MergeMethod::Squash,
+            delete_branch: false,
+            admin: false,
+            pr_snapshot_file: Some(snapshot),
+            merge_command: None,
+            merge_result: Some(MergeResult::Success),
+            expected_validation: None,
+        };
+
+        assert!(matches!(
+            execute_auto_merge(&store, temp.path(), &request).expect("production refusal"),
+            AutoMergeOutcome::AutomaticMergeRefused { ref detail }
+                if detail.contains("isolated test mode")
         ));
     }
 
