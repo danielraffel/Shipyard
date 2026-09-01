@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01451"></a>
+## [0.145.1] - 2026-09-01
+
+- fix/bounded wait subscribers 20260831 ([#530](https://github.com/danielraffel/Shipyard/pull/530))
+- fix(sandbox): recover exact retained guardian timeout ([#533](https://github.com/danielraffel/Shipyard/pull/533))
+
 <a id="v01450"></a>
 ## [0.145.0] - 2026-09-01
 
@@ -1263,6 +1269,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.145.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.145.1
 [0.145.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.145.0
 [0.144.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.144.0
 [0.143.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.143.0
