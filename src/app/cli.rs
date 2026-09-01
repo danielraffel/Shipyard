@@ -35,6 +35,29 @@ pub(super) struct Cli {
     pub(super) command: Command,
 }
 
+#[cfg(test)]
+impl Cli {
+    /// Clap builds the complete, intentionally broad command graph while
+    /// parsing. Rust's default test-worker stack is smaller than the main
+    /// thread used by the real CLI, so exercise that same parser on a bounded
+    /// main-thread-sized stack instead of making every parser test depend on
+    /// `RUST_MIN_STACK` in its environment.
+    fn try_parse_from<I, T>(arguments: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .name("shipyard-cli-parser-test".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || <Self as Parser>::try_parse_from(arguments))
+            .expect("spawn CLI parser test thread")
+            .join()
+            .expect("CLI parser test thread")
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(super) enum Command {
     /// Internal one-shot Linux provider descendant supervisor.
@@ -582,6 +605,9 @@ pub(super) enum WorkLedgerCommand {
     Status,
     /// List a bounded immutable view of local work without taking writer custody.
     Inventory,
+    /// Query the exact protected custody host for one accepted message.
+    #[command(name = "custody-inventory")]
+    CustodyInventory(Box<CustodyInventoryArgs>),
     /// Show exact durable custody states; no state named "read" is inferred.
     #[command(name = "custody-status")]
     CustodyStatus,
@@ -663,6 +689,16 @@ pub(super) enum WorkLedgerCommand {
         #[command(subcommand)]
         command: Box<WorkLedgerPolicyCommand>,
     },
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CustodyInventoryArgs {
+    /// Exact durable custody message identity.
+    #[arg(long)]
+    pub(super) message: String,
+    /// Optional owner-only client-side correlation metadata; never sent remotely.
+    #[arg(long = "correlation-hints")]
+    pub(super) correlation_hints: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1233,6 +1269,26 @@ pub(super) struct WatchLocalArgs {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum RunnerCommand {
+    /// Recover one exact Pulp Build and Test run that materialized zero jobs.
+    #[command(name = "zero-job-recover")]
+    ZeroJobRecover {
+        /// Canonical owner/repository slug. Only Generous-Corp/pulp is accepted.
+        #[arg(long, default_value = "Generous-Corp/pulp")]
+        repo: String,
+        /// Open, same-repository, steward-managed pull request to recover.
+        #[arg(long)]
+        pr: u64,
+        /// Exact queued `pull_request` Build and Test workflow run with zero jobs.
+        #[arg(long = "source-run-id")]
+        source_run_id: u64,
+        /// Minimum age of the source run before it is eligible.
+        #[arg(long = "min-age-minutes", default_value_t = 45)]
+        min_age_minutes: i64,
+        /// Persist the at-most-once receipt and dispatch protected recovery.
+        /// Without this flag the command is observation-only.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Process durable semantic-recovery requests with the trusted first-line worker.
     RecoveryWorker {
         /// Inspect or process at most one pending request (the default).
@@ -2464,29 +2520,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use clap::Parser;
-
     use super::{
         AuthCommand, Cli, Command, DependencyCommand, OwnershipLeaseCommand, PulpDependencyCommand,
         QueueHoldCommand, RunnerCommand, WorkLedgerCommand, WorkLedgerPolicyCommand,
     };
-
-    impl Cli {
-        fn try_parse_from<I, T>(itr: I) -> Result<Self, clap::Error>
-        where
-            I: IntoIterator<Item = T>,
-            T: Into<OsString> + Clone,
-        {
-            let args = itr.into_iter().map(Into::into).collect::<Vec<OsString>>();
-            std::thread::Builder::new()
-                .name("shipyard-cli-parse".to_owned())
-                .stack_size(8 * 1024 * 1024)
-                .spawn(move || <Self as Parser>::try_parse_from(args))
-                .expect("spawn CLI parser with production-sized stack")
-                .join()
-                .expect("CLI parser thread")
-        }
-    }
 
     fn parsed_work_ledger(cli: Cli) -> WorkLedgerCommand {
         match cli.command {
@@ -2844,6 +2881,38 @@ mod tests {
     }
 
     #[test]
+    fn zero_job_recovery_is_explicit_and_dry_run_by_default() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "runner",
+            "zero-job-recover",
+            "--pr",
+            "7882",
+            "--source-run-id",
+            "33439971439",
+        ])
+        .expect("bounded zero-job recovery");
+        let Command::Runner {
+            command:
+                RunnerCommand::ZeroJobRecover {
+                    repo,
+                    pr,
+                    source_run_id,
+                    min_age_minutes,
+                    apply,
+                },
+        } = cli.command
+        else {
+            panic!("expected zero-job recovery command");
+        };
+        assert_eq!(repo, "Generous-Corp/pulp");
+        assert_eq!(pr, 7882);
+        assert_eq!(source_run_id, 33_439_971_439);
+        assert_eq!(min_age_minutes, 45);
+        assert!(!apply);
+    }
+
+    #[test]
     fn work_ledger_import_is_dry_run_unless_apply_is_explicit() {
         let cli = Cli::try_parse_from(["shipyard", "work-ledger", "import"])
             .expect("work-ledger dry run");
@@ -2880,6 +2949,42 @@ mod tests {
                 "custody-receive",
                 "--peer",
                 "machine_untrusted",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn work_ledger_custody_inventory_cli_is_exact_and_has_no_host_argument() {
+        let message = format!("wm_{}", "a".repeat(64));
+        let inventory = Cli::try_parse_from([
+            "shipyard",
+            "--json",
+            "work-ledger",
+            "custody-inventory",
+            "--message",
+            &message,
+            "--correlation-hints",
+            "/owner-only/private.json",
+        ])
+        .expect("custody inventory exact CLI");
+        let WorkLedgerCommand::CustodyInventory(arguments) = parsed_work_ledger(inventory) else {
+            panic!("expected custody inventory command")
+        };
+        assert_eq!(arguments.message, message);
+        assert_eq!(
+            arguments.correlation_hints.as_deref(),
+            Some(Path::new("/owner-only/private.json"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "work-ledger",
+                "custody-inventory",
+                "--message",
+                &message,
+                "--host",
+                "current-machine",
             ])
             .is_err()
         );

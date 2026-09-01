@@ -3,12 +3,13 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::cloud::GitHubActions;
 use crate::custody_transport::{
     MAX_CUSTODY_WIRE_BYTES, handle_incoming_request, incoming_peer_evidence_from_environment,
-    load_custody_transport_policy,
+    load_custody_transport_policy, remote_custody_inventory,
 };
 use crate::daemon_ipc::read_daemon_status;
 use crate::output::write_pretty_json;
@@ -131,6 +132,49 @@ pub(super) fn work_ledger_command<W: Write>(
                     inventory.items.len(),
                     inventory.limit,
                     inventory.complete
+                )
+                .map_err(failure)?;
+            }
+        }
+        WorkLedgerCommand::CustodyInventory(arguments) => {
+            let message = &arguments.message;
+            let correlation_hints = &arguments.correlation_hints;
+            let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+            if runtime_paths != &production_paths {
+                return Err(CliFailure::new(
+                    1,
+                    "custody inventory is available only against canonical production roots",
+                ));
+            }
+            let policy = load_custody_transport_policy(
+                crate::identity::RuntimeMode::Shipyard,
+                runtime_paths.global_dir.clone(),
+            )
+            .map_err(|error| CliFailure::new(1, error))?
+            .ok_or_else(|| CliFailure::new(1, "custody transport is disabled"))?;
+            let hints = correlation_hints
+                .as_deref()
+                .map(read_correlation_hints)
+                .transpose()?;
+            let result = remote_custody_inventory(&policy, state_dir, message);
+            if json {
+                let mut rendered = serde_json::to_value(&result).map_err(failure)?;
+                if let (Some(hints), Some(object)) = (hints, rendered.as_object_mut()) {
+                    object.insert(
+                        "correlation_hints".to_owned(),
+                        serde_json::to_value(hints).map_err(failure)?,
+                    );
+                }
+                write_pretty_json(stdout, &rendered).map_err(failure)?;
+            } else {
+                let rendered = serde_json::to_value(&result).map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Custody inventory: {}",
+                    rendered
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .unwrap_or("refused")
                 )
                 .map_err(failure)?;
             }
@@ -658,6 +702,115 @@ fn ownership_custody_prepare_command<W: Write>(
         writeln!(stdout, "Generation: {}", rebind.ownership_lease_generation).map_err(failure)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+const MAX_CORRELATION_HINT_BYTES: u64 = 16 * 1024;
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CustodyCorrelationHints {
+    linear_workspace_id: String,
+    linear_root_uuid: String,
+    provider_repository_id: String,
+}
+
+#[cfg(not(unix))]
+fn read_correlation_hints(_path: &Path) -> Result<CustodyCorrelationHints, CliFailure> {
+    Err(CliFailure::new(
+        1,
+        "correlation hints owner-only access cannot be proven on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn read_correlation_hints(path: &Path) -> Result<CustodyCorrelationHints, CliFailure> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let metadata = std::fs::symlink_metadata(path).map_err(failure)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_CORRELATION_HINT_BYTES
+    {
+        return Err(CliFailure::new(
+            1,
+            "correlation hints must be a bounded regular file",
+        ));
+    }
+    if metadata.mode() & 0o077 != 0
+        || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+        || metadata.nlink() != 1
+    {
+        return Err(CliFailure::new(1, "correlation hints must be owner-only"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(failure)?;
+    let opened = file.metadata().map_err(failure)?;
+    if !opened.is_file()
+        || opened.len() != metadata.len()
+        || opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.uid() != nix::unistd::Uid::effective().as_raw()
+        || opened.nlink() != 1
+        || opened.mode() & 0o077 != 0
+    {
+        return Err(CliFailure::new(
+            1,
+            "correlation hints changed while opening",
+        ));
+    }
+    let mut encoded = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_CORRELATION_HINT_BYTES + 1)
+        .read_to_end(&mut encoded)
+        .map_err(failure)?;
+    if encoded.len() as u64 > MAX_CORRELATION_HINT_BYTES {
+        return Err(CliFailure::new(
+            1,
+            "correlation hints exceed the size bound",
+        ));
+    }
+    let after = file.metadata().map_err(failure)?;
+    if after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.uid() != opened.uid()
+        || after.nlink() != opened.nlink()
+        || after.mode() != opened.mode()
+        || after.len() != opened.len()
+        || after.mtime() != opened.mtime()
+        || after.mtime_nsec() != opened.mtime_nsec()
+        || after.ctime() != opened.ctime()
+        || after.ctime_nsec() != opened.ctime_nsec()
+    {
+        return Err(CliFailure::new(
+            1,
+            "correlation hints changed while reading",
+        ));
+    }
+    let hints: CustodyCorrelationHints = serde_json::from_slice(&encoded)
+        .map_err(|_| CliFailure::new(1, "correlation hints are malformed"))?;
+    for value in [&hints.linear_workspace_id, &hints.provider_repository_id] {
+        if value.is_empty()
+            || value.len() > 512
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+        {
+            return Err(CliFailure::new(1, "correlation hint identity is invalid"));
+        }
+    }
+    let root = hints.linear_root_uuid.as_bytes();
+    if root.len() != 36
+        || root.iter().enumerate().any(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte != b'-',
+            _ => !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase(),
+        })
+    {
+        return Err(CliFailure::new(1, "correlation hint root UUID is invalid"));
+    }
+    Ok(hints)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

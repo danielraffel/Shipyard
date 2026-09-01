@@ -755,6 +755,19 @@ auth_recover_generation_transaction() {{
   if [ -n "$auth_recovery_live_selector" ]; then
     :
   elif [ "$auth_recovery_selector_backed" = 1 ] && \
+       [ "$auth_recovery_phase" = anchor-select-intent ] && \
+       [ "$auth_recovery_original_kind" = direct ] && \
+       [ -L "$auth_recovery_wrapper.shipyard-generation" ]; then
+    # First migration publishes the anchor selector before replacing the
+    # legacy direct wrapper with the stable trampoline. Admit exactly that
+    # journaled selector-only boundary so recovery can restore the direct
+    # cohort rather than stranding the transaction.
+    auth_recovery_transition_target="$(/usr/bin/readlink "$auth_recovery_wrapper.shipyard-generation")"
+    test "$auth_recovery_transition_target" = "$auth_recovery_anchor_wrapper"
+    test -f "$auth_recovery_wrapper"; test ! -L "$auth_recovery_wrapper"
+    test "direct:$(/usr/bin/shasum -a 256 "$auth_recovery_wrapper" | /usr/bin/awk '{{print $1}}')" = "$auth_recovery_original_identity"
+    auth_recovery_live_selector="generation:$auth_recovery_transition_target"
+  elif [ "$auth_recovery_selector_backed" = 1 ] && \
        [ "$auth_recovery_phase" = target-select-intent ] && \
        [ -L "$auth_recovery_wrapper.shipyard-generation" ]; then
     # The selector is published before the stable public trampoline so direct
@@ -1326,7 +1339,16 @@ if [ "$auth_previous_wrapper_needs_anchor" = 1 ]; then
   fi
   auth_anchor_stage=
   auth_write_phase anchor-select-intent
-  auth_publish_generation_selection "$auth_wrapper" "$auth_anchor/ghapp"
+  # Publish the immutable selector before the stable regular-file trampoline.
+  # A legacy reader may already have opened the direct wrapper while this
+  # transaction replaces its pathname. Keeping the public entrypoint regular
+  # avoids making that reader's opened pathname fail the wrapper's no-symlink
+  # identity check; new readers immediately route through the anchor.
+  auth_publish_link "$auth_selector" "$auth_anchor/ghapp"
+  if [ "$auth_public_trampoline_active" = 0 ]; then
+    auth_publish_file "$auth_wrapper" "$auth_generation/ghapp.public-trampoline"
+    auth_public_trampoline_active=1
+  fi
   auth_write_phase anchor-selected
   auth_old_reader_cohort=
   # A direct-wrapper exec can cross the atomic selector rename before it is
