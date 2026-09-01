@@ -25,6 +25,7 @@ mod cloud_cmd;
 mod cloud_read_cmd;
 mod command_evidence_cmd;
 mod config_cmd;
+mod custody_cmd;
 mod daemon_cmd;
 mod dependency_cmd;
 mod doctor_cmd;
@@ -191,6 +192,7 @@ use self::cli::{
 use self::cloud_cmd::cloud_command;
 use self::command_evidence_cmd::{run_command_evidence, show_command_evidence};
 use self::config_cmd::config_command;
+use self::custody_cmd::custody_command;
 use self::daemon_cmd::daemon_command;
 use self::dependency_cmd::dependency_command;
 use self::doctor_cmd::doctor;
@@ -459,6 +461,16 @@ where
                 stdout,
             );
         }
+        Command::Custody { command } => {
+            return custody_command(
+                command,
+                cli.mode.into(),
+                &runtime_paths.global_dir,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
+        }
         command @ (Command::Init { .. }
         | Command::Changelog { .. }
         | Command::Branch { .. }
@@ -718,6 +730,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Ci { .. }
         | Command::Metrics { .. }
         | Command::Auth { .. }
+        | Command::Custody { .. }
         | Command::Init { .. }
         | Command::Changelog { .. }
         | Command::Branch { .. }

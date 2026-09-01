@@ -42,10 +42,16 @@ use crate::work_ledger::{
 };
 
 mod policy;
+mod readiness;
+mod setup;
 
 #[cfg(any(unix, test))]
 use policy::CustodyPeer;
 pub(crate) use policy::{CustodyTransportPolicy, load_custody_transport_policy};
+pub(crate) use setup::{
+    CustodySetupReport, disable as custody_disable, doctor as custody_doctor,
+    provision as custody_provision,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 const SUCCESSOR_SCHEMA_VERSION: u32 = 2;

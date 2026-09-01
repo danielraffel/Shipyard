@@ -89,6 +89,51 @@ visibility and planning, but Linear failure must never block execution, wake,
 repair routing, queue admission, or merge. Never project provider session IDs,
 credentials, private paths, or raw prompts.
 
+## Custody carrier setup and teardown
+
+Cross-machine custody stays default-off until the owner supplies the complete
+private host contract. Start with the no-write plan, apply only that exact
+manifest, and retain the returned policy digest:
+
+```bash
+shipyard --json custody provision --input /owner/private/custody.toml
+shipyard --json custody provision --input /owner/private/custody.toml --apply
+shipyard --json custody doctor
+```
+
+The manifest must be owner-only and contain both top-level
+`schema_version = 1` and `custody_transport.setup_contract_version = 1`.
+Doctor validates bounded include-expanded `/usr/sbin/sshd -T` output rather
+than scanning one config file: it requires `ExposeAuthInfo yes`, the exact
+`Subsystem shipyard-custody-v1 <receiver> --mode shipyard work-ledger
+custody-receive` argv, and an effective `AuthorizedKeysFile` that resolves to
+the configured path. Authorized-key checks accept OpenSSH options such as
+`restrict` but still bind the exact peer key. Each outbound private identity
+and inbound public key is directional and digest-pinned.
+
+SSH provisioning is not sufficient readiness. The same policy must bind valid
+owner-only destination-bootstrap, native-publication, and private-profile
+receipts for the exact machine, incarnation, route, and authority. Shipyard
+does not create or infer those prerequisites. Missing, unknown, legacy, stale,
+or mismatched setup evidence remains not-ready; migrate a legacy policy through
+supported exact-digest removal and reprovisioning, never manual TOML edits.
+
+Return the carrier to default-off through the supported dry-run/apply pair:
+
+```bash
+shipyard --json custody disable --policy-digest <doctor-policy-digest>
+shipyard --json custody disable --policy-digest <doctor-policy-digest> --apply
+shipyard --json custody doctor
+```
+
+Disable rereads the exact generation under the writer-domain lease, refuses
+while custody state is active or indeterminate, removes only the matching
+`[custody_transport]` table, preserves unrelated machine configuration and all
+append-only ledger history, and proves the disabled readback. It never deletes
+SSH keys, `authorized_keys`, `known_hosts`, or terminal custody receipts. See
+[`docs/durable-custody-transport.md`](../../docs/durable-custody-transport.md)
+for the full manifest and host-runbook boundary.
+
 ## First Steps
 
 1. Confirm the active repo and dirty state with `git status --short`.
