@@ -119,6 +119,11 @@ pub(super) fn database_effective_schema_version(state_dir: &Path) -> WorkLedgerR
     if wal_before.len == 0 {
         return Ok(Some(main_schema));
     }
+    if wal_before.len > MAX_SQLITE_SIDECAR_BYTES {
+        return Err(WorkLedgerError::Refused(format!(
+            "work ledger WAL exceeds the bounded schema-probe limit of {MAX_SQLITE_SIDECAR_BYTES} bytes"
+        )));
+    }
     let database_page_size = database_page_size(&database_header)?;
     let schema =
         committed_schema_from_wal(&mut wal, wal_before.len, main_schema, database_page_size)?;
@@ -193,10 +198,12 @@ fn committed_schema_from_wal(
     {
         wal.seek(SeekFrom::Start(offset))?;
         wal.read_exact(&mut frame_header)?;
+        // SQLite may reset and reuse a WAL without truncating its old physical
+        // tail. A salt or rolling-checksum disagreement terminates the valid
+        // current-generation prefix; bytes after that boundary are stale, not
+        // part of the logical WAL.
         if &frame_header[8..16] != salt {
-            return Err(WorkLedgerError::Refused(
-                "work ledger WAL frame salt is invalid".to_owned(),
-            ));
+            break;
         }
         let page_number = be_u32(&frame_header, 0)?;
         if page_number == 0 || page_number == u32::MAX {
@@ -208,9 +215,7 @@ fn committed_schema_from_wal(
         checksum = wal_checksum(&frame_header[..8], checksum_big_endian, checksum)?;
         checksum = wal_checksum(&page, checksum_big_endian, checksum)?;
         if checksum != [be_u32(&frame_header, 16)?, be_u32(&frame_header, 20)?] {
-            return Err(WorkLedgerError::Refused(
-                "work ledger WAL frame checksum is invalid".to_owned(),
-            ));
+            break;
         }
         if page_number == 1 {
             validate_database_page_header(&page, page_size)?;
@@ -229,11 +234,7 @@ fn committed_schema_from_wal(
         }
         offset += frame_size;
     }
-    if offset != wal_len {
-        return Err(WorkLedgerError::Refused(
-            "work ledger WAL has a truncated frame".to_owned(),
-        ));
-    }
+    // A partial final frame is likewise outside SQLite's valid frame prefix.
     Ok(schema)
 }
 
@@ -668,42 +669,160 @@ fn verify_inventory_schema(connection: &Connection) -> WorkLedgerResult<Inventor
 
 pub(super) fn verify_legacy_inventory_schema(connection: &Connection) -> WorkLedgerResult<()> {
     // Exact sqlite_schema object sets produced by Shipyard v0.139.1 schema v11.
-    // This binds table constraints, automatic/named indexes, and every trigger
-    // owned by each table, rather than trusting column metadata alone.
-    for table in [
-        "workstream_projection_bindings",
-        "work_items",
-        "agent_ownership",
-    ] {
+    // This is intentionally the complete schema-v11 manifest, not only the
+    // tables read directly by inventory. Publication migrates the whole ledger
+    // and then trusts policy, route, protected-object, continuation, import,
+    // adapter, delivery, and custody invariants. Every table, automatic/named
+    // index, constraint, and trigger therefore has to be authenticated first.
+    let actual_tables = connection
+        .prepare("SELECT DISTINCT tbl_name FROM sqlite_schema ORDER BY tbl_name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_tables = LEGACY_V11_SCHEMA_MANIFEST
+        .iter()
+        .map(|(table, _)| (*table).to_owned())
+        .collect::<Vec<_>>();
+    if actual_tables != expected_tables {
+        return Err(WorkLedgerError::Refused(
+            "schema v11 object inventory is missing, altered, or contains foreign objects"
+                .to_owned(),
+        ));
+    }
+    for (table, expected) in LEGACY_V11_SCHEMA_MANIFEST {
         let actual = schema_objects_digest(connection, table)?;
-        if !legacy_v11_schema_digest_allowed(table, &actual) {
+        let allowed = if *table == "workstream_projection_bindings" {
+            matches!(
+                actual.as_str(),
+                "93ad7a2dfb12e804a7589013803975e5f54a73eb413f5c999cfc24d34f512b52"
+                    | "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
+            )
+        } else {
+            actual == *expected
+        };
+        if !allowed {
             return Err(WorkLedgerError::Refused(format!(
-                "schema v11 inventory table {table} is missing or altered"
+                "schema v11 object set for {table} is missing or altered"
             )));
         }
     }
     Ok(())
 }
 
-fn legacy_v11_schema_digest_allowed(table: &str, actual: &str) -> bool {
-    match table {
-        // Both exact digests are released v0.139.1 representations of the
-        // same original v11 constraints/triggers. The second was observed on
-        // the governed M5 production ledger during the v0.142 canary.
-        "workstream_projection_bindings" => matches!(
-            actual,
-            "93ad7a2dfb12e804a7589013803975e5f54a73eb413f5c999cfc24d34f512b52"
-                | "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
-        ),
-        "work_items" => {
-            actual == "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9"
-        }
-        "agent_ownership" => {
-            actual == "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d"
-        }
-        _ => false,
-    }
-}
+const LEGACY_V11_SCHEMA_MANIFEST: &[(&str, &str)] = &[
+    (
+        "activation_epochs",
+        "5ed25cec7bdfd4913ce44eb39e9849978311d34f60e5f6d163552ec3b7a148fd",
+    ),
+    (
+        "adapter_registry",
+        "59764fdec7b777347b94e1125a793857905cc710c7ed78180d1dbd9a3a61aab5",
+    ),
+    (
+        "agent_ownership",
+        "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d",
+    ),
+    (
+        "continuation_contracts",
+        "9f6976425cbb06a36ffdc52cd8788b7c3e4c6502d578c014e6bbc4b4d35333ca",
+    ),
+    (
+        "custody_controls",
+        "a75a41e35ce99ac0cffd26661ea222e0aab47cc0aef82c55f568c3ce2103e5b0",
+    ),
+    (
+        "custody_effects",
+        "2c5b10b4f0c30dad20d612a2ba7b51749192d5d119325c273e967a3f79b5294b",
+    ),
+    (
+        "custody_events",
+        "96ff74461dd2c2e12b75e0938906b67154adc4858e89e7ca26245bee91b7038b",
+    ),
+    (
+        "custody_inbox",
+        "3d27f6ee672f9be9a350f1ae3326aea24d7138ab8ba28657eb4b62ee361a3663",
+    ),
+    (
+        "custody_inbox_claims",
+        "2f2b5d0eb9e7b15410474aca234541682ed4ef361d2301b6444d9aad388786f1",
+    ),
+    (
+        "custody_outbox",
+        "58776108fc676eda7fd76284e322a6fdd06906c7b6d9d86967f7cac21a47f99b",
+    ),
+    (
+        "custody_processed_acknowledgements",
+        "044d3f50e64c18a49e5e86d47e4e598293d789f6c920b3e95797db573faa80b4",
+    ),
+    (
+        "custody_rebinds",
+        "be92bb09004ef840165d2de5e72dab6e525c8066521fba180757e2cd9ab3585b",
+    ),
+    (
+        "custody_sender_claims",
+        "61a0f8b2d3690a0de3281040e33d553fb8e87e06b05fa7b5d090944b752c49ac",
+    ),
+    (
+        "custody_successor_rebinds",
+        "dcaf9f13d20c9f0f0b9ce3ff283576a1a5d5841bc1f08871eb2ef3a10b1ce79c",
+    ),
+    (
+        "events",
+        "4ccc356df6153ad9bcf6cce804d8de5ebedd76d63226adc270fc092068481690",
+    ),
+    (
+        "imports",
+        "b104e8365a7d17bd0ce8257c510da9af43f8aec349af34f8945add2738025c3c",
+    ),
+    (
+        "ledger_schema_identity",
+        "72257bf40fb374dd91eadeac9ee60cb24bf847d49daa542bf5025b9f6694cda7",
+    ),
+    (
+        "outbox",
+        "d2d1d289a7c5a2b6433dcb7be9e78d866bd0c121287ec670a1103a5445b19565",
+    ),
+    (
+        "projection_intents",
+        "c08bf11b61930305e070937531456cfd1c058df56e879bded9e4f3bc33443cec",
+    ),
+    (
+        "protected_objects",
+        "858ac7c24cf017c101f8f5318c4ecf354a839a4469ec6458cd0d02fbb80c272b",
+    ),
+    (
+        "provider_deliveries",
+        "9aa46de98feef623687cb2eef94c868e4cec11c3ce2ce9482b2d09071662e8a7",
+    ),
+    (
+        "provider_delivery_observations",
+        "4bc7270639d1ec95527c2caf53a4425a118f2177776122110f72a7afc9177924",
+    ),
+    (
+        "repo_policies",
+        "04b3cd4a480d6287b0231e048a89eb111af7cc787209503cafc57c60837a5696",
+    ),
+    (
+        "route_records",
+        "2c8951a5085ab7ae42e6a27786831d0e06d695ff6e5d2db1016843b70ad6b9e3",
+    ),
+    (
+        "wake_attempts",
+        "a553d438eb15c398bd01dd855343b6d29e309bd6ef0440cc3f97f240d1915177",
+    ),
+    (
+        "wake_claim_epochs",
+        "233ef3dbe2c386df3ea51f958e0df090c5b5bee0a08bea2cab6c99e914d1e78f",
+    ),
+    (
+        "work_items",
+        "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9",
+    ),
+    // The exact production representation is separately allowlisted above.
+    (
+        "workstream_projection_bindings",
+        "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8",
+    ),
+];
 
 pub(super) fn verify_legacy_custody_migration_schema(
     connection: &Connection,
@@ -1523,29 +1642,25 @@ mod tests {
 
         let error = local_work_inventory(state.path()).expect_err("schema drift must refuse");
 
-        assert!(error.to_string().contains("missing or altered"));
+        let message = error.to_string();
+        assert!(
+            message.contains("missing or altered")
+                || message.contains("object inventory is missing, altered, or contains foreign")
+        );
         #[cfg(unix)]
         assert_eq!(snapshot(state.path()), before);
     }
 
     #[test]
     fn gate_0b_1_live_v11_projection_representation_is_exactly_allowlisted() {
-        assert!(legacy_v11_schema_digest_allowed(
-            "workstream_projection_bindings",
-            "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
-        ));
-        assert!(legacy_v11_schema_digest_allowed(
-            "work_items",
-            "834d9274d49924d2ffc48b3f52be876af508876ac36bdb44e5238651eb2c9ce9"
-        ));
-        assert!(legacy_v11_schema_digest_allowed(
-            "agent_ownership",
-            "0935492203f50b3bd0ab767c5e376f4dfe5b94a264195fa1506c63c34738e30d"
-        ));
-        assert!(!legacy_v11_schema_digest_allowed(
-            "workstream_projection_bindings",
-            "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c80"
-        ));
+        assert_eq!(LEGACY_V11_SCHEMA_MANIFEST.len(), 28);
+        assert_eq!(
+            LEGACY_V11_SCHEMA_MANIFEST.last(),
+            Some(&(
+                "workstream_projection_bindings",
+                "c2e1484a34333c08343243eadc317c20b93172872be09fbf7fcc5820413ef2c8"
+            ))
+        );
     }
 
     #[test]
@@ -1670,6 +1785,21 @@ CHECK(length(workstream_handle) BETWEEN 1 AND 128)";
                      CREATE INDEX work_items_nonterminal ON work_items(phase, id);",
                 )
                 .expect("alter index");
+        });
+        assert_v11_schema_mutation_refuses("policy-constraint-drift", |connection| {
+            connection
+                .execute_batch("ALTER TABLE repo_policies ADD COLUMN unauthenticated_policy TEXT;")
+                .expect("alter policy schema");
+        });
+        assert_v11_schema_mutation_refuses("route-index-drift", |connection| {
+            connection
+                .execute_batch("CREATE INDEX unauthenticated_route ON route_records(work_item_id);")
+                .expect("alter route schema");
+        });
+        assert_v11_schema_mutation_refuses("foreign-schema-object", |connection| {
+            connection
+                .execute_batch("CREATE TABLE unauthenticated_table(value TEXT);")
+                .expect("add foreign table");
         });
     }
 

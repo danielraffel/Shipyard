@@ -2580,7 +2580,7 @@ pub(crate) mod tests {
         writer
             .execute_batch("PRAGMA wal_autocheckpoint = 0;")
             .expect("disable WAL autocheckpoint");
-        for index in 0..1_100 {
+        for index in 0..100 {
             writer
                 .execute(
                     "UPDATE work_items SET phase = ?1 WHERE id = ?2",
@@ -2595,7 +2595,7 @@ pub(crate) mod tests {
             std::fs::metadata(database.with_extension("sqlite3-wal"))
                 .expect("live WAL")
                 .len()
-                > super::super::inventory::MAX_SQLITE_SIDECAR_BYTES
+                < super::super::inventory::MAX_SQLITE_SIDECAR_BYTES
         );
         let before = state_tree_bytes(temp.path());
 
@@ -2656,12 +2656,90 @@ pub(crate) mod tests {
         );
 
         let wal_path = WorkLedger::path_at(temp.path()).with_extension("sqlite3-wal");
-        let mut corrupt_wal = std::fs::read(&wal_path).expect("v11 WAL bytes");
-        corrupt_wal[48] ^= 1;
-        std::fs::write(&wal_path, corrupt_wal).expect("corrupt frame checksum fixture");
+        let mut reset_tail = std::fs::read(&wal_path).expect("v11 WAL bytes");
+        reset_tail[48] ^= 1;
+        std::fs::write(&wal_path, reset_tail).expect("stale reset tail fixture");
+        assert_eq!(
+            super::super::inventory::database_effective_schema_version(temp.path())
+                .expect("invalid frame terminates current WAL prefix"),
+            Some(11)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_probe_refuses_oversized_sparse_wal_before_scanning() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        let writer =
+            rusqlite::Connection::open(WorkLedger::path_at(temp.path())).expect("v11 WAL writer");
+        writer
+            .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable WAL autocheckpoint");
+        writer
+            .execute(
+                "UPDATE work_items SET phase = 'managed' WHERE id = ?1",
+                [PublicationIdentities::legacy(&request).work_id],
+            )
+            .expect("commit WAL frame");
+        let wal_path = WorkLedger::path_at(temp.path()).with_extension("sqlite3-wal");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .expect("open WAL")
+            .set_len(super::super::inventory::MAX_SQLITE_SIDECAR_BYTES + 1)
+            .expect("make sparse oversized WAL");
+
         let error = super::super::inventory::database_effective_schema_version(temp.path())
-            .expect_err("checksum-invalid WAL must refuse schema routing");
-        assert!(error.to_string().contains("checksum is invalid"));
+            .expect_err("oversized WAL must refuse before parsing");
+        assert!(error.to_string().contains("bounded schema-probe limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_probe_ignores_stale_physical_tail_after_valid_wal_prefix() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        let writer =
+            rusqlite::Connection::open(WorkLedger::path_at(temp.path())).expect("v11 WAL writer");
+        writer
+            .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable WAL autocheckpoint");
+        writer
+            .execute(
+                "UPDATE work_items SET phase = 'managed' WHERE id = ?1",
+                [PublicationIdentities::legacy(&request).work_id],
+            )
+            .expect("commit current-generation WAL frame");
+        let wal_path = WorkLedger::path_at(temp.path()).with_extension("sqlite3-wal");
+        let mut wal = std::fs::read(&wal_path).expect("WAL bytes");
+        let page_size = u32::from_be_bytes(wal[8..12].try_into().expect("page-size bytes"));
+        let page_size = if page_size == 1 {
+            65_536_usize
+        } else {
+            usize::try_from(page_size).expect("page size")
+        };
+        let frame_size = 24_usize.checked_add(page_size).expect("frame size");
+        let first_frame = wal[32..32 + frame_size].to_vec();
+        let mut stale_frame = first_frame;
+        stale_frame[8] ^= 1;
+        wal.extend_from_slice(&stale_frame);
+        assert!(
+            wal.len()
+                < usize::try_from(super::super::inventory::MAX_SQLITE_SIDECAR_BYTES)
+                    .expect("sidecar limit")
+        );
+        std::fs::write(&wal_path, wal).expect("append stale reused-WAL tail");
+
+        assert_eq!(
+            super::super::inventory::database_effective_schema_version(temp.path())
+                .expect("valid current prefix with stale tail"),
+            Some(11)
+        );
     }
 
     #[cfg(unix)]

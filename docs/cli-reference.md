@@ -151,7 +151,7 @@ immutable, race-checked snapshot boundary as inventory; it does not migrate or
 open a WAL. When native publication encounters that released schema, dry-run
 returns a typed disposition for every bound row. Exactly one row must match the
 authenticated work ID, repository, PR, head, and workstream. Apply reacquires
-the exact snapshot under the exclusive writer domain, migrates without changing
+the exact snapshot under the exclusive writer domain, migrates schema 11 to
 schema 14, enriches only that row with immutable repository identity, and
 requires an exact reread/replay. Foreign lineage, ambiguous or changed
 snapshots, coordinate drift, and any unbound row refuse the operation.
