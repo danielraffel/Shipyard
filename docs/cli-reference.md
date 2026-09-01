@@ -58,6 +58,7 @@ shipyard metrics record --project pulp --job linux-arm64 --step compile --durati
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics summary --project pulp --json
+shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics slowest --project pulp --limit 20
 shipyard metrics watch --project pulp --since 14d --json
 shipyard metrics advise --project pulp --profile normal --json
@@ -473,9 +474,17 @@ and provider-neutral:
 - `shipyard metrics import tartci` imports JSON/JSONL from
   `tartci runtime export` when a project uses tartci VM lanes.
 
-The agent-facing queries are `summary`, `slowest`, `watch`, `advise`, and
-`compare`. Human tables are available by default; `--json` returns structured
-rows or findings for plugins, MCP tools, and monitoring agents.
+The agent-facing queries are `summary`, `scorecard`, `slowest`, `watch`,
+`advise`, and `compare`. `scorecard` returns one bounded project-level view of
+job outcomes (success, failure, and other terminal outcomes), worker-minutes,
+duration and queue percentiles, distinct-PR throughput, and cache reuse. It
+labels incomplete PR identity coverage as `partial` or `unavailable`, and
+does the same when worker-minute coverage lacks measured durations. It reports
+submit-to-receipt latency and model-token
+use as `unavailable` until those values have durable source telemetry; it never
+infers them from job duration. Human output is available by default; `--json`
+returns structured rows, findings, or the scorecard for plugins, MCP tools, and
+monitoring agents.
 
 `shipyard status` is intentionally limited to queue/target state and does not
 probe GitHub quota. Use `shipyard doctor --rate-limit` when you need to confirm

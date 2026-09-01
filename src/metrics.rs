@@ -90,6 +90,49 @@ pub struct MetricsFinding {
     pub recommended_actions: Vec<String>,
 }
 
+/// Compact, bounded stewardship scorecard. Fields that the metrics store does
+/// not yet capture are reported explicitly instead of inferred.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StewardshipScorecard {
+    pub project: String,
+    pub since_days: i64,
+    pub job_samples: usize,
+    pub successful_jobs: usize,
+    pub failed_jobs: usize,
+    pub other_jobs: usize,
+    pub failure_rate: Option<f64>,
+    pub worker_minutes: f64,
+    pub duration_samples: usize,
+    pub worker_minutes_coverage: ScorecardCoverage,
+    pub duration_p50_ms: Option<i64>,
+    pub duration_p90_ms: Option<i64>,
+    pub queue_samples: usize,
+    pub queue_p50_ms: Option<i64>,
+    pub queue_p90_ms: Option<i64>,
+    pub distinct_pull_requests: usize,
+    pub pull_requests_per_day: f64,
+    pub pull_request_throughput: ScorecardCoverage,
+    pub cache_samples: usize,
+    pub cache_hits: usize,
+    pub cache_hit_rate: Option<f64>,
+    pub submit_to_receipt: ScorecardCoverage,
+    pub model_token_use: ScorecardCoverage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ScorecardCoverage {
+    pub status: String,
+    pub reason: String,
+}
+
+type ScorecardSample = (
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
+
 impl MetricsStore {
     /// Open a metrics store under the selected Shipyard state directory.
     pub fn open(state_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
@@ -184,11 +227,59 @@ impl MetricsStore {
 
     /// Record one low-friction timing row.
     pub fn record(&self, input: &MetricRecordInput) -> Result<i64, Box<dyn std::error::Error>> {
+        self.record_with_refresh(input, false)
+    }
+
+    /// Record a terminal external observation, refreshing a prior partial row
+    /// with the same provider identity when necessary.
+    pub(crate) fn record_terminal_observation(
+        &self,
+        input: &MetricRecordInput,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        if input.completed_at.is_none() {
+            return Err("terminal metrics observation requires completed_at".into());
+        }
+        self.record_with_refresh(input, true)
+    }
+
+    fn record_with_refresh(
+        &self,
+        input: &MetricRecordInput,
+        refresh_existing: bool,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let conn = self.connect()?;
+        let completed_at = input.completed_at.unwrap_or_else(Utc::now);
+        let started_at = input
+            .started_at
+            .unwrap_or_else(|| completed_at - Duration::milliseconds(input.duration_ms.max(0)));
+        let measured_total_ms = measured_total_ms(input);
         if let Some(provider) = input.provider.as_deref()
             && let Some(existing) = existing_job_id(&conn, provider, input.external_id.as_deref())?
         {
+            if refresh_existing {
+                let machine_id = upsert_machine(
+                    &conn,
+                    input
+                        .host
+                        .as_deref()
+                        .or(input.runner.as_deref())
+                        .unwrap_or("unknown"),
+                    input.backend.as_deref().unwrap_or("unknown"),
+                    input.platform.as_deref(),
+                    None,
+                    input.runner.as_deref(),
+                )?;
+                refresh_existing_job(
+                    &conn,
+                    existing,
+                    machine_id,
+                    input,
+                    started_at,
+                    completed_at,
+                    measured_total_ms,
+                )?;
+            }
             return Ok(existing);
         }
         let machine_id = upsert_machine(
@@ -203,10 +294,6 @@ impl MetricsStore {
             None,
             input.runner.as_deref(),
         )?;
-        let completed_at = input.completed_at.unwrap_or_else(Utc::now);
-        let started_at = input
-            .started_at
-            .unwrap_or_else(|| completed_at - Duration::milliseconds(input.duration_ms.max(0)));
         let run_id = insert_run(
             &conn,
             &RunInsert {
@@ -238,8 +325,8 @@ impl MetricsStore {
                 queue_ms: None,
                 boot_ms: None,
                 setup_ms: None,
-                run_ms: Some(input.duration_ms),
-                total_ms: Some(input.duration_ms),
+                run_ms: measured_total_ms,
+                total_ms: measured_total_ms,
                 status: input.status.clone(),
                 exit_code: input.exit_code,
                 failure_class: input.failure_class.clone(),
@@ -403,6 +490,212 @@ impl MetricsStore {
         let rows = load_summary_inputs(&conn, Some(project))?;
         Ok(compare_findings(rows, split_days_ago))
     }
+
+    /// Return one compact historical scorecard without producing per-lane
+    /// findings or pretending absent telemetry was measured.
+    pub fn stewardship_scorecard(
+        &self,
+        project: &str,
+        since_days: i64,
+    ) -> Result<StewardshipScorecard, Box<dyn std::error::Error>> {
+        validate_scorecard_scope(project, since_days)?;
+        let conn = self.connect()?;
+        let window = Duration::try_days(since_days).ok_or("scorecard day window is too large")?;
+        let cutoff = Utc::now()
+            .checked_sub_signed(window)
+            .ok_or("scorecard day window is outside the timestamp range")?
+            .to_rfc3339();
+        let samples = load_scorecard_samples(&conn, project, &cutoff)?;
+        let successful_jobs = samples
+            .iter()
+            .filter(|(status, _, _, _, _)| is_success_status(status))
+            .count();
+        let failed_jobs = samples
+            .iter()
+            .filter(|(status, _, _, _, _)| is_failure_status(status))
+            .count();
+        let classified_jobs = successful_jobs + failed_jobs;
+        let other_jobs = samples.len().saturating_sub(classified_jobs);
+        let mut durations = samples
+            .iter()
+            .filter_map(|(_, duration, _, _, _)| *duration)
+            .filter(|value| *value >= 0)
+            .collect::<Vec<_>>();
+        durations.sort_unstable();
+        let worker_minutes_coverage = coverage_for_samples(
+            durations.len(),
+            samples.len(),
+            "completed job samples include measured duration",
+        );
+        let mut queues = samples
+            .iter()
+            .filter_map(|(_, _, queue, _, _)| *queue)
+            .filter(|value| *value >= 0)
+            .collect::<Vec<_>>();
+        queues.sort_unstable();
+        let distinct_pull_requests = samples
+            .iter()
+            .filter_map(|(_, _, _, repo, pr)| Some((repo.as_deref()?, (*pr)?)))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let identified_pull_request_samples = samples
+            .iter()
+            .filter(|(_, _, _, repo, pr)| repo.is_some() && pr.is_some())
+            .count();
+        let pull_request_throughput = if samples.is_empty() || identified_pull_request_samples == 0
+        {
+            ScorecardCoverage {
+                status: "unavailable".to_owned(),
+                reason: "no completed job samples include pull-request identity".to_owned(),
+            }
+        } else if identified_pull_request_samples == samples.len() {
+            ScorecardCoverage {
+                status: "available".to_owned(),
+                reason: "every completed job sample includes pull-request identity".to_owned(),
+            }
+        } else {
+            ScorecardCoverage {
+                status: "partial".to_owned(),
+                reason: format!(
+                    "{identified_pull_request_samples} of {} completed job samples include pull-request identity",
+                    samples.len()
+                ),
+            }
+        };
+        let cache = load_scorecard_cache_samples(&conn, project, &cutoff)?;
+        let cache_hits = cache.iter().filter(|hit| **hit).count();
+        let job_samples = samples.len();
+        Ok(StewardshipScorecard {
+            project: project.to_owned(),
+            since_days,
+            job_samples,
+            successful_jobs,
+            failed_jobs,
+            other_jobs,
+            failure_rate: ratio(failed_jobs, classified_jobs),
+            worker_minutes: worker_minutes(&durations),
+            duration_samples: durations.len(),
+            worker_minutes_coverage,
+            duration_p50_ms: percentile(&durations, 50),
+            duration_p90_ms: percentile(&durations, 90),
+            queue_samples: queues.len(),
+            queue_p50_ms: percentile(&queues, 50),
+            queue_p90_ms: percentile(&queues, 90),
+            distinct_pull_requests,
+            pull_requests_per_day: pull_requests_per_day(distinct_pull_requests, since_days),
+            pull_request_throughput,
+            cache_samples: cache.len(),
+            cache_hits,
+            cache_hit_rate: ratio(cache_hits, cache.len()),
+            submit_to_receipt: ScorecardCoverage {
+                status: "unavailable".to_owned(),
+                reason: "job metrics do not store durable submission and receipt timestamps"
+                    .to_owned(),
+            },
+            model_token_use: ScorecardCoverage {
+                status: "unavailable".to_owned(),
+                reason: "job metrics do not store model call or token counters".to_owned(),
+            },
+        })
+    }
+}
+
+fn validate_scorecard_scope(
+    project: &str,
+    since_days: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if project.trim().is_empty() || since_days <= 0 {
+        return Err("scorecard requires a project and positive day window".into());
+    }
+    Ok(())
+}
+
+fn is_success_status(status: &str) -> bool {
+    matches!(status, "pass" | "success")
+}
+
+fn is_failure_status(status: &str) -> bool {
+    matches!(
+        status,
+        "failure" | "failed" | "timed_out" | "action_required" | "startup_failure"
+    )
+}
+
+fn load_scorecard_samples(
+    conn: &Connection,
+    project: &str,
+    cutoff: &str,
+) -> Result<Vec<ScorecardSample>, rusqlite::Error> {
+    let mut statement = conn.prepare(
+        "SELECT job.status, job.total_ms, job.queue_ms, run.repo, run.pr
+           FROM jobs job JOIN runs run ON run.id = job.run_id
+          WHERE run.project = ?1 AND job.completed_at IS NOT NULL
+            AND julianday(job.completed_at) >= julianday(?2)
+          ORDER BY job.id",
+    )?;
+    statement
+        .query_map(params![project, cutoff], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect()
+}
+
+fn load_scorecard_cache_samples(
+    conn: &Connection,
+    project: &str,
+    cutoff: &str,
+) -> Result<Vec<bool>, rusqlite::Error> {
+    let mut statement = conn.prepare(
+        "SELECT step.cache_hit
+           FROM steps step
+           JOIN jobs job ON job.id = step.job_id
+           JOIN runs run ON run.id = job.run_id
+          WHERE run.project = ?1 AND job.completed_at IS NOT NULL
+            AND julianday(job.completed_at) >= julianday(?2)
+            AND step.cache_hit IS NOT NULL",
+    )?;
+    statement
+        .query_map(params![project, cutoff], |row| row.get(0))?
+        .collect()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn worker_minutes(durations: &[i64]) -> f64 {
+    durations
+        .iter()
+        .map(|duration| *duration as f64)
+        .sum::<f64>()
+        / 60_000.0
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn pull_requests_per_day(distinct_pull_requests: usize, since_days: i64) -> f64 {
+    distinct_pull_requests as f64 / since_days as f64
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ratio(numerator: usize, denominator: usize) -> Option<f64> {
+    (denominator != 0).then(|| numerator as f64 / denominator as f64)
+}
+
+fn coverage_for_samples(measured: usize, total: usize, description: &str) -> ScorecardCoverage {
+    let status = if measured == 0 {
+        "unavailable"
+    } else if measured == total {
+        "available"
+    } else {
+        "partial"
+    };
+    ScorecardCoverage {
+        status: status.to_owned(),
+        reason: format!("{measured} of {total} {description}"),
+    }
 }
 
 #[derive(Debug)]
@@ -565,6 +858,100 @@ fn existing_job_id(
         |row| row.get(0),
     )
     .optional()
+}
+
+fn refresh_existing_job(
+    conn: &Connection,
+    job_id: i64,
+    machine_id: i64,
+    input: &MetricRecordInput,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    measured_total_ms: Option<i64>,
+) -> Result<(), rusqlite::Error> {
+    let started_at = started_at.to_rfc3339();
+    let completed_at = completed_at.to_rfc3339();
+    conn.execute(
+        "UPDATE jobs
+            SET started_at = ?2, completed_at = ?3, run_ms = ?4, total_ms = ?4,
+                status = ?5, exit_code = COALESCE(?6, exit_code),
+                failure_class = COALESCE(?7, failure_class), machine_id = ?8,
+                target = COALESCE(?9, target), platform = COALESCE(?10, platform),
+                backend = COALESCE(?11, backend), provider = COALESCE(?12, provider)
+          WHERE id = ?1",
+        params![
+            job_id,
+            started_at,
+            completed_at,
+            measured_total_ms,
+            input.status,
+            input.exit_code,
+            input.failure_class,
+            machine_id,
+            input.target,
+            input.platform,
+            input.backend,
+            input.provider,
+        ],
+    )?;
+    conn.execute(
+        "UPDATE runs
+            SET ts = ?2, project = ?3, repo = COALESCE(?4, repo),
+                branch = COALESCE(?5, branch), sha = COALESCE(?6, sha),
+                pr = COALESCE(?7, pr), workflow = COALESCE(?8, workflow),
+                profile = COALESCE(?9, profile),
+                routing_decision = COALESCE(?10, routing_decision), status = ?11
+          WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
+        params![
+            job_id,
+            completed_at,
+            input.project,
+            input.repo,
+            input.branch,
+            input.sha,
+            input.pr,
+            input.workflow,
+            input.profile,
+            input.routing_decision,
+            input.status,
+        ],
+    )?;
+    let updated_steps = conn.execute(
+        "UPDATE steps
+            SET step = ?2, started_at = ?3, completed_at = ?4,
+                duration_ms = ?5, status = ?6
+          WHERE job_id = ?1",
+        params![
+            job_id,
+            input.step.as_deref().unwrap_or("total"),
+            started_at,
+            completed_at,
+            input.duration_ms,
+            input.status,
+        ],
+    )?;
+    if updated_steps == 0 {
+        insert_step(
+            conn,
+            job_id,
+            input.step.as_deref().unwrap_or("total"),
+            Some(&started_at),
+            Some(&completed_at),
+            input.duration_ms,
+            &input.status,
+        )?;
+    }
+    Ok(())
+}
+
+fn measured_total_ms(input: &MetricRecordInput) -> Option<i64> {
+    if input.step.as_deref() == Some("github_job")
+        && (input.started_at.is_none() || input.completed_at.is_none())
+    {
+        None
+    } else {
+        Some(input.duration_ms)
+    }
 }
 
 fn import_phases(
@@ -971,6 +1358,7 @@ pub fn github_job_to_record(
     repo: &str,
     workflow: Option<&str>,
     project: &str,
+    pr: Option<i64>,
     job: &GitHubRunJob,
 ) -> MetricRecordInput {
     let started_at = job
@@ -999,6 +1387,7 @@ pub fn github_job_to_record(
     MetricRecordInput {
         project: project.to_owned(),
         repo: Some(repo.to_owned()),
+        pr,
         workflow: workflow.map(str::to_owned),
         job: job.name.clone(),
         target: Some(job.name.clone()),
@@ -1035,6 +1424,87 @@ pub fn github_job_to_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insert_scorecard_sample(
+        store: &MetricsStore,
+        project: &str,
+        pr: i64,
+        status: &str,
+        total_ms: i64,
+        queue_ms: i64,
+        cache_hit: bool,
+    ) {
+        insert_scorecard_sample_at(
+            store,
+            project,
+            pr,
+            status,
+            total_ms,
+            queue_ms,
+            cache_hit,
+            Utc::now().to_rfc3339(),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_scorecard_sample_at(
+        store: &MetricsStore,
+        project: &str,
+        pr: i64,
+        status: &str,
+        total_ms: i64,
+        queue_ms: i64,
+        cache_hit: bool,
+        completed_at: String,
+    ) {
+        let conn = store.connect().expect("metrics connection");
+        let run_id = insert_run(
+            &conn,
+            &RunInsert {
+                ts: completed_at.clone(),
+                project: project.to_owned(),
+                repo: Some("danielraffel/Shipyard".to_owned()),
+                branch: Some("main".to_owned()),
+                sha: Some(format!("head-{pr}")),
+                pr: Some(pr),
+                workflow: Some("Build and Test".to_owned()),
+                profile: None,
+                routing_decision: None,
+                status: status.to_owned(),
+            },
+        )
+        .expect("insert run");
+        let job_id = insert_job(
+            &conn,
+            &JobInsert {
+                run_id,
+                machine_id: None,
+                job: format!("job-{pr}-{total_ms}"),
+                target: Some("test".to_owned()),
+                platform: Some("macos".to_owned()),
+                backend: Some("vm".to_owned()),
+                provider: Some("tart-macos".to_owned()),
+                queued_at: None,
+                started_at: None,
+                completed_at: Some(completed_at),
+                queue_ms: Some(queue_ms),
+                boot_ms: None,
+                setup_ms: None,
+                run_ms: Some(total_ms),
+                total_ms: Some(total_ms),
+                status: status.to_owned(),
+                exit_code: None,
+                failure_class: None,
+                external_id: None,
+            },
+        )
+        .expect("insert job");
+        conn.execute(
+            "INSERT INTO steps (job_id, step, duration_ms, status, cache_hit) VALUES (?1, 'build', ?2, ?3, ?4)",
+            params![job_id, total_ms, status, cache_hit],
+        )
+        .expect("insert cache sample");
+    }
 
     #[test]
     fn record_and_summary_round_trip() {
@@ -1077,5 +1547,341 @@ mod tests {
         assert_eq!(parse_duration_ms("42"), Ok(42));
         assert_eq!(parse_duration_ms("42ms"), Ok(42));
         assert_eq!(parse_duration_ms("1.5s"), Ok(1500));
+    }
+
+    #[test]
+    fn stewardship_scorecard_reports_empty_store_without_invented_telemetry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 14)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.job_samples, 0);
+        assert_eq!(scorecard.failure_rate, None);
+        assert!(scorecard.worker_minutes.abs() < f64::EPSILON);
+        assert_eq!(scorecard.duration_samples, 0);
+        assert_eq!(scorecard.worker_minutes_coverage.status, "unavailable");
+        assert_eq!(scorecard.duration_p50_ms, None);
+        assert_eq!(scorecard.queue_p90_ms, None);
+        assert_eq!(scorecard.cache_hit_rate, None);
+        assert_eq!(scorecard.pull_request_throughput.status, "unavailable");
+        assert_eq!(scorecard.submit_to_receipt.status, "unavailable");
+        assert_eq!(scorecard.model_token_use.status, "unavailable");
+    }
+
+    #[test]
+    fn stewardship_scorecard_aggregates_work_queue_pr_and_cache_history() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        // Insert out of duration and queue order: percentile calculation must
+        // not depend on row or completion order.
+        insert_scorecard_sample(&store, "shipyard", 41, "pass", 180_000, 1_000, true);
+        insert_scorecard_sample(&store, "shipyard", 41, "success", 60_000, 3_000, true);
+        insert_scorecard_sample(&store, "shipyard", 42, "failure", 120_000, 2_000, false);
+        insert_scorecard_sample(&store, "other", 99, "failure", 9_000_000, 90_000, false);
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.job_samples, 3);
+        assert_eq!(scorecard.successful_jobs, 2);
+        assert_eq!(scorecard.failed_jobs, 1);
+        assert_eq!(scorecard.other_jobs, 0);
+        assert_eq!(scorecard.failure_rate, Some(1.0 / 3.0));
+        assert!((scorecard.worker_minutes - 6.0).abs() < f64::EPSILON);
+        assert_eq!(scorecard.duration_samples, 3);
+        assert_eq!(scorecard.worker_minutes_coverage.status, "available");
+        assert_eq!(scorecard.duration_p50_ms, Some(120_000));
+        assert_eq!(scorecard.duration_p90_ms, Some(180_000));
+        assert_eq!(scorecard.queue_samples, 3);
+        assert_eq!(scorecard.queue_p50_ms, Some(2_000));
+        assert_eq!(scorecard.queue_p90_ms, Some(3_000));
+        assert_eq!(scorecard.distinct_pull_requests, 2);
+        assert!((scorecard.pull_requests_per_day - 1.0).abs() < f64::EPSILON);
+        assert_eq!(scorecard.pull_request_throughput.status, "available");
+        assert_eq!(scorecard.cache_samples, 3);
+        assert_eq!(scorecard.cache_hits, 2);
+        assert_eq!(scorecard.cache_hit_rate, Some(2.0 / 3.0));
+    }
+
+    #[test]
+    fn stewardship_scorecard_separates_nonfailure_outcomes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "success", 60_000, 1_000, true);
+        insert_scorecard_sample(&store, "shipyard", 42, "failure", 60_000, 1_000, false);
+        insert_scorecard_sample(&store, "shipyard", 43, "cancelled", 60_000, 1_000, false);
+        insert_scorecard_sample(&store, "shipyard", 44, "skipped", 60_000, 1_000, false);
+        insert_scorecard_sample(&store, "shipyard", 45, "neutral", 60_000, 1_000, false);
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.job_samples, 5);
+        assert_eq!(scorecard.successful_jobs, 1);
+        assert_eq!(scorecard.failed_jobs, 1);
+        assert_eq!(scorecard.other_jobs, 3);
+        assert_eq!(scorecard.failure_rate, Some(0.5));
+    }
+
+    #[test]
+    fn stewardship_scorecard_compares_offset_timestamps_chronologically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let within_window = Utc::now() - Duration::hours(23);
+        let pacific = chrono::FixedOffset::west_opt(7 * 60 * 60).expect("fixed offset");
+        insert_scorecard_sample_at(
+            &store,
+            "shipyard",
+            41,
+            "success",
+            60_000,
+            1_000,
+            true,
+            within_window.with_timezone(&pacific).to_rfc3339(),
+        );
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 1)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.job_samples, 1);
+        assert_eq!(scorecard.cache_samples, 1);
+    }
+
+    #[test]
+    fn stewardship_scorecard_rejects_ambiguous_scope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+
+        assert!(store.stewardship_scorecard("", 14).is_err());
+        assert!(store.stewardship_scorecard("shipyard", 0).is_err());
+        assert!(store.stewardship_scorecard("shipyard", -1).is_err());
+        assert!(store.stewardship_scorecard("shipyard", i64::MAX).is_err());
+    }
+
+    #[test]
+    fn stewardship_scorecard_marks_incomplete_pr_identity_coverage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "success", 60_000, 1_000, true);
+        insert_scorecard_sample(&store, "shipyard", 42, "success", 60_000, 1_000, true);
+        let conn = store.connect().expect("metrics connection");
+        conn.execute("UPDATE runs SET pr = NULL WHERE pr = 42", [])
+            .expect("remove one PR identity");
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.distinct_pull_requests, 1);
+        assert_eq!(scorecard.pull_request_throughput.status, "partial");
+        assert!(
+            scorecard
+                .pull_request_throughput
+                .reason
+                .starts_with("1 of 2")
+        );
+    }
+
+    #[test]
+    fn github_job_record_preserves_workflow_run_pr_identity() {
+        let job = GitHubRunJob {
+            id: 7,
+            run_id: Some(8),
+            run_attempt: Some(1),
+            name: "Build".to_owned(),
+            status: Some("completed".to_owned()),
+            conclusion: Some("success".to_owned()),
+            runner_name: None,
+            runner_group_name: None,
+            labels: None,
+            started_at: Some("2026-09-01T12:00:00Z".to_owned()),
+            completed_at: Some("2026-09-01T12:01:00Z".to_owned()),
+        };
+
+        let record = github_job_to_record(
+            "danielraffel/Shipyard",
+            Some("build.yml"),
+            "Shipyard",
+            Some(538),
+            &job,
+        );
+
+        assert_eq!(record.pr, Some(538));
+    }
+
+    #[test]
+    fn duplicate_external_job_refreshes_terminal_state_and_pr_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let external_id = Some("github:8/7/1".to_owned());
+        let first_id = store
+            .record(&MetricRecordInput {
+                project: "placeholder".to_owned(),
+                job: "Build".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                status: "in_progress".to_owned(),
+                external_id: external_id.clone(),
+                ..MetricRecordInput::default()
+            })
+            .expect("initial job");
+        let refreshed_id = store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                repo: Some("danielraffel/Shipyard".to_owned()),
+                pr: Some(538),
+                job: "Build".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                runner: Some("mac-runner".to_owned()),
+                host: Some("mac-runner".to_owned()),
+                step: Some("github_job".to_owned()),
+                duration_ms: 60_000,
+                status: "success".to_owned(),
+                external_id,
+                completed_at: Some(Utc::now()),
+                ..MetricRecordInput::default()
+            })
+            .expect("refreshed job");
+
+        assert_eq!(refreshed_id, first_id);
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 1)
+            .expect("scorecard");
+        assert_eq!(scorecard.job_samples, 1);
+        assert_eq!(scorecard.successful_jobs, 1);
+        assert_eq!(scorecard.distinct_pull_requests, 1);
+        assert_eq!(scorecard.pull_request_throughput.status, "available");
+        let conn = store.connect().expect("metrics connection");
+        let machine: String = conn
+            .query_row(
+                "SELECT machine.name FROM jobs job JOIN machines machine ON machine.id = job.machine_id WHERE job.id = ?1",
+                params![refreshed_id],
+                |row| row.get(0),
+            )
+            .expect("refreshed machine");
+        assert_eq!(machine, "mac-runner");
+        let step: (String, String, i64) = conn
+            .query_row(
+                "SELECT step, status, duration_ms FROM steps WHERE job_id = ?1",
+                params![refreshed_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("refreshed step");
+        assert_eq!(
+            step,
+            ("github_job".to_owned(), "success".to_owned(), 60_000)
+        );
+    }
+
+    #[test]
+    fn ordinary_duplicate_record_does_not_rewrite_terminal_history() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let external_id = Some("github:8/7/1".to_owned());
+        let completed_at = Utc::now() - Duration::days(30);
+        let first_id = store
+            .record(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                job: "Build".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                duration_ms: 60_000,
+                status: "success".to_owned(),
+                external_id: external_id.clone(),
+                completed_at: Some(completed_at),
+                ..MetricRecordInput::default()
+            })
+            .expect("initial job");
+        let duplicate_id = store
+            .record(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                job: "Build".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                status: "in_progress".to_owned(),
+                external_id,
+                ..MetricRecordInput::default()
+            })
+            .expect("duplicate job");
+
+        assert_eq!(duplicate_id, first_id);
+        assert_eq!(
+            store
+                .stewardship_scorecard("shipyard", 1)
+                .expect("scorecard")
+                .job_samples,
+            0
+        );
+    }
+
+    #[test]
+    fn scorecard_marks_worker_minutes_partial_when_a_duration_is_unmeasured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                repo: Some("danielraffel/Shipyard".to_owned()),
+                pr: Some(538),
+                job: "Conditional job".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                step: Some("github_job".to_owned()),
+                status: "skipped".to_owned(),
+                completed_at: Some(Utc::now()),
+                external_id: Some("github:8/9/1".to_owned()),
+                ..MetricRecordInput::default()
+            })
+            .expect("terminal job");
+        insert_scorecard_sample(&store, "shipyard", 539, "success", 60_000, 1_000, true);
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 1)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.job_samples, 2);
+        assert_eq!(scorecard.other_jobs, 1);
+        assert!((scorecard.worker_minutes - 1.0).abs() < f64::EPSILON);
+        assert_eq!(scorecard.duration_samples, 1);
+        assert_eq!(scorecard.duration_p50_ms, Some(60_000));
+        assert_eq!(scorecard.worker_minutes_coverage.status, "partial");
+    }
+
+    #[test]
+    fn stewardship_scorecard_scopes_pr_identity_by_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 42, "success", 60_000, 1_000, true);
+        insert_scorecard_sample(&store, "shipyard", 42, "success", 60_000, 1_000, true);
+        let conn = store.connect().expect("metrics connection");
+        conn.execute(
+            "UPDATE runs SET repo = 'another/repo' WHERE id = (SELECT MAX(id) FROM runs)",
+            [],
+        )
+        .expect("change second repository");
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 1)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.distinct_pull_requests, 2);
+        assert_eq!(scorecard.pull_request_throughput.status, "available");
+    }
+
+    #[test]
+    fn stewardship_scorecard_worker_minutes_cannot_overflow_i64() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "success", i64::MAX, 1_000, true);
+        insert_scorecard_sample(&store, "shipyard", 42, "success", i64::MAX, 1_000, true);
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 1)
+            .expect("scorecard");
+
+        assert!(scorecard.worker_minutes.is_finite());
+        assert!(scorecard.worker_minutes > worker_minutes(&[i64::MAX]));
     }
 }

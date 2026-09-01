@@ -1047,6 +1047,8 @@ pub(crate) enum MetricsCommand {
     Watch(MetricsWatchArgs),
     /// Emit agent-oriented placement advice.
     Advise(MetricsAdviseArgs),
+    /// Emit one compact stewardship scorecard with explicit telemetry gaps.
+    Scorecard(MetricsWatchArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -2634,6 +2636,29 @@ mod tests {
                 && (timeout - 42.0).abs() < f64::EPSILON
                 && (poll_interval - 0.25).abs() < f64::EPSILON
         ));
+    }
+
+    #[test]
+    fn metrics_scorecard_parses_project_and_bounded_history_window() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "metrics",
+            "scorecard",
+            "--project",
+            "pulp",
+            "--since",
+            "30d",
+        ])
+        .expect("metrics scorecard");
+
+        let Command::Metrics { command } = cli.command else {
+            panic!("expected metrics command");
+        };
+        let super::MetricsCommand::Scorecard(args) = *command else {
+            panic!("expected metrics scorecard command");
+        };
+        assert_eq!(args.project, "pulp");
+        assert_eq!(args.since, "30d");
     }
 
     #[test]

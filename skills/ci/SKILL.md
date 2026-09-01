@@ -155,6 +155,7 @@ identity; static labels and HerdR environment metadata do not grant authority.
 | Import recent GitHub Actions timing into runner metrics | `shipyard metrics import github --repo <owner/repo> --limit 20 --json` |
 | Import tartci VM timing into runner metrics | `tartci runtime export --repo <owner/repo> | shipyard metrics import tartci --json` |
 | Summarize runner timing history | `shipyard metrics summary --project <name> --json` |
+| Show one bounded stewardship scorecard | `shipyard metrics scorecard --project <name> --since 30d --json` |
 | Ask for agent-readable runner health findings | `shipyard metrics watch --project <name> --since 14d --json` |
 | Compare local vs GitHub runner timing | `shipyard metrics compare --project <name> --baseline github-hosted --candidate macstudio --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
@@ -322,12 +323,15 @@ Shipyard:
 tartci runtime export --repo Generous-Corp/pulp |
   shipyard metrics import tartci --json
 shipyard metrics summary --project pulp --json
+shipyard metrics scorecard --project pulp --since 30d --json
 ```
 
-The `summary`, `watch`, `advise`, and `compare` commands return structured JSON
-intended for agents. Treat insufficient-sample findings as "keep collecting",
-not as proof of a regression. Escalate only when the finding includes enough
-samples and a material delta for that repo/lane.
+The `summary`, `scorecard`, `watch`, `advise`, and `compare` commands return
+structured JSON intended for agents. `scorecard` is the concise project-level
+view; it reports telemetry that Shipyard does not collect as `unavailable`
+rather than inventing a value. Treat insufficient-sample findings as "keep
+collecting", not as proof of a regression. Escalate only when the finding
+includes enough samples and a material delta for that repo/lane.
 
 When debugging GitHub imports, remember that Shipyard invokes `gh api` with
 absolute `/repos/...` paths and forces `-X GET` when query parameters are passed

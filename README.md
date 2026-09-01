@@ -151,8 +151,10 @@ project will automatically recover or merge every PR.
 - **Agent-readable runner metrics.** `shipyard metrics` records local command
   timings, imports GitHub Actions jobs, and imports optional tartci VM timing
   exports into a small SQLite store. Agents can ask for summaries, drift
-  findings, and placement advice without requiring tartci or any observability
-  service.
+  findings, placement advice, or one compact stewardship scorecard without
+  requiring tartci or any observability service. The scorecard labels missing
+  submit-to-receipt and model-token telemetry as unavailable rather than
+  estimating it.
 
 See [exact-head changed-surface selection](docs/changed-surface-selection.md)
 for the base-owned schema, receipt fields, and hard-fail/fallback boundary.
