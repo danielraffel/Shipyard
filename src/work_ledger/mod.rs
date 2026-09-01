@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -106,6 +106,7 @@ pub(crate) use native_publication::tests::{
     policy as native_publication_test_policy, request as native_publication_test_request,
 };
 mod observation;
+mod ownership_lease;
 mod persistence;
 mod policy;
 mod projection_intents;
@@ -134,6 +135,9 @@ pub(crate) use native_publication::{
     verify_native_policy_binding, verify_native_policy_binding_for_repository,
 };
 pub use observation::ShadowPrTarget;
+#[cfg(test)]
+pub(crate) use ownership_lease::{OwnershipAdoptionProof, OwnershipLeaseFence};
+pub(crate) use ownership_lease::{OwnershipAdoptionResult, OwnershipLease, OwnershipLeaseHolder};
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
 pub use policy::RepoPolicy;
 pub(crate) use policy::validate_repo_policy;
@@ -148,6 +152,12 @@ use storage::{
     protect_database_file, protect_ledger_directory, schema_version, synchronous_name,
     validate_protected_storage, verify_integrity, verify_open_lineage, verify_supported_schema,
 };
+#[cfg(test)]
+use storage::{
+    reconstruct_authentic_v11_schema_for_test, reconstruct_authentic_v12_schema_for_test,
+};
+#[cfg(test)]
+pub(crate) use tests::ownership_lease_fixture;
 
 /// Error returned by a fail-closed work-ledger operation.
 #[derive(Debug)]

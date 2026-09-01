@@ -188,6 +188,7 @@ fn sample_route_labeled(
 }
 
 mod dispatch;
+pub(crate) use dispatch::ownership_lease_fixture;
 mod durable_custody;
 mod importer;
 mod lifecycle;

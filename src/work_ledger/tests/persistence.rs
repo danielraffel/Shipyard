@@ -397,6 +397,290 @@ fn v1_registry_migrates_transactionally_and_accepts_exact_agent_binding() {
 }
 
 #[test]
+fn gate_0b_3_v12_without_legacy_successor_authority_migrates_to_v13() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("create current ledger");
+    let connection = ledger.connect_read_write().expect("connection");
+    reconstruct_authentic_v12_schema_for_test(&connection).expect("authentic empty v12 schema");
+    drop(connection);
+    drop(ledger);
+
+    let migrated = WorkLedger::open(temp.path()).expect("empty v12 migrates");
+    let connection = migrated.connect_read_only().expect("inspect migration");
+    assert_eq!(
+        schema_version(&connection).expect("schema version"),
+        SCHEMA_VERSION
+    );
+    assert!(test_schema_object_exists(
+        &connection,
+        "table",
+        "ownership_leases"
+    ));
+    assert!(test_schema_object_exists(
+        &connection,
+        "table",
+        "custody_successor_events"
+    ));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Authentic paired v1 authority and atomic refusal stay auditable together.
+fn gate_0b_3_v12_effective_successor_authority_refuses_unsafe_v13_migration() {
+    #[derive(serde::Serialize)]
+    struct LegacyRebind<'a> {
+        rebind_id: &'a str,
+        message_id: &'a str,
+        identity_digest: &'a str,
+        workstream_revision: u64,
+        source_machine_ref: &'a str,
+        target_machine_ref: &'a str,
+        old_target_incarnation_ref: &'a str,
+        new_target_incarnation_ref: &'a str,
+        old_authority_epoch: u64,
+        new_authority_epoch: u64,
+        old_transfer_digest: &'a str,
+        old_custody_receipt_digest: &'a str,
+        new_target_route_ref: &'a str,
+        terminal_adapter: &'a str,
+        new_authority_digest: &'a str,
+        successor_proof_digest: &'a str,
+        rebind_digest: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct LegacyReceipt<'a> {
+        rebind_id: &'a str,
+        message_id: &'a str,
+        identity_digest: &'a str,
+        workstream_revision: u64,
+        target_machine_ref: &'a str,
+        new_target_incarnation_ref: &'a str,
+        new_authority_epoch: u64,
+        rebind_digest: &'a str,
+        successor_proof_digest: &'a str,
+        receipt_digest: &'a str,
+    }
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("create current ledger");
+    let connection = ledger.connect_read_write().expect("connection");
+    reconstruct_authentic_v12_schema_for_test(&connection)
+        .expect("authentic reconstructed v12 schema");
+    let message_id = opaque_ref("wm", "Gate0B.3 upgraded finalized message");
+    let identity_digest = digest(b"Gate0B.3 legacy identity");
+    let source_machine = opaque_ref("machine", "Gate0B.3 legacy source");
+    let target_machine = opaque_ref("machine", "Gate0B.3 legacy target");
+    let old_incarnation = opaque_ref("incarnation", "Gate0B.3 legacy old");
+    let new_incarnation = opaque_ref("incarnation", "Gate0B.3 legacy new");
+    let old_transfer = digest(b"Gate0B.3 legacy transfer");
+    let old_receipt = digest(b"Gate0B.3 legacy receipt");
+    let new_route = opaque_ref("route", "Gate0B.3 legacy route");
+    let new_authority = digest(b"Gate0B.3 legacy authority");
+    let proof = digest(b"Gate0B.3 legacy successor proof");
+    let rebind_digest = digest(
+        &serde_json::to_vec(&(
+            message_id.as_str(),
+            identity_digest.as_str(),
+            1_u64,
+            source_machine.as_str(),
+            target_machine.as_str(),
+            old_incarnation.as_str(),
+            new_incarnation.as_str(),
+            1_u64,
+            2_u64,
+            old_transfer.as_str(),
+            old_receipt.as_str(),
+            new_route.as_str(),
+            "cmux",
+            new_authority.as_str(),
+            proof.as_str(),
+        ))
+        .unwrap(),
+    );
+    let rebind_id = opaque_ref("cr", &rebind_digest);
+    let legacy_rebind = LegacyRebind {
+        rebind_id: &rebind_id,
+        message_id: &message_id,
+        identity_digest: &identity_digest,
+        workstream_revision: 1,
+        source_machine_ref: &source_machine,
+        target_machine_ref: &target_machine,
+        old_target_incarnation_ref: &old_incarnation,
+        new_target_incarnation_ref: &new_incarnation,
+        old_authority_epoch: 1,
+        new_authority_epoch: 2,
+        old_transfer_digest: &old_transfer,
+        old_custody_receipt_digest: &old_receipt,
+        new_target_route_ref: &new_route,
+        terminal_adapter: "cmux",
+        new_authority_digest: &new_authority,
+        successor_proof_digest: &proof,
+        rebind_digest: &rebind_digest,
+    };
+    let unsigned_receipt = LegacyReceipt {
+        rebind_id: &rebind_id,
+        message_id: &message_id,
+        identity_digest: &identity_digest,
+        workstream_revision: 1,
+        target_machine_ref: &target_machine,
+        new_target_incarnation_ref: &new_incarnation,
+        new_authority_epoch: 2,
+        rebind_digest: &rebind_digest,
+        successor_proof_digest: &proof,
+        receipt_digest: "",
+    };
+    let receipt_digest = digest(&serde_json::to_vec(&unsigned_receipt).unwrap());
+    let legacy_receipt = LegacyReceipt {
+        receipt_digest: &receipt_digest,
+        ..unsigned_receipt
+    };
+    connection
+        .execute(
+            "INSERT INTO custody_successor_rebinds
+             (rebind_id, message_id, side, rebind_json, rebind_digest, authority_epoch,
+              state, receipt_json, receipt_digest, created_at, updated_at)
+             VALUES (?1, ?2, 'sender', ?3, ?4, 2, 'acknowledged',
+                     ?5, ?6, ?7, ?7)",
+            params![
+                rebind_id,
+                message_id,
+                serde_json::to_vec(&legacy_rebind).unwrap(),
+                rebind_digest,
+                serde_json::to_vec(&legacy_receipt).unwrap(),
+                receipt_digest,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .expect("authentic v12 acknowledged successor row");
+    connection
+        .execute(
+            "INSERT INTO custody_successor_rebinds
+             (rebind_id, message_id, side, rebind_json, rebind_digest, authority_epoch,
+              state, receipt_json, receipt_digest, created_at, updated_at)
+             VALUES (?1, ?2, 'receiver', ?3, ?4, 2, 'committed', ?5, ?6, ?7, ?7)",
+            params![
+                rebind_id,
+                message_id,
+                serde_json::to_vec(&legacy_rebind).unwrap(),
+                rebind_digest,
+                serde_json::to_vec(&legacy_receipt).unwrap(),
+                receipt_digest,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .expect("authentic v12 committed receiver row");
+    drop(connection);
+    drop(ledger);
+
+    assert!(
+        WorkLedger::open(temp.path()).is_err(),
+        "paired legacy authority must be completed before v13 migration"
+    );
+    let connection = rusqlite::Connection::open(WorkLedger::path_at(temp.path()))
+        .expect("refused v12 remains inspectable");
+    assert_eq!(schema_version(&connection).expect("preserved schema"), 12);
+    let states: String = connection
+        .query_row(
+            "SELECT group_concat(side || ':' || state, ',')
+               FROM (SELECT side, state FROM custody_successor_rebinds
+                      WHERE rebind_id = ?1 ORDER BY side)",
+            [&rebind_id],
+            |row| row.get(0),
+        )
+        .expect("effective legacy authority remains exact");
+    assert_eq!(states, "receiver:committed,sender:acknowledged");
+    assert!(!test_schema_object_exists(
+        &connection,
+        "table",
+        "ownership_leases"
+    ));
+}
+
+#[test]
+fn gate_0b_3_direct_sql_cannot_forge_terminal_successor_or_history() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("ledger");
+    let connection = ledger.connect_read_write().expect("connection");
+    let rebind_id = opaque_ref("cr", "Gate0B.3 SQL fence");
+    let message_id = opaque_ref("wm", "Gate0B.3 SQL fence");
+    let rebind_digest = digest(b"Gate0B.3 SQL fence rebind");
+    let receipt_digest = digest(b"Gate0B.3 SQL fence receipt");
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO custody_successor_rebinds
+                 (rebind_id, message_id, side, rebind_json, rebind_digest, authority_epoch,
+                  state, receipt_json, receipt_digest, created_at, updated_at)
+                 VALUES (?1, ?2, 'sender', x'7b7d', ?3, 2, 'acknowledged',
+                         x'7b7d', ?4, ?5, ?5)",
+                params![
+                    rebind_id,
+                    message_id,
+                    rebind_digest,
+                    receipt_digest,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .is_err(),
+        "terminal successor cannot be inserted as sequence one"
+    );
+    connection
+        .execute(
+            "INSERT INTO custody_successor_rebinds
+             (rebind_id, message_id, side, rebind_json, rebind_digest, authority_epoch,
+              state, created_at, updated_at)
+             VALUES (?1, ?2, 'sender', x'7b7d', ?3, 2, 'prepared', ?4, ?4)",
+            params![
+                rebind_id,
+                message_id,
+                rebind_digest,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .expect("attacker stages a superficially prepared row");
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO custody_successor_events
+                 (rebind_id, side, sequence, from_state, to_state, evidence_digest, created_at)
+                 VALUES (?1, 'sender', 2, 'prepared', 'aborted', ?2, ?3)",
+                params![rebind_id, rebind_digest, Utc::now().to_rfc3339()],
+            )
+            .is_err(),
+        "history cannot be appended without the matching state transition"
+    );
+    let history: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM custody_successor_events WHERE rebind_id = ?1",
+            [&rebind_id],
+            |row| row.get(0),
+        )
+        .expect("history count");
+    assert_eq!(history, 1);
+    connection
+        .execute(
+            "UPDATE custody_successor_rebinds
+                SET receipt_json = x'7b7d', receipt_digest = ?2,
+                    state = 'acknowledged', updated_at = ?3
+              WHERE rebind_id = ?1 AND side = 'sender' AND state = 'prepared'",
+            params![rebind_id, receipt_digest, Utc::now().to_rfc3339()],
+        )
+        .expect("two-step SQL forge exercises the schema transition trigger");
+    let manufactured_history: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM custody_successor_events WHERE rebind_id = ?1",
+            [&rebind_id],
+            |row| row.get(0),
+        )
+        .expect("manufactured history count");
+    assert_eq!(manufactured_history, 2);
+    drop(connection);
+    drop(ledger);
+    assert!(
+        WorkLedger::open_existing(temp.path()).is_err(),
+        "canonical JSON, digest, receipt, and durable message binding reject the two-step forge"
+    );
+}
+
+#[test]
 fn v2_outbox_migrates_through_durable_attempts_and_claim_epochs() {
     let temp = TempDir::new().expect("temp");
     let ledger = WorkLedger::open(temp.path()).expect("create current ledger");

@@ -46,6 +46,7 @@ use policy::CustodyPeer;
 pub(crate) use policy::{CustodyTransportPolicy, load_custody_transport_policy};
 
 const SCHEMA_VERSION: u32 = 1;
+const SUCCESSOR_SCHEMA_VERSION: u32 = 2;
 pub(crate) const MAX_CUSTODY_WIRE_BYTES: u64 = 1024 * 1024;
 #[cfg(any(unix, test))]
 const MAX_BATCH: usize = 32;
@@ -57,9 +58,35 @@ pub(crate) enum CustodyTransportRequest {
         schema_version: u32,
         transfer: CustodyTransfer,
     },
+    #[serde(rename = "successor_rebind")]
+    LegacySuccessorRebind {
+        schema_version: u32,
+        rebind: serde_json::Value,
+    },
+    #[serde(rename = "successor_abort")]
+    LegacySuccessorAbort {
+        schema_version: u32,
+        rebind: serde_json::Value,
+    },
+    #[serde(rename = "successor_finalize")]
+    LegacySuccessorFinalize {
+        schema_version: u32,
+        receipt: serde_json::Value,
+    },
+    #[serde(rename = "successor_rebind_v2")]
     SuccessorRebind {
         schema_version: u32,
         rebind: CustodySuccessorRebind,
+    },
+    #[serde(rename = "successor_abort_v2")]
+    SuccessorAbort {
+        schema_version: u32,
+        rebind: CustodySuccessorRebind,
+    },
+    #[serde(rename = "successor_finalize_v2")]
+    SuccessorFinalize {
+        schema_version: u32,
+        receipt: CustodySuccessorReceipt,
     },
     Control {
         schema_version: u32,
@@ -78,9 +105,20 @@ pub(crate) enum CustodyTransportResponse {
         schema_version: u32,
         receipt: CustodyReceipt,
     },
-    SuccessorCommitted {
+    #[serde(rename = "successor_prepared_v2")]
+    SuccessorPrepared {
         schema_version: u32,
         receipt: CustodySuccessorReceipt,
+    },
+    #[serde(rename = "successor_finalized_v2")]
+    SuccessorFinalized {
+        schema_version: u32,
+        receipt_digest: String,
+    },
+    #[serde(rename = "successor_aborted_v2")]
+    SuccessorAborted {
+        schema_version: u32,
+        rebind_digest: String,
     },
     ControlApplied {
         schema_version: u32,
@@ -166,6 +204,7 @@ fn handle_incoming_request_inner(
     }
     let request: CustodyTransportRequest =
         serde_json::from_slice(input).map_err(|_| "custody-request-malformed".to_owned())?;
+    require_request_schema(&request)?;
     let ledger = WorkLedger::open_existing(state_dir)
         .map_err(|_| "custody-ledger-unavailable".to_owned())?
         .ok_or_else(|| "custody-ledger-absent".to_owned())?;
@@ -207,15 +246,8 @@ fn handle_incoming_request_inner(
             schema_version,
             rebind,
         } => {
-            require_schema(schema_version)?;
+            require_successor_schema(schema_version)?;
             require_local_mutation_authority(policy)?;
-            if rebind.new_authority_digest != policy.authority_digest
-                || rebind.successor_proof_digest != peer.successor_proof_digest
-                || rebind.new_target_route_ref != policy.local_route_ref
-                || rebind.terminal_adapter != policy.local_terminal_adapter
-            {
-                return Err("custody-successor-authority-mismatch".to_owned());
-            }
             let authenticated = authenticate_custody_successor_rebind(
                 &mut authenticator,
                 &evidence.peer_machine_ref,
@@ -227,13 +259,60 @@ fn handle_incoming_request_inner(
                     &authenticated,
                     &policy.local_machine_ref,
                     &policy.local_incarnation_ref,
-                    &peer.successor_proof_digest,
+                    &policy.local_route_ref,
+                    &policy.local_terminal_adapter,
+                    &policy.authority_digest,
                 )
                 .map_err(|_| "custody-successor-refused".to_owned())?;
-            Ok(CustodyTransportResponse::SuccessorCommitted {
-                schema_version: SCHEMA_VERSION,
+            Ok(CustodyTransportResponse::SuccessorPrepared {
+                schema_version: SUCCESSOR_SCHEMA_VERSION,
                 receipt,
             })
+        }
+        CustodyTransportRequest::SuccessorFinalize {
+            schema_version,
+            receipt,
+        } => {
+            require_successor_schema(schema_version)?;
+            require_local_mutation_authority(policy)?;
+            let authenticated = authenticate_custody_successor_receipt(
+                &mut authenticator,
+                &evidence.peer_machine_ref,
+                receipt.clone(),
+            )
+            .map_err(|_| "custody-successor-final-authentication-refused".to_owned())?;
+            ledger
+                .commit_custody_successor_rebind(&authenticated)
+                .map_err(|_| "custody-successor-final-refused".to_owned())?;
+            Ok(CustodyTransportResponse::SuccessorFinalized {
+                schema_version: SUCCESSOR_SCHEMA_VERSION,
+                receipt_digest: receipt.receipt_digest,
+            })
+        }
+        CustodyTransportRequest::SuccessorAbort {
+            schema_version,
+            rebind,
+        } => {
+            require_successor_schema(schema_version)?;
+            require_local_mutation_authority(policy)?;
+            let authenticated = authenticate_custody_successor_rebind(
+                &mut authenticator,
+                &evidence.peer_machine_ref,
+                rebind,
+            )
+            .map_err(|_| "custody-successor-abort-authentication-refused".to_owned())?;
+            let rebind_digest = ledger
+                .abort_expired_custody_successor_rebind(&authenticated, &policy.local_machine_ref)
+                .map_err(|_| "custody-successor-abort-refused".to_owned())?;
+            Ok(CustodyTransportResponse::SuccessorAborted {
+                schema_version: SUCCESSOR_SCHEMA_VERSION,
+                rebind_digest,
+            })
+        }
+        CustodyTransportRequest::LegacySuccessorRebind { .. }
+        | CustodyTransportRequest::LegacySuccessorAbort { .. }
+        | CustodyTransportRequest::LegacySuccessorFinalize { .. } => {
+            Err("custody-successor-schema-version-refused".to_owned())
         }
         CustodyTransportRequest::Control {
             schema_version,
@@ -511,28 +590,82 @@ fn reconcile_once<C: CustodyCarrier>(
         first_error.get_or_insert(error);
     }
     for rebind in ledger
+        .expired_prepared_custody_successor_rebinds(MAX_BATCH)
+        .map_err(map_ledger)?
+    {
+        let result = (|| {
+            let peer = peer(policy, &rebind.target_machine_ref)?;
+            let request = CustodyTransportRequest::SuccessorAbort {
+                schema_version: SUCCESSOR_SCHEMA_VERSION,
+                rebind: rebind.clone(),
+            };
+            let (response, _) = exchange(policy, peer, &request, carrier)?;
+            if matches!(
+                response,
+                CustodyTransportResponse::SuccessorAborted {
+                    schema_version: SUCCESSOR_SCHEMA_VERSION,
+                    ref rebind_digest,
+                } if rebind_digest == &rebind.rebind_digest
+            ) {
+                ledger
+                    .mark_custody_successor_aborted(&rebind.rebind_id, &rebind.rebind_digest)
+                    .map_err(map_ledger)
+            } else {
+                Err("custody-successor-abort-response-refused".to_owned())
+            }
+        })();
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    for rebind in ledger
         .pending_custody_successor_rebinds(MAX_BATCH)
         .map_err(map_ledger)?
     {
         let result = (|| {
             let peer = peer(policy, &rebind.target_machine_ref)?;
             let request = CustodyTransportRequest::SuccessorRebind {
-                schema_version: SCHEMA_VERSION,
+                schema_version: SUCCESSOR_SCHEMA_VERSION,
                 rebind,
             };
             let (response, witness) = exchange(policy, peer, &request, carrier)?;
-            if let CustodyTransportResponse::SuccessorCommitted { receipt, .. } = response {
+            if let CustodyTransportResponse::SuccessorPrepared {
+                schema_version: SUCCESSOR_SCHEMA_VERSION,
+                receipt,
+            } = response
+            {
                 ledger
                     .acknowledge_custody_successor_rebind(
                         &authenticate_custody_successor_receipt(
                             &mut WitnessAuthenticator::new(&peer.machine_ref, &witness),
                             &peer.machine_ref,
-                            receipt,
+                            receipt.clone(),
                         )
                         .map_err(map_ledger)?,
                     )
                     .map_err(map_ledger)?;
-                Ok(())
+                let final_request = CustodyTransportRequest::SuccessorFinalize {
+                    schema_version: SUCCESSOR_SCHEMA_VERSION,
+                    receipt: receipt.clone(),
+                };
+                let (final_response, _) = exchange(policy, peer, &final_request, carrier)?;
+                if matches!(
+                    final_response,
+                    CustodyTransportResponse::SuccessorFinalized {
+                        schema_version: SUCCESSOR_SCHEMA_VERSION,
+                        ref receipt_digest,
+                    } if receipt_digest == &receipt.receipt_digest
+                ) {
+                    ledger
+                        .mark_custody_successor_finalized(
+                            &receipt.rebind_id,
+                            &receipt.receipt_digest,
+                        )
+                        .map_err(map_ledger)?;
+                    Ok(())
+                } else {
+                    Err("custody-successor-final-response-refused".to_owned())
+                }
             } else {
                 Err("custody-successor-response-refused".to_owned())
             }
@@ -810,6 +943,34 @@ fn require_schema(version: u32) -> Result<(), String> {
         Ok(())
     } else {
         Err("custody-schema-version-refused".to_owned())
+    }
+}
+
+fn require_successor_schema(version: u32) -> Result<(), String> {
+    if version == SUCCESSOR_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err("custody-successor-schema-version-refused".to_owned())
+    }
+}
+
+fn require_request_schema(request: &CustodyTransportRequest) -> Result<(), String> {
+    match request {
+        CustodyTransportRequest::Transfer { schema_version, .. }
+        | CustodyTransportRequest::Control { schema_version, .. }
+        | CustodyTransportRequest::Processed { schema_version, .. } => {
+            require_schema(*schema_version)
+        }
+        CustodyTransportRequest::SuccessorRebind { schema_version, .. }
+        | CustodyTransportRequest::SuccessorAbort { schema_version, .. }
+        | CustodyTransportRequest::SuccessorFinalize { schema_version, .. } => {
+            require_successor_schema(*schema_version)
+        }
+        CustodyTransportRequest::LegacySuccessorRebind { .. }
+        | CustodyTransportRequest::LegacySuccessorAbort { .. }
+        | CustodyTransportRequest::LegacySuccessorFinalize { .. } => {
+            Err("custody-successor-schema-version-refused".to_owned())
+        }
     }
 }
 

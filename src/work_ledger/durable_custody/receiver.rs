@@ -206,6 +206,19 @@ impl WorkLedger {
                 "custody inbox message is not claimable".to_owned(),
             ));
         }
+        let prepared_successor: bool = tx.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM custody_successor_rebinds
+                WHERE message_id = ?1 AND side = 'receiver' AND state = 'prepared'
+             )",
+            [message_id],
+            |row| row.get(0),
+        )?;
+        if prepared_successor {
+            return Err(WorkLedgerError::Refused(
+                "custody inbox is pinned by a prepared successor".to_owned(),
+            ));
+        }
         let active: i64 = tx.query_row(
             "SELECT COUNT(*) FROM custody_inbox_claims WHERE message_id = ?1 AND state = 'active'",
             [message_id],

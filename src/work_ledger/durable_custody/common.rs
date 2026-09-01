@@ -28,9 +28,7 @@ pub(super) fn validate_persisted_processed_receipts(
     }
 
     let mut statement = connection.prepare(
-        "SELECT inbox.identity_json, inbox.target_machine_ref,
-                inbox.target_incarnation_ref, inbox.rebind_epoch,
-                inbox.transfer_digest, inbox.authority_digest, inbox.effect_digest,
+        "SELECT inbox.identity_json, inbox.target_machine_ref, inbox.effect_digest,
                 inbox.processed_receipt_digest, inbox.processed_receipt_json
            FROM custody_inbox inbox WHERE inbox.state = 'processed'",
     )?;
@@ -39,30 +37,17 @@ pub(super) fn validate_persisted_processed_receipts(
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, Vec<u8>>(8)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
         ))
     })?;
     for row in rows {
-        let (
-            identity_json,
-            machine,
-            incarnation,
-            epoch,
-            transfer,
-            authority,
-            effect,
-            receipt_digest,
-            receipt_json,
-        ) = row?;
+        let (identity_json, machine, effect, receipt_digest, receipt_json) = row?;
         let envelope: CustodyEnvelope = serde_json::from_slice(&identity_json).map_err(|_| {
             WorkLedgerError::Refused("stored custody envelope is invalid".to_owned())
         })?;
         envelope.validate()?;
+        let active = super::active_inbox_binding(connection, &envelope.message_id)?;
         let receipt: ProcessedReceipt = serde_json::from_slice(&receipt_json).map_err(|_| {
             WorkLedgerError::Refused("stored processed receipt is invalid".to_owned())
         })?;
@@ -83,10 +68,10 @@ pub(super) fn validate_persisted_processed_receipts(
             || receipt.workstream_revision != envelope.workstream_revision
             || receipt.effect_digest != effect
             || receipt.target_machine_ref != machine
-            || receipt.target_incarnation_ref != incarnation
-            || receipt.rebind_epoch != positive_u64("inbox rebind epoch", epoch)?
-            || receipt.transfer_digest != transfer
-            || receipt.authority_digest != authority
+            || receipt.target_incarnation_ref != active.incarnation
+            || receipt.rebind_epoch != active.epoch
+            || receipt.transfer_digest != active.transfer_digest
+            || receipt.authority_digest != active.authority_digest
             || claim_exists != 1
         {
             return Err(WorkLedgerError::Refused(
@@ -486,6 +471,25 @@ pub(super) fn validate_receipt(receipt: &CustodyReceipt) -> WorkLedgerResult<()>
     Ok(())
 }
 
+fn validate_successor_lease_binding(rebind: &CustodySuccessorRebind) -> WorkLedgerResult<()> {
+    validate_digest("custody successor proof", &rebind.successor_proof_digest)?;
+    validate_opaque_ref(
+        "custody successor ownership lease",
+        &rebind.ownership_lease_id,
+        "ol",
+    )?;
+    validate_opaque_ref(
+        "custody successor holder",
+        &rebind.successor_holder_ref,
+        "owner",
+    )?;
+    validate_opaque_ref(
+        "custody successor holder session",
+        &rebind.successor_session_incarnation_ref,
+        "incarnation",
+    )
+}
+
 pub(super) fn validate_successor_rebind(rebind: &CustodySuccessorRebind) -> WorkLedgerResult<()> {
     validate_opaque_ref("custody successor rebind", &rebind.rebind_id, "cr")?;
     validate_opaque_ref("custody successor message", &rebind.message_id, "wm")?;
@@ -520,11 +524,22 @@ pub(super) fn validate_successor_rebind(rebind: &CustodySuccessorRebind) -> Work
         "old custody successor receipt",
         &rebind.old_custody_receipt_digest,
     )?;
-    validate_digest("custody successor proof", &rebind.successor_proof_digest)?;
+    validate_successor_lease_binding(rebind)?;
     if rebind.workstream_revision == 0
         || rebind.old_authority_epoch == 0
+        || rebind.ownership_lease_generation == 0
         || rebind.new_authority_epoch != rebind.old_authority_epoch.saturating_add(1)
-        || rebind.old_target_incarnation_ref == rebind.new_target_incarnation_ref
+        || rebind.pull_request == 0
+        || rebind.ownership_root_uuid.len() != 36
+        || rebind.repository_provider.is_empty()
+        || rebind.repository_id.is_empty()
+        || !super::super::is_canonical_repo_slug(&rebind.repository)
+        || rebind.exact_head.len() != 40
+        || rebind
+            .exact_head
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        || rebind.workstream_handle.is_empty()
     {
         return Err(WorkLedgerError::Refused(
             "custody successor epochs or incarnations are invalid".to_owned(),
@@ -546,6 +561,20 @@ pub(super) fn validate_successor_rebind(rebind: &CustodySuccessorRebind) -> Work
             rebind.new_target_route_ref.as_str(),
             rebind.terminal_adapter.as_str(),
             rebind.new_authority_digest.as_str(),
+            (
+                rebind.ownership_lease_id.as_str(),
+                rebind.ownership_lease_generation,
+                rebind.ownership_lease_expires_at.to_rfc3339(),
+                rebind.ownership_root_uuid.as_str(),
+                rebind.repository_provider.as_str(),
+                rebind.repository_id.as_str(),
+                rebind.repository.as_str(),
+                rebind.pull_request,
+                rebind.exact_head.as_str(),
+                rebind.workstream_handle.as_str(),
+                rebind.successor_holder_ref.as_str(),
+                rebind.successor_session_incarnation_ref.as_str(),
+            ),
             rebind.successor_proof_digest.as_str(),
         ))
         .map_err(|_| {

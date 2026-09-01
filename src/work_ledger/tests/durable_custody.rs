@@ -148,7 +148,7 @@ fn delivered_fixture(label: &str) -> DeliveredFixture {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn accepted_custody_rebinds_to_authenticated_successor_after_restart() {
+fn gate_0b_3_accepted_custody_uses_two_phase_authenticated_successor_commit() {
     let delivered = delivered_fixture("successor recovery");
     let new_incarnation = opaque_ref("incarnation", "m5 daemon successor");
     let new_authority = digest(b"successor mutation authority");
@@ -156,7 +156,7 @@ fn accepted_custody_rebinds_to_authenticated_successor_after_restart() {
     let rebind = delivered
         .source
         .ledger
-        .prepare_custody_successor_rebind(
+        .prepare_custody_successor_rebind_for_test(
             &delivered.source.envelope.message_id,
             &delivered.transfer.target_incarnation_ref,
             &new_incarnation,
@@ -164,6 +164,7 @@ fn accepted_custody_rebinds_to_authenticated_successor_after_restart() {
             "herdr",
             &new_authority,
             &successor_proof,
+            Utc::now() + ChronoDuration::seconds(1),
         )
         .expect("durably prepare successor");
     drop(delivered.source.ledger);
@@ -182,9 +183,11 @@ fn accepted_custody_rebinds_to_authenticated_successor_after_restart() {
             &authenticated,
             &delivered.transfer.target_machine_ref,
             &new_incarnation,
-            &successor_proof,
+            &rebind.new_target_route_ref,
+            &rebind.terminal_adapter,
+            &rebind.new_authority_digest,
         )
-        .expect("destination commits successor custody");
+        .expect("destination prepares successor custody");
     assert_eq!(
         delivered
             .receiver
@@ -192,7 +195,9 @@ fn accepted_custody_rebinds_to_authenticated_successor_after_restart() {
                 &authenticated,
                 &delivered.transfer.target_machine_ref,
                 &new_incarnation,
-                &successor_proof,
+                &rebind.new_target_route_ref,
+                &rebind.terminal_adapter,
+                &rebind.new_authority_digest,
             )
             .expect("lost successor receipt replay"),
         successor_receipt
@@ -202,7 +207,7 @@ fn accepted_custody_rebinds_to_authenticated_successor_after_restart() {
         .expect("receiver reopen")
         .expect("successor commit survives restart");
     source
-        .acknowledge_custody_successor_rebind(
+        .acknowledge_custody_successor_rebind_for_test(
             &authenticate_custody_successor_receipt(
                 &mut TestAuthenticator,
                 &delivered.transfer.target_machine_ref,
@@ -212,15 +217,49 @@ fn accepted_custody_rebinds_to_authenticated_successor_after_restart() {
         )
         .expect("source commits successor acknowledgement");
     source
-        .acknowledge_custody_successor_rebind(
+        .acknowledge_custody_successor_rebind_for_test(
             &authenticate_custody_successor_receipt(
                 &mut TestAuthenticator,
                 &delivered.transfer.target_machine_ref,
-                successor_receipt,
+                successor_receipt.clone(),
             )
             .expect("authenticate replay"),
         )
         .expect("source acknowledgement replay is idempotent");
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    assert_eq!(
+        receiver
+            .accept_custody_successor_rebind(
+                &authenticated,
+                &delivered.transfer.target_machine_ref,
+                &new_incarnation,
+                &rebind.new_target_route_ref,
+                &rebind.terminal_adapter,
+                &rebind.new_authority_digest,
+            )
+            .expect("expired exact receiver replay returns its durable receipt"),
+        successor_receipt
+    );
+    source
+        .acknowledge_custody_successor_rebind_for_test(
+            &authenticate_custody_successor_receipt(
+                &mut TestAuthenticator,
+                &delivered.transfer.target_machine_ref,
+                successor_receipt.clone(),
+            )
+            .expect("authenticate expired acknowledgement replay"),
+        )
+        .expect("expired exact source replay remains idempotent");
+    receiver
+        .commit_custody_successor_rebind(
+            &authenticate_custody_successor_receipt(
+                &mut TestAuthenticator,
+                &delivered.source.envelope.source_machine_ref,
+                successor_receipt,
+            )
+            .expect("authenticate source finalization"),
+        )
+        .expect("receiver commits only after source acknowledgement");
     assert!(
         receiver
             .accept_custody(
@@ -257,25 +296,63 @@ fn accepted_custody_rebinds_to_authenticated_successor_after_restart() {
     let processed = receiver
         .apply_custody_effect(
             &claim,
-            &InboxAuthority::new(11, new_incarnation, new_authority).expect("successor authority"),
+            &InboxAuthority::new(11, new_incarnation.clone(), new_authority.clone())
+                .expect("successor authority"),
             &digest(b"successor effect"),
             |_| Ok(()),
         )
         .expect("successor applies one effect");
+    drop(receiver);
+    let receiver = WorkLedger::open_existing(delivered.receiver_temp.path())
+        .expect("processed successor receiver reopen")
+        .expect("processed successor receipt validates against effective binding");
+    let pending = receiver
+        .processed_custody_receipts(1)
+        .expect("processed successor receipt remains sendable after reopen");
+    assert_eq!(
+        pending,
+        vec![(
+            processed.clone(),
+            delivered.source.envelope.source_machine_ref.clone()
+        )]
+    );
+    assert_eq!(
+        receiver
+            .apply_custody_effect(
+                &claim,
+                &InboxAuthority::new(11, new_incarnation.clone(), new_authority.clone(),)
+                    .expect("successor replay authority"),
+                &digest(b"successor effect"),
+                |_| panic!("processed successor replay cannot apply twice"),
+            )
+            .expect("processed successor replay returns canonical receipt"),
+        processed
+    );
     source
         .acknowledge_remote_processed(
             &authenticate_processed_receipt(
                 &mut TestAuthenticator,
                 &delivered.transfer.target_machine_ref,
-                processed,
+                processed.clone(),
             )
             .expect("authenticate processed receipt"),
         )
         .expect("source closes retained custody");
+    receiver
+        .acknowledge_processed_delivery(&processed, &delivered.source.envelope.source_machine_ref)
+        .expect("receiver records processed delivery acknowledgement");
+    receiver
+        .acknowledge_processed_delivery(&processed, &delivered.source.envelope.source_machine_ref)
+        .expect("processed delivery acknowledgement replay is idempotent");
+    drop(receiver);
+    WorkLedger::open_existing(delivered.receiver_temp.path())
+        .expect("acknowledged processed successor reopen")
+        .expect("acknowledged processed successor remains valid");
 }
 
 #[test]
-fn successor_rebind_and_consumer_claim_are_race_fenced() {
+#[allow(clippy::too_many_lines)] // One Gate 0B.3 claim-versus-finalization race proof.
+fn gate_0b_3_successor_rebind_and_consumer_claim_are_race_fenced() {
     let delivered = delivered_fixture("successor claim race");
     let old_claim = delivered
         .receiver
@@ -290,7 +367,7 @@ fn successor_rebind_and_consumer_claim_are_race_fenced() {
     let rebind = delivered
         .source
         .ledger
-        .prepare_custody_successor_rebind(
+        .prepare_custody_successor_rebind_for_test(
             &delivered.source.envelope.message_id,
             &delivered.transfer.target_incarnation_ref,
             &new_incarnation,
@@ -298,12 +375,13 @@ fn successor_rebind_and_consumer_claim_are_race_fenced() {
             "cmux",
             &digest(b"new authority"),
             &successor_proof,
+            Utc::now() + ChronoDuration::minutes(5),
         )
         .expect("prepare successor");
     let authenticated = authenticate_custody_successor_rebind(
         &mut TestAuthenticator,
         &delivered.source.envelope.source_machine_ref,
-        rebind,
+        rebind.clone(),
     )
     .expect("authenticate successor");
     assert!(
@@ -313,7 +391,9 @@ fn successor_rebind_and_consumer_claim_are_race_fenced() {
                 &authenticated,
                 &delivered.transfer.target_machine_ref,
                 &new_incarnation,
-                &successor_proof,
+                &rebind.new_target_route_ref,
+                &rebind.terminal_adapter,
+                &rebind.new_authority_digest,
             )
             .is_err(),
         "an active old consumer wins the first race"
@@ -332,15 +412,51 @@ fn successor_rebind_and_consumer_claim_are_race_fenced() {
             ],
         )
         .expect("simulate offline old daemon");
-    delivered
+    let receipt = delivered
         .receiver
         .accept_custody_successor_rebind(
             &authenticated,
             &delivered.transfer.target_machine_ref,
             &new_incarnation,
-            &successor_proof,
+            &rebind.new_target_route_ref,
+            &rebind.terminal_adapter,
+            &rebind.new_authority_digest,
         )
-        .expect("expired old consumer permits successor commit");
+        .expect("expired old consumer permits successor prepare");
+    assert!(
+        delivered
+            .receiver
+            .claim_custody_inbox(
+                &delivered.source.envelope.message_id,
+                &opaque_ref("owner", "late old consumer"),
+                Utc::now() + ChronoDuration::minutes(1),
+            )
+            .is_err(),
+        "receiver prepare pins the old consumer boundary until final commit"
+    );
+    delivered
+        .source
+        .ledger
+        .acknowledge_custody_successor_rebind_for_test(
+            &authenticate_custody_successor_receipt(
+                &mut TestAuthenticator,
+                &delivered.transfer.target_machine_ref,
+                receipt.clone(),
+            )
+            .expect("authenticate prepared receipt"),
+        )
+        .expect("source acknowledges successor");
+    delivered
+        .receiver
+        .commit_custody_successor_rebind(
+            &authenticate_custody_successor_receipt(
+                &mut TestAuthenticator,
+                &delivered.source.envelope.source_machine_ref,
+                receipt,
+            )
+            .expect("authenticate source finalization"),
+        )
+        .expect("receiver finalizes successor");
     assert!(
         delivered
             .receiver
