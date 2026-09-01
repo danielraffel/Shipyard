@@ -681,15 +681,167 @@ fn pull_request_transport_preserves_fresh_queue_position() {
 
 #[cfg(unix)]
 #[test]
-fn merge_queue_transport_refuses_partial_snapshot() {
+fn merge_queue_transport_paginates_beyond_one_hundred_entries() {
+    let temp = tempfile::tempdir().expect("temp");
+    let nodes = |range: std::ops::RangeInclusive<u64>| {
+        range
+            .map(|number| {
+                serde_json::json!({
+                    "position": number,
+                    "enqueuedAt": "2026-09-01T00:00:00Z",
+                    "headCommit": {"oid": format!("{number:040x}")},
+                    "pullRequest": {"number": number}
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let first_page = temp.path().join("first.json");
+    let second_page = temp.path().join("second.json");
+    fs::write(
+        &first_page,
+        serde_json::to_vec(&serde_json::json!({
+            "data": {"repository": {"mergeQueue": {"entries": {
+                "nodes": nodes(1..=100),
+                "pageInfo": {"hasNextPage": true, "endCursor": "cursor-100"}
+            }}}}
+        }))
+        .expect("first page"),
+    )
+    .expect("write first page");
+    fs::write(
+        &second_page,
+        serde_json::to_vec(&serde_json::json!({
+            "data": {"repository": {"mergeQueue": {"entries": {
+                "nodes": nodes(101..=102),
+                "pageInfo": {"hasNextPage": false, "endCursor": "cursor-102"}
+            }}}}
+        }))
+        .expect("second page"),
+    )
+    .expect("write second page");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+if test "$#" -eq 10; then
+  cat '{}'
+elif test "$#" -eq 12 && test "${{11}}" = -F && test "${{12}}" = cursor=cursor-100; then
+  cat '{}'
+else
+  echo "unexpected pagination call: $*" >&2
+  exit 2
+fi
+"#,
+            first_page.display(),
+            second_page.display()
+        ),
+    );
+
+    let (enabled, positions, heads, enqueued) =
+        merge_queue_snapshot(&actions, "owner/repo", "main").expect("complete snapshot");
+    assert!(enabled);
+    assert_eq!(positions.len(), 102);
+    assert_eq!(positions.get(&101), Some(&101));
+    assert_eq!(heads.get(&102), Some(&format!("{:040x}", 102)));
+    assert_eq!(enqueued.len(), 102);
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_page_overlap() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(
         &temp,
-        r#"printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}}'"#,
+        r#"
+if test "$#" -eq 10; then
+  printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":1,"enqueuedAt":"2026-09-01T00:00:00Z","headCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"pullRequest":{"number":42}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}}}'
+else
+  printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":2,"enqueuedAt":"2026-09-01T00:00:01Z","headCommit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"pullRequest":{"number":42}}],"pageInfo":{"hasNextPage":false,"endCursor":"done"}}}}}}'
+fi
+"#,
     );
 
-    let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err("partial");
-    assert!(error.contains("exceeds 100 entries"), "{error}");
+    let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err("overlap");
+    assert!(error.contains("repeated PR #42"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_movement_between_complete_reads() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+count_path=$(dirname "$0")/count
+count=0
+test ! -f "$count_path" || count=$(cat "$count_path")
+count=$((count + 1))
+printf '%s' "$count" > "$count_path"
+case "$count" in
+  1|3) printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":1,"enqueuedAt":"2026-09-01T00:00:00Z","headCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"pullRequest":{"number":1}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}}}' ;;
+  2) printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":2,"enqueuedAt":"2026-09-01T00:00:01Z","headCommit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"pullRequest":{"number":2}}],"pageInfo":{"hasNextPage":false,"endCursor":"done"}}}}}}' ;;
+  4) printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":2,"enqueuedAt":"2026-09-01T00:00:02Z","headCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc"},"pullRequest":{"number":3}}],"pageInfo":{"hasNextPage":false,"endCursor":"done"}}}}}}' ;;
+  *) echo "unexpected pagination call $count: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+
+    let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err("moving queue");
+    assert!(error.contains("changed during pagination"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_malformed_page_info_and_cursor() {
+    let cases = [
+        (
+            r#"{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{}}}}}}"#,
+            "hasNextPage",
+        ),
+        (
+            r#"{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":""}}}}}}"#,
+            "non-empty endCursor",
+        ),
+    ];
+    for (payload, expected) in cases {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(&temp, &format!("printf '%s' '{payload}'"));
+        let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err(expected);
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_repeated_cursor() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"same"}}}}}}'"#,
+    );
+
+    let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err("cursor cycle");
+    assert!(error.contains("repeated endCursor"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_expired_deadline_without_github_call() {
+    let temp = tempfile::tempdir().expect("temp");
+    let called = temp.path().join("called");
+    let actions = fake_gh(&temp, &format!(": > '{}'; exit 2", called.display()));
+
+    let error = merge_queue_snapshot_before(
+        &actions,
+        "owner/repo",
+        "main",
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired instant"),
+    )
+    .expect_err("expired deadline");
+    assert!(error.contains("exceeded its bounded deadline"), "{error}");
+    assert!(!called.exists(), "expired read must not invoke GitHub");
 }
 
 #[cfg(unix)]

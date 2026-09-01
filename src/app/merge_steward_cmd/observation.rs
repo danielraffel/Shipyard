@@ -11,6 +11,7 @@ use crate::required_check_policy::{
 
 const BOUNDED_GH_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const BOUNDED_GH_STDERR_BYTES: usize = 64 * 1024;
+const MAX_MERGE_QUEUE_PAGES: usize = 10;
 
 pub(super) fn resolve_repos(mut repos: Vec<String>, cwd: &Path) -> Result<Vec<String>, CliFailure> {
     if repos.is_empty() {
@@ -255,64 +256,127 @@ fn merge_queue_snapshot_with_deadline(
     base: &str,
     deadline: Option<Instant>,
 ) -> Result<MergeQueueSnapshot, String> {
+    let (snapshot, pages) = load_merge_queue_snapshot_once(actions, repo, base, deadline)?;
+    if !snapshot.0 || pages == 1 {
+        return Ok(snapshot);
+    }
+    let (confirmation, confirmation_pages) =
+        load_merge_queue_snapshot_once(actions, repo, base, deadline)?;
+    if confirmation_pages != pages || confirmation != snapshot {
+        return Err(
+            "merge queue changed during pagination; refusing an inconsistent snapshot".to_owned(),
+        );
+    }
+    Ok(snapshot)
+}
+
+fn load_merge_queue_snapshot_once(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    deadline: Option<Instant>,
+) -> Result<(MergeQueueSnapshot, usize), String> {
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
-    let query = "query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage}}}}}";
-    let args = vec![
-        "api".to_owned(),
-        "graphql".to_owned(),
-        "-f".to_owned(),
-        format!("query={query}"),
-        "-F".to_owned(),
-        format!("owner={owner}"),
-        "-F".to_owned(),
-        format!("name={name}"),
-        "-F".to_owned(),
-        format!("branch={base}"),
-    ];
-    let value = match gh_json_with_deadline(actions, &args, "merge-queue policy", deadline) {
-        Ok(value) => value,
-        Err(error) if is_private_free_entitlement(&error) => {
-            return Ok((false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
+    let query = "query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
+    let mut positions = BTreeMap::new();
+    let mut heads = BTreeMap::new();
+    let mut enqueued = BTreeMap::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = std::collections::BTreeSet::new();
+    for page in 1..=MAX_MERGE_QUEUE_PAGES {
+        let mut args = vec![
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={query}"),
+            "-F".to_owned(),
+            format!("owner={owner}"),
+            "-F".to_owned(),
+            format!("name={name}"),
+            "-F".to_owned(),
+            format!("branch={base}"),
+        ];
+        if let Some(cursor) = cursor.as_deref() {
+            args.extend(["-F".to_owned(), format!("cursor={cursor}")]);
         }
-        Err(error) => return Err(error),
-    };
-    if value
-        .get("errors")
-        .and_then(Value::as_array)
-        .is_some_and(|errors| !errors.is_empty())
-    {
-        let text = value.to_string();
-        if is_private_free_entitlement(&text) {
-            return Ok((false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
+        let value = match gh_json_with_deadline(actions, &args, "merge-queue policy", deadline) {
+            Ok(value) => value,
+            Err(error) if page == 1 && is_private_free_entitlement(&error) => {
+                return Ok((
+                    (false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
+                    page,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if value
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            let text = value.to_string();
+            if page == 1 && is_private_free_entitlement(&text) {
+                return Ok((
+                    (false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
+                    page,
+                ));
+            }
+            return Err(format!("merge-queue GraphQL errors: {text}"));
         }
-        return Err(format!("merge-queue GraphQL errors: {text}"));
+        let Some(queue) = value.pointer("/data/repository/mergeQueue") else {
+            return Err("merge-queue response missing repository.mergeQueue".to_owned());
+        };
+        if queue.is_null() {
+            if page == 1 {
+                return Ok((
+                    (false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
+                    page,
+                ));
+            }
+            return Err("merge-queue response became unavailable during pagination".to_owned());
+        }
+        append_merge_queue_nodes(queue, &mut positions, &mut heads, &mut enqueued)?;
+        let Some(next_cursor) = merge_queue_next_cursor(queue)? else {
+            return Ok(((true, positions, heads, enqueued), page));
+        };
+        if page == MAX_MERGE_QUEUE_PAGES {
+            return Err(format!(
+                "merge queue exceeds {} entries; refusing a partial snapshot",
+                MAX_MERGE_QUEUE_PAGES * 100
+            ));
+        }
+        if !seen_cursors.insert(next_cursor.to_owned()) {
+            return Err("merge-queue pagination repeated endCursor".to_owned());
+        }
+        cursor = Some(next_cursor.to_owned());
     }
-    let Some(queue) = value.pointer("/data/repository/mergeQueue") else {
-        return Err("merge-queue response missing repository.mergeQueue".to_owned());
-    };
-    if queue.is_null() {
-        return Ok((false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
-    }
-    if queue
-        .pointer("/entries/pageInfo/hasNextPage")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err("merge queue exceeds 100 entries; refusing a partial snapshot".to_owned());
-    }
+    unreachable!("bounded merge-queue pagination returns from every page")
+}
+
+fn append_merge_queue_nodes(
+    queue: &Value,
+    positions: &mut BTreeMap<u64, u64>,
+    heads: &mut BTreeMap<u64, String>,
+    enqueued: &mut BTreeMap<u64, String>,
+) -> Result<(), String> {
     let nodes = queue
         .pointer("/entries/nodes")
         .and_then(Value::as_array)
         .ok_or_else(|| "merge-queue response missing entries.nodes".to_owned())?;
-    let mut positions = BTreeMap::new();
-    let mut heads = BTreeMap::new();
-    let mut enqueued = BTreeMap::new();
+    if nodes.len() > 100 {
+        return Err("merge-queue page exceeds the requested 100 entries".to_owned());
+    }
     for node in nodes {
         let Some(number) = node.pointer("/pullRequest/number").and_then(Value::as_u64) else {
             return Err("merge-queue entry missing PR number".to_owned());
         };
+        if positions.contains_key(&number) {
+            return Err(format!(
+                "merge-queue pagination repeated PR #{number}; refusing an overlapping snapshot"
+            ));
+        }
         let Some(position) = node.get("position").and_then(Value::as_u64) else {
             return Err(format!("merge-queue PR #{number} missing position"));
         };
@@ -329,7 +393,30 @@ fn merge_queue_snapshot_with_deadline(
             heads.insert(number, head.to_owned());
         }
     }
-    Ok((true, positions, heads, enqueued))
+    Ok(())
+}
+
+fn merge_queue_next_cursor(queue: &Value) -> Result<Option<&str>, String> {
+    let page_info = queue
+        .pointer("/entries/pageInfo")
+        .ok_or_else(|| "merge-queue response missing entries.pageInfo".to_owned())?;
+    let has_next_page = page_info
+        .get("hasNextPage")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            "merge-queue response missing boolean entries.pageInfo.hasNextPage".to_owned()
+        })?;
+    if !has_next_page {
+        return Ok(None);
+    }
+    page_info
+        .get("endCursor")
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.is_empty())
+        .map(Some)
+        .ok_or_else(|| {
+            "merge-queue response has next page without a non-empty endCursor".to_owned()
+        })
 }
 
 pub(super) fn pull_requests(

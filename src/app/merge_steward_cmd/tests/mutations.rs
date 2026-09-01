@@ -2139,7 +2139,7 @@ fn provenance_blocker_with_opt_out_and_steward_state_makes_no_github_write() {
         &temp,
         r#"
 calls_path=$(dirname "$0")/calls
-queue_query='query=query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage}}}}}'
+queue_query='query=query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}'
 pr_fields='id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup'
 if test "$#" -eq 10 \
   && test "$1" = api \
@@ -2240,7 +2240,7 @@ fi
     assert_eq!(
         calls,
         concat!(
-            "10:api graphql -f query=query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage}}}}} -F owner=owner -F name=repo -F branch=main\n",
+            "10:api graphql -f query=query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}} -F owner=owner -F name=repo -F branch=main\n",
             "7:pr view 42 --repo owner/repo --json id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup\n",
         ),
         "only the ordered fenced revalidation reads are allowed"
