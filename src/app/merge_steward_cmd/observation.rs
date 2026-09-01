@@ -1,5 +1,5 @@
 use super::{
-    BTreeMap, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
+    BTreeMap, BTreeSet, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
     MergeQueueSnapshot, ObservedPr, Path, RepoObservation, RequiredCheck, StewardCheck, StewardJob,
     StewardPullRequest, StewardRun, Value, is_admin_protection_denied,
     is_capacity_preemption_workflow, is_full_sha, is_private_free_entitlement,
@@ -167,13 +167,44 @@ fn gh_json_with_deadline(
     )
 }
 
-pub(super) fn required_checks(
+pub(in crate::app) fn required_checks(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
 ) -> Result<Vec<RequiredCheck>, String> {
     let evaluated_rules = evaluated_branch_rules(actions, repo, base)?;
     required_checks_with_evaluated_rules(actions, repo, base, &evaluated_rules)
+}
+
+pub(in crate::app) fn exact_pr_merge_identity(
+    actions: &GitHubActions,
+    repo: &str,
+    pr: u64,
+) -> Result<(String, String), String> {
+    let value = gh_json(
+        actions,
+        &[
+            "pr".to_owned(),
+            "view".to_owned(),
+            pr.to_string(),
+            "--repo".to_owned(),
+            repo.to_owned(),
+            "--json".to_owned(),
+            "headRefOid,baseRefName".to_owned(),
+        ],
+        "direct-merge pull-request identity",
+    )?;
+    let head = value
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .filter(|head| is_full_sha(head))
+        .ok_or_else(|| "direct-merge pull-request identity omitted a full head SHA".to_owned())?;
+    let base = value
+        .get("baseRefName")
+        .and_then(Value::as_str)
+        .filter(|base| !base.trim().is_empty())
+        .ok_or_else(|| "direct-merge pull-request identity omitted its base branch".to_owned())?;
+    Ok((head.to_owned(), base.to_owned()))
 }
 
 fn required_checks_with_evaluated_rules(
@@ -514,6 +545,7 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
                 .pointer("/checkSuite/app/databaseId")
                 .or_else(|| value.pointer("/app/id"))
                 .and_then(Value::as_u64),
+            check_run_id: value.get("databaseId").and_then(Value::as_u64),
             status: value.get("status")?.as_str()?.to_owned(),
             conclusion: value
                 .get("conclusion")
@@ -537,6 +569,7 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
                 name: value.get("context")?.as_str()?.to_owned(),
                 source: crate::merge_steward::StewardCheckSource::StatusContext,
                 app_id: None,
+                check_run_id: None,
                 status: if matches!(state, "PENDING" | "EXPECTED") {
                     "IN_PROGRESS"
                 } else {
@@ -717,12 +750,16 @@ fn check_runs_for_head_with_deadline(
     deadline: Option<Instant>,
 ) -> Result<Vec<StewardCheck>, String> {
     let mut checks = Vec::new();
+    let mut expected_total = None;
+    let mut check_run_ids = BTreeSet::new();
     for page in 1..=10 {
         let value = gh_json_with_deadline(
             actions,
             &[
                 "api".to_owned(),
-                format!("repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}"),
+                format!(
+                    "repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}&filter=all"
+                ),
             ],
             "current-head check identities",
             deadline,
@@ -731,16 +768,61 @@ fn check_runs_for_head_with_deadline(
             .get("check_runs")
             .and_then(Value::as_array)
             .ok_or_else(|| "current-head check identities missing check_runs".to_owned())?;
+        let total = value
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "current-head check identities missing total_count".to_owned())?;
+        if total > 1000 {
+            return Err(format!(
+                "current-head check runs declare total_count={total}, exceeding the bounded 1000-row identity scan"
+            ));
+        }
+        match expected_total {
+            None => expected_total = Some(total),
+            Some(expected) if expected != total => {
+                return Err(format!(
+                    "current-head check-run total_count changed from {expected} to {total} on page {page}"
+                ));
+            }
+            Some(_) => {}
+        }
         let count = rows.len();
-        checks.extend(rows.iter().filter_map(parse_rest_check));
-        if count < 100 {
+        for (index, row) in rows.iter().enumerate() {
+            let check = parse_rest_check(row).ok_or_else(|| {
+                format!(
+                    "current-head check identities contained malformed row {index} on page {page}"
+                )
+            })?;
+            let check_run_id = check
+                .check_run_id
+                .expect("strict REST parser requires immutable check-run ID");
+            if !check_run_ids.insert(check_run_id) {
+                return Err(format!(
+                    "current-head check identities repeated immutable check-run ID {check_run_id}"
+                ));
+            }
+            checks.push(check);
+        }
+        let observed = u64::try_from(checks.len())
+            .map_err(|_| "current-head check count overflowed".to_owned())?;
+        if observed > total {
+            return Err(format!(
+                "current-head check pagination observed {observed} rows but total_count={total}"
+            ));
+        }
+        if observed == total {
             return Ok(checks);
+        }
+        if count < 100 {
+            return Err(format!(
+                "current-head check pagination ended early after {observed} of total_count={total} rows"
+            ));
         }
     }
     Err("current-head check runs exceed 1000; refusing partial identity scan".to_owned())
 }
 
-pub(super) fn complete_checks_for_head(
+pub(in crate::app) fn complete_checks_for_head(
     actions: &GitHubActions,
     repo: &str,
     head_sha: &str,
@@ -773,7 +855,13 @@ fn commit_statuses_for_head_with_deadline(
             .as_array()
             .ok_or_else(|| "current-head commit statuses were not an array".to_owned())?;
         let count = rows.len();
-        checks.extend(rows.iter().filter_map(parse_rest_status));
+        for (index, row) in rows.iter().enumerate() {
+            checks.push(parse_rest_status(row).ok_or_else(|| {
+                format!(
+                    "current-head commit statuses contained malformed row {index} on page {page}"
+                )
+            })?);
+        }
         if count < 100 {
             return Ok(checks);
         }
@@ -786,6 +874,7 @@ pub(super) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
         name: value.get("name")?.as_str()?.to_owned(),
         source: crate::merge_steward::StewardCheckSource::CheckRun,
         app_id: value.pointer("/app/id").and_then(Value::as_u64),
+        check_run_id: Some(value.get("id")?.as_u64()?),
         status: value.get("status")?.as_str()?.to_owned(),
         conclusion: value
             .get("conclusion")
@@ -810,6 +899,7 @@ pub(super) fn parse_rest_status(value: &Value) -> Option<StewardCheck> {
         name: value.get("context")?.as_str()?.to_owned(),
         source: crate::merge_steward::StewardCheckSource::StatusContext,
         app_id: None,
+        check_run_id: None,
         status: if state.eq_ignore_ascii_case("pending") {
             "IN_PROGRESS"
         } else {

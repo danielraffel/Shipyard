@@ -25,6 +25,8 @@ use crate::ship_state::{ShipState, ShipStatePrLock, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
 use crate::writer_domain_lease::ProductionWriterDomainLease;
 
+mod direct_merge_readiness;
+
 pub(super) struct AutoMergeRequest {
     pub(super) mode: RuntimeMode,
     pub(super) global_dir: PathBuf,
@@ -185,6 +187,7 @@ pub(super) fn execute_auto_merge(
                 request.admin,
                 request.merge_command.as_deref(),
                 request.merge_result,
+                request.pr_snapshot_file.as_deref(),
             ) {
                 Ok(disposition) => disposition,
                 Err(error) => {
@@ -616,7 +619,20 @@ fn merge_pr(
     admin: bool,
     merge_command: Option<&Path>,
     merge_result: Option<MergeResult>,
+    pr_snapshot_file: Option<&Path>,
 ) -> Result<MergeDisposition, String> {
+    if merge_result == Some(MergeResult::Success)
+        && pr_snapshot_file.is_some_and(direct_merge_readiness::snapshot_declares_readiness)
+    {
+        let first = direct_merge_readiness::fetch(cwd, state, pr_snapshot_file)?;
+        let immediate = direct_merge_readiness::fetch(cwd, state, pr_snapshot_file)?;
+        if first != immediate {
+            return Err(format!(
+                "injected GitHub exact-head check readiness changed before merge for PR #{}; refusing merge",
+                state.pr
+            ));
+        }
+    }
     match merge_result {
         Some(MergeResult::Success) => {
             return Ok(MergeDisposition::Merged {
@@ -791,6 +807,7 @@ fn merge_pr(
             command.arg("--admin");
         }
     } else {
+        let readiness = direct_merge_readiness::fetch(cwd, state, pr_snapshot_file)?;
         verify_live_merge_target(
             client
                 .as_ref()
@@ -806,6 +823,24 @@ fn merge_pr(
             cwd,
             state,
             global_dir,
+        )?;
+        if repository_requires_merge_queue(
+            client
+                .as_ref()
+                .expect("built-in merge should have gh client"),
+            cwd,
+            &state.repo,
+            &state.base_branch,
+        )? {
+            return Err(format!(
+                "GitHub merge governance changed before classic merge mutation for PR #{}; refusing direct merge",
+                state.pr
+            ));
+        }
+        direct_merge_readiness::confirm_at_mutation_boundary(
+            &readiness,
+            || direct_merge_readiness::fetch_at_mutation_boundary(cwd, state, pr_snapshot_file),
+            state.pr,
         )?;
         command.args(classic_merge_args(
             state,

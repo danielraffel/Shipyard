@@ -805,6 +805,7 @@ esac
             name: "shipyard/steward-handoff".to_owned(),
             source: StewardCheckSource::StatusContext,
             app_id: None,
+            check_run_id: None,
             status: "COMPLETED".to_owned(),
             conclusion: Some("SUCCESS".to_owned()),
             run_id: None,

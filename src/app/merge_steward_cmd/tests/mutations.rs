@@ -81,6 +81,7 @@ esac
         name: HANDOFF_CONTEXT.to_owned(),
         source: StewardCheckSource::StatusContext,
         app_id: None,
+        check_run_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("SUCCESS".to_owned()),
         run_id: None,
@@ -161,7 +162,7 @@ case "$*" in
     if test -f '{}'; then admitted='{}'; else admitted='{}'; fi
     printf '{{"data":{{"repository":{{"pullRequest":{{"timelineItems":{{"nodes":[{{"__typename":"AddedToMergeQueueEvent","createdAt":"%s"}},{{"__typename":"RemovedFromMergeQueueEvent","reason":"failed_checks","createdAt":"{}"}}],"pageInfo":{{"hasPreviousPage":false}}}}}}}}}}}}' "$admitted" ;;
   *"actions/runs?event=merge_group"*) printf '%s' '{{"workflow_runs":[{{"id":32903260905,"event":"merge_group","status":"completed","conclusion":"failure","head_sha":"cccccccccccccccccccccccccccccccccccccccc","created_at":"{}","updated_at":"{}"}}]}}' ;;
-  *"commits/cccccccccccccccccccccccccccccccccccccccc/check-runs"*) printf '%s' '{{"check_runs":[{{"name":"macos","status":"completed","conclusion":"failure","details_url":"https://github.com/owner/repo/actions/runs/32903260905","completed_at":"{}","app":{{"id":15368}}}}]}}' ;;
+  *"commits/cccccccccccccccccccccccccccccccccccccccc/check-runs"*) printf '%s' '{{"total_count":1,"check_runs":[{{"id":901,"name":"macos","status":"completed","conclusion":"failure","details_url":"https://github.com/owner/repo/actions/runs/32903260905","completed_at":"{}","app":{{"id":15368}}}}]}}' ;;
   *"commits/cccccccccccccccccccccccccccccccccccccccc/statuses"*) printf '%s' '[]' ;;
   *"actions/runs/32903260905/jobs"*) printf '%s' '{{"jobs":[{{"id":97981596587,"conclusion":"failure","runner_group_name":"GitHub Actions","labels":{},"steps":[{{"name":"Set up job","status":"completed","conclusion":"failure"}}]}}]}}' ;;
   *"actions/jobs/97981596587/logs"*) printf '%s' '{}' ;;
@@ -532,6 +533,7 @@ fn managed_ownership_uses_the_configured_label_and_handoff_context() {
         name: "custom/handoff".to_owned(),
         source: StewardCheckSource::StatusContext,
         app_id: None,
+        check_run_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("SUCCESS".to_owned()),
         run_id: None,
@@ -794,6 +796,7 @@ esac
         name: RECOVERY_CONTEXT.to_owned(),
         source: StewardCheckSource::StatusContext,
         app_id: None,
+        check_run_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("FAILURE".to_owned()),
         run_id: None,
@@ -850,6 +853,7 @@ fn contended_terminal_publication_lease_cannot_report_healthy_without_an_obligat
         name: RECOVERY_CONTEXT.to_owned(),
         source: StewardCheckSource::StatusContext,
         app_id: None,
+        check_run_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("FAILURE".to_owned()),
         run_id: None,
@@ -920,6 +924,7 @@ esac
         name: RECOVERY_CONTEXT.to_owned(),
         source: StewardCheckSource::StatusContext,
         app_id: None,
+        check_run_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("FAILURE".to_owned()),
         run_id: None,
@@ -2185,6 +2190,7 @@ fi
             name: HANDOFF_CONTEXT.to_owned(),
             source: StewardCheckSource::StatusContext,
             app_id: None,
+            check_run_id: None,
             status: "COMPLETED".to_owned(),
             conclusion: Some("SUCCESS".to_owned()),
             run_id: None,
@@ -2194,6 +2200,7 @@ fi
             name: RECOVERY_CONTEXT.to_owned(),
             source: StewardCheckSource::StatusContext,
             app_id: None,
+            check_run_id: None,
             status: "COMPLETED".to_owned(),
             conclusion: Some("FAILURE".to_owned()),
             run_id: None,

@@ -663,6 +663,7 @@ mod tests {
             name: "required".to_owned(),
             source: crate::merge_steward::StewardCheckSource::CheckRun,
             app_id: Some(GITHUB_ACTIONS_APP_ID),
+            check_run_id: None,
             status: "COMPLETED".to_owned(),
             conclusion: Some("FAILURE".to_owned()),
             run_id: Some(42),

@@ -171,6 +171,94 @@ fn ship_command_runs_local_target_merges_and_archives_state() {
     );
 }
 
+#[test]
+fn ship_command_refuses_merge_while_advisory_check_is_running_and_preserves_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    seed_repo(&repo);
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let head = git_capture(&["rev-parse", "HEAD"], &repo);
+    let snapshot = temp.path().join("pr.json");
+    std::fs::write(
+        &snapshot,
+        serde_json::to_vec(&serde_json::json!({
+            "state": "OPEN",
+            "headRefName": "feature/test",
+            "headRefOid": head,
+            "baseRefName": "main",
+            "_required_checks_known": true,
+            "_required_check_policy": [{"context":"Linux","app_id":null}],
+            "statusCheckRollup": [
+                {
+                    "name":"Linux",
+                    "state":"COMPLETED",
+                    "conclusion":"SUCCESS",
+                    "isRequired":true
+                },
+                {
+                    "name":"Windows",
+                    "state":"IN_PROGRESS",
+                    "conclusion":null,
+                    "isRequired":false
+                }
+            ]
+        }))
+        .expect("snapshot JSON"),
+    )
+    .expect("write snapshot");
+    let mut stdout = Vec::new();
+
+    let code = ship_command(
+        ShipCommandArgs {
+            pr: Some(533),
+            base: "main".to_owned(),
+            auto_create_base: None,
+            no_warm: true,
+            resume_from: None,
+            merge_command: None,
+            merge_result: Some(MergeResult::Success),
+            gh_command: None,
+            pr_snapshot_file: Some(snapshot),
+            allow_unreachable_targets: false,
+            allow_fleet_epoch_drift: false,
+            skip_targets: Vec::new(),
+            adopt_head: false,
+            steward_handoff: None,
+            invocation: ShipInvocation::Direct,
+            foreground: true,
+        },
+        &loaded_config(temp.path()),
+        &repo,
+        &paths,
+        true,
+        &mut stdout,
+    )
+    .expect("local validation completes while merge stays fenced");
+
+    assert_eq!(code, ExitCode::SUCCESS);
+    let output: serde_json::Value = serde_json::from_slice(&stdout).expect("json");
+    assert_eq!(output["merged"], false);
+    assert_eq!(output["run"]["overall"], "pass");
+    assert!(
+        ShipStateStore::new(paths.state_dir.join("ship"))
+            .expect("store")
+            .get(533)
+            .is_some(),
+        "the exact-head ship state remains resumable"
+    );
+    assert_eq!(
+        std::fs::read_dir(paths.state_dir.join("ship").join("archive"))
+            .expect("archive")
+            .count(),
+        0,
+        "a refused direct merge must not archive active stewardship state"
+    );
+}
+
 // Regression coverage for Shipyard issue #296. The synthetic
 // `MergeResult::Failure` injects `Err("simulated merge failure")` in
 // `merge_pr`. `execute_auto_merge` then evaluates
