@@ -78,6 +78,10 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          # Its macOS save hook invokes interactive `sudo purge`, which can
+          # strand a self-hosted runner indefinitely. Restore remains enabled.
+          save-if: ${{ runner.os != 'macOS' }}
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -112,6 +116,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ runner.os != 'macOS' }}
 
       - name: Run coverage gate
         env:

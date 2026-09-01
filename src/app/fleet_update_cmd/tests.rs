@@ -712,7 +712,7 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
 
     std::fs::write(
         &binary,
-        "#!/bin/sh\n/usr/bin/python3 -c 'print(\"x\" * 16385)'\n",
+        "#!/bin/sh\n/usr/bin/python3 -c 'import sys; sys.stdout.write(\"x\" * 16385)'\n",
     )
     .expect("oversized resolver fixture");
     let output = Command::new("/bin/bash")

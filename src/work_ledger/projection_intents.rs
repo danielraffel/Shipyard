@@ -869,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_schema_installs_immutable_projection_tables() {
+    fn latest_schema_installs_projection_and_dispatch_probe_tables() {
         let state = tempfile::tempdir().expect("state");
         let ledger = WorkLedger::open(state.path()).expect("ledger");
         let connection = ledger.connect_read_only().expect("connection");
@@ -877,7 +877,11 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
         assert_eq!(version, super::super::SCHEMA_VERSION as u64);
-        for table in ["workstream_projection_bindings", "projection_intents"] {
+        for table in [
+            "workstream_projection_bindings",
+            "projection_intents",
+            "dispatch_probe_targets",
+        ] {
             let exists: bool = connection
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -902,6 +906,33 @@ mod tests {
             reopened.status().expect("status").schema_version,
             super::super::SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn schema_v13_migrates_dispatch_probe_state_atomically() {
+        let state = tempfile::tempdir().expect("state");
+        let ledger = WorkLedger::open(state.path()).expect("ledger");
+        let connection = ledger.connect_read_write().expect("connection");
+        connection
+            .execute_batch("DROP TABLE dispatch_probe_targets; PRAGMA user_version = 13;")
+            .expect("v13 fixture");
+        drop(connection);
+        let reopened = WorkLedger::open(state.path()).expect("migrated ledger");
+        assert_eq!(
+            reopened.status().expect("status").schema_version,
+            super::super::SCHEMA_VERSION
+        );
+        let exists: bool = reopened
+            .connect_read_only()
+            .expect("connection")
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                  WHERE type = 'table' AND name = 'dispatch_probe_targets')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("dispatch table");
+        assert!(exists);
     }
 
     #[test]

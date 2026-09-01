@@ -1850,7 +1850,7 @@ case "$*" in
     count=$((count + 1))
     printf '%s' "$count" > '{}'
     if test "$count" -le 5; then status=in_progress; else status=completed; fi
-    printf '%s' '{{"id":100,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"'"$status"'","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+    printf '%s' '{{"id":100,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"'"$status"'","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
@@ -1949,7 +1949,7 @@ case "$*" in
     count=$((count + 1))
     printf '%s' "$count" > '{}'
     if test "$count" -le 5; then status=in_progress; else status=completed; fi
-    printf '%s' '{{"id":100,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"'"$status"'","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+    printf '%s' '{{"id":100,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"'"$status"'","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
@@ -2139,7 +2139,7 @@ fn provenance_blocker_with_opt_out_and_steward_state_makes_no_github_write() {
         &temp,
         r#"
 calls_path=$(dirname "$0")/calls
-queue_query='query=query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage}}}}}'
+queue_query='query=query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}'
 pr_fields='id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup'
 if test "$#" -eq 10 \
   && test "$1" = api \
@@ -2240,7 +2240,7 @@ fi
     assert_eq!(
         calls,
         concat!(
-            "10:api graphql -f query=query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage}}}}} -F owner=owner -F name=repo -F branch=main\n",
+            "10:api graphql -f query=query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}} -F owner=owner -F name=repo -F branch=main\n",
             "7:pr view 42 --repo owner/repo --json id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup\n",
         ),
         "only the ordered fenced revalidation reads are allowed"
@@ -2522,10 +2522,10 @@ case "$*" in
   *"query=query("*"mergeQueue"*)
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
   *"actions/runs?status=queued"*)
-    printf '%s' '{{"workflow_runs":[{{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}]}}' ;;
+    printf '%s' '{{"workflow_runs":[{{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}]}}' ;;
   *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
   "api repos/owner/repo/actions/runs/1")
-    printf '%s' '{{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+    printf '%s' '{{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
   *"actions/runs/1/cancel"*) printf '%s' '{{}}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -2591,10 +2591,10 @@ case "$*" in
   *"query=query("*"mergeQueue"*)
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
   *"actions/runs?status=queued"*)
-    printf '%s' '{{"workflow_runs":[{{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}]}}' ;;
+    printf '%s' '{{"workflow_runs":[{{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}]}}' ;;
   *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
   "api repos/owner/repo/actions/runs/1")
-    printf '%s' '{{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+    printf '%s' '{{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
   *"actions/runs/1/cancel"*) echo "unexpected cancel" >&2; exit 2 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -2653,7 +2653,7 @@ case "$*" in
   *"query=query("*"mergeQueue"*)
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
   *"actions/runs?status=queued"*)
-    printf '%s' '{{"workflow_runs":[{{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}]}}' ;;
+    printf '%s' '{{"workflow_runs":[{{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}]}}' ;;
   *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
   "api repos/owner/repo/actions/runs/1")
     if [ "$(grep -c '^api repos/owner/repo/actions/runs/1$' '{}')" -le 2 ]; then
@@ -2661,7 +2661,7 @@ case "$*" in
     else
       status="in_progress"
     fi
-    printf '%s' '{{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"'"$status"'","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+    printf '%s' '{{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"'"$status"'","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
   *"actions/runs/1/cancel"*) echo "unexpected cancel" >&2; exit 2 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -2723,10 +2723,10 @@ case "$*" in
   *"query=query("*"mergeQueue"*)
     printf '%s' '{"data":{"repository":{"mergeQueue":null}}}' ;;
   *"actions/runs?status=queued"*)
-    printf '%s' '{"workflow_runs":[{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}]}' ;;
+    printf '%s' '{"workflow_runs":[{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}]}' ;;
   *"actions/runs?status="*) printf '%s' '{"workflow_runs":[]}' ;;
   "api repos/owner/repo/actions/runs/1")
-    printf '%s' '{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}' ;;
+    printf '%s' '{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}' ;;
   *"actions/runs/1/cancel"*) echo "HTTP 422: Cannot cancel a completed workflow run" >&2; exit 1 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac

@@ -32,6 +32,33 @@ fn parses_both_check_rollup_shapes() {
 }
 
 #[test]
+fn run_parser_requires_explicit_positive_attempt_identity() {
+    let base = serde_json::json!({
+        "id": 1,
+        "workflow_id": 2,
+        "name": "Required",
+        "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "head_branch": "feature",
+        "status": "queued",
+        "event": "pull_request",
+        "created_at": "2026-08-31T19:00:00Z",
+        "pull_requests": []
+    });
+    assert!(crate::app::merge_steward_cmd::observation::parse_run(&base).is_none());
+    let mut zero = base.clone();
+    zero.as_object_mut()
+        .unwrap()
+        .insert("run_attempt".to_owned(), serde_json::json!(0));
+    assert!(crate::app::merge_steward_cmd::observation::parse_run(&zero).is_none());
+    let mut malformed = base;
+    malformed
+        .as_object_mut()
+        .unwrap()
+        .insert("run_attempt".to_owned(), serde_json::json!("1"));
+    assert!(crate::app::merge_steward_cmd::observation::parse_run(&malformed).is_none());
+}
+
+#[test]
 fn active_check_uses_started_at_when_completed_at_is_null() {
     let check = parse_check(&serde_json::json!({
         "__typename": "CheckRun",
@@ -217,6 +244,262 @@ esac
             },
         ]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_runner_inventory_is_paginated_and_preserves_registered_state() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"actions/runners?per_page=100&page=1"*)
+    printf '{"runners":['
+    i=1
+    while [ "$i" -le 100 ]; do
+      [ "$i" -eq 1 ] || printf ','
+      printf '{"id":%s,"name":"runner-%s","status":"online","busy":false,"labels":[{"name":"self-hosted"},{"name":"macOS"}]}' "$i" "$i"
+      i=$((i + 1))
+    done
+    printf ']}' ;;
+  *"actions/runners?per_page=100&page=2"*)
+    printf '%s' '{"runners":[{"id":101,"name":"runner-101","status":"offline","busy":true,"labels":[{"name":"self-hosted"}]}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let runners = dispatch_runner_observations(&actions, "owner/repo").expect("runner inventory");
+    assert_eq!(runners.len(), 101);
+    assert_eq!(runners[0].runner_id, 1);
+    assert_eq!(runners[0].status, "online");
+    assert!(!runners[0].busy);
+    assert_eq!(runners[100].runner_id, 101);
+    assert!(runners[100].busy);
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_runner_inventory_accepts_exact_bound_and_refuses_overflow() {
+    for overflow in [false, true] {
+        let temp = tempfile::tempdir().expect("temp");
+        let page_eleven = if overflow {
+            r#"printf '%s' '{"runners":[{"id":1001,"name":"runner-1001","status":"online","busy":false,"labels":[]}]}'"#
+        } else {
+            r#"printf '%s' '{"runners":[]}'"#
+        };
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+query="$*"
+page="${{query##*page=}}"
+if [ "$page" -eq 11 ]; then
+  {page_eleven}
+  exit 0
+fi
+start=$(( (page - 1) * 100 + 1 ))
+printf '{{"runners":['
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$i" -eq 0 ] || printf ','
+  id=$(( start + i ))
+  printf '{{"id":%s,"name":"runner-%s","status":"online","busy":false,"labels":[]}}' "$id" "$id"
+  i=$(( i + 1 ))
+done
+printf ']}}'
+"#
+            ),
+        );
+        let result = dispatch_runner_observations(&actions, "owner/repo");
+        if overflow {
+            assert_eq!(
+                result.expect_err("overflow refusal"),
+                "repository runner inventory exceeds 1000; refusing partial scan"
+            );
+        } else {
+            assert_eq!(result.expect("exact bound").len(), 1_000);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_runner_inventory_refuses_missing_envelope() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, "printf '%s' '{}'");
+    assert!(dispatch_runner_observations(&actions, "owner/repo").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_job_inventory_is_bound_to_exact_run_attempt() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"actions/runs/77/attempts/3/jobs?per_page=100&page=1"*)
+    printf '%s' '{"jobs":[{"id":303,"name":"macos","status":"queued","conclusion":null,"labels":["self-hosted","macos"],"runner_name":null}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let jobs = crate::app::merge_steward_cmd::observation::fetch_run_attempt_jobs(
+        &actions,
+        "owner/repo",
+        77,
+        3,
+    )
+    .expect("attempt jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, 303);
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_check_producer_inventory_binds_run_job_and_app() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"printf '%s' '{"check_runs":[{"name":"macos","app":{"id":42},"details_url":"https://github.com/owner/repo/actions/runs/77/job/303"}]}'"#,
+    );
+    let producers = crate::app::merge_steward_cmd::observation::job_check_producers_for_head(
+        &actions,
+        "owner/repo",
+        &"a".repeat(40),
+    )
+    .expect("producer inventory");
+    let producer = producers.get(&303).expect("job producer");
+    assert_eq!(producer.run_id, 77);
+    assert_eq!(producer.job_id, 303);
+    assert_eq!(producer.name, "macos");
+    assert_eq!(producer.app_id, Some(42));
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_job_detail_vetoes_assignment_or_completion_race() {
+    let listed = StewardJob {
+        id: 303,
+        name: "macos".to_owned(),
+        status: "queued".to_owned(),
+        conclusion: None,
+        labels: vec!["self-hosted".to_owned(), "macos".to_owned()],
+        runner_name: None,
+    };
+    let required = vec![RequiredCheck {
+        context: "macos".to_owned(),
+        app_id: Some(42),
+    }];
+    let producers = BTreeMap::from([(
+        303,
+        crate::app::merge_steward_cmd::observation::JobCheckProducer {
+            run_id: 77,
+            job_id: 303,
+            name: "macos".to_owned(),
+            app_id: Some(42),
+        },
+    )]);
+    assert!(current_required_dispatch_job(&listed, &listed, 77, &required, &producers).is_some());
+
+    let mut assigned = listed.clone();
+    assigned.status = "in_progress".to_owned();
+    assigned.runner_name = Some("m3-pulp-gate-01".to_owned());
+    assert!(current_required_dispatch_job(&listed, &assigned, 77, &required, &producers).is_none());
+
+    let mut completed = listed.clone();
+    completed.status = "completed".to_owned();
+    completed.conclusion = Some("success".to_owned());
+    assert!(
+        current_required_dispatch_job(&listed, &completed, 77, &required, &producers).is_none()
+    );
+
+    let wrong_app = BTreeMap::from([(
+        303,
+        crate::app::merge_steward_cmd::observation::JobCheckProducer {
+            run_id: 77,
+            job_id: 303,
+            name: "macos".to_owned(),
+            app_id: Some(7),
+        },
+    )]);
+    assert!(current_required_dispatch_job(&listed, &listed, 77, &required, &wrong_app).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn one_hundred_same_repository_targets_load_shared_observation_once() {
+    use std::cell::Cell;
+
+    let targets = (1..=100)
+        .map(|pull_request| DispatchWedgeTargetRequest {
+            base_ref: "main".to_owned(),
+            pull_request,
+            expected_head_sha: format!("{pull_request:040x}"),
+        })
+        .collect::<Vec<_>>();
+    let runner_loads = Cell::new(0);
+    let repository_loads = Cell::new(0);
+    let target_observations = Cell::new(0);
+    let results = observe_dispatch_wedge_targets_with(
+        &targets,
+        || {
+            runner_loads.set(runner_loads.get() + 1);
+            Ok(Vec::new())
+        },
+        |base_ref| {
+            repository_loads.set(repository_loads.get() + 1);
+            Ok(base_ref.to_owned())
+        },
+        |shared, target, _| {
+            target_observations.set(target_observations.get() + 1);
+            assert_eq!(shared, &target.base_ref);
+            Ok(Vec::new())
+        },
+    );
+
+    assert_eq!(results.len(), 100);
+    assert!(results.iter().all(|result| result.result.is_ok()));
+    assert_eq!(runner_loads.get(), 1);
+    assert_eq!(repository_loads.get(), 1);
+    assert_eq!(target_observations.get(), 100);
+}
+
+#[cfg(unix)]
+#[test]
+fn one_target_observation_failure_does_not_poison_repository_batch() {
+    let targets = [
+        DispatchWedgeTargetRequest {
+            base_ref: "main".to_owned(),
+            pull_request: 42,
+            expected_head_sha: "a".repeat(40),
+        },
+        DispatchWedgeTargetRequest {
+            base_ref: "main".to_owned(),
+            pull_request: 43,
+            expected_head_sha: "b".repeat(40),
+        },
+    ];
+    let results = observe_dispatch_wedge_targets_with(
+        &targets,
+        || Ok(Vec::new()),
+        |_| Ok(()),
+        |(), target, _| {
+            if target.pull_request == 42 {
+                Err("exact target detail failed".to_owned())
+            } else {
+                Ok(Vec::new())
+            }
+        },
+    );
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].result.as_ref().expect_err("target 42 fails"),
+        "exact target detail failed"
+    );
+    assert!(results[1].result.is_ok());
 }
 
 #[cfg(unix)]
@@ -443,15 +726,328 @@ fn pull_request_transport_preserves_fresh_queue_position() {
 
 #[cfg(unix)]
 #[test]
-fn merge_queue_transport_refuses_partial_snapshot() {
+fn open_pull_request_transport_supports_more_than_one_hundred_rows() {
+    let temp = tempfile::tempdir().expect("temp");
+    let rows = (1..=101)
+        .map(|number| {
+            serde_json::json!({
+                "id": format!("PR_{number}"),
+                "number": number,
+                "isDraft": false,
+                "baseRefName": "main",
+                "headRefOid": format!("{number:040x}"),
+                "headRefName": format!("feature-{number}"),
+                "mergeStateStatus": "CLEAN",
+                "autoMergeRequest": null,
+                "labels": [],
+                "statusCheckRollup": []
+            })
+        })
+        .collect::<Vec<_>>();
+    let rows_path = temp.path().join("prs.json");
+    fs::write(&rows_path, serde_json::to_vec(&rows).expect("rows JSON")).expect("write rows");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+test "$9" = --limit
+test "${{10}}" = 1000
+cat '{}'
+"#,
+            rows_path.display()
+        ),
+    );
+
+    let prs = pull_requests(&actions, "owner/repo", "main", &BTreeMap::new())
+        .expect("complete open PR inventory");
+    assert_eq!(prs.len(), 101);
+    assert_eq!(prs.last().map(|pr| pr.fact.number), Some(101));
+}
+
+#[cfg(unix)]
+#[test]
+fn open_pull_request_transport_refuses_the_bounded_limit() {
+    let temp = tempfile::tempdir().expect("temp");
+    let rows = (1..=1000)
+        .map(|number| {
+            serde_json::json!({
+                "id": format!("PR_{number}"),
+                "number": number,
+                "isDraft": false,
+                "baseRefName": "main",
+                "headRefOid": format!("{number:040x}"),
+                "headRefName": format!("feature-{number}"),
+                "mergeStateStatus": "CLEAN",
+                "autoMergeRequest": null,
+                "labels": [],
+                "statusCheckRollup": []
+            })
+        })
+        .collect::<Vec<_>>();
+    let rows_path = temp.path().join("prs.json");
+    fs::write(&rows_path, serde_json::to_vec(&rows).expect("rows JSON")).expect("write rows");
+    let actions = fake_gh(&temp, &format!("cat '{}'", rows_path.display()));
+
+    let error = pull_requests(&actions, "owner/repo", "main", &BTreeMap::new())
+        .expect_err("bounded inventory");
+    assert!(error.contains("reached 1000"), "{error}");
+}
+
+#[test]
+fn dispatch_wedge_final_read_orders_pr_before_exact_queue_authority() {
+    use std::cell::RefCell;
+
+    let mut observed = ready_pr();
+    observed.fact.queue_position = Some(3);
+    let target = DispatchWedgeTargetRequest {
+        base_ref: "main".to_owned(),
+        pull_request: 42,
+        expected_head_sha: "a".repeat(40),
+    };
+    let calls = RefCell::new(Vec::new());
+    revalidate_dispatch_wedge_authority_with(
+        &observed,
+        &target,
+        3,
+        &"b".repeat(40),
+        || {
+            calls.borrow_mut().push("pr");
+            Ok(Some(observed.clone()))
+        },
+        || {
+            calls.borrow_mut().push("queue");
+            Ok((
+                true,
+                BTreeMap::from([(42, 3)]),
+                BTreeMap::from([(42, "b".repeat(40))]),
+                BTreeMap::new(),
+            ))
+        },
+    )
+    .expect("stable final authority");
+    assert_eq!(*calls.borrow(), vec!["pr", "queue"]);
+}
+
+#[test]
+fn dispatch_wedge_final_read_refuses_dequeue_or_regenerated_group() {
+    let observed = ready_pr();
+    let target = DispatchWedgeTargetRequest {
+        base_ref: "main".to_owned(),
+        pull_request: 42,
+        expected_head_sha: "a".repeat(40),
+    };
+    for (positions, heads) in [
+        (BTreeMap::new(), BTreeMap::new()),
+        (
+            BTreeMap::from([(42, 3)]),
+            BTreeMap::from([(42, "c".repeat(40))]),
+        ),
+    ] {
+        let error = revalidate_dispatch_wedge_authority_with(
+            &observed,
+            &target,
+            3,
+            &"b".repeat(40),
+            || Ok(Some(observed.clone())),
+            || Ok((true, positions.clone(), heads.clone(), BTreeMap::new())),
+        )
+        .expect_err("stale queue authority");
+        assert!(error.contains("queue authority changed"), "{error}");
+    }
+}
+
+#[test]
+fn dispatch_wedge_final_read_refuses_pull_request_head_movement() {
+    let observed = ready_pr();
+    let mut moved = observed.clone();
+    moved.fact.head_sha = "d".repeat(40);
+    let target = DispatchWedgeTargetRequest {
+        base_ref: "main".to_owned(),
+        pull_request: 42,
+        expected_head_sha: "a".repeat(40),
+    };
+    let error = revalidate_dispatch_wedge_authority_with(
+        &observed,
+        &target,
+        3,
+        &"b".repeat(40),
+        || Ok(Some(moved.clone())),
+        || {
+            Ok((
+                true,
+                BTreeMap::from([(42, 3)]),
+                BTreeMap::from([(42, "b".repeat(40))]),
+                BTreeMap::new(),
+            ))
+        },
+    )
+    .expect_err("moved PR head");
+    assert!(error.contains("PR authority changed"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_paginates_beyond_one_hundred_entries() {
+    let temp = tempfile::tempdir().expect("temp");
+    let nodes = |range: std::ops::RangeInclusive<u64>| {
+        range
+            .map(|number| {
+                serde_json::json!({
+                    "position": number,
+                    "enqueuedAt": "2026-09-01T00:00:00Z",
+                    "headCommit": {"oid": format!("{number:040x}")},
+                    "pullRequest": {"number": number}
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let first_page = temp.path().join("first.json");
+    let second_page = temp.path().join("second.json");
+    fs::write(
+        &first_page,
+        serde_json::to_vec(&serde_json::json!({
+            "data": {"repository": {"mergeQueue": {"entries": {
+                "nodes": nodes(1..=100),
+                "pageInfo": {"hasNextPage": true, "endCursor": "cursor-100"}
+            }}}}
+        }))
+        .expect("first page"),
+    )
+    .expect("write first page");
+    fs::write(
+        &second_page,
+        serde_json::to_vec(&serde_json::json!({
+            "data": {"repository": {"mergeQueue": {"entries": {
+                "nodes": nodes(101..=102),
+                "pageInfo": {"hasNextPage": false, "endCursor": "cursor-102"}
+            }}}}
+        }))
+        .expect("second page"),
+    )
+    .expect("write second page");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+if test "$#" -eq 10; then
+  cat '{}'
+elif test "$#" -eq 12 && test "${{11}}" = -F && test "${{12}}" = cursor=cursor-100; then
+  cat '{}'
+else
+  echo "unexpected pagination call: $*" >&2
+  exit 2
+fi
+"#,
+            first_page.display(),
+            second_page.display()
+        ),
+    );
+
+    let (enabled, positions, heads, enqueued) =
+        merge_queue_snapshot(&actions, "owner/repo", "main").expect("complete snapshot");
+    assert!(enabled);
+    assert_eq!(positions.len(), 102);
+    assert_eq!(positions.get(&101), Some(&101));
+    assert_eq!(heads.get(&102), Some(&format!("{:040x}", 102)));
+    assert_eq!(enqueued.len(), 102);
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_page_overlap() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(
         &temp,
-        r#"printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}}'"#,
+        r#"
+if test "$#" -eq 10; then
+  printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":1,"enqueuedAt":"2026-09-01T00:00:00Z","headCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"pullRequest":{"number":42}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}}}'
+else
+  printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":2,"enqueuedAt":"2026-09-01T00:00:01Z","headCommit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"pullRequest":{"number":42}}],"pageInfo":{"hasNextPage":false,"endCursor":"done"}}}}}}'
+fi
+"#,
     );
 
-    let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err("partial");
-    assert!(error.contains("exceeds 100 entries"), "{error}");
+    let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err("overlap");
+    assert!(error.contains("repeated PR #42"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_movement_between_complete_reads() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+count_path=$(dirname "$0")/count
+count=0
+test ! -f "$count_path" || count=$(cat "$count_path")
+count=$((count + 1))
+printf '%s' "$count" > "$count_path"
+case "$count" in
+  1|3) printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":1,"enqueuedAt":"2026-09-01T00:00:00Z","headCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"pullRequest":{"number":1}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}}}' ;;
+  2) printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":2,"enqueuedAt":"2026-09-01T00:00:01Z","headCommit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"pullRequest":{"number":2}}],"pageInfo":{"hasNextPage":false,"endCursor":"done"}}}}}}' ;;
+  4) printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":2,"enqueuedAt":"2026-09-01T00:00:02Z","headCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc"},"pullRequest":{"number":3}}],"pageInfo":{"hasNextPage":false,"endCursor":"done"}}}}}}' ;;
+  *) echo "unexpected pagination call $count: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+
+    let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err("moving queue");
+    assert!(error.contains("changed during pagination"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_malformed_page_info_and_cursor() {
+    let cases = [
+        (
+            r#"{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{}}}}}}"#,
+            "hasNextPage",
+        ),
+        (
+            r#"{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":""}}}}}}"#,
+            "non-empty endCursor",
+        ),
+    ];
+    for (payload, expected) in cases {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(&temp, &format!("printf '%s' '{payload}'"));
+        let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err(expected);
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_repeated_cursor() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"same"}}}}}}'"#,
+    );
+
+    let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err("cursor cycle");
+    assert!(error.contains("repeated endCursor"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_queue_transport_refuses_expired_deadline_without_github_call() {
+    let temp = tempfile::tempdir().expect("temp");
+    let called = temp.path().join("called");
+    let actions = fake_gh(&temp, &format!(": > '{}'; exit 2", called.display()));
+
+    let error = merge_queue_snapshot_before(
+        &actions,
+        "owner/repo",
+        "main",
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired instant"),
+    )
+    .expect_err("expired deadline");
+    assert!(error.contains("exceeded its bounded deadline"), "{error}");
+    assert!(!called.exists(), "expired read must not invoke GitHub");
 }
 
 #[cfg(unix)]
@@ -463,7 +1059,7 @@ fn active_run_transport_deduplicates_status_and_page_overlap() {
         r#"
 case "$*" in
   *"actions/runs?status=queued"*|*"actions/runs?status=waiting"*)
-    printf '%s' '{"workflow_runs":[{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}]}' ;;
+    printf '%s' '{"workflow_runs":[{"id":1,"workflow_id":77,"run_attempt":1,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}]}' ;;
   *"actions/runs?status="*) printf '%s' '{"workflow_runs":[]}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -473,6 +1069,26 @@ esac
     let runs = active_runs(&actions, "owner/repo").expect("active runs");
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].id, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn active_run_transport_refuses_any_malformed_attempt_identity() {
+    for attempt_field in ["", ",\"run_attempt\":0", ",\"run_attempt\":\"1\""] {
+        let temp = tempfile::tempdir().expect("temp");
+        let body = format!(
+            r#"
+case "$*" in
+  *"actions/runs?status=queued"*)
+    printf '%s' '{{"workflow_runs":[{{"id":1,"workflow_id":77{attempt_field},"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}]}}' ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#
+        );
+        let actions = fake_gh(&temp, &body);
+        assert!(active_runs(&actions, "owner/repo").is_err());
+    }
 }
 
 #[cfg(unix)]

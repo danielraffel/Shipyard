@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -50,6 +50,13 @@ macro_rules! candidate_params {
 }
 
 #[cfg(any(unix, test))]
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "the actionable scheduler is Unix-daemon production code retained in Windows test builds for type checking"
+    )
+)]
 mod actionable_scheduler;
 mod canary_wake;
 mod custody_inventory;
@@ -118,10 +125,13 @@ mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.
 mod route;
 mod storage;
-#[cfg(unix)]
-pub(crate) use actionable_scheduler::NativeStewardApplyReport;
 #[cfg(any(unix, test))]
 pub(crate) use actionable_scheduler::NativeStewardDisposition;
+#[cfg(unix)]
+pub(crate) use actionable_scheduler::{
+    DispatchProbeTargetRecord, MAX_DISPATCH_PROBE_TARGETS, NativeStewardApplyReport,
+    dispatch_probe_target_key,
+};
 #[cfg(test)]
 #[allow(unused_imports)] // Some target-specific test builds do not exercise the Unix carrier.
 pub(crate) use custody_inventory::CustodyInventoryBinding;

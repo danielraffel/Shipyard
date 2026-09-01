@@ -22,6 +22,8 @@ const JOB_ACTIVE_STATUSES: [&str; 2] = ["queued", "in_progress"];
 /// Maximum page size the GitHub Actions runs API accepts. Paginated listers
 /// request this many items per page and stop early on a short page.
 const RUNS_API_PAGE_SIZE: u32 = 100;
+const DEADLINE_GH_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const DEADLINE_GH_STDERR_BYTES: usize = 64 * 1024;
 
 /// Build the `gh api` path for a workflow-runs query.
 ///
@@ -362,6 +364,18 @@ impl GitHubActions {
                 .map_or(deadline, |current| current.min(deadline)),
         );
         self
+    }
+
+    #[cfg(test)]
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "absolute-deadline injection is exercised by the Unix daemon adapter"
+        )
+    )]
+    pub(crate) fn has_absolute_deadline_for_tests(&self) -> bool {
+        self.absolute_deadline.is_some()
     }
 
     /// Dispatch a workflow with optional repository and input fields.
@@ -764,7 +778,12 @@ impl GitHubActions {
 
     pub(crate) fn run_gh(&self, args: &[String]) -> Result<String, GitHubError> {
         if let Some(timeout) = self.remaining_deadline()? {
-            return self.run_gh_with_timeout(args, timeout);
+            return self.run_gh_with_timeout_bounded(
+                args,
+                timeout,
+                DEADLINE_GH_STDOUT_BYTES,
+                DEADLINE_GH_STDERR_BYTES,
+            );
         }
         let output = self
             .prepare_gh_command()?
@@ -1782,6 +1801,40 @@ exit 2
         let log = std::fs::read_to_string(log).expect("gh log");
         assert!(log.contains("GH_TOKEN=ghs_app_token ARGS=pr view 314"));
         assert!(log.contains("GH_TOKEN=ghs_app_token ARGS=api repos/danielraffel/pulp/pulls/314"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_deadline_also_bounds_gh_output_capture() {
+        let temp = TempDir::new().expect("tempdir");
+        let helper = temp.path().join("token-helper");
+        write_executable(
+            &helper,
+            r#"#!/bin/sh
+printf '{"token":"ghs_app_token","kind":"github-app-installation","expires_at":"2099-01-01T00:00:00Z"}'
+"#,
+        );
+        let gh = temp.path().join("gh");
+        write_executable(
+            &gh,
+            r"#!/bin/sh
+/bin/dd if=/dev/zero bs=1048576 count=5 2>/dev/null
+",
+        );
+        let config = config_with_command_helper(&helper);
+        let client = super::GitHubActions::from_loaded_config(temp.path(), &config)
+            .with_gh_binary_for_tests(&gh)
+            .with_absolute_deadline(std::time::Instant::now() + std::time::Duration::from_secs(30));
+
+        let error = client
+            .run_gh(&["api".to_owned(), "repos/owner/repo".to_owned()])
+            .expect_err("oversized output must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded bounded output capture")
+        );
     }
 
     #[test]

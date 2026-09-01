@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use crate::cloud::GitHubActions;
+use crate::dispatch_wedge::{
+    DispatchJobAuthority, DispatchRunnerObservation, DispatchWedgeObservation,
+};
 use crate::identity::RuntimeMode;
 use crate::merge_queue_control::{
     DurableMutationIntent, MergeQueueMutationGuard, authority_status, lock_is_contended,
@@ -1166,6 +1169,397 @@ pub(super) fn steward_command<W: Write>(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Read the exact queued merge-group jobs for one existing `WorkLedger` target.
+/// This deliberately performs no mutation. Registered runner capacity is read
+/// from GitHub; local admission holds remain a separate JIT/VM authority.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "Unix daemon observation entrypoint")
+)]
+pub(crate) fn observe_dispatch_wedge_target(
+    actions: &GitHubActions,
+    repository: &str,
+    base_ref: &str,
+    pull_request: u64,
+    expected_head_sha: &str,
+) -> Result<Vec<DispatchWedgeObservation>, String> {
+    let target = DispatchWedgeTargetRequest {
+        base_ref: base_ref.to_owned(),
+        pull_request,
+        expected_head_sha: expected_head_sha.to_owned(),
+    };
+    let mut results = observe_dispatch_wedge_targets(actions, repository, &[target]);
+    results
+        .pop()
+        .ok_or_else(|| "dispatch-wedge batch omitted its only target".to_owned())?
+        .result
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation request"))]
+pub(crate) struct DispatchWedgeTargetRequest {
+    pub(crate) base_ref: String,
+    pub(crate) pull_request: u64,
+    pub(crate) expected_head_sha: String,
+}
+
+#[derive(Debug)]
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation result"))]
+pub(crate) struct DispatchWedgeTargetResult {
+    pub(crate) target: DispatchWedgeTargetRequest,
+    pub(crate) result: Result<Vec<DispatchWedgeObservation>, String>,
+}
+
+/// Observe every due target for one immutable repository identity in a single
+/// bounded cycle. Repository policy/queue/run state is shared per exact base
+/// and the registered-runner inventory is shared for the whole repository;
+/// merge-head, run-attempt, job-detail, and producer identity remain exact to
+/// each target. There is deliberately no cache across cycles.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "Unix daemon observation entrypoint")
+)]
+pub(crate) fn observe_dispatch_wedge_targets(
+    actions: &GitHubActions,
+    repository: &str,
+    targets: &[DispatchWedgeTargetRequest],
+) -> Vec<DispatchWedgeTargetResult> {
+    observe_dispatch_wedge_targets_with(
+        targets,
+        || dispatch_runner_observations(actions, repository),
+        |base_ref| observe_repo(actions, repository, base_ref, false),
+        |observation, target, runners| {
+            observe_dispatch_wedge_target_from_repository(actions, observation, target, runners)
+        },
+    )
+}
+
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
+fn observe_dispatch_wedge_targets_with<Shared, LoadRunners, LoadRepository, ObserveTarget>(
+    targets: &[DispatchWedgeTargetRequest],
+    mut load_runners: LoadRunners,
+    mut load_repository: LoadRepository,
+    mut observe_target: ObserveTarget,
+) -> Vec<DispatchWedgeTargetResult>
+where
+    LoadRunners: FnMut() -> Result<Vec<DispatchRunnerObservation>, String>,
+    LoadRepository: FnMut(&str) -> Result<Shared, String>,
+    ObserveTarget: FnMut(
+        &Shared,
+        &DispatchWedgeTargetRequest,
+        &[DispatchRunnerObservation],
+    ) -> Result<Vec<DispatchWedgeObservation>, String>,
+{
+    let runners = load_runners();
+    let mut observations_by_base = BTreeMap::new();
+    for target in targets {
+        observations_by_base
+            .entry(target.base_ref.clone())
+            .or_insert_with(|| load_repository(&target.base_ref));
+    }
+
+    targets
+        .iter()
+        .cloned()
+        .map(|target| {
+            let result = match (&runners, observations_by_base.get(&target.base_ref)) {
+                (Err(error), _) | (_, Some(Err(error))) => Err(error.clone()),
+                (Ok(runners), Some(Ok(observation))) => {
+                    observe_target(observation, &target, runners)
+                }
+                (_, None) => Err("dispatch-wedge repository observation was omitted".to_owned()),
+            };
+            DispatchWedgeTargetResult { target, result }
+        })
+        .collect()
+}
+
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
+fn observe_dispatch_wedge_target_from_repository(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    target: &DispatchWedgeTargetRequest,
+    runners: &[DispatchRunnerObservation],
+) -> Result<Vec<DispatchWedgeObservation>, String> {
+    let pull_request = target.pull_request;
+    let expected_head_sha = &target.expected_head_sha;
+    let Some(pr) = observation.prs.iter().find(|candidate| {
+        candidate.fact.number == pull_request
+            && candidate
+                .fact
+                .head_sha
+                .eq_ignore_ascii_case(expected_head_sha)
+    }) else {
+        return Ok(Vec::new());
+    };
+    let Some(queue_position) = pr.fact.queue_position else {
+        return Ok(Vec::new());
+    };
+    let Some(merge_group_head) = observation.merge_group_heads.get(&pull_request) else {
+        return Ok(Vec::new());
+    };
+    let mut results = collect_dispatch_wedge_job_observations(
+        actions,
+        observation,
+        pr,
+        queue_position,
+        merge_group_head,
+        runners,
+    )?;
+    if !results.is_empty() {
+        revalidate_dispatch_wedge_authority_with(
+            pr,
+            target,
+            queue_position,
+            merge_group_head,
+            || {
+                cancellation_revalidation::pull_request(
+                    actions,
+                    &observation.repo,
+                    pull_request,
+                    &observation.base,
+                    &BTreeMap::new(),
+                )
+            },
+            || merge_queue_snapshot(actions, &observation.repo, &observation.base),
+        )?;
+        for result in &mut results {
+            result.observation_complete = true;
+        }
+    }
+    Ok(results)
+}
+
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
+fn collect_dispatch_wedge_job_observations(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    queue_position: u64,
+    merge_group_head: &str,
+    runners: &[DispatchRunnerObservation],
+) -> Result<Vec<DispatchWedgeObservation>, String> {
+    let check_producers =
+        observation::job_check_producers_for_head(actions, &observation.repo, merge_group_head)?;
+    let mut results = Vec::new();
+    for run in observation.runs.iter().filter(|run| {
+        run.event.eq_ignore_ascii_case("merge_group")
+            && run.head_sha.eq_ignore_ascii_case(merge_group_head)
+    }) {
+        for job in observation::fetch_run_attempt_jobs(
+            actions,
+            &observation.repo,
+            run.id,
+            run.run_attempt,
+        )? {
+            if !job.status.eq_ignore_ascii_case("queued")
+                || job.conclusion.is_some()
+                || job
+                    .runner_name
+                    .as_deref()
+                    .is_some_and(|name| !name.is_empty())
+                || !observation
+                    .required_checks
+                    .iter()
+                    .any(|required| required.context.eq_ignore_ascii_case(&job.name))
+            {
+                continue;
+            }
+            let detail = observation::gh_json(
+                actions,
+                &[
+                    "api".to_owned(),
+                    format!("repos/{}/actions/jobs/{}", observation.repo, job.id),
+                ],
+                "queued workflow job detail",
+            )?;
+            let detail_job = observation::parse_job(&detail)?;
+            let Some(required) = current_required_dispatch_job(
+                &job,
+                &detail_job,
+                run.id,
+                &observation.required_checks,
+                &check_producers,
+            ) else {
+                continue;
+            };
+            let producer_app_id = check_producers
+                .get(&detail_job.id)
+                .and_then(|check| check.app_id);
+            results.push(DispatchWedgeObservation {
+                authority: DispatchJobAuthority {
+                    repository: observation.repo.clone(),
+                    base_ref: observation.base.clone(),
+                    pull_request: pr.fact.number,
+                    pull_request_head: pr.fact.head_sha.clone(),
+                    queue_position,
+                    merge_group_head: merge_group_head.to_owned(),
+                    workflow_run_id: run.id,
+                    workflow_id: run.workflow_id,
+                    run_attempt: run.run_attempt,
+                    run_event: run.event.clone(),
+                    run_head: run.head_sha.clone(),
+                    job_id: detail_job.id,
+                    job_name: detail_job.name.clone(),
+                    job_status: detail_job.status.clone(),
+                    job_conclusion: detail_job.conclusion.clone(),
+                    runner_name: detail_job.runner_name.clone(),
+                    labels: detail_job.labels.clone(),
+                    // The durable producer replaces this observation-local
+                    // value with the persisted first-seen time for this exact
+                    // job before classification.
+                    first_observed_unassigned_at: Utc::now().to_rfc3339(),
+                    required_context: detail_job.name,
+                    required_app_id: required.app_id,
+                    producer_app_id,
+                },
+                runners: runners.to_vec(),
+                observation_complete: false,
+                #[cfg(test)]
+                first_observed_unassigned_at_seed: None,
+            });
+        }
+    }
+    Ok(results)
+}
+
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
+fn revalidate_dispatch_wedge_authority_with<ReadPullRequest, ReadQueue>(
+    observed_pr: &ObservedPr,
+    target: &DispatchWedgeTargetRequest,
+    observed_queue_position: u64,
+    observed_merge_group_head: &str,
+    mut read_pull_request: ReadPullRequest,
+    mut read_queue: ReadQueue,
+) -> Result<(), String>
+where
+    ReadPullRequest: FnMut() -> Result<Option<ObservedPr>, String>,
+    ReadQueue: FnMut() -> Result<MergeQueueSnapshot, String>,
+{
+    let live_pr = read_pull_request()?
+        .ok_or_else(|| "dispatch-wedge PR authority changed before final read".to_owned())?;
+    if live_pr.fact.number != target.pull_request
+        || !live_pr
+            .fact
+            .head_sha
+            .eq_ignore_ascii_case(&target.expected_head_sha)
+        || !live_pr
+            .fact
+            .head_sha
+            .eq_ignore_ascii_case(&observed_pr.fact.head_sha)
+    {
+        return Err("dispatch-wedge PR authority changed before final read".to_owned());
+    }
+
+    // This is deliberately the last remote read before an observation becomes
+    // complete. A dequeue, reinsertion, or regenerated merge group therefore
+    // refuses the stale observation instead of publishing a wake from it.
+    let (enabled, positions, heads, _) = read_queue()?;
+    let live_position = positions.get(&target.pull_request).copied();
+    let live_merge_group_head = heads.get(&target.pull_request);
+    if !enabled
+        || live_position != Some(observed_queue_position)
+        || !live_merge_group_head
+            .is_some_and(|head| head.eq_ignore_ascii_case(observed_merge_group_head))
+    {
+        return Err("dispatch-wedge queue authority changed before final read".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
+fn current_required_dispatch_job<'a>(
+    listed: &StewardJob,
+    detail: &StewardJob,
+    run_id: u64,
+    required_checks: &'a [RequiredCheck],
+    check_producers: &BTreeMap<u64, observation::JobCheckProducer>,
+) -> Option<&'a RequiredCheck> {
+    if detail.id != listed.id
+        || !detail.name.eq_ignore_ascii_case(&listed.name)
+        || !detail.status.eq_ignore_ascii_case("queued")
+        || detail.conclusion.is_some()
+        || detail
+            .runner_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+    {
+        return None;
+    }
+    let producer = check_producers.get(&detail.id);
+    let mut matching = required_checks.iter().filter(|required| {
+        required.context.eq_ignore_ascii_case(&detail.name)
+            && required.app_id.is_none_or(|app_id| {
+                producer.is_some_and(|producer| {
+                    producer.run_id == run_id
+                        && producer.job_id == detail.id
+                        && producer.name.eq_ignore_ascii_case(&detail.name)
+                        && producer.app_id == Some(app_id)
+                })
+            })
+    });
+    let required = matching.next()?;
+    matching.next().is_none().then_some(required)
+}
+
+#[cfg_attr(windows, allow(dead_code, reason = "Unix daemon observation helper"))]
+fn dispatch_runner_observations(
+    actions: &GitHubActions,
+    repository: &str,
+) -> Result<Vec<DispatchRunnerObservation>, String> {
+    let mut runners = Vec::new();
+    for page in 1..=11 {
+        let value = observation::gh_json(
+            actions,
+            &[
+                "api".to_owned(),
+                format!("repos/{repository}/actions/runners?per_page=100&page={page}"),
+            ],
+            "repository runner inventory",
+        )?;
+        let rows = value
+            .get("runners")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "repository runner inventory missing runners".to_owned())?;
+        if page == 11 {
+            return if rows.is_empty() {
+                Ok(runners)
+            } else {
+                Err("repository runner inventory exceeds 1000; refusing partial scan".to_owned())
+            };
+        }
+        let count = rows.len();
+        for row in rows {
+            runners.push(DispatchRunnerObservation {
+                runner_id: row.get("id").and_then(Value::as_u64).unwrap_or(0),
+                name: row
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                status: row
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                busy: row.get("busy").and_then(Value::as_bool).unwrap_or(true),
+                labels: row
+                    .get("labels")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|label| label.get("name").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect(),
+            });
+        }
+        if count < 100 {
+            return Ok(runners);
+        }
+    }
+    Err("repository runner inventory exceeds 1000; refusing partial scan".to_owned())
 }
 
 fn unreadable_repo_report(

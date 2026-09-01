@@ -19,7 +19,8 @@ fn strip_schema_identity(connection: &Connection) {
         .expect("remove the complete v13 ownership and successor schema");
     connection
         .execute_batch(
-            "DROP TRIGGER IF EXISTS projection_intent_no_delete;
+            "DROP TABLE IF EXISTS dispatch_probe_targets;
+             DROP TRIGGER IF EXISTS projection_intent_no_delete;
              DROP TRIGGER IF EXISTS projection_intent_identity_immutable;
              DROP TABLE IF EXISTS projection_intents;
              DROP TRIGGER IF EXISTS workstream_projection_binding_no_delete;
