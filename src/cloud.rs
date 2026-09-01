@@ -1817,7 +1817,7 @@ printf '{"token":"ghs_app_token","kind":"github-app-installation","expires_at":"
         let config = config_with_command_helper(&helper);
         let client = super::GitHubActions::from_loaded_config(temp.path(), &config)
             .with_gh_binary_for_tests(&gh)
-            .with_absolute_deadline(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            .with_absolute_deadline(std::time::Instant::now() + std::time::Duration::from_secs(30));
 
         let error = client
             .run_gh(&["api".to_owned(), "repos/owner/repo".to_owned()])

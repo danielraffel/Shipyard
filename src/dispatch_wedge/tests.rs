@@ -1,6 +1,7 @@
 use chrono::TimeZone;
 
 use super::*;
+#[cfg(unix)]
 use crate::work_ledger::{
     native_publication_test_policy as policy, native_publication_test_request as request,
 };
@@ -206,6 +207,7 @@ fn threshold_and_second_stable_read_prevent_transient_classification() {
     assert_eq!(invalid_threshold.state, DispatchWedgeState::Indeterminate);
 }
 
+#[cfg(unix)]
 fn published() -> (tempfile::TempDir, DispatchWedgeAssessment) {
     let state = tempfile::tempdir().expect("state");
     let publication = request();
@@ -236,6 +238,7 @@ fn published() -> (tempfile::TempDir, DispatchWedgeAssessment) {
 }
 
 #[test]
+#[cfg(unix)]
 fn durable_publication_records_exact_evidence_and_enqueues_once() {
     let (state, report) = published();
     let evidence = report.evidence.as_ref().expect("evidence");
@@ -289,6 +292,7 @@ fn exact_identity_changes_produce_distinct_receipts_without_queue_mutation() {
 }
 
 #[test]
+#[cfg(unix)]
 fn retargeted_base_ref_refuses_publication() {
     let (state, mut report) = published();
     let evidence = report.evidence.as_mut().expect("evidence");

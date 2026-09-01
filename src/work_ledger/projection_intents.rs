@@ -900,9 +900,6 @@ mod tests {
         let connection = ledger.connect_read_write().expect("connection");
         super::super::reconstruct_authentic_v10_schema_for_test(&connection)
             .expect("authentic v10 fixture");
-        connection
-            .execute_batch("DROP TABLE dispatch_probe_targets;")
-            .expect("v10 has no dispatch probe state");
         drop(connection);
         let reopened = WorkLedger::open(state.path()).expect("migrated ledger");
         assert_eq!(

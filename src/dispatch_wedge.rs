@@ -470,6 +470,7 @@ fn transition_dedupe_key(evidence: &DispatchWedgeEvidence) -> String {
 }
 
 /// Result of projecting one exact wedge into the existing native wake ledger.
+#[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct DispatchWedgeWakeReceipt {
     pub(crate) dedupe_key: String,
@@ -481,6 +482,7 @@ pub(crate) struct DispatchWedgeWakeReceipt {
 
 /// Publish a classified wedge through the existing transactional lifecycle
 /// event and outbox. Non-wedge observations remain read-only.
+#[cfg(unix)]
 pub(crate) fn publish_dispatch_wedge(
     ledger: &crate::work_ledger::WorkLedger,
     repository_provider: Option<&str>,
