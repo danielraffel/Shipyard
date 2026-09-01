@@ -94,6 +94,29 @@ fn exact_queued_job_with_registered_compatible_idle_runner_is_dispatch_wedge() {
 }
 
 #[test]
+fn distinct_runner_ids_may_share_a_display_name_but_duplicate_ids_refuse() {
+    let first = runner();
+    let mut same_name = first.clone();
+    same_name.runner_id += 1;
+    let accepted = assess(&authority(), &[first.clone(), same_name]);
+    assert_eq!(accepted.state, DispatchWedgeState::DispatchWedge);
+    assert_eq!(
+        accepted
+            .evidence
+            .expect("evidence")
+            .eligible_idle_runners
+            .len(),
+        2
+    );
+
+    let mut conflicting_identity = first.clone();
+    conflicting_identity.name = "m5-slot2".to_owned();
+    let refused = assess(&authority(), &[first, conflicting_identity]);
+    assert_eq!(refused.state, DispatchWedgeState::Indeterminate);
+    assert_eq!(refused.reason, "compatible_runner_identity_duplicated");
+}
+
+#[test]
 fn unrelated_runner_churn_does_not_reset_stable_exact_capacity_read() {
     let authority = authority();
     let compatible = runner();

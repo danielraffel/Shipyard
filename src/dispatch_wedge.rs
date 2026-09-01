@@ -244,11 +244,11 @@ pub fn assess_dispatch_wedge(inputs: &DispatchWedgeInputs<'_>) -> DispatchWedgeA
     {
         return indeterminate("compatible_runner_identity_invalid");
     }
-    let compatible_names = compatible
+    let compatible_ids = compatible
         .iter()
-        .map(|runner| runner.name.to_ascii_lowercase())
+        .map(|runner| runner.runner_id)
         .collect::<BTreeSet<_>>();
-    if compatible_names.len() != compatible.len() {
+    if compatible_ids.len() != compatible.len() {
         return indeterminate("compatible_runner_identity_duplicated");
     }
     let mut eligible_idle_runners = compatible
