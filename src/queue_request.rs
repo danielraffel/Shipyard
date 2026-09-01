@@ -3261,6 +3261,10 @@ mod tests {
             let Ok(contents) = fs::read_to_string(&full_path) else {
                 continue;
             };
+            // Git may materialize checked-in workflow text with CRLF on
+            // Windows. Keep the source-surface assertion byte-independent
+            // while still requiring the exact normalized Linux-only block.
+            let contents = contents.replace("\r\n", "\n");
             if is_official_invocation_surface(&path) {
                 if path == EXPERIMENTAL_AUTHORITY_CI_WORKFLOW {
                     assert_ci_contains_only_source_checks(&contents);

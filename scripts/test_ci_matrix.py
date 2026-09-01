@@ -224,8 +224,8 @@ class CiMatrixTests(unittest.TestCase):
     def test_ci_rust_tests_do_not_inherit_runner_shipyard_configuration(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("SHIPYARD_TEST_HOME: ${{ runner.temp }}"), 2)
-        self.assertEqual(workflow.count("--features ci-test-home"), 2)
+        self.assertEqual(workflow.count("SHIPYARD_TEST_HOME: ${{ runner.temp }}"), 3)
+        self.assertEqual(workflow.count("--features ci-test-home"), 3)
         self.assertIn("Never let a self-hosted runner's production Shipyard", workflow)
         self.assertIn("Coverage executes the same tests", workflow)
 
