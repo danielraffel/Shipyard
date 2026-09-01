@@ -81,6 +81,48 @@ pub(crate) struct NativePublicationReport {
     pub(crate) wake_id: String,
     pub(crate) profile_digest: String,
     pub(crate) repo_policy_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) schema11_reconciliation: Option<Schema11ReconciliationReport>,
+}
+
+/// Typed disposition for every authentic-v11 projection row considered by a
+/// publication reconciliation. Rows not selected remain deliberately
+/// identity-unbound after the schema migration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Schema11RowDisposition {
+    BindExactTarget,
+    PreserveUnrelated,
+}
+
+impl Schema11RowDisposition {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::BindExactTarget => "bind_exact_target",
+            Self::PreserveUnrelated => "preserve_unrelated",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct Schema11ReconciliationItem {
+    pub(crate) work_id: String,
+    pub(crate) repository: String,
+    pub(crate) pull_request: u64,
+    pub(crate) exact_head: String,
+    pub(crate) workstream_handle: String,
+    pub(crate) disposition: Schema11RowDisposition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct Schema11ReconciliationReport {
+    pub(crate) snapshot_sha256: String,
+    pub(crate) schema_before: i64,
+    pub(crate) schema_after: i64,
+    pub(crate) applied: bool,
+    pub(crate) replay: bool,
+    pub(crate) target_work_id: String,
+    pub(crate) items: Vec<Schema11ReconciliationItem>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -199,6 +241,18 @@ impl WorkLedger {
         policy: &WorkstreamContinuationConfig,
         apply: bool,
     ) -> WorkLedgerResult<NativePublicationReport> {
+        Self::plan_or_apply_native_continuation_with_hook(state_dir, request, policy, apply, || {
+            Ok(())
+        })
+    }
+
+    fn plan_or_apply_native_continuation_with_hook(
+        state_dir: &std::path::Path,
+        request: &NativePublicationRequest,
+        policy: &WorkstreamContinuationConfig,
+        apply: bool,
+        pre_apply_hook: impl FnOnce() -> WorkLedgerResult<()>,
+    ) -> WorkLedgerResult<NativePublicationReport> {
         // Authorization must precede even SQLite creation. A refused machine,
         // repository, or malformed profile is not a native ledger event.
         validate_request(request, policy)?;
@@ -206,6 +260,64 @@ impl WorkLedger {
             return Err(WorkLedgerError::Refused(
                 "native publication requires Unix policy-binding verification".to_owned(),
             ));
+        }
+        if super::inventory::database_effective_schema_version(state_dir)? == Some(11)
+            && let Some(reconciliation) = plan_schema11_reconciliation(state_dir, request, policy)?
+        {
+            let identities = PublicationIdentities::legacy_for_request(request);
+            if !apply {
+                let mut report = native_publication_report(request, &identities, false, false);
+                report.schema11_reconciliation = Some(reconciliation);
+                return Ok(report);
+            }
+
+            pre_apply_hook()?;
+
+            let directory = Self::path_at(state_dir)
+                .parent()
+                .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?
+                .to_path_buf();
+            let _writer_domain =
+                crate::writer_domain_lease::acquire_exclusive_for_protected_path(&directory)?;
+            let current =
+                plan_schema11_reconciliation(state_dir, request, policy)?.ok_or_else(|| {
+                    WorkLedgerError::Refused(
+                        "schema-v11 reconciliation snapshot changed before apply".to_owned(),
+                    )
+                })?;
+            if current != reconciliation {
+                return Err(WorkLedgerError::Refused(
+                    "schema-v11 reconciliation snapshot changed before apply".to_owned(),
+                ));
+            }
+            let ledger = Self::open_under_writer_domain(state_dir)?;
+            ledger
+                .verify_repo_policy_revision(&request.repository, request.repo_policy_revision)?;
+            let planned = ledger.publish_native_continuation(request, policy, false)?;
+            if planned.work_id != reconciliation.target_work_id {
+                return Err(WorkLedgerError::Refused(
+                    "schema-v11 reconciliation selected a different work item after migration"
+                        .to_owned(),
+                ));
+            }
+            persist_native_policy_binding(state_dir, request, &planned)?;
+            let mut applied = ledger.publish_native_continuation(request, policy, true)?;
+            let reread = ledger.publish_native_continuation(request, policy, false)?;
+            if reread.work_id != applied.work_id
+                || reread.route_ref != applied.route_ref
+                || reread.wake_id != applied.wake_id
+                || !reread.replay
+            {
+                return Err(WorkLedgerError::Refused(
+                    "schema-v11 reconciliation did not replay exactly after apply".to_owned(),
+                ));
+            }
+            let mut applied_reconciliation = reconciliation;
+            applied_reconciliation.applied = true;
+            applied_reconciliation.replay = true;
+            applied_reconciliation.schema_after = super::SCHEMA_VERSION;
+            applied.schema11_reconciliation = Some(applied_reconciliation);
+            return Ok(applied);
         }
         let ledger = Self::open_existing(state_dir)?.ok_or_else(|| {
             WorkLedgerError::Refused("explicit repository policy is unavailable".to_owned())
@@ -978,6 +1090,334 @@ impl WorkLedger {
     }
 }
 
+fn plan_schema11_reconciliation(
+    state_dir: &Path,
+    request: &NativePublicationRequest,
+    policy: &WorkstreamContinuationConfig,
+) -> WorkLedgerResult<Option<Schema11ReconciliationReport>> {
+    let inspection = super::inventory::local_work_inventory_inspection(state_dir)?;
+    if inspection.schema_version != 11 {
+        return Ok(None);
+    }
+    if inspection.inventory.truncated {
+        return Err(WorkLedgerError::Refused(
+            "schema-v11 reconciliation inventory is truncated".to_owned(),
+        ));
+    }
+    let snapshot_sha256 = inspection.inventory.snapshot_sha256.ok_or_else(|| {
+        WorkLedgerError::Refused("schema-v11 reconciliation lacks a snapshot".to_owned())
+    })?;
+    let expected = PublicationIdentities::legacy_for_request(request);
+    let (expected_route, expected_adapters) = native_route(request, policy, &expected)?;
+    let snapshot_ledger = WorkLedger {
+        path: WorkLedger::path_at(state_dir),
+    };
+    let (policy_snapshot, policy_matches) =
+        super::inventory::immutable_schema11_query(state_dir, |connection| {
+            let policy_matches = connection.query_row(
+                "SELECT COUNT(*) FROM repo_policies WHERE repo = ?1 AND revision = ?2",
+                params![request.repository, request.repo_policy_revision],
+                |row| row.get::<_, u64>(0),
+            )?;
+            verify_schema11_publication_authority(
+                &snapshot_ledger,
+                connection,
+                request,
+                &expected,
+            )?;
+            verify_schema11_route_authority(connection, &expected_route, &expected_adapters)?;
+            Ok(policy_matches)
+        })?;
+    if policy_snapshot != snapshot_sha256 || policy_matches != 1 {
+        return Err(WorkLedgerError::Refused(
+            "schema-v11 repository policy revision is absent or changed".to_owned(),
+        ));
+    }
+    let expected_repository = request
+        .legacy_repository_alias
+        .as_deref()
+        .unwrap_or(&request.repository);
+    let mut target_count = 0_usize;
+    let mut items = Vec::with_capacity(inspection.inventory.items.len());
+    for item in inspection.inventory.items {
+        if item.repository_provider.is_some()
+            || item.repository_id.is_some()
+            || item.root_uuid.is_some()
+        {
+            return Err(WorkLedgerError::Refused(
+                "schema-v11 reconciliation found foreign repository identity".to_owned(),
+            ));
+        }
+        let exact = item.work_item_id == expected.work_id
+            && item.repository == expected_repository
+            && item.pull_request == request.pull_request
+            && item.exact_head == request.head_sha
+            && item.workstream_handle == request.workstream_handle;
+        if item.work_item_id == expected.work_id && !exact {
+            return Err(WorkLedgerError::Refused(
+                "schema-v11 target repository, PR, head, or workstream disagrees".to_owned(),
+            ));
+        }
+        if exact {
+            target_count += 1;
+        }
+        items.push(Schema11ReconciliationItem {
+            work_id: item.work_item_id,
+            repository: item.repository,
+            pull_request: item.pull_request,
+            exact_head: item.exact_head,
+            workstream_handle: item.workstream_handle,
+            disposition: if exact {
+                Schema11RowDisposition::BindExactTarget
+            } else {
+                Schema11RowDisposition::PreserveUnrelated
+            },
+        });
+    }
+    if target_count != 1 {
+        return Err(WorkLedgerError::Refused(
+            "schema-v11 publication target is absent or ambiguous".to_owned(),
+        ));
+    }
+    Ok(Some(Schema11ReconciliationReport {
+        snapshot_sha256,
+        schema_before: 11,
+        schema_after: 11,
+        applied: false,
+        replay: false,
+        target_work_id: expected.work_id,
+        items,
+    }))
+}
+
+#[allow(clippy::type_complexity)]
+fn verify_schema11_route_authority(
+    connection: &rusqlite::Connection,
+    expected: &RouteRegistration,
+    adapters: &[AdapterBindingRecord],
+) -> WorkLedgerResult<()> {
+    type StoredRoute = (
+        String,
+        String,
+        u64,
+        String,
+        u64,
+        u64,
+        String,
+        String,
+        String,
+        String,
+        Vec<u8>,
+        String,
+        String,
+    );
+    let stored: StoredRoute = connection
+        .query_row(
+            "SELECT work_item_id, head_sha, work_generation, owner_ref, owner_generation,
+                    revision, origin_machine_ref, terminal_kind, agent_kind, provider_kind,
+                    payload_json, payload_digest, integrity_hash
+               FROM route_records WHERE route_ref = ?1",
+            [&expected.route_ref],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => {
+                WorkLedgerError::Refused("schema-v11 publication route is absent".to_owned())
+            }
+            other => WorkLedgerError::Sql(other),
+        })?;
+    let payload = serde_json::to_vec(&expected.provenance).map_err(|_| {
+        WorkLedgerError::Refused("expected schema-v11 route cannot be serialized".to_owned())
+    })?;
+    let exact = stored.0 == expected.work_id
+        && stored.1 == expected.head_sha
+        && stored.2 == expected.work_generation
+        && stored.3 == expected.owner_ref
+        && stored.4 == expected.owner_generation
+        && stored.5 == expected.revision
+        && stored.6 == expected.origin_machine_ref
+        && stored.7 == expected.provenance.terminal_kind()
+        && stored.8 == expected.provenance.agent_kind()
+        && stored.9 == expected.provenance.provider_kind()
+        && stored.10 == payload
+        && stored.11 == digest(&payload)
+        && stored.12 == expected.envelope_integrity;
+    if !exact {
+        return Err(WorkLedgerError::Refused(
+            "schema-v11 publication route authority disagrees".to_owned(),
+        ));
+    }
+    for adapter in adapters {
+        let exact: Option<bool> = connection
+            .query_row(
+                "SELECT axis = ?2 AND name = ?3 AND generation = ?4 AND revision = ?5
+                        AND implementation_digest = ?6 AND configuration_digest = ?7
+                        AND capabilities_digest = ?8 AND state = 'active'
+                   FROM adapter_registry WHERE registry_ref = ?1",
+                params![
+                    adapter.registry_ref.as_str(),
+                    adapter.axis.as_str(),
+                    adapter.name,
+                    adapter.generation,
+                    adapter.revision,
+                    adapter.implementation_sha256.as_str(),
+                    adapter.configuration_sha256.as_str(),
+                    adapter.capabilities_sha256.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exact != Some(true) {
+            return Err(WorkLedgerError::Refused(
+                "schema-v11 publication adapter authority disagrees".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_schema11_publication_authority(
+    ledger: &WorkLedger,
+    connection: &rusqlite::Connection,
+    request: &NativePublicationRequest,
+    expected: &PublicationIdentities,
+) -> WorkLedgerResult<()> {
+    let expected_repository = request
+        .legacy_repository_alias
+        .as_deref()
+        .unwrap_or(&request.repository);
+    let exact: bool = connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+             FROM work_items work
+             JOIN workstream_projection_bindings binding
+               ON binding.work_item_id = work.id
+            WHERE work.id = ?1 AND work.kind = 'terminal_handoff'
+              AND work.repo = ?2 AND work.pr = ?3 AND work.head_sha = ?4
+              AND work.owner_generation = ?5 AND work.source_digest = ?6
+              AND work.phase IN ('managed', 'waiting', 'actionable', 'dispatching',
+                                 'agent_owned_repair', 'returned', 'terminal')
+              AND binding.repository = ?2 AND binding.exact_head = ?4
+              AND binding.workstream_handle = ?7 AND binding.plan_sha256 = ?8
+              AND binding.root_revision = ?9 AND binding.issue_revision = ?10
+              AND binding.projection_revision = ?11
+              AND binding.material_event_revision = ?12
+              AND EXISTS (
+                SELECT 1 FROM imports import
+                 WHERE import.work_item_id = work.id AND import.source_ref = ?13
+                   AND import.content_digest = ?6
+              )
+              AND EXISTS (
+                SELECT 1 FROM continuation_contracts continuation
+                 WHERE continuation.work_item_id = work.id
+                   AND continuation.success_contract_digest = ?14
+                   AND continuation.failure_contract_digest = ?15
+                   AND continuation.revision = 1
+              )
+              AND EXISTS (
+                SELECT 1 FROM route_records route
+                 WHERE route.route_ref = ?16 AND route.work_item_id = work.id
+                   AND route.head_sha = ?4 AND route.owner_generation = ?5
+              )
+              AND EXISTS (
+                SELECT 1 FROM protected_objects profile
+                 WHERE profile.work_item_id = work.id AND profile.kind = 'launch_profile'
+                   AND profile.profile_ref = ?17 AND profile.content_digest = ?18
+              )
+         )",
+        params![
+            expected.work_id,
+            expected_repository,
+            request.pull_request,
+            request.head_sha,
+            request.owner_generation,
+            expected.publication_digest,
+            request.workstream_handle,
+            request.plan_sha256,
+            request.root_revision,
+            request.issue_revision,
+            request.projection_revision,
+            request.material_event_revision,
+            expected.source_ref,
+            request.success_continuation_digest,
+            request.failure_continuation_digest,
+            expected.route_ref,
+            expected.profile_ref,
+            request.profile_digest,
+        ],
+        |row| row.get(0),
+    )?;
+    if !exact {
+        return Err(WorkLedgerError::Refused(
+            "schema-v11 publication authority disagrees with the authenticated request".to_owned(),
+        ));
+    }
+    verify_schema11_protected_profile(ledger, connection, request, expected)
+}
+
+fn verify_schema11_protected_profile(
+    ledger: &WorkLedger,
+    connection: &rusqlite::Connection,
+    request: &NativePublicationRequest,
+    expected: &PublicationIdentities,
+) -> WorkLedgerResult<()> {
+    let (storage_name, profile) = connection
+        .query_row(
+            "SELECT storage_name, object_ref, work_item_id, kind, profile_ref,
+                    content_digest, byte_length
+               FROM protected_objects
+              WHERE work_item_id = ?1 AND kind = 'launch_profile'
+                AND profile_ref = ?2 AND content_digest = ?3",
+            params![
+                expected.work_id,
+                expected.profile_ref,
+                request.profile_digest
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    super::ProtectedObjectRecord {
+                        object_ref: row.get(1)?,
+                        work_item_id: row.get(2)?,
+                        kind: row.get(3)?,
+                        profile_ref: row.get(4)?,
+                        content_digest: row.get(5)?,
+                        byte_length: row.get(6)?,
+                    },
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => WorkLedgerError::Refused(
+                "schema-v11 publication lacks its exact protected launch profile".to_owned(),
+            ),
+            other => WorkLedgerError::Sql(other),
+        })?;
+    let bytes = ledger.read_protected_object_snapshot(&storage_name, &profile)?;
+    if bytes != request.protected_profile_bytes {
+        return Err(WorkLedgerError::Refused(
+            "schema-v11 protected launch profile bytes disagree".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_native_policy_binding(
     state_dir: &Path,
     repository: &str,
@@ -1352,6 +1792,14 @@ impl PublicationIdentities {
         Self::from_work_seed(request, &work_seed, true)
     }
 
+    fn legacy_for_request(request: &NativePublicationRequest) -> Self {
+        let mut legacy_request = request.clone();
+        if let Some(alias) = &request.legacy_repository_alias {
+            legacy_request.repository.clone_from(alias);
+        }
+        Self::legacy(&legacy_request)
+    }
+
     fn from_work_seed(request: &NativePublicationRequest, work_seed: &str, legacy: bool) -> Self {
         let authority_seed = format!(
             "{work_seed}\n{}\n{}",
@@ -1435,6 +1883,7 @@ fn native_publication_report(
         wake_id: identities.wake_id.clone(),
         profile_digest: request.profile_digest.clone(),
         repo_policy_revision: request.repo_policy_revision,
+        schema11_reconciliation: None,
     }
 }
 
@@ -1676,6 +2125,8 @@ pub(crate) mod tests {
     use crate::work_ledger::{
         DeliveryAuthorization, ProviderAuthorizationOperation, ReconciliationAuthorization,
     };
+    #[cfg(unix)]
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use tempfile::TempDir;
@@ -1954,6 +2405,492 @@ pub(crate) mod tests {
             )
             .expect("legacy NULL repository binding");
         legacy
+    }
+
+    #[cfg(unix)]
+    fn seed_authentic_v11(
+        state_dir: &std::path::Path,
+        request: &NativePublicationRequest,
+        continuation_policy: &WorkstreamContinuationConfig,
+    ) -> PublicationIdentities {
+        let legacy = seed_unbound_legacy_v11(state_dir, request);
+        WorkLedger::plan_or_apply_native_continuation(
+            state_dir,
+            request,
+            continuation_policy,
+            true,
+        )
+        .expect("seed complete legacy publication");
+        let ledger = WorkLedger::open_existing(state_dir)
+            .expect("open seeded ledger")
+            .expect("seeded ledger");
+        let unrelated_request = NativePublicationRequest {
+            pull_request: request.pull_request + 1,
+            head_sha: "d".repeat(40),
+            workstream_handle: "GEN-44".to_owned(),
+            ..request.clone()
+        };
+        let unrelated = PublicationIdentities::legacy(&unrelated_request);
+        ledger
+            .ensure_native_work_item(&unrelated_request, &unrelated)
+            .expect("unrelated v11 work item");
+        ledger
+            .ensure_projection_binding(&unrelated_request, &unrelated.work_id)
+            .expect("unrelated v11 projection binding");
+        let connection = ledger
+            .connect_read_write()
+            .expect("authentic v11 fixture connection");
+        super::super::storage::reconstruct_authentic_v11_schema_for_test(&connection)
+            .expect("authentic production v11 schema");
+        drop(connection);
+        drop(ledger);
+        legacy
+    }
+
+    #[cfg(unix)]
+    fn state_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let mut entries = std::fs::read_dir(path)
+                .expect("read state tree")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("state entries");
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                if entry.file_type().expect("entry type").is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root)
+                            .expect("relative state path")
+                            .to_path_buf(),
+                        std::fs::read(path).expect("state bytes"),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_publication_reconciliation_is_zero_write_then_exact_and_idempotent() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        let legacy = seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        let before = state_tree_bytes(temp.path());
+
+        let planned = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &request,
+            &continuation_policy,
+            false,
+        )
+        .expect("plan v11 reconciliation");
+
+        assert_eq!(state_tree_bytes(temp.path()), before);
+        assert_eq!(planned.work_id, legacy.work_id);
+        let reconciliation = planned
+            .schema11_reconciliation
+            .as_ref()
+            .expect("typed v11 plan");
+        assert!(!reconciliation.applied);
+        assert_eq!(reconciliation.schema_before, 11);
+        assert_eq!(reconciliation.schema_after, 11);
+        assert_eq!(reconciliation.items.len(), 2);
+        assert_eq!(
+            reconciliation.items[0].disposition,
+            Schema11RowDisposition::BindExactTarget
+        );
+        assert_eq!(
+            reconciliation.items[1].disposition,
+            Schema11RowDisposition::PreserveUnrelated
+        );
+
+        let applied = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &request,
+            &continuation_policy,
+            true,
+        )
+        .expect("apply v11 reconciliation");
+        assert!(applied.applied);
+        assert!(!applied.replay);
+        assert_eq!(applied.work_id, legacy.work_id);
+        assert_eq!(
+            applied
+                .schema11_reconciliation
+                .as_ref()
+                .expect("applied reconciliation")
+                .schema_after,
+            super::super::SCHEMA_VERSION
+        );
+        assert!(
+            applied
+                .schema11_reconciliation
+                .as_ref()
+                .expect("applied reconciliation")
+                .replay
+        );
+
+        let replay = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &request,
+            &continuation_policy,
+            true,
+        )
+        .expect("exact replay");
+        assert!(replay.replay);
+        assert!(!replay.applied);
+        assert_eq!(replay.work_id, applied.work_id);
+        let inventory = super::super::local_work_inventory(temp.path()).expect("current inventory");
+        assert_eq!(inventory.items.len(), 2);
+        assert_eq!(
+            inventory.items[0].repository_id.as_deref(),
+            Some(request.repository_id.as_str())
+        );
+        assert_eq!(inventory.items[1].repository_id, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_schema_committed_in_live_wal_does_not_route_as_v11() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        let database = WorkLedger::path_at(temp.path());
+        let reader = rusqlite::Connection::open(&database).expect("checkpoint-blocking reader");
+        reader
+            .execute_batch("PRAGMA wal_autocheckpoint = 0; BEGIN; SELECT * FROM work_items;")
+            .expect("hold pre-migration read snapshot");
+
+        let migrated = WorkLedger::open(temp.path()).expect("migrate through live WAL");
+        assert_eq!(
+            super::super::inventory::database_schema_from_header(
+                &std::fs::read(&database).expect("main database bytes")
+            )
+            .expect("main-file schema"),
+            11
+        );
+        let writer = migrated.connect_read_write().expect("current WAL writer");
+        writer
+            .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable WAL autocheckpoint");
+        for index in 0..1_100 {
+            writer
+                .execute(
+                    "UPDATE work_items SET phase = ?1 WHERE id = ?2",
+                    params![
+                        if index % 2 == 0 { "managed" } else { "claimed" },
+                        PublicationIdentities::legacy(&request).work_id,
+                    ],
+                )
+                .expect("grow current WAL");
+        }
+        assert!(
+            std::fs::metadata(database.with_extension("sqlite3-wal"))
+                .expect("live WAL")
+                .len()
+                > super::super::inventory::MAX_SQLITE_SIDECAR_BYTES
+        );
+        let before = state_tree_bytes(temp.path());
+
+        assert_eq!(
+            super::super::inventory::database_effective_schema_version(temp.path())
+                .expect("WAL-aware schema"),
+            Some(super::super::SCHEMA_VERSION)
+        );
+        assert_eq!(
+            super::super::inventory::immutable_legacy_status(temp.path())
+                .expect("current status routing"),
+            None
+        );
+        assert_eq!(state_tree_bytes(temp.path()), before);
+
+        drop(migrated);
+        reader.execute_batch("ROLLBACK;").expect("release reader");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_with_live_wal_refuses_without_migration() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        let writer =
+            rusqlite::Connection::open(WorkLedger::path_at(temp.path())).expect("v11 WAL writer");
+        writer
+            .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable WAL autocheckpoint");
+        writer
+            .execute(
+                "UPDATE work_items SET phase = 'managed' WHERE id = ?1",
+                [PublicationIdentities::legacy(&request).work_id],
+            )
+            .expect("commit v11 WAL frame");
+        assert_eq!(
+            super::super::inventory::database_effective_schema_version(temp.path())
+                .expect("effective v11 schema"),
+            Some(11)
+        );
+        let before = state_tree_bytes(temp.path());
+
+        let error = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &request,
+            &continuation_policy,
+            false,
+        )
+        .expect_err("immutable v11 must refuse a live WAL");
+        assert!(error.to_string().contains("uncheckpointed WAL"));
+        assert_eq!(state_tree_bytes(temp.path()), before);
+        assert_eq!(
+            super::super::inventory::database_effective_schema_version(temp.path())
+                .expect("still v11"),
+            Some(11)
+        );
+
+        let wal_path = WorkLedger::path_at(temp.path()).with_extension("sqlite3-wal");
+        let mut corrupt_wal = std::fs::read(&wal_path).expect("v11 WAL bytes");
+        corrupt_wal[48] ^= 1;
+        std::fs::write(&wal_path, corrupt_wal).expect("corrupt frame checksum fixture");
+        let error = super::super::inventory::database_effective_schema_version(temp.path())
+            .expect_err("checksum-invalid WAL must refuse schema routing");
+        assert!(error.to_string().contains("checksum is invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_apply_refuses_snapshot_drift_before_migration() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+
+        let error = WorkLedger::plan_or_apply_native_continuation_with_hook(
+            temp.path(),
+            &request,
+            &continuation_policy,
+            true,
+            || {
+                let connection = rusqlite::Connection::open(WorkLedger::path_at(temp.path()))?;
+                connection.execute(
+                    "UPDATE repo_policies SET primary_platform = 'linux' WHERE repo = ?1",
+                    [&request.repository],
+                )?;
+                connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                Ok(())
+            },
+        )
+        .expect_err("snapshot drift must refuse");
+
+        assert!(error.to_string().contains("snapshot changed before apply"));
+        assert_eq!(
+            super::super::inventory::database_effective_schema_version(temp.path())
+                .expect("schema header"),
+            Some(11)
+        );
+        let inventory = super::super::local_work_inventory(temp.path()).expect("v11 inventory");
+        assert_eq!(inventory.items.len(), 2);
+        assert!(
+            inventory
+                .items
+                .iter()
+                .all(|item| item.repository_id.is_none())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_reconciliation_refuses_corrupt_profile_before_migration() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        let object_directory = temp.path().join("work-ledger/protected-objects");
+        let object = std::fs::read_dir(&object_directory)
+            .expect("protected objects")
+            .next()
+            .expect("target protected object")
+            .expect("protected object entry")
+            .path();
+        std::fs::write(object, b"corrupt profile").expect("corrupt profile fixture");
+
+        for apply in [false, true] {
+            WorkLedger::plan_or_apply_native_continuation(
+                temp.path(),
+                &request,
+                &continuation_policy,
+                apply,
+            )
+            .expect_err("corrupt profile must refuse");
+            assert_eq!(
+                super::super::inventory::database_effective_schema_version(temp.path())
+                    .expect("schema header"),
+                Some(11)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_reconciliation_refuses_route_drift_before_migration() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        let connection = rusqlite::Connection::open(WorkLedger::path_at(temp.path()))
+            .expect("route drift fixture");
+        connection
+            .execute(
+                "UPDATE route_records SET integrity_hash = ?1",
+                ["0".repeat(64)],
+            )
+            .expect("drift route authority");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint route drift");
+        drop(connection);
+
+        for apply in [false, true] {
+            let error = WorkLedger::plan_or_apply_native_continuation(
+                temp.path(),
+                &request,
+                &continuation_policy,
+                apply,
+            )
+            .expect_err("route drift must refuse");
+            assert!(error.to_string().contains("route authority disagrees"));
+            assert_eq!(
+                super::super::inventory::database_effective_schema_version(temp.path())
+                    .expect("schema header"),
+                Some(11)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_reconciliation_refuses_wrong_identity_and_unbound_rows() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        for changed in [
+            NativePublicationRequest {
+                repository: "other/repo".to_owned(),
+                ..request.clone()
+            },
+            NativePublicationRequest {
+                pull_request: request.pull_request + 1,
+                ..request.clone()
+            },
+            NativePublicationRequest {
+                head_sha: "c".repeat(40),
+                ..request.clone()
+            },
+            NativePublicationRequest {
+                workstream_handle: "GEN-99".to_owned(),
+                ..request.clone()
+            },
+        ] {
+            assert!(
+                WorkLedger::plan_or_apply_native_continuation(
+                    temp.path(),
+                    &changed,
+                    &policy(vec![changed.repository.clone()]),
+                    false,
+                )
+                .is_err()
+            );
+        }
+        let changed_plan = NativePublicationRequest {
+            plan_sha256: "e".repeat(64),
+            ..request.clone()
+        };
+        for apply in [false, true] {
+            let error = WorkLedger::plan_or_apply_native_continuation(
+                temp.path(),
+                &changed_plan,
+                &continuation_policy,
+                apply,
+            )
+            .expect_err("legacy plan authority mismatch must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("publication authority disagrees")
+            );
+            assert_eq!(
+                super::super::inventory::database_effective_schema_version(temp.path())
+                    .expect("schema header"),
+                Some(11)
+            );
+        }
+        for changed in [
+            NativePublicationRequest {
+                root_revision: request.root_revision + 1,
+                ..request.clone()
+            },
+            NativePublicationRequest {
+                owner_generation: request.owner_generation + 1,
+                ..request.clone()
+            },
+            NativePublicationRequest {
+                success_continuation_digest: "f".repeat(64),
+                ..request.clone()
+            },
+        ] {
+            for apply in [false, true] {
+                WorkLedger::plan_or_apply_native_continuation(
+                    temp.path(),
+                    &changed,
+                    &continuation_policy,
+                    apply,
+                )
+                .expect_err("legacy authority mismatch must refuse");
+                assert_eq!(
+                    super::super::inventory::database_effective_schema_version(temp.path())
+                        .expect("schema header"),
+                    Some(11)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_reconciliation_refuses_unbound_rows() {
+        let unbound = TempDir::new().expect("unbound temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_repo_policy(unbound.path(), &request.repository);
+        let ledger = WorkLedger::open(unbound.path()).expect("unbound ledger");
+        let unbound_identity = PublicationIdentities::legacy(&request);
+        ledger
+            .ensure_native_work_item(&request, &unbound_identity)
+            .expect("unbound row");
+        let connection = ledger.connect_read_write().expect("v11 fixture");
+        super::super::storage::reconstruct_authentic_v11_schema_for_test(&connection)
+            .expect("authentic v11");
+        drop(connection);
+        drop(ledger);
+        assert!(
+            WorkLedger::plan_or_apply_native_continuation(
+                unbound.path(),
+                &request,
+                &continuation_policy,
+                false,
+            )
+            .expect_err("unbound row must refuse")
+            .to_string()
+            .contains("unbound local work row")
+        );
     }
 
     #[cfg(unix)]

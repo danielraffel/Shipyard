@@ -63,6 +63,24 @@ pub(crate) struct ProtectedObjectRecord {
 }
 
 impl WorkLedger {
+    pub(super) fn read_protected_object_snapshot(
+        &self,
+        stored_name: &str,
+        record: &ProtectedObjectRecord,
+    ) -> WorkLedgerResult<Vec<u8>> {
+        let expected_name = storage_name(&record.object_ref)?;
+        if stored_name != expected_name {
+            return Err(WorkLedgerError::Refused(
+                "protected object storage identity disagrees".to_owned(),
+            ));
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        read_object_file(parent, &expected_name, record)
+    }
+
     /// Remove only safe, unpublished temporary objects while the caller owns
     /// the work-ledger writer domain. Final object files are never removed.
     pub(super) fn reconcile_protected_object_storage(&self) -> WorkLedgerResult<()> {

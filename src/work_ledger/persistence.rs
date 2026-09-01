@@ -24,6 +24,14 @@ impl WorkLedger {
         reject_symlink_if_present(state_dir, &dir, "ledger directory")?;
         let _writer_domain =
             crate::writer_domain_lease::acquire_exclusive_for_protected_path(&dir)?;
+        Self::open_under_writer_domain(state_dir)
+    }
+
+    /// Open and migrate while the caller retains the exclusive writer-domain
+    /// fence across a larger exact-snapshot reconciliation transaction.
+    pub(super) fn open_under_writer_domain(state_dir: &Path) -> WorkLedgerResult<Self> {
+        let dir = state_dir.join("work-ledger");
+        reject_symlink_if_present(state_dir, &dir, "ledger directory")?;
         crate::writer_domain_lease::ensure_protected_dir_all(&dir)?;
         let ledger = Self {
             path: dir.join(DATABASE_NAME),

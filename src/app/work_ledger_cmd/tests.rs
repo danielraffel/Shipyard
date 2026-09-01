@@ -267,6 +267,7 @@ fn publication_json_is_stable_and_exposes_no_private_profile() {
         wake_id: "wake:test".to_owned(),
         profile_digest: "a".repeat(64),
         repo_policy_revision: 1,
+        schema11_reconciliation: None,
     };
     let mut output = Vec::new();
     write_publication_report(&mut output, &report, true).expect("publication json");
