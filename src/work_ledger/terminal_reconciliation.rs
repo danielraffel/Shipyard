@@ -202,6 +202,186 @@ struct TerminalEvidenceV1<'a> {
 }
 
 impl WorkLedger {
+    /// Zero-write preview for an uncertain dispatch. The preview projects the
+    /// next terminal generation in memory, then describes the same immutable
+    /// receipt/event/binding that `--apply` will commit.
+    pub(crate) fn plan_uncertain_dispatch_reconciliation(
+        &self,
+        request: &TerminalReconciliationRequest,
+    ) -> WorkLedgerResult<TerminalReconciliationReport> {
+        validate_request(request)?;
+        let target = self.terminal_reconciliation_target(
+            &request.repository,
+            request.pull_request,
+            &request.head_sha,
+        )?;
+        if target.work_id != request.work_id
+            || target.phase != "dispatching"
+            || target.work_generation != request.work_generation
+        {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation dispatch target changed".to_owned(),
+            ));
+        }
+        let connection = self.connect_read_only()?;
+        let (deliveries, uncertain): (u64, u64) = connection.query_row(
+            "SELECT COUNT(delivery.delivery_id),
+                    COALESCE(SUM(delivery.state = 'uncertain'), 0)
+               FROM outbox wake
+               JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+              WHERE wake.work_item_id = ?1 AND wake.wake_id = ?2
+                AND wake.state = 'uncertain'",
+            params![request.work_id, request.wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if deliveries != 1 || uncertain != 1 {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation requires an uncertain wake and delivery".to_owned(),
+            ));
+        }
+        if projection_binding(&connection, &request.work_id)?.is_some()
+            || ownership_root_exists(&connection, &request.work_id)?
+        {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation dispatch target already has projection state".to_owned(),
+            ));
+        }
+        let mut projected = request.clone();
+        projected.work_generation = projected
+            .work_generation
+            .checked_add(1)
+            .ok_or_else(|| WorkLedgerError::Refused("work generation exhausted".to_owned()))?;
+        let evidence_digest = digest(&terminal_evidence_bytes(&projected)?);
+        let plan_sha256 = reconciliation_plan_digest(&projected, &evidence_digest)?;
+        Ok(TerminalReconciliationReport {
+            applied: false,
+            replay: false,
+            work_id: projected.work_id,
+            workstream_handle: projected.workstream_handle,
+            repository: projected.repository,
+            pull_request: projected.pull_request,
+            exact_head: projected.head_sha,
+            merge_sha: projected.merge_sha,
+            merged_at: projected.merged_at,
+            receipt_sha256: evidence_digest,
+            plan_sha256,
+        })
+    }
+
+    /// Close a dispatching handoff whose provider wake is durably uncertain
+    /// after an exact merged-head proof. This is deliberately separate from
+    /// projection reconciliation: it only advances the existing lifecycle
+    /// generation to terminal and never creates ownership or routing state.
+    pub(crate) fn finalize_uncertain_dispatch(
+        &self,
+        target: &TerminalReconciliationTarget,
+    ) -> WorkLedgerResult<bool> {
+        self.finalize_uncertain_dispatch_with_authority(target, || Ok(()))
+    }
+
+    /// Same transition, but require the caller's final authenticated authority
+    /// reread while writer custody is held and immediately before mutation.
+    pub(crate) fn finalize_uncertain_dispatch_with_authority(
+        &self,
+        target: &TerminalReconciliationTarget,
+        final_authority: impl FnOnce() -> WorkLedgerResult<()>,
+    ) -> WorkLedgerResult<bool> {
+        if target.phase != LifecycleState::Dispatching.as_str() {
+            return Ok(false);
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Hold the immediate transaction while obtaining the final remote
+        // proof so no competing writer can invalidate the fenced snapshot.
+        final_authority()?;
+        let phase: Option<String> = transaction
+            .query_row(
+                "SELECT phase FROM work_items
+                 WHERE id = ?1 AND work_generation = ?2 AND owner_generation = ?3",
+                params![
+                    target.work_id,
+                    target.work_generation,
+                    target.owner_generation
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(phase) = phase else {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation work generation no longer matches".to_owned(),
+            ));
+        };
+        if phase != LifecycleState::Dispatching.as_str() {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation dispatch phase changed".to_owned(),
+            ));
+        }
+        let (deliveries, uncertain): (u64, u64) = transaction.query_row(
+            "SELECT COUNT(delivery.delivery_id),
+                    COALESCE(SUM(delivery.state = 'uncertain'), 0)
+               FROM outbox wake
+               JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+              WHERE wake.work_item_id = ?1 AND wake.wake_id = ?2
+                AND wake.state = 'uncertain'",
+            params![target.work_id, target.wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if deliveries != 1 || uncertain != 1 {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation requires an uncertain wake and delivery".to_owned(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let changed = transaction.execute(
+            "UPDATE work_items SET phase = 'terminal', work_generation = work_generation + 1,
+                    updated_at = ?1
+              WHERE id = ?2 AND work_generation = ?3 AND owner_generation = ?4",
+            params![
+                now,
+                target.work_id,
+                target.work_generation,
+                target.owner_generation
+            ],
+        )?;
+        if changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation work generation no longer matches".to_owned(),
+            ));
+        }
+        let payload = digest(
+            format!(
+                "terminal-dispatch-reconciled\n{}\n{}\n{}\n{}\n{}",
+                target.work_id,
+                target.work_generation,
+                target.owner_generation,
+                target.wake_id,
+                target.exact_head
+            )
+            .as_bytes(),
+        );
+        record_event(
+            &transaction,
+            &target.work_id,
+            target.work_generation + 1,
+            target.owner_generation,
+            "terminal_dispatch_reconciled",
+            Some(LifecycleState::Dispatching),
+            LifecycleState::Terminal,
+            &payload,
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// List only incomplete terminal projection identities. The ordinary
     /// inventory remains fail-closed and never treats these rows as authority.
     pub(crate) fn terminal_reconciliation_inventory(
@@ -231,7 +411,7 @@ impl WorkLedger {
                 AND wake.work_generation = work.work_generation - 1
                 AND wake.owner_generation = work.owner_generation
                 AND (wake.profile_ref = profile.profile_ref
-                     OR (wake.profile_ref IS NULL AND wake.state = 'failed'))
+                     OR (wake.profile_ref IS NULL AND wake.state IN ('failed', 'uncertain')))
               WHERE binding.work_item_id IS NULL AND work.kind = 'terminal_handoff'
                 AND work.phase = 'terminal'
               ORDER BY work.id LIMIT ?1",
@@ -301,12 +481,13 @@ impl WorkLedger {
                  ON wake.work_item_id = work.id
                 AND wake.route_ref = work.repair_route_ref
                 AND wake.payload_digest = profile.content_digest
-                AND wake.work_generation = work.work_generation - 1
+                AND (wake.work_generation = work.work_generation - 1
+                     OR (work.phase = 'dispatching' AND wake.work_generation = work.work_generation))
                 AND wake.owner_generation = work.owner_generation
                 AND (wake.profile_ref = profile.profile_ref
-                     OR (wake.profile_ref IS NULL AND wake.state = 'failed'))
-              WHERE work.kind = 'terminal_handoff' AND work.phase = 'terminal'
-                AND work.repo = ?1 AND work.pr = ?2 AND work.head_sha = ?3
+                     OR (wake.profile_ref IS NULL AND wake.state IN ('failed', 'uncertain')))
+              WHERE work.kind = 'terminal_handoff' AND work.phase IN ('terminal', 'dispatching')
+                AND lower(work.repo) = ?1 AND work.pr = ?2 AND lower(work.head_sha) = ?3
                 AND (NOT EXISTS(
                        SELECT 1 FROM workstream_projection_bindings binding
                         WHERE binding.work_item_id = work.id)
@@ -865,14 +1046,17 @@ fn validate_existing_native_authority(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let wake_exact = matches!(wakes.as_slice(), [wake] if
+    let wake_exact = if let [wake] = wakes.as_slice() {
         wake.0 == request.wake_id
             && wake.1 == request.route_ref
             && wake.3 == request.profile_digest
             && wake.5.checked_add(1) == Some(request.work_generation)
             && wake.6 == request.owner_generation
             && (wake.2.as_deref() == Some(profile_ref.as_str())
-                || (wake.2.is_none() && wake.4 == "failed")));
+                || (wake.2.is_none() && (wake.4 == "failed" || wake.4 == "uncertain")))
+    } else {
+        false
+    };
     let continuations_exact: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM continuation_contracts
                         WHERE work_item_id = ?1 AND success_contract_digest = ?2
@@ -2092,5 +2276,31 @@ pub(crate) mod tests {
             .expect("exact replay");
         assert!(replay.replay);
         assert!(!replay.applied);
+    }
+
+    #[test]
+    fn dispatching_target_requires_durable_uncertain_delivery_before_terminalizing() {
+        let temp = TempDir::new().expect("temp");
+        let (request, ledger) = seed_unbound_terminal(temp.path());
+        ledger
+            .connect_read_write()
+            .expect("fixture connection")
+            .execute(
+                "UPDATE work_items SET phase = 'dispatching' WHERE id = ?1",
+                [&request.work_id],
+            )
+            .expect("fixture dispatching row");
+        let target = ledger
+            .terminal_reconciliation_target(
+                &request.repository,
+                request.pull_request,
+                &request.head_sha,
+            )
+            .expect("exact dispatching target");
+        assert_eq!(target.phase, "dispatching");
+        let error = ledger
+            .finalize_uncertain_dispatch(&target)
+            .expect_err("pending/absent delivery must refuse");
+        assert!(error.to_string().contains("uncertain wake and delivery"));
     }
 }
