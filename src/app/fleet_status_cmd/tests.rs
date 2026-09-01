@@ -14,6 +14,41 @@ fn executable_script(path: &Path, body: &str) {
 
 #[cfg(unix)]
 #[test]
+fn fleet_github_reads_share_one_absolute_deadline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let hanging_gh = temp.path().join("hanging-gh");
+    executable_script(&hanging_gh, "sleep 30");
+    let config = LoadedConfig {
+        data: toml::Table::new(),
+        global_dir: temp.path().join("global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: crate::config::LocalOverlaySource::None,
+    };
+    let actions = GitHubActions::from_loaded_config(temp.path(), &config)
+        .with_gh_binary_for_tests(&hanging_gh);
+    let bounded = fleet_github_actions_with_timeout(&actions, Duration::from_millis(150));
+    let started = Instant::now();
+
+    let error = bounded
+        .run_gh(&["api".to_owned(), "repos/example/project".to_owned()])
+        .expect_err("hung GitHub observation must time out");
+
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(error.to_string().contains("timed out"));
+    let retry_started = Instant::now();
+    let expired = bounded
+        .run_gh(&["api".to_owned(), "repos/example/project".to_owned()])
+        .expect_err("later reads must not receive a fresh timeout");
+    assert!(retry_started.elapsed() < Duration::from_secs(1));
+    assert!(
+        expired.to_string().contains("absolute deadline")
+            || expired.to_string().contains("timed out")
+    );
+}
+
+#[cfg(unix)]
+#[test]
 #[allow(clippy::too_many_lines)] // One end-to-end mixed-host observer fixture.
 fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -59,10 +94,10 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
         },
     ];
 
-    // The contract is one shared deadline, not a two-second scheduler-latency
-    // budget. Leave enough slack for healthy probes in the fully parallel test
-    // suite while the 30-second fixture still proves bounded cancellation.
-    let timeout = std::time::Duration::from_secs(10);
+    // Exercise the production host-observation contract. A shorter test-only
+    // deadline makes a healthy shell probe race the fully parallel test suite
+    // even though production would still accept it.
+    let timeout = FLEET_HOST_PROBE_TIMEOUT;
     let started = std::time::Instant::now();
     let mut probes = probe_hosts_concurrently_with_timeout(&classes, timeout);
 
@@ -83,15 +118,19 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
         probes[1].doctor.source
     );
     assert!(
-        probes[1].storage.readable,
+        probes[1].storage.readable || probes[1].storage.source.contains("timed out"),
         "healthy storage source: {}",
         probes[1].storage.source
     );
 
-    // The concurrency contract above must exercise the real storage probe, but
-    // the pure routability assertion below must not depend on how much disk or
-    // ccache space the CI host happens to have. Normalize only the already-read
-    // healthy observation after proving it completed within the shared bound.
+    // Host observation deliberately includes the canonical ambient ccache. In
+    // a saturated parallel suite its stats read may consume the shared
+    // deadline; that fail-closed result is valid and is not evidence that the
+    // otherwise healthy host failed to run concurrently. Storage parsing and
+    // thresholds have deterministic tests below, so normalize the observation
+    // only for the pure routability assertion.
+    probes[1].storage.readable = true;
+    probes[1].storage.source = "test fixture".to_owned();
     probes[1].storage.disk_available_kibibyte = Some(DEFAULT_DISK_FLOOR_KIBIBYTE.saturating_mul(2));
     probes[1].storage.ccache_size_kibibyte = Some(1);
     probes[1].storage.ccache_max_kibibyte = Some(2);

@@ -73,6 +73,7 @@ pub(in crate::app) use render::{render_fleet_assessment, render_fleet_watch_even
 const FLEET_LANE_TARGET: &str = "macos";
 const DEFAULT_DISK_FLOOR_KIBIBYTE: u64 = 25 * 1024 * 1024;
 const FLEET_HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const FLEET_GITHUB_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) struct FleetStatusArgs {
     pub(super) repo: Option<String>,
@@ -132,10 +133,15 @@ pub(super) fn collect_fleet_assessment(
         .iter()
         .map(|probe| probe.capacity.clone())
         .collect::<Vec<_>>();
+    // One fleet tick is an observation, not a batch job. Share one absolute
+    // GitHub deadline across runner inventory, active-run detail, merge-queue,
+    // and release reads so a large or slow API surface fails closed with a
+    // rendered assessment instead of wedging the overseer indefinitely.
+    let actions = fleet_github_actions_with_timeout(actions, FLEET_GITHUB_OBSERVATION_TIMEOUT);
     // Observe repository runners once through the controller's authenticated
     // GitHub client. Host-local doctor probes can share an unauthenticated IP
     // rate limit, which must not make otherwise healthy capacity unroutable.
-    let runners = fetch_repository_runners(actions, &repo);
+    let runners = fetch_repository_runners(&actions, &repo);
     let expected_host_configs =
         parse_expected_hosts(&config.data).map_err(|error| CliFailure::new(2, error))?;
     let expected_hosts = assess_expected_hosts(&expected_host_configs, &runners);
@@ -155,7 +161,7 @@ pub(super) fn collect_fleet_assessment(
     }
 
     let queue_run_limit = args.queue_run_limit.clamp(1, MAX_DETAILED_WORKFLOW_RUNS);
-    let observed_runs = fetch_observed_workflow_runs(actions, &repo, queue_run_limit);
+    let observed_runs = fetch_observed_workflow_runs(&actions, &repo, queue_run_limit);
     let routing_mismatches = observed_runs.as_ref().map_or_else(
         |_| Vec::new(),
         |observed| detect_routing_mismatches(&observed.runs, &runners),
@@ -192,7 +198,7 @@ pub(super) fn collect_fleet_assessment(
         .map_err(Clone::clone)
         .and_then(|observed| {
             inspect_merge_queue_liveness(
-                actions,
+                &actions,
                 &repo,
                 &args.base,
                 state_dir,
@@ -211,7 +217,7 @@ pub(super) fn collect_fleet_assessment(
             report: None,
         });
     let release = inspect_release_liveness(
-        actions,
+        &actions,
         &repo,
         &args.base,
         args.release_stale_threshold_secs,
@@ -286,6 +292,12 @@ pub(super) fn collect_fleet_assessment(
         observation_incomplete,
         should_fail,
     })
+}
+
+fn fleet_github_actions_with_timeout(actions: &GitHubActions, timeout: Duration) -> GitHubActions {
+    actions
+        .clone()
+        .with_absolute_deadline(Instant::now() + timeout)
 }
 
 struct HostProbeBundle {
