@@ -1149,6 +1149,26 @@ pub(super) struct WatchLocalArgs {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum RunnerCommand {
+    /// Recover one exact Pulp Build and Test run that materialized zero jobs.
+    #[command(name = "zero-job-recover")]
+    ZeroJobRecover {
+        /// Canonical owner/repository slug. Only Generous-Corp/pulp is accepted.
+        #[arg(long, default_value = "Generous-Corp/pulp")]
+        repo: String,
+        /// Open, same-repository, steward-managed pull request to recover.
+        #[arg(long)]
+        pr: u64,
+        /// Exact queued `pull_request` Build and Test workflow run with zero jobs.
+        #[arg(long = "source-run-id")]
+        source_run_id: u64,
+        /// Minimum age of the source run before it is eligible.
+        #[arg(long = "min-age-minutes", default_value_t = 45)]
+        min_age_minutes: i64,
+        /// Persist the at-most-once receipt and dispatch protected recovery.
+        /// Without this flag the command is observation-only.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Process durable semantic-recovery requests with the trusted first-line worker.
     RecoveryWorker {
         /// Inspect or process at most one pending request (the default).
@@ -2717,6 +2737,38 @@ mod tests {
             Cli::try_parse_from(["shipyard", "runner", "recovery-worker", "--once", "--drain",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn zero_job_recovery_is_explicit_and_dry_run_by_default() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "runner",
+            "zero-job-recover",
+            "--pr",
+            "7882",
+            "--source-run-id",
+            "33439971439",
+        ])
+        .expect("bounded zero-job recovery");
+        let Command::Runner {
+            command:
+                RunnerCommand::ZeroJobRecover {
+                    repo,
+                    pr,
+                    source_run_id,
+                    min_age_minutes,
+                    apply,
+                },
+        } = cli.command
+        else {
+            panic!("expected zero-job recovery command");
+        };
+        assert_eq!(repo, "Generous-Corp/pulp");
+        assert_eq!(pr, 7882);
+        assert_eq!(source_run_id, 33_439_971_439);
+        assert_eq!(min_age_minutes, 45);
+        assert!(!apply);
     }
 
     #[test]
