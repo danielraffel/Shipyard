@@ -11,11 +11,11 @@ type = "rust"
 platforms = ["macos", "linux", "windows"]
 
 # What CI runs (see .github/workflows/ci.yml). Keep in sync.
-# Find a cargo that actually runs (the `~/.cargo/bin/cargo` rustup shim
-# is broken on some hosts after partial rustup updates), then exec the
-# pipeline through that.
+# Find a cargo whose sibling rustc satisfies this crate's declared MSRV. The
+# `~/.cargo/bin/cargo` rustup shim can be broken after partial rustup updates,
+# and a working older cargo can still fail before validation starts.
 [validation.default]
-command = "_sy_find_cargo_bin() { for c in cargo \"$HOME/.cargo/bin/cargo\"; do command -v \"$c\" >/dev/null 2>&1 && \"$c\" fmt --version >/dev/null 2>&1 && { dirname \"$(command -v \"$c\")\"; return 0; }; done; for c in \"$HOME\"/.rustup/toolchains/*/bin/cargo; do [ -x \"$c\" ] && \"$c\" --version >/dev/null 2>&1 && { dirname \"$c\"; return 0; }; done; return 1; }; CARGO_BIN=$(_sy_find_cargo_bin) || { echo 'shipyard validation: could not locate a working cargo (with rustfmt + clippy) binary' >&2; exit 1; }; export PATH=\"$CARGO_BIN:$PATH\"; SHIPYARD_TEST_HOME=$(mktemp -d \"${TMPDIR:-/tmp}/shipyard-test-home.XXXXXX\") || { echo 'shipyard validation: could not create isolated test home' >&2; exit 1; }; export SHIPYARD_TEST_HOME RUST_MIN_STACK=8388608; trap 'rm -rf -- \"$SHIPYARD_TEST_HOME\"' EXIT; cargo fmt --all --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --all-targets --locked --features ci-test-home"
+command = "_sy_cargo_supports_msrv() { c=$(command -v \"$1\" 2>/dev/null) || return 1; d=$(dirname \"$c\"); r=\"$d/rustc\"; [ -x \"$r\" ] || return 1; need=$(awk -F'\"' '/^rust-version[[:space:]]*=/ { print $2; exit }' Cargo.toml); [ -n \"$need\" ] || return 1; have=$(\"$r\" --version 2>/dev/null | awk '{ print $2; exit }'); [ -n \"$have\" ] || return 1; awk -v have=\"$have\" -v need=\"$need\" 'BEGIN { split(have, h, \".\"); split(need, n, \".\"); for (i = 1; i <= 3; i++) { hv = h[i] + 0; nv = n[i] + 0; if (hv > nv) exit 0; if (hv < nv) exit 1 } exit 0 }' || return 1; PATH=\"$d:$PATH\" \"$c\" fmt --version >/dev/null 2>&1; }; _sy_find_cargo_bin() { for c in cargo \"$HOME/.cargo/bin/cargo\"; do _sy_cargo_supports_msrv \"$c\" && { dirname \"$(command -v \"$c\")\"; return 0; }; done; for c in \"$HOME\"/.rustup/toolchains/*/bin/cargo; do [ -x \"$c\" ] && _sy_cargo_supports_msrv \"$c\" && { dirname \"$c\"; return 0; }; done; return 1; }; CARGO_BIN=$(_sy_find_cargo_bin) || { echo 'shipyard validation: could not locate cargo, rustc, rustfmt, and clippy satisfying Cargo.toml rust-version' >&2; exit 1; }; export PATH=\"$CARGO_BIN:$PATH\"; SHIPYARD_TEST_HOME=$(mktemp -d \"${TMPDIR:-/tmp}/shipyard-test-home.XXXXXX\") || { echo 'shipyard validation: could not create isolated test home' >&2; exit 1; }; export SHIPYARD_TEST_HOME RUST_MIN_STACK=8388608; trap 'rm -rf -- \"$SHIPYARD_TEST_HOME\"' EXIT; cargo fmt --all --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --all-targets --locked --features ci-test-home"
 
 [targets.mac]
 backend = "local"

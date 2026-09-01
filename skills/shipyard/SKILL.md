@@ -1486,9 +1486,12 @@ database or takes writer custody. A valid migrated legacy `NULL,NULL`
 repository identity makes `complete=false`; malformed or half-bound identity
 and a noncanonical `GEN-N` handle refuse the whole snapshot.
 
-Use `shipyard work-ledger reconcile-terminal --json` to inventory only native
-`terminal_handoff` rows that are already terminal but lack their immutable
-projection binding. The inventory is bounded, redacted, and no-write. Select
+Use `shipyard work-ledger reconcile-terminal --json` to inventory native
+`terminal_handoff` rows that lack their immutable projection binding. The
+bounded, redacted, no-write result separates exact already-terminal repair
+targets from clean publication precursors, managed-unbound rows, and blocked
+rows; bounded related-state counts and explicit blockers prevent incomplete
+rows from disappearing or becoming repair authority. Select
 one exact repository/PR/head for a dry-run; add `--apply` only after reviewing
 the authenticated merged-head/base proof. Apply re-reads GitHub under exclusive
 writer custody and may add only the immutable provider receipt, projection

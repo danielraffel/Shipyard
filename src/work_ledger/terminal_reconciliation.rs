@@ -22,6 +22,43 @@ use super::{
 const MAX_UNBOUND_TERMINAL_TARGETS: usize = 32;
 const MAX_UNBOUND_TERMINAL_QUERY_ROWS: i64 = 33;
 
+const STRANDED_PUBLICATION_INVENTORY_SQL: &str =
+    "SELECT work.id, work.repo, work.pr, work.head_sha, work.base_ref,
+            work.phase, work.work_generation, work.owner_generation, work.source_digest,
+            (SELECT COUNT(*) FROM imports imported WHERE imported.work_item_id = work.id),
+            (SELECT COUNT(*) FROM imports imported WHERE imported.work_item_id = work.id
+              AND imported.content_digest = work.source_digest),
+            (SELECT COUNT(*) FROM continuation_contracts continuation
+              WHERE continuation.work_item_id = work.id),
+            (SELECT COUNT(*) FROM route_records route WHERE route.work_item_id = work.id),
+            (SELECT COUNT(*) FROM protected_objects object WHERE object.work_item_id = work.id),
+            (SELECT COUNT(*) FROM protected_objects profile
+              WHERE profile.work_item_id = work.id AND profile.kind = 'launch_profile'),
+            (SELECT COUNT(*) FROM outbox wake WHERE wake.work_item_id = work.id),
+            (SELECT COUNT(*) FROM outbox wake
+              WHERE wake.work_item_id = work.id AND wake.state = 'uncertain'),
+            (SELECT COUNT(*) FROM provider_deliveries delivery WHERE delivery.wake_id IN (
+              SELECT wake.wake_id FROM outbox wake WHERE wake.work_item_id = work.id)),
+            (SELECT COUNT(*) FROM ownership_roots root WHERE root.work_item_id = work.id),
+            (SELECT COUNT(*) FROM agent_ownership ownership WHERE ownership.work_item_id = work.id),
+            (SELECT COUNT(*) FROM ownership_holder_materials material
+              WHERE material.work_item_id = work.id),
+            (SELECT COUNT(*) FROM ownership_lease_bootstrap_eligibility eligibility
+              WHERE eligibility.ownership_id IN (SELECT ownership.ownership_id
+                FROM agent_ownership ownership WHERE ownership.work_item_id = work.id)),
+            (SELECT COUNT(*) FROM ownership_leases lease WHERE lease.ownership_id IN (
+              SELECT ownership.ownership_id FROM agent_ownership ownership
+               WHERE ownership.work_item_id = work.id)),
+            (SELECT COUNT(*) FROM activation_epochs activation
+              WHERE activation.work_item_id = work.id),
+            (SELECT COUNT(*) FROM projection_intents intent WHERE intent.work_item_id = work.id),
+            (SELECT COUNT(*) FROM custody_outbox custody WHERE custody.wake_id IN (
+              SELECT wake.wake_id FROM outbox wake WHERE wake.work_item_id = work.id))
+       FROM work_items work
+       LEFT JOIN workstream_projection_bindings binding ON binding.work_item_id = work.id
+      WHERE binding.work_item_id IS NULL AND work.kind = 'terminal_handoff'
+      ORDER BY work.id LIMIT ?1";
+
 /// Redacted exact target discovered without taking mutation authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct TerminalReconciliationTarget {
@@ -49,6 +86,52 @@ pub(crate) struct TerminalReconciliationInventory {
     pub(crate) complete: bool,
     pub(crate) limit: usize,
     pub(crate) items: Vec<TerminalReconciliationTarget>,
+    pub(crate) stranded_publications: Vec<StrandedPublicationTarget>,
+}
+
+/// Redacted precursor created before native publication could bind its
+/// workstream projection. These rows are observable but remain ineligible for
+/// the completed-terminal repair path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct StrandedPublicationTarget {
+    pub(crate) work_id: String,
+    pub(crate) repository: Option<String>,
+    pub(crate) pull_request: Option<u64>,
+    pub(crate) exact_head: Option<String>,
+    pub(crate) base_ref: Option<String>,
+    pub(crate) phase: String,
+    pub(crate) work_generation: u64,
+    pub(crate) owner_generation: u64,
+    pub(crate) classification: String,
+    pub(crate) terminal_reconciliation_eligible: bool,
+    pub(crate) blocking_reasons: Vec<String>,
+    pub(crate) related: StrandedPublicationRelatedCounts,
+    #[serde(skip_serializing)]
+    pub(crate) source_digest: String,
+}
+
+/// Bounded related-state census used to explain why an unbound row is or is
+/// not the narrow publication precursor. Counts are evidence only; they never
+/// authorize reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct StrandedPublicationRelatedCounts {
+    pub(crate) imports: u64,
+    pub(crate) matching_imports: u64,
+    pub(crate) continuation_contracts: u64,
+    pub(crate) routes: u64,
+    pub(crate) protected_objects: u64,
+    pub(crate) launch_profiles: u64,
+    pub(crate) wakes: u64,
+    pub(crate) uncertain_wakes: u64,
+    pub(crate) provider_deliveries: u64,
+    pub(crate) ownership_roots: u64,
+    pub(crate) agent_ownership: u64,
+    pub(crate) ownership_holder_materials: u64,
+    pub(crate) ownership_bootstrap_eligibility: u64,
+    pub(crate) ownership_leases: u64,
+    pub(crate) activation_epochs: u64,
+    pub(crate) projection_intents: u64,
+    pub(crate) custody_outbox: u64,
 }
 
 /// Complete public authority required to bind an already-terminal target.
@@ -124,13 +207,15 @@ impl WorkLedger {
     pub(crate) fn terminal_reconciliation_inventory(
         &self,
     ) -> WorkLedgerResult<TerminalReconciliationInventory> {
-        let connection = self.connect_read_only()?;
-        verify_supported_schema(&connection)?;
-        verify_integrity(&connection)?;
-        self.verify_protected_object_storage(&connection)?;
+        let mut connection = self.connect_read_only()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        verify_supported_schema(&transaction)?;
+        verify_integrity(&transaction)?;
+        self.verify_protected_object_storage(&transaction)?;
 
-        let mut statement = connection.prepare(
-            "SELECT work.id, lower(work.repo), work.pr, lower(work.head_sha), work.base_ref,
+        let mut items = {
+            let mut statement = transaction.prepare(
+                "SELECT work.id, work.repo, work.pr, work.head_sha, work.base_ref,
                     work.phase, work.work_generation, work.owner_generation,
                     profile.content_digest, work.repair_route_ref, wake.wake_id,
                     work.source_digest
@@ -150,22 +235,29 @@ impl WorkLedger {
               WHERE binding.work_item_id IS NULL AND work.kind = 'terminal_handoff'
                 AND work.phase = 'terminal'
               ORDER BY work.id LIMIT ?1",
-        )?;
-        let rows =
-            statement.query_map([MAX_UNBOUND_TERMINAL_QUERY_ROWS], terminal_target_from_row)?;
-        let mut items = rows.collect::<Result<Vec<_>, _>>()?;
-        if items.len() > MAX_UNBOUND_TERMINAL_TARGETS {
+            )?;
+            statement
+                .query_map([MAX_UNBOUND_TERMINAL_QUERY_ROWS], terminal_target_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        validate_terminal_target_identities(&items)?;
+        let mut stranded_publications = stranded_publication_inventory(&transaction, &items)?;
+        if items.len() + stranded_publications.len() > MAX_UNBOUND_TERMINAL_TARGETS {
             return Err(WorkLedgerError::Refused(
                 "terminal reconciliation inventory exceeds its bound".to_owned(),
             ));
         }
         validate_unique_targets(&items)?;
-        let snapshot_sha256 = inventory_digest(&items)?;
+        classify_stranded_identity_ambiguity(&mut stranded_publications);
+        validate_cross_bucket_identity_uniqueness(&items, &stranded_publications)?;
+        let snapshot_sha256 = inventory_digest(&items, &stranded_publications)?;
+        transaction.commit()?;
         Ok(TerminalReconciliationInventory {
             snapshot_sha256,
             complete: true,
             limit: MAX_UNBOUND_TERMINAL_TARGETS,
             items: std::mem::take(&mut items),
+            stranded_publications: std::mem::take(&mut stranded_publications),
         })
     }
 
@@ -179,12 +271,26 @@ impl WorkLedger {
         head_sha: &str,
     ) -> WorkLedgerResult<TerminalReconciliationTarget> {
         validate_target(repository, pull_request, head_sha)?;
-        let connection = self.connect_read_only()?;
-        verify_supported_schema(&connection)?;
-        verify_integrity(&connection)?;
-        self.verify_protected_object_storage(&connection)?;
-        let mut statement = connection.prepare(
-            "SELECT work.id, lower(work.repo), work.pr, lower(work.head_sha), work.base_ref,
+        let mut connection = self.connect_read_only()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        verify_supported_schema(&transaction)?;
+        verify_integrity(&transaction)?;
+        self.verify_protected_object_storage(&transaction)?;
+        let identity_count: u64 = transaction.query_row(
+            "SELECT COUNT(*) FROM work_items work
+              WHERE work.kind = 'terminal_handoff'
+                AND lower(work.repo) = ?1 AND work.pr = ?2 AND lower(work.head_sha) = ?3",
+            params![repository, pull_request, head_sha],
+            |row| row.get(0),
+        )?;
+        if identity_count != 1 {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation target identity is absent or ambiguous".to_owned(),
+            ));
+        }
+        let matches = {
+            let mut statement = transaction.prepare(
+                "SELECT work.id, work.repo, work.pr, work.head_sha, work.base_ref,
                     work.phase, work.work_generation, work.owner_generation,
                     profile.content_digest, work.repair_route_ref, wake.wake_id,
                     work.source_digest
@@ -200,7 +306,7 @@ impl WorkLedger {
                 AND (wake.profile_ref = profile.profile_ref
                      OR (wake.profile_ref IS NULL AND wake.state = 'failed'))
               WHERE work.kind = 'terminal_handoff' AND work.phase = 'terminal'
-                AND lower(work.repo) = ?1 AND work.pr = ?2 AND lower(work.head_sha) = ?3
+                AND work.repo = ?1 AND work.pr = ?2 AND work.head_sha = ?3
                 AND (NOT EXISTS(
                        SELECT 1 FROM workstream_projection_bindings binding
                         WHERE binding.work_item_id = work.id)
@@ -209,13 +315,15 @@ impl WorkLedger {
                         WHERE event.work_item_id = work.id
                           AND event.kind = 'terminal_projection_reconciled'))
               ORDER BY work.id LIMIT 2",
-        )?;
-        let matches = statement
-            .query_map(
-                params![repository, pull_request, head_sha],
-                terminal_target_from_row,
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
+            )?;
+            statement
+                .query_map(
+                    params![repository, pull_request, head_sha],
+                    terminal_target_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
         match matches.as_slice() {
             [target] => Ok(target.clone()),
             [] => Err(WorkLedgerError::Refused(
@@ -468,6 +576,167 @@ fn terminal_target_from_row(
         wake_id: row.get(10)?,
         source_digest: row.get(11)?,
     })
+}
+
+fn stranded_publication_inventory(
+    connection: &rusqlite::Connection,
+    terminal_targets: &[TerminalReconciliationTarget],
+) -> WorkLedgerResult<Vec<StrandedPublicationTarget>> {
+    let mut statement = connection.prepare(STRANDED_PUBLICATION_INVENTORY_SQL)?;
+    let rows = statement.query_map(
+        [MAX_UNBOUND_TERMINAL_QUERY_ROWS],
+        stranded_publication_from_row,
+    )?;
+    let terminal_work_ids = terminal_targets
+        .iter()
+        .map(|item| item.work_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|item| !terminal_work_ids.contains(item.work_id.as_str()))
+        .collect())
+}
+
+fn stranded_publication_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StrandedPublicationTarget> {
+    let base_ref = row.get::<_, Option<String>>(4)?;
+    let repository = row.get::<_, Option<String>>(1)?;
+    let pull_request = row.get::<_, Option<u64>>(2)?;
+    let exact_head = row.get::<_, Option<String>>(3)?;
+    let phase = row.get::<_, String>(5)?;
+    let work_generation = row.get::<_, u64>(6)?;
+    let owner_generation = row.get::<_, u64>(7)?;
+    let related = stranded_related_counts(row)?;
+    let downstream = [
+        ("continuation_contract", related.continuation_contracts),
+        ("route", related.routes),
+        ("protected_object", related.protected_objects),
+        ("wake", related.wakes),
+        ("provider_delivery", related.provider_deliveries),
+        ("ownership_root", related.ownership_roots),
+        ("agent_ownership", related.agent_ownership),
+        (
+            "ownership_holder_material",
+            related.ownership_holder_materials,
+        ),
+        (
+            "ownership_bootstrap_eligibility",
+            related.ownership_bootstrap_eligibility,
+        ),
+        ("ownership_lease", related.ownership_leases),
+        ("activation_epoch", related.activation_epochs),
+        ("projection_intent", related.projection_intents),
+        ("custody_outbox", related.custody_outbox),
+    ];
+    let mut blocking_reasons = downstream
+        .into_iter()
+        .filter(|(_, count)| *count != 0)
+        .map(|(name, _)| format!("unexpected_{name}"))
+        .collect::<Vec<_>>();
+    if phase != LifecycleState::ShadowImported.as_str() {
+        blocking_reasons.push("unexpected_phase".to_owned());
+    }
+    if work_generation != 1 {
+        blocking_reasons.push("unexpected_generation".to_owned());
+    }
+    if owner_generation != 1 {
+        blocking_reasons.push("unexpected_owner_generation".to_owned());
+    }
+    if base_ref.is_none() {
+        blocking_reasons.push("missing_base_ref".to_owned());
+    }
+    if repository.is_none() {
+        blocking_reasons.push("missing_repository".to_owned());
+    }
+    if pull_request.is_none() {
+        blocking_reasons.push("missing_pull_request".to_owned());
+    }
+    if exact_head.is_none() {
+        blocking_reasons.push("missing_exact_head".to_owned());
+    }
+    if let (Some(repository), Some(pull_request), Some(exact_head)) =
+        (&repository, pull_request, &exact_head)
+        && validate_target(repository, pull_request, exact_head).is_err()
+    {
+        blocking_reasons.push("invalid_target_identity".to_owned());
+    }
+    if base_ref
+        .as_deref()
+        .is_some_and(|base_ref| base_ref.is_empty() || base_ref.len() > 255)
+    {
+        blocking_reasons.push("invalid_base_ref".to_owned());
+    }
+    if related.imports != 1 {
+        blocking_reasons.push("unexpected_import_count".to_owned());
+    }
+    if related.matching_imports != 1 {
+        blocking_reasons.push("source_import_mismatch".to_owned());
+    }
+    let precursor_shape_matches = blocking_reasons.is_empty();
+    let classification = if precursor_shape_matches {
+        "publication_precursor"
+    } else if phase == LifecycleState::Terminal.as_str() || downstream_state_exists(&related) {
+        "managed_unbound"
+    } else {
+        "blocked"
+    };
+    Ok(StrandedPublicationTarget {
+        work_id: row.get(0)?,
+        repository,
+        pull_request,
+        exact_head,
+        base_ref,
+        phase,
+        work_generation,
+        owner_generation,
+        classification: classification.to_owned(),
+        terminal_reconciliation_eligible: false,
+        blocking_reasons,
+        related,
+        source_digest: row.get(8)?,
+    })
+}
+
+fn stranded_related_counts(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StrandedPublicationRelatedCounts> {
+    Ok(StrandedPublicationRelatedCounts {
+        imports: row.get(9)?,
+        matching_imports: row.get(10)?,
+        continuation_contracts: row.get(11)?,
+        routes: row.get(12)?,
+        protected_objects: row.get(13)?,
+        launch_profiles: row.get(14)?,
+        wakes: row.get(15)?,
+        uncertain_wakes: row.get(16)?,
+        provider_deliveries: row.get(17)?,
+        ownership_roots: row.get(18)?,
+        agent_ownership: row.get(19)?,
+        ownership_holder_materials: row.get(20)?,
+        ownership_bootstrap_eligibility: row.get(21)?,
+        ownership_leases: row.get(22)?,
+        activation_epochs: row.get(23)?,
+        projection_intents: row.get(24)?,
+        custody_outbox: row.get(25)?,
+    })
+}
+
+fn downstream_state_exists(related: &StrandedPublicationRelatedCounts) -> bool {
+    related.continuation_contracts != 0
+        || related.routes != 0
+        || related.protected_objects != 0
+        || related.wakes != 0
+        || related.provider_deliveries != 0
+        || related.ownership_roots != 0
+        || related.agent_ownership != 0
+        || related.ownership_holder_materials != 0
+        || related.ownership_bootstrap_eligibility != 0
+        || related.ownership_leases != 0
+        || related.activation_epochs != 0
+        || related.projection_intents != 0
+        || related.custody_outbox != 0
 }
 
 type ProjectionBinding = (
@@ -726,6 +995,20 @@ fn validate_target(repository: &str, pull_request: u64, head_sha: &str) -> WorkL
     Ok(())
 }
 
+fn validate_terminal_target_identities(
+    items: &[TerminalReconciliationTarget],
+) -> WorkLedgerResult<()> {
+    for item in items {
+        validate_target(&item.repository, item.pull_request, &item.exact_head)?;
+        if item.base_ref.is_empty() || item.base_ref.len() > 255 {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation target base is invalid".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_unique_targets(items: &[TerminalReconciliationTarget]) -> WorkLedgerResult<()> {
     let unique = items
         .iter()
@@ -739,7 +1022,44 @@ fn validate_unique_targets(items: &[TerminalReconciliationTarget]) -> WorkLedger
     Ok(())
 }
 
-fn inventory_digest(items: &[TerminalReconciliationTarget]) -> WorkLedgerResult<String> {
+fn validate_cross_bucket_identity_uniqueness(
+    terminal_targets: &[TerminalReconciliationTarget],
+    stranded: &[StrandedPublicationTarget],
+) -> WorkLedgerResult<()> {
+    let terminal_identities = terminal_targets
+        .iter()
+        .map(|item| {
+            (
+                item.repository.to_ascii_lowercase(),
+                item.pull_request,
+                item.exact_head.to_ascii_lowercase(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if stranded.iter().any(|item| {
+        item.repository
+            .as_deref()
+            .zip(item.pull_request)
+            .zip(item.exact_head.as_deref())
+            .is_some_and(|((repository, pull_request), exact_head)| {
+                terminal_identities.contains(&(
+                    repository.to_ascii_lowercase(),
+                    pull_request,
+                    exact_head.to_ascii_lowercase(),
+                ))
+            })
+    }) {
+        return Err(WorkLedgerError::Refused(
+            "terminal reconciliation inventory contains a cross-class target collision".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn inventory_digest(
+    items: &[TerminalReconciliationTarget],
+    stranded_publications: &[StrandedPublicationTarget],
+) -> WorkLedgerResult<String> {
     let bound = items
         .iter()
         .map(|item| {
@@ -759,9 +1079,65 @@ fn inventory_digest(items: &[TerminalReconciliationTarget]) -> WorkLedgerResult<
             )
         })
         .collect::<Vec<_>>();
-    serde_json::to_vec(&("terminal-reconciliation-inventory-v1", bound))
+    let stranded = stranded_publications
+        .iter()
+        .map(|item| {
+            (
+                &item.work_id,
+                &item.repository,
+                item.pull_request,
+                &item.exact_head,
+                &item.base_ref,
+                &item.phase,
+                item.work_generation,
+                item.owner_generation,
+                &item.classification,
+                item.terminal_reconciliation_eligible,
+                &item.blocking_reasons,
+                &item.related,
+                &item.source_digest,
+            )
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&("terminal-reconciliation-inventory-v2", bound, stranded))
         .map(|bytes| digest(&bytes))
         .map_err(|error| WorkLedgerError::Refused(format!("encode terminal inventory: {error}")))
+}
+
+fn classify_stranded_identity_ambiguity(items: &mut [StrandedPublicationTarget]) {
+    let counts = items
+        .iter()
+        .map(|item| {
+            (
+                item.repository
+                    .as_ref()
+                    .map(|value| value.to_ascii_lowercase()),
+                item.pull_request,
+                item.exact_head
+                    .as_ref()
+                    .map(|value| value.to_ascii_lowercase()),
+            )
+        })
+        .fold(std::collections::BTreeMap::new(), |mut counts, identity| {
+            *counts.entry(identity).or_insert(0_usize) += 1;
+            counts
+        });
+    for item in items {
+        let identity = (
+            item.repository
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase()),
+            item.pull_request,
+            item.exact_head
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase()),
+        );
+        if counts.get(&identity).copied().unwrap_or_default() > 1 {
+            "blocked".clone_into(&mut item.classification);
+            item.blocking_reasons
+                .push("ambiguous_target_identity".to_owned());
+        }
+    }
 }
 
 fn terminal_evidence_bytes(request: &TerminalReconciliationRequest) -> WorkLedgerResult<Vec<u8>> {
@@ -828,7 +1204,8 @@ fn validate_commit_sha(name: &str, value: &str) -> WorkLedgerResult<()> {
 pub(crate) mod tests {
     use super::*;
     use crate::work_ledger::{
-        RepoPolicy, WakeIntent, native_publication_test_policy, native_publication_test_request,
+        ContinuationSet, ImportCandidate, RepoPolicy, WakeIntent, digest,
+        native_publication_test_policy, native_publication_test_request, opaque_ref,
     };
     use tempfile::TempDir;
 
@@ -1026,6 +1403,265 @@ pub(crate) mod tests {
             .expect("outbox snapshot")
     }
 
+    fn seed_stranded_publication_precursor(state_dir: &std::path::Path) -> (WorkLedger, String) {
+        let ledger = WorkLedger::open(state_dir).expect("ledger");
+        let repository = "owner/repo";
+        let pull_request = 74;
+        let exact_head = "a".repeat(40);
+        let workstream = "GEN-37";
+        let work_seed =
+            format!("github.com\nrepository-node\n{pull_request}\n{exact_head}\n{workstream}");
+        let work_id = opaque_ref(
+            "wi",
+            &format!("shipyard-native-continuation-v2\n{work_seed}"),
+        );
+        ledger
+            .import_candidates(&[ImportCandidate {
+                work_id: work_id.clone(),
+                kind: "terminal_handoff".to_owned(),
+                repo: Some(repository.to_owned()),
+                pr: Some(pull_request),
+                head_sha: Some(exact_head),
+                base_ref: Some("main".to_owned()),
+                goal_id: Some(opaque_ref("goal", workstream)),
+                goal_generation: 1,
+                lane: Some("fresh_agent_continuation".to_owned()),
+                role: "root".to_owned(),
+                owner_id: Some(opaque_ref("owner", "owner")),
+                owner_generation: 1,
+                terminal_adapter: Some("session_host".to_owned()),
+                agent_adapter: Some("codex".to_owned()),
+                provider_adapter: Some("codex".to_owned()),
+                coordinator_route_ref: None,
+                repair_route_ref: Some(opaque_ref("route", "pending-route")),
+                pr_truth: "unknown".to_owned(),
+                acceptance_truth: "unknown".to_owned(),
+                continuation_truth: "pending".to_owned(),
+                phase: LifecycleState::ShadowImported.as_str().to_owned(),
+                source_ref: opaque_ref("src", "pending-publication"),
+                content_digest: digest(b"pending publication authority"),
+                source_updated_at: None,
+            }])
+            .expect("stranded precursor");
+        (ledger, work_id)
+    }
+
+    #[test]
+    fn terminal_reconciliation_inventory_types_stranded_publication_precursors() {
+        let temp = TempDir::new().expect("temp");
+        let (ledger, work_id) = seed_stranded_publication_precursor(temp.path());
+
+        let inventory = ledger
+            .terminal_reconciliation_inventory()
+            .expect("typed inventory");
+        assert!(inventory.items.is_empty());
+        assert_eq!(inventory.stranded_publications.len(), 1);
+        let stranded = &inventory.stranded_publications[0];
+        assert_eq!(stranded.work_id, work_id);
+        assert_eq!(stranded.classification, "publication_precursor");
+        assert!(!stranded.terminal_reconciliation_eligible);
+        assert!(stranded.blocking_reasons.is_empty());
+        assert_eq!(stranded.related.imports, 1);
+        assert_eq!(stranded.related.matching_imports, 1);
+        let rendered = serde_json::to_string(&inventory).expect("inventory JSON");
+        assert!(!rendered.contains(&stranded.source_digest));
+
+        let mut other = stranded.clone();
+        other.work_id = opaque_ref("wi", "ambiguous duplicate");
+        other.repository = other.repository.map(|value| value.to_ascii_uppercase());
+        other.exact_head = other.exact_head.map(|value| value.to_ascii_uppercase());
+        let mut ambiguous = vec![stranded.clone(), other];
+        classify_stranded_identity_ambiguity(&mut ambiguous);
+        assert!(
+            ambiguous
+                .iter()
+                .all(|item| item.classification == "blocked")
+        );
+        assert!(ambiguous.iter().all(|item| {
+            item.blocking_reasons
+                .contains(&"ambiguous_target_identity".to_owned())
+        }));
+
+        ledger
+            .record_continuations(
+                &work_id,
+                0,
+                &ContinuationSet::new(digest(b"success"), None, digest(b"failure"), None)
+                    .expect("continuations"),
+            )
+            .expect("plant downstream state");
+        let blocked = ledger
+            .terminal_reconciliation_inventory()
+            .expect("blocked inventory");
+        assert_eq!(
+            blocked.stranded_publications[0].classification,
+            "managed_unbound"
+        );
+        assert!(!blocked.stranded_publications[0].terminal_reconciliation_eligible);
+        assert_eq!(
+            blocked.stranded_publications[0].blocking_reasons,
+            ["unexpected_continuation_contract"]
+        );
+    }
+
+    #[test]
+    fn terminal_reconciliation_inventory_keeps_incomplete_identity_visible() {
+        let temp = TempDir::new().expect("temp");
+        let (ledger, work_id) = seed_stranded_publication_precursor(temp.path());
+        ledger
+            .connect_read_write()
+            .expect("fixture connection")
+            .execute("DELETE FROM imports WHERE work_item_id = ?1", [&work_id])
+            .expect("remove import fixture");
+        let missing_import = ledger
+            .terminal_reconciliation_inventory()
+            .expect("missing import remains observable");
+        assert_eq!(missing_import.stranded_publications.len(), 1);
+        assert_eq!(
+            missing_import.stranded_publications[0].classification,
+            "blocked"
+        );
+        assert_eq!(missing_import.stranded_publications[0].related.imports, 0);
+        for reason in ["unexpected_import_count", "source_import_mismatch"] {
+            assert!(
+                missing_import.stranded_publications[0]
+                    .blocking_reasons
+                    .contains(&reason.to_owned())
+            );
+        }
+
+        let connection = ledger.connect_read_write().expect("fixture connection");
+        connection
+            .execute(
+                "UPDATE work_items SET repo = NULL, pr = NULL, head_sha = NULL WHERE id = ?1",
+                [&work_id],
+            )
+            .expect("remove target identity fixture");
+        drop(connection);
+        let incomplete = ledger
+            .terminal_reconciliation_inventory()
+            .expect("incomplete identity remains observable");
+        let incomplete = &incomplete.stranded_publications[0];
+        assert_eq!(incomplete.classification, "blocked");
+        assert!(incomplete.repository.is_none());
+        assert!(incomplete.pull_request.is_none());
+        assert!(incomplete.exact_head.is_none());
+        for reason in [
+            "missing_repository",
+            "missing_pull_request",
+            "missing_exact_head",
+        ] {
+            assert!(incomplete.blocking_reasons.contains(&reason.to_owned()));
+        }
+
+        let connection = ledger.connect_read_write().expect("fixture connection");
+        connection
+            .execute(
+                "UPDATE work_items SET repo = 'OWNER/REPO', pr = 0,
+                        head_sha = 'not-a-commit', base_ref = '' WHERE id = ?1",
+                [&work_id],
+            )
+            .expect("malformed target identity fixture");
+        drop(connection);
+        let malformed = ledger
+            .terminal_reconciliation_inventory()
+            .expect("malformed identity remains observable");
+        let malformed = &malformed.stranded_publications[0];
+        assert_eq!(malformed.classification, "blocked");
+        for reason in ["invalid_target_identity", "invalid_base_ref"] {
+            assert!(malformed.blocking_reasons.contains(&reason.to_owned()));
+        }
+    }
+
+    #[test]
+    fn terminal_reconciliation_refuses_cross_class_identity_collisions() {
+        let temp = TempDir::new().expect("temp");
+        let (request, ledger) = seed_unbound_terminal(temp.path());
+        let duplicate_work_id = opaque_ref("wi", "cross-class duplicate");
+        ledger
+            .import_candidates(&[ImportCandidate {
+                work_id: duplicate_work_id.clone(),
+                kind: "terminal_handoff".to_owned(),
+                repo: Some(request.repository.clone()),
+                pr: Some(request.pull_request),
+                head_sha: Some(request.head_sha.clone()),
+                base_ref: Some(request.base_ref.clone()),
+                goal_id: Some(opaque_ref("goal", "cross-class duplicate")),
+                goal_generation: 1,
+                lane: Some("fresh_agent_continuation".to_owned()),
+                role: "root".to_owned(),
+                owner_id: Some(opaque_ref("owner", "cross-class duplicate")),
+                owner_generation: 1,
+                terminal_adapter: Some("session_host".to_owned()),
+                agent_adapter: Some("codex".to_owned()),
+                provider_adapter: Some("codex".to_owned()),
+                coordinator_route_ref: None,
+                repair_route_ref: Some(opaque_ref("route", "cross-class duplicate")),
+                pr_truth: "unknown".to_owned(),
+                acceptance_truth: "unknown".to_owned(),
+                continuation_truth: "pending".to_owned(),
+                phase: LifecycleState::ShadowImported.as_str().to_owned(),
+                source_ref: opaque_ref("src", "cross-class duplicate"),
+                content_digest: digest(b"cross-class duplicate"),
+                source_updated_at: None,
+            }])
+            .expect("cross-class duplicate fixture");
+        ledger
+            .connect_read_write()
+            .expect("fixture connection")
+            .execute(
+                "UPDATE work_items SET repo = upper(repo), head_sha = upper(head_sha)
+                  WHERE id = ?1",
+                [&duplicate_work_id],
+            )
+            .expect("noncanonical alias fixture");
+
+        let inventory_error = ledger
+            .terminal_reconciliation_inventory()
+            .expect_err("cross-class inventory must refuse");
+        assert!(
+            inventory_error
+                .to_string()
+                .contains("cross-class target collision")
+        );
+        let target_error = ledger
+            .terminal_reconciliation_target(
+                &request.repository,
+                request.pull_request,
+                &request.head_sha,
+            )
+            .expect_err("targeted repair must refuse the duplicate identity");
+        assert!(target_error.to_string().contains("absent or ambiguous"));
+    }
+
+    #[test]
+    fn terminal_reconciliation_refuses_noncanonical_stored_terminal_identity() {
+        let temp = TempDir::new().expect("temp");
+        let (request, ledger) = seed_unbound_terminal(temp.path());
+        ledger
+            .connect_read_write()
+            .expect("fixture connection")
+            .execute(
+                "UPDATE work_items SET repo = upper(repo), head_sha = upper(head_sha)
+                  WHERE id = ?1",
+                [&request.work_id],
+            )
+            .expect("noncanonical terminal identity fixture");
+
+        let inventory_error = ledger
+            .terminal_reconciliation_inventory()
+            .expect_err("inventory must reject a noncanonical repair target");
+        assert!(inventory_error.to_string().contains("target is invalid"));
+        let target_error = ledger
+            .terminal_reconciliation_target(
+                &request.repository,
+                request.pull_request,
+                &request.head_sha,
+            )
+            .expect_err("targeted repair must reject normalized aliasing");
+        assert!(target_error.to_string().contains("no exact terminal"));
+    }
+
     #[test]
     fn terminal_reconciliation_is_bounded_dry_run_apply_and_exact_replay() {
         let temp = TempDir::new().expect("temp");
@@ -1159,7 +1795,7 @@ pub(crate) mod tests {
                 &request.head_sha,
             )
             .expect_err("absent exact target must refuse");
-        assert!(absent.to_string().contains("no exact terminal"));
+        assert!(absent.to_string().contains("absent or ambiguous"));
 
         for (label, changed) in [
             ("repository", {
@@ -1377,7 +2013,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn terminal_reconciliation_inventory_omits_nonterminal_rows_and_target_replays() {
+    fn terminal_reconciliation_inventory_types_nonterminal_rows_and_target_replays() {
         let temp = TempDir::new().expect("temp");
         let (request, ledger) = seed_unbound_terminal(temp.path());
         let connection = ledger.connect_read_write().expect("fixture connection");
@@ -1388,13 +2024,16 @@ pub(crate) mod tests {
             )
             .expect("fixture nonterminal phase");
         drop(connection);
-        assert!(
-            ledger
-                .terminal_reconciliation_inventory()
-                .expect("nonterminal inventory")
-                .items
-                .is_empty()
+        let nonterminal = ledger
+            .terminal_reconciliation_inventory()
+            .expect("nonterminal inventory");
+        assert!(nonterminal.items.is_empty());
+        assert_eq!(nonterminal.stranded_publications.len(), 1);
+        assert_eq!(
+            nonterminal.stranded_publications[0].classification,
+            "managed_unbound"
         );
+        assert!(!nonterminal.stranded_publications[0].terminal_reconciliation_eligible);
         ledger
             .connect_read_write()
             .expect("fixture connection")

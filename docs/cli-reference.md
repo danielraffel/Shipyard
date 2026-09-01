@@ -122,7 +122,7 @@ shipyard work-ledger status                         # inspect canonical shadow s
 shipyard work-ledger inventory                      # bounded immutable local-work view; does not create storage
 shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" # authentic-v11 exact-row reconciliation plan; no writes
 shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" --apply # writer-fenced migrate/bind/publication
-shipyard work-ledger reconcile-terminal              # bounded redacted inventory of terminal native rows missing projection bindings
+shipyard work-ledger reconcile-terminal              # bounded redacted inventory of terminal repairs plus typed unbound handoff rows
 shipyard work-ledger reconcile-terminal --repo OWNER/REPO --pr 123 --head "$SHA" # exact dry-run; verifies local and merged GitHub authority
 shipyard work-ledger reconcile-terminal --repo OWNER/REPO --pr 123 --head "$SHA" --apply # bind one already-terminal row; exact replay is write-free
 shipyard work-ledger import                         # deterministic redacted legacy-import plan; no writes
@@ -164,8 +164,12 @@ snapshots, coordinate drift, and any unbound row refuse the operation.
 
 `work-ledger reconcile-terminal` is the narrow repair for a native
 `terminal_handoff` that reached terminal state before its immutable workstream
-projection binding was recorded. With no target it returns only a bounded,
-redacted, no-write inventory. A targeted command is dry-run by default and
+projection binding was recorded. With no target it returns a bounded,
+redacted, no-write inventory of exact terminal repairs and every other unbound
+terminal handoff. Non-repairable rows are typed as a clean publication
+precursor, managed-unbound state, or blocked, with bounded related-state counts
+and explicit blockers; they are never silently omitted or made eligible for the
+terminal repair. A targeted command is dry-run by default and
 requires the exact repository, PR, and head. Apply additionally requires the
 protected launch profile and continuation contracts, the exact route and
 authoritative wake, authenticated GitHub App reads proving the PR merged at

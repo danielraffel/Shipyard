@@ -381,10 +381,33 @@ pub(super) fn work_ledger_command<W: Write>(
                             )
                             .map_err(failure)?;
                         }
+                        for item in &inventory.stranded_publications {
+                            writeln!(
+                                stdout,
+                                "{}#{} {} phase={} work={} generation={}/{} classification={} eligible={} blockers={}",
+                                item.repository.as_deref().unwrap_or("<missing>"),
+                                item.pull_request
+                                    .map_or_else(|| "<missing>".to_owned(), |value| value.to_string()),
+                                item.exact_head.as_deref().unwrap_or("<missing>"),
+                                item.phase,
+                                item.work_id,
+                                item.work_generation,
+                                item.owner_generation,
+                                item.classification,
+                                item.terminal_reconciliation_eligible,
+                                if item.blocking_reasons.is_empty() {
+                                    "none".to_owned()
+                                } else {
+                                    item.blocking_reasons.join(",")
+                                },
+                            )
+                            .map_err(failure)?;
+                        }
                         writeln!(
                             stdout,
-                            "Terminal reconciliation inventory: {} item(s), limit={}, complete={}",
+                            "Terminal reconciliation inventory: {} terminal item(s), {} stranded publication(s), limit={}, complete={}",
                             inventory.items.len(),
+                            inventory.stranded_publications.len(),
                             inventory.limit,
                             inventory.complete,
                         )
