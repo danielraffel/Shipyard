@@ -278,7 +278,7 @@ fn wal_checksum(
             "work ledger WAL checksum input is invalid".to_owned(),
         ));
     }
-    for words in bytes.chunks_exact(8) {
+    for words in bytes.as_chunks::<8>().0 {
         let first = wal_checksum_word(&words[..4], big_endian)?;
         let second = wal_checksum_word(&words[4..], big_endian)?;
         checksum[0] = checksum[0].wrapping_add(first).wrapping_add(checksum[1]);
@@ -423,7 +423,7 @@ pub(super) fn immutable_schema11_query<T>(
     Ok((source_before.database.sha256, result))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn local_work_inventory_with_preopen_hook(
     state_dir: &Path,
     preopen_hook: impl FnOnce() -> WorkLedgerResult<()>,
