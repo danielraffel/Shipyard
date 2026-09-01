@@ -33,6 +33,7 @@ use crate::executor::ssh_windows::{WindowsTargetConfig, WindowsValidation};
 use crate::job::{Priority, ValidationMode};
 #[cfg(any(unix, test))]
 use crate::record_identity::is_exact_lower_hex_git_sha;
+#[cfg(any(unix, test))]
 use crate::record_identity::is_valid_repository_slug;
 use crate::ship::{RunExecutionRequest, ShipExecutionRequest};
 #[cfg(any(unix, test))]
@@ -2086,6 +2087,7 @@ pub(crate) fn decode_queued_execution_request_bytes(
 }
 
 #[cfg(not(feature = "experimental-authority-v5"))]
+#[cfg(unix)]
 pub(crate) fn decode_queued_execution_request_bytes_for_import(
     contents: &[u8],
     _authoritative_filename: &str,
