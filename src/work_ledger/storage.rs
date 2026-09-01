@@ -1642,7 +1642,8 @@ pub(super) fn reconstruct_authentic_v12_schema_for_test(
     connection: &Connection,
 ) -> WorkLedgerResult<()> {
     connection.execute_batch(
-        "DROP TRIGGER workstream_projection_binding_mint_ownership_root;
+        "DROP TABLE dispatch_probe_targets;
+         DROP TRIGGER workstream_projection_binding_mint_ownership_root;
          DROP TRIGGER agent_ownership_generation_advance_fence;
          DROP TABLE ownership_leases;
          DROP TRIGGER ownership_lease_bootstrap_eligibility_no_insert;
