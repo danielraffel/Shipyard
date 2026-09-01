@@ -121,6 +121,9 @@ shipyard work-ledger status                         # inspect canonical shadow s
 shipyard work-ledger inventory                      # bounded immutable local-work view; does not create storage
 shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" # authentic-v11 exact-row reconciliation plan; no writes
 shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" --apply # writer-fenced migrate/bind/publication
+shipyard work-ledger reconcile-terminal              # bounded redacted inventory of terminal native rows missing projection bindings
+shipyard work-ledger reconcile-terminal --repo OWNER/REPO --pr 123 --head "$SHA" # exact dry-run; verifies local and merged GitHub authority
+shipyard work-ledger reconcile-terminal --repo OWNER/REPO --pr 123 --head "$SHA" --apply # bind one already-terminal row; exact replay is write-free
 shipyard work-ledger import                         # deterministic redacted legacy-import plan; no writes
 shipyard work-ledger import --apply                 # idempotently populate shadow storage; no activation/dispatch
 shipyard work-ledger policy list                    # list revision-fenced per-repository lane policy
@@ -157,6 +160,25 @@ the exact snapshot under the exclusive writer domain, migrates schema 11 to
 schema 14, enriches only that row with immutable repository identity, and
 requires an exact reread/replay. Foreign lineage, ambiguous or changed
 snapshots, coordinate drift, and any unbound row refuse the operation.
+
+`work-ledger reconcile-terminal` is the narrow repair for a native
+`terminal_handoff` that reached terminal state before its immutable workstream
+projection binding was recorded. With no target it returns only a bounded,
+redacted, no-write inventory. A targeted command is dry-run by default and
+requires the exact repository, PR, and head. Apply additionally requires the
+protected launch profile and continuation contracts, the exact route and
+authoritative wake, authenticated GitHub App reads proving the PR merged at
+that head/base, and a second identical GitHub read under exclusive writer
+custody. It adds only the immutable provider receipt, projection binding, and
+terminal-to-terminal audit event; the binding insert also mints its
+schema-required inert ownership-root identity. That root grants no authority:
+the repair cannot create agent ownership, holder material, bootstrap
+eligibility, or a lease, nor can it revise wakes, routes, continuations,
+custody, activation, or projection intents.
+Historical unrelated wakes are preserved. Ambiguity, incomplete authority,
+head/base movement, an existing ownership root without a binding, or any
+mismatch refuses. Repeating the exact targeted command after success is a
+write-free replay.
 
 Semantic blockers receive one deduplicated `shipyard:needs-agent` label and
 failed `shipyard/steward-recovery` status, which are cleared after recovery.

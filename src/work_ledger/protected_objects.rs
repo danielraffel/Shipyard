@@ -62,7 +62,111 @@ pub(crate) struct ProtectedObjectRecord {
     pub(crate) byte_length: u64,
 }
 
+pub(super) struct StagedProtectedObject {
+    pub(super) record: ProtectedObjectRecord,
+    pub(super) storage_name: String,
+    pub(super) already_registered: bool,
+}
+
 impl WorkLedger {
+    pub(super) fn stage_protected_object_with_writer_domain(
+        &self,
+        work_item_id: &str,
+        kind: ProtectedObjectKind,
+        profile_ref: Option<&str>,
+        expected_digest: &str,
+        bytes: &[u8],
+    ) -> WorkLedgerResult<StagedProtectedObject> {
+        let (record, storage_name) = prepare_protected_object_record(
+            work_item_id,
+            kind,
+            profile_ref,
+            expected_digest,
+            bytes,
+        )?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let directory = open_object_directory(parent, true)?;
+        reconcile_pending_objects(&directory)?;
+        let connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        if let Some(existing) = protected_object_record(&connection, &record.object_ref)? {
+            if existing != record {
+                return Err(WorkLedgerError::Refused(
+                    "protected object identity collides with different metadata".to_owned(),
+                ));
+            }
+            if read_object_from_directory(&directory, &storage_name, &record)? != bytes {
+                return Err(WorkLedgerError::Refused(
+                    "protected object replay bytes differ".to_owned(),
+                ));
+            }
+            return Ok(StagedProtectedObject {
+                record,
+                storage_name,
+                already_registered: true,
+            });
+        }
+        let work_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = ?1)",
+            [work_item_id],
+            |row| row.get(0),
+        )?;
+        if !work_exists {
+            return Err(WorkLedgerError::Refused(
+                "protected object work item does not exist".to_owned(),
+            ));
+        }
+        ensure_protected_object_capacity(&connection, record.byte_length)?;
+        write_object_to_directory(&directory, &storage_name, &record, bytes)?;
+        verify_directory_binding(parent, &directory)?;
+        if read_object_from_directory(&directory, &storage_name, &record)? != bytes {
+            return Err(WorkLedgerError::Refused(
+                "staged protected object bytes differ".to_owned(),
+            ));
+        }
+        Ok(StagedProtectedObject {
+            record,
+            storage_name,
+            already_registered: false,
+        })
+    }
+
+    pub(super) fn discard_exact_unregistered_protected_object_with_writer_domain(
+        &self,
+        work_item_id: &str,
+        kind: ProtectedObjectKind,
+        profile_ref: Option<&str>,
+        expected_digest: &str,
+        bytes: &[u8],
+    ) -> WorkLedgerResult<bool> {
+        let (record, storage_name) = prepare_protected_object_record(
+            work_item_id,
+            kind,
+            profile_ref,
+            expected_digest,
+            bytes,
+        )?;
+        let connection = self.connect_read_only()?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        if protected_object_record(&connection, &record.object_ref)?.is_some() {
+            return Ok(false);
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let Some(directory) = try_open_object_directory(parent, false)? else {
+            return Ok(false);
+        };
+        remove_exact_object_from_directory(&directory, &storage_name, &record, bytes)
+    }
+
     pub(super) fn read_protected_object_snapshot(
         &self,
         stored_name: &str,
@@ -651,6 +755,32 @@ fn reconcile_pending_objects(directory: &std::fs::File) -> WorkLedgerResult<()> 
 }
 
 #[cfg(unix)]
+fn remove_exact_object_from_directory(
+    directory: &std::fs::File,
+    name: &str,
+    record: &ProtectedObjectRecord,
+    expected_bytes: &[u8],
+) -> WorkLedgerResult<bool> {
+    use rustix::fs::{AtFlags, unlinkat};
+
+    let observed = match read_object_from_directory(directory, name, record) {
+        Ok(bytes) => bytes,
+        Err(WorkLedgerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if observed != expected_bytes {
+        return Err(WorkLedgerError::Refused(
+            "unregistered protected object bytes disagree with exact recovery authority".to_owned(),
+        ));
+    }
+    unlinkat(directory, name, AtFlags::empty()).map_err(std::io::Error::from)?;
+    directory.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(unix)]
 fn validate_pending_object(directory: &std::fs::File, name: &str) -> WorkLedgerResult<()> {
     use rustix::fs::{Mode, OFlags, openat};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -810,6 +940,28 @@ fn reconcile_pending_objects(directory: &ProtectedObjectDirectory) -> WorkLedger
         std::fs::remove_file(entry.path())?;
     }
     Ok(())
+}
+
+#[cfg(all(not(unix), test))]
+fn remove_exact_object_from_directory(
+    directory: &ProtectedObjectDirectory,
+    name: &str,
+    record: &ProtectedObjectRecord,
+    expected_bytes: &[u8],
+) -> WorkLedgerResult<bool> {
+    let path = directory.path.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    if read_object_from_directory(directory, name, record)? != expected_bytes {
+        return Err(WorkLedgerError::Refused(
+            "unregistered protected object bytes disagree with exact recovery authority".to_owned(),
+        ));
+    }
+    std::fs::remove_file(path)?;
+    Ok(true)
 }
 
 #[cfg(all(not(unix), test))]
@@ -1041,6 +1193,18 @@ fn read_object_from_directory(
 
 #[cfg(all(not(unix), not(test)))]
 fn reconcile_pending_objects(_directory: &ProtectedObjectDirectory) -> WorkLedgerResult<()> {
+    Err(WorkLedgerError::Refused(
+        "protected objects require no-follow file descriptors on this platform".to_owned(),
+    ))
+}
+
+#[cfg(all(not(unix), not(test)))]
+fn remove_exact_object_from_directory(
+    _directory: &ProtectedObjectDirectory,
+    _name: &str,
+    _record: &ProtectedObjectRecord,
+    _expected_bytes: &[u8],
+) -> WorkLedgerResult<bool> {
     Err(WorkLedgerError::Refused(
         "protected objects require no-follow file descriptors on this platform".to_owned(),
     ))

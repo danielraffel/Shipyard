@@ -635,6 +635,22 @@ pub(super) enum WorkLedgerCommand {
         #[arg(long)]
         apply: bool,
     },
+    /// Discover or reconcile one already-terminal native row missing its projection binding.
+    #[command(name = "reconcile-terminal")]
+    ReconcileTerminal {
+        /// Canonical lowercase owner/repository slug. Omit all target fields for inventory.
+        #[arg(long, requires_all = ["pr", "head"])]
+        repo: Option<String>,
+        /// Pull request number bound by the terminal row.
+        #[arg(long, requires_all = ["repo", "head"])]
+        pr: Option<u64>,
+        /// Exact lowercase 40-character terminal head SHA.
+        #[arg(long, requires_all = ["repo", "pr"])]
+        head: Option<String>,
+        /// Commit the exact reconciliation. Dry-run is the default.
+        #[arg(long, requires_all = ["repo", "pr", "head"])]
+        apply: bool,
+    },
     /// Inspect the exact redacted context challenge for one delivered wake.
     #[command(name = "context-challenge")]
     ContextChallenge {
@@ -3076,6 +3092,58 @@ mod tests {
             parsed_work_ledger(cli),
             WorkLedgerCommand::Publish { apply: true, .. }
         ));
+    }
+
+    #[test]
+    fn terminal_reconciliation_is_inventory_or_exact_dry_run_by_default() {
+        let inventory = Cli::try_parse_from(["shipyard", "work-ledger", "reconcile-terminal"])
+            .expect("terminal reconciliation inventory");
+        assert!(matches!(
+            parsed_work_ledger(inventory),
+            WorkLedgerCommand::ReconcileTerminal {
+                repo: None,
+                pr: None,
+                head: None,
+                apply: false,
+            }
+        ));
+
+        let head = "a".repeat(40);
+        let plan = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "reconcile-terminal",
+            "--repo",
+            "generous-corp/agent-workstream",
+            "--pr",
+            "74",
+            "--head",
+            &head,
+        ])
+        .expect("terminal reconciliation plan");
+        assert!(matches!(
+            parsed_work_ledger(plan),
+            WorkLedgerCommand::ReconcileTerminal {
+                repo: Some(repo),
+                pr: Some(74),
+                head: Some(parsed_head),
+                apply: false,
+            } if repo == "generous-corp/agent-workstream" && parsed_head == head
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "work-ledger",
+                "reconcile-terminal",
+                "--repo",
+                "generous-corp/agent-workstream",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["shipyard", "work-ledger", "reconcile-terminal", "--apply",])
+                .is_err()
+        );
     }
 
     #[test]
