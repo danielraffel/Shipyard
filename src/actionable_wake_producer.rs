@@ -739,10 +739,16 @@ impl ActionableWakeProducer {
                 .filter(|checkpoint| checkpoint.digest == digest)
                 .map_or_else(
                     || {
-                        (now + chrono::Duration::seconds(
-                            assignment_threshold_secs.max(stability_delay_seconds()),
-                        ))
-                        .to_rfc3339()
+                        let stability_due =
+                            now + chrono::Duration::seconds(stability_delay_seconds());
+                        let threshold_due =
+                            chrono::DateTime::parse_from_rfc3339(&authority.queued_at)
+                                .map(|queued_at| {
+                                    queued_at.with_timezone(&Utc)
+                                        + chrono::Duration::seconds(assignment_threshold_secs)
+                                })
+                                .unwrap_or(stability_due);
+                        std::cmp::max(stability_due, threshold_due).to_rfc3339()
                     },
                     |checkpoint| checkpoint.not_before.clone(),
                 );
@@ -2622,6 +2628,38 @@ mod tests {
     }
 
     #[test]
+    fn mature_first_observation_does_not_reapply_assignment_threshold() {
+        let state = tempfile::tempdir().expect("state");
+        let mut observation = dispatch_observation();
+        observation.authority.queued_at =
+            (Utc::now() - chrono::Duration::seconds(301)).to_rfc3339();
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+
+        let waiting = producer.process_dispatch_wedge_observation(&observation, 300);
+        assert_eq!(
+            waiting.reason_code.as_deref(),
+            Some("matching_second_read_required")
+        );
+
+        let scope = dispatch_scope_prefix(
+            test_repository_provider(),
+            test_repository_id(),
+            &observation.authority.repository,
+            observation.authority.pull_request,
+            &observation.authority.pull_request_head,
+        );
+        let checkpoint = producer.status.dispatch_targets[&scope]
+            .observations
+            .values()
+            .next()
+            .expect("first stable observation");
+        let not_before = chrono::DateTime::parse_from_rfc3339(&checkpoint.not_before)
+            .expect("checkpoint deadline")
+            .with_timezone(&Utc);
+        assert!(not_before <= Utc::now() + chrono::Duration::seconds(1));
+    }
+
+    #[test]
     fn failed_first_checkpoint_cannot_authorize_second_read() {
         let temp = tempfile::tempdir().expect("temp");
         let blocker = temp.path().join("blocker");
@@ -3818,7 +3856,7 @@ mod tests {
     }
 
     #[test]
-    fn old_workflow_clock_cannot_skip_first_observed_job_threshold() {
+    fn mature_job_uses_observation_stability_not_assignment_threshold() {
         let state = tempfile::tempdir().expect("state");
         let publication = request();
         seed_repo_policy(state.path(), &publication.repository);
@@ -3838,16 +3876,11 @@ mod tests {
             Some("matching_second_read_required")
         );
         let immediate_second = producer.process_dispatch_wedge_observation(&observation, 1);
-        assert!(!immediate_second.wake_enqueued);
         assert_eq!(
             immediate_second.reason_code.as_deref(),
-            Some("matching_second_read_required")
+            Some("dispatch_wedge")
         );
-
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
-        let mature = producer.process_dispatch_wedge_observation(&observation, 1);
-        assert_eq!(mature.reason_code.as_deref(), Some("dispatch_wedge"));
-        assert!(mature.wake_enqueued);
+        assert!(immediate_second.wake_enqueued);
     }
 
     #[test]
