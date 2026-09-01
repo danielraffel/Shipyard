@@ -631,8 +631,7 @@ fn read_object_from_directory(
 
 #[cfg(unix)]
 fn reconcile_pending_objects(directory: &std::fs::File) -> WorkLedgerResult<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use rustix::fs::{AtFlags, unlinkat};
 
     let entries = rustix::fs::Dir::read_from(directory).map_err(std::io::Error::from)?;
     for entry in entries {
@@ -644,28 +643,37 @@ fn reconcile_pending_objects(directory: &std::fs::File) -> WorkLedgerResult<()> 
         let name = std::str::from_utf8(name).map_err(|_| {
             WorkLedgerError::Refused("pending protected object name is not UTF-8".to_owned())
         })?;
-        let file = std::fs::File::from(
-            openat(
-                directory,
-                name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(std::io::Error::from)?,
-        );
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.permissions().mode() & 0o777 != 0o600
-            || metadata.nlink() != 1
-            || metadata.len() > MAX_PROTECTED_OBJECT_BYTES as u64
-        {
-            return Err(WorkLedgerError::Refused(
-                "pending protected object is unsafe to reconcile".to_owned(),
-            ));
-        }
+        validate_pending_object(directory, name)?;
         unlinkat(directory, name, AtFlags::empty()).map_err(std::io::Error::from)?;
     }
     directory.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_pending_object(directory: &std::fs::File, name: &str) -> WorkLedgerResult<()> {
+    use rustix::fs::{Mode, OFlags, openat};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let file = std::fs::File::from(
+        openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_PROTECTED_OBJECT_BYTES as u64
+    {
+        return Err(WorkLedgerError::Refused(
+            "pending protected object is unsafe to reconcile".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -696,6 +704,13 @@ fn scan_object_directory(
         let name = std::str::from_utf8(&name).map_err(|_| {
             WorkLedgerError::Refused("protected object filename is not UTF-8".to_owned())
         })?;
+        if name.starts_with(".pending-") {
+            // Read-only inventory/status/publication may observe safe crash
+            // residue but must not delete it. Writer-owned open uses the same
+            // validator and removes it before migration.
+            validate_pending_object(&directory, name)?;
+            continue;
+        }
         let Some(record) = expected.remove(name) else {
             return Err(WorkLedgerError::Refused(
                 "protected object directory contains an unregistered entry".to_owned(),

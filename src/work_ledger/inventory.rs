@@ -499,6 +499,8 @@ pub(crate) fn immutable_legacy_status(state_dir: &Path) -> WorkLedgerResult<Opti
     verify_legacy_inventory_schema(&connection)?;
     validate_inventory_rows_sql_side(&connection, InventorySchema::LegacyV11)?;
     let integrity = verify_integrity(&connection)?;
+    let snapshot_ledger = WorkLedger { path: path.clone() };
+    snapshot_ledger.verify_protected_object_storage(&connection)?;
     let status = LedgerStatus {
         exists: true,
         schema_version: LEGACY_INVENTORY_SCHEMA_VERSION,

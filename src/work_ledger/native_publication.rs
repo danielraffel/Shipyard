@@ -10,6 +10,8 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::io::Read;
 use std::io::Write;
+#[cfg(all(unix, test))]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -1114,6 +1116,10 @@ fn plan_schema11_reconciliation(
     };
     let (policy_snapshot, policy_matches) =
         super::inventory::immutable_schema11_query(state_dir, |connection| {
+            // Migration authenticates the whole protected store, not merely the
+            // launch profile selected by this request. A corrupt, missing, or
+            // unregistered sibling object must refuse before any schema write.
+            snapshot_ledger.verify_protected_object_storage(connection)?;
             let policy_matches = connection.query_row(
                 "SELECT COUNT(*) FROM repo_policies WHERE repo = ?1 AND revision = ?2",
                 params![request.repository, request.repo_policy_revision],
@@ -2437,6 +2443,16 @@ pub(crate) mod tests {
         ledger
             .ensure_projection_binding(&unrelated_request, &unrelated.work_id)
             .expect("unrelated v11 projection binding");
+        let unrelated_receipt = b"unrelated protected receipt";
+        ledger
+            .put_protected_object(
+                &unrelated.work_id,
+                crate::work_ledger::ProtectedObjectKind::ProviderReceipt,
+                None,
+                &digest(unrelated_receipt),
+                unrelated_receipt,
+            )
+            .expect("unrelated protected object");
         let connection = ledger
             .connect_read_write()
             .expect("authentic v11 fixture connection");
@@ -2553,6 +2569,235 @@ pub(crate) mod tests {
             Some(request.repository_id.as_str())
         );
         assert_eq!(inventory.items[1].repository_id, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_atomic_migration_rolls_back_each_intermediate_stage_and_retries() {
+        for interrupted_after in [12_i64, 13_i64] {
+            let temp = TempDir::new().expect("temp");
+            let request = request();
+            let continuation_policy = policy(vec![request.repository.clone()]);
+            seed_authentic_v11(temp.path(), &request, &continuation_policy);
+            let before = super::super::local_work_inventory(temp.path()).expect("v11 inventory");
+
+            let mut connection = rusqlite::Connection::open(WorkLedger::path_at(temp.path()))
+                .expect("migration connection");
+            let error = super::super::storage::migrate_v11_to_v14_atomic_with_hook(
+                &mut connection,
+                |stage| {
+                    if stage == interrupted_after {
+                        Err(WorkLedgerError::Refused(format!(
+                            "injected interruption after schema {stage}"
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("injected interruption must roll back");
+            assert!(error.to_string().contains("injected interruption"));
+            drop(connection);
+
+            assert_eq!(
+                super::super::inventory::database_effective_schema_version(temp.path())
+                    .expect("rolled-back schema"),
+                Some(11)
+            );
+            assert_eq!(
+                super::super::local_work_inventory(temp.path()).expect("rolled-back inventory"),
+                before
+            );
+
+            let applied = WorkLedger::plan_or_apply_native_continuation(
+                temp.path(),
+                &request,
+                &continuation_policy,
+                true,
+            )
+            .expect("retry from authentic v11");
+            assert!(applied.applied);
+            assert_eq!(
+                super::super::inventory::database_effective_schema_version(temp.path())
+                    .expect("current schema"),
+                Some(super::super::SCHEMA_VERSION)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_status_and_publication_validate_the_entire_protected_store() {
+        for fault in ["corrupt", "missing", "unsafe_pending", "unregistered"] {
+            let temp = TempDir::new().expect("temp");
+            let request = request();
+            let continuation_policy = policy(vec![request.repository.clone()]);
+            let target = seed_authentic_v11(temp.path(), &request, &continuation_policy);
+            let object_directory = temp.path().join("work-ledger/protected-objects");
+            let connection = rusqlite::Connection::open(WorkLedger::path_at(temp.path()))
+                .expect("protected-object fixture connection");
+            let unrelated_name: String = connection
+                .query_row(
+                    "SELECT storage_name FROM protected_objects WHERE work_item_id != ?1",
+                    [&target.work_id],
+                    |row| row.get(0),
+                )
+                .expect("unrelated protected object");
+            drop(connection);
+            match fault {
+                "corrupt" => std::fs::write(
+                    object_directory.join(&unrelated_name),
+                    b"corrupt unrelated protected object",
+                )
+                .expect("corrupt unrelated object"),
+                "missing" => std::fs::remove_file(object_directory.join(&unrelated_name))
+                    .expect("remove unrelated object"),
+                "unsafe_pending" => {
+                    let path = object_directory.join(".pending-unsafe");
+                    std::fs::write(&path, b"unsafe pending").expect("write unsafe pending");
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                        .expect("make pending unsafe");
+                }
+                "unregistered" => {
+                    let mut file = OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .mode(0o600)
+                        .open(object_directory.join("unregistered-object"))
+                        .expect("create unregistered object");
+                    file.write_all(b"unregistered").expect("write fixture");
+                }
+                _ => unreachable!(),
+            }
+            let before = state_tree_bytes(temp.path());
+
+            super::super::inventory::immutable_legacy_status(temp.path())
+                .expect_err("legacy status must reject the protected-store fault");
+            assert_eq!(state_tree_bytes(temp.path()), before);
+            WorkLedger::plan_or_apply_native_continuation(
+                temp.path(),
+                &request,
+                &continuation_policy,
+                false,
+            )
+            .expect_err("legacy publication must reject the protected-store fault");
+            assert_eq!(state_tree_bytes(temp.path()), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentic_v11_read_only_paths_tolerate_safe_pending_without_mutation() {
+        let temp = TempDir::new().expect("temp");
+        let request = request();
+        let continuation_policy = policy(vec![request.repository.clone()]);
+        seed_authentic_v11(temp.path(), &request, &continuation_policy);
+        let pending = temp
+            .path()
+            .join("work-ledger/protected-objects/.pending-interrupted-write");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&pending)
+            .expect("create safe pending");
+        file.write_all(b"safe pending residue")
+            .expect("write safe pending");
+        drop(file);
+        let before = state_tree_bytes(temp.path());
+
+        super::super::inventory::immutable_legacy_status(temp.path())
+            .expect("legacy status")
+            .expect("v11 status");
+        assert_eq!(state_tree_bytes(temp.path()), before);
+        WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &request,
+            &continuation_policy,
+            false,
+        )
+        .expect("legacy publication plan");
+        assert_eq!(state_tree_bytes(temp.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_open_validates_the_entire_v11_protected_store_before_migration() {
+        let clean = TempDir::new().expect("clean temp");
+        let clean_request = request();
+        let clean_policy = policy(vec![clean_request.repository.clone()]);
+        seed_authentic_v11(clean.path(), &clean_request, &clean_policy);
+        let clean_pending = clean
+            .path()
+            .join("work-ledger/protected-objects/.pending-interrupted-write");
+        let mut pending_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&clean_pending)
+            .expect("create safe pending");
+        pending_file
+            .write_all(b"safe pending residue")
+            .expect("write safe pending");
+        drop(pending_file);
+        WorkLedger::open(clean.path()).expect("clean generic v11 migration");
+        assert!(!clean_pending.exists());
+        assert_eq!(
+            super::super::inventory::database_effective_schema_version(clean.path())
+                .expect("clean current schema"),
+            Some(super::super::SCHEMA_VERSION)
+        );
+
+        for fault in ["corrupt", "missing", "unsafe_pending", "unregistered"] {
+            let temp = TempDir::new().expect("fault temp");
+            let request = request();
+            let continuation_policy = policy(vec![request.repository.clone()]);
+            let target = seed_authentic_v11(temp.path(), &request, &continuation_policy);
+            let object_directory = temp.path().join("work-ledger/protected-objects");
+            let connection = rusqlite::Connection::open(WorkLedger::path_at(temp.path()))
+                .expect("protected-object fixture connection");
+            let unrelated_name: String = connection
+                .query_row(
+                    "SELECT storage_name FROM protected_objects WHERE work_item_id != ?1",
+                    [&target.work_id],
+                    |row| row.get(0),
+                )
+                .expect("unrelated protected object");
+            drop(connection);
+            match fault {
+                "corrupt" => std::fs::write(
+                    object_directory.join(&unrelated_name),
+                    b"corrupt unrelated protected object",
+                )
+                .expect("corrupt unrelated object"),
+                "missing" => std::fs::remove_file(object_directory.join(&unrelated_name))
+                    .expect("remove unrelated object"),
+                "unsafe_pending" => {
+                    let path = object_directory.join(".pending-unsafe");
+                    std::fs::write(&path, b"unsafe pending").expect("write unsafe pending");
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                        .expect("make pending unsafe");
+                }
+                "unregistered" => {
+                    let mut file = OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .mode(0o600)
+                        .open(object_directory.join("unregistered-object"))
+                        .expect("create unregistered object");
+                    file.write_all(b"unregistered").expect("write fixture");
+                }
+                _ => unreachable!(),
+            }
+
+            WorkLedger::open(temp.path())
+                .expect_err("generic open must reject the protected-store fault");
+            assert_eq!(
+                super::super::inventory::database_effective_schema_version(temp.path())
+                    .expect("refused schema remains v11"),
+                Some(11)
+            );
+        }
     }
 
     #[cfg(unix)]

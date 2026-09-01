@@ -183,8 +183,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
         version = 12;
     }
     if version == 11 {
-        migrate_v11_to_v12(connection)?;
-        version = 12;
+        return migrate_v11_to_v14_atomic(connection);
     }
     if version == 12 {
         migrate_v12_to_v13(connection)?;
@@ -936,18 +935,10 @@ fn migrate_v10_to_v12(connection: &mut Connection) -> WorkLedgerResult<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // Keep the one atomic identity migration auditable intact.
-fn migrate_v11_to_v12(connection: &mut Connection) -> WorkLedgerResult<()> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-    if schema_version(&transaction)? != 11 {
-        return Err(WorkLedgerError::Refused(
-            "schema version changed while acquiring the repository identity migration fence"
-                .to_owned(),
-        ));
-    }
-    verify_open_lineage(&transaction, 11)?;
-    super::inventory::verify_legacy_custody_migration_schema(&transaction)?;
-    validate_relational_integrity(&transaction)?;
+#[allow(clippy::too_many_lines)] // Keep the repository identity DDL auditable intact.
+fn install_repository_identity_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> WorkLedgerResult<()> {
     transaction.execute_batch(
         "DROP TRIGGER workstream_projection_binding_no_delete;
          DROP TRIGGER workstream_projection_binding_identity_immutable;
@@ -1044,7 +1035,43 @@ fn migrate_v11_to_v12(connection: &mut Connection) -> WorkLedgerResult<()> {
          )
          BEGIN SELECT RAISE(ABORT, 'legacy and immutable repository bindings cannot overlap'); END;",
     )?;
-    transaction.pragma_update(None, "user_version", 12)?;
+    Ok(())
+}
+
+/// Upgrade the production schema-v11 cohort in one `SQLite` transaction.
+///
+/// The individual v12 and v13 migrators remain supported for authentic
+/// historical ledgers, but a new v11 publication must never expose those
+/// intermediate schemas. A process exit or error before commit therefore
+/// leaves the exact authenticated v11 snapshot available for a clean retry.
+fn migrate_v11_to_v14_atomic(connection: &mut Connection) -> WorkLedgerResult<()> {
+    migrate_v11_to_v14_atomic_with_hook(connection, |_| Ok(()))
+}
+
+pub(super) fn migrate_v11_to_v14_atomic_with_hook(
+    connection: &mut Connection,
+    mut stage_hook: impl FnMut(i64) -> WorkLedgerResult<()>,
+) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if schema_version(&transaction)? != 11 {
+        return Err(WorkLedgerError::Refused(
+            "schema version changed while acquiring the atomic schema-v11 migration fence"
+                .to_owned(),
+        ));
+    }
+    verify_open_lineage(&transaction, 11)?;
+    super::inventory::verify_legacy_inventory_schema(&transaction)?;
+    super::inventory::verify_legacy_custody_migration_schema(&transaction)?;
+    validate_relational_integrity(&transaction)?;
+
+    install_repository_identity_schema(&transaction)?;
+    stage_hook(12)?;
+    rebuild_legacy_custody_successor_schema(&transaction)?;
+    install_ownership_lease_schema(&transaction)?;
+    stage_hook(13)?;
+    install_dispatch_probe_state_schema(&transaction)?;
+
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     verify_schema_identity(&transaction)?;
     validate_relational_integrity(&transaction)?;
     transaction.commit()?;

@@ -47,6 +47,13 @@ impl WorkLedger {
             protect_database_file(&ledger.path)?;
         }
         let mut connection = ledger.connect_read_write()?;
+        // Schema-v11 startup is itself a migration authority. Authenticate the
+        // complete bounded protected store before generic daemon/CLI open can
+        // advance the schema, even when no native-publication request exists.
+        if schema_version(&connection)? == 11 {
+            ledger.reconcile_protected_object_storage()?;
+            ledger.verify_protected_object_storage(&connection)?;
+        }
         configure_durable(&connection)?;
         migrate(&mut connection)?;
         verify_integrity(&connection)?;
