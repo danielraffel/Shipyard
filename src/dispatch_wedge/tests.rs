@@ -29,7 +29,7 @@ fn authority() -> DispatchJobAuthority {
             "ARM64".to_owned(),
             "build".to_owned(),
         ],
-        queued_at: "2026-08-31T10:29:40Z".to_owned(),
+        first_observed_unassigned_at: "2026-08-31T10:29:40Z".to_owned(),
         required_context: "macos".to_owned(),
         required_app_id: Some(42),
         producer_app_id: Some(42),

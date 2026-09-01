@@ -32,7 +32,10 @@ pub struct DispatchJobAuthority {
     pub job_conclusion: Option<String>,
     pub runner_name: Option<String>,
     pub labels: Vec<String>,
-    pub queued_at: String,
+    /// Durable producer-supplied origin for how long this exact job has been
+    /// observed queued and unassigned. GitHub does not expose a reliable
+    /// job-specific queue timestamp for an unstarted workflow job.
+    pub first_observed_unassigned_at: String,
     pub required_context: String,
     pub required_app_id: Option<u64>,
     pub producer_app_id: Option<u64>,
@@ -57,6 +60,11 @@ pub(crate) struct DispatchWedgeObservation {
     pub(crate) authority: DispatchJobAuthority,
     pub(crate) runners: Vec<DispatchRunnerObservation>,
     pub(crate) observation_complete: bool,
+    /// Test-only seed for controls that model an already-durable aged
+    /// observation. Production has no such field and always establishes the
+    /// origin in the producer's persisted checkpoint.
+    #[cfg(test)]
+    pub(crate) first_observed_unassigned_at_seed: Option<String>,
 }
 
 /// One complete joined observation.
@@ -106,8 +114,8 @@ pub struct DispatchWedgeEvidence {
     pub required_context: String,
     pub required_app_id: Option<u64>,
     pub producer_app_id: Option<u64>,
-    pub queued_at: String,
-    pub assignment_age_secs: i64,
+    pub first_observed_unassigned_at: String,
+    pub unassigned_observation_age_secs: i64,
     pub labels: Vec<String>,
     pub required_labels_digest: String,
     pub eligible_idle_runners: Vec<DispatchRunnerEvidence>,
@@ -190,17 +198,18 @@ pub fn assess_dispatch_wedge(inputs: &DispatchWedgeInputs<'_>) -> DispatchWedgeA
     if labels.is_empty() || !labels.contains("self-hosted") {
         return indeterminate("job_labels_not_self_hosted");
     }
-    let queued_at = match DateTime::parse_from_rfc3339(&authority.queued_at) {
-        Ok(value) => value.with_timezone(&Utc),
-        Err(_) => return indeterminate("queued_at_invalid"),
-    };
-    if queued_at > inputs.now {
-        return indeterminate("queued_at_in_future");
+    let first_observed_unassigned_at =
+        match DateTime::parse_from_rfc3339(&authority.first_observed_unassigned_at) {
+            Ok(value) => value.with_timezone(&Utc),
+            Err(_) => return indeterminate("first_observed_unassigned_at_invalid"),
+        };
+    if first_observed_unassigned_at > inputs.now {
+        return indeterminate("first_observed_unassigned_at_in_future");
     }
     if inputs.assignment_threshold_secs <= 0 {
         return indeterminate("assignment_threshold_invalid");
     }
-    let age = (inputs.now - queued_at).num_seconds();
+    let age = (inputs.now - first_observed_unassigned_at).num_seconds();
     if age < inputs.assignment_threshold_secs {
         return DispatchWedgeAssessment {
             state: DispatchWedgeState::Waiting,
@@ -277,8 +286,8 @@ pub fn assess_dispatch_wedge(inputs: &DispatchWedgeInputs<'_>) -> DispatchWedgeA
         required_context: authority.required_context.clone(),
         required_app_id: authority.required_app_id,
         producer_app_id: authority.producer_app_id,
-        queued_at: authority.queued_at.clone(),
-        assignment_age_secs: age,
+        first_observed_unassigned_at: authority.first_observed_unassigned_at.clone(),
+        unassigned_observation_age_secs: age,
         labels: labels.iter().cloned().collect(),
         required_labels_digest: required_labels_digest(&labels),
         eligible_idle_runners,
@@ -352,7 +361,7 @@ struct CanonicalObservationAuthority<'a> {
     job_conclusion: Option<String>,
     runner_name: Option<String>,
     labels: Vec<String>,
-    queued_at: &'a str,
+    first_observed_unassigned_at: &'a str,
     required_context: &'a str,
     required_app_id: Option<u64>,
     producer_app_id: Option<u64>,
@@ -398,7 +407,7 @@ pub(crate) fn dispatch_wedge_observation_digest(
             .as_ref()
             .map(|value| value.to_ascii_lowercase()),
         labels: normalized_labels(&authority.labels).into_iter().collect(),
-        queued_at: &authority.queued_at,
+        first_observed_unassigned_at: &authority.first_observed_unassigned_at,
         required_context: &authority.required_context,
         required_app_id: authority.required_app_id,
         producer_app_id: authority.producer_app_id,
@@ -433,7 +442,7 @@ fn evidence_digest(evidence: &DispatchWedgeEvidence) -> String {
     canonical.dedupe_key.clear();
     canonical.evidence_digest.clear();
     canonical.observed_at.clear();
-    canonical.assignment_age_secs = 0;
+    canonical.unassigned_observation_age_secs = 0;
     format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&canonical).expect("serializable evidence"))

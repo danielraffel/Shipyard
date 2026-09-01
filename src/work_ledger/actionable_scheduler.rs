@@ -202,6 +202,96 @@ impl WorkLedger {
         Ok(())
     }
 
+    /// Apply only the dispatch-target rows changed by the single-threaded
+    /// producer. The final row count is checked in the same transaction so a
+    /// stale in-memory cache cannot silently delete or preserve unrelated
+    /// durable targets.
+    pub(crate) fn patch_dispatch_probe_targets(
+        &self,
+        upserts: &[DispatchProbeTargetRecord],
+        deletes: &[String],
+        expected_total: usize,
+    ) -> WorkLedgerResult<()> {
+        if expected_total > MAX_DISPATCH_PROBE_TARGETS
+            || upserts.len() > MAX_DISPATCH_PROBE_TARGETS
+            || deletes.len() > MAX_DISPATCH_PROBE_TARGETS
+        {
+            return Err(WorkLedgerError::Refused(
+                "dispatch_probe_capacity_exhausted".to_owned(),
+            ));
+        }
+        let upsert_keys = upserts
+            .iter()
+            .map(|record| record.target_key.as_str())
+            .collect::<BTreeSet<_>>();
+        let delete_keys = deletes.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        if upsert_keys.len() != upserts.len()
+            || delete_keys.len() != deletes.len()
+            || !upsert_keys.is_disjoint(&delete_keys)
+        {
+            return Err(WorkLedgerError::Refused(
+                "dispatch_probe_patch_key_invalid".to_owned(),
+            ));
+        }
+        let mut connection = self.connect_read_write()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for record in upserts {
+            validate_dispatch_probe_record(record)?;
+            transaction.execute(
+                "INSERT INTO dispatch_probe_targets
+                   (target_key, repository_provider, repository_id, repository, pull_request,
+                    head_sha, generation, due_at, checkpoint_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(target_key) DO UPDATE SET
+                   repository_provider = excluded.repository_provider,
+                   repository_id = excluded.repository_id,
+                   repository = excluded.repository,
+                   pull_request = excluded.pull_request,
+                   head_sha = excluded.head_sha,
+                   generation = excluded.generation,
+                   due_at = excluded.due_at,
+                   checkpoint_json = excluded.checkpoint_json,
+                   updated_at = excluded.updated_at",
+                params![
+                    record.target_key,
+                    record.repository_provider,
+                    record.repository_id,
+                    record.repository,
+                    record.pull_request,
+                    record.head_sha,
+                    record.generation,
+                    record.due_at,
+                    record.checkpoint_json,
+                    now,
+                ],
+            )?;
+        }
+        for target_key in deletes {
+            if transaction.execute(
+                "DELETE FROM dispatch_probe_targets WHERE target_key = ?1",
+                [target_key],
+            )? != 1
+            {
+                return Err(WorkLedgerError::Refused(
+                    "dispatch_probe_patch_delete_mismatch".to_owned(),
+                ));
+            }
+        }
+        let observed_total: usize =
+            transaction.query_row("SELECT count(*) FROM dispatch_probe_targets", [], |row| {
+                row.get(0)
+            })?;
+        if observed_total != expected_total {
+            return Err(WorkLedgerError::Refused(
+                "dispatch_probe_patch_total_mismatch".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn load_dispatch_probe_targets(
         &self,
     ) -> WorkLedgerResult<Vec<DispatchProbeTargetRecord>> {
@@ -852,6 +942,45 @@ mod tests {
                 if message.starts_with("dispatch_probe_capacity_exhausted:")
         ));
         assert_eq!(ledger.load_dispatch_probe_targets().unwrap(), vec![prior]);
+    }
+
+    #[test]
+    fn dispatch_probe_patch_is_delta_bounded_and_refuses_stale_cache() {
+        let state = tempfile::tempdir().expect("state");
+        let ledger = WorkLedger::open(state.path()).expect("ledger");
+        let first = dispatch_probe_record(1);
+        let mut second = dispatch_probe_record(2);
+        ledger
+            .replace_dispatch_probe_targets(std::slice::from_ref(&first))
+            .expect("seed");
+
+        ledger
+            .patch_dispatch_probe_targets(std::slice::from_ref(&second), &[], 2)
+            .expect("one-row append");
+        second.generation = 2;
+        ledger
+            .patch_dispatch_probe_targets(std::slice::from_ref(&second), &[], 2)
+            .expect("one-row update");
+        assert_eq!(
+            ledger.load_dispatch_probe_targets().unwrap(),
+            vec![first.clone(), second]
+        );
+
+        let stale_patch = ledger.patch_dispatch_probe_targets(&[], &["missing".to_owned()], 1);
+        assert!(matches!(
+            stale_patch,
+            Err(WorkLedgerError::Refused(message))
+                if message == "dispatch_probe_patch_delete_mismatch"
+        ));
+        assert_eq!(ledger.load_dispatch_probe_targets().unwrap().len(), 2);
+
+        let wrong_total = ledger.patch_dispatch_probe_targets(&[], &[], 1);
+        assert!(matches!(
+            wrong_total,
+            Err(WorkLedgerError::Refused(message))
+                if message == "dispatch_probe_patch_total_mismatch"
+        ));
+        assert_eq!(ledger.load_dispatch_probe_targets().unwrap().len(), 2);
     }
 
     fn published() -> (tempfile::TempDir, WorkLedger, String, String) {

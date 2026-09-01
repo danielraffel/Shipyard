@@ -84,6 +84,8 @@ pub(crate) struct DispatchObservationCheckpoint {
     pub(crate) digest: String,
     pub(crate) not_before: String,
     pub(crate) boot_epoch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) first_observed_unassigned_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -169,6 +171,7 @@ pub(crate) struct ActionableWakeProducer {
     boot_epoch: String,
     dispatch_state_available: bool,
     dispatch_state_digest: Option<String>,
+    persisted_dispatch_records: BTreeMap<String, crate::work_ledger::DispatchProbeTargetRecord>,
 }
 
 impl ActionableWakeProducer {
@@ -228,6 +231,11 @@ impl ActionableWakeProducer {
             .transpose()
             .ok()
             .flatten();
+        let persisted_dispatch_records = dispatch_target_records(&status.dispatch_targets)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| (record.target_key.clone(), record))
+            .collect();
         let seed = format!(
             "{}:{}:{}",
             std::process::id(),
@@ -241,6 +249,7 @@ impl ActionableWakeProducer {
             boot_epoch,
             dispatch_state_available,
             dispatch_state_digest,
+            persisted_dispatch_records,
         }
     }
 
@@ -557,8 +566,26 @@ impl ActionableWakeProducer {
                 false,
             );
         }
-        let digest = dispatch_wedge_observation_digest(authority, &observation.runners);
         let now = Utc::now();
+        #[cfg(test)]
+        let test_seed = observation.first_observed_unassigned_at_seed.as_deref();
+        #[cfg(not(test))]
+        let test_seed: Option<&str> = None;
+        let first_observed_unassigned_at = self
+            .status
+            .dispatch_targets
+            .get(&scope)
+            .and_then(|target| target.observations.get(&key))
+            .and_then(|checkpoint| checkpoint.first_observed_unassigned_at.as_deref())
+            .or(test_seed)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .filter(|value| *value <= now)
+            .unwrap_or(now);
+        let mut effective_authority = authority.clone();
+        effective_authority.first_observed_unassigned_at =
+            first_observed_unassigned_at.to_rfc3339();
+        let digest = dispatch_wedge_observation_digest(&effective_authority, &observation.runners);
         let pending_digest = self
             .status
             .dispatch_targets
@@ -579,7 +606,7 @@ impl ActionableWakeProducer {
             .map(|checkpoint| checkpoint.digest.clone());
         let previous = pending_digest.clone().or_else(|| checkpoint_digest.clone());
         let assessment = assess_dispatch_wedge(&DispatchWedgeInputs {
-            authority,
+            authority: &effective_authority,
             runners: &observation.runners,
             observation_complete: observation.observation_complete,
             previous_observation_digest: previous.as_deref(),
@@ -741,13 +768,14 @@ impl ActionableWakeProducer {
                     || {
                         let stability_due =
                             now + chrono::Duration::seconds(stability_delay_seconds());
-                        let threshold_due =
-                            chrono::DateTime::parse_from_rfc3339(&authority.queued_at)
-                                .map(|queued_at| {
-                                    queued_at.with_timezone(&Utc)
-                                        + chrono::Duration::seconds(assignment_threshold_secs)
-                                })
-                                .unwrap_or(stability_due);
+                        let threshold_due = chrono::DateTime::parse_from_rfc3339(
+                            &effective_authority.first_observed_unassigned_at,
+                        )
+                        .map(|first_observed| {
+                            first_observed.with_timezone(&Utc)
+                                + chrono::Duration::seconds(assignment_threshold_secs)
+                        })
+                        .unwrap_or(stability_due);
                         std::cmp::max(stability_due, threshold_due).to_rfc3339()
                     },
                     |checkpoint| checkpoint.not_before.clone(),
@@ -758,6 +786,9 @@ impl ActionableWakeProducer {
                     digest,
                     not_before,
                     boot_epoch: self.boot_epoch.clone(),
+                    first_observed_unassigned_at: Some(
+                        effective_authority.first_observed_unassigned_at.clone(),
+                    ),
                 },
             );
             if self.persist_status().is_err() {
@@ -957,6 +988,10 @@ impl ActionableWakeProducer {
         clippy::too_many_arguments,
         reason = "repository identity and exact target generation are independent mutation fences"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one generation-fenced cycle keeps target pruning, classification, and follow-up deadline selection auditable"
+    )]
     pub(crate) fn process_dispatch_wedge_cycle_at_generation_with_followup_for_repository(
         &mut self,
         repository_provider: &str,
@@ -1023,7 +1058,10 @@ impl ActionableWakeProducer {
                 observation,
                 assignment_threshold_secs,
             );
-            if observed.reason_code.as_deref() == Some("matching_second_read_required") {
+            if matches!(
+                observed.reason_code.as_deref(),
+                Some("matching_second_read_required" | "assignment_threshold_not_reached")
+            ) {
                 let due_at = self.dispatch_matching_second_read_due_at_for_observation(
                     repository_provider,
                     repository_id,
@@ -1781,10 +1819,14 @@ impl ActionableWakeProducer {
         );
         let target = self.status.dispatch_targets.get(&key)?;
         let observation_key = dispatch_observation_key(authority);
-        let digest = dispatch_wedge_observation_digest(authority, &observation.runners);
-        target
-            .observations
-            .get(&observation_key)
+        let checkpoint = target.observations.get(&observation_key)?;
+        let mut effective_authority = authority.clone();
+        effective_authority.first_observed_unassigned_at = checkpoint
+            .first_observed_unassigned_at
+            .clone()
+            .unwrap_or_default();
+        let digest = dispatch_wedge_observation_digest(&effective_authority, &observation.runners);
+        Some(checkpoint)
             .filter(|checkpoint| checkpoint.digest == digest)
             .and_then(|checkpoint| {
                 chrono::DateTime::parse_from_rfc3339(&checkpoint.not_before)
@@ -1975,7 +2017,29 @@ impl ActionableWakeProducer {
         if self.dispatch_state_digest.as_deref() == Some(&digest) {
             return Ok(());
         }
-        persist_dispatch_targets(&self.state_dir, &self.status.dispatch_targets)?;
+        let records = dispatch_target_records(&self.status.dispatch_targets)?;
+        let desired = records
+            .into_iter()
+            .map(|record| (record.target_key.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        let upserts = desired
+            .iter()
+            .filter(|(key, record)| self.persisted_dispatch_records.get(*key) != Some(*record))
+            .map(|(_, record)| record.clone())
+            .collect::<Vec<_>>();
+        let deletes = self
+            .persisted_dispatch_records
+            .keys()
+            .filter(|key| !desired.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let ledger = WorkLedger::open_existing(&self.state_dir)
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| std::io::Error::other("dispatch target WorkLedger is unavailable"))?;
+        ledger
+            .patch_dispatch_probe_targets(&upserts, &deletes, desired.len())
+            .map_err(std::io::Error::other)?;
+        self.persisted_dispatch_records = desired;
         self.dispatch_state_digest = Some(digest);
         Ok(())
     }
@@ -2172,7 +2236,19 @@ fn persist_dispatch_targets(
     state_dir: &Path,
     targets: &BTreeMap<String, DispatchTargetCheckpoint>,
 ) -> std::io::Result<()> {
-    let records = targets
+    let records = dispatch_target_records(targets)?;
+    let ledger = WorkLedger::open_existing(state_dir)
+        .map_err(std::io::Error::other)?
+        .ok_or_else(|| std::io::Error::other("dispatch target WorkLedger is unavailable"))?;
+    ledger
+        .replace_dispatch_probe_targets(&records)
+        .map_err(std::io::Error::other)
+}
+
+fn dispatch_target_records(
+    targets: &BTreeMap<String, DispatchTargetCheckpoint>,
+) -> std::io::Result<Vec<crate::work_ledger::DispatchProbeTargetRecord>> {
+    targets
         .iter()
         .map(|(target_key, checkpoint)| {
             Ok(crate::work_ledger::DispatchProbeTargetRecord {
@@ -2190,13 +2266,7 @@ fn persist_dispatch_targets(
                 checkpoint_json: serde_json::to_vec(checkpoint).map_err(std::io::Error::other)?,
             })
         })
-        .collect::<std::io::Result<Vec<_>>>()?;
-    let ledger = WorkLedger::open_existing(state_dir)
-        .map_err(std::io::Error::other)?
-        .ok_or_else(|| std::io::Error::other("dispatch target WorkLedger is unavailable"))?;
-    ledger
-        .replace_dispatch_probe_targets(&records)
-        .map_err(std::io::Error::other)
+        .collect()
 }
 
 fn dispatch_targets_digest(
@@ -2382,7 +2452,8 @@ mod tests {
                 job_conclusion: None,
                 runner_name: None,
                 labels: vec!["self-hosted".to_owned(), "macos".to_owned()],
-                queued_at: (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339(),
+                first_observed_unassigned_at: (Utc::now() - chrono::Duration::minutes(10))
+                    .to_rfc3339(),
                 required_context: "macos".to_owned(),
                 required_app_id: Some(42),
                 producer_app_id: Some(42),
@@ -2399,6 +2470,9 @@ mod tests {
                 ],
             }],
             observation_complete: true,
+            first_observed_unassigned_at_seed: Some(
+                (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339(),
+            ),
         }
     }
 
@@ -2421,7 +2495,13 @@ mod tests {
             .observations
             .values_mut()
             .for_each(|checkpoint| {
+                let first_observed = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
                 checkpoint.not_before = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+                checkpoint.first_observed_unassigned_at = Some(first_observed.clone());
+                let mut effective_authority = observation.authority.clone();
+                effective_authority.first_observed_unassigned_at = first_observed;
+                checkpoint.digest =
+                    dispatch_wedge_observation_digest(&effective_authority, &observation.runners);
             });
         producer.persist_status().expect("persist due checkpoint");
     }
@@ -2628,18 +2708,38 @@ mod tests {
     }
 
     #[test]
-    fn mature_first_observation_does_not_reapply_assignment_threshold() {
+    fn old_workflow_age_does_not_make_new_job_observation_immediately_actionable() {
         let state = tempfile::tempdir().expect("state");
         let mut observation = dispatch_observation();
-        observation.authority.queued_at =
+        // The observer may carry an old workflow-derived value, but the
+        // producer must replace it with this exact job's durable first-seen
+        // time before classification.
+        observation.authority.first_observed_unassigned_at =
             (Utc::now() - chrono::Duration::seconds(301)).to_rfc3339();
+        observation.first_observed_unassigned_at_seed = None;
         let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
 
         let waiting = producer.process_dispatch_wedge_observation(&observation, 300);
         assert_eq!(
             waiting.reason_code.as_deref(),
-            Some("matching_second_read_required")
+            Some("assignment_threshold_not_reached")
         );
+
+        let persisted = ActionableWakeProducer::new(state.path().to_path_buf());
+        let checkpoint = persisted
+            .status
+            .dispatch_targets
+            .values()
+            .next()
+            .and_then(|target| target.observations.values().next())
+            .expect("durable first observation");
+        let first_observed = checkpoint
+            .first_observed_unassigned_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .expect("valid first-observed timestamp")
+            .with_timezone(&Utc);
+        assert!(Utc::now() - first_observed < chrono::Duration::seconds(5));
 
         let scope = dispatch_scope_prefix(
             test_repository_provider(),
@@ -2656,7 +2756,7 @@ mod tests {
         let not_before = chrono::DateTime::parse_from_rfc3339(&checkpoint.not_before)
             .expect("checkpoint deadline")
             .with_timezone(&Utc);
-        assert!(not_before <= Utc::now() + chrono::Duration::seconds(1));
+        assert!(not_before >= Utc::now() + chrono::Duration::seconds(295));
     }
 
     #[test]
@@ -2747,6 +2847,12 @@ mod tests {
                 ),
                 not_before: (now - chrono::Duration::minutes(1)).to_rfc3339(),
                 boot_epoch: boot_epoch.clone(),
+                first_observed_unassigned_at: Some(
+                    current_mature_nonmatching
+                        .authority
+                        .first_observed_unassigned_at
+                        .clone(),
+                ),
             },
         );
         target.observations.insert(
@@ -2758,6 +2864,12 @@ mod tests {
                 ),
                 not_before: future.to_rfc3339(),
                 boot_epoch,
+                first_observed_unassigned_at: Some(
+                    fresh_matching
+                        .authority
+                        .first_observed_unassigned_at
+                        .clone(),
+                ),
             },
         );
 
@@ -2814,6 +2926,9 @@ mod tests {
                 ),
                 not_before: matured.to_rfc3339(),
                 boot_epoch,
+                first_observed_unassigned_at: Some(
+                    observation.authority.first_observed_unassigned_at.clone(),
+                ),
             },
         );
 
@@ -3275,6 +3390,7 @@ mod tests {
                 digest: "evidence-digest".to_owned(),
                 not_before: Utc::now().to_rfc3339(),
                 boot_epoch: "prior-boot".to_owned(),
+                first_observed_unassigned_at: Some(Utc::now().to_rfc3339()),
             },
         );
         target.pending_publication = Some(DispatchPendingPublication {
@@ -3842,7 +3958,8 @@ mod tests {
         )
         .expect("publish managed handoff");
         let mut observation = dispatch_observation();
-        observation.authority.queued_at = Utc::now().to_rfc3339();
+        observation.authority.first_observed_unassigned_at = Utc::now().to_rfc3339();
+        observation.first_observed_unassigned_at_seed = None;
         let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
         let early = producer.process_dispatch_wedge_observation(&observation, 1);
         assert_eq!(

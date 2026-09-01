@@ -331,6 +331,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut steward_repository_in_flight = None;
     let mut dispatch_probes_in_flight = BTreeSet::new();
     let mut dispatch_probe_repositories_in_flight = BTreeSet::new();
+    let mut next_dispatch_scan_at = Instant::now();
     if let Ok(mut published) = custody_transport_error.lock() {
         *published = custody_transport_runtime.diagnostic_error();
     }
@@ -571,8 +572,12 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 }
             }
         }
-        if let Ok(active_targets) = authoritative_native_steward_inventory(&config.state_dir) {
-            actionable_producer.retain_dispatch_targets(&active_targets);
+        let dispatch_scan_due = Instant::now() >= next_dispatch_scan_at;
+        if dispatch_scan_due {
+            next_dispatch_scan_at = Instant::now() + DISPATCH_SCAN_INTERVAL;
+            if let Ok(active_targets) = authoritative_native_steward_inventory(&config.state_dir) {
+                actionable_producer.retain_dispatch_targets(&active_targets);
+            }
         }
         let available_dispatch_probes = MAX_CONCURRENT_DISPATCH_PROBES
             .saturating_sub(dispatch_probe_repositories_in_flight.len());
@@ -584,12 +589,16 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         if let Some(repository) = steward_repository_in_flight.clone() {
             occupied_dispatch_repositories.insert(repository);
         }
-        let due_dispatch_probe_batches = select_due_dispatch_probe_batches(
-            actionable_producer.due_dispatch_probes(Utc::now(), usize::MAX),
-            &occupied_dispatch_targets,
-            &occupied_dispatch_repositories,
-            available_dispatch_probes,
-        );
+        let due_dispatch_probe_batches = if dispatch_scan_due {
+            select_due_dispatch_probe_batches(
+                actionable_producer.due_dispatch_probes(Utc::now(), usize::MAX),
+                &occupied_dispatch_targets,
+                &occupied_dispatch_repositories,
+                available_dispatch_probes,
+            )
+        } else {
+            Vec::new()
+        };
         for batch in due_dispatch_probe_batches {
             let mut targets = Vec::new();
             for schedule in batch.schedules {
@@ -1039,6 +1048,9 @@ fn authoritative_native_steward_inventory(
 const MAX_CONCURRENT_DISPATCH_PROBES: usize = 2;
 
 #[cfg(unix)]
+const DISPATCH_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+#[cfg(unix)]
 const MAX_DISPATCH_TARGETS_PER_REPOSITORY_BATCH: usize = 4;
 
 #[cfg(unix)]
@@ -1334,7 +1346,7 @@ fn schedule_dispatch_followup(
     repository: &str,
     pull_request: u64,
     head_sha: &str,
-    observations: &[crate::dispatch_wedge::DispatchWedgeObservation],
+    _observations: &[crate::dispatch_wedge::DispatchWedgeObservation],
     status: &ActionableWakeProducerStatus,
     matching_second_read_due_at: Option<chrono::DateTime<Utc>>,
 ) {
@@ -1343,9 +1355,11 @@ fn schedule_dispatch_followup(
     }
     let now = Utc::now();
     let due_at = match status.reason_code.as_deref() {
-        Some("matching_second_read_required") => matching_second_read_due_at
-            .map(|due| due.max(now + chrono::Duration::seconds(1)))
-            .or_else(|| Some(now + chrono::Duration::seconds(300))),
+        Some("matching_second_read_required" | "assignment_threshold_not_reached") => {
+            matching_second_read_due_at
+                .map(|due| due.max(now + chrono::Duration::seconds(1)))
+                .or_else(|| Some(now + chrono::Duration::seconds(300)))
+        }
         Some(
             "dispatch_wedge_checkpoint_failed"
             | "dispatch_wedge_cleanup_failed"
@@ -1355,15 +1369,6 @@ fn schedule_dispatch_followup(
             | "dispatch_wedge_unmatched"
             | "status_persistence_refused",
         ) => Some(now + chrono::Duration::seconds(20)),
-        Some("assignment_threshold_not_reached") => observations
-            .iter()
-            .filter_map(|observation| {
-                chrono::DateTime::parse_from_rfc3339(&observation.authority.queued_at)
-                    .ok()
-                    .map(|queued| queued.with_timezone(&Utc) + chrono::Duration::seconds(300))
-            })
-            .min()
-            .map(|due| due.max(now + chrono::Duration::seconds(1))),
         _ => None,
     };
     if let Some(due_at) = due_at {
@@ -2895,7 +2900,8 @@ mod tests {
                 job_conclusion: None,
                 runner_name: None,
                 labels: vec!["self-hosted".to_owned(), "macos".to_owned()],
-                queued_at: (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339(),
+                first_observed_unassigned_at: (Utc::now() - chrono::Duration::minutes(10))
+                    .to_rfc3339(),
                 required_context: "macos".to_owned(),
                 required_app_id: Some(42),
                 producer_app_id: Some(42),
@@ -2908,6 +2914,9 @@ mod tests {
                 labels: vec!["self-hosted".to_owned(), "macos".to_owned()],
             }],
             observation_complete: true,
+            first_observed_unassigned_at_seed: Some(
+                (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339(),
+            ),
         };
         let mut mature_nonmatching = observation.clone();
         mature_nonmatching.runners.clear();
@@ -2926,6 +2935,7 @@ mod tests {
         let mut fresh_matching = observation.clone();
         fresh_matching.authority.workflow_run_id = 102;
         fresh_matching.authority.job_id = 304;
+        fresh_matching.first_observed_unassigned_at_seed = None;
         let generation = producer
             .begin_dispatch_wedge_cycle_for_repository(
                 "github.com",
@@ -2948,7 +2958,7 @@ mod tests {
             );
         assert_eq!(
             result.status.reason_code.as_deref(),
-            Some("matching_second_read_required")
+            Some("assignment_threshold_not_reached")
         );
         let expected = producer
             .dispatch_matching_second_read_due_at_for_observation(
