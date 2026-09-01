@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use super::*;
 use serde_json::Value;
+#[cfg(unix)]
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 

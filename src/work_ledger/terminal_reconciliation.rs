@@ -20,6 +20,7 @@ use super::{
 };
 
 const MAX_UNBOUND_TERMINAL_TARGETS: usize = 32;
+const MAX_UNBOUND_TERMINAL_QUERY_ROWS: i64 = 33;
 
 /// Redacted exact target discovered without taking mutation authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -150,10 +151,8 @@ impl WorkLedger {
                 AND work.phase = 'terminal'
               ORDER BY work.id LIMIT ?1",
         )?;
-        let rows = statement.query_map(
-            [(MAX_UNBOUND_TERMINAL_TARGETS + 1) as i64],
-            terminal_target_from_row,
-        )?;
+        let rows =
+            statement.query_map([MAX_UNBOUND_TERMINAL_QUERY_ROWS], terminal_target_from_row)?;
         let mut items = rows.collect::<Result<Vec<_>, _>>()?;
         if items.len() > MAX_UNBOUND_TERMINAL_TARGETS {
             return Err(WorkLedgerError::Refused(
@@ -860,6 +859,7 @@ pub(crate) mod tests {
             .expect("ownership counts")
     }
 
+    #[allow(clippy::too_many_lines)] // One end-to-end legacy terminal authority fixture.
     pub(crate) fn seed_unbound_terminal_with_request(
         state_dir: &std::path::Path,
         publication: crate::work_ledger::NativePublicationRequest,

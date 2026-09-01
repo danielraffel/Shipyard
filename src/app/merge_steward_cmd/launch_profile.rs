@@ -518,7 +518,7 @@ fn launch_profile_protected_bytes(profile: &LaunchProfileV1) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn terminal_reconciliation_test_profile_bytes(
     request: &crate::work_ledger::NativePublicationRequest,
 ) -> Vec<u8> {

@@ -461,7 +461,7 @@ pub(crate) use handoff::{
     steward_handoff_command, steward_handoff_transfer_report,
 };
 mod launch_profile;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use launch_profile::terminal_reconciliation_test_profile_bytes;
 #[allow(unused_imports)] // Consumed by the daemon wake-loop integration slice.
 pub(crate) use launch_profile::{LaunchProfileV1, decode_protected_launch_profile};
