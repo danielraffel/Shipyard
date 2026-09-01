@@ -1386,6 +1386,7 @@ fn schedule_dispatch_followup(
                 .map(|due| due.max(now + chrono::Duration::seconds(1)))
                 .or_else(|| Some(now + chrono::Duration::seconds(300)))
         }
+        Some("no_compatible_idle_runner") => Some(now + chrono::Duration::seconds(60)),
         Some(
             "dispatch_wedge_checkpoint_failed"
             | "dispatch_wedge_cleanup_failed"
@@ -2893,6 +2894,41 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_compatible_capacity_keeps_a_bounded_durable_probe() {
+        let state = tempfile::tempdir().expect("state");
+        let mut producer = ActionableWakeProducer::new(state.path().to_path_buf());
+        let status = ActionableWakeProducerStatus {
+            reason_code: Some("no_compatible_idle_runner".to_owned()),
+            ..ActionableWakeProducerStatus::default()
+        };
+        let before = Utc::now();
+        schedule_dispatch_followup(
+            &mut producer,
+            "github",
+            "R_test",
+            "owner/repo",
+            42,
+            &"a".repeat(40),
+            &[],
+            &status,
+            None,
+        );
+        let current = producer.status();
+        let schedule = current
+            .dispatch_targets
+            .values()
+            .next()
+            .and_then(|target| target.schedule.as_ref())
+            .expect("durable capacity recheck");
+        let due_at = chrono::DateTime::parse_from_rfc3339(&schedule.due_at)
+            .expect("due_at")
+            .with_timezone(&Utc);
+        assert!(due_at >= before + chrono::Duration::seconds(60));
+        assert!(due_at <= Utc::now() + chrono::Duration::seconds(61));
     }
 
     #[cfg(unix)]
