@@ -3,6 +3,17 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01540"></a>
+## [0.154.0] - 2026-09-02
+
+- feature/custody transport setup 20260901 ([#543](https://github.com/danielraffel/Shipyard/pull/543))
+
+<a id="v01531"></a>
+## [0.153.1] - 2026-09-02
+
+- fix/ghapp release upload 20260902 ([#549](https://github.com/danielraffel/Shipyard/pull/549))
+- docs: close terminal reconciliation friction ([#548](https://github.com/danielraffel/Shipyard/pull/548))
+
 <a id="v01530"></a>
 ## [0.153.0] - 2026-09-02
 
@@ -1330,6 +1341,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.154.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.154.0
+[0.153.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.153.1
 [0.153.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.153.0
 [0.152.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.152.2
 [0.152.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.152.1
