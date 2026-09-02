@@ -148,6 +148,27 @@ pub(super) fn derive_public_key_digest(identity: &Path) -> Result<String, &'stat
     Ok(hex::encode(Sha256::digest(key.as_bytes())))
 }
 
+pub(super) fn validate_public_key_file(path: &Path) -> Result<(), &'static str> {
+    let mut command = Command::new("ssh-keygen");
+    command
+        .args(["-l", "-f"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    let output = crate::process::run_output_until(
+        &mut command,
+        Instant::now() + Duration::from_secs(5),
+        "custody inbound public key validation",
+    )
+    .map_err(|_| "custody-inbound-public-key-validation-unavailable")?;
+    if !output.status.success() {
+        return Err("custody-inbound-public-key-invalid");
+    }
+    Ok(())
+}
+
 pub(super) fn normalize_public_key(text: &str) -> Option<String> {
     let mut rows = text.lines().filter_map(|line| {
         let fields = line.split_whitespace().collect::<Vec<_>>();

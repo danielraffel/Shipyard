@@ -328,6 +328,32 @@ fn directional_identity_swap_is_refused() {
 }
 
 #[test]
+fn malformed_inbound_public_key_is_refused_before_digest_acceptance() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = fixture(root.path());
+    let inbound = root.path().join("peer_id_ed25519.pub");
+    let original = fs::read_to_string(&inbound).unwrap();
+    let original_digest = hex::encode(Sha256::digest(
+        normalize_public_key(&original).unwrap().as_bytes(),
+    ));
+    let malformed = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIfixture\n";
+    fs::write(&inbound, malformed).unwrap();
+    fs::set_permissions(&inbound, fs::Permissions::from_mode(0o600)).unwrap();
+    let malformed_digest = hex::encode(Sha256::digest(
+        normalize_public_key(malformed).unwrap().as_bytes(),
+    ));
+    let path = root.path().join("manifest.toml");
+    fs::write(&path, manifest.replace(&original_digest, &malformed_digest)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = provision(&root.path().join("global"), &path, false);
+    assert_eq!(
+        report.reason_code.as_deref(),
+        Some("custody-inbound-public-key-invalid")
+    );
+}
+
+#[test]
 fn readiness_receipt_wrong_machine_is_refused() {
     let root = tempfile::tempdir().unwrap();
     let manifest = fixture(root.path());

@@ -26,7 +26,8 @@ mod host;
 pub(super) use host::{ReadPrivateError, read_private_input};
 use host::{
     derive_public_key_digest, ensure_private_directory, normalize_public_key, read_public_config,
-    validate_authorized_keys, validate_private_file, validate_sshd_effective_config,
+    validate_authorized_keys, validate_private_file, validate_public_key_file,
+    validate_sshd_effective_config,
 };
 #[cfg(all(test, unix))]
 use host::{effective_authorized_keys_path, parse_authorized_key_line, validate_sshd_config};
@@ -599,6 +600,9 @@ fn validate_raw_policy(raw: RawPolicy, global_dir: &Path) -> Result<ValidatedSet
             &inbound_public,
         ));
         paths.push(peer.inbound_public_key_file.display().to_string());
+        validate_public_key_file(&peer.inbound_public_key_file).map_err(|reason| {
+            SetupFailure::with_all(reason, Some(policy_digest.clone()), checks.clone())
+        })?;
         let inbound_text = read_public_config(&peer.inbound_public_key_file, MAX_SETUP_BYTES)
             .map_err(|reason| {
                 SetupFailure::with_all(reason, Some(policy_digest.clone()), checks.clone())
