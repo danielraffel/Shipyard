@@ -1,6 +1,6 @@
 # Terminal reconciliation conflated a closed PR with a merged PR
 
-**Status:** IN PROGRESS
+**Status:** RESOLVED
 **Filed:** 2026-09-02 by Codex@M3
 **Owner:** GEN-14 Shipyard stewardship
 **Class:** SYSTEMIC
@@ -103,16 +103,28 @@ tests for both outcomes; document the distinction in the CLI and agent skill.
 
 ## Resolution
 
-**Outcome:** Implementation and production canary in progress.
-**Landed in:** pending
-**Did it work?:** Targeted tests pass locally; live PR21 dry-run/apply pending release and fleet deployment.
-**Still open:** Merge, release, deploy, exact live dry-run/apply/replay, and final report update.
+**Outcome:** Shipyard now reconciles closed-without-merge rows as the distinct
+`closed_unmerged` terminal disposition without manufacturing merge authority.
+**Landed in:** PR #547, merge `e6691a6059b2f3f829552c76432a38bb47ed9b88`,
+released as v0.153.0 from that exact commit and deployed identically to M1, M5,
+and Studio.
+**Did it work?:** Yes. On M5, the exact PR21 no-write plan classified
+`closed_unmerged` with plan digest
+`bacd4b7140d4d79380ff501a2eccaaf6bc0ac6a109ab6cae02ea4b4c000e7455`
+and receipt digest
+`7dbcc2d891082fe272417d42191c6676630397b14aeec493739d7420c6ebec3a`.
+Apply terminalized work item
+`wi_32b4d12bc538a693271ce531f53589c268b35e009e01e932b1812492df47997d`
+at generation 7. After a daemon restart, inventory retained the exact terminal
+row and the same command returned `applied=false, replay=true` with unchanged
+digests.
+**Still open:** Nothing for this incident. Broader custody transport work and
+unrelated daemon policy/webhook diagnostics remain separate GEN-14 lanes.
 
 Confidence: HIGH
 
-Why: the production PR state, shipped parser, #542 acceptance statement, and
-exact refusal were all inspected directly. The prevention mechanism has focused
-tests but has not yet completed the live fleet canary.
+Why: the production PR state, original refusal, typed implementation, release
+ancestry, identical fleet installation, exact apply receipt, restart readback,
+and write-free replay were all inspected directly.
 
-What would raise it: successful exact PR21 dry-run, apply, restart/readback, and
-write-free replay using the released fleet binary.
+What would raise it: no further evidence is required for this incident.
