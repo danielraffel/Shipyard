@@ -5,6 +5,14 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+## Metrics authority
+
+When reviewing stewardship scorecards, treat GitHub `created_at` plus
+`started_at` as the only currently supported queue-latency evidence. Missing or
+invalid timestamps produce unavailable queue coverage; do not synthesize
+submit-to-receipt, cache, or model-token measurements. New providers must bind
+those values to authenticated durable events before they are imported.
+
 ## Core Rule
 
 Preserve the user's active Shipyard install and rollback path. Rust Shipyard is

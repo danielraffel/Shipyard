@@ -39,6 +39,8 @@ pub struct MetricRecordInput {
     pub exit_code: Option<i64>,
     pub failure_class: Option<String>,
     pub external_id: Option<String>,
+    /// Time the provider placed the job in its queue, when authoritative.
+    pub queued_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -242,6 +244,7 @@ impl MetricsStore {
         self.record_with_refresh(input, true)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn record_with_refresh(
         &self,
         input: &MetricRecordInput,
@@ -254,6 +257,12 @@ impl MetricsStore {
             .started_at
             .unwrap_or_else(|| completed_at - Duration::milliseconds(input.duration_ms.max(0)));
         let measured_total_ms = measured_total_ms(input);
+        let queued_at = input.queued_at.map(|value| value.to_rfc3339());
+        let queue_ms = input
+            .queued_at
+            .zip(input.started_at)
+            .map(|(queued, started)| (started - queued).num_milliseconds())
+            .filter(|value| *value >= 0);
         if let Some(provider) = input.provider.as_deref()
             && let Some(existing) = existing_job_id(&conn, provider, input.external_id.as_deref())?
         {
@@ -278,6 +287,8 @@ impl MetricsStore {
                     started_at,
                     completed_at,
                     measured_total_ms,
+                    queued_at.as_deref(),
+                    queue_ms,
                 )?;
             }
             return Ok(existing);
@@ -319,10 +330,10 @@ impl MetricsStore {
                 platform: input.platform.clone(),
                 backend: input.backend.clone(),
                 provider: input.provider.clone(),
-                queued_at: None,
+                queued_at,
                 started_at: Some(started_at.to_rfc3339()),
                 completed_at: Some(completed_at.to_rfc3339()),
-                queue_ms: None,
+                queue_ms,
                 boot_ms: None,
                 setup_ms: None,
                 run_ms: measured_total_ms,
@@ -860,6 +871,7 @@ fn existing_job_id(
     .optional()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_existing_job(
     conn: &Connection,
     job_id: i64,
@@ -868,22 +880,26 @@ fn refresh_existing_job(
     started_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
     measured_total_ms: Option<i64>,
+    queued_at: Option<&str>,
+    queue_ms: Option<i64>,
 ) -> Result<(), rusqlite::Error> {
     let started_at = started_at.to_rfc3339();
     let completed_at = completed_at.to_rfc3339();
     conn.execute(
         "UPDATE jobs
-            SET started_at = ?2, completed_at = ?3, run_ms = ?4, total_ms = ?4,
-                status = ?5, exit_code = COALESCE(?6, exit_code),
-                failure_class = COALESCE(?7, failure_class), machine_id = ?8,
-                target = COALESCE(?9, target), platform = COALESCE(?10, platform),
-                backend = COALESCE(?11, backend), provider = COALESCE(?12, provider)
+            SET queued_at = COALESCE(?2, queued_at), started_at = ?3, completed_at = ?4, run_ms = ?5, total_ms = ?5,
+                queue_ms = COALESCE(?6, queue_ms), status = ?7, exit_code = COALESCE(?8, exit_code),
+                failure_class = COALESCE(?9, failure_class), machine_id = ?10,
+                target = COALESCE(?11, target), platform = COALESCE(?12, platform),
+                backend = COALESCE(?13, backend), provider = COALESCE(?14, provider)
           WHERE id = ?1",
         params![
             job_id,
+            queued_at,
             started_at,
             completed_at,
             measured_total_ms,
+            queue_ms,
             input.status,
             input.exit_code,
             input.failure_class,
@@ -1349,6 +1365,7 @@ pub struct GitHubRunJob {
     pub runner_name: Option<String>,
     pub runner_group_name: Option<String>,
     pub labels: Option<Vec<String>>,
+    pub created_at: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
 }
@@ -1363,6 +1380,11 @@ pub fn github_job_to_record(
 ) -> MetricRecordInput {
     let started_at = job
         .started_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let queued_at = job
+        .created_at
         .as_deref()
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .map(|value| value.with_timezone(&Utc));
@@ -1416,6 +1438,7 @@ pub fn github_job_to_record(
             job.run_attempt.unwrap_or(1)
         )),
         started_at,
+        queued_at,
         completed_at,
         ..MetricRecordInput::default()
     }
@@ -1700,6 +1723,7 @@ mod tests {
             runner_name: None,
             runner_group_name: None,
             labels: None,
+            created_at: Some("2026-09-01T11:59:30Z".to_owned()),
             started_at: Some("2026-09-01T12:00:00Z".to_owned()),
             completed_at: Some("2026-09-01T12:01:00Z".to_owned()),
         };
@@ -1713,6 +1737,44 @@ mod tests {
         );
 
         assert_eq!(record.pr, Some(538));
+        assert_eq!(
+            record.queued_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-09-01T11:59:30Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+        );
+    }
+
+    #[test]
+    fn github_job_queue_timing_is_persisted_only_from_authoritative_timestamps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let job = GitHubRunJob {
+            id: 9,
+            run_id: Some(10),
+            run_attempt: Some(1),
+            name: "Build".to_owned(),
+            status: Some("completed".to_owned()),
+            conclusion: Some("success".to_owned()),
+            runner_name: None,
+            runner_group_name: None,
+            labels: None,
+            created_at: Some("2026-09-01T11:59:30Z".to_owned()),
+            started_at: Some("2026-09-01T12:00:00Z".to_owned()),
+            completed_at: Some("2026-09-01T12:01:00Z".to_owned()),
+        };
+        let record = github_job_to_record("owner/repo", None, "repo", None, &job);
+        store.record(&record).expect("record");
+        let conn = store.connect().expect("connection");
+        let (queued_at, queue_ms): (String, i64) = conn
+            .query_row("SELECT queued_at, queue_ms FROM jobs", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("queue timing");
+        assert_eq!(queued_at, "2026-09-01T11:59:30+00:00");
+        assert_eq!(queue_ms, 30_000);
     }
 
     #[test]
@@ -1743,6 +1805,16 @@ mod tests {
                 duration_ms: 60_000,
                 status: "success".to_owned(),
                 external_id,
+                queued_at: Some(
+                    DateTime::parse_from_rfc3339("2026-09-01T11:59:30Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                ),
+                started_at: Some(
+                    DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                ),
                 completed_at: Some(Utc::now()),
                 ..MetricRecordInput::default()
             })
@@ -1765,6 +1837,14 @@ mod tests {
             )
             .expect("refreshed machine");
         assert_eq!(machine, "mac-runner");
+        let queue_ms: i64 = conn
+            .query_row(
+                "SELECT queue_ms FROM jobs WHERE id = ?1",
+                params![refreshed_id],
+                |row| row.get(0),
+            )
+            .expect("refreshed queue timing");
+        assert_eq!(queue_ms, 30_000);
         let step: (String, String, i64) = conn
             .query_row(
                 "SELECT step, status, duration_ms FROM steps WHERE job_id = ?1",
