@@ -22,6 +22,29 @@ use super::{
 const MAX_UNBOUND_TERMINAL_TARGETS: usize = 32;
 const MAX_UNBOUND_TERMINAL_QUERY_ROWS: i64 = 33;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalReconciliationDisposition {
+    Merged,
+    ClosedUnmerged,
+}
+
+impl TerminalReconciliationDisposition {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::ClosedUnmerged => "closed_unmerged",
+        }
+    }
+
+    fn terminal_event_kind(self) -> &'static str {
+        match self {
+            Self::Merged => "terminal_dispatch_reconciled",
+            Self::ClosedUnmerged => "terminal_closed_unmerged_reconciled",
+        }
+    }
+}
+
 const STRANDED_PUBLICATION_INVENTORY_SQL: &str =
     "SELECT work.id, work.repo, work.pr, work.head_sha, work.base_ref,
             work.phase, work.work_generation, work.owner_generation, work.source_digest,
@@ -139,6 +162,7 @@ pub(crate) struct StrandedPublicationRelatedCounts {
 /// Complete public authority required to bind an already-terminal target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TerminalReconciliationRequest {
+    pub(crate) disposition: TerminalReconciliationDisposition,
     pub(crate) repository_provider: String,
     pub(crate) repository_id: String,
     pub(crate) repository: String,
@@ -146,8 +170,9 @@ pub(crate) struct TerminalReconciliationRequest {
     pub(crate) pull_request: u64,
     pub(crate) head_sha: String,
     pub(crate) base_ref: String,
-    pub(crate) merge_sha: String,
-    pub(crate) merged_at: String,
+    pub(crate) merge_sha: Option<String>,
+    pub(crate) merged_at: Option<String>,
+    pub(crate) closed_at: Option<String>,
     pub(crate) github_installation_id: u64,
     pub(crate) work_id: String,
     pub(crate) work_generation: u64,
@@ -167,6 +192,21 @@ pub(crate) struct TerminalReconciliationRequest {
     pub(crate) failure_continuation_digest: String,
 }
 
+impl TerminalReconciliationRequest {
+    fn terminal_at(&self) -> &str {
+        match self.disposition {
+            TerminalReconciliationDisposition::Merged => self
+                .merged_at
+                .as_deref()
+                .expect("validated merged terminal timestamp"),
+            TerminalReconciliationDisposition::ClosedUnmerged => self
+                .closed_at
+                .as_deref()
+                .expect("validated closed terminal timestamp"),
+        }
+    }
+}
+
 /// Stable plan/apply receipt. No protected profile or route material is exposed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct TerminalReconciliationReport {
@@ -177,8 +217,10 @@ pub(crate) struct TerminalReconciliationReport {
     pub(crate) repository: String,
     pub(crate) pull_request: u64,
     pub(crate) exact_head: String,
-    pub(crate) merge_sha: String,
-    pub(crate) merged_at: String,
+    pub(crate) disposition: TerminalReconciliationDisposition,
+    pub(crate) merge_sha: Option<String>,
+    pub(crate) merged_at: Option<String>,
+    pub(crate) closed_at: Option<String>,
     pub(crate) receipt_sha256: String,
     pub(crate) plan_sha256: String,
 }
@@ -194,8 +236,12 @@ struct TerminalEvidenceV1<'a> {
     exact_head: &'a str,
     base_ref: &'a str,
     disposition: &'static str,
-    merge_sha: &'a str,
-    merged_at: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_sha: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merged_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    closed_at: Option<&'a str>,
     github_installation_id: u64,
     work_id: &'a str,
     work_generation: u64,
@@ -216,6 +262,29 @@ struct UncertainDispatchEvidenceV1<'a> {
     base_ref: &'a str,
     merge_sha: &'a str,
     merged_at: &'a str,
+    github_installation_id: u64,
+    work_id: &'a str,
+    work_generation: u64,
+    owner_generation: u64,
+    source_digest: &'a str,
+    route_ref: &'a str,
+    wake_id: &'a str,
+    delivery_id: &'a str,
+    profile_digest: &'a str,
+}
+
+#[derive(Serialize)]
+struct ClosedUnmergedDispatchEvidenceV1<'a> {
+    schema_version: u32,
+    disposition: &'static str,
+    repository_provider: &'a str,
+    repository_id: &'a str,
+    repository: &'a str,
+    pull_request_node_id: &'a str,
+    pull_request: u64,
+    exact_head: &'a str,
+    base_ref: &'a str,
+    closed_at: &'a str,
     github_installation_id: u64,
     work_id: &'a str,
     work_generation: u64,
@@ -263,15 +332,17 @@ impl WorkLedger {
             repository: projected.repository,
             pull_request: projected.pull_request,
             exact_head: projected.head_sha,
+            disposition: projected.disposition,
             merge_sha: projected.merge_sha,
             merged_at: projected.merged_at,
+            closed_at: projected.closed_at,
             receipt_sha256: evidence_digest,
             plan_sha256,
         })
     }
 
     /// Close a dispatching handoff whose provider wake is durably uncertain
-    /// after an exact merged-head proof. This is deliberately separate from
+    /// after an exact terminal-head proof. This is deliberately separate from
     /// projection reconciliation: it only advances the existing lifecycle
     /// generation to terminal and never creates ownership or routing state.
     /// Require the caller's final authenticated authority reread while writer
@@ -335,7 +406,7 @@ impl WorkLedger {
             &request.work_id,
             projected_generation,
             request.owner_generation,
-            "terminal_dispatch_reconciled",
+            request.disposition.terminal_event_kind(),
             Some(LifecycleState::Dispatching),
             LifecycleState::Terminal,
             &payload,
@@ -612,8 +683,10 @@ impl WorkLedger {
             repository: request.repository.clone(),
             pull_request: request.pull_request,
             exact_head: request.head_sha.clone(),
+            disposition: request.disposition,
             merge_sha: request.merge_sha.clone(),
             merged_at: request.merged_at.clone(),
+            closed_at: request.closed_at.clone(),
             receipt_sha256: evidence_digest,
             plan_sha256,
         })
@@ -688,7 +761,7 @@ impl WorkLedger {
                 request.repository_id,
                 request.repository,
                 request.head_sha,
-                request.merged_at,
+                request.terminal_at(),
             ],
         )?;
         record_event(
@@ -700,7 +773,7 @@ impl WorkLedger {
             Some(LifecycleState::Terminal),
             LifecycleState::Terminal,
             evidence_digest,
-            &request.merged_at,
+            request.terminal_at(),
         )?;
         transaction.commit()?;
         Ok(())
@@ -1044,27 +1117,60 @@ fn uncertain_dispatch_evidence_digest(
             "terminal reconciliation requires an exact uncertain delivery identity".to_owned(),
         )
     })?;
-    let bytes = serde_json::to_vec(&UncertainDispatchEvidenceV1 {
-        schema_version: 1,
-        repository_provider: &request.repository_provider,
-        repository_id: &request.repository_id,
-        repository: &request.repository,
-        pull_request_node_id: &request.pull_request_node_id,
-        pull_request: request.pull_request,
-        exact_head: &request.head_sha,
-        base_ref: &request.base_ref,
-        merge_sha: &request.merge_sha,
-        merged_at: &request.merged_at,
-        github_installation_id: request.github_installation_id,
-        work_id: &request.work_id,
-        work_generation: request.work_generation,
-        owner_generation: request.owner_generation,
-        source_digest: &request.source_digest,
-        route_ref: &request.route_ref,
-        wake_id: &request.wake_id,
-        delivery_id,
-        profile_digest: &request.profile_digest,
-    })
+    let bytes = match request.disposition {
+        TerminalReconciliationDisposition::Merged => {
+            serde_json::to_vec(&UncertainDispatchEvidenceV1 {
+                schema_version: 1,
+                repository_provider: &request.repository_provider,
+                repository_id: &request.repository_id,
+                repository: &request.repository,
+                pull_request_node_id: &request.pull_request_node_id,
+                pull_request: request.pull_request,
+                exact_head: &request.head_sha,
+                base_ref: &request.base_ref,
+                merge_sha: request.merge_sha.as_deref().expect("validated merge SHA"),
+                merged_at: request
+                    .merged_at
+                    .as_deref()
+                    .expect("validated merge timestamp"),
+                github_installation_id: request.github_installation_id,
+                work_id: &request.work_id,
+                work_generation: request.work_generation,
+                owner_generation: request.owner_generation,
+                source_digest: &request.source_digest,
+                route_ref: &request.route_ref,
+                wake_id: &request.wake_id,
+                delivery_id,
+                profile_digest: &request.profile_digest,
+            })
+        }
+        TerminalReconciliationDisposition::ClosedUnmerged => {
+            serde_json::to_vec(&ClosedUnmergedDispatchEvidenceV1 {
+                schema_version: 1,
+                disposition: request.disposition.as_str(),
+                repository_provider: &request.repository_provider,
+                repository_id: &request.repository_id,
+                repository: &request.repository,
+                pull_request_node_id: &request.pull_request_node_id,
+                pull_request: request.pull_request,
+                exact_head: &request.head_sha,
+                base_ref: &request.base_ref,
+                closed_at: request
+                    .closed_at
+                    .as_deref()
+                    .expect("validated close timestamp"),
+                github_installation_id: request.github_installation_id,
+                work_id: &request.work_id,
+                work_generation: request.work_generation,
+                owner_generation: request.owner_generation,
+                source_digest: &request.source_digest,
+                route_ref: &request.route_ref,
+                wake_id: &request.wake_id,
+                delivery_id,
+                profile_digest: &request.profile_digest,
+            })
+        }
+    }
     .map_err(|error| {
         WorkLedgerError::Refused(format!("encode terminal dispatch evidence: {error}"))
     })?;
@@ -1177,7 +1283,7 @@ fn validate_existing_native_authority(
                 AND attempt.attempt = delivery.attempt
               WHERE event.work_item_id = ?1
                 AND event.work_generation = ?3 AND event.owner_generation = ?4
-                AND event.kind = 'terminal_dispatch_reconciled'
+                AND event.kind = ?7
                 AND event.from_state = 'dispatching' AND event.to_state = 'terminal'
                 AND event.payload_digest = ?5
                 AND delivery.delivery_id = ?6 AND delivery.state = 'uncertain'
@@ -1191,6 +1297,7 @@ fn validate_existing_native_authority(
                 request.owner_generation,
                 event_digest,
                 delivery_id,
+                request.disposition.terminal_event_kind(),
             ],
             |row| row.get(0),
         )?
@@ -1285,7 +1392,27 @@ fn validate_request(request: &TerminalReconciliationRequest) -> WorkLedgerResult
         validate_digest(name, value)?;
     }
     validate_commit_sha("head SHA", &request.head_sha)?;
-    validate_commit_sha("merge SHA", &request.merge_sha)?;
+    if let Some(merge_sha) = request.merge_sha.as_deref() {
+        validate_commit_sha("merge SHA", merge_sha)?;
+    }
+    let timestamps_valid = match request.disposition {
+        TerminalReconciliationDisposition::Merged => {
+            request
+                .merged_at
+                .as_deref()
+                .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+                && request.merge_sha.is_some()
+                && request.closed_at.is_none()
+        }
+        TerminalReconciliationDisposition::ClosedUnmerged => {
+            request
+                .closed_at
+                .as_deref()
+                .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+                && request.merge_sha.is_none()
+                && request.merged_at.is_none()
+        }
+    };
     if request.repository_provider != "github.com"
         || request.github_installation_id == 0
         || request.work_generation == 0
@@ -1293,7 +1420,7 @@ fn validate_request(request: &TerminalReconciliationRequest) -> WorkLedgerResult
         || request.projection_revision == 0
         || request.base_ref.is_empty()
         || request.base_ref.len() > 255
-        || chrono::DateTime::parse_from_rfc3339(&request.merged_at).is_err()
+        || !timestamps_valid
     {
         return Err(WorkLedgerError::Refused(
             "terminal reconciliation authority is incomplete".to_owned(),
@@ -1477,9 +1604,10 @@ fn terminal_evidence_bytes(request: &TerminalReconciliationRequest) -> WorkLedge
         pull_request: request.pull_request,
         exact_head: &request.head_sha,
         base_ref: &request.base_ref,
-        disposition: "merged",
-        merge_sha: &request.merge_sha,
-        merged_at: &request.merged_at,
+        disposition: request.disposition.as_str(),
+        merge_sha: request.merge_sha.as_deref(),
+        merged_at: request.merged_at.as_deref(),
+        closed_at: request.closed_at.as_deref(),
         github_installation_id: request.github_installation_id,
         work_id: &request.work_id,
         work_generation: request.work_generation,
@@ -1687,6 +1815,7 @@ pub(crate) mod tests {
             .expect("work generation");
         drop(connection);
         let request = TerminalReconciliationRequest {
+            disposition: TerminalReconciliationDisposition::Merged,
             repository_provider: publication.repository_provider.clone(),
             repository_id: publication.repository_id.clone(),
             repository: publication.repository.clone(),
@@ -1694,8 +1823,9 @@ pub(crate) mod tests {
             pull_request: publication.pull_request,
             head_sha: publication.head_sha.clone(),
             base_ref: publication.base_ref.clone(),
-            merge_sha: "c".repeat(40),
-            merged_at: "2026-09-01T12:00:00Z".to_owned(),
+            merge_sha: Some("c".repeat(40)),
+            merged_at: Some("2026-09-01T12:00:00Z".to_owned()),
+            closed_at: None,
             github_installation_id: publication.github_installation_id,
             work_id: report.work_id,
             work_generation,
@@ -2378,7 +2508,7 @@ pub(crate) mod tests {
         let temp = TempDir::new().expect("temp");
         let (request, _ledger) = seed_unbound_terminal(temp.path());
         let mut wrong_merge = request.clone();
-        wrong_merge.merge_sha = "d".repeat(40);
+        wrong_merge.merge_sha = Some("d".repeat(40));
         let wrong = WorkLedger::plan_or_apply_terminal_reconciliation(
             temp.path(),
             &wrong_merge,
@@ -2823,6 +2953,173 @@ pub(crate) mod tests {
             )
             .expect("unrelated snapshot");
         assert_eq!(unrelated_after, unrelated_before, "active work changed");
+    }
+
+    #[test]
+    fn closed_unmerged_uncertain_dispatch_is_distinct_and_replayable() {
+        let temp = TempDir::new().expect("temp");
+        let (mut request, ledger) = seed_uncertain_dispatch(temp.path(), false, true);
+        request.disposition = TerminalReconciliationDisposition::ClosedUnmerged;
+        request.merge_sha = None;
+        request.merged_at = None;
+        request.closed_at = Some("2026-09-02T01:02:03Z".to_owned());
+        ledger
+            .connect_read_write()
+            .expect("legacy fixture connection")
+            .execute(
+                "UPDATE work_items SET base_ref = NULL WHERE id = ?1",
+                [&request.work_id],
+            )
+            .expect("plant legacy NULL base");
+
+        let planned = ledger
+            .plan_uncertain_dispatch_reconciliation(&request)
+            .expect("closed-unmerged dry run");
+        assert_eq!(
+            planned.disposition,
+            TerminalReconciliationDisposition::ClosedUnmerged
+        );
+        assert_eq!(planned.merge_sha, None);
+        assert_eq!(planned.merged_at, None);
+        assert_eq!(planned.closed_at, request.closed_at);
+
+        let projected = ledger
+            .finalize_uncertain_dispatch_with_authority(&request, || Ok(()))
+            .expect("closed-unmerged terminalization");
+        let event_count: u64 = ledger
+            .connect_read_only()
+            .expect("event read")
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE work_item_id = ?1
+                   AND kind = 'terminal_closed_unmerged_reconciled'",
+                [&request.work_id],
+                |row| row.get(0),
+            )
+            .expect("closed-unmerged event count");
+        assert_eq!(event_count, 1);
+
+        let applied = WorkLedger::plan_or_apply_terminal_reconciliation(
+            temp.path(),
+            &projected,
+            true,
+            || Ok(()),
+        )
+        .expect("closed-unmerged projection apply");
+        assert!(applied.applied);
+        assert!(applied.replay);
+        assert_eq!(applied.plan_sha256, planned.plan_sha256);
+        let replay = WorkLedger::plan_or_apply_terminal_reconciliation(
+            temp.path(),
+            &projected,
+            true,
+            || panic!("closed-unmerged replay must not reread remote authority"),
+        )
+        .expect("closed-unmerged exact replay");
+        assert!(replay.replay);
+        assert!(!replay.applied);
+    }
+
+    #[test]
+    fn merged_uncertain_dispatch_receipt_keeps_legacy_bytes() {
+        let temp = TempDir::new().expect("temp");
+        let (request, _ledger) = seed_uncertain_dispatch(temp.path(), false, true);
+        let delivery_id = request.delivery_id.as_deref().expect("delivery");
+        let legacy = format!(
+            concat!(
+                "{{\"schema_version\":1,",
+                "\"repository_provider\":\"{}\",\"repository_id\":\"{}\",",
+                "\"repository\":\"{}\",\"pull_request_node_id\":\"{}\",",
+                "\"pull_request\":{},\"exact_head\":\"{}\",\"base_ref\":\"{}\",",
+                "\"merge_sha\":\"{}\",\"merged_at\":\"{}\",",
+                "\"github_installation_id\":{},\"work_id\":\"{}\",",
+                "\"work_generation\":{},\"owner_generation\":{},",
+                "\"source_digest\":\"{}\",\"route_ref\":\"{}\",",
+                "\"wake_id\":\"{}\",\"delivery_id\":\"{}\",",
+                "\"profile_digest\":\"{}\"}}"
+            ),
+            request.repository_provider,
+            request.repository_id,
+            request.repository,
+            request.pull_request_node_id,
+            request.pull_request,
+            request.head_sha,
+            request.base_ref,
+            request.merge_sha.as_deref().expect("merge SHA"),
+            request.merged_at.as_deref().expect("merge timestamp"),
+            request.github_installation_id,
+            request.work_id,
+            request.work_generation,
+            request.owner_generation,
+            request.source_digest,
+            request.route_ref,
+            request.wake_id,
+            delivery_id,
+            request.profile_digest,
+        );
+        assert_eq!(
+            uncertain_dispatch_evidence_digest(&request).expect("merged receipt"),
+            digest(legacy.as_bytes()),
+            "merged production receipts must remain replay-compatible"
+        );
+    }
+
+    #[test]
+    fn merged_terminal_receipt_keeps_legacy_bytes() {
+        let temp = TempDir::new().expect("temp");
+        let (request, _ledger) = seed_unbound_terminal(temp.path());
+        let legacy = format!(
+            concat!(
+                "{{\"schema_version\":1,",
+                "\"repository_provider\":\"{}\",\"repository_id\":\"{}\",",
+                "\"repository\":\"{}\",\"pull_request_node_id\":\"{}\",",
+                "\"pull_request\":{},\"exact_head\":\"{}\",\"base_ref\":\"{}\",",
+                "\"disposition\":\"merged\",\"merge_sha\":\"{}\",",
+                "\"merged_at\":\"{}\",\"github_installation_id\":{},",
+                "\"work_id\":\"{}\",\"work_generation\":{},",
+                "\"owner_generation\":{},\"source_digest\":\"{}\",",
+                "\"workstream_handle\":\"{}\"}}"
+            ),
+            request.repository_provider,
+            request.repository_id,
+            request.repository,
+            request.pull_request_node_id,
+            request.pull_request,
+            request.head_sha,
+            request.base_ref,
+            request.merge_sha.as_deref().expect("merge SHA"),
+            request.merged_at.as_deref().expect("merge timestamp"),
+            request.github_installation_id,
+            request.work_id,
+            request.work_generation,
+            request.owner_generation,
+            request.source_digest,
+            request.workstream_handle,
+        );
+        assert_eq!(
+            terminal_evidence_bytes(&request).expect("merged terminal receipt"),
+            legacy.as_bytes(),
+            "merged terminal projection receipts must remain replay-compatible"
+        );
+    }
+
+    #[test]
+    fn terminal_disposition_rejects_mixed_merge_and_closure_evidence() {
+        let temp = TempDir::new().expect("temp");
+        let (mut request, ledger) = seed_uncertain_dispatch(temp.path(), false, true);
+        request.disposition = TerminalReconciliationDisposition::ClosedUnmerged;
+        request.closed_at = Some("2026-09-02T01:02:03Z".to_owned());
+        let error = ledger
+            .plan_uncertain_dispatch_reconciliation(&request)
+            .expect_err("closed-unmerged disposition cannot carry merge evidence");
+        assert!(error.to_string().contains("authority is incomplete"));
+
+        request.disposition = TerminalReconciliationDisposition::Merged;
+        request.merge_sha = None;
+        request.merged_at = None;
+        let error = ledger
+            .plan_uncertain_dispatch_reconciliation(&request)
+            .expect_err("merged disposition requires merge evidence");
+        assert!(error.to_string().contains("authority is incomplete"));
     }
 
     #[test]

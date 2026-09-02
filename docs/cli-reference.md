@@ -123,7 +123,7 @@ shipyard work-ledger inventory                      # bounded immutable local-wo
 shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" # authentic-v11 exact-row reconciliation plan; no writes
 shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" --apply # writer-fenced migrate/bind/publication
 shipyard work-ledger reconcile-terminal              # bounded redacted inventory of terminal repairs plus typed unbound handoff rows
-shipyard work-ledger reconcile-terminal --repo OWNER/REPO --pr 123 --head "$SHA" # exact dry-run; verifies local and merged GitHub authority
+shipyard work-ledger reconcile-terminal --repo OWNER/REPO --pr 123 --head "$SHA" # exact dry-run; verifies local and typed terminal GitHub authority
 shipyard work-ledger reconcile-terminal --repo OWNER/REPO --pr 123 --head "$SHA" --apply # bind one already-terminal row; exact replay is write-free
 shipyard work-ledger import                         # deterministic redacted legacy-import plan; no writes
 shipyard work-ledger import --apply                 # idempotently populate shadow storage; no activation/dispatch
@@ -172,9 +172,12 @@ and explicit blockers; they are never silently omitted or made eligible for the
 terminal repair. A targeted command is dry-run by default and
 requires the exact repository, PR, and head. Apply additionally requires the
 protected launch profile and continuation contracts, the exact route and
-authoritative wake, authenticated GitHub App reads proving the PR merged at
-that head/base, and a second identical GitHub read under exclusive writer
-custody. It adds only the immutable provider receipt, projection binding, and
+authoritative wake, and authenticated GitHub App reads proving one typed
+terminal outcome at that head/base. A merged outcome requires its exact merge
+commit and timestamp. A closed-without-merge outcome requires its exact close
+timestamp and absent merge evidence, and is recorded as `closed_unmerged`
+without creating or implying merge authority. Apply requires a second
+identical GitHub read under exclusive writer custody. It adds only the immutable provider receipt, projection binding, and
 terminal-to-terminal audit event; the binding insert also mints its
 schema-required inert ownership-root identity. That root grants no authority:
 the repair cannot create agent ownership, holder material, bootstrap
