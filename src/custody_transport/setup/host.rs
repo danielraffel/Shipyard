@@ -20,14 +20,16 @@ pub(super) fn ensure_private_directory(path: &Path) -> Result<(), &'static str> 
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(path).map_err(|_| "custody-config-directory-create-failed")?;
-            let mut permissions = fs::metadata(path)
+            let permissions = fs::metadata(path)
                 .map_err(|_| "custody-config-directory-untrusted")?
                 .permissions();
             #[cfg(unix)]
-            {
+            let permissions = {
                 use std::os::unix::fs::PermissionsExt;
+                let mut permissions = permissions;
                 permissions.set_mode(0o700);
-            }
+                permissions
+            };
             fs::set_permissions(path, permissions)
                 .map_err(|_| "custody-config-directory-untrusted")?;
             let metadata =
@@ -54,6 +56,8 @@ fn validate_private_mode(
             return Err(reason);
         }
     }
+    #[cfg(not(unix))]
+    let _ = expected_mode;
     Ok(())
 }
 
@@ -69,6 +73,8 @@ pub(in crate::custody_transport) fn read_private_input(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed());
     }
+    #[cfg(not(unix))]
+    let _ = require_mode;
     let file = options.open(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ReadPrivateError::Missing
@@ -265,7 +271,7 @@ fn normalize_path(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn validate_sshd_config(text: &str) -> Result<(), &'static str> {
     let mut expose = false;
     let mut subsystem = false;

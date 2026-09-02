@@ -28,7 +28,7 @@ use host::{
     derive_public_key_digest, ensure_private_directory, normalize_public_key, read_public_config,
     validate_authorized_keys, validate_private_file, validate_sshd_effective_config,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use host::{effective_authorized_keys_path, parse_authorized_key_line, validate_sshd_config};
 
 const SETUP_SCHEMA_VERSION: u32 = 1;

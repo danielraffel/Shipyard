@@ -227,10 +227,7 @@ pub(crate) fn load_custody_transport_policy(
             required(raw.profile_receipt_file.clone(), "profile-receipt-file")?,
         ] {
             let path = absolute_path(&receipt)?;
-            if !std::fs::metadata(path)
-                .map(|meta| meta.is_file())
-                .unwrap_or(false)
-            {
+            if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
                 return Err("custody-policy-readiness-receipt-unavailable".to_owned());
             }
         }
