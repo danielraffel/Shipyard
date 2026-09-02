@@ -37,13 +37,14 @@ not a single PR.
 
 ## The fix now (unblock)
 
-Commit `f70c4e1d` carries GitHub `created_at` as `queued_at`, derives `queue_ms` only
+The merged commit `d8393379dd84f22c29b6fa31376ff76f008f970a` carries GitHub
+`created_at` as `queued_at`, derives `queue_ms` only
 from valid authoritative queue/start timestamps, persists it, and covers terminal
 refresh plus SQLite round-trip tests.
 
 ## The fix forever (prevent)
 
-1. Land the queue-timing patch through the normal Shipyard PR path.
+1. Keep the landed queue-timing patch covered by the normal Shipyard release path.
 2. Define authenticated submit/receipt and cache event fields before importing them;
    never infer them from wall-clock duration or log ordering.
 3. Add importer contract tests requiring explicit coverage or an honest unavailable
@@ -58,10 +59,10 @@ refresh plus SQLite round-trip tests.
 
 ## Resolution
 
-**Outcome:** Queue timing implementation is prepared and locally committed; other
-metrics remain intentionally unavailable pending an authoritative event contract.
-**Landed in:** local commit on `feature/metrics-queue-latency-20260902` (not pushed).
-**Did it work?:** M5 disposable current-main worktree compiled successfully; all 16
-metrics tests passed.
-**Still open:** PR publication/ownership, cache importer coverage, submit-to-receipt,
-and model-token telemetry.
+**Outcome:** Queue timing implementation is merged; other metrics remain intentionally
+unavailable pending an authoritative event contract.
+**Landed in:** PR #551, merged to `origin/main` at
+`d8393379dd84f22c29b6fa31376ff76f008f970a`.
+**Did it work?:** Full Shipyard validation passed, including Windows; the focused
+metrics suite and SQLite round-trip coverage passed.
+**Still open:** cache importer coverage, submit-to-receipt, and model-token telemetry.
