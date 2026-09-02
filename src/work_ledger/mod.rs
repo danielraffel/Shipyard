@@ -172,10 +172,11 @@ pub use storage::absent_status;
 use storage::{
     configure_durable, count, count_where, create_database_file_no_follow, migrate,
     protect_database_file, protect_ledger_directory, schema_version, synchronous_name,
-    validate_protected_storage, verify_integrity, verify_open_lineage, verify_supported_schema,
+    validate_protected_storage, verified_custody_schema_digest, verify_integrity,
+    verify_open_lineage, verify_supported_schema,
 };
 #[cfg(test)]
-use storage::{
+pub(crate) use storage::{
     reconstruct_authentic_v10_schema_for_test, reconstruct_authentic_v11_schema_for_test,
     reconstruct_authentic_v12_schema_for_test,
 };

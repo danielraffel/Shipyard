@@ -147,6 +147,12 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Diagnose or provision the optional authenticated custody transport.
+    Custody {
+        /// Custody setup subcommand.
+        #[command(subcommand)]
+        command: CustodyCommand,
+    },
     /// Configure Shipyard for the current project.
     Init {
         /// Show detected config output; preserves Python's current write behavior.
@@ -1905,6 +1911,30 @@ pub(super) enum AuthCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub(super) enum CustodyCommand {
+    /// Validate the installed owner-private policy and SSH receiver contract.
+    Doctor,
+    /// Plan or atomically install a custody policy manifest (dry-run default).
+    Provision {
+        /// Owner-private TOML manifest containing `schema_version` and `custody_transport`.
+        #[arg(long)]
+        input: PathBuf,
+        /// Add the exact validated policy to machine-global config.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Plan or remove the exact installed custody policy (dry-run default).
+    Disable {
+        /// SHA-256 digest printed by `custody provision`/`custody doctor`.
+        #[arg(long)]
+        policy_digest: String,
+        /// Remove the exact matching policy from machine-global config.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(super) enum AuthConfigScope {
     /// Machine-global config.
@@ -2553,8 +2583,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        AuthCommand, Cli, Command, DependencyCommand, OwnershipLeaseCommand, PulpDependencyCommand,
-        QueueHoldCommand, RunnerCommand, WaitCommand, WorkLedgerCommand, WorkLedgerPolicyCommand,
+        AuthCommand, Cli, Command, CustodyCommand, DependencyCommand, OwnershipLeaseCommand,
+        PulpDependencyCommand, QueueHoldCommand, RunnerCommand, WaitCommand, WorkLedgerCommand,
+        WorkLedgerPolicyCommand,
     };
 
     fn parsed_work_ledger(cli: Cli) -> WorkLedgerCommand {
@@ -2605,6 +2636,42 @@ mod tests {
             Command::Auth {
                 command: AuthCommand::Doctor { repo: Some(repo) }
             } if repo == "Generous-Corp/pulp"
+        ));
+    }
+
+    #[test]
+    fn custody_setup_is_explicit_and_provision_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "custody",
+            "provision",
+            "--input",
+            "/owner/private/custody.toml",
+        ])
+        .expect("custody provision parser");
+        assert!(matches!(
+            cli.command,
+            Command::Custody {
+                command: CustodyCommand::Provision { input, apply: false }
+            } if input == Path::new("/owner/private/custody.toml")
+        ));
+    }
+
+    #[test]
+    fn custody_disable_requires_digest_and_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "custody",
+            "disable",
+            "--policy-digest",
+            "a0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ])
+        .expect("custody disable parser");
+        assert!(matches!(
+            cli.command,
+            Command::Custody {
+                command: CustodyCommand::Disable { apply: false, .. }
+            }
         ));
     }
 

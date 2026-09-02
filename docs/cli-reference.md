@@ -10,6 +10,11 @@ shipyard doctor --rate-limit --repo OWNER/REPO  # resolve auth for an exact repo
 shipyard auth doctor --repo OWNER/REPO          # same override, auth-only
 shipyard auth export --output shipyard-auth.toml        # export non-secret auth config
 shipyard auth import shipyard-auth.toml --scope local   # import auth config locally
+shipyard custody doctor                                  # read-only custody receiver/policy checks
+shipyard custody provision --input /owner/private/custody.toml  # dry-run setup plan
+shipyard custody provision --input /owner/private/custody.toml --apply  # atomic machine-global install
+shipyard custody disable --policy-digest <sha256>  # dry-run exact-generation removal
+shipyard custody disable --policy-digest <sha256> --apply  # atomic exact-generation removal
 shipyard targets               # show targets + reachability
 shipyard targets add <name>    # interactively add a new target
 shipyard targets remove <name> # remove a target

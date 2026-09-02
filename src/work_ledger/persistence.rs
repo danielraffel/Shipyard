@@ -7,8 +7,8 @@ use super::{
     WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable, count, count_where,
     create_database_file_no_follow, fs, import_report, importer, migrate, opaque_path_ref, params,
     protect_database_file, protect_ledger_directory, schema_version, synchronous_name,
-    validate_candidate, validate_protected_storage, verify_integrity, verify_open_lineage,
-    verify_supported_schema,
+    validate_candidate, validate_protected_storage, verified_custody_schema_digest,
+    verify_integrity, verify_open_lineage, verify_supported_schema,
 };
 
 impl WorkLedger {
@@ -79,6 +79,31 @@ impl WorkLedger {
         ledger.verify_existing_schema_snapshot(true)?;
         ledger.reconcile_protected_object_storage()?;
         Ok(Some(ledger))
+    }
+
+    /// Inspect one existing current-schema custody ledger without creating,
+    /// migrating, reconciling, or otherwise mutating it.
+    ///
+    /// The caller owns the surrounding writer-domain snapshot barrier. The
+    /// inventory layer pins and rechecks the exact filesystem snapshot, opens
+    /// `SQLite` in immutable mode, and refuses live WAL or schema/topology drift.
+    pub(crate) fn inspect_existing_verified_custody_read_only<T>(
+        state_dir: &Path,
+        snapshot_barrier: Option<&crate::writer_domain_lease::ProductionSnapshotLease>,
+        inspect: impl FnOnce(&Connection, &str) -> WorkLedgerResult<T>,
+    ) -> WorkLedgerResult<Option<T>> {
+        if crate::writer_domain_lease::is_current_protected_path(state_dir)?
+            && snapshot_barrier.is_none()
+        {
+            return Err(WorkLedgerError::Refused(
+                "production custody inspection requires an exclusive writer-domain snapshot"
+                    .to_owned(),
+            ));
+        }
+        super::inventory::immutable_ledger_query(state_dir, |connection, _snapshot| {
+            let schema_digest = verified_custody_schema_digest(connection)?;
+            inspect(connection, &schema_digest)
+        })
     }
 
     /// Database path.

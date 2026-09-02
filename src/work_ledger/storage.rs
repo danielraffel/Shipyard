@@ -6,8 +6,11 @@ use std::io;
 use std::path::Path;
 
 use rusqlite::{Connection, TransactionBehavior};
+use sha2::{Digest, Sha256};
 
 use super::{LedgerStatus, SCHEMA_VERSION, WorkLedgerError, WorkLedgerResult};
+
+type CustodySchemaObject = (String, String, String, Option<String>);
 
 /// Status for a ledger that has not been created yet.
 #[must_use]
@@ -1665,7 +1668,7 @@ fn install_legacy_custody_successor_schema(connection: &Connection) -> WorkLedge
 
 #[cfg(test)]
 #[allow(clippy::too_many_lines)] // Exact historical v12 DDL is intentionally reconstructed intact.
-pub(super) fn reconstruct_authentic_v12_schema_for_test(
+pub(crate) fn reconstruct_authentic_v12_schema_for_test(
     connection: &Connection,
 ) -> WorkLedgerResult<()> {
     connection.execute_batch(
@@ -1702,7 +1705,7 @@ pub(super) fn reconstruct_authentic_v12_schema_for_test(
 
 #[cfg(test)]
 #[allow(clippy::too_many_lines)] // Exact deployed v11 table and trigger bytes are the migration oracle.
-pub(super) fn reconstruct_authentic_v11_schema_for_test(
+pub(crate) fn reconstruct_authentic_v11_schema_for_test(
     connection: &Connection,
 ) -> WorkLedgerResult<()> {
     reconstruct_authentic_v12_schema_for_test(connection)?;
@@ -1813,7 +1816,7 @@ pub(super) fn reconstruct_authentic_v11_schema_for_test(
 }
 
 #[cfg(test)]
-pub(super) fn reconstruct_authentic_v10_schema_for_test(
+pub(crate) fn reconstruct_authentic_v10_schema_for_test(
     connection: &Connection,
 ) -> WorkLedgerResult<()> {
     reconstruct_authentic_v12_schema_for_test(connection)?;
@@ -2618,6 +2621,57 @@ pub(super) fn verify_supported_schema(connection: &Connection) -> WorkLedgerResu
         return Err(WorkLedgerError::UnsupportedSchema(version));
     }
     verify_schema_identity(connection)
+}
+
+/// Authenticate the complete current custody schema and return its canonical
+/// digest. This covers tables, columns and constraints through their DDL, plus
+/// every explicit/automatic index and trigger owned by a custody table.
+pub(super) fn verified_custody_schema_digest(connection: &Connection) -> WorkLedgerResult<String> {
+    let actual = custody_schema_objects(connection)?;
+    let mut expected_connection = Connection::open_in_memory()?;
+    migrate(&mut expected_connection)?;
+    let expected = custody_schema_objects(&expected_connection)?;
+    if actual != expected {
+        return Err(WorkLedgerError::Refused(
+            "current custody schema is missing, altered, or contains foreign objects".to_owned(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"shipyard.work-ledger.custody-schema.v1\0");
+    for (kind, name, owner, sql) in actual {
+        for value in [kind, name, owner] {
+            let length = u64::try_from(value.len()).map_err(|_| {
+                WorkLedgerError::Refused("custody schema identity is too large".to_owned())
+            })?;
+            digest.update(length.to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        match sql {
+            Some(sql) => {
+                digest.update([1]);
+                let length = u64::try_from(sql.len()).map_err(|_| {
+                    WorkLedgerError::Refused("custody schema SQL is too large".to_owned())
+                })?;
+                digest.update(length.to_be_bytes());
+                digest.update(sql.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn custody_schema_objects(connection: &Connection) -> WorkLedgerResult<Vec<CustodySchemaObject>> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema
+          WHERE name LIKE 'custody_%' OR tbl_name LIKE 'custody_%'
+          ORDER BY type, name, tbl_name",
+    )?;
+    Ok(statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 pub(super) fn schema_version(connection: &Connection) -> WorkLedgerResult<i64> {
