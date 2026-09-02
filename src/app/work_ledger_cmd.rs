@@ -600,6 +600,7 @@ pub(super) fn work_ledger_command<W: Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // One fail-closed GitHub + local ledger reconciliation protocol.
 fn reconcile_terminal_target<W: Write>(
     state_dir: &Path,
     repo: &str,
@@ -611,7 +612,7 @@ fn reconcile_terminal_target<W: Write>(
     actions: &GitHubActions,
 ) -> Result<(), CliFailure> {
     let ledger = required_ledger(state_dir)?;
-    let candidate = ledger
+    let mut candidate = ledger
         .terminal_reconciliation_target(repo, pr, head)
         .map_err(failure)?;
     let mut resolver = ExactProtectedProfileResolver::new(&ledger, decode_protected_launch_profile);
@@ -637,7 +638,7 @@ fn reconcile_terminal_target<W: Write>(
             "terminal reconciliation repository/base authority disagrees",
         ));
     }
-    let request = TerminalReconciliationRequest {
+    let mut request = TerminalReconciliationRequest {
         repository_provider: authority.repository_provider.clone(),
         repository_id: authority.repository_id.clone(),
         repository: authority.canonical_repository.clone(),
@@ -654,6 +655,7 @@ fn reconcile_terminal_target<W: Write>(
         source_digest: candidate.source_digest.clone(),
         route_ref: candidate.route_ref.clone(),
         wake_id: candidate.wake_id.clone(),
+        delivery_id: candidate.delivery_id.clone(),
         profile_digest: candidate.profile_digest.clone(),
         workstream_handle: expectation.workstream_handle.to_owned(),
         plan_sha256: expectation.plan_sha256.to_owned(),
@@ -664,6 +666,58 @@ fn reconcile_terminal_target<W: Write>(
         success_continuation_digest: expectation.success_continuation_digest.to_owned(),
         failure_continuation_digest: expectation.failure_continuation_digest.to_owned(),
     };
+    if apply && candidate.phase == "dispatching" {
+        let expected_authority = authority.clone();
+        request = ledger
+            .finalize_uncertain_dispatch_with_authority(&request, || {
+                let observed = observe_terminal_merge_authority(actions, repo, pr, head)
+                    .map_err(|error| WorkLedgerError::Refused(error.message().to_owned()))?;
+                if observed != expected_authority {
+                    return Err(WorkLedgerError::Refused(
+                        "terminal reconciliation GitHub authority changed before terminalization"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
+            })
+            .map_err(failure)?;
+        candidate = ledger
+            .terminal_reconciliation_target(repo, pr, head)
+            .map_err(failure)?;
+        if request.work_generation != candidate.work_generation {
+            return Err(CliFailure::new(
+                1,
+                "terminal reconciliation projected generation disagrees after terminalization",
+            ));
+        }
+    }
+    if !apply && candidate.phase == "dispatching" {
+        let report = ledger
+            .plan_uncertain_dispatch_reconciliation(&request)
+            .map_err(failure)?;
+        if json {
+            write_pretty_json(stdout, &report).map_err(failure)?;
+        } else {
+            writeln!(
+                stdout,
+                "Terminal reconciliation: dry-run (dispatch terminalization)"
+            )
+            .map_err(failure)?;
+            writeln!(stdout, "Work: {}", report.work_id).map_err(failure)?;
+            writeln!(stdout, "Workstream: {}", report.workstream_handle).map_err(failure)?;
+            writeln!(
+                stdout,
+                "Target: {}#{}",
+                report.repository, report.pull_request
+            )
+            .map_err(failure)?;
+            writeln!(stdout, "Head: {}", report.exact_head).map_err(failure)?;
+            writeln!(stdout, "Merge: {}", report.merge_sha).map_err(failure)?;
+            writeln!(stdout, "Receipt digest: {}", report.receipt_sha256).map_err(failure)?;
+            writeln!(stdout, "Plan digest: {}", report.plan_sha256).map_err(failure)?;
+        }
+        return Ok(());
+    }
     drop(profile);
     drop(ledger);
     let expected_authority = authority.clone();

@@ -77,6 +77,8 @@ pub(crate) struct TerminalReconciliationTarget {
     pub(crate) wake_id: String,
     #[serde(skip_serializing)]
     pub(crate) source_digest: String,
+    #[serde(skip_serializing)]
+    pub(crate) delivery_id: Option<String>,
 }
 
 /// Bounded no-write inventory used before selecting one exact repair target.
@@ -153,6 +155,7 @@ pub(crate) struct TerminalReconciliationRequest {
     pub(crate) source_digest: String,
     pub(crate) route_ref: String,
     pub(crate) wake_id: String,
+    pub(crate) delivery_id: Option<String>,
     pub(crate) profile_digest: String,
     pub(crate) workstream_handle: String,
     pub(crate) plan_sha256: String,
@@ -201,7 +204,148 @@ struct TerminalEvidenceV1<'a> {
     workstream_handle: &'a str,
 }
 
+#[derive(Serialize)]
+struct UncertainDispatchEvidenceV1<'a> {
+    schema_version: u32,
+    repository_provider: &'a str,
+    repository_id: &'a str,
+    repository: &'a str,
+    pull_request_node_id: &'a str,
+    pull_request: u64,
+    exact_head: &'a str,
+    base_ref: &'a str,
+    merge_sha: &'a str,
+    merged_at: &'a str,
+    github_installation_id: u64,
+    work_id: &'a str,
+    work_generation: u64,
+    owner_generation: u64,
+    source_digest: &'a str,
+    route_ref: &'a str,
+    wake_id: &'a str,
+    delivery_id: &'a str,
+    profile_digest: &'a str,
+}
+
 impl WorkLedger {
+    /// Zero-write preview for an uncertain dispatch. The preview projects the
+    /// next terminal generation in memory, then describes the same immutable
+    /// receipt/event/binding that `--apply` will commit.
+    pub(crate) fn plan_uncertain_dispatch_reconciliation(
+        &self,
+        request: &TerminalReconciliationRequest,
+    ) -> WorkLedgerResult<TerminalReconciliationReport> {
+        validate_request(request)?;
+        let connection = self.connect_read_only()?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        self.verify_protected_object_storage(&connection)?;
+        validate_uncertain_dispatch_authority(&connection, request)?;
+        if projection_binding(&connection, &request.work_id)?.is_some()
+            || ownership_root_exists(&connection, &request.work_id)?
+        {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation dispatch target already has projection state".to_owned(),
+            ));
+        }
+        let mut projected = request.clone();
+        projected.work_generation = projected
+            .work_generation
+            .checked_add(1)
+            .ok_or_else(|| WorkLedgerError::Refused("work generation exhausted".to_owned()))?;
+        let evidence_digest = digest(&terminal_evidence_bytes(&projected)?);
+        let plan_sha256 = reconciliation_plan_digest(&projected, &evidence_digest)?;
+        Ok(TerminalReconciliationReport {
+            applied: false,
+            replay: false,
+            work_id: projected.work_id,
+            workstream_handle: projected.workstream_handle,
+            repository: projected.repository,
+            pull_request: projected.pull_request,
+            exact_head: projected.head_sha,
+            merge_sha: projected.merge_sha,
+            merged_at: projected.merged_at,
+            receipt_sha256: evidence_digest,
+            plan_sha256,
+        })
+    }
+
+    /// Close a dispatching handoff whose provider wake is durably uncertain
+    /// after an exact merged-head proof. This is deliberately separate from
+    /// projection reconciliation: it only advances the existing lifecycle
+    /// generation to terminal and never creates ownership or routing state.
+    /// Require the caller's final authenticated authority reread while writer
+    /// custody is held, fence the complete request, and atomically append the
+    /// terminalization event with the lifecycle transition.
+    pub(crate) fn finalize_uncertain_dispatch_with_authority(
+        &self,
+        request: &TerminalReconciliationRequest,
+        final_authority: impl FnOnce() -> WorkLedgerResult<()>,
+    ) -> WorkLedgerResult<TerminalReconciliationRequest> {
+        validate_request(request)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut connection = self.connect_read_write()?;
+        configure_durable(&connection)?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Hold the immediate transaction while obtaining the final remote
+        // proof so no competing writer can invalidate the fenced snapshot.
+        final_authority()?;
+        validate_uncertain_dispatch_authority(&transaction, request)?;
+        let projected_generation = request
+            .work_generation
+            .checked_add(1)
+            .ok_or_else(|| WorkLedgerError::Refused("work generation exhausted".to_owned()))?;
+        let now = Utc::now().to_rfc3339();
+        let changed = transaction.execute(
+            "UPDATE work_items SET phase = 'terminal', work_generation = work_generation + 1,
+                    updated_at = ?1
+              WHERE id = ?2 AND kind = 'terminal_handoff'
+                AND repo = ?3 AND pr = ?4 AND head_sha = ?5
+                AND base_ref = ?6 AND source_digest = ?7 AND repair_route_ref = ?8
+                AND phase = 'dispatching' AND work_generation = ?9
+                AND owner_generation = ?10",
+            params![
+                now,
+                request.work_id,
+                request.repository,
+                request.pull_request,
+                request.head_sha,
+                request.base_ref,
+                request.source_digest,
+                request.route_ref,
+                request.work_generation,
+                request.owner_generation,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(WorkLedgerError::Refused(
+                "terminal reconciliation work generation no longer matches".to_owned(),
+            ));
+        }
+        let payload = uncertain_dispatch_evidence_digest(request)?;
+        record_event(
+            &transaction,
+            &request.work_id,
+            projected_generation,
+            request.owner_generation,
+            "terminal_dispatch_reconciled",
+            Some(LifecycleState::Dispatching),
+            LifecycleState::Terminal,
+            &payload,
+            &now,
+        )?;
+        transaction.commit()?;
+        let mut projected = request.clone();
+        projected.work_generation = projected_generation;
+        Ok(projected)
+    }
+
     /// List only incomplete terminal projection identities. The ordinary
     /// inventory remains fail-closed and never treats these rows as authority.
     pub(crate) fn terminal_reconciliation_inventory(
@@ -218,7 +362,7 @@ impl WorkLedger {
                 "SELECT work.id, work.repo, work.pr, work.head_sha, work.base_ref,
                     work.phase, work.work_generation, work.owner_generation,
                     profile.content_digest, work.repair_route_ref, wake.wake_id,
-                    work.source_digest
+                    work.source_digest, delivery.delivery_id
                FROM work_items work
                LEFT JOIN workstream_projection_bindings binding
                  ON binding.work_item_id = work.id
@@ -231,7 +375,8 @@ impl WorkLedger {
                 AND wake.work_generation = work.work_generation - 1
                 AND wake.owner_generation = work.owner_generation
                 AND (wake.profile_ref = profile.profile_ref
-                     OR (wake.profile_ref IS NULL AND wake.state = 'failed'))
+                     OR (wake.profile_ref IS NULL AND wake.state IN ('failed', 'uncertain')))
+               LEFT JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
               WHERE binding.work_item_id IS NULL AND work.kind = 'terminal_handoff'
                 AND work.phase = 'terminal'
               ORDER BY work.id LIMIT ?1",
@@ -293,7 +438,7 @@ impl WorkLedger {
                 "SELECT work.id, work.repo, work.pr, work.head_sha, work.base_ref,
                     work.phase, work.work_generation, work.owner_generation,
                     profile.content_digest, work.repair_route_ref, wake.wake_id,
-                    work.source_digest
+                    work.source_digest, delivery.delivery_id
                FROM work_items work
                JOIN protected_objects profile
                  ON profile.work_item_id = work.id AND profile.kind = 'launch_profile'
@@ -301,11 +446,13 @@ impl WorkLedger {
                  ON wake.work_item_id = work.id
                 AND wake.route_ref = work.repair_route_ref
                 AND wake.payload_digest = profile.content_digest
-                AND wake.work_generation = work.work_generation - 1
+                AND (wake.work_generation = work.work_generation - 1
+                     OR (work.phase = 'dispatching' AND wake.work_generation = work.work_generation))
                 AND wake.owner_generation = work.owner_generation
                 AND (wake.profile_ref = profile.profile_ref
-                     OR (wake.profile_ref IS NULL AND wake.state = 'failed'))
-              WHERE work.kind = 'terminal_handoff' AND work.phase = 'terminal'
+                     OR (wake.profile_ref IS NULL AND wake.state IN ('failed', 'uncertain')))
+               LEFT JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+              WHERE work.kind = 'terminal_handoff' AND work.phase IN ('terminal', 'dispatching')
                 AND work.repo = ?1 AND work.pr = ?2 AND work.head_sha = ?3
                 AND (NOT EXISTS(
                        SELECT 1 FROM workstream_projection_bindings binding
@@ -575,6 +722,7 @@ fn terminal_target_from_row(
         route_ref: row.get(9)?,
         wake_id: row.get(10)?,
         source_digest: row.get(11)?,
+        delivery_id: row.get(12)?,
     })
 }
 
@@ -797,6 +945,131 @@ fn expected_binding(request: &TerminalReconciliationRequest) -> ProjectionBindin
     )
 }
 
+fn validate_uncertain_dispatch_authority(
+    connection: &rusqlite::Connection,
+    request: &TerminalReconciliationRequest,
+) -> WorkLedgerResult<()> {
+    let Some(delivery_id) = request.delivery_id.as_deref() else {
+        return Err(WorkLedgerError::Refused(
+            "terminal reconciliation requires an exact uncertain delivery identity".to_owned(),
+        ));
+    };
+    let profile_ref = OpaqueRef::derive("launch-profile", request.profile_digest.as_bytes())
+        .as_str()
+        .to_owned();
+    let exact: bool = connection.query_row(
+        "SELECT COUNT(*) = 1
+           FROM work_items work
+           JOIN route_records route
+            ON route.route_ref = work.repair_route_ref
+            AND route.work_item_id = work.id
+            AND route.head_sha = work.head_sha
+            AND route.owner_generation = work.owner_generation
+           JOIN protected_objects profile
+             ON profile.work_item_id = work.id AND profile.kind = 'launch_profile'
+            AND profile.profile_ref = ?12 AND profile.content_digest = ?13
+           JOIN continuation_contracts continuation ON continuation.work_item_id = work.id
+           JOIN outbox wake ON wake.work_item_id = work.id
+            AND wake.wake_id = ?10 AND wake.state = 'uncertain'
+            AND wake.route_ref = route.route_ref
+            AND wake.payload_digest = profile.content_digest
+            AND (wake.profile_ref = profile.profile_ref OR wake.profile_ref IS NULL)
+            AND wake.work_generation = work.work_generation
+            AND wake.owner_generation = work.owner_generation
+           JOIN wake_attempts attempt ON attempt.wake_id = wake.wake_id
+            AND attempt.state = 'uncertain'
+           JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+            AND delivery.delivery_id = ?11 AND delivery.attempt = attempt.attempt
+            AND delivery.adapter_id = attempt.adapter_id
+            AND delivery.state = 'uncertain'
+           JOIN activation_epochs activation ON activation.activation_id = delivery.activation_id
+            AND activation.work_item_id = work.id
+            AND activation.work_generation = work.work_generation
+            AND activation.owner_generation = work.owner_generation
+            AND activation.state = 'released'
+           JOIN protected_objects provider_request
+             ON provider_request.object_ref = delivery.request_object_ref
+            AND provider_request.work_item_id = work.id
+            AND provider_request.kind = 'provider_request'
+          WHERE work.id = ?1 AND work.kind = 'terminal_handoff'
+            AND work.repo = ?2 AND work.pr = ?3 AND work.head_sha = ?4
+            AND work.base_ref = ?5 AND work.phase = 'dispatching'
+            AND work.work_generation = ?6 AND work.owner_generation = ?7
+            AND work.repair_route_ref = ?8 AND work.source_digest = ?9
+            AND continuation.success_contract_digest = ?14
+            AND continuation.failure_contract_digest = ?15
+            AND NOT EXISTS (
+                SELECT 1 FROM provider_deliveries other
+                 WHERE other.wake_id = wake.wake_id AND other.delivery_id != ?11)
+            AND NOT EXISTS (
+                SELECT 1 FROM workstream_projection_bindings binding
+                 WHERE binding.work_item_id = work.id)
+            AND NOT EXISTS (
+                SELECT 1 FROM ownership_roots root WHERE root.work_item_id = work.id)",
+        params![
+            request.work_id,
+            request.repository,
+            request.pull_request,
+            request.head_sha,
+            request.base_ref,
+            request.work_generation,
+            request.owner_generation,
+            request.route_ref,
+            request.source_digest,
+            request.wake_id,
+            delivery_id,
+            profile_ref,
+            request.profile_digest,
+            request.success_continuation_digest,
+            request.failure_continuation_digest,
+        ],
+        |row| row.get(0),
+    )?;
+    if !exact {
+        return Err(WorkLedgerError::Refused(
+            "terminal reconciliation uncertain dispatch authority is incomplete or changed"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn uncertain_dispatch_evidence_digest(
+    request: &TerminalReconciliationRequest,
+) -> WorkLedgerResult<String> {
+    let delivery_id = request.delivery_id.as_deref().ok_or_else(|| {
+        WorkLedgerError::Refused(
+            "terminal reconciliation requires an exact uncertain delivery identity".to_owned(),
+        )
+    })?;
+    let bytes = serde_json::to_vec(&UncertainDispatchEvidenceV1 {
+        schema_version: 1,
+        repository_provider: &request.repository_provider,
+        repository_id: &request.repository_id,
+        repository: &request.repository,
+        pull_request_node_id: &request.pull_request_node_id,
+        pull_request: request.pull_request,
+        exact_head: &request.head_sha,
+        base_ref: &request.base_ref,
+        merge_sha: &request.merge_sha,
+        merged_at: &request.merged_at,
+        github_installation_id: request.github_installation_id,
+        work_id: &request.work_id,
+        work_generation: request.work_generation,
+        owner_generation: request.owner_generation,
+        source_digest: &request.source_digest,
+        route_ref: &request.route_ref,
+        wake_id: &request.wake_id,
+        delivery_id,
+        profile_digest: &request.profile_digest,
+    })
+    .map_err(|error| {
+        WorkLedgerError::Refused(format!("encode terminal dispatch evidence: {error}"))
+    })?;
+    Ok(digest(&bytes))
+}
+
+#[allow(clippy::too_many_lines)] // Validate the complete legacy native authority in one snapshot.
 fn validate_existing_native_authority(
     connection: &rusqlite::Connection,
     request: &TerminalReconciliationRequest,
@@ -865,14 +1138,17 @@ fn validate_existing_native_authority(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let wake_exact = matches!(wakes.as_slice(), [wake] if
+    let wake_exact = if let [wake] = wakes.as_slice() {
         wake.0 == request.wake_id
             && wake.1 == request.route_ref
             && wake.3 == request.profile_digest
             && wake.5.checked_add(1) == Some(request.work_generation)
             && wake.6 == request.owner_generation
             && (wake.2.as_deref() == Some(profile_ref.as_str())
-                || (wake.2.is_none() && wake.4 == "failed")));
+                || (wake.2.is_none() && (wake.4 == "failed" || wake.4 == "uncertain")))
+    } else {
+        false
+    };
     let continuations_exact: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM continuation_contracts
                         WHERE work_item_id = ?1 AND success_contract_digest = ?2
@@ -884,12 +1160,53 @@ fn validate_existing_native_authority(
         ],
         |row| row.get(0),
     )?;
-    if !route_exact || !profile_exact || !wake_exact || !continuations_exact {
+    let terminalization_exact = if let Some(delivery_id) = request.delivery_id.as_deref() {
+        let mut dispatch_request = request.clone();
+        dispatch_request.work_generation = dispatch_request
+            .work_generation
+            .checked_sub(1)
+            .ok_or_else(|| WorkLedgerError::Refused("work generation underflow".to_owned()))?;
+        let event_digest = uncertain_dispatch_evidence_digest(&dispatch_request)?;
+        connection.query_row(
+            "SELECT COUNT(*) = 1
+               FROM events event
+               JOIN provider_deliveries delivery ON delivery.wake_id = ?2
+               JOIN wake_attempts attempt ON attempt.wake_id = delivery.wake_id
+                AND attempt.attempt = delivery.attempt
+              WHERE event.work_item_id = ?1
+                AND event.work_generation = ?3 AND event.owner_generation = ?4
+                AND event.kind = 'terminal_dispatch_reconciled'
+                AND event.from_state = 'dispatching' AND event.to_state = 'terminal'
+                AND event.payload_digest = ?5
+                AND delivery.delivery_id = ?6 AND delivery.state = 'uncertain'
+                AND attempt.state = 'uncertain'
+                AND NOT EXISTS (SELECT 1 FROM provider_deliveries other
+                                 WHERE other.wake_id = ?2 AND other.delivery_id != ?6)",
+            params![
+                request.work_id,
+                request.wake_id,
+                request.work_generation,
+                request.owner_generation,
+                event_digest,
+                delivery_id,
+            ],
+            |row| row.get(0),
+        )?
+    } else {
+        true
+    };
+    if !route_exact
+        || !profile_exact
+        || !wake_exact
+        || !continuations_exact
+        || !terminalization_exact
+    {
         let missing = [
             (!route_exact).then_some("route"),
             (!profile_exact).then_some("profile"),
             (!wake_exact).then_some("wake"),
             (!continuations_exact).then_some("continuations"),
+            (!terminalization_exact).then_some("dispatch terminalization"),
         ]
         .into_iter()
         .flatten()
@@ -946,6 +1263,9 @@ fn validate_request(request: &TerminalReconciliationRequest) -> WorkLedgerResult
     validate_opaque_ref("work ID", &request.work_id, "wi")?;
     validate_opaque_ref("route reference", &request.route_ref, "route")?;
     validate_opaque_ref("wake ID", &request.wake_id, "wake")?;
+    if let Some(delivery_id) = request.delivery_id.as_deref() {
+        validate_opaque_ref("delivery ID", delivery_id, "pd")?;
+    }
     super::validate_workstream_handle(&request.workstream_handle)?;
     for (name, value) in [
         ("profile digest", &request.profile_digest),
@@ -1076,6 +1396,7 @@ fn inventory_digest(
                 &item.route_ref,
                 &item.wake_id,
                 &item.source_digest,
+                &item.delivery_id,
             )
         })
         .collect::<Vec<_>>();
@@ -1167,23 +1488,45 @@ fn reconciliation_plan_digest(
     request: &TerminalReconciliationRequest,
     evidence_digest: &str,
 ) -> WorkLedgerResult<String> {
-    let bytes = serde_json::to_vec(&(
-        "terminal-reconciliation-plan-v1",
-        &request.work_id,
-        request.work_generation,
-        request.owner_generation,
-        &request.source_digest,
-        &request.route_ref,
-        &request.wake_id,
-        &request.profile_digest,
-        &request.workstream_handle,
-        &request.plan_sha256,
-        request.root_revision,
-        request.issue_revision,
-        request.projection_revision,
-        request.material_event_revision,
-        evidence_digest,
-    ))
+    let bytes = if let Some(delivery_id) = request.delivery_id.as_deref() {
+        serde_json::to_vec(&(
+            "terminal-reconciliation-plan-v2",
+            &request.work_id,
+            request.work_generation,
+            request.owner_generation,
+            &request.source_digest,
+            &request.route_ref,
+            &request.wake_id,
+            delivery_id,
+            &request.profile_digest,
+            &request.workstream_handle,
+            &request.plan_sha256,
+            request.root_revision,
+            request.issue_revision,
+            request.projection_revision,
+            request.material_event_revision,
+            evidence_digest,
+        ))
+    } else {
+        // Preserve byte-for-byte legacy plan identities and exact replay.
+        serde_json::to_vec(&(
+            "terminal-reconciliation-plan-v1",
+            &request.work_id,
+            request.work_generation,
+            request.owner_generation,
+            &request.source_digest,
+            &request.route_ref,
+            &request.wake_id,
+            &request.profile_digest,
+            &request.workstream_handle,
+            &request.plan_sha256,
+            request.root_revision,
+            request.issue_revision,
+            request.projection_revision,
+            request.material_event_revision,
+            evidence_digest,
+        ))
+    }
     .map_err(|error| WorkLedgerError::Refused(format!("encode reconciliation plan: {error}")))?;
     Ok(digest(&bytes))
 }
@@ -1354,6 +1697,7 @@ pub(crate) mod tests {
             source_digest,
             route_ref: report.route_ref,
             wake_id: report.wake_id,
+            delivery_id: None,
             profile_digest: report.profile_digest,
             workstream_handle: publication.workstream_handle,
             plan_sha256: publication.plan_sha256,
@@ -1660,6 +2004,287 @@ pub(crate) mod tests {
             )
             .expect_err("targeted repair must reject normalized aliasing");
         assert!(target_error.to_string().contains("no exact terminal"));
+    }
+
+    fn seed_uncertain_dispatch(
+        state_dir: &std::path::Path,
+        null_profile_ref: bool,
+        release_activation: bool,
+    ) -> (TerminalReconciliationRequest, WorkLedger) {
+        let (mut request, ledger) = seed_unbound_terminal(state_dir);
+        request.work_generation -= 1;
+        let delivery_id = format!("pd_{}", "3".repeat(64));
+        let activation_id = format!("ae_{}", "4".repeat(64));
+        let request_bytes = b"terminal reconciliation provider request";
+        let request_digest = digest(request_bytes);
+        let request_object = ledger
+            .put_protected_object(
+                &request.work_id,
+                ProtectedObjectKind::ProviderRequest,
+                None,
+                &request_digest,
+                request_bytes,
+            )
+            .expect("provider request fixture");
+        let now = Utc::now().to_rfc3339();
+        let connection = ledger.connect_read_write().expect("fixture connection");
+        connection
+            .execute(
+                "UPDATE work_items SET phase = 'dispatching', work_generation = ?2
+                  WHERE id = ?1",
+                params![request.work_id, request.work_generation],
+            )
+            .expect("restore dispatching generation");
+        connection
+            .execute(
+                "INSERT INTO activation_epochs
+                 (activation_id, work_item_id, work_generation, owner_generation,
+                  epoch, owner_ref, state, acquired_at, released_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, 'active', ?6, NULL)",
+                params![
+                    activation_id,
+                    request.work_id,
+                    request.work_generation,
+                    request.owner_generation,
+                    format!("owner_{}", "5".repeat(64)),
+                    now,
+                ],
+            )
+            .expect("released activation fixture");
+        connection
+            .execute(
+                "INSERT INTO wake_attempts
+                 (wake_id, attempt, state, adapter_id, idempotent, outcome_digest,
+                  started_at, finished_at)
+                 VALUES (?1, 1, 'uncertain', 'test-provider-adapter', 0, ?2, ?3, ?3)",
+                params![request.wake_id, digest(b"uncertain outcome"), now],
+            )
+            .expect("uncertain attempt fixture");
+        connection
+            .execute(
+                "INSERT INTO provider_deliveries
+                 (delivery_id, wake_id, attempt, activation_id, provider_id, adapter_id,
+                  idempotency_key, request_object_ref, state, created_at, updated_at)
+                 VALUES (?1, ?2, 1, ?3, 'test-provider', 'test-provider-adapter',
+                         'terminal-reconciliation-test-key', ?4, 'uncertain', ?5, ?5)",
+                params![
+                    delivery_id,
+                    request.wake_id,
+                    activation_id,
+                    request_object.object_ref,
+                    now,
+                ],
+            )
+            .expect("uncertain delivery fixture");
+        if release_activation {
+            connection
+                .execute(
+                    "UPDATE activation_epochs SET state = 'released', released_at = ?2
+                      WHERE activation_id = ?1",
+                    params![activation_id, now],
+                )
+                .expect("release uncertain activation fixture");
+        }
+        connection
+            .execute(
+                "UPDATE outbox SET state = 'uncertain',
+                    profile_ref = CASE WHEN ?2 THEN NULL ELSE profile_ref END,
+                    updated_at = ?3 WHERE wake_id = ?1",
+                params![request.wake_id, null_profile_ref, now],
+            )
+            .expect("uncertain wake fixture");
+        drop(connection);
+        request.delivery_id = Some(delivery_id);
+        (request, ledger)
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct DeliveryMutationSnapshot {
+        delivery_id: String,
+        wake_id: String,
+        attempt: u64,
+        activation_id: String,
+        provider_id: String,
+        adapter_id: String,
+        idempotency_key: String,
+        request_object_ref: String,
+        receipt_object_ref: Option<String>,
+        state: String,
+        created_at: String,
+        updated_at: String,
+        delivered_at: Option<String>,
+    }
+
+    type WorkMutationSnapshot = (String, u64, u64, String, String, String, String);
+    type EventMutationSnapshot = (
+        String,
+        u64,
+        u64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+    );
+    type WakeMutationSnapshot = (
+        String,
+        u64,
+        u64,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    type ActivationMutationSnapshot = (
+        String,
+        u64,
+        u64,
+        u64,
+        String,
+        String,
+        String,
+        Option<String>,
+    );
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ReconciliationMutationSnapshot {
+        work: WorkMutationSnapshot,
+        events: Vec<EventMutationSnapshot>,
+        wake: WakeMutationSnapshot,
+        delivery: DeliveryMutationSnapshot,
+        activation: ActivationMutationSnapshot,
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the immutable snapshot schema in one auditable query order.
+    fn reconciliation_mutation_snapshot(
+        ledger: &WorkLedger,
+        request: &TerminalReconciliationRequest,
+    ) -> ReconciliationMutationSnapshot {
+        let connection = ledger.connect_read_only().expect("snapshot connection");
+        let work = connection
+            .query_row(
+                "SELECT phase, work_generation, owner_generation, updated_at,
+                        base_ref, source_digest, repair_route_ref
+                   FROM work_items WHERE id = ?1",
+                [&request.work_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("work snapshot");
+        let events = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT event_id, work_generation, owner_generation, kind,
+                            from_state, to_state, payload_digest, created_at
+                       FROM events WHERE work_item_id = ?1 ORDER BY event_id",
+                )
+                .expect("event snapshot statement");
+            statement
+                .query_map([&request.work_id], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                })
+                .expect("event snapshot rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("event snapshot")
+        };
+        let wake = connection
+            .query_row(
+                "SELECT state, work_generation, owner_generation, route_ref, profile_ref,
+                        payload_digest, transport_receipt_digest, provider_delivery_id, updated_at
+                   FROM outbox WHERE wake_id = ?1",
+                [&request.wake_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .expect("wake snapshot");
+        let delivery = connection
+            .query_row(
+                "SELECT delivery_id, wake_id, attempt, activation_id, provider_id,
+                        adapter_id, idempotency_key, request_object_ref, receipt_object_ref,
+                        state, created_at, updated_at, delivered_at
+                   FROM provider_deliveries WHERE wake_id = ?1",
+                [&request.wake_id],
+                |row| {
+                    Ok(DeliveryMutationSnapshot {
+                        delivery_id: row.get(0)?,
+                        wake_id: row.get(1)?,
+                        attempt: row.get(2)?,
+                        activation_id: row.get(3)?,
+                        provider_id: row.get(4)?,
+                        adapter_id: row.get(5)?,
+                        idempotency_key: row.get(6)?,
+                        request_object_ref: row.get(7)?,
+                        receipt_object_ref: row.get(8)?,
+                        state: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
+                        delivered_at: row.get(12)?,
+                    })
+                },
+            )
+            .expect("delivery snapshot");
+        let activation = connection
+            .query_row(
+                "SELECT activation.activation_id, activation.work_generation,
+                        activation.owner_generation, activation.epoch, activation.owner_ref,
+                        activation.state, activation.acquired_at, activation.released_at
+                   FROM activation_epochs activation
+                   JOIN provider_deliveries delivery
+                     ON delivery.activation_id = activation.activation_id
+                  WHERE delivery.wake_id = ?1",
+                [&request.wake_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .expect("activation snapshot");
+        ReconciliationMutationSnapshot {
+            work,
+            events,
+            wake,
+            delivery,
+            activation,
+        }
     }
 
     #[test]
@@ -2092,5 +2717,178 @@ pub(crate) mod tests {
             .expect("exact replay");
         assert!(replay.replay);
         assert!(!replay.applied);
+    }
+
+    #[test]
+    fn uncertain_dispatch_dry_run_is_zero_write_and_apply_is_replayable() {
+        let temp = TempDir::new().expect("temp");
+        let (request, ledger) = seed_uncertain_dispatch(temp.path(), false, true);
+        let mut unrelated = native_publication_test_request();
+        unrelated.pull_request += 1;
+        unrelated.head_sha = "b".repeat(40);
+        unrelated.workstream_handle = "GEN-44".to_owned();
+        let unrelated_report = WorkLedger::plan_or_apply_native_continuation(
+            temp.path(),
+            &unrelated,
+            &native_publication_test_policy(vec![unrelated.repository.clone()]),
+            true,
+        )
+        .expect("unrelated active work");
+        let unrelated_before: (String, u64, u64) = ledger
+            .connect_read_only()
+            .expect("unrelated read")
+            .query_row(
+                "SELECT phase, work_generation, owner_generation FROM work_items WHERE id = ?1",
+                [&unrelated_report.work_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("unrelated snapshot");
+        let before = reconciliation_mutation_snapshot(&ledger, &request);
+        let planned = ledger
+            .plan_uncertain_dispatch_reconciliation(&request)
+            .expect("uncertain dry run");
+        assert!(!planned.applied);
+        assert_eq!(
+            reconciliation_mutation_snapshot(&ledger, &request),
+            before,
+            "dry-run changed exact reconciliation authority"
+        );
+
+        let projected = ledger
+            .finalize_uncertain_dispatch_with_authority(&request, || Ok(()))
+            .expect("fenced terminalization");
+        assert_eq!(projected.work_generation, request.work_generation + 1);
+        drop(ledger);
+        let ledger = WorkLedger::open_existing(temp.path())
+            .expect("restart open")
+            .expect("restart ledger");
+        let applied = WorkLedger::plan_or_apply_terminal_reconciliation(
+            temp.path(),
+            &projected,
+            true,
+            || Ok(()),
+        )
+        .expect("projection apply");
+        assert!(applied.applied);
+        assert_eq!(applied.plan_sha256, planned.plan_sha256);
+        let replay = WorkLedger::plan_or_apply_terminal_reconciliation(
+            temp.path(),
+            &projected,
+            true,
+            || panic!("replay must not reread remote authority"),
+        )
+        .expect("response-loss replay");
+        assert!(replay.replay);
+        assert!(!replay.applied);
+        assert_eq!(table_count(&ledger, "provider_deliveries"), 1);
+        let unrelated_after: (String, u64, u64) = ledger
+            .connect_read_only()
+            .expect("unrelated read")
+            .query_row(
+                "SELECT phase, work_generation, owner_generation FROM work_items WHERE id = ?1",
+                [&unrelated_report.work_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("unrelated snapshot");
+        assert_eq!(unrelated_after, unrelated_before, "active work changed");
+    }
+
+    #[test]
+    fn uncertain_dispatch_accepts_legacy_null_profile_and_refuses_local_drift() {
+        let temp = TempDir::new().expect("temp");
+        let (request, ledger) = seed_uncertain_dispatch(temp.path(), true, true);
+        ledger
+            .plan_uncertain_dispatch_reconciliation(&request)
+            .expect("NULL profile is valid when exact protected profile remains bound");
+        let before = reconciliation_mutation_snapshot(&ledger, &request);
+        let error = ledger
+            .finalize_uncertain_dispatch_with_authority(&request, || {
+                Err(WorkLedgerError::Refused(
+                    "simulated GitHub drift".to_owned(),
+                ))
+            })
+            .expect_err("remote authority drift refuses");
+        assert!(error.to_string().contains("simulated GitHub drift"));
+        assert_eq!(
+            reconciliation_mutation_snapshot(&ledger, &request),
+            before,
+            "remote-authority refusal changed exact reconciliation authority"
+        );
+
+        let connection = ledger.connect_read_write().expect("drift connection");
+        connection
+            .execute(
+                "UPDATE work_items SET base_ref = 'different' WHERE id = ?1",
+                [&request.work_id],
+            )
+            .expect("local drift");
+        drop(connection);
+        let before_local_refusal = reconciliation_mutation_snapshot(&ledger, &request);
+        let error = ledger
+            .finalize_uncertain_dispatch_with_authority(&request, || Ok(()))
+            .expect_err("full local fence refuses");
+        assert!(error.to_string().contains("authority"));
+        assert_eq!(
+            reconciliation_mutation_snapshot(&ledger, &request),
+            before_local_refusal,
+            "local-authority refusal changed exact reconciliation authority"
+        );
+    }
+
+    #[test]
+    fn uncertain_dispatch_refuses_non_uncertain_or_wrong_delivery_without_mutation() {
+        for drift in ["wake-state", "delivery-id"] {
+            let temp = TempDir::new().expect("temp");
+            let (mut request, ledger) = seed_uncertain_dispatch(temp.path(), false, true);
+            if drift == "wake-state" {
+                ledger
+                    .connect_read_write()
+                    .expect("drift connection")
+                    .execute(
+                        "UPDATE outbox SET state = 'failed' WHERE wake_id = ?1",
+                        [&request.wake_id],
+                    )
+                    .expect("non-uncertain wake");
+            } else {
+                request.delivery_id = Some(format!("pd_{}", "9".repeat(64)));
+            }
+            let before = reconciliation_mutation_snapshot(&ledger, &request);
+            let error = ledger
+                .finalize_uncertain_dispatch_with_authority(&request, || Ok(()))
+                .expect_err("contradictory dispatch authority refuses");
+            assert!(error.to_string().contains("authority"), "{drift}: {error}");
+            assert_eq!(
+                reconciliation_mutation_snapshot(&ledger, &request),
+                before,
+                "{drift} refusal changed exact reconciliation authority"
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_dispatch_refuses_active_activation_without_mutation() {
+        let temp = TempDir::new().expect("temp");
+        let (request, ledger) = seed_uncertain_dispatch(temp.path(), false, false);
+        let before = reconciliation_mutation_snapshot(&ledger, &request);
+
+        let plan_error = ledger
+            .plan_uncertain_dispatch_reconciliation(&request)
+            .expect_err("dry-run must refuse a still-active activation");
+        assert!(plan_error.to_string().contains("authority"));
+        assert_eq!(
+            reconciliation_mutation_snapshot(&ledger, &request),
+            before,
+            "dry-run mutated active work"
+        );
+
+        let apply_error = ledger
+            .finalize_uncertain_dispatch_with_authority(&request, || Ok(()))
+            .expect_err("apply must refuse a still-active activation");
+        assert!(apply_error.to_string().contains("authority"));
+        assert_eq!(
+            reconciliation_mutation_snapshot(&ledger, &request),
+            before,
+            "apply mutated active work"
+        );
     }
 }
