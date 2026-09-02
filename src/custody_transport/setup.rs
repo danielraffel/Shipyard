@@ -375,6 +375,23 @@ pub(crate) fn disable(
     if let Err(error) = ensure_private_directory(global_dir) {
         return refused_report(error, Some(actual_digest), planned.checks);
     }
+    // Disable spans two protected surfaces: the custody ledger and the
+    // machine-global policy.  Hold the machine-wide writer domain exclusively
+    // before the final ledger check so no custody writer can create new
+    // in-flight state between that check and policy removal.  Acquiring the
+    // config lease below is then a safe nested lease on the same thread.
+    let _exclusive_writer_domain =
+        match crate::writer_domain_lease::acquire_exclusive_for_protected_path(state_dir) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return refused_report(
+                    "custody-state-writer-domain-unavailable",
+                    Some(actual_digest),
+                    planned.checks,
+                )
+                .with_detail(error.to_string());
+            }
+        };
     let _writer_domain = match crate::writer_domain_lease::acquire_for_protected_path(&config_path)
     {
         Ok(lease) => lease,
@@ -387,8 +404,7 @@ pub(crate) fn disable(
             .with_detail(error.to_string());
         }
     };
-    // Recheck after acquiring the config writer lease so a concurrent
-    // lifecycle transition cannot race the disable publication.
+    // Recheck only after the exclusive state/config writer barrier is held.
     if let Err(reason) = ensure_no_active_custody_state(state_dir) {
         return refused_report(reason, Some(actual_digest), planned.checks);
     }
