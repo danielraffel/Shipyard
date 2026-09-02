@@ -12,7 +12,6 @@ use std::io::Write;
 use std::path::Path;
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
-use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, Item};
@@ -21,7 +20,10 @@ use super::policy::RawPolicy;
 use super::{CustodyTransportPolicy, load_custody_transport_policy};
 use crate::identity::RuntimeMode;
 
+mod disable;
 mod host;
+
+pub(crate) use disable::disable;
 
 pub(super) use host::{ReadPrivateError, read_private_input};
 use host::{
@@ -58,6 +60,9 @@ pub(crate) struct CustodySetupReport {
     /// Stable failure code, when refused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason_code: Option<String>,
+    /// Digest of the immutable exact-generation disable receipt, when proven.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) receipt_digest: Option<String>,
 }
 
 /// One redacted setup check.
@@ -133,7 +138,7 @@ pub(crate) fn doctor(global_dir: &Path) -> CustodySetupReport {
 /// Validate a private manifest and optionally add its policy atomically to the
 /// machine-global config.  Dry-run is represented by `apply = false`.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn provision(global_dir: &Path, input_path: &Path, apply: bool) -> CustodySetupReport {
+fn provision(global_dir: &Path, input_path: &Path, apply: bool) -> CustodySetupReport {
     let bytes = match read_private_input(input_path, MAX_SETUP_BYTES, true) {
         Ok(bytes) => bytes,
         Err(error) => return refused_report(error.code(), None, Vec::new()),
@@ -310,172 +315,71 @@ pub(crate) fn provision(global_dir: &Path, input_path: &Path, apply: bool) -> Cu
     report_for("applied", &validated, None)
 }
 
-/// Disable only the exact policy generation named by its digest.
-/// External SSH receiver files and any unrelated machine configuration remain
-/// untouched.  Dry-run is the default; `apply` performs a leased atomic edit.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn disable(
+/// Run the supported provision command with disable-generation fencing.
+///
+/// A completed disable generation may be followed by a fresh installation,
+/// but an unresolved intent must be completed before any policy can be
+/// installed. Apply holds the same exclusive machine writer domain used by
+/// disable so the check and config publication cannot cross.
+pub(crate) fn provision_with_state(
     global_dir: &Path,
     state_dir: &Path,
-    expected_digest: &str,
+    input_path: &Path,
     apply: bool,
 ) -> CustodySetupReport {
-    if !is_digest(expected_digest) {
-        return refused_report("custody-policy-digest-invalid", None, Vec::new());
+    let preflight = provision(global_dir, input_path, false);
+    if !preflight.ready {
+        return preflight;
     }
-    let config_path = global_dir.join("config.toml");
-    let current = match read_optional_config(&config_path) {
-        Ok(Some(text)) => text,
-        Ok(None) => return disabled_report("machine-global custody policy is absent"),
-        Err(reason) => return refused_report(reason, None, Vec::new()),
-    };
-    let existing = match parse_existing_policy(&current) {
-        Ok(Some(policy)) => policy,
-        Ok(None) => return disabled_report("[custody_transport] is absent"),
-        Err(reason) => return refused_report(reason, None, Vec::new()),
-    };
-    let Ok(actual_digest) = policy_digest(&existing) else {
-        return refused_report("custody-policy-serialization-failed", None, Vec::new());
-    };
-    if actual_digest != expected_digest {
-        return refused_report(
-            "custody-policy-digest-mismatch",
-            Some(actual_digest),
-            vec![check(
-                "digest",
-                false,
-                "installed policy differs from requested generation",
-            )],
-        );
-    }
-    if let Err(reason) = ensure_no_active_custody_state(state_dir) {
-        return refused_report(
-            reason,
-            Some(actual_digest),
-            vec![check(
-                "state",
-                false,
-                "active or indeterminate custody state must drain before disable",
-            )],
-        );
-    }
-    let planned = CustodySetupReport {
-        schema_version: SETUP_SCHEMA_VERSION,
-        outcome: "disable_planned".to_owned(),
-        ready: true,
-        policy_digest: Some(actual_digest.clone()),
-        local_machine_ref: existing.local_machine_ref.clone(),
-        checks: vec![check("digest", true, "exact installed generation matched")],
-        paths: vec![config_path.display().to_string()],
-        reason_code: None,
-    };
-    if !apply {
-        return planned;
-    }
-    if let Err(error) = ensure_private_directory(global_dir) {
-        return refused_report(error, Some(actual_digest), planned.checks);
-    }
-    // Disable spans two protected surfaces: the custody ledger and the
-    // machine-global policy.  Hold the machine-wide writer domain exclusively
-    // before the final ledger check so no custody writer can create new
-    // in-flight state between that check and policy removal.  Acquiring the
-    // config lease below is then a safe nested lease on the same thread.
-    let _exclusive_writer_domain =
+    let _snapshot = if apply {
         match crate::writer_domain_lease::acquire_exclusive_for_protected_path(state_dir) {
             Ok(lease) => lease,
             Err(error) => {
                 return refused_report(
                     "custody-state-writer-domain-unavailable",
-                    Some(actual_digest),
-                    planned.checks,
+                    preflight.policy_digest,
+                    preflight.checks,
                 )
                 .with_detail(error.to_string());
             }
-        };
-    let _writer_domain = match crate::writer_domain_lease::acquire_for_protected_path(&config_path)
-    {
-        Ok(lease) => lease,
-        Err(error) => {
-            return refused_report(
-                "custody-config-writer-domain-unavailable",
-                Some(actual_digest),
-                planned.checks,
-            )
-            .with_detail(error.to_string());
+        }
+    } else {
+        match disable::disable_record_store_exists(state_dir) {
+            Ok(false) => None,
+            Ok(true) => {
+                match crate::writer_domain_lease::acquire_existing_exclusive_for_protected_path(
+                    state_dir,
+                ) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        return refused_report(
+                            "custody-state-read-barrier-unavailable",
+                            preflight.policy_digest,
+                            preflight.checks,
+                        )
+                        .with_detail(error.to_string());
+                    }
+                }
+            }
+            Err(reason) => {
+                return refused_report(
+                    "custody-disable-receipt-unavailable",
+                    preflight.policy_digest,
+                    preflight.checks,
+                )
+                .with_detail(reason);
+            }
         }
     };
-    // Recheck only after the exclusive state/config writer barrier is held.
-    if let Err(reason) = ensure_no_active_custody_state(state_dir) {
-        return refused_report(reason, Some(actual_digest), planned.checks);
-    }
-    let reread = match read_optional_config(&config_path) {
-        Ok(Some(text)) => text,
-        Ok(None) => return disabled_report("policy disappeared before disable publication"),
-        Err(reason) => return refused_report(reason, Some(actual_digest), planned.checks),
-    };
-    let reread_policy = match parse_existing_policy(&reread) {
-        Ok(Some(policy)) => policy,
-        Ok(None) => return disabled_report("policy already absent"),
-        Err(reason) => return refused_report(reason, Some(actual_digest), planned.checks),
-    };
-    let Ok(reread_digest) = policy_digest(&reread_policy) else {
-        return refused_report("custody-policy-serialization-failed", None, planned.checks);
-    };
-    if reread_digest != expected_digest {
+    if let Err(reason) = disable::provisioning_fence(state_dir) {
         return refused_report(
-            "custody-policy-digest-mismatch",
-            Some(reread_digest),
-            planned.checks,
-        );
-    }
-    let Ok(mut document) = reread.parse::<DocumentMut>() else {
-        return refused_report(
-            "custody-config-malformed",
-            Some(actual_digest),
-            planned.checks,
-        );
-    };
-    document.remove("custody_transport");
-    let rendered = document.to_string();
-    let rendered = if rendered.is_empty() {
-        "\n"
-    } else {
-        rendered.as_str()
-    };
-    if let Err(error) = atomic_write_private(&config_path, rendered.as_bytes()) {
-        return refused_report(
-            "custody-config-write-failed",
-            Some(actual_digest),
-            planned.checks,
+            "custody-disable-generation-unresolved",
+            preflight.policy_digest,
+            preflight.checks,
         )
-        .with_detail(error.to_string());
+        .with_detail(reason);
     }
-    let readback = doctor(global_dir);
-    if readback.outcome != "disabled" {
-        return refused_report(
-            "custody-disable-readback-refused",
-            Some(actual_digest),
-            vec![check(
-                "readback",
-                false,
-                "custody policy remains present after removal",
-            )],
-        );
-    }
-    CustodySetupReport {
-        schema_version: SETUP_SCHEMA_VERSION,
-        outcome: "disabled".to_owned(),
-        ready: true,
-        policy_digest: Some(actual_digest),
-        local_machine_ref: Some(reread_policy.local_machine_ref.unwrap_or_default()),
-        checks: vec![check(
-            "removed",
-            true,
-            "exact custody policy removed atomically",
-        )],
-        paths: vec![config_path.display().to_string()],
-        reason_code: None,
-    }
+    provision(global_dir, input_path, apply)
 }
 
 impl CustodySetupReport {
@@ -741,6 +645,7 @@ fn report_for(
         checks: validated.checks.clone(),
         paths: validated.paths.clone(),
         reason_code: reason.map(ToOwned::to_owned),
+        receipt_digest: None,
     }
 }
 
@@ -754,6 +659,7 @@ fn disabled_report(detail: &str) -> CustodySetupReport {
         checks: vec![check("enabled", true, detail)],
         paths: Vec::new(),
         reason_code: None,
+        receipt_digest: None,
     }
 }
 
@@ -767,6 +673,7 @@ fn migration_required_report(detail: &str, policy_digest: Option<String>) -> Cus
         checks: vec![check("migration", false, detail)],
         paths: Vec::new(),
         reason_code: Some("custody-policy-migration-required".to_owned()),
+        receipt_digest: None,
     }
 }
 
@@ -784,6 +691,7 @@ fn refused_report(
         checks,
         paths: Vec::new(),
         reason_code: Some(reason.to_owned()),
+        receipt_digest: None,
     }
 }
 
@@ -836,58 +744,6 @@ fn parse_existing_policy(text: &str) -> Result<Option<RawPolicy>, &'static str> 
                 .map_err(|_| "custody-policy-malformed")
         })
         .transpose()
-}
-
-/// Prove that no in-flight custody operation remains before disabling the
-/// carrier. Terminal WAL rows are intentionally retained for audit; this
-/// read-only check only rejects active/unknown states and never deletes data.
-fn ensure_no_active_custody_state(state_dir: &Path) -> Result<(), &'static str> {
-    let db = state_dir.join("work-items.sqlite3");
-    if !db.exists() {
-        return Ok(());
-    }
-    let connection = Connection::open_with_flags(
-        &db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|_| "custody-state-unavailable")?;
-    let tables = [
-        (
-            "custody_outbox",
-            "state NOT IN ('processed','cancelled','superseded')",
-        ),
-        (
-            "custody_inbox",
-            "state NOT IN ('processed','cancelled','superseded')",
-        ),
-        ("custody_sender_claims", "state = 'active'"),
-        ("custody_inbox_claims", "state = 'active'"),
-        ("custody_controls", "state = 'pending'"),
-        (
-            "custody_successor_rebinds",
-            "state NOT IN ('finalized','aborted')",
-        ),
-    ];
-    for (table, predicate) in tables {
-        let exists: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
-                [table],
-                |row| row.get(0),
-            )
-            .map_err(|_| "custody-state-unavailable")?;
-        if !exists {
-            continue;
-        }
-        let query = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate})");
-        let active: bool = connection
-            .query_row(&query, [], |row| row.get(0))
-            .map_err(|_| "custody-state-unavailable")?;
-        if active {
-            return Err("custody-state-active");
-        }
-    }
-    Ok(())
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

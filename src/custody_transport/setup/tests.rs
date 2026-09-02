@@ -4,7 +4,7 @@ use std::process::Command;
 use super::*;
 
 #[allow(clippy::too_many_lines)]
-fn fixture(root: &Path) -> String {
+pub(super) fn fixture(root: &Path) -> String {
     let identity = root.join("id_ed25519");
     let status = Command::new("ssh-keygen")
         .args(["-q", "-t", "ed25519", "-N", "", "-f"])

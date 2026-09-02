@@ -50,7 +50,7 @@ use policy::CustodyPeer;
 pub(crate) use policy::{CustodyTransportPolicy, load_custody_transport_policy};
 pub(crate) use setup::{
     CustodySetupReport, disable as custody_disable, doctor as custody_doctor,
-    provision as custody_provision,
+    provision_with_state as custody_provision,
 };
 
 const SCHEMA_VERSION: u32 = 1;

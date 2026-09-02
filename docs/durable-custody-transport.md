@@ -160,6 +160,19 @@ control, or successor rebind remains, the command refuses with no write. This
 command never purges WAL history. SSH configuration, keys, and known-hosts
 remain owner-managed and are never deleted by Shipyard.
 
+The apply path first commits an immutable intent that binds the exact policy,
+before/after config bytes, exact current custody table/index/trigger topology,
+and complete custody snapshot. Only then does it publish the config change.
+After exact config and ledger readback, it commits an immutable completion
+receipt and prints its digest. Intents form one monotonic chain: a new intent
+binds the prior completion receipt, supported reprovision of the same policy
+creates a distinct next disable generation, and any unresolved intent blocks
+all provisioning until exact recovery completes. Restarting after interruption
+resumes only that intent; config, history, or schema drift, an uncheckpointed or
+orphan SQLite sidecar, a malformed/replayed receipt, and any ambiguity all
+refuse without erasing history. Dry-run holds a noncreating snapshot barrier
+and never creates writer locks or SQLite sidecars.
+
 ```toml
 [custody_transport]
 enabled = true

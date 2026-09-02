@@ -126,11 +126,19 @@ shipyard --json custody disable --policy-digest <doctor-policy-digest> --apply
 shipyard --json custody doctor
 ```
 
-Disable rereads the exact generation under the writer-domain lease, refuses
-while custody state is active or indeterminate, removes only the matching
-`[custody_transport]` table, preserves unrelated machine configuration and all
-append-only ledger history, and proves the disabled readback. It never deletes
-SSH keys, `authorized_keys`, `known_hosts`, or terminal custody receipts. See
+Disable rereads the exact generation under the exclusive writer-domain lease,
+refuses while custody state is active or indeterminate, commits a durable
+intent before config publication, removes only the matching
+`[custody_transport]` table, and commits an immutable completion receipt only
+after exact config and custody-schema/history readback. Intents are globally
+sequenced and chained to the prior receipt: an unresolved generation blocks all
+provisioning, while an identical supported reprovision creates a distinct next
+disable generation. Re-running after interruption resumes only the pending
+intent; drift, live/orphan SQLite sidecars, custody topology mismatch,
+ambiguity, and malformed or replayed receipts refuse. Dry-run creates no lock
+or SQLite files. Disable preserves unrelated machine configuration and all
+custody history, and never deletes SSH keys, `authorized_keys`, `known_hosts`,
+or terminal custody receipts. See
 [`docs/durable-custody-transport.md`](../../docs/durable-custody-transport.md)
 for the full manifest and host-runbook boundary.
 

@@ -32,7 +32,9 @@ pub(super) fn custody_command<W: Write>(
     }
     let report = match command {
         CustodyCommand::Doctor => custody_doctor(global_dir),
-        CustodyCommand::Provision { input, apply } => custody_provision(global_dir, &input, apply),
+        CustodyCommand::Provision { input, apply } => {
+            custody_provision(global_dir, state_dir, &input, apply)
+        }
         CustodyCommand::Disable {
             policy_digest,
             apply,
@@ -73,6 +75,10 @@ fn render_report<W: Write>(
         writeln!(stdout, "policy digest: {digest}")
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
+    if let Some(digest) = report.receipt_digest.as_deref() {
+        writeln!(stdout, "receipt digest: {digest}")
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
     if !report.paths.is_empty() {
         writeln!(stdout, "paths:").map_err(|error| CliFailure::new(1, error.to_string()))?;
         for path in &report.paths {
@@ -94,4 +100,34 @@ fn render_report<W: Write>(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_report_prints_exact_disable_receipt_digest() {
+        let digest = "a".repeat(64);
+        let report = CustodySetupReport {
+            schema_version: 1,
+            outcome: "disabled".to_owned(),
+            ready: true,
+            policy_digest: Some("b".repeat(64)),
+            local_machine_ref: None,
+            checks: Vec::new(),
+            paths: Vec::new(),
+            reason_code: None,
+            receipt_digest: Some(digest.clone()),
+        };
+        let mut output = Vec::new();
+
+        render_report(&report, false, &mut output).expect("render");
+
+        assert!(
+            String::from_utf8(output)
+                .expect("UTF-8")
+                .contains(&format!("receipt digest: {digest}"))
+        );
+    }
 }
