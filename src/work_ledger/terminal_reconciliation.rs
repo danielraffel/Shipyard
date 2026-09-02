@@ -66,7 +66,7 @@ pub(crate) struct TerminalReconciliationTarget {
     pub(crate) repository: String,
     pub(crate) pull_request: u64,
     pub(crate) exact_head: String,
-    pub(crate) base_ref: String,
+    pub(crate) base_ref: Option<String>,
     pub(crate) phase: String,
     pub(crate) work_generation: u64,
     pub(crate) owner_generation: u64,
@@ -303,20 +303,21 @@ impl WorkLedger {
             .ok_or_else(|| WorkLedgerError::Refused("work generation exhausted".to_owned()))?;
         let now = Utc::now().to_rfc3339();
         let changed = transaction.execute(
-            "UPDATE work_items SET phase = 'terminal', work_generation = work_generation + 1,
-                    updated_at = ?1
-              WHERE id = ?2 AND kind = 'terminal_handoff'
-                AND repo = ?3 AND pr = ?4 AND head_sha = ?5
-                AND base_ref = ?6 AND source_digest = ?7 AND repair_route_ref = ?8
+            "UPDATE work_items SET base_ref = ?1, phase = 'terminal',
+                    work_generation = work_generation + 1, updated_at = ?2
+              WHERE id = ?3 AND kind = 'terminal_handoff'
+                AND repo = ?4 AND pr = ?5 AND head_sha = ?6
+                AND (base_ref = ?1 OR base_ref IS NULL)
+                AND source_digest = ?7 AND repair_route_ref = ?8
                 AND phase = 'dispatching' AND work_generation = ?9
                 AND owner_generation = ?10",
             params![
+                request.base_ref,
                 now,
                 request.work_id,
                 request.repository,
                 request.pull_request,
                 request.head_sha,
-                request.base_ref,
                 request.source_digest,
                 request.route_ref,
                 request.work_generation,
@@ -378,7 +379,7 @@ impl WorkLedger {
                      OR (wake.profile_ref IS NULL AND wake.state IN ('failed', 'uncertain')))
                LEFT JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
               WHERE binding.work_item_id IS NULL AND work.kind = 'terminal_handoff'
-                AND work.phase = 'terminal'
+                AND work.phase = 'terminal' AND work.base_ref IS NOT NULL
               ORDER BY work.id LIMIT ?1",
             )?;
             statement
@@ -993,7 +994,8 @@ fn validate_uncertain_dispatch_authority(
             AND provider_request.kind = 'provider_request'
           WHERE work.id = ?1 AND work.kind = 'terminal_handoff'
             AND work.repo = ?2 AND work.pr = ?3 AND work.head_sha = ?4
-            AND work.base_ref = ?5 AND work.phase = 'dispatching'
+            AND (work.base_ref = ?5 OR work.base_ref IS NULL)
+            AND work.phase = 'dispatching'
             AND work.work_generation = ?6 AND work.owner_generation = ?7
             AND work.repair_route_ref = ?8 AND work.source_digest = ?9
             AND continuation.success_contract_digest = ?14
@@ -1320,7 +1322,13 @@ fn validate_terminal_target_identities(
 ) -> WorkLedgerResult<()> {
     for item in items {
         validate_target(&item.repository, item.pull_request, &item.exact_head)?;
-        if item.base_ref.is_empty() || item.base_ref.len() > 255 {
+        if item
+            .base_ref
+            .as_deref()
+            .map_or(true, |base_ref| {
+                base_ref.is_empty() || base_ref.len() > 255
+            })
+        {
             return Err(WorkLedgerError::Refused(
                 "terminal reconciliation target base is invalid".to_owned(),
             ));
@@ -2115,7 +2123,15 @@ pub(crate) mod tests {
         delivered_at: Option<String>,
     }
 
-    type WorkMutationSnapshot = (String, u64, u64, String, String, String, String);
+    type WorkMutationSnapshot = (
+        String,
+        u64,
+        u64,
+        String,
+        Option<String>,
+        String,
+        String,
+    );
     type EventMutationSnapshot = (
         String,
         u64,
@@ -2723,6 +2739,22 @@ pub(crate) mod tests {
     fn uncertain_dispatch_dry_run_is_zero_write_and_apply_is_replayable() {
         let temp = TempDir::new().expect("temp");
         let (request, ledger) = seed_uncertain_dispatch(temp.path(), false, true);
+        ledger
+            .connect_read_write()
+            .expect("legacy fixture connection")
+            .execute(
+                "UPDATE work_items SET base_ref = NULL WHERE id = ?1",
+                [&request.work_id],
+            )
+            .expect("plant legacy NULL base");
+        let legacy_target = ledger
+            .terminal_reconciliation_target(
+                &request.repository,
+                request.pull_request,
+                &request.head_sha,
+            )
+            .expect("legacy NULL base remains an exact target");
+        assert_eq!(legacy_target.base_ref, None);
         let mut unrelated = native_publication_test_request();
         unrelated.pull_request += 1;
         unrelated.head_sha = "b".repeat(40);
@@ -2758,6 +2790,16 @@ pub(crate) mod tests {
             .finalize_uncertain_dispatch_with_authority(&request, || Ok(()))
             .expect("fenced terminalization");
         assert_eq!(projected.work_generation, request.work_generation + 1);
+        let repaired_base: String = ledger
+            .connect_read_only()
+            .expect("repaired base read")
+            .query_row(
+                "SELECT base_ref FROM work_items WHERE id = ?1",
+                [&request.work_id],
+                |row| row.get(0),
+            )
+            .expect("repaired base");
+        assert_eq!(repaired_base, request.base_ref);
         drop(ledger);
         let ledger = WorkLedger::open_existing(temp.path())
             .expect("restart open")

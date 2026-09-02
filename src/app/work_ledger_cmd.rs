@@ -632,7 +632,13 @@ fn reconcile_terminal_target<W: Write>(
         ));
     }
     let authority = observe_terminal_merge_authority(actions, repo, pr, head)?;
-    if authority.canonical_repository != repo || authority.base_ref != candidate.base_ref {
+    if authority.canonical_repository != repo
+        || candidate
+            .base_ref
+            .as_deref()
+            .is_some_and(|base_ref| authority.base_ref != base_ref)
+        || (candidate.base_ref.is_none() && candidate.phase != "dispatching")
+    {
         return Err(CliFailure::new(
             1,
             "terminal reconciliation repository/base authority disagrees",
