@@ -307,7 +307,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         .and_then(|ledger| ledger.map_or_else(|| Ok(Vec::new()), |ledger| ledger.repo_policies()))
         .unwrap_or_default()
         .into_iter()
-        .map(|policy| policy.repo)
+        .map(|policy| policy.repo.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     for repository in &repos {
         if configured_policy_repositories.contains(repository) {
@@ -2663,8 +2663,11 @@ fn remove_protected_file(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn normalize_repos(mut repos: Vec<String>) -> Vec<String> {
+pub(crate) fn normalize_repos(mut repos: Vec<String>) -> Vec<String> {
     repos.retain(|repo| !repo.is_empty());
+    for repo in &mut repos {
+        repo.make_ascii_lowercase();
+    }
     repos.sort();
     repos.dedup();
     repos
@@ -3567,7 +3570,7 @@ mod tests {
         let repos = resolve_repos(
             temp.path(),
             &[
-                "z/r".to_owned(),
+                "Z/R".to_owned(),
                 "a/r".to_owned(),
                 "z/r".to_owned(),
                 String::new(),
@@ -3575,6 +3578,16 @@ mod tests {
         );
 
         assert_eq!(repos, vec!["a/r".to_owned(), "z/r".to_owned()]);
+    }
+
+    #[test]
+    fn resolve_repos_matches_canonical_repository_policy_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(
+            resolve_repos(temp.path(), &["Generous-Corp/pulp".to_owned()]),
+            vec!["generous-corp/pulp".to_owned()]
+        );
     }
 
     #[test]
