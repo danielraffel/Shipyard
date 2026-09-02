@@ -31,6 +31,12 @@ class VersionSurfaceConfigTests(unittest.TestCase):
             version_bump_check._matches_any("scripts/versioning.json", patterns)
         )
 
+    def test_release_matched_ghapp_wrapper_is_a_cli_release_surface(self) -> None:
+        config = json.loads((ROOT / "scripts/versioning.json").read_text())
+        patterns = config["surfaces"]["cli"]["trigger_paths"]
+
+        self.assertTrue(version_bump_check._matches_any("scripts/ghapp", patterns))
+
     def test_tag_managed_changelog_has_no_pre_tag_version_stub(self) -> None:
         config = json.loads((ROOT / "scripts/versioning.json").read_text())
 
