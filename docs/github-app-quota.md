@@ -256,7 +256,7 @@ audited against the fleet's native `gh` 2.93 and 2.96 binaries:
 | `auth` | `status`, `token` |
 | `issue` | `list`, `view` |
 | `pr` | `checks`, `close`, `create`, `list`, `merge`, `update-branch`, `view` |
-| `release` | `edit`, `list`, `view` |
+| `release` | `edit`, `list`, `upload`, `view` |
 | `repo` | `view` |
 | `run` | `cancel`, `list`, `rerun`, `view`, `watch` |
 | `secret` | `list`, `set` |
@@ -268,6 +268,16 @@ surface in the same grammar table. An unknown command, subcommand, flag,
 missing value, alias, or extension fails before token mint. Extend that table
 only with a routing regression and security review; use ambient native `gh`
 for interactive operator commands outside it.
+
+`release upload` is a deliberately narrower publication surface than native
+`gh`: it requires exactly one explicit `--repo OWNER/REPO`, one exact tag, and
+one or more existing non-symlink regular-file operands. It cannot create or
+delete a release, retarget a tag, or use `--clobber`; an existing same-name
+asset fails closed instead of being overwritten.
+Before token mint, the wrapper opens every source through no-follow directory
+descriptors, copies it into an owner-only staging directory, and rejects any
+source identity change during the copy. Native `gh` receives only those stable
+private snapshots under the original asset basenames.
 
 For an App installed on more than one account, the exact repository slug is the
 routing authority. Do not put `--installation-id` in shared config and do not

@@ -397,6 +397,7 @@ surface|pr|update-branch
 surface|pr|view
 surface|release|edit
 surface|release|list
+surface|release|upload
 surface|release|view
 surface|repo|view
 surface|run|cancel
@@ -959,6 +960,165 @@ if [[ "$repo_selector_count" -gt 1 ]]; then
     echo "ghapp: multiple repository selectors cannot share one installation token" >&2
     exit 1
 fi
+
+# Asset publication is intentionally narrower than native `gh release upload`.
+# Require an explicit installation-routing repository, one exact release tag,
+# and one or more existing regular-file operands. In particular, do not admit
+# native --clobber or any release create/delete/retarget surface through this
+# narrowly privileged path.
+if [[ "${1:-}" == "release" && "${2:-}" == "upload" ]]; then
+    if [[ "$repo_selector_count" != 1 ]]; then
+        echo "ghapp: release upload requires exactly one explicit --repo OWNER/REPO selector" >&2
+        exit 1
+    fi
+    release_upload_repo_pending=0
+    release_upload_options_ended=0
+    release_upload_help=0
+    release_upload_positionals=()
+    for argument in "${@:3}"; do
+        if [[ "$release_upload_repo_pending" == 1 ]]; then
+            release_upload_repo_pending=0
+            continue
+        fi
+        if [[ "$release_upload_options_ended" == 1 ]]; then
+            release_upload_positionals+=("$argument")
+            continue
+        fi
+        case "$argument" in
+            --repo|-R)
+                release_upload_repo_pending=1
+                ;;
+            --repo=*|-R=*|-R?*)
+                ;;
+            --)
+                release_upload_options_ended=1
+                ;;
+            --help)
+                release_upload_help=1
+                ;;
+            *)
+                release_upload_positionals+=("$argument")
+                ;;
+        esac
+    done
+    if [[ "$release_upload_help" == 0 ]]; then
+        if [[ "${#release_upload_positionals[@]}" -lt 2 ]]; then
+            echo "ghapp: release upload requires one exact tag and at least one asset file" >&2
+            exit 1
+        fi
+        release_upload_tag="${release_upload_positionals[0]}"
+        if [[ -z "$release_upload_tag" || "$release_upload_tag" == -* || \
+              "$release_upload_tag" == *$'\n'* || \
+              "$release_upload_tag" == *$'\r'* || "$release_upload_tag" == *://* ]] || \
+           ! PATH="$trusted_path" /usr/bin/git check-ref-format \
+               "refs/tags/$release_upload_tag" >/dev/null 2>&1; then
+            echo "ghapp: release upload tag is malformed or ambiguous" >&2
+            exit 1
+        fi
+        release_upload_stage_dir="$(/usr/bin/mktemp -d \
+            /tmp/shipyard-ghapp-release-upload.XXXXXX)"
+        /bin/chmod 700 "$release_upload_stage_dir"
+        cleanup_release_upload_stage() {
+            if [[ -n "${release_upload_stage_dir:-}" && \
+                  "$release_upload_stage_dir" == /tmp/shipyard-ghapp-release-upload.* && \
+                  -d "$release_upload_stage_dir" && ! -L "$release_upload_stage_dir" ]]; then
+                /bin/rm -rf -- "$release_upload_stage_dir"
+            fi
+        }
+        trap cleanup_release_upload_stage EXIT
+        release_upload_staged_assets=()
+        for release_upload_asset in "${release_upload_positionals[@]:1}"; do
+            release_upload_staged_asset="$(/usr/bin/env \
+                -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+                "$python_binary" -I - "$release_upload_asset" \
+                "$release_upload_stage_dir" <<'PY'
+import os
+import stat
+import sys
+
+source = os.path.abspath(sys.argv[1])
+destination_dir = sys.argv[2]
+if sys.platform == "darwin":
+    for alias, canonical in (("/var", "/private/var"), ("/tmp", "/private/tmp")):
+        if (
+            (source == alias or source.startswith(alias + os.sep))
+            and os.path.islink(alias)
+            and os.path.realpath(alias) == canonical
+        ):
+            source = canonical + source[len(alias):]
+            break
+parent, name = os.path.split(source)
+if not name or name in {".", ".."} or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+    raise SystemExit("ghapp: release upload asset name is malformed")
+no_follow = getattr(os, "O_NOFOLLOW", None)
+directory = getattr(os, "O_DIRECTORY", None)
+if no_follow is None or directory is None:
+    raise SystemExit("ghapp: no-follow asset staging is unsupported")
+
+parent_fd = os.open("/", os.O_RDONLY | directory)
+source_fd = None
+destination_fd = None
+destination = os.path.join(destination_dir, name)
+try:
+    for component in parent.split(os.sep)[1:]:
+        if component:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | directory | no_follow,
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = next_fd
+    source_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_NONBLOCK | no_follow,
+        dir_fd=parent_fd,
+    )
+    before = os.fstat(source_fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise SystemExit(
+            "ghapp: release upload asset must be a non-symlink regular file"
+        )
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow,
+        0o600,
+    )
+    while True:
+        chunk = os.read(source_fd, 1024 * 1024)
+        if not chunk:
+            break
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_fd, view)
+            view = view[written:]
+    os.fsync(destination_fd)
+    after = os.fstat(source_fd)
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+        raise SystemExit("ghapp: release upload asset changed while staging")
+except (OSError, ValueError) as error:
+    raise SystemExit(f"ghapp: release upload asset staging failed: {error}")
+finally:
+    for descriptor in (destination_fd, source_fd, parent_fd):
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+sys.stdout.write(destination)
+PY
+            )" || exit 1
+            release_upload_staged_assets+=("$release_upload_staged_asset")
+        done
+        release_upload_canonical_tag="$release_upload_tag"
+    fi
+    unset release_upload_repo_pending release_upload_options_ended
+    unset release_upload_help release_upload_tag release_upload_asset
+    unset release_upload_staged_asset
+    unset release_upload_positionals
+fi
 if [[ "$url_repo_routed" == 1 && "$repo_selector_count" -gt 0 ]]; then
     echo "ghapp: URL targets cannot be combined with a repository selector" >&2
     exit 1
@@ -1206,6 +1366,13 @@ fi
 PATH="$trusted_path" "$close_guard" "${guard_arguments[@]}" || exit 1
 if [[ -x "$guards/queue-removal-guard" ]]; then
     PATH="$trusted_path" "$guards/queue-removal-guard" "$@" || exit 1
+fi
+
+if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
+      -n "${release_upload_stage_dir:-}" ]]; then
+    "$gh_binary" release upload "$release_upload_canonical_tag" \
+        "${release_upload_staged_assets[@]}" --repo "$repo"
+    exit 0
 fi
 
 exec "$gh_binary" "$@"
