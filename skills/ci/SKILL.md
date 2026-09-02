@@ -406,6 +406,12 @@ their `GHAPP_REAL_GH`/merge probe to the wrapper's selected native binary, and
 dispatch the PR-close guard for every command so its REST/GraphQL/issue aliases
 cannot bypass inspection.
 
+The bounded App-authenticated publication exception is
+`ghapp release upload <tag> <files>... --repo OWNER/REPO`. It accepts only an
+existing release, stable private snapshots of non-symlink regular files, and
+an explicit repository; `--clobber`, lifecycle creation/deletion, and tag
+retargeting remain outside the privileged grammar.
+
 ## Supervised-Push Signal (`SHIPYARD_PR_RUNNING=1`)
 
 Every `git` / `gh` subprocess spawned by `shipyard pr` / `ship` /
