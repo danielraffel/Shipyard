@@ -1024,6 +1024,170 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertIn("--repo danielraffel/Shipyard", helper_args)
         self.assertNotIn("--repo other/repo", helper_args)
 
+    def test_release_upload_allows_exact_existing_assets(self) -> None:
+        package = self.root / "Forge Sequencer.pkg"
+        checksum = self.root / "Forge Sequencer.pkg.sha256"
+        package.write_bytes(b"pkg fixture")
+        checksum.write_text("fixture checksum\n", encoding="utf-8")
+
+        result = self.run_wrapper(
+            "release",
+            "upload",
+            "v0.1.0",
+            str(package),
+            str(checksum),
+            "--repo",
+            "Generous-Corp/forge-sequencer",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "--repo Generous-Corp/forge-sequencer", self.helper_log.read_text()
+        )
+        gh_arguments = self.gh_log.read_text().strip()
+        self.assertRegex(
+            gh_arguments,
+            r"^release upload v0\.1\.0 "
+            r"/tmp/shipyard-ghapp-release-upload\.[^/]+/Forge Sequencer\.pkg "
+            r"/tmp/shipyard-ghapp-release-upload\.[^/]+/Forge Sequencer\.pkg\.sha256 "
+            r"--repo Generous-Corp/forge-sequencer$",
+        )
+        self.assertNotIn(str(package), gh_arguments)
+        self.assertNotIn(str(checksum), gh_arguments)
+
+    def test_release_upload_rejects_clobber_before_token_mint(self) -> None:
+        package = self.root / "sequencer.pkg"
+        package.write_bytes(b"pkg fixture")
+
+        result = self.run_wrapper(
+            "release",
+            "upload",
+            "v0.1.0",
+            str(package),
+            "--clobber",
+            "--repo",
+            "Generous-Corp/forge-sequencer",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside privileged grammar", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_release_upload_allows_native_help_with_explicit_repository(self) -> None:
+        result = self.run_wrapper(
+            "release",
+            "upload",
+            "--help",
+            "--repo",
+            "Generous-Corp/forge-sequencer",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.gh_log.read_text().strip(),
+            "release upload --help --repo Generous-Corp/forge-sequencer",
+        )
+
+    def test_release_upload_requires_explicit_repository_before_token_mint(self) -> None:
+        package = self.root / "sequencer.pkg"
+        package.write_bytes(b"pkg fixture")
+        self.environment["GH_REPO"] = "Generous-Corp/forge-sequencer"
+
+        result = self.run_wrapper(
+            "release", "upload", "v0.1.0", str(package)
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires exactly one explicit --repo", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_release_upload_rejects_missing_or_ambiguous_operands(self) -> None:
+        package = self.root / "sequencer.pkg"
+        package.write_bytes(b"pkg fixture")
+        cases = (
+            ("v0.1.0",),
+            ("https://github.com/acme/repo/releases/tag/v0.1.0", str(package)),
+            ("bad tag", str(package)),
+            ("v0.1.0", str(self.root / "missing.pkg")),
+        )
+        for operands in cases:
+            with self.subTest(operands=operands):
+                self.helper_log.unlink(missing_ok=True)
+                self.gh_log.unlink(missing_ok=True)
+                result = self.run_wrapper(
+                    "release",
+                    "upload",
+                    *operands,
+                    "--repo",
+                    "Generous-Corp/forge-sequencer",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.helper_log.exists())
+                self.assertFalse(self.gh_log.exists())
+
+    def test_release_upload_rejects_symlink_asset_before_token_mint(self) -> None:
+        package = self.root / "sequencer.pkg"
+        package.write_bytes(b"pkg fixture")
+        linked_package = self.root / "linked.pkg"
+        linked_package.symlink_to(package)
+
+        result = self.run_wrapper(
+            "release",
+            "upload",
+            "v0.1.0",
+            str(linked_package),
+            "--repo",
+            "Generous-Corp/forge-sequencer",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("asset staging failed", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_release_upload_rejects_fifo_without_blocking(self) -> None:
+        fifo = self.root / "sequencer.pkg"
+        os.mkfifo(fifo)
+
+        result = self.run_wrapper(
+            "release",
+            "upload",
+            "v0.1.0",
+            str(fifo),
+            "--repo",
+            "Generous-Corp/forge-sequencer",
+            timeout=2,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-symlink regular file", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_release_upload_does_not_admit_release_lifecycle_broadening(self) -> None:
+        package = self.root / "sequencer.pkg"
+        package.write_bytes(b"pkg fixture")
+        cases = (
+            ("release", "create", "v0.1.0", str(package)),
+            ("release", "delete", "v0.1.0"),
+            ("release", "upload", "v0.1.0", str(package), "--tag", "v0.2.0"),
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                self.helper_log.unlink(missing_ok=True)
+                self.gh_log.unlink(missing_ok=True)
+                result = self.run_wrapper(
+                    *arguments,
+                    "--repo",
+                    "Generous-Corp/forge-sequencer",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("outside privileged grammar", result.stderr)
+                self.assertFalse(self.helper_log.exists())
+                self.assertFalse(self.gh_log.exists())
+
     def test_untrusted_repo_host_fails_before_token_mint(self) -> None:
         result = self.run_wrapper(
             "pr", "view", "7", "--repo", "git.example.com/acme/widgets"
@@ -1540,6 +1704,7 @@ class GhappWrapperTests(unittest.TestCase):
             ("issue", "view", "7", "--comments", "--repo", "owner/repo"),
             ("pr", "create", "--fill", "--repo", "owner/repo"),
             ("release", "edit", "v1", "--draft", "--repo", "owner/repo"),
+            ("release", "upload", "v1", __file__, "--repo", "owner/repo"),
             ("repo", "view", "--web", "--repo", "owner/repo"),
             ("run", "list", "--all", "--repo", "owner/repo"),
             ("secret", "list", "--user", "--repo", "owner/repo"),

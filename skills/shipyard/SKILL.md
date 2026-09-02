@@ -701,6 +701,12 @@ Shipyard while the audited `shipyard-v1` CLI surface remains available to
 tartci. Remove the old fixed installation id. Missing repo provenance fails
 closed. The privileged wrapper is not a
 general native-`gh` drop-in, and unknown commands or flags fail before minting.
+The one bounded asset-publication exception is `ghapp release upload`: require
+an explicit exact repository, tag, and existing non-symlink regular files. It
+does not admit `--clobber`, release creation/deletion, or tag retargeting.
+The wrapper snapshots each operand through no-follow descriptors into a private
+staging directory before token mint; native `gh` must never reopen the original
+workspace path.
 The wrapper/helper must resolve trusted Python, `openssl`, and native `gh` through
 absolute paths, preserve the installed merge/queue/close guards, and never put
 the token in process argv. Guards that query GitHub must receive the same
