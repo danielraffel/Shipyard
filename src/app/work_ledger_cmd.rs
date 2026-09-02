@@ -16,17 +16,18 @@ use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
 use crate::work_ledger::{
     AgentReturnExpectation, CustodyStatus, ExactProtectedProfileResolver, FreshAgentLaunchProfile,
-    NativePublicationReport, RepoPolicy, TerminalReconciliationRequest, WorkLedger,
-    WorkLedgerError, absent_status, apply_legacy_snapshot, immutable_legacy_status,
-    local_work_inventory, plan_legacy_snapshot, validate_repo_policy,
+    NativePublicationReport, RepoPolicy, TerminalReconciliationDisposition,
+    TerminalReconciliationRequest, WorkLedger, WorkLedgerError, absent_status,
+    apply_legacy_snapshot, immutable_legacy_status, local_work_inventory, plan_legacy_snapshot,
+    validate_repo_policy,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 
 use super::CliFailure;
 use super::cli::{OwnershipLeaseCommand, WorkLedgerCommand, WorkLedgerPolicyCommand};
 use super::merge_steward_cmd::{
-    LaunchProfileV1, decode_protected_launch_profile, native_publication_request,
-    observe_terminal_merge_authority,
+    LaunchProfileV1, TerminalGitHubAuthority, decode_protected_launch_profile,
+    native_publication_request, observe_terminal_github_authority,
 };
 
 const MAX_AGENT_RECEIPT_BYTES: u64 = 64 * 1024;
@@ -631,12 +632,55 @@ fn reconcile_terminal_target<W: Write>(
             "terminal reconciliation launch profile target disagrees",
         ));
     }
-    let authority = observe_terminal_merge_authority(actions, repo, pr, head)?;
-    if authority.canonical_repository != repo
+    let authority = observe_terminal_github_authority(actions, repo, pr, head)?;
+    let (
+        disposition,
+        installation_id,
+        repository_provider,
+        repository_id,
+        canonical_repository,
+        pull_request_node_id,
+        pull_request,
+        head_sha,
+        base_ref,
+        merge_sha,
+        merged_at,
+        closed_at,
+    ) = match &authority {
+        TerminalGitHubAuthority::Merged(authority) => (
+            TerminalReconciliationDisposition::Merged,
+            authority.installation_id,
+            authority.repository_provider.clone(),
+            authority.repository_id.clone(),
+            authority.canonical_repository.clone(),
+            authority.pull_request_node_id.clone(),
+            authority.pull_request,
+            authority.head_sha.clone(),
+            authority.base_ref.clone(),
+            Some(authority.merge_sha.clone()),
+            Some(authority.merged_at.clone()),
+            None,
+        ),
+        TerminalGitHubAuthority::ClosedUnmerged(authority) => (
+            TerminalReconciliationDisposition::ClosedUnmerged,
+            authority.installation_id,
+            authority.repository_provider.clone(),
+            authority.repository_id.clone(),
+            authority.canonical_repository.clone(),
+            authority.pull_request_node_id.clone(),
+            authority.pull_request,
+            authority.head_sha.clone(),
+            authority.base_ref.clone(),
+            None,
+            None,
+            Some(authority.closed_at.clone()),
+        ),
+    };
+    if canonical_repository != repo
         || candidate
             .base_ref
             .as_deref()
-            .is_some_and(|base_ref| authority.base_ref != base_ref)
+            .is_some_and(|candidate_base| base_ref != candidate_base)
         || (candidate.base_ref.is_none() && candidate.phase != "dispatching")
     {
         return Err(CliFailure::new(
@@ -645,16 +689,18 @@ fn reconcile_terminal_target<W: Write>(
         ));
     }
     let mut request = TerminalReconciliationRequest {
-        repository_provider: authority.repository_provider.clone(),
-        repository_id: authority.repository_id.clone(),
-        repository: authority.canonical_repository.clone(),
-        pull_request_node_id: authority.pull_request_node_id.clone(),
-        pull_request: authority.pull_request,
-        head_sha: authority.head_sha.clone(),
-        base_ref: authority.base_ref.clone(),
-        merge_sha: authority.merge_sha.clone(),
-        merged_at: authority.merged_at.clone(),
-        github_installation_id: authority.installation_id,
+        disposition,
+        repository_provider,
+        repository_id,
+        repository: canonical_repository,
+        pull_request_node_id,
+        pull_request,
+        head_sha,
+        base_ref,
+        merge_sha,
+        merged_at,
+        closed_at,
+        github_installation_id: installation_id,
         work_id: candidate.work_id.clone(),
         work_generation: candidate.work_generation,
         owner_generation: candidate.owner_generation,
@@ -676,7 +722,7 @@ fn reconcile_terminal_target<W: Write>(
         let expected_authority = authority.clone();
         request = ledger
             .finalize_uncertain_dispatch_with_authority(&request, || {
-                let observed = observe_terminal_merge_authority(actions, repo, pr, head)
+                let observed = observe_terminal_github_authority(actions, repo, pr, head)
                     .map_err(|error| WorkLedgerError::Refused(error.message().to_owned()))?;
                 if observed != expected_authority {
                     return Err(WorkLedgerError::Refused(
@@ -718,7 +764,10 @@ fn reconcile_terminal_target<W: Write>(
             )
             .map_err(failure)?;
             writeln!(stdout, "Head: {}", report.exact_head).map_err(failure)?;
-            writeln!(stdout, "Merge: {}", report.merge_sha).map_err(failure)?;
+            writeln!(stdout, "Disposition: {}", report.disposition.as_str()).map_err(failure)?;
+            if let Some(merge_sha) = report.merge_sha.as_deref() {
+                writeln!(stdout, "Merge: {merge_sha}").map_err(failure)?;
+            }
             writeln!(stdout, "Receipt digest: {}", report.receipt_sha256).map_err(failure)?;
             writeln!(stdout, "Plan digest: {}", report.plan_sha256).map_err(failure)?;
         }
@@ -729,7 +778,7 @@ fn reconcile_terminal_target<W: Write>(
     let expected_authority = authority.clone();
     let report =
         WorkLedger::plan_or_apply_terminal_reconciliation(state_dir, &request, apply, || {
-            let observed = observe_terminal_merge_authority(actions, repo, pr, head)
+            let observed = observe_terminal_github_authority(actions, repo, pr, head)
                 .map_err(|error| WorkLedgerError::Refused(error.message().to_owned()))?;
             if observed != expected_authority {
                 return Err(WorkLedgerError::Refused(
@@ -758,7 +807,10 @@ fn reconcile_terminal_target<W: Write>(
         )
         .map_err(failure)?;
         writeln!(stdout, "Head: {}", report.exact_head).map_err(failure)?;
-        writeln!(stdout, "Merge: {}", report.merge_sha).map_err(failure)?;
+        writeln!(stdout, "Disposition: {}", report.disposition.as_str()).map_err(failure)?;
+        if let Some(merge_sha) = report.merge_sha.as_deref() {
+            writeln!(stdout, "Merge: {merge_sha}").map_err(failure)?;
+        }
         writeln!(stdout, "Receipt digest: {}", report.receipt_sha256).map_err(failure)?;
         writeln!(stdout, "Plan digest: {}", report.plan_sha256).map_err(failure)?;
     }

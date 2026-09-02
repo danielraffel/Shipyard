@@ -457,8 +457,8 @@ pub(crate) use handoff::steward_handoff_command_without_ambient;
 #[cfg(unix)]
 pub(crate) use handoff::verify_native_repository_identity;
 pub(crate) use handoff::{
-    StewardHandoffArgs, native_publication_request, observe_terminal_merge_authority,
-    steward_handoff_command, steward_handoff_transfer_report,
+    StewardHandoffArgs, TerminalGitHubAuthority, native_publication_request,
+    observe_terminal_github_authority, steward_handoff_command, steward_handoff_transfer_report,
 };
 mod launch_profile;
 #[cfg(all(test, unix))]

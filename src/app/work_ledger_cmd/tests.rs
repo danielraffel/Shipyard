@@ -213,8 +213,8 @@ fn inventory_command_emits_bounded_empty_json_without_creating_state() {
 }
 
 #[cfg(unix)]
-#[test]
-fn terminal_reconciliation_cli_apply_is_reachable_as_exact_replay() {
+#[allow(clippy::too_many_lines)] // One end-to-end CLI fixture for both terminal dispositions.
+fn run_terminal_reconciliation_cli_case(closed_unmerged: bool) {
     let temp = TempDir::new().expect("temp");
     let state = temp.path().join("state");
     let mut publication = crate::work_ledger::native_publication_test_request();
@@ -222,21 +222,40 @@ fn terminal_reconciliation_cli_apply_is_reachable_as_exact_replay() {
         crate::app::merge_steward_cmd::terminal_reconciliation_test_profile_bytes(&publication);
     publication.profile_digest = hex::encode(Sha256::digest(&profile_bytes));
     publication.protected_profile_bytes = profile_bytes;
-    let (request, _ledger) =
+    let (mut request, _ledger) =
         crate::work_ledger::terminal_reconciliation_test_fixture_with_request(&state, publication);
+    if closed_unmerged {
+        request.disposition = crate::work_ledger::TerminalReconciliationDisposition::ClosedUnmerged;
+        request.merge_sha = None;
+        request.merged_at = None;
+        request.closed_at = Some("2026-09-01T13:00:00Z".to_owned());
+    }
     let repository_json = serde_json::json!({
         "id": request.repository_id,
         "nameWithOwner": request.repository,
     })
     .to_string();
-    let pull_json = serde_json::json!({
-        "id": request.pull_request_node_id,
-        "state": "MERGED",
-        "headRefOid": request.head_sha,
-        "baseRefName": request.base_ref,
-        "mergeCommit": {"oid": request.merge_sha},
-        "mergedAt": request.merged_at,
-    })
+    let pull_json = if closed_unmerged {
+        serde_json::json!({
+            "id": request.pull_request_node_id,
+            "state": "CLOSED",
+            "headRefOid": request.head_sha,
+            "baseRefName": request.base_ref,
+            "mergeCommit": null,
+            "mergedAt": null,
+            "closedAt": request.closed_at,
+        })
+    } else {
+        serde_json::json!({
+            "id": request.pull_request_node_id,
+            "state": "MERGED",
+            "headRefOid": request.head_sha,
+            "baseRefName": request.base_ref,
+            "mergeCommit": {"oid": request.merge_sha},
+            "mergedAt": request.merged_at,
+            "closedAt": request.merged_at,
+        })
+    }
     .to_string();
     let source = format!(
         r#"
@@ -301,6 +320,13 @@ fn main() {{
     let replay: Value = serde_json::from_slice(&replay_output).expect("replay JSON");
     assert_eq!(replay["applied"], false);
     assert_eq!(replay["replay"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_reconciliation_cli_apply_is_reachable_as_exact_replay() {
+    run_terminal_reconciliation_cli_case(false);
+    run_terminal_reconciliation_cli_case(true);
 }
 
 #[cfg(unix)]

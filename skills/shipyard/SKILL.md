@@ -1493,11 +1493,15 @@ targets from clean publication precursors, managed-unbound rows, and blocked
 rows; bounded related-state counts and explicit blockers prevent incomplete
 rows from disappearing or becoming repair authority. Select
 one exact repository/PR/head for a dry-run; add `--apply` only after reviewing
-the authenticated merged-head/base proof. An exact dispatching row is eligible
+the authenticated terminal-head/base proof. Terminal authority is typed: a
+merged PR requires its exact merge commit and merge timestamp, while a PR
+closed without merging requires an exact close timestamp and the absence of
+merge evidence. The latter is recorded as `closed_unmerged`; it never mints or
+implies merge authority. An exact dispatching row is eligible
 only when one exact wake/delivery is durably uncertain and its activation epoch
 is released; dry-run projects the terminal receipt without writing. Apply
-re-reads GitHub inside the writer transaction, atomically terminalizes that
-fenced row with evidence bound to the GitHub/wake/delivery identities, then
+re-reads the same typed GitHub outcome inside the writer transaction, atomically
+terminalizes that fenced row with evidence bound to the GitHub/wake/delivery identities, then
 continues the ordinary terminal projection repair. Apply may add only the immutable provider receipt, projection
 binding, its schema-required inert ownership-root identity, and the
 dispatch-to-terminal and terminal-to-terminal audit events. The root is not ownership authority: apply

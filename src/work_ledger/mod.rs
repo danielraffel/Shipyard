@@ -179,9 +179,11 @@ use storage::{
     reconstruct_authentic_v10_schema_for_test, reconstruct_authentic_v11_schema_for_test,
     reconstruct_authentic_v12_schema_for_test,
 };
-pub(crate) use terminal_reconciliation::TerminalReconciliationRequest;
 #[cfg(all(test, unix))]
 pub(crate) use terminal_reconciliation::tests::seed_unbound_terminal_with_request as terminal_reconciliation_test_fixture_with_request;
+pub(crate) use terminal_reconciliation::{
+    TerminalReconciliationDisposition, TerminalReconciliationRequest,
+};
 #[cfg(test)]
 pub(crate) use tests::ownership_lease_fixture;
 

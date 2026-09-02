@@ -1325,15 +1325,110 @@ pub(crate) struct TerminalMergeAuthority {
     pub(crate) merged_at: String,
 }
 
-/// Observe immutable terminal PR authority without consulting mutable handoff prose.
-pub(crate) fn observe_terminal_merge_authority(
+/// Exact authority for a PR closed without merging. This is intentionally a
+/// separate type so callers cannot mistake closure evidence for merge proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClosedUnmergedAuthority {
+    pub(crate) installation_id: u64,
+    pub(crate) repository_provider: String,
+    pub(crate) repository_id: String,
+    pub(crate) canonical_repository: String,
+    pub(crate) pull_request_node_id: String,
+    pub(crate) pull_request: u64,
+    pub(crate) head_sha: String,
+    pub(crate) base_ref: String,
+    pub(crate) closed_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalGitHubAuthority {
+    Merged(TerminalMergeAuthority),
+    ClosedUnmerged(ClosedUnmergedAuthority),
+}
+
+pub(crate) fn closed_unmerged_authority_from_snapshots(
+    installation_id: u64,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    repository: &Value,
+    snapshot: &Value,
+) -> Result<ClosedUnmergedAuthority, CliFailure> {
+    if installation_id == 0 || pr == 0 || !is_full_sha(head) || head != head.to_ascii_lowercase() {
+        return Err(CliFailure::new(1, "terminal merge target is invalid"));
+    }
+    let repository_id = repository
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty() && v.len() <= 512)
+        .ok_or_else(|| {
+            CliFailure::new(1, "terminal reconciliation repository ID is unavailable")
+        })?;
+    let canonical_repository = repository
+        .get("nameWithOwner")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .filter(|v| *v == repo)
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "terminal reconciliation canonical repository is unavailable or changed",
+            )
+        })?;
+    let observed_head = snapshot
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .filter(|v| is_full_sha(v));
+    let base_ref = snapshot
+        .get("baseRefName")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty() && v.len() <= 255);
+    let node = snapshot
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty() && v.len() <= 512);
+    let closed_at = snapshot
+        .get("closedAt")
+        .and_then(Value::as_str)
+        .filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok());
+    if snapshot.get("state").and_then(Value::as_str) != Some("CLOSED")
+        || snapshot.get("mergeCommit").is_some_and(|v| !v.is_null())
+        || snapshot.get("mergedAt").is_some_and(|v| !v.is_null())
+        || observed_head != Some(head)
+        || base_ref.is_none()
+        || node.is_none()
+        || closed_at.is_none()
+    {
+        return Err(CliFailure::new(
+            1,
+            "terminal reconciliation closed-unmerged authority is incomplete or changed",
+        ));
+    }
+    Ok(ClosedUnmergedAuthority {
+        installation_id,
+        repository_provider: "github.com".to_owned(),
+        repository_id: repository_id.to_owned(),
+        canonical_repository,
+        pull_request_node_id: node.expect("checked").to_owned(),
+        pull_request: pr,
+        head_sha: head.to_owned(),
+        base_ref: base_ref.expect("checked").to_owned(),
+        closed_at: closed_at.expect("checked").to_owned(),
+    })
+}
+
+/// Observe exact terminal PR authority without conflating a closed PR with a merge.
+pub(crate) fn observe_terminal_github_authority(
     actions: &GitHubActions,
     repo: &str,
     pr: u64,
     head: &str,
-) -> Result<TerminalMergeAuthority, CliFailure> {
+) -> Result<TerminalGitHubAuthority, CliFailure> {
     if pr == 0 || !is_full_sha(head) || head != head.to_ascii_lowercase() {
-        return Err(CliFailure::new(1, "terminal merge target is invalid"));
+        return Err(CliFailure::new(
+            1,
+            "terminal reconciliation target is invalid",
+        ));
     }
     let installation_id = actions
         .app_installation_id()
@@ -1359,12 +1454,35 @@ pub(crate) fn observe_terminal_merge_authority(
             "--repo".into(),
             repo.to_owned(),
             "--json".into(),
-            "id,state,headRefOid,baseRefName,mergeCommit,mergedAt".into(),
+            "id,state,headRefOid,baseRefName,mergeCommit,mergedAt,closedAt".into(),
         ],
-        "observe terminal reconciliation merge authority",
+        "observe terminal reconciliation authority",
     )
     .map_err(|error| CliFailure::new(1, error))?;
-    terminal_merge_authority_from_snapshots(installation_id, repo, pr, head, &repository, &snapshot)
+    match snapshot.get("state").and_then(Value::as_str) {
+        Some("MERGED") => terminal_merge_authority_from_snapshots(
+            installation_id,
+            repo,
+            pr,
+            head,
+            &repository,
+            &snapshot,
+        )
+        .map(TerminalGitHubAuthority::Merged),
+        Some("CLOSED") => closed_unmerged_authority_from_snapshots(
+            installation_id,
+            repo,
+            pr,
+            head,
+            &repository,
+            &snapshot,
+        )
+        .map(TerminalGitHubAuthority::ClosedUnmerged),
+        _ => Err(CliFailure::new(
+            1,
+            "terminal reconciliation authority is not terminal or changed",
+        )),
+    }
 }
 
 fn terminal_merge_authority_from_snapshots(
@@ -3413,6 +3531,31 @@ mod tests {
         )
         .expect_err("canonical repository movement must refuse");
         assert!(repository_error.message().contains("canonical repository"));
+
+        let closed = serde_json::json!({"id":"PR_test_terminal","state":"CLOSED","headRefOid":head,"baseRefName":"main","mergeCommit":null,"mergedAt":null,"closedAt":"2026-09-01T13:00:00Z"});
+        let closed_auth = closed_unmerged_authority_from_snapshots(
+            42,
+            "owner/repo",
+            74,
+            &head,
+            &repository,
+            &closed,
+        )
+        .expect("closed-unmerged authority");
+        assert_eq!(closed_auth.closed_at, "2026-09-01T13:00:00Z");
+        let mut bad = closed.clone();
+        bad["mergeCommit"] = serde_json::json!({"oid":"c".repeat(40)});
+        assert!(
+            closed_unmerged_authority_from_snapshots(
+                42,
+                "owner/repo",
+                74,
+                &head,
+                &repository,
+                &bad,
+            )
+            .is_err()
+        );
 
         for (label, key, value) in [
             ("base", "baseRefName", Value::Null),
