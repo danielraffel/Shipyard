@@ -1325,9 +1325,7 @@ fn validate_terminal_target_identities(
         if item
             .base_ref
             .as_deref()
-            .map_or(true, |base_ref| {
-                base_ref.is_empty() || base_ref.len() > 255
-            })
+            .map_or(true, |base_ref| base_ref.is_empty() || base_ref.len() > 255)
         {
             return Err(WorkLedgerError::Refused(
                 "terminal reconciliation target base is invalid".to_owned(),
@@ -2123,15 +2121,7 @@ pub(crate) mod tests {
         delivered_at: Option<String>,
     }
 
-    type WorkMutationSnapshot = (
-        String,
-        u64,
-        u64,
-        String,
-        Option<String>,
-        String,
-        String,
-    );
+    type WorkMutationSnapshot = (String, u64, u64, String, Option<String>, String, String);
     type EventMutationSnapshot = (
         String,
         u64,
