@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01530"></a>
+## [0.153.0] - 2026-09-02
+
+- fix(work-ledger): reconcile closed unmerged dispatches ([#547](https://github.com/danielraffel/Shipyard/pull/547))
+
 <a id="v01522"></a>
 ## [0.152.2] - 2026-09-02
 
@@ -1325,6 +1330,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.153.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.153.0
 [0.152.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.152.2
 [0.152.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.152.1
 [0.152.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.152.0
