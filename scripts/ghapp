@@ -1007,7 +1007,8 @@ if [[ "${1:-}" == "release" && "${2:-}" == "upload" ]]; then
             exit 1
         fi
         release_upload_tag="${release_upload_positionals[0]}"
-        if [[ -z "$release_upload_tag" || "$release_upload_tag" == *$'\n'* || \
+        if [[ -z "$release_upload_tag" || "$release_upload_tag" == -* || \
+              "$release_upload_tag" == *$'\n'* || \
               "$release_upload_tag" == *$'\r'* || "$release_upload_tag" == *://* ]] || \
            ! PATH="$trusted_path" /usr/bin/git check-ref-format \
                "refs/tags/$release_upload_tag" >/dev/null 2>&1; then

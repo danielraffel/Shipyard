@@ -1074,6 +1074,25 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertFalse(self.helper_log.exists())
         self.assertFalse(self.gh_log.exists())
 
+    def test_release_upload_rejects_option_injection_through_tag(self) -> None:
+        package = self.root / "sequencer.pkg"
+        package.write_bytes(b"pkg fixture")
+
+        result = self.run_wrapper(
+            "release",
+            "upload",
+            "--repo",
+            "Generous-Corp/forge-sequencer",
+            "--",
+            "--clobber",
+            str(package),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tag is malformed or ambiguous", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
     def test_release_upload_allows_native_help_with_explicit_repository(self) -> None:
         result = self.run_wrapper(
             "release",
