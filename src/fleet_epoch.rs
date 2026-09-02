@@ -179,6 +179,7 @@ fn read_applied_epoch(receipts_dir: &Path, machine: &str) -> Result<Option<u64>,
         // A missing receipts directory means nothing has ever applied here.
         return Ok(None);
     };
+    let mut applied = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
@@ -201,9 +202,9 @@ fn read_applied_epoch(receipts_dir: &Path, machine: &str) -> Result<Option<u64>,
             .get("epoch")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| format!("receipt {} declares no integer epoch", path.display()))?;
-        return Ok(Some(epoch));
+        applied.get_or_insert(epoch);
     }
-    Ok(None)
+    Ok(applied)
 }
 
 #[cfg(test)]
@@ -411,11 +412,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unrelated_hosts_malformed_receipt_does_not_block_this_host() {
-        // Reading every file in the directory must not let a sibling host's
-        // broken receipt take this host down with it... but it also must not
-        // be silently skipped. Current behavior: a malformed receipt anywhere
-        // is unobservable, which is the conservative direction.
+    fn an_unrelated_hosts_malformed_receipt_blocks_deterministically() {
+        // Reading every file in the directory must not silently skip a sibling
+        // host's malformed receipt. Directory iteration order must not decide
+        // whether the same receipt set is observable.
         let sandbox = TempDir::new().expect("tempdir");
         seed_manifest(sandbox.path(), "epoch = 7\n");
         seed_receipt(sandbox.path(), "macstudio", "Daniels-Mac-Studio", 7);

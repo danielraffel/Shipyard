@@ -41,6 +41,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
+| Experimental authority schema v5 | No operational command exists. Official builds are v4-only; an explicit source test build may validate the reserved request shape only to return `ExperimentalAuthorityRefused`, with no writer, queue mutation, outcome, backend, execution, or authority. |
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
 | Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |
 | Shadow-plan changed-surface tests for an exact PR head | `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n> --target <name>` (base-owned literal tests only; full suite remains authoritative; identity mismatch hard-fails, ambiguity falls back full) |

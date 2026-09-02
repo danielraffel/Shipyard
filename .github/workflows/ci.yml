@@ -96,6 +96,13 @@ jobs:
           RUST_MIN_STACK: 8388608
         run: cargo test --all-targets --locked --features ci-test-home
 
+      - name: Run experimental authority refusal tests
+        if: runner.os == 'Linux'
+        env:
+          SHIPYARD_TEST_HOME: ${{ runner.temp }}
+          RUST_MIN_STACK: 8388608
+        run: cargo test --all-targets --locked --features ci-test-home,experimental-authority-v5
+
       - name: Run clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 

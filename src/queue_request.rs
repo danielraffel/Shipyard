@@ -80,6 +80,10 @@ pub enum QueueRequestError {
         /// Observed schema version.
         version: u32,
     },
+    /// A valid experimental authority request was recognized but cannot be
+    /// projected into an executable queue envelope.
+    #[cfg(feature = "experimental-authority-v5")]
+    ExperimentalAuthorityRefused,
     /// Durable request snapshot cannot be converted back to executable inputs.
     InvalidSnapshot {
         /// Human-readable reason.
@@ -98,6 +102,10 @@ impl Display for QueueRequestError {
                     "unsupported queue request schema version {version}"
                 )
             }
+            #[cfg(feature = "experimental-authority-v5")]
+            Self::ExperimentalAuthorityRefused => {
+                formatter.write_str("experimental authority request refused")
+            }
             Self::InvalidSnapshot { reason } => {
                 write!(formatter, "invalid queue request snapshot: {reason}")
             }
@@ -111,6 +119,8 @@ impl std::error::Error for QueueRequestError {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::UnsupportedSchema { .. } | Self::InvalidSnapshot { .. } => None,
+            #[cfg(feature = "experimental-authority-v5")]
+            Self::ExperimentalAuthorityRefused => None,
         }
     }
 }
@@ -209,7 +219,7 @@ impl QueueRequestStore {
 
     /// Load one request envelope.
     pub fn load(&self, job_id: &str) -> QueueRequestResult<Option<QueuedExecutionEnvelope>> {
-        read_versioned_json(&self.path_for(job_id))?
+        read_queue_request_json(&self.path_for(job_id))?
             .map(upgrade_legacy_request)
             .transpose()
     }
@@ -231,7 +241,7 @@ impl QueueRequestStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            if let Some(envelope) = read_versioned_json(&path)? {
+            if let Some(envelope) = read_queue_request_json(&path)? {
                 envelopes.push(upgrade_legacy_request(envelope)?);
             }
         }
@@ -2029,6 +2039,658 @@ fn write_json_atomic_durable<T: Serialize>(path: &Path, value: &T) -> QueueReque
     Ok(())
 }
 
+#[cfg(not(feature = "experimental-authority-v5"))]
+fn read_queue_request_json(path: &Path) -> QueueRequestResult<Option<QueuedExecutionEnvelope>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(QueueRequestError::Io(error)),
+    };
+    decode_queued_execution_request_bytes(contents.as_bytes()).map(Some)
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn read_queue_request_json(path: &Path) -> QueueRequestResult<Option<QueuedExecutionEnvelope>> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(QueueRequestError::Io(error)),
+    };
+    let authoritative_filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid_snapshot("queue request filename must be valid UTF-8"))?;
+    decode_queued_execution_request_bytes_with_filename(&contents, Some(authoritative_filename))
+        .map(Some)
+}
+
+/// Decode original queue-request bytes while enforcing the active reader
+/// ceiling before a request reaches typed projection.
+#[cfg(not(feature = "experimental-authority-v5"))]
+pub(crate) fn decode_queued_execution_request_bytes(
+    contents: &[u8],
+) -> QueueRequestResult<QueuedExecutionEnvelope> {
+    let value: Value = serde_json::from_slice(contents)?;
+    let version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| QueueRequestError::UnsupportedSchema { version: u32::MAX })?
+        .unwrap_or_default();
+    if !(LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION..=QUEUED_EXECUTION_SCHEMA_VERSION)
+        .contains(&version)
+    {
+        return Err(QueueRequestError::UnsupportedSchema { version });
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+#[cfg(not(feature = "experimental-authority-v5"))]
+#[cfg(unix)]
+pub(crate) fn decode_queued_execution_request_bytes_for_import(
+    contents: &[u8],
+    _authoritative_filename: &str,
+) -> QueueRequestResult<QueuedExecutionEnvelope> {
+    decode_queued_execution_request_bytes(contents)
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+// Retained as the raw decoder API for feature-gated readers and focused tests;
+// store reads must use the filename-aware path below.
+#[allow(dead_code)]
+pub(crate) fn decode_queued_execution_request_bytes(
+    contents: &[u8],
+) -> QueueRequestResult<QueuedExecutionEnvelope> {
+    decode_queued_execution_request_bytes_with_filename(contents, None)
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+pub(crate) fn decode_queued_execution_request_bytes_for_import(
+    contents: &[u8],
+    authoritative_filename: &str,
+) -> QueueRequestResult<QueuedExecutionEnvelope> {
+    decode_queued_execution_request_bytes_with_filename(contents, Some(authoritative_filename))
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn decode_queued_execution_request_bytes_with_filename(
+    contents: &[u8],
+    authoritative_filename: Option<&str>,
+) -> QueueRequestResult<QueuedExecutionEnvelope> {
+    let value = parse_json_rejecting_duplicate_keys(contents)?;
+    let version = experimental_schema_version(&value)?;
+    match version {
+        LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION..=QUEUED_EXECUTION_SCHEMA_VERSION => {
+            let envelope: QueuedExecutionEnvelope = serde_json::from_value(value.clone())?;
+            let canonical = serde_json::to_value(&envelope)?;
+            reject_reserved_authority_keys(&value, Some(&canonical))?;
+            Ok(envelope)
+        }
+        5 => {
+            validate_experimental_authority_v5(&value)?;
+            if let Some(filename) = authoritative_filename {
+                let job_id = value
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_snapshot("queue request job_id must be a string"))?;
+                if filename != format!("{job_id}.json") {
+                    return Err(invalid_snapshot(
+                        "authoritative queue filename disagrees with embedded job_id",
+                    ));
+                }
+            }
+            Err(QueueRequestError::ExperimentalAuthorityRefused)
+        }
+        version => Err(QueueRequestError::UnsupportedSchema { version }),
+    }
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+const AUTHORITY_RESERVED_KEYS: &[&str] = &[
+    "experimental_authority",
+    "backend_policy",
+    "authority_class",
+    "output_disposition",
+    "trust_proof",
+    "protected_ref",
+    "observed_protected_ref_sha",
+];
+
+#[cfg(feature = "experimental-authority-v5")]
+const EXPERIMENTAL_AUTHORITY_REPOSITORY: &str = "Generous-Corp/pulp";
+
+#[cfg(feature = "experimental-authority-v5")]
+struct DuplicateRejectingJsonValue(Value);
+
+#[cfg(feature = "experimental-authority-v5")]
+impl<'de> Deserialize<'de> for DuplicateRejectingJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StrictValueVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for StrictValueVisitor {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON value without duplicate object keys")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(Value::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(Value::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(Value::String(value))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                DuplicateRejectingJsonValue::deserialize(deserializer).map(|value| value.0)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<DuplicateRejectingJsonValue>()? {
+                    values.push(value.0);
+                }
+                Ok(Value::Array(values))
+            }
+
+            fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = object.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON object key {key:?}"
+                        )));
+                    }
+                    let value = object.next_value::<DuplicateRejectingJsonValue>()?;
+                    values.insert(key, value.0);
+                }
+                Ok(Value::Object(values))
+            }
+        }
+
+        deserializer
+            .deserialize_any(StrictValueVisitor)
+            .map(DuplicateRejectingJsonValue)
+    }
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn parse_json_rejecting_duplicate_keys(contents: &[u8]) -> QueueRequestResult<Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(contents);
+    let value = DuplicateRejectingJsonValue::deserialize(&mut deserializer)?.0;
+    deserializer.end()?;
+    Ok(value)
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn experimental_schema_version(value: &Value) -> QueueRequestResult<u32> {
+    let Some(object) = value.as_object() else {
+        return Err(invalid_snapshot("queued request must be a JSON object"));
+    };
+    let Some(version) = object.get("schema_version").and_then(Value::as_u64) else {
+        return Err(invalid_snapshot(
+            "queued request schema_version must be an unsigned integer",
+        ));
+    };
+    u32::try_from(version).map_err(|_| QueueRequestError::UnsupportedSchema { version: u32::MAX })
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn reject_reserved_authority_keys(
+    value: &Value,
+    canonical: Option<&Value>,
+) -> QueueRequestResult<()> {
+    match value {
+        Value::Object(object) => {
+            let canonical = canonical.and_then(Value::as_object);
+            for (key, value) in object {
+                let canonical_value = canonical.and_then(|object| object.get(key));
+                if AUTHORITY_RESERVED_KEYS.contains(&key.as_str()) && canonical_value != Some(value)
+                {
+                    return Err(invalid_snapshot(format!(
+                        "authority-reserved key {key:?} is invalid before schema v5"
+                    )));
+                }
+                reject_reserved_authority_keys(value, canonical_value)?;
+            }
+            Ok(())
+        }
+        Value::Array(values) => {
+            let canonical = canonical.and_then(Value::as_array);
+            for (index, value) in values.iter().enumerate() {
+                reject_reserved_authority_keys(
+                    value,
+                    canonical.and_then(|values| values.get(index)),
+                )?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn validate_experimental_authority_v5(value: &Value) -> QueueRequestResult<()> {
+    let envelope = exact_json_object(
+        value,
+        "queue request",
+        &[
+            "schema_version",
+            "job_id",
+            "kind",
+            "cwd",
+            "created_at",
+            "execution_owner",
+            "resource_plan",
+            "request",
+            "experimental_authority",
+        ],
+        &["provenance"],
+    )?;
+    require_u64(envelope, "schema_version", "queue request", 5)?;
+    let job_id = require_string(envelope, "job_id", "queue request")?;
+    validate_job_id(job_id)?;
+    require_literal(envelope, "kind", "queue request", "run")?;
+    require_string(envelope, "cwd", "queue request")?;
+    let created_at = require_string(envelope, "created_at", "queue request")?;
+    DateTime::parse_from_rfc3339(created_at)
+        .map_err(|_| invalid_snapshot("queue request created_at must be RFC 3339"))?;
+    require_one_of(
+        envelope,
+        "execution_owner",
+        "queue request",
+        &["legacy_unspecified", "foreground", "daemon"],
+    )?;
+
+    let provenance_head_sha = match envelope.get("provenance") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(validate_experimental_provenance(value)?),
+    };
+    validate_empty_experimental_resource_plan(required_value(
+        envelope,
+        "resource_plan",
+        "queue request",
+    )?)?;
+    let request_sha = validate_empty_experimental_run_request(required_value(
+        envelope,
+        "request",
+        "queue request",
+    )?)?;
+    validate_experimental_authority(
+        required_value(envelope, "experimental_authority", "queue request")?,
+        request_sha,
+        provenance_head_sha,
+    )
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn validate_experimental_provenance(value: &Value) -> QueueRequestResult<&str> {
+    let provenance = exact_json_object(
+        value,
+        "provenance",
+        &["canonical_cwd", "repo_root", "head_sha", "tree_signature"],
+        &["repo_slug", "config_signature"],
+    )?;
+    require_string(provenance, "canonical_cwd", "provenance")?;
+    require_string(provenance, "repo_root", "provenance")?;
+    let head_sha = require_string(provenance, "head_sha", "provenance")?;
+    require_exact_lower_sha1(head_sha, "provenance.head_sha")?;
+    require_string(provenance, "tree_signature", "provenance")?;
+    if let Some(repo_slug) = provenance.get("repo_slug") {
+        let Some(repo_slug) = repo_slug.as_str() else {
+            return Err(invalid_snapshot("provenance.repo_slug must be a string"));
+        };
+        if repo_slug != EXPERIMENTAL_AUTHORITY_REPOSITORY {
+            return Err(invalid_snapshot(
+                "provenance.repo_slug must match experimental_authority.trust_proof.repository",
+            ));
+        }
+    }
+    if let Some(config_signature) = provenance.get("config_signature")
+        && !config_signature.is_string()
+    {
+        return Err(invalid_snapshot(
+            "provenance.config_signature must be a string",
+        ));
+    }
+    Ok(head_sha)
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn validate_empty_experimental_resource_plan(value: &Value) -> QueueRequestResult<()> {
+    let resource_plan = exact_json_object(
+        value,
+        "resource_plan",
+        &[
+            "targets",
+            "exclusive_claims",
+            "cloud_targets",
+            "host_pools",
+            "vm_slots",
+        ],
+        &[],
+    )?;
+    for key in [
+        "targets",
+        "exclusive_claims",
+        "cloud_targets",
+        "host_pools",
+        "vm_slots",
+    ] {
+        require_empty_array(resource_plan, key, "resource_plan")?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn validate_empty_experimental_run_request(value: &Value) -> QueueRequestResult<&str> {
+    let request = exact_json_object(
+        value,
+        "request",
+        &[
+            "type",
+            "branch",
+            "sha",
+            "mode",
+            "priority",
+            "warm_disabled",
+            "fail_fast",
+            "resume_from",
+            "targets",
+        ],
+        &[],
+    )?;
+    require_literal(request, "type", "request", "run")?;
+    if require_string(request, "branch", "request")?.is_empty() {
+        return Err(invalid_snapshot("request.branch must not be empty"));
+    }
+    let sha = require_string(request, "sha", "request")?;
+    require_exact_lower_sha1(sha, "request.sha")?;
+    require_one_of(request, "mode", "request", &["full", "smoke"])?;
+    require_one_of(request, "priority", "request", &["low", "normal", "high"])?;
+    require_bool(request, "warm_disabled", "request")?;
+    require_bool(request, "fail_fast", "request")?;
+    match required_value(request, "resume_from", "request")? {
+        Value::Null | Value::String(_) => {}
+        _ => {
+            return Err(invalid_snapshot(
+                "request.resume_from must be a string or null",
+            ));
+        }
+    }
+    require_empty_array(request, "targets", "request")?;
+    Ok(sha)
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn validate_experimental_authority(
+    value: &Value,
+    request_sha: &str,
+    provenance_head_sha: Option<&str>,
+) -> QueueRequestResult<()> {
+    let authority = exact_json_object(
+        value,
+        "experimental_authority",
+        &[
+            "backend_policy",
+            "authority_class",
+            "output_disposition",
+            "trust_proof",
+        ],
+        &[],
+    )?;
+    require_literal(
+        authority,
+        "backend_policy",
+        "experimental_authority",
+        "trusted_native_advisory",
+    )?;
+    require_literal(
+        authority,
+        "authority_class",
+        "experimental_authority",
+        "advisory",
+    )?;
+    require_literal(
+        authority,
+        "output_disposition",
+        "experimental_authority",
+        "quarantined_non_promotable",
+    )?;
+    let trust_proof = exact_json_object(
+        required_value(authority, "trust_proof", "experimental_authority")?,
+        "experimental_authority.trust_proof",
+        &[
+            "kind",
+            "repository",
+            "head_sha",
+            "protected_ref",
+            "observed_protected_ref_sha",
+        ],
+        &[],
+    )?;
+    require_literal(
+        trust_proof,
+        "kind",
+        "experimental_authority.trust_proof",
+        "protected_main_ancestor",
+    )?;
+    let repository = require_string(
+        trust_proof,
+        "repository",
+        "experimental_authority.trust_proof",
+    )?;
+    if repository != EXPERIMENTAL_AUTHORITY_REPOSITORY || !is_valid_repository_slug(repository) {
+        return Err(invalid_snapshot(
+            "experimental_authority.trust_proof.repository must be exactly Generous-Corp/pulp",
+        ));
+    }
+    let head_sha = require_string(
+        trust_proof,
+        "head_sha",
+        "experimental_authority.trust_proof",
+    )?;
+    require_exact_lower_sha1(head_sha, "experimental_authority.trust_proof.head_sha")?;
+    require_literal(
+        trust_proof,
+        "protected_ref",
+        "experimental_authority.trust_proof",
+        "refs/heads/main",
+    )?;
+    let observed_sha = require_string(
+        trust_proof,
+        "observed_protected_ref_sha",
+        "experimental_authority.trust_proof",
+    )?;
+    require_exact_lower_sha1(
+        observed_sha,
+        "experimental_authority.trust_proof.observed_protected_ref_sha",
+    )?;
+    if head_sha != request_sha || provenance_head_sha.is_some_and(|sha| sha != request_sha) {
+        return Err(invalid_snapshot(
+            "experimental authority head SHA copies disagree",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn exact_json_object<'a>(
+    value: &'a Value,
+    path: &str,
+    required: &[&str],
+    optional: &[&str],
+) -> QueueRequestResult<&'a serde_json::Map<String, Value>> {
+    let Some(object) = value.as_object() else {
+        return Err(invalid_snapshot(format!("{path} must be an object")));
+    };
+    for key in object.keys() {
+        if !required.contains(&key.as_str()) && !optional.contains(&key.as_str()) {
+            return Err(invalid_snapshot(format!(
+                "unknown or misplaced key {key:?} at {path}"
+            )));
+        }
+    }
+    for key in required {
+        if !object.contains_key(*key) {
+            return Err(invalid_snapshot(format!(
+                "missing required key {key:?} at {path}"
+            )));
+        }
+    }
+    Ok(object)
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn required_value<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> QueueRequestResult<&'a Value> {
+    object
+        .get(key)
+        .ok_or_else(|| invalid_snapshot(format!("missing required key {key:?} at {path}")))
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn require_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> QueueRequestResult<&'a str> {
+    required_value(object, key, path)?
+        .as_str()
+        .ok_or_else(|| invalid_snapshot(format!("{path}.{key} must be a string")))
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn require_bool(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> QueueRequestResult<bool> {
+    required_value(object, key, path)?
+        .as_bool()
+        .ok_or_else(|| invalid_snapshot(format!("{path}.{key} must be a boolean")))
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn require_u64(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    path: &str,
+    expected: u64,
+) -> QueueRequestResult<()> {
+    if required_value(object, key, path)?.as_u64() != Some(expected) {
+        return Err(invalid_snapshot(format!(
+            "{path}.{key} must be integer {expected}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn require_literal(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    path: &str,
+    expected: &str,
+) -> QueueRequestResult<()> {
+    if require_string(object, key, path)? != expected {
+        return Err(invalid_snapshot(format!(
+            "{path}.{key} must be exactly {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn require_one_of(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    path: &str,
+    expected: &[&str],
+) -> QueueRequestResult<()> {
+    let value = require_string(object, key, path)?;
+    if !expected.contains(&value) {
+        return Err(invalid_snapshot(format!(
+            "{path}.{key} has an unsupported literal"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn require_empty_array(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> QueueRequestResult<()> {
+    if !matches!(required_value(object, key, path)?, Value::Array(values) if values.is_empty()) {
+        return Err(invalid_snapshot(format!(
+            "{path}.{key} must be an empty array"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-authority-v5")]
+fn require_exact_lower_sha1(value: &str, path: &str) -> QueueRequestResult<()> {
+    if value.len() != 40
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_snapshot(format!(
+            "{path} must be exactly 40 lowercase hexadecimal characters"
+        )));
+    }
+    Ok(())
+}
+
 fn read_versioned_json<T>(path: &Path) -> QueueRequestResult<Option<T>>
 where
     T: for<'de> Deserialize<'de>,
@@ -2246,7 +2908,9 @@ fn sweep_absent_older_than(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -2274,6 +2938,788 @@ mod tests {
     use crate::job::{Priority, ValidationMode};
     use crate::ship::{RunExecutionRequest, ShipExecutionRequest};
     use crate::ship_state::{DispatchedRun, ShipState};
+
+    fn experimental_v5_request_value() -> Value {
+        json!({
+            "schema_version": 5,
+            "job_id": "experimental-reader-only",
+            "kind": "run",
+            "cwd": "/work/pulp",
+            "created_at": "2026-09-01T12:00:00Z",
+            "execution_owner": "foreground",
+            "provenance": {
+                "canonical_cwd": "/work/pulp",
+                "repo_root": "/work/pulp",
+                "repo_slug": "Generous-Corp/pulp",
+                "head_sha": "a".repeat(40),
+                "tree_signature": "b".repeat(64),
+                "config_signature": "c".repeat(64)
+            },
+            "resource_plan": {
+                "targets": [],
+                "exclusive_claims": [],
+                "cloud_targets": [],
+                "host_pools": [],
+                "vm_slots": []
+            },
+            "request": {
+                "type": "run",
+                "branch": "main",
+                "sha": "a".repeat(40),
+                "mode": "full",
+                "priority": "normal",
+                "warm_disabled": false,
+                "fail_fast": true,
+                "resume_from": null,
+                "targets": []
+            },
+            "experimental_authority": {
+                "backend_policy": "trusted_native_advisory",
+                "authority_class": "advisory",
+                "output_disposition": "quarantined_non_promotable",
+                "trust_proof": {
+                    "kind": "protected_main_ancestor",
+                    "repository": "Generous-Corp/pulp",
+                    "head_sha": "a".repeat(40),
+                    "protected_ref": "refs/heads/main",
+                    "observed_protected_ref_sha": "d".repeat(40)
+                }
+            }
+        })
+    }
+
+    fn request_store_with_contents(contents: &str) -> (tempfile::TempDir, QueueRequestStore) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("request store");
+        std::fs::write(store.path_for("experimental-reader-only"), contents)
+            .expect("write request fixture");
+        (temp, store)
+    }
+
+    fn request_store_with_value(value: &Value) -> (tempfile::TempDir, QueueRequestStore) {
+        request_store_with_contents(&serde_json::to_string(value).expect("serialize fixture"))
+    }
+
+    const EXPERIMENTAL_AUTHORITY_FEATURE: &str = "experimental-authority-v5";
+    const EXPERIMENTAL_AUTHORITY_CI_WORKFLOW: &str = ".github/workflows/ci.yml";
+    const EXPERIMENTAL_AUTHORITY_CI_STEP: &str = r"      - name: Run experimental authority refusal tests
+        if: runner.os == 'Linux'
+        env:
+          SHIPYARD_TEST_HOME: ${{ runner.temp }}
+          RUST_MIN_STACK: 8388608
+        run: cargo test --all-targets --locked --features ci-test-home,experimental-authority-v5";
+    const REFUSAL_ONLY_GUIDANCE: [&str; 4] = [
+        "docs/pulp-mac-cache-readiness.md",
+        "docs/ship-state-machine.md",
+        "skills/ci/SKILL.md",
+        "skills/shipyard/SKILL.md",
+    ];
+
+    fn tracked_paths(repository: &Path) -> Vec<String> {
+        let output = Command::new("git")
+            .args(["-C", repository.to_str().expect("UTF-8 repository path")])
+            .args(["ls-files", "-z"])
+            .output()
+            .expect("git ls-files must be available for the repository guard");
+        assert!(
+            output.status.success(),
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                String::from_utf8(path.to_vec()).expect("tracked paths must be valid UTF-8")
+            })
+            .collect()
+    }
+
+    fn is_official_invocation_surface(path: &str) -> bool {
+        if path == ".shipyard/config.toml"
+            || path == "install.sh"
+            || path == "RELEASING.md"
+            || path.starts_with(".github/workflows/")
+            || path.starts_with(".githooks/")
+            || path.starts_with("hooks/")
+        {
+            return true;
+        }
+        let file_name = path.rsplit('/').next().unwrap_or(path);
+        let is_test_or_fixture = file_name.starts_with("test_")
+            || path.contains("/tests/")
+            || path.contains("/fixtures/");
+        let is_script = [".sh", ".py", ".ps1", ".bash"]
+            .iter()
+            .any(|extension| path.ends_with(extension));
+        !is_test_or_fixture && is_script
+    }
+
+    fn is_guidance_surface(path: &str) -> bool {
+        path.starts_with(".claude-plugin/")
+            || path.starts_with("agents/")
+            || path.starts_with("commands/")
+            || path.starts_with("hooks/")
+            || path.starts_with("skills/")
+            || path.starts_with("docs/")
+    }
+
+    fn contains_authority_vocabulary(contents: &str) -> bool {
+        let contents = contents.to_ascii_lowercase();
+        [
+            EXPERIMENTAL_AUTHORITY_FEATURE,
+            "experimental_authority",
+            "trusted_native_advisory",
+            "experimental authority schema v5",
+            "schema-v5 experimental authority",
+        ]
+        .iter()
+        .any(|needle| contents.contains(needle))
+    }
+
+    fn contains_activation(contents: &str) -> bool {
+        let contents = contents.to_ascii_lowercase();
+        contents.contains("--all-features")
+            || contents.contains("--all_features")
+            || contents.contains("all_features = true")
+            || (contents.contains(EXPERIMENTAL_AUTHORITY_FEATURE)
+                && (contents.contains("--features") || contents.contains("--features=")))
+    }
+
+    fn contains_affirmative_producer_instruction(contents: &str) -> bool {
+        let mut previous = String::new();
+        for line in contents.lines() {
+            let line = line.to_ascii_lowercase();
+            if !contains_authority_vocabulary(&line)
+                && !line.contains("v5")
+                && !line.contains("experimental authority")
+            {
+                previous = line;
+                continue;
+            }
+            let continuation = previous
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_some_and(|character| matches!(character, ',' | ':' | ';' | '\\'));
+            let denial_context = if continuation {
+                format!("{previous} {line}")
+            } else {
+                line.clone()
+            };
+            let denied = [
+                "never",
+                "must not",
+                "cannot",
+                "can't",
+                "no writer",
+                "no request",
+                "no operational",
+                "not an operational",
+                "refus",
+                "default-off",
+                "compile-disabled",
+                "only to test",
+                "only validate",
+            ]
+            .iter()
+            .any(|marker| denial_context.contains(marker));
+            if denied {
+                previous = line;
+                continue;
+            }
+            if line
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+                .any(|word| {
+                    matches!(
+                        word,
+                        "seed"
+                            | "submit"
+                            | "enqueue"
+                            | "write"
+                            | "create"
+                            | "emit"
+                            | "produce"
+                            | "repair"
+                            | "execute"
+                            | "run"
+                            | "enable"
+                            | "deploy"
+                    )
+                })
+            {
+                return true;
+            }
+            previous = line;
+        }
+        false
+    }
+
+    fn default_reaches_feature(
+        feature: &str,
+        features: &toml::map::Map<String, toml::Value>,
+        visiting: &mut BTreeSet<String>,
+    ) -> bool {
+        if feature == EXPERIMENTAL_AUTHORITY_FEATURE {
+            return true;
+        }
+        if !visiting.insert(feature.to_owned()) {
+            return false;
+        }
+        let reaches = features
+            .get(feature)
+            .and_then(toml::Value::as_array)
+            .is_some_and(|members| {
+                members
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .any(|member| {
+                        !member.starts_with("dep:")
+                            && !member.contains('/')
+                            && default_reaches_feature(member, features, visiting)
+                    })
+            });
+        visiting.remove(feature);
+        reaches
+    }
+
+    fn assert_experimental_authority_guard_self_checks() {
+        assert!(contains_activation("cargo test --all-features"));
+        assert!(contains_activation(
+            "cargo test --features ci-test-home,experimental-authority-v5"
+        ));
+        assert!(contains_activation(
+            "cargo test --features\n  experimental-authority-v5"
+        ));
+        assert!(contains_affirmative_producer_instruction(
+            "Submit a v5 record to enable experimental authority."
+        ));
+        assert!(!contains_affirmative_producer_instruction(
+            "Never submit or execute a v5 record."
+        ));
+    }
+
+    fn assert_ci_contains_only_source_checks(contents: &str) {
+        assert_eq!(
+            contents.matches(EXPERIMENTAL_AUTHORITY_FEATURE).count(),
+            1,
+            "experimental authority CI feature must have one exact test-only invocation"
+        );
+        assert!(
+            contents.contains(EXPERIMENTAL_AUTHORITY_CI_STEP),
+            "experimental authority CI invocation must retain its exact Linux test-only boundary"
+        );
+        assert!(
+            !contents.contains("--all-features")
+                && !contents.contains("--all_features")
+                && !contents.contains("all_features = true"),
+            "official CI must not enable every feature"
+        );
+    }
+
+    fn assert_experimental_feature_is_dependency_free_and_default_off(repository: &Path) {
+        let manifest_text =
+            fs::read_to_string(repository.join("Cargo.toml")).expect("read repository Cargo.toml");
+        let manifest: toml::Value = toml::from_str(&manifest_text).expect("parse Cargo.toml");
+        let features = manifest
+            .get("features")
+            .and_then(toml::Value::as_table)
+            .expect("Cargo.toml must contain a features table");
+        assert!(
+            features
+                .get(EXPERIMENTAL_AUTHORITY_FEATURE)
+                .and_then(toml::Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "the experimental feature declaration must remain dependency-free"
+        );
+        for default_member in features
+            .get("default")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|member| {
+                member
+                    .as_str()
+                    .expect("default feature members must be strings")
+            })
+        {
+            assert!(
+                !default_reaches_feature(default_member, features, &mut BTreeSet::new()),
+                "Cargo default feature member {default_member:?} enables {EXPERIMENTAL_AUTHORITY_FEATURE}"
+            );
+        }
+    }
+
+    fn assert_experimental_authority_absent_from_surfaces(repository: &Path) {
+        let refusal_only = REFUSAL_ONLY_GUIDANCE.into_iter().collect::<BTreeSet<_>>();
+        for path in tracked_paths(repository) {
+            if path == "Cargo.toml" || path == "src/queue_request.rs" {
+                continue;
+            }
+            let full_path = repository.join(&path);
+            let Ok(contents) = fs::read_to_string(&full_path) else {
+                continue;
+            };
+            // Git may materialize checked-in workflow text with CRLF on
+            // Windows. Keep the source-surface assertion byte-independent
+            // while still requiring the exact normalized Linux-only block.
+            let contents = contents.replace("\r\n", "\n");
+            if is_official_invocation_surface(&path) {
+                if path == EXPERIMENTAL_AUTHORITY_CI_WORKFLOW {
+                    assert_ci_contains_only_source_checks(&contents);
+                } else {
+                    assert!(
+                        !contents.contains(EXPERIMENTAL_AUTHORITY_FEATURE),
+                        "official invocation surface {path} mentions or enables {EXPERIMENTAL_AUTHORITY_FEATURE}"
+                    );
+                    assert!(
+                        !contains_activation(&contents),
+                        "official invocation surface {path} enables all features"
+                    );
+                }
+            }
+            if !is_guidance_surface(&path) || !contains_authority_vocabulary(&contents) {
+                continue;
+            }
+            assert!(
+                refusal_only.contains(path.as_str()),
+                "producer guidance {path} introduces experimental authority vocabulary"
+            );
+            let lower = contents.to_ascii_lowercase();
+            assert!(
+                lower.contains("refus")
+                    && (lower.contains("v4-only")
+                        || lower.contains("compile-disabled")
+                        || lower.contains("official build")),
+                "allowed guidance {path} must remain explicitly refusal-only"
+            );
+            assert!(
+                !contains_activation(&contents),
+                "allowed refusal-only guidance {path} contains an activation command"
+            );
+            assert!(
+                !contains_affirmative_producer_instruction(&contents),
+                "allowed refusal-only guidance {path} contains producer instructions"
+            );
+        }
+    }
+
+    #[test]
+    fn experimental_authority_feature_is_absent_from_official_and_producer_surfaces() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_experimental_authority_guard_self_checks();
+        assert_experimental_feature_is_dependency_free_and_default_off(repository);
+        assert_experimental_authority_absent_from_surfaces(repository);
+    }
+
+    #[cfg(not(feature = "experimental-authority-v5"))]
+    #[test]
+    fn default_reader_keeps_v5_unsupported() {
+        let (_temp, store) = request_store_with_value(&experimental_v5_request_value());
+
+        let error = store
+            .load("experimental-reader-only")
+            .expect_err("v5 rejected");
+
+        assert!(matches!(
+            error,
+            QueueRequestError::UnsupportedSchema { version: 5 }
+        ));
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    fn assert_experimental_v5_invalid(value: &Value) {
+        let (_temp, store) = request_store_with_value(value);
+        let error = store
+            .load("experimental-reader-only")
+            .expect_err("invalid v5 must fail closed");
+        assert!(
+            !matches!(error, QueueRequestError::ExperimentalAuthorityRefused),
+            "invalid fixture reached typed refusal: {value}"
+        );
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn valid_experimental_v5_is_refused_without_returning_an_envelope() {
+        let encoded = serde_json::to_vec(&experimental_v5_request_value()).expect("fixture");
+        assert!(matches!(
+            super::decode_queued_execution_request_bytes(&encoded),
+            Err(QueueRequestError::ExperimentalAuthorityRefused)
+        ));
+
+        let (_temp, store) = request_store_with_value(&experimental_v5_request_value());
+
+        assert!(matches!(
+            store.load("experimental-reader-only"),
+            Err(QueueRequestError::ExperimentalAuthorityRefused)
+        ));
+        assert!(matches!(
+            store.list(),
+            Err(QueueRequestError::ExperimentalAuthorityRefused)
+        ));
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_v5_rejects_filename_job_id_mismatch_on_store_reads() {
+        let value = experimental_v5_request_value();
+        let contents = serde_json::to_string(&value).expect("serialize fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("request store");
+        std::fs::write(store.path().join("different-job.json"), contents)
+            .expect("write mismatched request fixture");
+
+        let error = store
+            .list()
+            .expect_err("mismatched filename must fail closed");
+        assert!(matches!(error, QueueRequestError::InvalidSnapshot { .. }));
+        assert!(error.to_string().contains("filename disagrees"));
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_v5_rejects_duplicate_keys_at_every_object_depth() {
+        let encoded = serde_json::to_string(&experimental_v5_request_value()).expect("fixture");
+        let duplicates = [
+            encoded.replacen('{', "{\"schema_version\":5,", 1),
+            encoded.replacen(
+                "\"provenance\":{",
+                "\"provenance\":{\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+                1,
+            ),
+            encoded.replacen(
+                "\"resource_plan\":{",
+                "\"resource_plan\":{\"targets\":[],",
+                1,
+            ),
+            encoded.replacen("\"request\":{", "\"request\":{\"type\":\"run\",", 1),
+            encoded.replacen(
+                "\"experimental_authority\":{",
+                "\"experimental_authority\":{\"backend_policy\":\"trusted_native_advisory\",",
+                1,
+            ),
+            encoded.replacen(
+                "\"trust_proof\":{",
+                "\"trust_proof\":{\"kind\":\"protected_main_ancestor\",",
+                1,
+            ),
+        ];
+        for duplicate in duplicates {
+            let (_temp, store) = request_store_with_contents(&duplicate);
+            assert!(matches!(
+                store.load("experimental-reader-only"),
+                Err(QueueRequestError::Json(_))
+            ));
+        }
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_v5_rejects_unknown_missing_and_misplaced_keys() {
+        let fixture = experimental_v5_request_value();
+        let mut cases = Vec::new();
+        for path in [
+            &[][..],
+            &["provenance"][..],
+            &["resource_plan"][..],
+            &["request"][..],
+            &["experimental_authority"][..],
+            &["experimental_authority", "trust_proof"][..],
+        ] {
+            let mut value = fixture.clone();
+            let mut object = &mut value;
+            for component in path {
+                object = &mut object[*component];
+            }
+            object
+                .as_object_mut()
+                .expect("fixture object")
+                .insert("unknown_field".to_owned(), json!(true));
+            cases.push(value);
+        }
+        let mut missing = fixture.clone();
+        missing["request"]
+            .as_object_mut()
+            .expect("request")
+            .remove("targets");
+        cases.push(missing);
+        let mut misplaced = fixture.clone();
+        misplaced["request"]["trust_proof"] = json!({});
+        cases.push(misplaced);
+
+        for value in cases {
+            assert_experimental_v5_invalid(&value);
+        }
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_reader_rejects_reserved_authority_keys_in_v1_through_v4() {
+        for version in 1..=4 {
+            for reserved in super::AUTHORITY_RESERVED_KEYS {
+                let mut value = experimental_v5_request_value();
+                value["schema_version"] = json!(version);
+                value
+                    .as_object_mut()
+                    .expect("envelope")
+                    .remove("experimental_authority");
+                value["request"][*reserved] = json!("misplaced");
+                let (_temp, store) = request_store_with_value(&value);
+                assert!(matches!(
+                    store.load("experimental-reader-only"),
+                    Err(QueueRequestError::InvalidSnapshot { .. })
+                ));
+            }
+
+            let mut nested_array = experimental_v5_request_value();
+            nested_array["schema_version"] = json!(version);
+            nested_array
+                .as_object_mut()
+                .expect("envelope")
+                .remove("experimental_authority");
+            nested_array["unknown_nested_arrays"] =
+                json!([[{"experimental_authority": "misplaced"}]]);
+            let (_temp, store) = request_store_with_value(&nested_array);
+            assert!(matches!(
+                store.load("experimental-reader-only"),
+                Err(QueueRequestError::InvalidSnapshot { .. })
+            ));
+
+            let mut misplaced_user_map_name = experimental_v5_request_value();
+            misplaced_user_map_name["schema_version"] = json!(version);
+            misplaced_user_map_name
+                .as_object_mut()
+                .expect("envelope")
+                .remove("experimental_authority");
+            misplaced_user_map_name["environment"] = json!({"experimental_authority": "misplaced"});
+            let (_temp, store) = request_store_with_value(&misplaced_user_map_name);
+            assert!(matches!(
+                store.load("experimental-reader-only"),
+                Err(QueueRequestError::InvalidSnapshot { .. })
+            ));
+        }
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_reader_preserves_reserved_names_in_user_defined_v4_maps() {
+        let envelope = QueuedExecutionEnvelope::from_run_request(
+            "job-v4-map-keys",
+            "/work/repo",
+            &run_request(),
+        );
+        let mut value = serde_json::to_value(envelope).expect("serialize v4 envelope");
+        value["request"]["targets"][0]["validation"]["environment"]["trust_proof"] =
+            json!("user-defined");
+        value["request"]["targets"][0]["validation"]["stages"]["backend_policy"] =
+            json!("cargo test");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("request store");
+        std::fs::write(
+            store.path_for("job-v4-map-keys"),
+            serde_json::to_vec(&value).expect("serialize mutated envelope"),
+        )
+        .expect("write v4 fixture");
+
+        store
+            .load("job-v4-map-keys")
+            .expect("user-defined map keys remain valid")
+            .expect("v4 envelope is present");
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_v5_rejects_wrong_types_case_and_exact_identity_drift() {
+        let fixture = experimental_v5_request_value();
+        let mut cases = Vec::new();
+
+        let mut wrong_type = fixture.clone();
+        wrong_type["request"]["warm_disabled"] = json!("false");
+        cases.push(wrong_type);
+        let mut wrong_policy_case = fixture.clone();
+        wrong_policy_case["experimental_authority"]["authority_class"] = json!("Advisory");
+        cases.push(wrong_policy_case);
+        let mut wrong_repository_case = fixture.clone();
+        wrong_repository_case["experimental_authority"]["trust_proof"]["repository"] =
+            json!("generous-corp/pulp");
+        cases.push(wrong_repository_case);
+        let mut invalid_repository = fixture.clone();
+        invalid_repository["experimental_authority"]["trust_proof"]["repository"] =
+            json!("Generous-Corp/pulp/extra");
+        cases.push(invalid_repository);
+        let mut uppercase_sha = fixture.clone();
+        uppercase_sha["experimental_authority"]["trust_proof"]["head_sha"] = json!("A".repeat(40));
+        cases.push(uppercase_sha);
+        let mut long_sha = fixture.clone();
+        long_sha["experimental_authority"]["trust_proof"]["observed_protected_ref_sha"] =
+            json!("d".repeat(64));
+        cases.push(long_sha);
+        let mut wrong_ref = fixture.clone();
+        wrong_ref["experimental_authority"]["trust_proof"]["protected_ref"] =
+            json!("refs/heads/trunk");
+        cases.push(wrong_ref);
+        let mut cross_field = fixture.clone();
+        cross_field["experimental_authority"]["trust_proof"]["head_sha"] = json!("e".repeat(40));
+        cases.push(cross_field);
+        let mut provenance_cross_field = fixture.clone();
+        provenance_cross_field["provenance"]["head_sha"] = json!("e".repeat(40));
+        cases.push(provenance_cross_field);
+
+        for value in cases {
+            assert_experimental_v5_invalid(&value);
+        }
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_v5_rejects_provenance_repository_different_from_frozen_trust_repository() {
+        let mut value = experimental_v5_request_value();
+        value["provenance"]["repo_slug"] = json!("Generous-Corp/other");
+        let (_temp, store) = request_store_with_value(&value);
+
+        let error = store
+            .load("experimental-reader-only")
+            .expect_err("mismatched provenance repository must fail closed");
+        assert!(matches!(error, QueueRequestError::InvalidSnapshot { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("provenance.repo_slug must match")
+        );
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_v5_preserves_optional_provenance_and_repo_slug() {
+        let mut without_provenance = experimental_v5_request_value();
+        without_provenance
+            .as_object_mut()
+            .expect("request envelope")
+            .remove("provenance");
+        let mut without_repo_slug = experimental_v5_request_value();
+        without_repo_slug["provenance"]
+            .as_object_mut()
+            .expect("provenance")
+            .remove("repo_slug");
+        let mut null_provenance = experimental_v5_request_value();
+        null_provenance["provenance"] = Value::Null;
+
+        for value in [without_provenance, without_repo_slug, null_provenance] {
+            let (_temp, store) = request_store_with_value(&value);
+            assert!(matches!(
+                store.load("experimental-reader-only"),
+                Err(QueueRequestError::ExperimentalAuthorityRefused)
+            ));
+        }
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_v5_rejects_nonempty_resource_and_execution_collections() {
+        let fixture = experimental_v5_request_value();
+        for key in [
+            "targets",
+            "exclusive_claims",
+            "cloud_targets",
+            "host_pools",
+            "vm_slots",
+        ] {
+            let mut value = fixture.clone();
+            value["resource_plan"][key] = json!(["occupied"]);
+            assert_experimental_v5_invalid(&value);
+        }
+        let mut request_target = fixture;
+        request_target["request"]["targets"] = json!([{}]);
+        assert_experimental_v5_invalid(&request_target);
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_v5_rejects_ship_and_nonadvisory_policy_shapes() {
+        let fixture = experimental_v5_request_value();
+        let mut cases = Vec::new();
+        let mut ship_kind = fixture.clone();
+        ship_kind["kind"] = json!("ship");
+        cases.push(ship_kind);
+        let mut ship_request = fixture.clone();
+        ship_request["request"]["type"] = json!("ship");
+        cases.push(ship_request);
+        let mut tart_required = fixture.clone();
+        tart_required["experimental_authority"]["backend_policy"] = json!("tart_required");
+        cases.push(tart_required);
+        let mut promotable = fixture;
+        promotable["experimental_authority"]["output_disposition"] = json!("promotable");
+        cases.push(promotable);
+
+        for value in cases {
+            assert_experimental_v5_invalid(&value);
+        }
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_v5_rejects_trailing_json_and_every_outcome_shape() {
+        let encoded = serde_json::to_string(&experimental_v5_request_value()).expect("fixture");
+        let (_temp, store) = request_store_with_contents(&format!("{encoded} true"));
+        assert!(matches!(
+            store.load("experimental-reader-only"),
+            Err(QueueRequestError::Json(_))
+        ));
+
+        for outcome in [
+            json!({"type": "run", "schema_version": 5, "job_id": "future-run"}),
+            json!({
+                "type": "ship",
+                "schema_version": 5,
+                "job_id": "future-ship",
+                "experimental_authority": {"output_disposition": "quarantined_non_promotable"}
+            }),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let store = QueueOutcomeStore::new(temp.path()).expect("outcome store");
+            std::fs::write(
+                store.path_for(outcome["job_id"].as_str().expect("job id")),
+                serde_json::to_vec(&outcome).expect("outcome fixture"),
+            )
+            .expect("write outcome");
+            assert!(matches!(
+                store.load(outcome["job_id"].as_str().expect("job id")),
+                Err(QueueRequestError::UnsupportedSchema { version: 5 })
+            ));
+        }
+    }
+
+    #[cfg(feature = "experimental-authority-v5")]
+    #[test]
+    fn experimental_feature_does_not_raise_any_writer_or_constructor_ceiling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let request_store = QueueRequestStore::new(temp.path()).expect("request store");
+        let outcome_store = QueueOutcomeStore::new(temp.path()).expect("outcome store");
+        let mut request = run_request();
+        request.targets.clear();
+        let mut envelope =
+            QueuedExecutionEnvelope::from_run_request("writer-ceiling", "/work/repo", &request);
+        let outcome = QueuedExecutionOutcome::run("writer-ceiling");
+        assert_eq!(envelope.schema_version, QUEUED_EXECUTION_SCHEMA_VERSION);
+        assert_eq!(outcome.schema_version(), QUEUED_EXECUTION_SCHEMA_VERSION);
+
+        envelope.schema_version = 5;
+        assert!(matches!(
+            request_store.save(&envelope),
+            Err(QueueRequestError::UnsupportedSchema { version: 5 })
+        ));
+        let future_outcome = QueuedExecutionOutcome::Run {
+            schema_version: 5,
+            job_id: "writer-ceiling".to_owned(),
+        };
+        assert!(matches!(
+            outcome_store.save(&future_outcome),
+            Err(QueueRequestError::UnsupportedSchema { version: 5 })
+        ));
+    }
 
     #[test]
     fn repository_slug_accepts_only_canonical_authenticated_github_origins() {

@@ -15,6 +15,21 @@ Keep this doc in step with `src/ship_state.rs`, `src/ship.rs`,
 **Phase B** (transition tests, see below) and **Phase C** (pre-merge
 doc-sync hook, dedicated CI lane) land in follow-up PRs.
 
+## Compile-disabled schema-v5 refusal boundary
+
+The default-off Cargo feature `experimental-authority-v5` exists only to test
+the original-byte compatibility contract for a future request envelope.
+Official builds omit it and retain the schema-v4 reader ceiling. With the
+feature enabled, the sole valid request-only v5 advisory shape terminates in
+`ExperimentalAuthorityRefused` before it becomes a
+`QueuedExecutionEnvelope`; malformed and non-advisory v5 records fail the
+whole scan closed. There is no v5 writer, outcome schema, digest, queue job,
+state transition, recovery record, projection, dispatcher, or executor path.
+Every v5 outcome remains unsupported. A durable-v5 design must separately own
+all writers, cancellation, supersedence, retention, deletion, recovery, and a
+linearizable per-job transaction before this state-machine map can grow a v5
+edge.
+
 ## Vocabulary note: the state labels are derived
 
 The labels in the diagram below (`STATE_FRESH`, `STATE_IN_FLIGHT`,
