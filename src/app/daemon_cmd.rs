@@ -8,8 +8,8 @@ use serde_json::Value;
 use super::{CliFailure, cli::DaemonCommand};
 use crate::daemon_ipc::read_daemon_status;
 use crate::daemon_runtime::{
-    DaemonRunConfig, DaemonRunError, DaemonSpawnFailedError, SpawnRequest, resolve_repos,
-    run_blocking, spawn_detached, stop_running,
+    DaemonRunConfig, DaemonRunError, DaemonSpawnFailedError, SpawnRequest, normalize_repos,
+    resolve_repos, run_blocking, spawn_detached, stop_running,
 };
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
@@ -35,7 +35,7 @@ pub(super) fn ensure_execution_daemon(
                 ),
             ));
         }
-        let mut configured = status
+        let configured = status
             .get("configured_repos")
             .or_else(|| status.get("registered_repos"))
             .and_then(Value::as_array)
@@ -44,13 +44,10 @@ pub(super) fn ensure_execution_daemon(
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let missing_repo = repos.iter().any(|repo| !configured.contains(repo));
-        if !missing_repo {
+        let requested = normalize_repos(repos);
+        let Some(configured) = configured_repositories_with_missing(configured, &requested) else {
             return Ok(0);
-        }
-        configured.extend(repos);
-        configured.sort();
-        configured.dedup();
+        };
         if !stop_running(&runtime_paths.state_dir) {
             return Err(CliFailure::new(
                 3,
@@ -59,7 +56,23 @@ pub(super) fn ensure_execution_daemon(
         }
         return spawn_execution_daemon(mode, runtime_paths, configured);
     }
-    spawn_execution_daemon(mode, runtime_paths, repos)
+    spawn_execution_daemon(mode, runtime_paths, normalize_repos(repos))
+}
+
+fn configured_repositories_with_missing(
+    configured: Vec<String>,
+    requested: &[String],
+) -> Option<Vec<String>> {
+    let mut configured = normalize_repos(configured);
+    requested
+        .iter()
+        .any(|repo| !configured.contains(repo))
+        .then(|| {
+            configured.extend_from_slice(requested);
+            configured.sort();
+            configured.dedup();
+            configured
+        })
 }
 
 fn spawn_execution_daemon(
@@ -475,9 +488,31 @@ mod tests {
 
     use super::{
         DaemonRefreshError, DaemonRefreshOutcome, RuntimeMode, configured_repos_from_status,
-        daemon_command, execute_daemon_refresh, render_daemon_refresh, render_daemon_refresh_error,
-        render_daemon_start, render_daemon_status, render_daemon_stop, stop_running,
+        configured_repositories_with_missing, daemon_command, execute_daemon_refresh,
+        render_daemon_refresh, render_daemon_refresh_error, render_daemon_start,
+        render_daemon_status, render_daemon_stop, stop_running,
     };
+
+    #[test]
+    fn configured_repository_membership_uses_canonical_policy_identity() {
+        assert_eq!(
+            configured_repositories_with_missing(
+                vec!["generous-corp/pulp".to_owned()],
+                &["generous-corp/pulp".to_owned()],
+            ),
+            None
+        );
+        assert_eq!(
+            configured_repositories_with_missing(
+                vec!["Generous-Corp/Pulp".to_owned()],
+                &["generous-corp/forge".to_owned()],
+            ),
+            Some(vec![
+                "generous-corp/forge".to_owned(),
+                "generous-corp/pulp".to_owned(),
+            ])
+        );
+    }
     #[cfg(unix)]
     use super::{DaemonRunConfig, daemon_run_with_repos, read_daemon_status, run_blocking};
     use crate::app::cli::DaemonCommand;
