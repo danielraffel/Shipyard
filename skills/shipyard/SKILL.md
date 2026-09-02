@@ -5,6 +5,10 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+When updating a durable friction report, reconcile its landed commit, PR, and
+release status in the same change; do not leave historical "local/unpushed"
+claims after the implementation has merged.
+
 ## Metrics authority
 
 When reviewing stewardship scorecards, treat GitHub `created_at` plus
