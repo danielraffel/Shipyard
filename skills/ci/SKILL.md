@@ -5,6 +5,14 @@ description: Cross-platform CI coordination with Shipyard — validates, ships, 
 
 # CI Operations with Shipyard
 
+## Metrics authority
+
+GitHub job `created_at` is the provider-authoritative queue timestamp. Metrics
+imports may persist queue latency only when both `created_at` and `started_at`
+parse successfully; never infer submit-to-receipt, cache reuse, or model-token
+counts from wall-clock duration or logs. Those scorecard dimensions must remain
+explicitly unavailable until authenticated event fields exist.
+
 Shipyard coordinates validation across local, SSH, and cloud targets.
 
 ## Quick reference

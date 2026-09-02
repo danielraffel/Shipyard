@@ -223,6 +223,7 @@ fn record_input(args: MetricsRecordArgs) -> Result<MetricRecordInput, CliFailure
         exit_code: args.exit_code,
         failure_class: args.failure_class,
         external_id: args.external_id,
+        queued_at: None,
         started_at: parse_rfc3339(args.started_at.as_deref())?,
         completed_at: parse_rfc3339(args.completed_at.as_deref())?,
     })
