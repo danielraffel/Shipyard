@@ -63,7 +63,14 @@ const TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
 // escaped setsid descendant instead of returning uncertain with it alive.
 const SENTINEL_TEARDOWN_BUDGET: Duration = Duration::from_secs(10);
 const EXECUTION_SENTINEL_FD_ENV: &str = "SHIPYARD_PROVIDER_SENTINEL_FD";
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
+// macOS cleanup proof invokes host-wide `lsof`. Running several fixtures at
+// once makes that probe miss its bounded deadline on a loaded CI host and
+// reports a false `cleanup-unproven` result. Keep these process-observing
+// fixtures serialized; this is test-only admission control and does not alter
+// production wrapper concurrency.
+const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 1;
+#[cfg(all(test, not(target_os = "macos")))]
 const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 4;
 #[cfg(test)]
 static PROVIDER_EXECUTION_TEST_PERMITS: std::sync::Mutex<usize> =
