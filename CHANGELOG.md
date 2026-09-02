@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01520"></a>
+## [0.152.0] - 2026-09-01
+
+- fix(daemon): canonicalize repository policy identity ([#544](https://github.com/danielraffel/Shipyard/pull/544))
+
 <a id="v01511"></a>
 ## [0.151.1] - 2026-09-01
 
@@ -1309,6 +1314,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.152.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.152.0
 [0.151.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.151.1
 [0.151.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.151.0
 [0.150.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.150.0

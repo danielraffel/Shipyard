@@ -1636,6 +1636,9 @@ Use `shipyard work-ledger policy set` to plan a per-repository platform policy;
 apply requires the exact current revision. The primary platform is explicit
 (use macOS for Pulp, Forge, and Vellum), with a complete repeatable
 `--compatibility-lane` inventory and independent compatibility scheduling.
+Repository identity is canonical lowercase across daemon arguments, handoffs,
+and policy lookup, even when the daemon is launched with GitHub's display-case
+spelling.
 Repeat `--declared-dependency-lane` only for an inventoried lane with a real
 artifact dependency; unknown lanes fail closed and other
 cross-lane blocking requires evidenced shared-integrity fault. A policy row
