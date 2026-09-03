@@ -69,7 +69,10 @@ const EXECUTION_SENTINEL_FD_ENV: &str = "SHIPYARD_PROVIDER_SENTINEL_FD";
 // reports a false `cleanup-unproven` result. Keep these process-observing
 // fixtures serialized; this is test-only admission control and does not alter
 // production wrapper concurrency.
-const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 1;
+// Two concurrent fixtures keep the macOS process-observation probe bounded
+// while preventing a long-running fixture from starving the entire test
+// suite behind a single global permit.
+const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 2;
 #[cfg(all(test, not(target_os = "macos")))]
 const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 4;
 #[cfg(test)]
@@ -86,7 +89,9 @@ impl Drop for ProviderExecutionTestPermit {
     fn drop(&mut self) {
         if let Ok(mut available) = PROVIDER_EXECUTION_TEST_PERMITS.lock() {
             *available += 1;
-            PROVIDER_EXECUTION_TEST_READY.notify_one();
+            // Wake all waiters so a permit is not stranded behind a waiter
+            // whose test thread was descheduled during a loaded suite.
+            PROVIDER_EXECUTION_TEST_READY.notify_all();
         }
     }
 }
