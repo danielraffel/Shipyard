@@ -380,7 +380,7 @@ pub fn collect_orphans(
     now: DateTime<Utc>,
 ) -> Vec<(String, u64, OrphanReport)> {
     store
-        .list_active()
+        .list_in_flight()
         .iter()
         .filter_map(|state| {
             liveness

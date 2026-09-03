@@ -162,7 +162,7 @@ pub fn resolve_repos(state_dir: &Path, explicit_repos: &[String]) -> Vec<String>
     let Ok(store) = ShipStateStore::new(state_dir.join("ship")) else {
         return Vec::new();
     };
-    let states = store.list_active();
+    let states = store.list_in_flight();
     normalize_repos(
         states
             .into_iter()
@@ -3600,6 +3600,41 @@ mod tests {
         let repos = resolve_repos(temp.path(), &[]);
 
         assert_eq!(repos, vec!["owner/repo".to_owned()]);
+    }
+
+    #[test]
+    fn resolve_repos_ignores_terminal_historical_ship_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let live = ShipState::new(151, "owner/live", "feature/x", "main", "a".repeat(40), "p1");
+        let mut terminal = ShipState::new(
+            152,
+            "owner/historical",
+            "feature/y",
+            "main",
+            "b".repeat(40),
+            "p1",
+        );
+        terminal.upsert_run(crate::ship_state::DispatchedRun {
+            target: "cloud".to_owned(),
+            provider: "github".to_owned(),
+            run_id: "152".to_owned(),
+            status: "completed".to_owned(),
+            started_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            attempt: 1,
+            last_heartbeat_at: None,
+            phase: None,
+            required: true,
+        });
+        terminal.update_evidence("cloud", "pass");
+        store.save(&live).expect("live save");
+        store.save(&terminal).expect("terminal save");
+
+        assert_eq!(
+            resolve_repos(temp.path(), &[]),
+            vec!["owner/live".to_owned()]
+        );
     }
 
     #[cfg(unix)]
