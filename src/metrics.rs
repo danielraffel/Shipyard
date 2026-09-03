@@ -841,6 +841,7 @@ fn insert_job(conn: &Connection, job: &JobInsert) -> Result<i64, rusqlite::Error
     Ok(conn.last_insert_rowid())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_step(
     conn: &Connection,
     job_id: i64,
