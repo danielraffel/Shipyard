@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -16,6 +17,8 @@ use crate::metrics::{
     MetricsSummaryRow, github_job_to_record, parse_duration_ms,
 };
 use crate::output::write_pretty_json;
+
+const GITHUB_METRICS_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize)]
 struct MetricsRecordOutput {
@@ -364,10 +367,27 @@ fn github_jobs_api_path(repo: &str, run_id: i64) -> String {
 }
 
 fn gh_json(args: &[String]) -> Result<Value, CliFailure> {
-    let output = Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|error| CliFailure::new(1, format!("gh spawn failed: {error}")))?;
+    gh_json_with_timeout("gh", args, GITHUB_METRICS_OBSERVATION_TIMEOUT)
+}
+
+fn gh_json_with_timeout(
+    program: impl AsRef<Path>,
+    args: &[String],
+    timeout: Duration,
+) -> Result<Value, CliFailure> {
+    // Metrics import is observational and must never strand the invoking
+    // agent behind an unbounded gh subprocess. Capture to regular files so an
+    // escaped descendant cannot keep a pipe reader blocked, and supervise the
+    // complete process tree under one fixed deadline.
+    let mut command = Command::new(program.as_ref());
+    command.args(args);
+    let deadline = Instant::now() + timeout;
+    let output = crate::process::run_output_until(
+        &mut command,
+        deadline,
+        "metrics GitHub observation",
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if !output.status.success() {
         return Err(CliFailure::new(
             u8::try_from(output.status.code().unwrap_or(1)).unwrap_or(1),
@@ -522,6 +542,26 @@ fn _json_debug(value: &impl Serialize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn github_metrics_observation_times_out_escaped_helper() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let helper = temp.path().join("gh");
+        std::fs::write(&helper, "#!/bin/sh\nsleep 2\n")
+            .expect("write helper");
+        let mut permissions = std::fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&helper, permissions).expect("helper permissions");
+
+        let error = gh_json_with_timeout(&helper, &[], Duration::from_millis(50))
+            .expect_err("hung helper must time out");
+        assert!(error.message().contains("timed out"));
+    }
 
     #[test]
     fn github_api_paths_are_absolute() {
