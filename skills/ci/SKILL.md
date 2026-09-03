@@ -21,6 +21,13 @@ parse successfully; never infer submit-to-receipt, cache reuse, or model-token
 counts from wall-clock duration or logs. Those scorecard dimensions must remain
 explicitly unavailable until authenticated event fields exist.
 
+## Version-only release bumps
+
+The CLI version is part of the CI surface map. Even a release-only
+`Cargo.toml`/`Cargo.lock` bump must carry a CI skill note (or an explicit
+`Skill-Update: skip` trailer), so the version and skill-sync gate remains
+truthful on release PRs.
+
 Shipyard coordinates validation across local, SSH, and cloud targets.
 
 ## Quick reference
