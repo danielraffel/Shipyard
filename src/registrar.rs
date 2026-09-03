@@ -1223,7 +1223,7 @@ mod tests {
 
     #[test]
     fn classify_leaves_generic_failure_alone() {
-        let error = super::classify_gh_failure("create", "HTTP 500: server error".to_owned());
+        let error = super::classify_gh_failure("create", "unexpected gh failure".to_owned());
         assert!(!error.is_auth_degraded());
         assert!(!error.is_missing_webhook_scope());
         assert!(matches!(error, super::RegistrarError::GhFailed { .. }));
