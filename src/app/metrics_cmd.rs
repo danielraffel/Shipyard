@@ -382,12 +382,9 @@ fn gh_json_with_timeout(
     let mut command = Command::new(program.as_ref());
     command.args(args);
     let deadline = Instant::now() + timeout;
-    let output = crate::process::run_output_until(
-        &mut command,
-        deadline,
-        "metrics GitHub observation",
-    )
-    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let output =
+        crate::process::run_output_until(&mut command, deadline, "metrics GitHub observation")
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if !output.status.success() {
         return Err(CliFailure::new(
             u8::try_from(output.status.code().unwrap_or(1)).unwrap_or(1),
@@ -550,8 +547,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let helper = temp.path().join("gh");
-        std::fs::write(&helper, "#!/bin/sh\nsleep 2\n")
-            .expect("write helper");
+        std::fs::write(&helper, "#!/bin/sh\nsleep 2\n").expect("write helper");
         let mut permissions = std::fs::metadata(&helper)
             .expect("helper metadata")
             .permissions();
