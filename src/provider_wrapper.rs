@@ -96,8 +96,7 @@ impl Drop for ProviderExecutionTestPermit {
 }
 
 #[cfg(test)]
-fn provider_execution_test_permit(
-) -> Result<ProviderExecutionTestPermit, ProviderWrapperRefusal> {
+fn provider_execution_test_permit() -> Result<ProviderExecutionTestPermit, ProviderWrapperRefusal> {
     let deadline = std::time::Instant::now() + PROVIDER_EXECUTION_TEST_ADMISSION_DEADLINE;
     let mut available = PROVIDER_EXECUTION_TEST_PERMITS
         .lock()
