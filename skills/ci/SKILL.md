@@ -5,6 +5,14 @@ description: Cross-platform CI coordination with Shipyard — validates, ships, 
 
 # CI Operations with Shipyard
 
+## Webhook repository identity
+
+Webhook registrar repository keys are canonical lowercase `owner/name` values
+(surrounding whitespace is ignored). Mixed-case callers therefore reuse the
+same persisted registration and can unregister through any casing. Registrar
+changes must be committed and pushed to the same PR branch so Shipyard validates
+one exact head; do not create a parallel PR or mutate webhooks manually.
+
 ## Metrics authority
 
 GitHub job `created_at` is the provider-authoritative queue timestamp. Metrics

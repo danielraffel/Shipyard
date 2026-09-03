@@ -5,6 +5,14 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+## Webhook repository identity
+
+Webhook registrar repository keys are canonical lowercase `owner/name` values
+(surrounding whitespace is ignored). Mixed-case callers therefore reuse the
+same persisted registration and can unregister through any casing. Registrar
+changes must be committed and pushed to the same PR branch so Shipyard validates
+one exact head; do not create a parallel PR or mutate webhooks manually.
+
 When updating a durable friction report, reconcile its landed commit, PR, and
 release status in the same change; do not leave historical "local/unpushed"
 claims after the implementation has merged.

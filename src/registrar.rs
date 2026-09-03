@@ -234,8 +234,9 @@ impl Registrar {
         url: &str,
         secret: &str,
     ) -> Result<u64, RegistrarError> {
-        let client = self.configured_gh_client(repo)?;
-        self.ensure_registered_with_client(repo, url, secret, &client, None)
+        let repo = canonical_repo(repo);
+        let client = self.configured_gh_client(&repo)?;
+        self.ensure_registered_with_client(&repo, url, secret, &client, None)
     }
 
     /// Idempotently create or update a webhook with an explicit `gh` binary.
@@ -247,8 +248,9 @@ impl Registrar {
         gh_binary: &Path,
     ) -> Result<u64, RegistrarError> {
         validate_gh_binary(gh_binary)?;
+        let repo = canonical_repo(repo);
         let client = GhClient::ambient();
-        self.ensure_registered_with_client(repo, url, secret, &client, Some(gh_binary))
+        self.ensure_registered_with_client(&repo, url, secret, &client, Some(gh_binary))
     }
 
     fn ensure_registered_with_client(
@@ -286,13 +288,14 @@ impl Registrar {
 
     /// Best-effort unregister a repo using `gh` from `PATH` when present.
     pub fn unregister(&mut self, repo: &str) -> Result<(), RegistrarError> {
-        let Some(hook_id) = self.by_repo.get(repo).copied() else {
+        let repo = canonical_repo(repo);
+        let Some(hook_id) = self.by_repo.get(&repo).copied() else {
             return Ok(());
         };
-        if let Some(client) = self.configured_gh_client_optional(Some(repo))? {
-            delete_hook(&client, &self.cwd, None, repo, hook_id)?;
+        if let Some(client) = self.configured_gh_client_optional(Some(&repo))? {
+            delete_hook(&client, &self.cwd, None, &repo, hook_id)?;
         }
-        self.by_repo.remove(repo);
+        self.by_repo.remove(&repo);
         self.save()
     }
 
@@ -302,13 +305,14 @@ impl Registrar {
         repo: &str,
         gh_binary: &Path,
     ) -> Result<(), RegistrarError> {
-        let Some(hook_id) = self.by_repo.get(repo).copied() else {
+        let repo = canonical_repo(repo);
+        let Some(hook_id) = self.by_repo.get(&repo).copied() else {
             return Ok(());
         };
         validate_gh_binary(gh_binary)?;
         let client = GhClient::ambient();
-        delete_hook(&client, &self.cwd, Some(gh_binary), repo, hook_id)?;
-        self.by_repo.remove(repo);
+        delete_hook(&client, &self.cwd, Some(gh_binary), &repo, hook_id)?;
+        self.by_repo.remove(&repo);
         self.save()
     }
 
@@ -395,9 +399,16 @@ fn load_registrations(state_path: &Path) -> BTreeMap<String, u64> {
     };
     records
         .into_iter()
-        .filter(|record| !record.repo.is_empty())
-        .map(|record| (record.repo, record.hook_id))
+        .filter(|record| !record.repo.trim().is_empty())
+        .map(|record| (canonical_repo(&record.repo), record.hook_id))
         .collect()
+}
+
+/// Canonical repository identity used for durable registrar keys and lookups.
+/// GitHub repository slugs are case-insensitive; lowercase prevents duplicate
+/// registrations when callers use mixed-case owner/name spellings.
+fn canonical_repo(repo: &str) -> String {
+    repo.trim().to_ascii_lowercase()
 }
 
 fn create_hook(
@@ -780,6 +791,19 @@ mod tests {
         assert!(registrar.all().is_empty());
     }
 
+    #[test]
+    fn mixed_case_persisted_repository_is_canonicalized() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("daemon").join("registrations.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, r#"[{"repo":" Generous-Corp/PuLp ","hook_id":17}]"#)
+            .expect("write");
+
+        let registrar = Registrar::new(temp.path());
+        assert_eq!(registrar.all().get("generous-corp/pulp"), Some(&17));
+        assert!(!registrar.all().contains_key("Generous-Corp/PuLp"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn creates_updates_deletes_and_persists_hooks() {
@@ -855,6 +879,36 @@ mod tests {
 
         assert!(third_args.contains("-X DELETE"));
         assert!(third_args.contains("repos/owner/repo/hooks/4242"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_case_alias_reuses_and_unregisters_canonical_registration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::Ok);
+        let mut registrar = stub_registrar(temp.path());
+        let id = registrar
+            .ensure_registered_with_gh(
+                "Owner/Repo",
+                "https://shipyard.example/webhook",
+                "secret",
+                &gh,
+            )
+            .expect("create");
+        assert_eq!(id, 4242);
+        let id = registrar
+            .ensure_registered_with_gh(
+                "oWnEr/rEpO",
+                "https://shipyard.example/webhook",
+                "secret",
+                &gh,
+            )
+            .expect("reuse");
+        assert_eq!(id, 4242);
+        registrar
+            .unregister_with_gh("OWNER/REPO", &gh)
+            .expect("unregister alias");
+        assert!(registrar.all().is_empty());
     }
 
     #[cfg(unix)]
