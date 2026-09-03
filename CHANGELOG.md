@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01552"></a>
+## [0.155.2] - 2026-09-02
+
+- fix: canonicalize webhook repository identities (#553) ([#554](https://github.com/danielraffel/Shipyard/pull/554))
+- fix: canonicalize webhook repository identities ([#553](https://github.com/danielraffel/Shipyard/pull/553))
+
 <a id="v01550"></a>
 ## [0.155.0] - 2026-09-02
 
@@ -1346,6 +1352,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.155.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.2
 [0.155.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.0
 [0.154.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.154.0
 [0.153.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.153.1
