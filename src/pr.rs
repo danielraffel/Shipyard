@@ -156,7 +156,15 @@ pub fn find_pr_for_head(
     let client = gh_client(config)?;
     let output = gh(&client, cwd, gh_command)?
         .args([
-            "pr", "list", "--base", base, "--state", "open", "--limit", "100", "--json",
+            "pr",
+            "list",
+            "--base",
+            base,
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
             PR_JSON_FIELDS,
         ])
         .current_dir(cwd)
@@ -771,11 +779,10 @@ fn nested_string_field(value: &Value, path: &[&str]) -> Result<String, PrError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        PrInfo, is_graphql_pr_create_integration_blocked, is_graphql_rate_limited,
-        is_integration_blocked, parse_github_remote_slug, parse_pr_checkout_info,
-        parse_pr_checkout_rest_info, parse_pr_info, parse_pr_list, parse_pr_rest_info,
-        parse_pr_rest_list, selector_pr_number, url_encode,
-        select_unique_head_match,
+        is_graphql_pr_create_integration_blocked, is_graphql_rate_limited, is_integration_blocked,
+        parse_github_remote_slug, parse_pr_checkout_info, parse_pr_checkout_rest_info,
+        parse_pr_info, parse_pr_list, parse_pr_rest_info, parse_pr_rest_list,
+        select_unique_head_match, selector_pr_number, url_encode, PrInfo,
     };
 
     const GRAPHQL_PR: &str = r#"{
@@ -850,13 +857,10 @@ mod tests {
             "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "baseRefName": "main"
         }]);
-        let info = select_unique_head_match(
-            &value,
-            "main",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .expect("unique match")
-        .expect("PR");
+        let info =
+            select_unique_head_match(&value, "main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("unique match")
+                .expect("PR");
         assert_eq!(info.number, 7);
         assert_eq!(info.branch, "renamed-branch");
     }
@@ -867,12 +871,9 @@ mod tests {
             {"number": 7, "url":"u/7", "title":"a", "state":"OPEN", "headRefName":"a", "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "baseRefName":"main"},
             {"number": 8, "url":"u/8", "title":"b", "state":"OPEN", "headRefName":"b", "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "baseRefName":"main"}
         ]);
-        let error = select_unique_head_match(
-            &value,
-            "main",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .expect_err("duplicate must refuse");
+        let error =
+            select_unique_head_match(&value, "main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect_err("duplicate must refuse");
         assert!(error.to_string().contains("multiple open PRs"));
     }
 
@@ -882,13 +883,10 @@ mod tests {
             {"number": 7, "url":"u/7", "title":"other", "state":"OPEN", "headRefName":"a", "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "baseRefName":"develop"},
             {"number": 8, "url":"u/8", "title":"wanted", "state":"OPEN", "headRefName":"b", "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "baseRefName":"main"}
         ]);
-        let info = select_unique_head_match(
-            &value,
-            "main",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .expect("base-filtered match")
-        .expect("PR");
+        let info =
+            select_unique_head_match(&value, "main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("base-filtered match")
+                .expect("PR");
         assert_eq!(info.number, 8);
     }
 
