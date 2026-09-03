@@ -1830,6 +1830,13 @@ A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever the ma
 
 ## Bypass trailers (tip commit)
 
+### Bounded metrics observation
+
+`shipyard metrics import github` is observational and supervises each GitHub CLI
+request under a fixed process-tree deadline. A timeout is an incomplete
+observation, not a zero-job or failure result; preserve the nonzero refusal and
+retry only through a later bounded invocation.
+
 | Gate          | Trailer                                                      |
 |---------------|--------------------------------------------------------------|
 | Version bump  | `Version-Bump: <surface>=<patch\|minor\|major\|skip> reason="..."` |
