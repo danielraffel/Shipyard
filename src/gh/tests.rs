@@ -607,7 +607,10 @@ fn configured_ambient_binary_is_used_by_default_policy() {
 
     assert_eq!(
         command.get_program(),
-        native_gh.canonicalize().expect("canonical native gh").as_os_str()
+        native_gh
+            .canonicalize()
+            .expect("canonical native gh")
+            .as_os_str()
     );
 }
 

@@ -796,8 +796,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("daemon").join("registrations.json");
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        fs::write(&path, r#"[{"repo":" Generous-Corp/PuLp ","hook_id":17}]"#)
-            .expect("write");
+        fs::write(&path, r#"[{"repo":" Generous-Corp/PuLp ","hook_id":17}]"#).expect("write");
 
         let registrar = Registrar::new(temp.path());
         assert_eq!(registrar.all().get("generous-corp/pulp"), Some(&17));
