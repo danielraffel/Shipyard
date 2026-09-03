@@ -204,14 +204,12 @@ impl RegistrarError {
         }
     }
 
-    #[must_use]
     /// True when GitHub no longer has the repository or hook endpoint.
     #[must_use]
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::RemoteNotFound { .. })
     }
 
-    #[must_use]
     /// True when the failure is retryable without changing local state.
     #[must_use]
     pub fn is_transient(&self) -> bool {
