@@ -290,8 +290,15 @@ impl Registrar {
         gh_binary: Option<&Path>,
     ) -> Result<u64, RegistrarError> {
         if let Some(hook_id) = self.by_repo.get(repo).copied() {
-            update_hook(client, &self.cwd, gh_binary, repo, hook_id, url, secret)?;
-            return Ok(hook_id);
+            match update_hook(client, &self.cwd, gh_binary, repo, hook_id, url, secret) {
+                Ok(()) => return Ok(hook_id),
+                Err(RegistrarError::RemoteNotFound { .. }) => {
+                    // The persisted remote hook was deleted out of band.
+                    // Drop only this stale binding and reconcile by URL below.
+                    self.by_repo.remove(repo);
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let matching = list_matching_hooks(client, &self.cwd, gh_binary, repo, url)?;
