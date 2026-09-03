@@ -1235,9 +1235,16 @@ mod tests {
         assert!(missing.is_not_found());
         assert!(!missing.is_transient());
 
-        for output in ["HTTP 429: rate limit", "HTTP 503: Service Unavailable", "request timed out"] {
+        for output in [
+            "HTTP 429: rate limit",
+            "HTTP 503: Service Unavailable",
+            "request timed out",
+        ] {
             let error = super::classify_gh_failure("patch", output.to_owned());
-            assert!(error.is_transient(), "expected transient classification: {output}");
+            assert!(
+                error.is_transient(),
+                "expected transient classification: {output}"
+            );
         }
     }
 
