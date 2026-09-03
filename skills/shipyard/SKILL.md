@@ -2468,6 +2468,13 @@ and distribution eligibility to the lock.
 
 ## Cutover Discipline
 
+### Bounded metrics observation
+
+`shipyard metrics import github` is observational and supervises each GitHub CLI
+request under a fixed process-tree deadline. A timeout is an incomplete
+observation, not a zero-job or failure result; preserve the nonzero refusal and
+retry only through a later bounded invocation.
+
 For native continuation delivery, require fresh exact PR head/base SHA and the
 numeric repository-scoped GitHub App installation identity. Treat cmux labels
 as provenance only: delivery authority is a unique local process/surface plus
