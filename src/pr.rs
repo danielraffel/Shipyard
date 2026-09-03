@@ -779,10 +779,10 @@ fn nested_string_field(value: &Value, path: &[&str]) -> Result<String, PrError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_graphql_pr_create_integration_blocked, is_graphql_rate_limited, is_integration_blocked,
-        parse_github_remote_slug, parse_pr_checkout_info, parse_pr_checkout_rest_info,
-        parse_pr_info, parse_pr_list, parse_pr_rest_info, parse_pr_rest_list,
-        select_unique_head_match, selector_pr_number, url_encode, PrInfo,
+        PrInfo, is_graphql_pr_create_integration_blocked, is_graphql_rate_limited,
+        is_integration_blocked, parse_github_remote_slug, parse_pr_checkout_info,
+        parse_pr_checkout_rest_info, parse_pr_info, parse_pr_list, parse_pr_rest_info,
+        parse_pr_rest_list, select_unique_head_match, selector_pr_number, url_encode,
     };
 
     const GRAPHQL_PR: &str = r#"{
