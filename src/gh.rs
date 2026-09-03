@@ -144,6 +144,12 @@ impl GhClient {
                 })?,
                 None => self.resolve_ambient_gh_binary()?,
             })
+        } else if binary_override.is_none() && self.auth.ambient_gh_binary.is_some() {
+            // The default policy may still use a configured native executable.
+            // Falling back to `Command::new("gh")` here bypasses the private
+            // absolute-path binding and fails on hosts where `gh` is only an
+            // interactive shell function or lives outside the child PATH.
+            Some(self.resolve_ambient_gh_binary()?)
         } else {
             None
         };
