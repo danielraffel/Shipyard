@@ -96,7 +96,8 @@ impl Drop for ProviderExecutionTestPermit {
 }
 
 #[cfg(test)]
-fn provider_execution_test_permit() -> Result<ProviderExecutionTestPermit, ProviderWrapperRefusal> {
+fn provider_execution_test_permit(
+) -> Result<ProviderExecutionTestPermit, ProviderWrapperRefusal> {
     let deadline = std::time::Instant::now() + PROVIDER_EXECUTION_TEST_ADMISSION_DEADLINE;
     let mut available = PROVIDER_EXECUTION_TEST_PERMITS
         .lock()
@@ -104,14 +105,18 @@ fn provider_execution_test_permit() -> Result<ProviderExecutionTestPermit, Provi
     while *available == 0 {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err(refusal("provider wrapper test fixture admission deadline exceeded"));
+            return Err(refusal(
+                "provider wrapper test fixture admission deadline exceeded",
+            ));
         }
         let (next, timeout) = PROVIDER_EXECUTION_TEST_READY
             .wait_timeout(available, remaining)
             .map_err(|_| refusal("provider wrapper test execution permits are poisoned"))?;
         available = next;
         if timeout.timed_out() && *available == 0 {
-            return Err(refusal("provider wrapper test fixture admission deadline exceeded"));
+            return Err(refusal(
+                "provider wrapper test fixture admission deadline exceeded",
+            ));
         }
     }
     *available -= 1;
