@@ -136,10 +136,18 @@ impl std::fmt::Display for RegistrarError {
                 )
             }
             Self::RemoteNotFound { action, output } => {
-                write!(formatter, "{action} hook target not found: {}", output.trim())
+                write!(
+                    formatter,
+                    "{action} hook target not found: {}",
+                    output.trim()
+                )
             }
             Self::Transient { action, output } => {
-                write!(formatter, "{action} hook temporarily unavailable: {}", output.trim())
+                write!(
+                    formatter,
+                    "{action} hook temporarily unavailable: {}",
+                    output.trim()
+                )
             }
             Self::MissingHookId(output) => {
                 write!(
@@ -663,14 +671,18 @@ fn classify_gh_failure(action: &'static str, output: String) -> RegistrarError {
 
 fn mentions_not_found(output: &str) -> bool {
     let lowered = output.to_ascii_lowercase();
-    lowered.contains("http 404") || lowered.contains("404 not found") || lowered.contains("not found")
+    lowered.contains("http 404")
+        || lowered.contains("404 not found")
+        || lowered.contains("not found")
 }
 
 fn mentions_transient(output: &str) -> bool {
     let lowered = output.to_ascii_lowercase();
-    ["http 408", "http 409", "http 429", "http 500", "http 502", "http 503", "http 504"]
-        .iter()
-        .any(|status| lowered.contains(status))
+    [
+        "http 408", "http 409", "http 429", "http 500", "http 502", "http 503", "http 504",
+    ]
+    .iter()
+    .any(|status| lowered.contains(status))
         || lowered.contains("timed out")
         || lowered.contains("temporarily unavailable")
 }
