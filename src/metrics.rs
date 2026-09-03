@@ -854,7 +854,15 @@ fn insert_step(
     conn.execute(
         "INSERT INTO steps (job_id, step, started_at, completed_at, duration_ms, status, cache_hit)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![job_id, step, started_at, completed_at, duration_ms, status, cache_hit],
+        params![
+            job_id,
+            step,
+            started_at,
+            completed_at,
+            duration_ms,
+            status,
+            cache_hit
+        ],
     )?;
     Ok(())
 }
