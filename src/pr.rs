@@ -143,6 +143,115 @@ pub fn find_pr_for_branch(
     parse_pr_list(&text)
 }
 
+/// Find an open PR for an exact head SHA and base branch, regardless of the
+/// source branch name. A unique match is safe to reuse; duplicate matches are
+/// refused so callers cannot attach work to an ambiguous PR.
+pub fn find_pr_for_head(
+    config: &LoadedConfig,
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    base: &str,
+    head_sha: &str,
+) -> Result<Option<PrInfo>, PrError> {
+    let client = gh_client(config)?;
+    let output = gh(&client, cwd, gh_command)?
+        .args([
+            "pr", "list", "--base", base, "--state", "open", "--limit", "100", "--json",
+            PR_JSON_FIELDS,
+        ])
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| PrError::new(format!("gh pr list failed to start: {error}")))?;
+    if !output.status.success() {
+        let message = stderr_or_stdout(&output);
+        if is_graphql_rate_limited(&message) {
+            report_rate_limit_fallback_with_client(&client, "gh pr list", cwd);
+            return find_pr_for_head_rest(&client, cwd, gh_command, base, head_sha);
+        }
+        return Err(PrError::new(format!("gh pr list failed: {message}")));
+    }
+    let value = serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|error| PrError::new(format!("failed to parse gh pr list JSON: {error}")))?;
+    select_unique_head_match(&value, base, head_sha)
+}
+
+fn find_pr_for_head_rest(
+    client: &GhClient,
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    base: &str,
+    head_sha: &str,
+) -> Result<Option<PrInfo>, PrError> {
+    let repo = repo_slug(cwd)?;
+    let endpoint = format!(
+        "repos/{repo}/pulls?base={}&state=open&per_page=100",
+        url_encode(base)
+    );
+    let output = gh(client, cwd, gh_command)?
+        .args(["api", "-X", "GET"])
+        .arg(&endpoint)
+        .output()
+        .map_err(|error| PrError::new(format!("gh REST PR lookup failed to start: {error}")))?;
+    if !output.status.success() {
+        return Err(PrError::new(format!(
+            "gh REST PR lookup failed after GraphQL rate limit: {}",
+            stderr_or_stdout(&output)
+        )));
+    }
+    let value = serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|error| PrError::new(format!("failed to parse REST PR list JSON: {error}")))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| PrError::new("REST PR list JSON was not an array"))?;
+    let matches = items
+        .iter()
+        .filter(|item| {
+            item.get("head")
+                .and_then(|head| head.get("sha"))
+                .and_then(Value::as_str)
+                == Some(head_sha)
+                && item
+                    .get("base")
+                    .and_then(|base| base.get("ref"))
+                    .and_then(Value::as_str)
+                    == Some(base)
+        })
+        .map(parse_pr_rest_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    match matches.as_slice() {
+        [] => Ok(None),
+        [info] => Ok(Some(info.clone())),
+        _ => Err(PrError::new(format!(
+            "multiple open PRs match base {base:?} and head {head_sha}; refusing ambiguous reuse"
+        ))),
+    }
+}
+
+fn select_unique_head_match(
+    value: &Value,
+    base: &str,
+    head_sha: &str,
+) -> Result<Option<PrInfo>, PrError> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| PrError::new("gh pr list JSON was not an array"))?;
+    let matches = items
+        .iter()
+        .filter(|item| {
+            item.get("headRefOid").and_then(Value::as_str) == Some(head_sha)
+                && item.get("baseRefName").and_then(Value::as_str) == Some(base)
+        })
+        .map(parse_pr_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    match matches.as_slice() {
+        [] => Ok(None),
+        [info] => Ok(Some(info.clone())),
+        _ => Err(PrError::new(format!(
+            "multiple open PRs match base {base:?} and head {head_sha}; refusing ambiguous reuse"
+        ))),
+    }
+}
+
 /// Create a PR and normalize its metadata through `gh pr view`.
 pub fn create_pr(
     config: &LoadedConfig,
@@ -240,7 +349,7 @@ fn get_pr_status_with_client(
     parse_pr_info(&String::from_utf8_lossy(&output.stdout))
 }
 
-const PR_JSON_FIELDS: &str = "number,url,title,state,headRefName,baseRefName";
+const PR_JSON_FIELDS: &str = "number,url,title,state,headRefName,headRefOid,baseRefName";
 const PR_CHECKOUT_JSON_FIELDS: &str = "number,url,title,state,headRefName,headRefOid,baseRefName";
 
 fn gh_client(config: &LoadedConfig) -> Result<GhClient, PrError> {
@@ -666,6 +775,7 @@ mod tests {
         is_integration_blocked, parse_github_remote_slug, parse_pr_checkout_info,
         parse_pr_checkout_rest_info, parse_pr_info, parse_pr_list, parse_pr_rest_info,
         parse_pr_rest_list, selector_pr_number, url_encode,
+        select_unique_head_match,
     };
 
     const GRAPHQL_PR: &str = r#"{
@@ -727,6 +837,59 @@ mod tests {
             .number,
             7
         );
+    }
+
+    #[test]
+    fn exact_head_match_reuses_unique_pr_regardless_of_branch() {
+        let value = serde_json::json!([{
+            "number": 7,
+            "url": "https://github.com/o/r/pull/7",
+            "title": "Ship it",
+            "state": "OPEN",
+            "headRefName": "renamed-branch",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "baseRefName": "main"
+        }]);
+        let info = select_unique_head_match(
+            &value,
+            "main",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("unique match")
+        .expect("PR");
+        assert_eq!(info.number, 7);
+        assert_eq!(info.branch, "renamed-branch");
+    }
+
+    #[test]
+    fn exact_head_match_refuses_duplicates() {
+        let value = serde_json::json!([
+            {"number": 7, "url":"u/7", "title":"a", "state":"OPEN", "headRefName":"a", "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "baseRefName":"main"},
+            {"number": 8, "url":"u/8", "title":"b", "state":"OPEN", "headRefName":"b", "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "baseRefName":"main"}
+        ]);
+        let error = select_unique_head_match(
+            &value,
+            "main",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect_err("duplicate must refuse");
+        assert!(error.to_string().contains("multiple open PRs"));
+    }
+
+    #[test]
+    fn exact_head_match_filters_base_even_when_api_returns_extra_rows() {
+        let value = serde_json::json!([
+            {"number": 7, "url":"u/7", "title":"other", "state":"OPEN", "headRefName":"a", "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "baseRefName":"develop"},
+            {"number": 8, "url":"u/8", "title":"wanted", "state":"OPEN", "headRefName":"b", "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "baseRefName":"main"}
+        ]);
+        let info = select_unique_head_match(
+            &value,
+            "main",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("base-filtered match")
+        .expect("PR");
+        assert_eq!(info.number, 8);
     }
 
     #[test]
