@@ -91,7 +91,7 @@ real ship-state write from overlapping that audit.
 | `policy_signature`  | SHA-256[:16] of (required_platforms, target_names, mode) at dispatch. Drift refuses resume. |
 | `dispatched_runs`   | List of `DispatchedRun`. Upsert key is `(target, run_id)`, not just `target` — a single target can hold multiple rows if a new run id was issued (e.g. from a peer dispatch under the same state). Phase B should either add deduplication logic or document the multi-row invariant. |
 | `evidence_snapshot` | `{target: "pass" | "fail"}` written by `_update_ship_state_from_job` (cli.py:4576). No other values are ever written by the normal path — `"pending"` is accepted by `_ship_terminal_verdict` but never produced. |
-| `attempt`           | Intended to be a monotonic counter bumped on `--no-resume`. **Currently broken** — see T8 and "Bugs discovered by this audit" below. |
+| `attempt`           | Monotonic attempt counter bumped on `--no-resume`; the value is carried into the replacement state so old attempts do not reattach. |
 | `pr_url`, `pr_title`, `commit_subject` | Human context. Refreshed by the `ship` resume path (cli.py:2679) on each invocation; NOT refreshed by add-lane's `save` (cli.py:2359) or by `_update_ship_state_from_job`. Test coverage: `ship-state show` after a force-push + `shipyard ship` resume should see updated fields; after a `cloud add-lane` against the same state, should not. |
 | `created_at`        | Attempt-scoped: stable for the life of an attempt.                                  |
 | `updated_at`        | Last `touch()` — bumped after every mutation helper.                                |
@@ -106,7 +106,7 @@ real ship-state write from overlapping that audit.
 | `provider`           | Dispatch channel or backend label: `namespace`, `github-hosted`, `ssh`, `ssh-windows`, `local`, `host_pool`, etc. |
 | `run_id`             | GH Actions run ID for cloud, Shipyard job id for local/SSH/host-pool work, or `pending-<target>` when `cloud add-lane` couldn't discover the real run id. **No code backfills this sentinel today** — `watch` is read-only with respect to ship state (cli.py:3497). |
 | `status`             | Last observed lifecycle string. `cloud add-lane` records `queued`; the Rust ship worker mirrors terminal target results as `completed` or `failed`. `reused` is **not** a valid `DispatchedRun.status` — cross-PR evidence reuse synthesizes a `TargetStatus.PASS` with `backend="reused"` (cli.py:4510) and persists it as `status="completed"` (cli.py:4586). |
-| `attempt`            | `ShipState.attempt` at dispatch time. Intended to survive resume so old attempts don't reattach, but coupled to the broken `attempt` counter from T8. |
+| `attempt`            | `ShipState.attempt` at dispatch time. Survives resume and increments for each `--no-resume` replacement so old attempts do not reattach. |
 | `last_heartbeat_at`  | Additive liveness signal (default `None`) — written by the poller via `_update_ship_state_from_job`, used by `watch` to mark `stale` runs. |
 | `phase`              | Additive validation-phase tag (setup/configure/build/test, default `None`), same source as `last_heartbeat_at`. |
 | `required`           | Lane policy **at dispatch time**, snapshotted in `DispatchedRun.required` by add-lane (cli.py:2357) and by `_update_ship_state_from_job` (cli.py:4593). `from_dict` defaults to `True` for legacy files written before #87. `_ship_terminal_verdict` reads this persisted value (cli.py:3809) to decide which failures tolerate. |
@@ -157,11 +157,10 @@ real ship-state write from overlapping that audit.
               │ evidence AND   │      │ evidence       │      └──────┬─────────┘
               │ every present  │      │                │             │
               │ value is       │      │                │             │ archive_and_replace
-              │ terminal       │      │                │             │ (BUG: returned
-              │                │      │                │             │  replacement with
-              │ ⚠ see Bug B1:  │      │                │             │  bumped attempt is
-              │  partial       │      │                │             │  discarded; fresh
-              │  coverage can  │      │                │             │  state uses attempt=1)
+              │ terminal       │      │                │             │ (replacement carries
+              │                │      │                │             │  the incremented
+              │ ⚠ see Bug B1:  │      │                │             │  attempt counter;
+              │  partial       │      │                │             │  state is persisted)
               │  be false-PASS │      │                │             ▼
               └──────┬─────────┘      └──────┬─────────┘      ┌────────────────┐
                      │                       │                 │ STATE_FRESH    │
@@ -222,7 +221,7 @@ real ship-state write from overlapping that audit.
 | `shipyard pr` metadata-only authority | Trusted machine-global `[metadata_authority]` repository policy; exact protected base/head/tree/merge base and complete changed-path closure; configured hosted checks terminal green at the exact head | Replaces native targets with an immutable metadata receipt, so the scheduler allocates no local worker, VM, configure, build, or test capacity. The daemon reloads trusted policy and rechecks the local head/tree plus live GitHub head/check state before accepting the zero-target job. Unknown paths, incomplete observations, stale or duplicate checks, SHA drift, malformed policy, or missing provenance preserve ordinary full validation at submission or refuse stale execution. Tracked project and checkout-local config cannot activate or widen this authority. |
 | `shipyard pr` with provenance and/or steward handoff | Project `[pr.provenance]` argv plus the submitting process environment; protected `origin/<base>:.shipyard/config.toml`, or explicit `--workstream-id` / `--context-url` / private `--launch-profile` | After the exact PR and head are resolved, runs the configured provenance hook before any durable receipt or validation dispatch. A required hook failure exits with no steward status/label or queued validation. On success, the handoff first persists private crash-consistent intent, writes `shipyard/steward-handoff`, revalidates the open PR and exact head, adds `shipyard:managed`, and advances the private receipt to ready/managed. With an exact launch profile and enabled trusted consumer it then publishes a zero-wake canonical ledger obligation and only afterward reports `monitoring_transferred=true`; provider delivery cannot decide disposition. `continue` is the default, while `pause` requires a digest-bound durable task graph proving no independent runnable work. Public status exposes only an opaque route id. Replay is idempotent. Explicit `shipyard ship --pr` recovery does not rerun submitter provenance. |
 | `shipyard ship` (fresh)     | `ShipStateStore.get_scoped(repo, pr)` (auto-resume decision; returns None) | Saves fresh state BEFORE preflight (cli.py:2675). Calls `_update_ship_state_from_job` once after `_execute_job` ends. `archive_scoped(repo, pr)` on MERGED. |
-| `shipyard ship --no-resume` | Same                                                | `ShipStateStore.archive_and_replace(state)` archives prior attempt; then a new `ShipState(...)` is constructed with `attempt=1` (see Bug B2). |
+| `shipyard ship --no-resume` | Same                                                | `ShipStateStore.archive_and_replace(state)` archives the prior attempt and returns a replacement carrying the incremented attempt counter; the CLI persists that replacement. |
 | `shipyard ship --resume`    | Refuses on SHA/policy drift via `_detect_ship_state_drift` | Refreshes `pr_url` / `pr_title` / `commit_subject` on the existing state and saves (cli.py:2679–2689). |
 | `shipyard cloud add-lane`   | `ShipStateStore.get_scoped(repo, pr)`; verdict check; idempotent `has_target` | `append_run` + `save`. Does NOT refresh human-context fields. |
 | `shipyard cloud retarget`   | None (the command operates on the live GH Actions run; it does not load `ShipState` at all) | **None** — cancels old job, dispatches new workflow; never writes `ShipState`. See T9 + Bug B3. |
@@ -419,12 +418,13 @@ authoritative even when an unrelated hosted check has a similar target name.
 ### T8 — Force-restart via `--no-resume`
 
 - **From:** any existing state for `<pr>` (FRESH / IN_FLIGHT / VERDICT_*)
-- **To:** prior state archived; new `STATE_FRESH` created with `attempt=1` (see bug below)
+- **To:** prior state archived; new `STATE_FRESH` created with the incremented attempt counter.
 - **Trigger:** `shipyard ship --no-resume`
 - **Writes:**
-  1. `ship_state_store.archive_and_replace(existing_state)` at cli.py:2644. The call **archives the prior state and returns a new `ShipState` with `attempt+1`** — but the caller discards the return value.
-  2. The CLI then sets `existing_state = None` and falls through to cli.py:2663 where a fresh `ShipState(...)` is constructed with no `attempt=` kwarg, defaulting to `attempt=1`.
-- **⚠ Known bug — Bug B2.** Every `--no-resume` resets the attempt counter. Phase B test: assert `attempt` is `N+1` after N `--no-resume` invocations; today it stays at 1.
+  1. `ship_state_store.archive_and_replace(existing_state)` archives the prior state and returns a new `ShipState` with `attempt+1`.
+  2. The CLI persists that returned replacement as the fresh state, preserving the monotonic counter.
+The former reset-to-one behavior was Bug B2; it is fixed and covered by the
+`TestB2_NoResumeAttemptCounter` regression.
 - **Failure modes**
   - `archive` succeeds but the subsequent `save(fresh_state)` at cli.py:2675 fails → the prior attempt is archived and no active state file exists for the PR, effectively the "no state" branch. *Recovery: a fresh `shipyard ship` creates a new state.*
   - `archive` fails (disk) → the prior state file remains active; no new attempt started.

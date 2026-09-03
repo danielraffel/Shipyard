@@ -186,7 +186,7 @@ where
     let Ok(store) = ShipStateStore::new(state_dir.join("ship")) else {
         return report;
     };
-    for state in store.list_active() {
+    for state in store.list_in_flight() {
         if ship_terminal_verdict(&state).is_some() {
             continue;
         }
