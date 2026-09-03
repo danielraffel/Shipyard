@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01560"></a>
+## [0.156.0] - 2026-09-03
+
+- fix: make PR and recovery stewardship exact-head aware ([#558](https://github.com/danielraffel/Shipyard/pull/558))
+
 <a id="v01553"></a>
 ## [0.155.3] - 2026-09-02
 
@@ -1357,6 +1362,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.156.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.156.0
 [0.155.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.3
 [0.155.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.2
 [0.155.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.0
