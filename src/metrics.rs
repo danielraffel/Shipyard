@@ -43,6 +43,8 @@ pub struct MetricRecordInput {
     pub queued_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Authoritative cache reuse observation for this step, when supplied.
+    pub cache_hit: Option<bool>,
 }
 
 /// One grouped timing summary row.
@@ -354,6 +356,7 @@ impl MetricsStore {
             Some(&completed_at_text),
             input.duration_ms,
             &input.status,
+            input.cache_hit,
         )?;
         Ok(job_id)
     }
@@ -846,11 +849,12 @@ fn insert_step(
     completed_at: Option<&str>,
     duration_ms: i64,
     status: &str,
+    cache_hit: Option<bool>,
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO steps (job_id, step, started_at, completed_at, duration_ms, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![job_id, step, started_at, completed_at, duration_ms, status],
+        "INSERT INTO steps (job_id, step, started_at, completed_at, duration_ms, status, cache_hit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![job_id, step, started_at, completed_at, duration_ms, status, cache_hit],
     )?;
     Ok(())
 }
@@ -955,6 +959,7 @@ fn refresh_existing_job(
             Some(&completed_at),
             input.duration_ms,
             &input.status,
+            input.cache_hit,
         )?;
     }
     Ok(())
@@ -988,6 +993,7 @@ fn import_phases(
                 None,
                 ms,
                 value_str(value, "status").unwrap_or("unknown"),
+                value.get("cache_hit").and_then(Value::as_bool),
             )?;
         }
     }
