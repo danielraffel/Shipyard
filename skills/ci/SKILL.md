@@ -1952,9 +1952,7 @@ between service batches preserves already completed safe shutdown but forbids
 remaining mutations and terminal-state publication. This host-local hold does
 not prove GitHub persistent-runner drain, lease/VM idleness, or host capacity;
 those independent fail-closed gates remain required.
-
-### Stewardship recovery note
-
-Exact-head PR deduplication and terminal ship-state filtering are intentionally
-implemented in Shipyard and validated by focused CI; callers must preserve the
-same head/base identity and must not infer readiness from historical records.
+**Webhook failures are typed.** Registrar 404/not-found and retryable
+408/409/429/5xx/timeout outcomes remain distinct from scope/auth failures;
+persisted stale bindings are reconciled only after exact remote evidence is
+re-read.

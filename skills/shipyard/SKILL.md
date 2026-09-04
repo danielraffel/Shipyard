@@ -2493,3 +2493,7 @@ asking for go/no-go, ensure:
   or explicitly risk-accepted.
 - Signing/notarization and rollback paths are validated.
 - Documentation changes for Shipyard, GUI, and Pulp/consumer pins are tracked.
+**Webhook failures are typed.** Registrar 404/not-found and retryable
+408/409/429/5xx/timeout outcomes remain distinct from scope/auth failures;
+persisted stale bindings are reconciled only after exact remote evidence is
+re-read.
