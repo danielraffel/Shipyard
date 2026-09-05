@@ -84,6 +84,8 @@ pub mod fleet_escalation;
 pub mod fleet_guards;
 /// Typed relay assertions: does every declared hop connect inside its budget?
 pub mod fleet_relay;
+/// Bounded self-heal gate: is a corrective action provably safe to take?
+pub mod fleet_selfheal;
 /// Typed service assertions: is a declared lane actually being served?
 pub mod fleet_service;
 /// Typed slot assertions: is a free macOS VM slot being withheld, and why?
