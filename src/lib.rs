@@ -77,6 +77,8 @@ pub(crate) mod execution_termination;
 pub mod executor;
 /// Fail-closed check that a host has converged to the declared fleet epoch.
 pub mod fleet_epoch;
+/// The leak assertion: a live object whose subject already ended is a defect.
+pub mod fleet_lifecycle;
 /// Typed relay assertions: does every declared hop connect inside its budget?
 pub mod fleet_relay;
 /// Typed service assertions: is a declared lane actually being served?

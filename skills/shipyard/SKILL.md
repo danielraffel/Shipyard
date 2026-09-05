@@ -1051,6 +1051,15 @@ against budget, never as a boolean. When reproducing a proxy fault, do NOT use
 `env -i`: it strips the `*_proxy` variables, so the control is cleaner than the
 thing it controls for and passes every time.
 
+**A live object whose subject already ended is a defect**, and handing work to
+Shipyard is only safe if it hands back. Judge anything long-running against
+that: absence is never success (a vanished state, an empty probe and a
+not-found subject are all INDETERMINATE, never exit 0 — a false success for a
+PR closed *without* merging is worse than never exiting); the authority decides
+terminality in both directions, so local evidence being complete never ends an
+open subject; and the losing signal is always recorded, because a rule that
+drops it makes a false terminal impossible to debug later.
+
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
