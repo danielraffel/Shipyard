@@ -82,13 +82,16 @@ pub mod fleet_escalation;
 /// Typed guard assertions: is a declared guard actually armed on the host, and
 /// is the installed copy still the one the repo believes it deployed?
 pub mod fleet_guards;
+/// Typed service assertions: is a declared lane actually being served?
+/// Reconcile a host-health claim against evidence that the host is serving,
+/// so a confidently wrong verdict cannot remove a working host from rotation.
+pub mod fleet_health_reconciliation;
 /// The leak assertion: a live object whose subject already ended is a defect.
 pub mod fleet_lifecycle;
 /// Typed relay assertions: does every declared hop connect inside its budget?
 pub mod fleet_relay;
 /// Bounded self-heal gate: is a corrective action provably safe to take?
 pub mod fleet_selfheal;
-/// Typed service assertions: is a declared lane actually being served?
 pub mod fleet_service;
 /// Typed slot assertions: is a free macOS VM slot being withheld, and why?
 pub mod fleet_slot;
