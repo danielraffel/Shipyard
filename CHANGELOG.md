@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01750"></a>
+## [0.175.0] - 2026-09-04
+
+- fix(fleet): gate the escalation test helper for unix, unbreaking Windows ([#572](https://github.com/danielraffel/Shipyard/pull/572))
+- feat(fleet): carry the escalation off-host — actually open, edit and close the issue ([#570](https://github.com/danielraffel/Shipyard/pull/570))
+
 <a id="v01660"></a>
 ## [0.166.0] - 2026-09-04
 
@@ -1395,6 +1401,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.175.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.175.0
 [0.166.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.166.0
 [0.161.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.161.0
 [0.160.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.160.0
