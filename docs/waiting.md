@@ -46,6 +46,24 @@ job waits do not need a network fallback.
 | 7 | unsupported scope — rulesets / merge-queue detected |
 | 130 | SIGINT / SIGTERM |
 
+**These codes are `wait`'s, and they are not `watch`'s.** The two commands
+answer different questions and number their outcomes independently:
+
+| Code | `wait` | `watch` |
+|---|---|---|
+| 1 | `--timeout` elapsed | terminal verdict observed, and it failed |
+| 3 | *(unused)* | still in flight when a bounded watch ended |
+| 4 | a success condition became impossible | ship state archived — outcome undetermined |
+
+So `1` means *"I stopped waiting"* to `wait` and *"it failed"* to `watch`, and a
+caller that branches on a bare `$?` without knowing which command produced it
+will read one of them backwards. Branch per command, or read the `--json`
+envelope, which names the outcome instead of encoding it.
+
+This is a documented difference rather than a defect in either command: each
+table is internally coherent, and renumbering one to match the other would
+break its own contract for no gain. The hazard is generalising across them.
+
 ## Truth conditions
 
 ### `wait release <version>`

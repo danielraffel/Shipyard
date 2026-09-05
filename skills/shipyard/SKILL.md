@@ -1147,6 +1147,22 @@ cheaper than a CI round trip, and unlike `--target x86_64-pc-windows-msvc` it
 needs no cross toolchain — that target cannot even build this tree's native
 dependencies (`libsqlite3-sys`, `zstd-sys`) without MSVC.
 
+## Watch exit codes: absence is not success
+
+`shipyard watch` exits **4** when the ship state is archived, because "archived"
+covers merged, discarded and pruned alike and the archive does not record which.
+Do **not** read 4 as failure — read it as *ask the authority*
+(`gh pr view <n> --json state,mergedAt`). It previously exited 0 there, which
+reported a PR closed **without** merging as a success.
+
+**Exit codes do not mean the same thing across commands.** `wait` numbers its
+outcomes independently: its `1` is *"`--timeout` elapsed"*, where `watch`'s `1`
+is *"it failed"*. `wait` has no `3`; `watch` uses `3` for still-in-flight. Both
+tables are internally coherent, so this is a difference to know rather than a
+bug to fix — but a caller that branches on a bare `$?` without tracking which
+command produced it will read one of them backwards. Branch per command, or read
+the `--json` envelope, which names the outcome instead of encoding it.
+
 ## Host-Health Pre-Dispatch Gate (optional)
 
 For self-hosted runners *co-located with heavy interactive work*: read a shared

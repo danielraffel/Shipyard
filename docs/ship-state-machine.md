@@ -677,6 +677,38 @@ checkout, provenance, ownership identity, or GitHub evidence fails closed and
 emits a durable `needs_agent` receipt; absence never abandons or merges the ship
 state.
 
+### Watch handback: an archived state is UNDETERMINED, not success
+
+`shipyard watch` is a consumer of this machine, and the one transition it cannot
+observe is the state simply being gone. `ShipStateStore::get` returning `None`
+after the watcher has already seen a state means the record was **archived**,
+and archiving covers *merged*, *discarded* and *pruned* alike — the store
+records **that** a state ended, never **how**.
+
+That path previously returned `ExitCode::SUCCESS`. Three outcomes with opposite
+consequences shared one exit code, and that code asserts the work landed, so a
+pull request closed **without** merging reported success to anything branching
+on it.
+
+It now exits **4 — undetermined**:
+
+| Exit | Meaning for `watch` |
+|---|---|
+| 0 | terminal verdict observed, and it passed |
+| 1 | terminal verdict observed, and it failed |
+| 2 | no ship state for this branch / PR (typo, wrong repo, never shipped) |
+| 3 | still in flight when a bounded watch ended |
+| **4** | **state archived — outcome not observable from the store** |
+| 130 | interrupted |
+
+Read `4` as *ask the authority*, not as failure: the handback names
+`gh pr view <n> --json state,mergedAt`, scoped to that PR. Sending a reader to
+look up a different subject would be a wrong terminal rather than no terminal.
+
+This is the consumer-side half of the orphan problem above. The store having no
+lifecycle that marks a state terminal when its subject ended by a path Shipyard
+never observed is the producer-side half, and it is unchanged here.
+
 ## Separate recovery-worker lifecycle (not `ShipState`)
 
 The merge steward's semantic exception worker deliberately does not add a

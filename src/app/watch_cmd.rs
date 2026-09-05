@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use super::CliFailure;
+use super::{CliFailure, WATCH_EXIT_INDETERMINATE};
 use crate::diagnostics::{DiagnosticsFetcher, GhDiagnosticsFetcher};
 use crate::evidence::EvidenceStore;
 use crate::ship_state::ShipStateStore;
@@ -83,8 +83,7 @@ pub(super) fn watch_with_fetcher<W: Write, F: DiagnosticsFetcher + ?Sized>(
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
                 return Ok(ExitCode::from(2));
             }
-            let message =
-                format!("PR #{target_pr}: ship state archived (merged, discarded, or pruned).");
+            let (message, exit_code) = archived_handback(target_pr);
             emit_watch_event(
                 "state-archived",
                 Some(target_pr),
@@ -93,7 +92,7 @@ pub(super) fn watch_with_fetcher<W: Write, F: DiagnosticsFetcher + ?Sized>(
                 stdout,
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            return Ok(ExitCode::SUCCESS);
+            return Ok(exit_code);
         };
 
         observed_any_state = true;
@@ -133,8 +132,28 @@ pub(super) fn watch_with_fetcher<W: Write, F: DiagnosticsFetcher + ?Sized>(
     }
 }
 
+/// Message for a ship state that is gone by the time the watcher looks again.
+///
+/// Kept as its own function so the wording and the exit code can be asserted
+/// without driving the whole watch loop — the absence of any test over this
+/// path is why it returned success for years.
+///
+/// The archive records that a state ended, never *how*: "archived" covers
+/// merged, discarded and pruned alike. Reporting success would tell a caller
+/// that a pull request closed **without** merging had landed, so the handback
+/// says the outcome is undetermined and names the authority that knows.
+pub(super) fn archived_handback(target_pr: u64) -> (String, ExitCode) {
+    let message = format!(
+        "PR #{target_pr}: ship state archived, so the outcome is UNDETERMINED — archived covers \
+         merged, discarded and pruned alike, and the archive does not record which. Ask the \
+         authority: `gh pr view {target_pr} --json state,mergedAt`."
+    );
+    (message, ExitCode::from(WATCH_EXIT_INDETERMINATE))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::archived_handback;
     use std::process::ExitCode;
 
     use chrono::Utc;
@@ -200,6 +219,53 @@ mod tests {
             phase: Some("test".to_owned()),
             required,
         }
+    }
+
+    /// An archived ship state means merged, discarded, or pruned. Reporting
+    /// success there tells a caller that a pull request closed WITHOUT merging
+    /// had landed — the false-success terminal an adversarial review called out
+    /// as strictly worse than never handing back at all.
+    #[test]
+    fn negative_control_an_archived_state_is_not_a_success() {
+        let (_, code) = archived_handback(7996);
+
+        assert_ne!(
+            code,
+            ExitCode::SUCCESS,
+            "absence must never be reported as success"
+        );
+        assert_eq!(code, ExitCode::from(4));
+    }
+
+    /// The handback has to say the outcome is unknown AND where to get it. An
+    /// alert that only says something ended makes its reader start from
+    /// nothing.
+    #[test]
+    fn the_archived_handback_names_the_ambiguity_and_the_authority() {
+        let (message, _) = archived_handback(7996);
+
+        assert!(message.contains("UNDETERMINED"), "{message}");
+        assert!(
+            message.contains("merged, discarded and pruned"),
+            "it must name what it cannot distinguish: {message}"
+        );
+        assert!(
+            message.contains("gh pr view 7996"),
+            "it must name the authority, scoped to this PR: {message}"
+        );
+    }
+
+    /// Planted control for the test above: the message is per-PR, so a caller
+    /// cannot be sent to look up the wrong subject. A wrong terminal is worse
+    /// than none.
+    #[test]
+    fn control_the_handback_is_scoped_to_its_own_pr() {
+        let (a, _) = archived_handback(7996);
+        let (b, _) = archived_handback(1234);
+
+        assert_ne!(a, b);
+        assert!(!a.contains("1234"), "{a}");
+        assert!(!b.contains("7996"), "{b}");
     }
 
     #[test]
