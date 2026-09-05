@@ -50,6 +50,10 @@ fn calls_of(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+// Only the `#[cfg(unix)]` tests build an action, because the fake-`gh` harness
+// needs a `#!/bin/sh` shim. Without the same gate this is dead code on Windows,
+// where `-D warnings` turns that into a build failure.
+#[cfg(unix)]
 fn open_action() -> EscalationAction {
     EscalationAction::Open {
         key: "host=macpro lane=linux".to_owned(),
