@@ -1025,6 +1025,23 @@ slot, a scan that failed and fell closed to `1`, and a legitimate
 yielding supervisor is neither "unserved" nor "starved"; establish which cause
 applies before touching routing.
 
+A third case, distinct from both: a host that **refuses work it could do**.
+`priority_demand=1` / `priority lane 'X' has the slot` is printed for four
+causes with non-overlapping remedies — genuine queued demand (correct), an
+already-assigned or hosted-only job that can never take a self-hosted slot
+(a defect), a scan that failed and fell closed to `1` (invisible), and a
+legitimate `host_health_yield` on memory saturation (correct). Free VM slots +
+aged demand + a yielding supervisor is neither `unserved` nor `starved`;
+establish which cause applies before touching routing. Two of the four are
+correct behaviour and must not raise — raising on correct behaviour is what
+teaches an operator to ignore the raise.
+
+When two supervisors on the same host scan the same repo and contradict each
+other, that disagreement is itself proof one is wrong, with no external oracle
+needed. Differing `queued=` alone is not a contradiction (they watch different
+label sets); the sharp case is lane A yielding *citing* lane B while every
+supervisor serving B reports zero.
+
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
