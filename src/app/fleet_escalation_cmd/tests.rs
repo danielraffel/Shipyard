@@ -7,6 +7,9 @@
 //! shared repository, "did not call" is the more important half.
 
 use super::*;
+// Gated with the tests that use it: `open_action` is the only consumer and it
+// is unix-only, so an ungated import is an unused-import error on Windows.
+#[cfg(unix)]
 use crate::fleet_escalation::EscalationAction;
 
 #[cfg(unix)]
