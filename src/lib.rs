@@ -77,6 +77,8 @@ pub(crate) mod execution_termination;
 pub mod executor;
 /// Fail-closed check that a host has converged to the declared fleet epoch.
 pub mod fleet_epoch;
+/// Bounded self-heal gate: is a corrective action provably safe to take?
+pub mod fleet_selfheal;
 /// Typed service assertions: is a declared lane actually being served?
 pub mod fleet_service;
 /// Typed supervisor assertions: can the thing that boots VMs see the work?
