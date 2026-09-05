@@ -621,6 +621,28 @@ terminal is worse than none.
 
 Contract: `planning/2026-09-05-shipyard-handback-contract.md`.
 
+### An archived ship state is undetermined, not a success
+
+`shipyard watch` returned `ExitCode::SUCCESS` whenever the ship state was gone,
+under a message that already admitted the problem: *"archived (merged,
+discarded, or pruned)"*. Three outcomes with opposite consequences, one exit
+code, and that code says the work landed — so a pull request closed **without**
+merging reported success to anything branching on it.
+
+The archive records *that* a state ended, never *how*. So the handback now:
+
+- exits **4 (undetermined)** rather than 0;
+- names the outcomes it cannot distinguish;
+- names the authority that knows, scoped to the right PR — sending a reader to
+  look up a different subject is a wrong terminal rather than no terminal.
+
+The message and code are returned together by one function, so no exit-code
+literal is left in the loop to drift, and the control asserts the value actually
+returned. The first version of that control asserted only the constant and the
+message: restoring `SUCCESS` in the loop reddened nothing, which is a test
+passing on a broken implementation, and it was caught only by running the
+mutation rather than by reading the test.
+
 ## Implementation notes
 
 - Pure detection logic lives in `src/runner_watchdog.rs` and has no I/O.
