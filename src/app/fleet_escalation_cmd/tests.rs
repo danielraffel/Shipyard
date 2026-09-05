@@ -373,3 +373,60 @@ fn a_clean_batch_reports_every_action() {
     assert_eq!(applied.len(), 2);
     assert!(applied.iter().all(|record| !record.applied));
 }
+
+// ---------------------------------------------------------------------------
+// Forcing the ETXTBSY race, rather than hoping it does not recur
+// ---------------------------------------------------------------------------
+
+/// Force the race the `wait_until_executable` probe exists to survive, and
+/// prove the probe survives it.
+///
+/// A flake fix that cannot be made to fail on demand is a hope, not a fix. This
+/// makes it fail on demand: Linux refuses to exec a file any process currently
+/// holds open for writing, so holding a write handle open reproduces ETXTBSY
+/// deterministically — no parallelism, no timing, no retry-and-see.
+///
+/// Linux-gated because macOS does not implement that guard at all: the same
+/// sequence execs happily there, which is exactly why the original failure was
+/// invisible on the machine it was written on and only ever appeared in CI.
+///
+/// The test asserts both halves. First that the race is real and forced — an
+/// exec while the writer is open MUST fail with ETXTBSY, so a future change
+/// that made this impossible would fail here rather than silently turn the
+/// guard into decoration. Then that closing the writer lets the probe return.
+#[cfg(target_os = "linux")]
+#[test]
+fn forcing_the_etxtbsy_race_shows_the_probe_survives_it() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp");
+    let path = temp.path().join("busy_gh");
+
+    let mut writer = std::fs::File::create(&path).expect("create");
+    writer.write_all(b"#!/bin/sh\nexit 0\n").expect("write");
+    writer.flush().expect("flush");
+    let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("chmod");
+
+    // The forced failure. Still holding the write handle, so the kernel must
+    // refuse the exec.
+    let blocked = std::process::Command::new(&path).output();
+    let errno = blocked
+        .err()
+        .and_then(|error| error.raw_os_error())
+        .expect("exec must fail while a writer is open");
+    assert_eq!(
+        errno, 26,
+        "expected ETXTBSY while the file is open for writing"
+    );
+
+    // Release the writer; the probe must now return rather than spin out.
+    drop(writer);
+    wait_until_executable(&path);
+
+    std::process::Command::new(&path)
+        .output()
+        .expect("exec must succeed once no writer is open");
+}
