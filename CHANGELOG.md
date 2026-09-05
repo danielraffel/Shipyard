@@ -3,6 +3,37 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01630"></a>
+## [0.163.0] - 2026-09-04
+
+- feat(fleet): assert each declared relay hop against a connect budget ([#568](https://github.com/danielraffel/Shipyard/pull/568))
+
+<a id="v01600"></a>
+## [0.160.0] - 2026-09-04
+
+- docs(skill): the four causes behind a withheld slot ([#565](https://github.com/danielraffel/Shipyard/pull/565))
+
+<a id="v01580"></a>
+## [0.158.0] - 2026-09-04
+
+- docs(fleet): supervisor scan assertions — ratio not sample, timeout not auth ([#563](https://github.com/danielraffel/Shipyard/pull/563))
+
+<a id="v01571"></a>
+## [0.157.1] - 2026-09-04
+
+- fix(versioning): register marketplace.json so a plugin bump moves both files ([#562](https://github.com/danielraffel/Shipyard/pull/562))
+
+<a id="v01570"></a>
+## [0.157.0] - 2026-09-04
+
+- feat(fleet): typed service assertions for declared lanes ([#561](https://github.com/danielraffel/Shipyard/pull/561))
+- fix(webhook): reconcile deleted persisted hooks ([#559](https://github.com/danielraffel/Shipyard/pull/559))
+
+<a id="v01560"></a>
+## [0.156.0] - 2026-09-03
+
+- fix: make PR and recovery stewardship exact-head aware ([#558](https://github.com/danielraffel/Shipyard/pull/558))
+
 <a id="v01553"></a>
 ## [0.155.3] - 2026-09-02
 
@@ -1357,6 +1388,12 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.163.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.163.0
+[0.160.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.160.0
+[0.158.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.158.0
+[0.157.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.157.1
+[0.157.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.157.0
+[0.156.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.156.0
 [0.155.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.3
 [0.155.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.2
 [0.155.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.0

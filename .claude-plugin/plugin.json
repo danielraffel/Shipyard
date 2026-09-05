@@ -1,6 +1,6 @@
 {
   "name": "shipyard",
-  "version": "0.64.0",
+  "version": "0.66.0",
   "description": "Cross-platform CI coordination",
   "min_shipyard_version": "0.148.1",
   "commands": "./commands",

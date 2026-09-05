@@ -186,7 +186,7 @@ where
     };
     let mut report = ReconcileReport::default();
 
-    for state in store.list_active() {
+    for state in store.list_in_flight() {
         if is_aged_terminal(&state, window, now) {
             report.skipped_terminal += 1;
             continue;

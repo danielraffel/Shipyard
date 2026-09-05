@@ -76,6 +76,22 @@ pub enum RegistrarError {
         /// Combined stdout/stderr from `gh`.
         output: String,
     },
+    /// The repository or hook endpoint no longer exists. Callers may
+    /// reconcile by listing remote hooks before deciding whether to create.
+    RemoteNotFound {
+        /// Registrar operation being attempted.
+        action: &'static str,
+        /// Combined stdout/stderr from `gh`.
+        output: String,
+    },
+    /// GitHub or the network returned a retryable response. Polling remains
+    /// the source of truth; do not persist a partial registration.
+    Transient {
+        /// Registrar operation being attempted.
+        action: &'static str,
+        /// Combined stdout/stderr from `gh`.
+        output: String,
+    },
     /// GitHub CLI returned a successful response without a hook ID.
     MissingHookId(String),
     /// GitHub returned more than one Shipyard hook for the exact callback URL.
@@ -120,6 +136,20 @@ impl std::fmt::Display for RegistrarError {
                 write!(
                     formatter,
                     "{action} hook failed: GitHub rejected the request ({}). The token is invalid, expired, or missing. Run `gh auth status` or configure a [github.auth] token.",
+                    output.trim()
+                )
+            }
+            Self::RemoteNotFound { action, output } => {
+                write!(
+                    formatter,
+                    "{action} hook target not found: {}",
+                    output.trim()
+                )
+            }
+            Self::Transient { action, output } => {
+                write!(
+                    formatter,
+                    "{action} hook temporarily unavailable: {}",
                     output.trim()
                 )
             }
@@ -172,6 +202,18 @@ impl RegistrarError {
             Self::AuthDegraded { output, .. } => auth_failure_detail(output),
             _ => String::new(),
         }
+    }
+
+    /// True when GitHub no longer has the repository or hook endpoint.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::RemoteNotFound { .. })
+    }
+
+    /// True when the failure is retryable without changing local state.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient { .. })
     }
 }
 
@@ -262,8 +304,15 @@ impl Registrar {
         gh_binary: Option<&Path>,
     ) -> Result<u64, RegistrarError> {
         if let Some(hook_id) = self.by_repo.get(repo).copied() {
-            update_hook(client, &self.cwd, gh_binary, repo, hook_id, url, secret)?;
-            return Ok(hook_id);
+            match update_hook(client, &self.cwd, gh_binary, repo, hook_id, url, secret) {
+                Ok(()) => return Ok(hook_id),
+                Err(RegistrarError::RemoteNotFound { .. }) => {
+                    // The persisted remote hook was deleted out of band.
+                    // Drop only this stale binding and reconcile by URL below.
+                    self.by_repo.remove(repo);
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let matching = list_matching_hooks(client, &self.cwd, gh_binary, repo, url)?;
@@ -617,9 +666,31 @@ fn classify_gh_failure(action: &'static str, output: String) -> RegistrarError {
         RegistrarError::MissingWebhookScope { action, output }
     } else if mentions_auth_failure(&output) {
         RegistrarError::AuthDegraded { action, output }
+    } else if mentions_not_found(&output) {
+        RegistrarError::RemoteNotFound { action, output }
+    } else if mentions_transient(&output) {
+        RegistrarError::Transient { action, output }
     } else {
         RegistrarError::GhFailed { action, output }
     }
+}
+
+fn mentions_not_found(output: &str) -> bool {
+    let lowered = output.to_ascii_lowercase();
+    lowered.contains("http 404")
+        || lowered.contains("404 not found")
+        || lowered.contains("not found")
+}
+
+fn mentions_transient(output: &str) -> bool {
+    let lowered = output.to_ascii_lowercase();
+    [
+        "http 408", "http 409", "http 429", "http 500", "http 502", "http 503", "http 504",
+    ]
+    .iter()
+    .any(|status| lowered.contains(status))
+        || lowered.contains("timed out")
+        || lowered.contains("temporarily unavailable")
 }
 
 fn mentions_webhook_scope(output: &str) -> bool {
@@ -1170,10 +1241,29 @@ mod tests {
 
     #[test]
     fn classify_leaves_generic_failure_alone() {
-        let error = super::classify_gh_failure("create", "HTTP 500: server error".to_owned());
+        let error = super::classify_gh_failure("create", "unexpected gh failure".to_owned());
         assert!(!error.is_auth_degraded());
         assert!(!error.is_missing_webhook_scope());
         assert!(matches!(error, super::RegistrarError::GhFailed { .. }));
+    }
+
+    #[test]
+    fn classify_not_found_and_transient_failures() {
+        let missing = super::classify_gh_failure("list", "HTTP 404: Not Found".to_owned());
+        assert!(missing.is_not_found());
+        assert!(!missing.is_transient());
+
+        for output in [
+            "HTTP 429: rate limit",
+            "HTTP 503: Service Unavailable",
+            "request timed out",
+        ] {
+            let error = super::classify_gh_failure("patch", output.to_owned());
+            assert!(
+                error.is_transient(),
+                "expected transient classification: {output}"
+            );
+        }
     }
 
     #[cfg(unix)]

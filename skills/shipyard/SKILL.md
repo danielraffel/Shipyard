@@ -974,6 +974,86 @@ reap_in_progress_max_min = 300
 reap_queued_max_min = 480
 ```
 
+## Fleet Service Assertions (assert service, never liveness)
+
+When asked whether a host or lane is healthy, **do not answer from uptime, from
+`systemctl status`, or from the required gate being green.** All three read
+healthy while a lane is dead. A Linux lane once went unserved for ~19 days with
+the pool unit reporting `active (running)` throughout (it was running — and
+failing every 30 seconds, 36,088 times), the required gate merging normally, and
+a GitHub-hosted fallback quietly absorbing the work.
+
+`src/fleet_service.rs` holds the pure verdict logic. Two rules to carry into any
+fleet diagnosis, whether or not you use the module:
+
+1. **Query both runner scopes.** `repos/{owner}/{repo}/actions/runners` omits
+   org-registered runners entirely. A lane served only at the org scope reads
+   *unserved* from the repo census — the same empty result you get when the host
+   is genuinely dead. Always pair it with `orgs/{org}/actions/runners`.
+2. **An absence needs demand before it means anything.** An idle just-in-time
+   pool registers no runners. `Unserved` (aged queued demand, nothing online
+   advertises the labels) and `Idle` (nothing registered, nothing asking) look
+   identical in a census and mean opposite things. `Starved` — demand plus an
+   online server that is not reaching it — is a third, and its remedy is
+   capacity, not routing.
+
+`Unknown` is a verdict, not a pass: when the census cannot be read, say so and
+name the `Boundary` (`grammar` / `scope` / `identity` / `permission` / `parse` /
+`transport`). Only `permission` means "cannot"; the rest have an equivalent path
+and `Boundary::next_action` names it. A `transport` failure is explicitly **not**
+an auth fault — do not re-authenticate in response to a timeout.
+
+Two more rules when the thing being judged is a **supervisor**
+(`src/fleet_supervisor.rs`):
+
+3. **Never judge scan blindness from a sample.** `SCAN BLIND (gh queue scan
+   failed) N/9` flickers. One supervisor measured here was blind on 1598 of its
+   last 2000 log lines while its final ~70 lines read healthy — `tail` it at the
+   wrong moment and it is green. Count blind vs sighted cycles over a window and
+   report the ratio, alongside the supervisor's own consecutive counter.
+4. **Do not believe a supervisor's own diagnosis.** It logs `self-restarting the
+   supervisor for fresh gh auth` for what is a *timeout*, then performs an auth
+   restart that cannot help. Treat a timeout as `transport`; require real
+   credential evidence (`HTTP 401`, `bad credentials`) before calling anything an
+   auth fault. A rate limit is a completed call, not a credential failure.
+
+Related trap when a host **refuses** work: `priority_demand=1` /
+`priority lane 'X' has the slot` is printed for at least four different causes —
+genuine queued demand, an `in_progress` job that can never take a self-hosted
+slot, a scan that failed and fell closed to `1`, and a legitimate
+`host_health_yield` on memory saturation. Free VM slots + queued demand + a
+yielding supervisor is neither "unserved" nor "starved"; establish which cause
+applies before touching routing.
+
+A third case, distinct from both: a host that **refuses work it could do**.
+`priority_demand=1` / `priority lane 'X' has the slot` is printed for four
+causes with non-overlapping remedies — genuine queued demand (correct), an
+already-assigned or hosted-only job that can never take a self-hosted slot
+(a defect), a scan that failed and fell closed to `1` (invisible), and a
+legitimate `host_health_yield` on memory saturation (correct). Free VM slots +
+aged demand + a yielding supervisor is neither `unserved` nor `starved`;
+establish which cause applies before touching routing. Two of the four are
+correct behaviour and must not raise — raising on correct behaviour is what
+teaches an operator to ignore the raise.
+
+When two supervisors on the same host scan the same repo and contradict each
+other, that disagreement is itself proof one is wrong, with no external oracle
+needed. Differing `queued=` alone is not a contradiction (they watch different
+label sets); the sharp case is lane A yielding *citing* lane B while every
+supervisor serving B reports zero.
+
+For a relay, **"does the proxy answer?" is the wrong question.** Assert each
+declared hop against a connect budget, in order. A dead first hop keeps the
+relay working via fallback while taxing every connection — 18s vs 2s in the
+incident — and that tax lands on whatever downstream timeout is smallest, so it
+surfaces as an unrelated subsystem failing. Report connect time as a ratio
+against budget, never as a boolean. When reproducing a proxy fault, do NOT use
+`env -i`: it strips the `*_proxy` variables, so the control is cleaner than the
+thing it controls for and passes every time.
+
+Details: `docs/runner-watchdog.md` and
+`planning/2026-09-04-fleet-service-assertions.md`.
+
 ## Host-Health Pre-Dispatch Gate (optional)
 
 For self-hosted runners *co-located with heavy interactive work*: read a shared
@@ -2493,3 +2573,7 @@ asking for go/no-go, ensure:
   or explicitly risk-accepted.
 - Signing/notarization and rollback paths are validated.
 - Documentation changes for Shipyard, GUI, and Pulp/consumer pins are tracked.
+**Webhook failures are typed.** Registrar 404/not-found and retryable
+408/409/429/5xx/timeout outcomes remain distinct from scope/auth failures;
+persisted stale bindings are reconciled only after exact remote evidence is
+re-read.
