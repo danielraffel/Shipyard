@@ -159,10 +159,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::Value;
 
-    use super::{
-        WATCH_EXIT_INDETERMINATE, WatchCommandContext, WatchCommandOptions, watch,
-        watch_with_fetcher,
-    };
+    use super::{WatchCommandContext, WatchCommandOptions, watch, watch_with_fetcher};
     use crate::diagnostics::{DiagnosticsError, DiagnosticsFetcher};
     use crate::evidence::EvidenceStore;
     use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
