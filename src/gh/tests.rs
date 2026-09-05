@@ -582,6 +582,40 @@ fn configured_ambient_binary_outranks_hostile_path_and_removes_tokens() {
 
 #[cfg(unix)]
 #[test]
+fn configured_ambient_binary_is_used_by_default_policy() {
+    let temp = TempDir::new().expect("tempdir");
+    let native_gh = temp.path().join("gh");
+    std::os::unix::fs::symlink("/bin/echo", &native_gh).expect("native gh fixture");
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["/bin/echo", "token"]
+            ambient_gh_binary = "{}"
+            "#,
+        native_gh.display()
+    ));
+    let client = GhClient::from_loaded_config(&config).expect("client");
+    let command = client
+        .prepare_command(
+            temp.path(),
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .expect("default command");
+
+    assert_eq!(
+        command.get_program(),
+        native_gh
+            .canonicalize()
+            .expect("canonical native gh")
+            .as_os_str()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn configured_ambient_binary_rejects_script_wrappers() {
     let temp = TempDir::new().expect("tempdir");
     let wrapper = temp.path().join("gh");
