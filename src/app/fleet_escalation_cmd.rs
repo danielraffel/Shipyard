@@ -258,5 +258,10 @@ pub fn marker_for(key: &str) -> String {
     subject_marker(key)
 }
 
-#[cfg(test)]
+// Gated on unix as a whole rather than per-item. Every test here drives a
+// fake `gh` that is a `#!/bin/sh` script, so none of them can run on Windows —
+// and gating them individually left helpers and imports behind as dead code
+// that only the skipped platform could see. One gate cannot be applied
+// inconsistently.
+#[cfg(all(test, unix))]
 mod tests;
