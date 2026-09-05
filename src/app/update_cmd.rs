@@ -829,11 +829,12 @@ fn render<W: Write>(
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     /// Argument that makes every fixture written here exit immediately, so the
     /// readiness probe below cannot trigger a fixture's real behaviour.
+    #[cfg(unix)]
     const PROBE_ARG: &str = "--shipyard-fixture-probe";
 
+    #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -873,6 +874,7 @@ mod tests {
     ///
     /// Linux enforces `ETXTBSY`; macOS does not, so this failure is invisible
     /// locally and only ever appears on the Linux leg.
+    #[cfg(unix)]
     fn wait_until_executable(path: &Path) {
         for _ in 0..200 {
             let busy = std::process::Command::new(path)
