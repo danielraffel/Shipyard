@@ -1090,6 +1090,22 @@ the second instance of a fault behind the first.
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
+## cfg-gated tests: gate the helpers identically
+
+A `#[cfg(unix)]` test module must gate its **helpers** with the same cfg, not
+just its `#[test]` functions. A helper used only by gated tests is *dead code*
+on the platform that skips them, and `-D warnings` turns that into a **build
+failure** — so the break lands on the one platform that never runs the code, and
+no amount of local testing on a Mac can see it.
+
+This is not hypothetical: `open_action` in the escalation I/O tests was left
+ungated while its three siblings were gated, and it took `main` red on Windows.
+`cargo clippy --all-targets` on macOS compiles the unix branch, where the
+function is used, so the local gate passes.
+
+If you add or rename a helper in a gated module, check every helper in that
+module, not just the one you touched.
+
 ## Host-Health Pre-Dispatch Gate (optional)
 
 For self-hosted runners *co-located with heavy interactive work*: read a shared
