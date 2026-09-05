@@ -3,6 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01910"></a>
+## [0.191.0] - 2026-09-05
+
+- feat(fleet): assert a lane's service survives an ordinary exit ([#576](https://github.com/danielraffel/Shipyard/pull/576))
+- fix(test): stop a 2s deadline deciding the refill-ordering verdict ([#575](https://github.com/danielraffel/Shipyard/pull/575))
+- fix(test): stop a poisoned process-tree lock cascading into every later test ([#574](https://github.com/danielraffel/Shipyard/pull/574))
+
 <a id="v01850"></a>
 ## [0.185.0] - 2026-09-05
 
@@ -1417,6 +1424,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.191.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.191.0
 [0.185.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.185.0
 [0.181.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.181.0
 [0.176.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.176.0
