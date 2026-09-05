@@ -1003,6 +1003,28 @@ name the `Boundary` (`grammar` / `scope` / `identity` / `permission` / `parse` /
 and `Boundary::next_action` names it. A `transport` failure is explicitly **not**
 an auth fault — do not re-authenticate in response to a timeout.
 
+Two more rules when the thing being judged is a **supervisor**
+(`src/fleet_supervisor.rs`):
+
+3. **Never judge scan blindness from a sample.** `SCAN BLIND (gh queue scan
+   failed) N/9` flickers. One supervisor measured here was blind on 1598 of its
+   last 2000 log lines while its final ~70 lines read healthy — `tail` it at the
+   wrong moment and it is green. Count blind vs sighted cycles over a window and
+   report the ratio, alongside the supervisor's own consecutive counter.
+4. **Do not believe a supervisor's own diagnosis.** It logs `self-restarting the
+   supervisor for fresh gh auth` for what is a *timeout*, then performs an auth
+   restart that cannot help. Treat a timeout as `transport`; require real
+   credential evidence (`HTTP 401`, `bad credentials`) before calling anything an
+   auth fault. A rate limit is a completed call, not a credential failure.
+
+Related trap when a host **refuses** work: `priority_demand=1` /
+`priority lane 'X' has the slot` is printed for at least four different causes —
+genuine queued demand, an `in_progress` job that can never take a self-hosted
+slot, a scan that failed and fell closed to `1`, and a legitimate
+`host_health_yield` on memory saturation. Free VM slots + queued demand + a
+yielding supervisor is neither "unserved" nor "starved"; establish which cause
+applies before touching routing.
+
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
