@@ -1025,6 +1025,59 @@ slot, a scan that failed and fell closed to `1`, and a legitimate
 yielding supervisor is neither "unserved" nor "starved"; establish which cause
 applies before touching routing.
 
+A third case, distinct from both: a host that **refuses work it could do**.
+`priority_demand=1` / `priority lane 'X' has the slot` is printed for four
+causes with non-overlapping remedies — genuine queued demand (correct), an
+already-assigned or hosted-only job that can never take a self-hosted slot
+(a defect), a scan that failed and fell closed to `1` (invisible), and a
+legitimate `host_health_yield` on memory saturation (correct). Free VM slots +
+aged demand + a yielding supervisor is neither `unserved` nor `starved`;
+establish which cause applies before touching routing. Two of the four are
+correct behaviour and must not raise — raising on correct behaviour is what
+teaches an operator to ignore the raise.
+
+When two supervisors on the same host scan the same repo and contradict each
+other, that disagreement is itself proof one is wrong, with no external oracle
+needed. Differing `queued=` alone is not a contradiction (they watch different
+label sets); the sharp case is lane A yielding *citing* lane B while every
+supervisor serving B reports zero.
+
+For a relay, **"does the proxy answer?" is the wrong question.** Assert each
+declared hop against a connect budget, in order. A dead first hop keeps the
+relay working via fallback while taxing every connection — 18s vs 2s in the
+incident — and that tax lands on whatever downstream timeout is smallest, so it
+surfaces as an unrelated subsystem failing. Report connect time as a ratio
+against budget, never as a boolean. When reproducing a proxy fault, do NOT use
+`env -i`: it strips the `*_proxy` variables, so the control is cleaner than the
+thing it controls for and passes every time.
+
+When judging whether a host's guards are in place, two rules that have each
+already cost real time:
+
+- **`enabled` is not armed.** A timer enabled with no next elapse fires never.
+  And a script present on disk with no unit to invoke it is not a guard at all —
+  that exact combination cost ~19 days of a dead Linux lane.
+- **Never threshold `NRestarts` on its level.** It is monotonic and survives the
+  repair; a healthy host here still reads 36089. Assert the *delta* against a
+  recorded baseline over a known interval. No baseline is `unknown`, not a pass.
+
+**Before measuring drift at all, prove the path is what executes.** On this
+fleet `~/.local/share/tartci` is inert: the supervisors exec a content-addressed
+generation under `~/.local/share/tartci-generations/<commit>-<manifest16>/`, and
+the gate LaunchAgent names that path directly. A drift number computed against
+the wrong directory is confident and meaningless — it happened here, and the
+running code turned out byte-identical to its source commit. Read the
+LaunchAgent's `ProgramArguments`, follow the launcher, and compare that.
+
+Such a host is changed by a PR plus a newly cut generation
+(`tartci support-manifest write` then `tartci fleet-macos install --apply`),
+never by editing a file in place. A file edited under `~/.local/share/tartci` is
+not deployed and never runs.
+
+When you do compare, the answer is three-valued: in sync / behind (deploy) /
+**ahead** (upstream the delta, do NOT redeploy) — collapsing the third into the
+second licenses a redeploy that destroys whatever the host was carrying.
+
 When a fleet fault needs to reach a human, do not leave it in a log on the
 broken host — nobody reads that host. Open a tracking issue and auto-close it on
 recovery (`src/fleet_escalation.rs` decides; the caller does the I/O), and give
