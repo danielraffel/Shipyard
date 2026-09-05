@@ -77,6 +77,8 @@ pub(crate) mod execution_termination;
 pub mod executor;
 /// Fail-closed check that a host has converged to the declared fleet epoch.
 pub mod fleet_epoch;
+/// Typed relay assertions: does every declared hop connect inside its budget?
+pub mod fleet_relay;
 /// Decide when a fleet verdict should leave the host and reach a human.
 pub mod fleet_escalation;
 /// Typed service assertions: is a declared lane actually being served?
