@@ -1736,11 +1736,7 @@ fn should_start_sweep(sweep_in_flight: bool, now: Instant, next_sweep_at: Instan
 }
 
 #[cfg(unix)]
-fn start_sweep_worker(
-    mode: RuntimeMode,
-    state_dir: PathBuf,
-    sender: mpsc::Sender<AbandonReport>,
-) {
+fn start_sweep_worker(mode: RuntimeMode, state_dir: PathBuf, sender: mpsc::Sender<AbandonReport>) {
     thread::spawn(move || {
         // Purely local: no GitHub, no HTTP. Config is reloaded each pass so
         // toggling `[ship_state] auto_resume` takes effect without a daemon
@@ -2935,7 +2931,10 @@ mod tests {
         // ZERO only in production and a full interval under cfg(test), so a
         // sweep sharing it would be safe in tests and hazardous in the field —
         // the exact shape that hides a startup bug from its own test suite.
-        assert_eq!(initial_sweep_delay(), Duration::from_secs(RECONCILE_INTERVAL_SECONDS));
+        assert_eq!(
+            initial_sweep_delay(),
+            Duration::from_secs(RECONCILE_INTERVAL_SECONDS)
+        );
     }
 
     #[test]
@@ -2949,7 +2948,6 @@ mod tests {
         // Never run before the deadline.
         assert!(!should_start_sweep(false, now, not_due));
     }
-
 
     #[cfg(unix)]
     use std::collections::BTreeMap;
