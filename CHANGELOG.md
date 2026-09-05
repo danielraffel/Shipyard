@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01810"></a>
+## [0.181.0] - 2026-09-05
+
+- feat(fleet): the leak assertion and the four-quadrant handback contract ([#569](https://github.com/danielraffel/Shipyard/pull/569))
+
 <a id="v01760"></a>
 ## [0.176.0] - 2026-09-05
 
@@ -1406,6 +1411,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.181.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.181.0
 [0.176.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.176.0
 [0.175.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.175.0
 [0.166.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.166.0
