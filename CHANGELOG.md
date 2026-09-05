@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01571"></a>
+## [0.157.1] - 2026-09-04
+
+- fix(versioning): register marketplace.json so a plugin bump moves both files ([#562](https://github.com/danielraffel/Shipyard/pull/562))
+
 <a id="v01570"></a>
 ## [0.157.0] - 2026-09-04
 
@@ -1368,6 +1373,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.157.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.157.1
 [0.157.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.157.0
 [0.156.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.156.0
 [0.155.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.3
