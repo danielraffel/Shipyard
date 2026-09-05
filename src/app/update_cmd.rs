@@ -829,14 +829,65 @@ fn render<W: Write>(
 mod tests {
     use super::*;
 
+    /// Argument that makes every fixture written here exit immediately, so the
+    /// readiness probe below cannot trigger a fixture's real behaviour.
+    #[cfg(unix)]
+    const PROBE_ARG: &str = "--shipyard-fixture-probe";
+
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         use std::os::unix::fs::PermissionsExt;
 
-        std::fs::write(path, contents).expect("write executable");
+        // Fixtures short-circuit on the probe argument. Without this the probe
+        // would run the script for real, and a fixture with side effects would
+        // record an invocation nobody made.
+        let guarded = contents.replacen(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\ncase \"${{1:-}}\" in {PROBE_ARG}) exit 0;; esac\n"),
+            1,
+        );
+        // If a future fixture uses a different shebang the guard silently will
+        // not apply, and the probe below would run it for real. Fail loudly
+        // rather than let that become an invocation nobody made.
+        assert!(
+            guarded.contains(PROBE_ARG),
+            "a fixture must begin with `#!/bin/sh` so the readiness probe cannot execute it: {contents}"
+        );
+        std::fs::write(path, &guarded).expect("write executable");
         let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(path, permissions).expect("permissions");
+        wait_until_executable(path);
+    }
+
+    /// Wait until the fixture can actually be executed.
+    ///
+    /// A freshly written file can fail `exec` with `ETXTBSY` ("Text file
+    /// busy", errno 26) while any process still holds it open for writing.
+    /// `fs::write` closes its own handle, but this is a multi-threaded test
+    /// binary: a sibling test that forks between the `write` and the `exec`
+    /// leaves the child holding an inherited descriptor, and the exec fails.
+    ///
+    /// Renaming a staged file into place does **not** avoid this — the
+    /// descriptor refers to the inode, not the path. Only observing that the
+    /// file runs proves it is no longer busy.
+    ///
+    /// Linux enforces `ETXTBSY`; macOS does not, so this failure is invisible
+    /// locally and only ever appears on the Linux leg.
+    #[cfg(unix)]
+    fn wait_until_executable(path: &Path) {
+        for _ in 0..200 {
+            let busy = std::process::Command::new(path)
+                .arg(PROBE_ARG)
+                .output()
+                .err()
+                .is_some_and(|error| error.raw_os_error() == Some(26));
+            if !busy {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("fixture never became executable: {}", path.display());
     }
 
     #[cfg(unix)]
@@ -1033,9 +1084,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_refresh_executes_verified_binary_with_exact_runtime_context() {
-        let _process_fixture = crate::test_support::PROCESS_TREE_TEST_LOCK
-            .lock()
-            .expect("process fixture lock");
+        let _process_fixture = crate::test_support::lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let binary = temp.path().join("shipyard");
         let args_capture = temp.path().join("args");
@@ -1079,9 +1128,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_refresh_fails_closed_without_exact_typed_receipt() {
-        let _process_fixture = crate::test_support::PROCESS_TREE_TEST_LOCK
-            .lock()
-            .expect("process fixture lock");
+        let _process_fixture = crate::test_support::lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let binary = temp.path().join("shipyard");
         write_executable(

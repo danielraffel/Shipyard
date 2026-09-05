@@ -2790,6 +2790,32 @@ fix away and confirm that exact test goes red. If a test is non-deterministic
 by construction, say so and propose making it deterministic rather than
 quarantining it.
 
+### Three ways a test lies about its environment
+
+Each of these was a real red on a healthy change, and each was fixed by forcing
+the mechanism rather than re-running it.
+
+**A deadline that decides a verdict.** `RefillOrderingDispatcher` waited 2s for
+an event and recorded "timed out" and "never happened" as the same `false`.
+That value was read by two tests with *opposite* expectations, so the negative
+one passed harder as the host slowed while the positive one went red. When a
+bounded wait feeds an assertion, ask which outcome the deadline produces: if it
+is the failing one, the clock is the test. Wait unbounded where the event is
+expected — waking is then the proof — and keep the bound only where "nothing
+happened" is the expected result.
+
+**Write-then-exec (`ETXTBSY`, errno 26).** A fixture written and immediately
+executed can fail with `ETXTBSY` while the writing fd is still open. Renaming
+into place does **not** fix it: the fd refers to the inode, not the path. Probe
+the binary until it runs (`--probe` short-circuit so the probe stays out of the
+call log). Linux enforces this and macOS does not, so it is invisible locally.
+
+**Running a different command than CI does.** Before concluding the repo is
+broken, read the workflow's own command and env. `cargo test --lib` aborts on a
+stack overflow that CI never sees, because every lane sets
+`RUST_MIN_STACK: 8388608` for the CLI dispatch enum. A control proves your
+instrument works; it does not prove you aimed it at the right thing.
+
 ## Cutover Discipline
 
 ### Bounded metrics observation

@@ -2138,6 +2138,32 @@ mod tests {
         );
     }
 
+    /// Block until a freshly written script can actually be exec'd.
+    ///
+    /// Linux refuses to exec a file any process holds open for writing, so a
+    /// sibling test thread that forks between this thread's write and its close
+    /// makes the exec fail ETXTBSY until that child is gone. Probing until one
+    /// exec succeeds closes the race by construction; after that no write
+    /// descriptor remains anywhere and later forks are harmless.
+    ///
+    /// macOS does not implement the guard at all, which is why this only ever
+    /// fails in CI.
+    #[cfg(unix)]
+    fn wait_until_executable(path: &std::path::Path) {
+        for _ in 0..200 {
+            let busy = std::process::Command::new(path)
+                .arg("--probe")
+                .output()
+                .err()
+                .is_some_and(|error| error.raw_os_error() == Some(26));
+            if !busy {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("script never became executable: {}", path.display());
+    }
+
     #[cfg(unix)]
     #[test]
     fn runner_configuration_receives_the_canonical_path() {
@@ -2149,6 +2175,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).expect("executable");
+        wait_until_executable(&script);
 
         let canonical = runner_path_file(temp.path());
         run_in_with_path(
