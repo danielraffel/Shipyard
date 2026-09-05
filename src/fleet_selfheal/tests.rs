@@ -334,8 +334,8 @@ fn never_touch_unreadable_provenance_even_when_every_other_fact_is_idle() {
     observation.provenance = None;
     observation.provenance_boundary = Some(Boundary::Permission);
 
-    assert!(observation.runner_listener_running == Some(false));
-    assert!(observation.registered_runner == Some(false));
+    assert_eq!(observation.runner_listener_running, Some(false));
+    assert_eq!(observation.registered_runner, Some(false));
 
     let decision = decide_clone_reap(&observation, ReapMode::Destroy, now());
     assert_eq!(
