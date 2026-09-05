@@ -268,9 +268,12 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         .map_err(|error| DaemonRunError::Protocol(error.to_string()))?;
 
     let (reconcile_tx, reconcile_rx) = mpsc::channel::<ReconcileWorkerResult>();
+    let (sweep_tx, sweep_rx) = mpsc::channel::<AbandonReport>();
     let mut reconcile_window = ReconcileWindow::default();
     let mut reconcile_in_flight = false;
     let mut next_reconcile_at = Instant::now() + initial_reconcile_delay();
+    let mut sweep_in_flight = false;
+    let mut next_sweep_at = Instant::now() + initial_reconcile_delay();
     let mut previous_states = ship_state_map(&ship_dir);
     let mut next_ship_state_scan_at = Instant::now() + SHIP_STATE_SCAN_INTERVAL;
     let mut registration_sync = RegistrationSyncState::default();
@@ -378,6 +381,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             reconcile_window = result.window;
             publish_reconcile_events(&server, &last_event_at, &result.report);
             publish_abandon_events(&server, &last_event_at, &result.abandon);
+        }
+        while let Ok(abandon) = sweep_rx.try_recv() {
+            sweep_in_flight = false;
+            publish_abandon_events(&server, &last_event_at, &abandon);
         }
         while let Ok(completed) = steward_rx.try_recv() {
             let completed_target = normalized_dispatch_target(
@@ -951,11 +958,15 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             reconcile_in_flight = true;
             next_reconcile_at = now + Duration::from_secs(RECONCILE_INTERVAL_SECONDS);
             start_reconcile_worker(
-                config.mode,
                 config.state_dir.clone(),
                 reconcile_window.clone(),
                 reconcile_tx.clone(),
             );
+        }
+        if should_start_sweep(sweep_in_flight, now, next_sweep_at) {
+            sweep_in_flight = true;
+            next_sweep_at = now + Duration::from_secs(RECONCILE_INTERVAL_SECONDS);
+            start_sweep_worker(config.mode, config.state_dir.clone(), sweep_tx.clone());
         }
         // Note: we deliberately do NOT push `next_reconcile_at` forward while
         // idle. Doing so would force a freshly-attached subscriber to wait up
@@ -1708,6 +1719,42 @@ fn should_start_reconcile(
     has_subscribers && !reconcile_in_flight && now >= next_reconcile_at
 }
 
+/// The local orphan sweep must NOT wait for a subscriber.
+///
+/// `should_start_reconcile` gates on `has_subscribers` to conserve GitHub
+/// quota, which is correct for the reconcile pass because it fetches pull
+/// request state. `sweep_orphaned_ship_states` makes no network call at all —
+/// it reads a local `ShipStateStore` and a local liveness context — so the
+/// quota rationale does not apply to it. Sharing the reconcile gate suppressed
+/// a free, purely local housekeeping pass whenever nobody happened to be
+/// subscribed, which is the ordinary state: `shipyard watch` reads the state
+/// file directly and never subscribes, so a stranded watcher does not keep the
+/// sweep alive. Orphaned ship-states therefore accumulated without bound (54 of
+/// 95 observed on one host) and could never self-clear.
+fn should_start_sweep(sweep_in_flight: bool, now: Instant, next_sweep_at: Instant) -> bool {
+    !sweep_in_flight && now >= next_sweep_at
+}
+
+#[cfg(unix)]
+fn start_sweep_worker(
+    mode: RuntimeMode,
+    state_dir: PathBuf,
+    sender: mpsc::Sender<AbandonReport>,
+) {
+    thread::spawn(move || {
+        // Purely local: no GitHub, no HTTP. Config is reloaded each pass so
+        // toggling `[ship_state] auto_resume` takes effect without a daemon
+        // restart; a load failure or the disabled default both yield an empty
+        // report (no queue opened, nothing mutated).
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let report = match LoadedConfig::load_from_cwd(mode, &cwd) {
+            Ok(config) => sweep_orphaned_ship_states(&state_dir, &config, Utc::now()),
+            Err(_) => AbandonReport::default(),
+        };
+        let _ = sender.send(report);
+    });
+}
+
 #[cfg(unix)]
 struct ReconcileWorkerResult {
     report: ReconcileReport,
@@ -1717,7 +1764,6 @@ struct ReconcileWorkerResult {
 
 #[cfg(unix)]
 fn start_reconcile_worker(
-    mode: RuntimeMode,
     state_dir: PathBuf,
     mut window: ReconcileWindow,
     sender: mpsc::Sender<ReconcileWorkerResult>,
@@ -1730,13 +1776,10 @@ fn start_reconcile_worker(
         // yield an empty report (no queue opened, nothing mutated). The load is
         // scoped to the daemon's own runtime mode so an isolated daemon reads
         // its own config, not the Shipyard-mode overlay.
-        let abandon = {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            match LoadedConfig::load_from_cwd(mode, &cwd) {
-                Ok(config) => sweep_orphaned_ship_states(&state_dir, &config, Utc::now()),
-                Err(_) => AbandonReport::default(),
-            }
-        };
+        // The sweep now runs on its own ungated cadence (see `should_start_sweep`),
+        // so it is deliberately NOT performed here: doing both would double-run it
+        // whenever a subscriber is attached.
+        let abandon = AbandonReport::default();
         let _ = sender.send(ReconcileWorkerResult {
             report,
             window,
@@ -2830,6 +2873,46 @@ impl Drop for PidFileGuard {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::time::{Duration as StdDuration, Instant as StdInstant};
+
+    /// The whole point of the fix: a local sweep must not wait for a subscriber.
+    ///
+    /// `sweep_orphaned_ship_states` makes no network call, so the GitHub-quota
+    /// rationale behind `should_start_reconcile`'s `has_subscribers` gate does
+    /// not apply to it. Sharing that gate meant orphaned ship-states could never
+    /// self-clear on an ordinary host, because `shipyard watch` reads the state
+    /// file directly and never subscribes.
+    #[test]
+    fn sweep_runs_with_no_subscribers_while_reconcile_still_waits() {
+        let now = StdInstant::now();
+        let due = now - StdDuration::from_secs(1);
+
+        // The fix: due, not in flight, and nobody subscribed -> sweep runs.
+        assert!(should_start_sweep(false, now, due));
+
+        // The quota rationale is preserved: the GitHub-touching reconcile is
+        // still suppressed with no subscribers, at the very same instant.
+        assert!(!should_start_reconcile(false, false, now, due));
+
+        // Control: with a subscriber the reconcile does run, so the assertion
+        // above is about the subscriber gate and not about the deadline.
+        assert!(should_start_reconcile(true, false, now, due));
+    }
+
+    #[test]
+    fn sweep_respects_in_flight_and_deadline() {
+        let now = StdInstant::now();
+        let due = now - StdDuration::from_secs(1);
+        let not_due = now + StdDuration::from_secs(5);
+
+        // Never overlap a sweep with itself.
+        assert!(!should_start_sweep(true, now, due));
+        // Never run before the deadline.
+        assert!(!should_start_sweep(false, now, not_due));
+    }
+
+
     #[cfg(unix)]
     use std::collections::BTreeMap;
     #[cfg(unix)]
