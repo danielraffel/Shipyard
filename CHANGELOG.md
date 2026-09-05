@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01570"></a>
+## [0.157.0] - 2026-09-04
+
+- feat(fleet): typed service assertions for declared lanes ([#561](https://github.com/danielraffel/Shipyard/pull/561))
+- fix(webhook): reconcile deleted persisted hooks ([#559](https://github.com/danielraffel/Shipyard/pull/559))
+
 <a id="v01560"></a>
 ## [0.156.0] - 2026-09-03
 
@@ -1362,6 +1368,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.157.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.157.0
 [0.156.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.156.0
 [0.155.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.3
 [0.155.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.155.2
