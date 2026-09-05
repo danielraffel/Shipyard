@@ -273,7 +273,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut reconcile_in_flight = false;
     let mut next_reconcile_at = Instant::now() + initial_reconcile_delay();
     let mut sweep_in_flight = false;
-    let mut next_sweep_at = Instant::now() + initial_reconcile_delay();
+    let mut next_sweep_at = Instant::now() + initial_sweep_delay();
     let mut previous_states = ship_state_map(&ship_dir);
     let mut next_ship_state_scan_at = Instant::now() + SHIP_STATE_SCAN_INTERVAL;
     let mut registration_sync = RegistrationSyncState::default();
@@ -1854,6 +1854,24 @@ fn initial_reconcile_delay() -> Duration {
     }
 }
 
+/// The first sweep must NOT fire at daemon start.
+///
+/// `initial_reconcile_delay` is ZERO in production, which is safe for reconcile
+/// because reconcile only heals state — it never abandons. The sweep does
+/// abandon, and at daemon start every foreground job looks stale for a reason
+/// that has nothing to do with the job: the machine was off. Abandoning there
+/// removes the state from `list_in_flight`, which drops it from
+/// `protected_request_job_ids`, which makes the envelope that queue-absent
+/// recovery would have replayed collectable. A sweep at zero delay can
+/// therefore destroy the precondition of the recovery path it is supposed to
+/// support, and a reboot is exactly when both are most needed.
+///
+/// So the first sweep waits a full interval, giving the execution supervisor
+/// its ticks and reconcile its first pass before anything is judged abandoned.
+fn initial_sweep_delay() -> Duration {
+    Duration::from_secs(RECONCILE_INTERVAL_SECONDS)
+}
+
 /// Non-Unix builds do not expose the daemon IPC runtime yet.
 #[cfg(not(unix))]
 pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
@@ -2898,6 +2916,26 @@ mod tests {
         // Control: with a subscriber the reconcile does run, so the assertion
         // above is about the subscriber gate and not about the deadline.
         assert!(should_start_reconcile(true, false, now, due));
+    }
+
+    /// A sweep at daemon start can destroy the queue-absent recovery precondition.
+    ///
+    /// Reconcile may start at zero delay because it only heals. The sweep
+    /// abandons, and at start every foreground job is stale for a reason that is
+    /// not about the job — the machine was off. Abandoning drops the state from
+    /// `list_in_flight` and therefore from `protected_request_job_ids`, making
+    /// the envelope recovery would replay collectable.
+    #[test]
+    fn the_first_sweep_does_not_fire_at_daemon_start() {
+        assert!(
+            initial_sweep_delay() > Duration::ZERO,
+            "a sweep at zero delay abandons jobs that are stale only because the host rebooted"
+        );
+        // The sweep delay must be unconditional: `initial_reconcile_delay` is
+        // ZERO only in production and a full interval under cfg(test), so a
+        // sweep sharing it would be safe in tests and hazardous in the field —
+        // the exact shape that hides a startup bug from its own test suite.
+        assert_eq!(initial_sweep_delay(), Duration::from_secs(RECONCILE_INTERVAL_SECONDS));
     }
 
     #[test]
