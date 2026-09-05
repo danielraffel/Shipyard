@@ -82,6 +82,8 @@ pub mod fleet_escalation;
 /// Typed guard assertions: is a declared guard actually armed on the host, and
 /// is the installed copy still the one the repo believes it deployed?
 pub mod fleet_guards;
+/// The leak assertion: a live object whose subject already ended is a defect.
+pub mod fleet_lifecycle;
 /// Typed relay assertions: does every declared hop connect inside its budget?
 pub mod fleet_relay;
 /// Bounded self-heal gate: is a corrective action provably safe to take?
