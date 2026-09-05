@@ -759,6 +759,40 @@ What it does:
 
 See `docs/cloud-retarget.md` for full context; add-lane complements retarget.
 
+### A health verdict needs a control too
+
+The same rule that governs a runner census governs a health signal: a verdict
+you cannot contradict is not a verdict, it is an assertion. tartci #188 is the
+case — a fleet health checker reported a host **dead while it was serving a
+busy runner**. That is the only shape in this family where the system was
+*confident and wrong* rather than silent, and it is the most corrosive: once an
+operator sees one confidently wrong "dead", they stop trusting every other
+verdict the same system emits.
+
+`fleet_health_reconciliation` checks a claim against independent evidence that
+the host is doing work, and the asymmetry is the whole design:
+
+- **Service evidence is positive and hard to fake.** A `busy` runner is
+  executing someone's job; a job completed after the claim finished on that
+  host. Neither happens on a dead machine, so both *refute* a `critical` claim
+  and downgrade it from `Block` to `Warn` — the host keeps taking work and the
+  operator learns the signal is wrong.
+- **Silence refutes nothing.** An idle host serves nothing and is healthy.
+  Reading quiet as dead would condemn every unused machine in the fleet.
+
+Two traps it deliberately encodes:
+
+- **`online` is not proof of life.** A registration outlives the machine behind
+  it — tartci #189, an offline runner still advertising its labels — so only
+  *work* counts as evidence. Census presence never refutes a health claim.
+- **Staleness is not health.** A vitals file whose producer died repeats its
+  last word forever with total confidence. Past a ceiling the claim is neither
+  green nor critical; it is `Unknown`, because nobody is answering.
+
+When triaging a host the fleet calls unusable, get the counter-evidence before
+the diagnosis: is anything on it *busy right now*? If so, the signal is the
+fault.
+
 ## Before blaming a lane: a runner census needs both scopes and a control
 
 A job stuck `queued` on self-hosted labels has three very different causes that
