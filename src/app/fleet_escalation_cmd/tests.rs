@@ -13,12 +13,22 @@ use crate::fleet_escalation::EscalationAction;
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     use std::os::unix::fs::PermissionsExt;
     let path = temp.path().join("gh");
-    std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake gh");
-    let mut permissions = std::fs::metadata(&path)
+    // Write to a staging name and rename into place. Writing the script and
+    // exec'ing it directly races: with tests running in parallel, another
+    // thread can fork while this one still holds the file open for writing,
+    // the child inherits that descriptor, and the exec fails ETXTBSY ("Text
+    // file busy"). Rename is atomic and publishes an inode nobody holds a
+    // write handle to, so the exec cannot observe the half-written state.
+    // Seen only on Linux under llvm-cov, where instrumentation widens the
+    // window enough to hit it.
+    let staging = temp.path().join("gh.staging");
+    std::fs::write(&staging, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake gh");
+    let mut permissions = std::fs::metadata(&staging)
         .expect("fake gh metadata")
         .permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(&path, permissions).expect("chmod fake gh");
+    std::fs::set_permissions(&staging, permissions).expect("chmod fake gh");
+    std::fs::rename(&staging, &path).expect("publish fake gh");
     // An empty config keeps the fake off the ambient auth path, which
     // otherwise demands a real GitHub remote on the temp dir.
     let config = crate::config::LoadedConfig {
