@@ -25,13 +25,20 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     // Seen only on Linux under llvm-cov, where instrumentation widens the
     // window enough to hit it.
     let staging = temp.path().join("gh.staging");
-    std::fs::write(&staging, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake gh");
+    // The probe short-circuits before the body so it cannot append to a
+    // recording script's call log and corrupt the assertions that read it.
+    std::fs::write(
+        &staging,
+        format!("#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--probe\" ]; then exit 0; fi\n{body}\n"),
+    )
+    .expect("write fake gh");
     let mut permissions = std::fs::metadata(&staging)
         .expect("fake gh metadata")
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&staging, permissions).expect("chmod fake gh");
     std::fs::rename(&staging, &path).expect("publish fake gh");
+    wait_until_executable(&path);
     // An empty config keeps the fake off the ambient auth path, which
     // otherwise demands a real GitHub remote on the temp dir.
     let config = crate::config::LoadedConfig {
@@ -45,6 +52,35 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
 }
 
 /// A fake `gh` that logs every argv line to `calls` and prints `payload`.
+/// Block until the freshly written script can actually be exec'd.
+///
+/// Renaming is not sufficient on Linux. The window is: this thread writes the
+/// file, a sibling test thread forks before the descriptor is closed, the child
+/// inherits it, and any exec of that inode fails ETXTBSY until the child is
+/// gone. The inherited descriptor outlives the rename, because it refers to the
+/// inode rather than the path.
+///
+/// The child clears in milliseconds, so probing until an exec succeeds closes
+/// the race by construction rather than by timing guess. Once one exec
+/// succeeds, no write descriptor remains anywhere and later forks are harmless.
+#[cfg(unix)]
+fn wait_until_executable(path: &std::path::Path) {
+    for _ in 0..200 {
+        // ETXTBSY (26) is the one error worth waiting out; anything else means
+        // the exec is not going to start working, so stop rather than spin.
+        let busy = std::process::Command::new(path)
+            .arg("--probe")
+            .output()
+            .err()
+            .is_some_and(|error| error.raw_os_error() == Some(26));
+        if !busy {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("fake gh never became executable: {}", path.display());
+}
+
 #[cfg(unix)]
 fn recording_gh(temp: &tempfile::TempDir, payload: &str) -> (GitHubActions, std::path::PathBuf) {
     let calls = temp.path().join("calls");
