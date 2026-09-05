@@ -261,6 +261,19 @@ pub(super) const SHIP_EXIT_VALIDATION_STATE_MISSING: u8 = 9;
 /// Automatic merge is safely unavailable; operator action is required.
 pub(super) const SHIP_EXIT_AUTOMATIC_MERGE_REFUSED: u8 = 10;
 
+/// `shipyard watch` could not determine the subject's outcome.
+///
+/// Distinct from success on purpose. An archived ship state means *merged,
+/// discarded, or pruned* — three outcomes with opposite consequences — and the
+/// archive alone cannot tell them apart. Returning 0 there reports a pull
+/// request that was closed **without** merging as a success, which is worse
+/// than never returning at all: a caller that branches on 0 proceeds as though
+/// the work landed.
+///
+/// Absence is never success. When the outcome was not positively observed, say
+/// so and let the caller consult the authority.
+pub(super) const WATCH_EXIT_INDETERMINATE: u8 = 4;
+
 pub(super) const WAIT_EXIT_TIMEOUT: u8 = 1;
 pub(super) const WAIT_EXIT_TERMINAL_WRONG: u8 = 4;
 pub(super) const WAIT_EXIT_INVALID: u8 = 5;
