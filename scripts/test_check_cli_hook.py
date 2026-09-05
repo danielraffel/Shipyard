@@ -27,6 +27,84 @@ class CheckCliHookTests(unittest.TestCase):
         )
         self.assertEqual(entry["version"], plugin["version"])
 
+    def test_marketplace_is_registered_as_a_plugin_version_file(self) -> None:
+        """The bump tool must actually own marketplace.json, not just be able to.
+
+        The drift test above only fires *after* the two files have already
+        diverged on main, and only on the next run of a check that does not
+        block a merge. This asserts the arming instead: that the plugin
+        surface lists marketplace.json among its version files, so
+        `version_bump_check.py --mode=apply` moves both in lockstep.
+
+        It was unregistered for long enough to ship a split-brain version,
+        while the apply logic that keeps multiple files in step already
+        existed and named this very file in its comments. A guard that is
+        present but unwired is not a guard.
+        """
+        versioning = json.loads(
+            (ROOT / "scripts" / "versioning.json").read_text(encoding="utf-8")
+        )
+        paths = [
+            version_file["path"]
+            for version_file in versioning["surfaces"]["plugin"]["version_files"]
+        ]
+        self.assertIn(".claude-plugin/plugin.json", paths)
+        self.assertIn(".claude-plugin/marketplace.json", paths)
+
+    def test_marketplace_version_pattern_targets_the_plugin_not_the_metadata(
+        self,
+    ) -> None:
+        """marketplace.json carries two unrelated versions; pick the right one.
+
+        `metadata.version` describes the marketplace itself and must never be
+        rewritten by a plugin bump, so the pattern is anchored inside the
+        `plugins` array. This is the planted control for that anchoring: it
+        rewrites through the configured pattern and asserts the other version
+        is left alone. An unanchored pattern passes the drift test above and
+        silently corrupts the marketplace version instead.
+        """
+        import re
+
+        versioning = json.loads(
+            (ROOT / "scripts" / "versioning.json").read_text(encoding="utf-8")
+        )
+        version_file = next(
+            candidate
+            for candidate in versioning["surfaces"]["plugin"]["version_files"]
+            if candidate["path"] == ".claude-plugin/marketplace.json"
+        )
+        text = (ROOT / ".claude-plugin" / "marketplace.json").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(version_file["pattern"], text)
+        self.assertIsNotNone(match, "pattern must match marketplace.json")
+        assert match is not None
+        original = json.loads(text)
+        self.assertEqual(
+            match.group(1),
+            next(
+                item
+                for item in original["plugins"]
+                if item["name"] == "shipyard"
+            )["version"],
+            "the pattern must capture the plugin entry's version",
+        )
+
+        rewritten = json.loads(
+            re.sub(
+                version_file["pattern"],
+                lambda found: found.group(0).replace(found.group(1), "9.9.9"),
+                text,
+                count=1,
+            )
+        )
+        self.assertEqual(rewritten["plugins"][0]["version"], "9.9.9")
+        self.assertEqual(
+            rewritten["metadata"]["version"],
+            original["metadata"]["version"],
+            "a plugin bump must not rewrite the marketplace's own version",
+        )
+
     def test_partial_install_warns_without_running_installer(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
