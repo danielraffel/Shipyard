@@ -1003,6 +1003,15 @@ name the `Boundary` (`grammar` / `scope` / `identity` / `permission` / `parse` /
 and `Boundary::next_action` names it. A `transport` failure is explicitly **not**
 an auth fault — do not re-authenticate in response to a timeout.
 
+When a fleet fault needs to reach a human, do not leave it in a log on the
+broken host — nobody reads that host. Open a tracking issue and auto-close it on
+recovery (`src/fleet_escalation.rs` decides; the caller does the I/O), and give
+it hysteresis: raise only after a subject has been failing *continuously*, clear
+only after it has been healthy *continuously*, and clear more slowly than you
+raise. Everything here flickers, and a flapping alarm gets ignored along with
+the one real occurrence. Never a single roll-up issue for the fleet — that hides
+the second instance of a fault behind the first.
+
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
