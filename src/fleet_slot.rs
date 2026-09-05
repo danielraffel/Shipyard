@@ -998,5 +998,187 @@ fn finish_coherence(mut report: CoherenceReport) -> CoherenceReport {
     report
 }
 
+// ---------------------------------------------------------------------------
+// A queued run that will neither schedule nor cancel is an immortal demand
+// signal
+// ---------------------------------------------------------------------------
+
+/// Default age, in seconds, after which a queued job that a capable idle runner
+/// is available for is treated as wedged rather than merely waiting.
+///
+/// Generous on purpose: GitHub's dispatcher is not instantaneous and a
+/// just-in-time pool takes minutes to boot. The case this catches sat queued for
+/// nearly two days.
+pub const DEFAULT_WEDGED_AFTER_SECS: i64 = 3600;
+
+/// Default grace, in seconds, allowed for a cancellation to take effect.
+pub const DEFAULT_CANCEL_GRACE_SECS: i64 = 300;
+
+/// A queued job, and what the fleet could do about it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QueuedJobObservation {
+    /// Run identifier, so the report names something actionable.
+    pub run_id: String,
+    /// Job name.
+    pub name: String,
+    /// When it entered the queue.
+    pub queued_since: DateTime<Utc>,
+    /// Whether some runner, in either scope, is online and advertises every
+    /// label this job requests.
+    pub capable_runner_online: bool,
+    /// Whether at least one such runner is idle right now.
+    pub capable_runner_idle: bool,
+    /// When a cancellation was requested, if one was.
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+}
+
+/// Thresholds for [`assess_queued_job`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WedgeThresholds {
+    /// Age past which a schedulable queued job counts as wedged.
+    pub wedged_after_secs: i64,
+    /// Grace allowed for a cancellation to take effect.
+    pub cancel_grace_secs: i64,
+}
+
+impl Default for WedgeThresholds {
+    fn default() -> Self {
+        Self {
+            wedged_after_secs: DEFAULT_WEDGED_AFTER_SECS,
+            cancel_grace_secs: DEFAULT_CANCEL_GRACE_SECS,
+        }
+    }
+}
+
+/// What a queued job is doing to the fleet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedJobState {
+    /// Waiting normally, within its threshold.
+    Waiting,
+    /// Nothing online advertises its labels. A routing question, and the
+    /// province of the lane-service assertion rather than this one.
+    NoCapableRunner,
+    /// A capable runner is online and idle, and the job has waited past the
+    /// threshold anyway: the dispatcher will not place it.
+    Wedged,
+    /// A cancellation was requested and did not take within its grace. The
+    /// strongest form, because the operator has already tried the remedy.
+    Unclearable,
+}
+
+impl QueuedJobState {
+    /// Snake-case string form used in JSON and human output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::NoCapableRunner => "no_capable_runner",
+            Self::Wedged => "wedged",
+            Self::Unclearable => "unclearable",
+        }
+    }
+}
+
+/// Verdict for one queued job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QueuedJobReport {
+    /// Run identifier.
+    pub run_id: String,
+    /// What the job is doing.
+    pub state: QueuedJobState,
+    /// The shared verdict.
+    pub verdict: ServiceVerdict,
+    /// How long it has been queued, in seconds.
+    pub queued_secs: i64,
+    /// Whether this job will be counted as priority demand for as long as it
+    /// exists.
+    pub counts_as_demand: bool,
+    /// Operator-facing explanation.
+    pub detail: String,
+}
+
+/// Classify a queued job, and say whether it is silently holding a lane open.
+///
+/// The reason this belongs beside the withholding assertion rather than with
+/// the lane-service one: `priority_demand` counts **queued** jobs, and it has no
+/// notion of a job that will never start. So a run that GitHub will neither
+/// schedule nor cancel is not merely one stuck job — it is a demand signal with
+/// no expiry, and any lane that yields to it yields forever.
+///
+/// Observed: a run queued for roughly forty-five hours whose remaining job
+/// requested labels two online, idle runners advertised, and whose cancellation
+/// did not take.
+#[must_use]
+pub fn assess_queued_job(
+    observation: &QueuedJobObservation,
+    thresholds: WedgeThresholds,
+    now: DateTime<Utc>,
+) -> QueuedJobReport {
+    let queued_secs = (now - observation.queued_since).num_seconds();
+    let run_id = observation.run_id.clone();
+    let name = observation.name.as_str();
+
+    // A cancellation that did not take is the strongest evidence available,
+    // and it is checked first: the operator has already applied the remedy.
+    if let Some(requested) = observation.cancel_requested_at {
+        let since_cancel = (now - requested).num_seconds();
+        if since_cancel >= thresholds.cancel_grace_secs {
+            return QueuedJobReport {
+                run_id,
+                state: QueuedJobState::Unclearable,
+                verdict: ServiceVerdict::Degraded,
+                queued_secs,
+                counts_as_demand: true,
+                detail: format!(
+                    "{name} was asked to cancel {since_cancel}s ago and is still queued after \
+                     {queued_secs}s. It cannot be scheduled and cannot be cleared, so it counts \
+                     as priority demand indefinitely and any lane yielding to it yields forever. \
+                     Escalate: this needs the run deleted or the workflow re-dispatched, not \
+                     another cancel"
+                ),
+            };
+        }
+    }
+
+    if !observation.capable_runner_online {
+        return QueuedJobReport {
+            run_id,
+            state: QueuedJobState::NoCapableRunner,
+            verdict: ServiceVerdict::Served,
+            queued_secs,
+            counts_as_demand: true,
+            detail: format!(
+                "{name} has waited {queued_secs}s with no online runner advertising its labels; \
+                 that is a routing question for the lane-service assertion, not a wedge"
+            ),
+        };
+    }
+
+    if queued_secs >= thresholds.wedged_after_secs && observation.capable_runner_idle {
+        return QueuedJobReport {
+            run_id,
+            state: QueuedJobState::Wedged,
+            verdict: ServiceVerdict::Degraded,
+            queued_secs,
+            counts_as_demand: true,
+            detail: format!(
+                "{name} has been queued {queued_secs}s while a capable runner sits online and \
+                 idle, so the dispatcher is not placing it. It still counts as priority demand, \
+                 so it can hold another lane's slot open for as long as it exists"
+            ),
+        };
+    }
+
+    QueuedJobReport {
+        run_id,
+        state: QueuedJobState::Waiting,
+        verdict: ServiceVerdict::Served,
+        queued_secs,
+        counts_as_demand: true,
+        detail: format!("{name} has been queued {queued_secs}s and is waiting normally"),
+    }
+}
+
 #[cfg(test)]
 mod tests;

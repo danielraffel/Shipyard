@@ -554,3 +554,117 @@ fn every_unknown_verdict_carries_a_boundary_and_no_other_verdict_does() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A queued run that will neither schedule nor cancel
+// ---------------------------------------------------------------------------
+
+fn queued_job(
+    queued_mins: i64,
+    capable_online: bool,
+    capable_idle: bool,
+    cancel_mins_ago: Option<i64>,
+) -> QueuedJobObservation {
+    QueuedJobObservation {
+        run_id: "33719986724".to_owned(),
+        name: "Linux (x64) [local]".to_owned(),
+        queued_since: now() - Duration::minutes(queued_mins),
+        capable_runner_online: capable_online,
+        capable_runner_idle: capable_idle,
+        cancel_requested_at: cancel_mins_ago.map(|m| now() - Duration::minutes(m)),
+    }
+}
+
+fn wedge(observation: &QueuedJobObservation) -> QueuedJobReport {
+    assess_queued_job(observation, WedgeThresholds::default(), now())
+}
+
+/// The observed case: queued ~45 hours while two capable runners sat online and
+/// idle. Not unserved (its labels are advertised) and not starved by priority
+/// (the runners are free) — the dispatcher simply will not place it.
+#[test]
+fn a_long_queued_job_with_an_idle_capable_runner_is_wedged() {
+    let report = wedge(&queued_job(45 * 60, true, true, None));
+    assert_eq!(report.state, QueuedJobState::Wedged);
+    assert!(report.verdict.is_raise());
+    assert!(report.counts_as_demand);
+    assert!(report.detail.contains("online and"), "{}", report.detail);
+}
+
+/// Planted control for the test above: the same job, inside its threshold. If
+/// this went red too, the wedge rule would just be flagging every queued job.
+#[test]
+fn control_a_recently_queued_job_is_merely_waiting() {
+    let report = wedge(&queued_job(2, true, true, None));
+    assert_eq!(report.state, QueuedJobState::Waiting);
+    assert!(!report.verdict.is_raise());
+}
+
+/// Second control: aged, but no capable runner. That is a routing question and
+/// belongs to the lane-service assertion; reporting it as a wedge would send an
+/// operator to chase a dispatcher bug that does not exist.
+#[test]
+fn control_an_aged_job_with_no_capable_runner_is_not_a_wedge() {
+    let report = wedge(&queued_job(45 * 60, false, false, None));
+    assert_eq!(report.state, QueuedJobState::NoCapableRunner);
+    assert!(!report.verdict.is_raise());
+}
+
+/// Third control: aged, capable runner online but busy. Waiting behind real
+/// work is ordinary queueing, not a wedge.
+#[test]
+fn control_an_aged_job_behind_a_busy_capable_runner_is_not_a_wedge() {
+    let report = wedge(&queued_job(45 * 60, true, false, None));
+    assert_eq!(report.state, QueuedJobState::Waiting);
+    assert!(!report.verdict.is_raise());
+}
+
+/// The strongest form: the operator already tried the remedy and it did not
+/// take. This outranks the plain wedge because another cancel is not the answer.
+#[test]
+fn a_cancellation_that_did_not_take_is_unclearable() {
+    let report = wedge(&queued_job(45 * 60, true, true, Some(30)));
+    assert_eq!(report.state, QueuedJobState::Unclearable);
+    assert!(report.verdict.is_raise());
+    assert!(
+        report.detail.contains("not another cancel"),
+        "the remedy must not be the thing that already failed: {}",
+        report.detail
+    );
+}
+
+/// Control for the above: a cancellation still inside its grace is not yet
+/// evidence of anything.
+#[test]
+fn control_a_fresh_cancellation_is_still_within_its_grace() {
+    let report = wedge(&queued_job(45 * 60, true, true, Some(1)));
+    assert_ne!(report.state, QueuedJobState::Unclearable);
+}
+
+/// The whole reason this lives beside the withholding assertion: a job that
+/// cannot start still counts as demand, so a lane yielding to it yields forever.
+#[test]
+fn every_queued_state_still_counts_as_demand() {
+    for observation in [
+        queued_job(2, true, true, None),
+        queued_job(45 * 60, true, true, None),
+        queued_job(45 * 60, false, false, None),
+        queued_job(45 * 60, true, true, Some(30)),
+    ] {
+        assert!(
+            wedge(&observation).counts_as_demand,
+            "priority_demand counts queued jobs regardless of whether they can ever start"
+        );
+    }
+}
+
+#[test]
+fn queued_job_state_strings_are_stable() {
+    assert_eq!(QueuedJobState::Waiting.as_str(), "waiting");
+    assert_eq!(
+        QueuedJobState::NoCapableRunner.as_str(),
+        "no_capable_runner"
+    );
+    assert_eq!(QueuedJobState::Wedged.as_str(), "wedged");
+    assert_eq!(QueuedJobState::Unclearable.as_str(), "unclearable");
+}
