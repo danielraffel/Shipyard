@@ -2655,6 +2655,35 @@ bypasses the cache. The consumer build remains responsible for verifying the
 exact SDK bytes it consumes and matching extracted `sdk-provenance.json` source
 and distribution eligibility to the lock.
 
+### A wall of reds is usually one red
+
+Before triaging N failures in a leg, check whether N-1 of them are cascades of
+one. Two mechanisms in this repo manufacture them, and both name healthy tests
+as the culprit:
+
+- **A poisoned shared lock.** `std::sync::Mutex` poisons when a holder panics,
+  and `lock().expect(..)` re-panics for *every later caller in the binary*. One
+  real assertion failure in `merge_steward_cmd` once produced sixteen
+  `PoisonError` reds behind it. A lock that guards `()` — pure mutual exclusion,
+  no state — cannot have a broken invariant, so poisoning carries no
+  information and must be recovered with `PoisonError::into_inner`. Take the
+  process-tree lock via `test_support::lock_process_tree_for_test()`, never
+  `PROCESS_TREE_TEST_LOCK.lock().expect(..)`.
+- **A `SIGABRT`.** A stack overflow or abort kills the whole test binary, so
+  every test that had not yet run is reported as not-passed regardless of its
+  own health.
+
+The tell is the panic *site*: cascades all panic at the same shared line, and
+the real failure is the one panicking somewhere of its own.
+
+**Fix a flake by forcing it, never by re-running it.** A fix you cannot make
+fail on demand is a hope. Force the mechanism (poison the lock deliberately;
+hold the executable open to force `ETXTBSY`), plant a control that proves the
+precondition really happened so the test cannot pass vacuously, then mutate the
+fix away and confirm that exact test goes red. If a test is non-deterministic
+by construction, say so and propose making it deterministic rather than
+quarantining it.
+
 ## Cutover Discipline
 
 ### Bounded metrics observation
