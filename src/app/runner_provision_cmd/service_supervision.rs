@@ -1,6 +1,6 @@
 //! Make a provisioned runner's service survive an ordinary exit.
 //!
-//! The GitHub Actions runner's own `svc.sh install` writes a LaunchAgent with
+//! The GitHub Actions runner's own `svc.sh install` writes a `LaunchAgent` with
 //! `RunAtLoad` and **no** `KeepAlive`. That starts the job once and says
 //! nothing about what happens when it stops, which is not supervision — it
 //! only looks like it, because a freshly installed runner is running.
