@@ -83,7 +83,7 @@ pub(super) fn watch_with_fetcher<W: Write, F: DiagnosticsFetcher + ?Sized>(
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
                 return Ok(ExitCode::from(2));
             }
-            let message = archived_handback_message(target_pr);
+            let (message, exit_code) = archived_handback(target_pr);
             emit_watch_event(
                 "state-archived",
                 Some(target_pr),
@@ -92,7 +92,7 @@ pub(super) fn watch_with_fetcher<W: Write, F: DiagnosticsFetcher + ?Sized>(
                 stdout,
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            return Ok(ExitCode::from(WATCH_EXIT_INDETERMINATE));
+            return Ok(exit_code);
         };
 
         observed_any_state = true;
@@ -142,17 +142,18 @@ pub(super) fn watch_with_fetcher<W: Write, F: DiagnosticsFetcher + ?Sized>(
 /// merged, discarded and pruned alike. Reporting success would tell a caller
 /// that a pull request closed **without** merging had landed, so the handback
 /// says the outcome is undetermined and names the authority that knows.
-pub(super) fn archived_handback_message(target_pr: u64) -> String {
-    format!(
+pub(super) fn archived_handback(target_pr: u64) -> (String, ExitCode) {
+    let message = format!(
         "PR #{target_pr}: ship state archived, so the outcome is UNDETERMINED — archived covers \
          merged, discarded and pruned alike, and the archive does not record which. Ask the \
          authority: `gh pr view {target_pr} --json state,mergedAt`."
-    )
+    );
+    (message, ExitCode::from(WATCH_EXIT_INDETERMINATE))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::archived_handback_message;
+    use super::archived_handback;
     use std::process::ExitCode;
 
     use chrono::Utc;
@@ -229,12 +230,14 @@ mod tests {
     /// as strictly worse than never handing back at all.
     #[test]
     fn negative_control_an_archived_state_is_not_a_success() {
+        let (_, code) = archived_handback(7996);
+
         assert_ne!(
-            ExitCode::from(WATCH_EXIT_INDETERMINATE),
+            code,
             ExitCode::SUCCESS,
             "absence must never be reported as success"
         );
-        assert_eq!(WATCH_EXIT_INDETERMINATE, 4);
+        assert_eq!(code, ExitCode::from(4));
     }
 
     /// The handback has to say the outcome is unknown AND where to get it. An
@@ -242,7 +245,7 @@ mod tests {
     /// nothing.
     #[test]
     fn the_archived_handback_names_the_ambiguity_and_the_authority() {
-        let message = archived_handback_message(7996);
+        let (message, _) = archived_handback(7996);
 
         assert!(message.contains("UNDETERMINED"), "{message}");
         assert!(
@@ -260,8 +263,8 @@ mod tests {
     /// than none.
     #[test]
     fn control_the_handback_is_scoped_to_its_own_pr() {
-        let a = archived_handback_message(7996);
-        let b = archived_handback_message(1234);
+        let (a, _) = archived_handback(7996);
+        let (b, _) = archived_handback(1234);
 
         assert_ne!(a, b);
         assert!(!a.contains("1234"), "{a}");
