@@ -3503,7 +3503,7 @@ mod tests {
     use crate::ship_state::DispatchedRun;
     use crate::ship_state::{ShipState, ShipStateStore};
     #[cfg(unix)]
-    use crate::test_support::PROCESS_TREE_TEST_LOCK;
+    use crate::test_support::lock_process_tree_for_test;
     #[cfg(unix)]
     use crate::webhook::hmac_sha256_hex;
     #[cfg(unix)]
@@ -4268,7 +4268,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stop_running_terminates_pid_when_ipc_is_unavailable() {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let daemon_dir = temp.path().join("daemon");
         std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
@@ -4321,7 +4321,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stop_running_kills_daemon_that_removes_pid_file_but_survives_term() {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let daemon_dir = temp.path().join("daemon");
         std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
@@ -4366,7 +4366,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stop_running_does_not_signal_unrecognized_pid_file() {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let daemon_dir = temp.path().join("daemon");
         std::fs::create_dir_all(&daemon_dir).expect("daemon dir");

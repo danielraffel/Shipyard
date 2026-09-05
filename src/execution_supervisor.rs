@@ -1375,7 +1375,7 @@ mod tests {
     };
     use crate::ship_state::ShipState;
     #[cfg(unix)]
-    use crate::test_support::PROCESS_TREE_TEST_LOCK;
+    use crate::test_support::lock_process_tree_for_test;
 
     fn envelope(claims: &[&str], provenance: bool) -> QueuedExecutionEnvelope {
         use crate::job::{Priority, ValidationMode};
@@ -1944,7 +1944,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn manual_cancellation_terminates_the_worker_process_group() {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         queued_job(temp.path(), "cancel-tree");
         let mut supervisor = ExecutionSupervisor::new(
@@ -2008,7 +2008,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gen42_issues_436_437_exact_merge_kills_tree_types_outcome_and_releases_capacity() {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         queued_ship_job(temp.path(), "merged-tree", "exact-head");
         let mut supervisor = ExecutionSupervisor::new(
@@ -2220,7 +2220,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn receiptless_recovery_still_refuses_a_present_replacement_generation() {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let job_id = "replacement-generation";
         queued_ship_job(temp.path(), job_id, "exact-head");
@@ -2293,7 +2293,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gen42_issue_437_cancel_promotes_released_defer_transaction_on_restart() {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         queued_job(temp.path(), "defer-then-cancel");
         let mut original = ExecutionSupervisor::new(
@@ -2383,7 +2383,7 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_defer_cleanup_preserves_replacement_generation(restart_cleanup: bool) {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let job_id = "defer-generation-cas";
         queued_job(temp.path(), job_id);
@@ -2465,7 +2465,7 @@ mod tests {
         boundary: TerminationCrashBoundary,
         retain_receipt: bool,
     ) {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let job_id = match action {
             TerminationAction::Cancel => {
@@ -2816,7 +2816,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gen42_issue_437_restart_kills_adopted_tree_before_releasing_lease_and_capacity() {
-        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         queued_job(temp.path(), "adopted-cancel-tree");
         let binary = fake_worker_tree(temp.path());

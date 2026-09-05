@@ -277,6 +277,60 @@ pub(crate) mod test_support {
     pub(crate) static PROCESS_TREE_TEST_LOCK: LazyLock<Mutex<()>> =
         LazyLock::new(|| Mutex::new(()));
 
+    /// Take the process-tree lock, ignoring poisoning.
+    ///
+    /// This mutex guards `()`. It carries no state, so a panicking holder
+    /// cannot have left an invariant broken — poisoning here says only "some
+    /// earlier test failed", which the harness already reports.
+    ///
+    /// Honouring it is actively harmful: `lock().expect(..)` turns one failing
+    /// test into a cascade, because every later test panics on the poison
+    /// rather than on anything of its own. A single real assertion failure was
+    /// observed producing sixteen such cascades in one CI run, which buries the
+    /// one line that mattered under sixteen that did not.
+    pub(crate) fn lock_process_tree_for_test() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_TREE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Force the poisoning cascade deterministically, then show the fix.
+    ///
+    /// No timing, no race, no retry: a holder panics, and from that instant the
+    /// raw `lock()` returns `Err` **forever** for every later caller in the
+    /// binary. That is the whole mechanism. One real assertion failure in
+    /// `merge_steward_cmd` was observed turning into sixteen further reds this
+    /// way, none of which had anything wrong with them.
+    ///
+    /// The first assertion is the planted control. Without it this test would
+    /// still pass against a mutex that was never poisoned at all, and would be
+    /// proving nothing.
+    ///
+    /// This test poisons the lock that the other suites in this binary share.
+    /// That is deliberate and is the integration half of the proof: every one
+    /// of them goes on to acquire it through the helper regardless of the order
+    /// the harness happens to run them in.
+    ///
+    /// A panic message is printed while this runs. It is expected.
+    #[test]
+    fn forcing_a_panic_under_the_tree_lock_poisons_it_and_the_helper_serves_it_anyway() {
+        let panicked = std::panic::catch_unwind(|| {
+            let _guard = lock_process_tree_for_test();
+            panic!("deliberate poison, expected by this test: a holder failed");
+        });
+        assert!(panicked.is_err(), "the forcing panic did not happen");
+
+        // Control: prove the lock really is poisoned, so the assertion below is
+        // not passing vacuously against a healthy mutex.
+        assert!(
+            PROCESS_TREE_TEST_LOCK.lock().is_err(),
+            "control failed: the lock was not poisoned, so this test proves nothing"
+        );
+
+        // The fix: a later caller is served rather than cascaded into.
+        let _guard = lock_process_tree_for_test();
+    }
+
     /// Compile a tiny native fixture when a security boundary deliberately
     /// rejects script wrappers. The fixture is scoped to the caller's tempdir.
     pub(crate) fn compile_native_test_program(
