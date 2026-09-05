@@ -7,18 +7,36 @@
 //! shared repository, "did not call" is the more important half.
 
 use super::*;
+// Gated with the tests that use it: `open_action` is the only consumer and it
+// is unix-only, so an ungated import is an unused-import error on Windows.
 use crate::fleet_escalation::EscalationAction;
 
-#[cfg(unix)]
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     use std::os::unix::fs::PermissionsExt;
     let path = temp.path().join("gh");
-    std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake gh");
-    let mut permissions = std::fs::metadata(&path)
+    // Write to a staging name and rename into place. Writing the script and
+    // exec'ing it directly races: with tests running in parallel, another
+    // thread can fork while this one still holds the file open for writing,
+    // the child inherits that descriptor, and the exec fails ETXTBSY ("Text
+    // file busy"). Rename is atomic and publishes an inode nobody holds a
+    // write handle to, so the exec cannot observe the half-written state.
+    // Seen only on Linux under llvm-cov, where instrumentation widens the
+    // window enough to hit it.
+    let staging = temp.path().join("gh.staging");
+    // The probe short-circuits before the body so it cannot append to a
+    // recording script's call log and corrupt the assertions that read it.
+    std::fs::write(
+        &staging,
+        format!("#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--probe\" ]; then exit 0; fi\n{body}\n"),
+    )
+    .expect("write fake gh");
+    let mut permissions = std::fs::metadata(&staging)
         .expect("fake gh metadata")
         .permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(&path, permissions).expect("chmod fake gh");
+    std::fs::set_permissions(&staging, permissions).expect("chmod fake gh");
+    std::fs::rename(&staging, &path).expect("publish fake gh");
+    wait_until_executable(&path);
     // An empty config keeps the fake off the ambient auth path, which
     // otherwise demands a real GitHub remote on the temp dir.
     let config = crate::config::LoadedConfig {
@@ -32,7 +50,34 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
 }
 
 /// A fake `gh` that logs every argv line to `calls` and prints `payload`.
-#[cfg(unix)]
+/// Block until the freshly written script can actually be exec'd.
+///
+/// Renaming is not sufficient on Linux. The window is: this thread writes the
+/// file, a sibling test thread forks before the descriptor is closed, the child
+/// inherits it, and any exec of that inode fails ETXTBSY until the child is
+/// gone. The inherited descriptor outlives the rename, because it refers to the
+/// inode rather than the path.
+///
+/// The child clears in milliseconds, so probing until an exec succeeds closes
+/// the race by construction rather than by timing guess. Once one exec
+/// succeeds, no write descriptor remains anywhere and later forks are harmless.
+fn wait_until_executable(path: &std::path::Path) {
+    for _ in 0..200 {
+        // ETXTBSY (26) is the one error worth waiting out; anything else means
+        // the exec is not going to start working, so stop rather than spin.
+        let busy = std::process::Command::new(path)
+            .arg("--probe")
+            .output()
+            .err()
+            .is_some_and(|error| error.raw_os_error() == Some(26));
+        if !busy {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("fake gh never became executable: {}", path.display());
+}
+
 fn recording_gh(temp: &tempfile::TempDir, payload: &str) -> (GitHubActions, std::path::PathBuf) {
     let calls = temp.path().join("calls");
     let actions = fake_gh(
@@ -45,11 +90,13 @@ fn recording_gh(temp: &tempfile::TempDir, payload: &str) -> (GitHubActions, std:
     (actions, calls)
 }
 
-#[cfg(unix)]
 fn calls_of(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+// Only the `#[cfg(unix)]` tests build an action, because the fake-`gh` harness
+// needs a `#!/bin/sh` shim. Without the same gate this is dead code on Windows,
+// where `-D warnings` turns that into a build failure.
 fn open_action() -> EscalationAction {
     EscalationAction::Open {
         key: "host=macpro lane=linux".to_owned(),
@@ -65,7 +112,6 @@ fn open_action() -> EscalationAction {
 /// The planted control for the most dangerous property of this module: with
 /// `apply` false it must make **no mutating call at all**. A dry run that
 /// quietly writes is worse than no dry run, because it is trusted.
-#[cfg(unix)]
 #[test]
 fn negative_control_a_dry_run_makes_no_mutating_call() {
     let temp = tempfile::tempdir().expect("temp");
@@ -95,7 +141,6 @@ fn negative_control_a_dry_run_makes_no_mutating_call() {
 
 /// Pairing control: with `apply` true the same open DOES call the API.
 /// Without this, "makes no call" would also pass for a module that never works.
-#[cfg(unix)]
 #[test]
 fn control_applying_an_open_posts_to_the_issues_endpoint() {
     let temp = tempfile::tempdir().expect("temp");
@@ -120,7 +165,6 @@ fn control_applying_an_open_posts_to_the_issues_endpoint() {
 // Each action hits its own endpoint, and only its own
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 #[test]
 fn an_update_patches_the_issue_and_does_not_open_a_new_one() {
     let temp = tempfile::tempdir().expect("temp");
@@ -149,7 +193,6 @@ fn an_update_patches_the_issue_and_does_not_open_a_new_one() {
 /// The comment must be posted before the state change. If the close fails, the
 /// reader is left with an open issue that explains the recovery; reversed, a
 /// failure would leave a silently closed issue and no explanation.
-#[cfg(unix)]
 #[test]
 fn a_close_comments_before_it_closes() {
     let temp = tempfile::tempdir().expect("temp");
@@ -175,7 +218,6 @@ fn a_close_comments_before_it_closes() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn nothing_touches_the_api_even_when_applying() {
     let temp = tempfile::tempdir().expect("temp");
@@ -199,7 +241,6 @@ fn nothing_touches_the_api_even_when_applying() {
 // Reading the open issues back
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 #[test]
 fn tracking_issues_are_matched_by_marker_not_title() {
     let temp = tempfile::tempdir().expect("temp");
@@ -223,7 +264,6 @@ fn tracking_issues_are_matched_by_marker_not_title() {
 /// Planted control: an issue we did not write must never be adopted, however
 /// much its title looks like ours. Editing somebody else's report is worse than
 /// opening a duplicate.
-#[cfg(unix)]
 #[test]
 fn negative_control_an_unmarked_issue_is_never_adopted() {
     let temp = tempfile::tempdir().expect("temp");
@@ -239,7 +279,6 @@ fn negative_control_an_unmarked_issue_is_never_adopted() {
 
 /// The issues endpoint returns pull requests. Closing one as "recovered" would
 /// be a memorable way to lose somebody's work.
-#[cfg(unix)]
 #[test]
 fn pull_requests_are_excluded_even_when_marked() {
     let temp = tempfile::tempdir().expect("temp");
@@ -258,7 +297,6 @@ fn pull_requests_are_excluded_even_when_marked() {
 /// An unreadable list must be an error, not an empty vector. Reading "nothing
 /// is open" from a failed call is how a duplicate gets opened next to the issue
 /// that already exists.
-#[cfg(unix)]
 #[test]
 fn negative_control_an_unreadable_list_errors_rather_than_reading_empty() {
     let temp = tempfile::tempdir().expect("temp");
@@ -282,7 +320,6 @@ fn a_marker_round_trips() {
 
 /// A failed mutation invalidates the snapshot the whole batch was decided
 /// against, so the batch stops rather than pressing on and risking a duplicate.
-#[cfg(unix)]
 #[test]
 fn a_batch_stops_at_the_first_failure() {
     let temp = tempfile::tempdir().expect("temp");
@@ -321,7 +358,6 @@ fn a_batch_stops_at_the_first_failure() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_clean_batch_reports_every_action() {
     let temp = tempfile::tempdir().expect("temp");

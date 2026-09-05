@@ -1099,6 +1099,45 @@ out-of-memory failure into `no free clone id`.
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
+## cfg-gated tests: gate the helpers identically
+
+A `#[cfg(unix)]` test module must gate its **helpers** with the same cfg, not
+just its `#[test]` functions. A helper used only by gated tests is *dead code*
+on the platform that skips them, and `-D warnings` turns that into a **build
+failure** — so the break lands on the one platform that never runs the code, and
+no amount of local testing on a Mac can see it.
+
+This is not hypothetical: `open_action` in the escalation I/O tests was left
+ungated while its three siblings were gated, and it took `main` red on Windows.
+`cargo clippy --all-targets` on macOS compiles the unix branch, where the
+function is used, so the local gate passes.
+
+**Prefer one gate on the module over many on its items.** If every test in a
+module needs the platform, write `#[cfg(all(test, unix))] mod tests;` at the
+declaration and none inside. Per-item gating is what fails: it leaves helpers
+and imports visible to the platform that skips the tests, each one a separate
+dead-code or unused-import error, and fixing one reveals the next. Three
+consecutive CI failures on one PR were that exact loop; collapsing 18 gates to
+1 ended it. A single gate cannot be applied inconsistently.
+
+If you must gate per item, check every helper **and every import** in the
+module, not just the one you touched — gating an item orphans its imports,
+which fail the same way.
+
+**Verify it instead of reasoning about it.** The skipping platform's view is
+simply "the gated branch does not exist", and you can reproduce that natively:
+
+```sh
+sed -i '' 's/#\[cfg(unix)\]/#[cfg(any())]/g' <file>   # always-false cfg
+cargo clippy --all-targets --locked -- -D warnings
+git checkout -- <file>                                  # restore
+```
+
+Anything that lint reports is what the other platform will report. This is much
+cheaper than a CI round trip, and unlike `--target x86_64-pc-windows-msvc` it
+needs no cross toolchain — that target cannot even build this tree's native
+dependencies (`libsqlite3-sys`, `zstd-sys`) without MSVC.
+
 ## Host-Health Pre-Dispatch Gate (optional)
 
 For self-hosted runners *co-located with heavy interactive work*: read a shared
