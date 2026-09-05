@@ -500,6 +500,44 @@ consumer's pre-push hook; without keepalive traffic, an hour-long local gate can
 finish successfully only to find GitHub closed the idle connection. Preserve a
 caller's explicit SSH command rather than replacing its identity/proxy policy.
 
+### `RunAtLoad` is not supervision
+
+`svc.sh install` — the GitHub runner's own installer, which `shipyard runner
+register` delegates to — writes a LaunchAgent with `RunAtLoad` and **no**
+`KeepAlive`. It starts the job once and says nothing about what happens when it
+stops. A freshly installed runner is running, so this looks supervised and is
+not.
+
+The consequence is that an ordinary, correct developer action removes a lane.
+A force-push trips `cancel-in-progress`; the cancel reaches the runner as a
+signal (`Runner will be shutdown for UserCancelled`); it exits; nothing brings
+it back. On 2026-09-05 that took out the only macOS runner for
+`danielraffel/Shipyard`, and a read-only sweep afterwards found **four** runners
+in the same shape across two hosts — one already offline on a repository whose
+only runner it was, quietly unserved with no queued work to make it visible.
+
+`shipyard runner register` now patches the definition between `install` and
+`start`, so the job is loaded with the policy in place. Three rules worth
+knowing if you touch it:
+
+- **Never on an ephemeral runner.** It is *supposed* to exit after one job;
+  restarting it in place would respawn it forever and defeat the isolation it
+  exists for. The fix would become a new bug.
+- **Refuse rather than guess.** If the installer's template changes shape, it
+  errors instead of returning the definition unpatched — a silent pass-through
+  would recreate the original bug invisibly on every runner from then on.
+- **Idempotent.** A duplicate key makes a plist malformed, which would turn a
+  merely-unsupervised runner into an unloadable one.
+
+**Existing runners predate this and are not retrofitted.** To audit one by hand,
+read its plist — and query the *right* launchd domain, since a LaunchAgent is
+invisible from another session:
+
+```sh
+launchctl print gui/$(id -u)/<label>          # run against a known-loaded job first
+grep -c KeepAlive ~/Library/LaunchAgents/<label>.plist
+```
+
 ## Runner Provider Defaults
 
 Shipyard's own workflows default to GitHub-hosted runners for Linux, macOS, and
