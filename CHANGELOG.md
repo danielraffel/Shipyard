@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01760"></a>
+## [0.176.0] - 2026-09-05
+
+- feat(fleet): bounded self-heal gate that decides but never acts ([#567](https://github.com/danielraffel/Shipyard/pull/567))
+
 <a id="v01750"></a>
 ## [0.175.0] - 2026-09-04
 
@@ -1401,6 +1406,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.176.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.176.0
 [0.175.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.175.0
 [0.166.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.166.0
 [0.161.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.161.0
