@@ -527,6 +527,45 @@ install receipt records `support.source_commit`. The assertion is to **resolve
 and compare** those, not to invent an identity scheme. A change reaches such a
 host by PR plus a newly cut generation, never by editing a file in place.
 
+### Escalation leaves the host, and it has hysteresis
+
+`src/fleet_escalation.rs` decides *what* to escalate and *when*; the caller does
+the I/O. The target shape is the one that already works elsewhere in this stack:
+**open a tracking issue on degradation, auto-close it on recovery.**
+
+A journal line on a broken machine is not a signal, because nobody reads that
+machine. The bar: *a lane unserved for an hour should cost a human one glance,
+not nineteen days and a lucky question.*
+
+**Hysteresis is the design, not a refinement.** Every signal here flickers — a
+supervisor blind on 1598 of 2000 cycles reads healthy in its last 70 lines; a
+just-in-time pool registers and deregisters around every job. Reacting to a
+single sample would open and close an issue repeatedly, and a flapping alarm is
+worse than no alarm: it gets ignored, and the one real occurrence is ignored
+with it.
+
+So a subject must raise **continuously** for `raise_after_secs` (default 900)
+before anything opens, and be healthy **continuously** for `clear_after_secs`
+(default 1800) before it closes. Clearing is deliberately slower than raising,
+so a fault that briefly looks fixed does not close its own issue and restart the
+cycle.
+
+Three further rules, each with a reason paid for by an incident:
+
+- **An unchanged body is left alone.** Re-posting the same text every cycle
+  buries the one edit that mattered and teaches the reader to skip the
+  notification.
+- **One issue per subject key, never a fleet roll-up.** A roll-up hides the
+  second instance of a fault behind the first — exactly how a supervisor fault
+  on one host stayed dark for hours after its twin was found and fixed.
+- **`Unknown` escalates like any other fault**, and the body names its
+  `Boundary` and that boundary's `next_action`. An assertion that could not
+  measure is not one that passed.
+
+Every body names the host, the lane, what was already tried, and the next
+action. An alert that only says something is wrong makes its reader start from
+nothing, which is most of the cost of these incidents.
+
 ### An archived ship state is undetermined, not a success
 
 `shipyard watch` returned `ExitCode::SUCCESS` whenever the ship state was gone,
