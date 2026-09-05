@@ -1249,6 +1249,44 @@ resume is refused with a clear message — re-run with `--no-resume` to
 archive the stale state and start fresh. Full details in
 [`docs/ship-resume.md`](../../docs/ship-resume.md).
 
+### Being right does not discharge the duty
+
+A process that exits fail-closed because it cannot prove a resource is gone has
+made the *correct* decision, and it must never be "fixed" by making it proceed.
+But a correct refusal is not a completed obligation — it is the start of one.
+
+At the moment it stops, that process knows three things nobody else does: that
+it stopped, what it was holding, and why it could not finish. If it exits
+without saying them, that knowledge dies with it and the only remaining
+evidence is a resource nobody can account for. The real incident: a teardown
+refused correctly, **raised nothing**, and left a failed lease release
+unresolved, so a shared resource stayed held by a process that no longer
+existed.
+
+`fleet_handback::assess_exit` names the three obligations, most consequential
+first:
+
+1. **Bound the retry.** Repeating an unproven action is not recovery — an
+   unbounded restart into unproven state is the `NRestarts=36088` crash loop,
+   and it does damage on a timer rather than sitting inert.
+2. **Dispose.** Every held resource gets an owner or an explicit release. A
+   lease held by a dead process is a leak whatever the exit code was.
+3. **Raise.** Somewhere that outlives the host, because a journal line on a
+   machine nobody is looking at is not a signal. An empty reference does not
+   count.
+
+Two things it deliberately will *not* do, both of which would make it useless:
+
+- **A clean exit holding nothing owes nothing.** Faulting on every quiet
+  success buries the real findings under ordinary ones.
+- **An unobservable exit is `Unknown`, not `Discharged`.** It has a separate
+  constructor precisely so nobody can score one by passing defaults into the
+  normal path.
+
+`fleet_selfheal` already returns `Escalate` instead of acting when idleness
+cannot be proven. This is the other end of that contract — what the caller owes
+on receiving one.
+
 ## Queue management
 
 When multiple jobs are queued (common with parallel worktrees):

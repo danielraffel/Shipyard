@@ -82,6 +82,9 @@ pub mod fleet_escalation;
 /// Typed guard assertions: is a declared guard actually armed on the host, and
 /// is the installed copy still the one the repo believes it deployed?
 pub mod fleet_guards;
+/// What a process owes when it correctly refuses to act: raise it, dispose of
+/// what it held, and bound the retry.
+pub mod fleet_handback;
 /// Typed service assertions: is a declared lane actually being served?
 /// Reconcile a host-health claim against evidence that the host is serving,
 /// so a confidently wrong verdict cannot remove a working host from rotation.
