@@ -1051,6 +1051,33 @@ against budget, never as a boolean. When reproducing a proxy fault, do NOT use
 `env -i`: it strips the `*_proxy` variables, so the control is cleaner than the
 thing it controls for and passes every time.
 
+When judging whether a host's guards are in place, two rules that have each
+already cost real time:
+
+- **`enabled` is not armed.** A timer enabled with no next elapse fires never.
+  And a script present on disk with no unit to invoke it is not a guard at all —
+  that exact combination cost ~19 days of a dead Linux lane.
+- **Never threshold `NRestarts` on its level.** It is monotonic and survives the
+  repair; a healthy host here still reads 36089. Assert the *delta* against a
+  recorded baseline over a known interval. No baseline is `unknown`, not a pass.
+
+**Before measuring drift at all, prove the path is what executes.** On this
+fleet `~/.local/share/tartci` is inert: the supervisors exec a content-addressed
+generation under `~/.local/share/tartci-generations/<commit>-<manifest16>/`, and
+the gate LaunchAgent names that path directly. A drift number computed against
+the wrong directory is confident and meaningless — it happened here, and the
+running code turned out byte-identical to its source commit. Read the
+LaunchAgent's `ProgramArguments`, follow the launcher, and compare that.
+
+Such a host is changed by a PR plus a newly cut generation
+(`tartci support-manifest write` then `tartci fleet-macos install --apply`),
+never by editing a file in place. A file edited under `~/.local/share/tartci` is
+not deployed and never runs.
+
+When you do compare, the answer is three-valued: in sync / behind (deploy) /
+**ahead** (upstream the delta, do NOT redeploy) — collapsing the third into the
+second licenses a redeploy that destroys whatever the host was carrying.
+
 Before any automated repair: **prove the target is idle, or escalate instead of
 acting.** Only three self-heals are authorized — reap an outlived clone, restart
 a supervisor blind for N cycles *while jobs queue on its labels*, and drop or
