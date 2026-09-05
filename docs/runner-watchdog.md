@@ -386,15 +386,32 @@ is reported as context only. A first observation with no baseline is `Unknown`
 (you cannot measure a rate from one sample), and a counter that went *backwards*
 is `Unknown` too rather than a bogus delta — the interval spanned a reset.
 
-**Drift is three-valued, and this matters.** Installed artifacts on this fleet
-were measured **227 changed lines AHEAD** of the repo, including `fcntl` locking
-of a shared cache the repo's main branch lacks. So the verdict is
-`in sync` / `behind the repo` (deploy) / **`ahead of the repo`** (upstream the
-delta, and do **not** redeploy) — plus the size of the delta, so two lines and
-two hundred are not the same alarm. A boolean "drifted" would prompt exactly the
-wrong action here: redeploying would silently strip locking from a cache several
-processes write concurrently. An artifact with no recorded upstream ref is
-`Unknown`; you cannot compare against a ref nobody wrote down.
+**Compare only what actually executes.** This is the correction that matters
+most, and it was learned the hard way here. A drift measurement against
+`~/.local/share/tartci` reported hundreds of changed lines; that directory is
+**inert**. The supervisors exec a content-addressed generation under
+`~/.local/share/tartci-generations/<commit>-<manifest16>/`, and the gate
+LaunchAgent names that path directly rather than going through the launcher at
+all. Measured against the generation, the files were **byte-identical** to their
+source commit — zero drift, merely some commits behind head.
+
+So `ArtifactObservation` carries an `ExecProvenance`, and an unproven path
+yields `Undetermined` with `Boundary::Scope` rather than any drift verdict. An
+inert copy of a real thing passes every check except *is this the artifact that
+executes?*
+
+**Drift is three-valued.** `in sync` / `behind the repo` (deploy) /
+**`ahead of the repo`** (upstream the delta, and do **not** redeploy) — plus the
+size of the delta, so two changed lines and two hundred are not the same alarm.
+Collapsing `ahead` into `behind` licenses a redeploy that deletes whatever the
+host was carrying. An artifact with no recorded upstream ref is `Unknown`; you
+cannot compare against a ref nobody wrote down.
+
+For a content-addressed runtime the identity is already recorded twice — the
+generation directory is named `<source_commit>-<manifest_sha256[:16]>`, and the
+install receipt records `support.source_commit`. The assertion is to **resolve
+and compare** those, not to invent an identity scheme. A change reaches such a
+host by PR plus a newly cut generation, never by editing a file in place.
 
 ## Implementation notes
 

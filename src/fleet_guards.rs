@@ -20,12 +20,23 @@
 //! green; the guard had simply never run.
 //!
 //! **The mirror image is more dangerous, because a working host has no
-//! symptom.** Measured on another host: the installed copies are **227 changed
-//! lines ahead of the repo** — 141 in one Python file, 86 in a shell file —
-//! including `fcntl.flock` locking of a cache several processes write
-//! concurrently, and an API-call budget the repo's main branch does not carry.
-//! Nothing alarms, because nothing is broken. A "drift detected → redeploy from
-//! the repo" reflex would silently strip the file locking off a shared cache.
+//! symptom.** A host carrying changes the repo does not have raises nothing: it
+//! works. A "drift detected → redeploy from the repo" reflex then deletes
+//! whatever it was carrying, and the loss surfaces later, as whatever breaks.
+//!
+//! **Compare only the artifact that actually executes.** This assertion was
+//! written directly after a drift measurement that was confidently wrong. A
+//! populated, plausible install directory — sitting at the path the docs and
+//! the probes both used — turned out to be inert, and the number computed from
+//! it described nothing that runs. The supervisors were executing a
+//! content-addressed generation elsewhere, byte-identical to a real commit and
+//! merely some commits behind it: zero drift, where the abandoned directory
+//! suggested hundreds of lines of it.
+//!
+//! An inert copy of a real thing passes every check except *is this the artifact
+//! that executes?*, so [`ArtifactObservation`] carries [`ExecProvenance`] and
+//! this module refuses to render a drift verdict for a path nobody proved is the
+//! exec target. Being unable to compare is reported; it is never a pass.
 //!
 //! So neither assertion returns a boolean, and the drift verdict is not even
 //! two-valued. [`DriftState`] separates *behind the repo* (deploy) from *ahead
@@ -764,6 +775,33 @@ pub struct UpstreamRecord {
     pub compare_digest: Option<String>,
 }
 
+/// Whether the compared path was proven to be the thing that actually runs.
+///
+/// A drift number computed against a path nobody execs describes a directory,
+/// not a fleet. That mistake has already been made here once, convincingly, so
+/// the provenance is a required field rather than an assumption: an unproven
+/// path yields [`DriftState::Undetermined`], never a clean bill of health.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecProvenance {
+    /// Something the caller resolved — a service definition, a launcher, a
+    /// wrapper chain — names this exact path as what it executes.
+    ProvenExecTarget {
+        /// How it was proven, named so the claim can be audited.
+        resolved_via: String,
+    },
+    /// The path was chosen because it looked right. Not sufficient.
+    Unproven,
+}
+
+impl ExecProvenance {
+    /// Whether a drift comparison against this path means anything.
+    #[must_use]
+    pub fn is_proven(&self) -> bool {
+        matches!(self, Self::ProvenExecTarget { .. })
+    }
+}
+
 /// One installed artifact, and the repo copy it is recorded as coming from.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ArtifactObservation {
@@ -778,6 +816,8 @@ pub struct ArtifactObservation {
     pub upstream: Option<UpstreamRecord>,
     /// Size of the difference against the repo copy, in changed lines.
     pub delta: Option<LineDelta>,
+    /// Whether `installed_path` was proven to be what actually executes.
+    pub exec_provenance: ExecProvenance,
 }
 
 /// Three-way drift state, with three different remedies.
@@ -785,10 +825,9 @@ pub struct ArtifactObservation {
 /// Not a boolean, and deliberately not two-valued either. [`Self::BehindRepo`]
 /// and [`Self::AheadOfRepo`] produce the identical "the digests differ"
 /// observation and want opposite actions: deploy, versus upstream the delta and
-/// leave the host alone. Treating the second as the first is what turns a
-/// working host into a broken one — on the fleet this was written against it
-/// would have deleted `fcntl.flock` locking from a cache several processes
-/// write concurrently.
+/// leave the host alone. Treating the second as the first turns a working host
+/// into a broken one: it licenses a redeploy that deletes whatever the host was
+/// carrying, with no symptom until something later fails.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriftState {
@@ -878,6 +917,21 @@ pub fn assess_artifact_drift(observation: &ArtifactObservation) -> DriftReport {
 
     let name = observation.name.as_str();
     let path = observation.installed_path.as_str();
+
+    // Refuse to compare a path nobody proved is what runs. A populated,
+    // plausible directory can be entirely inert, and a number computed from it
+    // describes a directory rather than a fleet — the mistake this field exists
+    // to make impossible.
+    if !observation.exec_provenance.is_proven() {
+        report.boundary = Some(Boundary::Scope);
+        report.detail = format!(
+            "{name}: `{path}` was not proven to be what executes, so any drift number \
+             computed against it describes a directory rather than the running code. \
+             Resolve the service definition or launcher to its exec target first \
+             (boundary: scope)"
+        );
+        return report;
+    }
 
     let Some(upstream) = observation.upstream.as_ref() else {
         report.boundary = Some(Boundary::Scope);

@@ -1,9 +1,15 @@
 //! Tests for the fleet guard assertions.
 //!
-//! The paths, unit names and numbers below are the ones observed on the hosts
-//! these assertions were written against — `NRestarts=36089` and a 227-line
-//! host-side delta are measurements, not illustrations — so each fixture
-//! reproduces the shape of the incident rather than an idealisation of it.
+//! The paths, unit names and restart counters below are the ones observed on
+//! the hosts these assertions were written against — `NRestarts=36089` on a
+//! healthy host is a real measurement, and the fixture that matters most.
+//!
+//! The `AheadOfRepo` line counts are **illustrative**, not measured. The
+//! host-side delta that originally motivated them turned out to have been
+//! computed against an inert directory; the artifact that actually executes was
+//! byte-identical to its source commit. The state is still worth modelling —
+//! collapsing it into `BehindRepo` would license a destructive redeploy — but
+//! no claim is made here that this fleet is in it.
 //!
 //! Every check carries a **planted negative control that must go red**, and
 //! each is paired with the healthy fixture that must stay green, because a
@@ -401,6 +407,9 @@ fn artifact(
         installed_digest: installed.map(str::to_owned),
         upstream,
         delta,
+        exec_provenance: ExecProvenance::ProvenExecTarget {
+            resolved_via: "pulp-ephemeral-reap.service ExecStart".to_owned(),
+        },
     }
 }
 
@@ -638,4 +647,57 @@ fn each_drift_state_carries_its_own_remedy() {
         .changed(),
         227
     );
+}
+
+// ---------------------------------------------------------------------------
+// A drift number is only meaningful against the artifact that executes
+// ---------------------------------------------------------------------------
+
+/// Planted control for the mistake that produced this field. An unproven path
+/// must not yield a drift verdict at all — not even `InSync`, and especially not
+/// a confident `AheadOfRepo` computed from a directory nothing runs.
+#[test]
+fn negative_control_an_unproven_path_yields_no_drift_verdict() {
+    let mut observation = artifact(
+        Some("aaaa"),
+        Some(upstream(Some("aaaa"), Some("aaaa"))),
+        None,
+    );
+    observation.exec_provenance = ExecProvenance::Unproven;
+
+    let report = assess_artifact_drift(&observation);
+
+    assert_eq!(report.state, DriftState::Undetermined);
+    assert_eq!(report.verdict, ServiceVerdict::Unknown);
+    assert_eq!(report.boundary, Some(Boundary::Scope));
+    assert!(
+        report.detail.contains("not proven to be what executes"),
+        "{}",
+        report.detail
+    );
+}
+
+/// The pairing control: identical digests, identical everything, but the path
+/// IS proven. Without this the rule above could be suppressing every verdict.
+#[test]
+fn control_the_same_observation_with_proven_provenance_reads_in_sync() {
+    let report = assess_artifact_drift(&artifact(
+        Some("aaaa"),
+        Some(upstream(Some("aaaa"), Some("aaaa"))),
+        None,
+    ));
+
+    assert_eq!(report.state, DriftState::InSync);
+    assert!(!report.verdict.is_raise());
+}
+
+#[test]
+fn exec_provenance_reports_whether_a_comparison_is_meaningful() {
+    assert!(
+        ExecProvenance::ProvenExecTarget {
+            resolved_via: "launcher".to_owned()
+        }
+        .is_proven()
+    );
+    assert!(!ExecProvenance::Unproven.is_proven());
 }

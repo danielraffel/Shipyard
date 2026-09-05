@@ -1013,11 +1013,22 @@ already cost real time:
   repair; a healthy host here still reads 36089. Assert the *delta* against a
   recorded baseline over a known interval. No baseline is `unknown`, not a pass.
 
-And when comparing an installed artifact to the repo, the answer is three-valued:
-in sync / behind (deploy) / **ahead** (upstream the delta, do NOT redeploy).
-Installed copies on this fleet are 227 lines ahead of the repo, including cache
-locking the repo lacks, so a reflexive "drift → redeploy" would destroy live
-protections.
+**Before measuring drift at all, prove the path is what executes.** On this
+fleet `~/.local/share/tartci` is inert: the supervisors exec a content-addressed
+generation under `~/.local/share/tartci-generations/<commit>-<manifest16>/`, and
+the gate LaunchAgent names that path directly. A drift number computed against
+the wrong directory is confident and meaningless — it happened here, and the
+running code turned out byte-identical to its source commit. Read the
+LaunchAgent's `ProgramArguments`, follow the launcher, and compare that.
+
+Such a host is changed by a PR plus a newly cut generation
+(`tartci support-manifest write` then `tartci fleet-macos install --apply`),
+never by editing a file in place. A file edited under `~/.local/share/tartci` is
+not deployed and never runs.
+
+When you do compare, the answer is three-valued: in sync / behind (deploy) /
+**ahead** (upstream the delta, do NOT redeploy) — collapsing the third into the
+second licenses a redeploy that destroys whatever the host was carrying.
 
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
