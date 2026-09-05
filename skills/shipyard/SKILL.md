@@ -1042,6 +1042,15 @@ needed. Differing `queued=` alone is not a contradiction (they watch different
 label sets); the sharp case is lane A yielding *citing* lane B while every
 supervisor serving B reports zero.
 
+For a relay, **"does the proxy answer?" is the wrong question.** Assert each
+declared hop against a connect budget, in order. A dead first hop keeps the
+relay working via fallback while taxing every connection — 18s vs 2s in the
+incident — and that tax lands on whatever downstream timeout is smallest, so it
+surfaces as an unrelated subsystem failing. Report connect time as a ratio
+against budget, never as a boolean. When reproducing a proxy fault, do NOT use
+`env -i`: it strips the `*_proxy` variables, so the control is cleaner than the
+thing it controls for and passes every time.
+
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
