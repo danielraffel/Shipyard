@@ -1081,6 +1081,14 @@ second licenses a redeploy that destroys whatever the host was carrying.
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
+## Watch exit codes: absence is not success
+
+`shipyard watch` exits **4** when the ship state is archived, because "archived"
+covers merged, discarded and pruned alike and the archive does not record which.
+Do **not** read 4 as failure — read it as *ask the authority*
+(`gh pr view <n> --json state,mergedAt`). It previously exited 0 there, which
+reported a PR closed **without** merging as a success.
+
 ## Host-Health Pre-Dispatch Gate (optional)
 
 For self-hosted runners *co-located with heavy interactive work*: read a shared
