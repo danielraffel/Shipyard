@@ -1025,6 +1025,15 @@ slot, a scan that failed and fell closed to `1`, and a legitimate
 yielding supervisor is neither "unserved" nor "starved"; establish which cause
 applies before touching routing.
 
+Before any automated repair: **prove the target is idle, or escalate instead of
+acting.** Only three self-heals are authorized — reap an outlived clone, restart
+a supervisor blind for N cycles *while jobs queue on its labels*, and drop or
+reorder a relay hop failing its budget — and three targets are never touched
+whatever the proof says: a running release build, a required-gate VM, and a
+clone whose provenance cannot be read. Reaping means **destroy, not stop**: an
+orphan holds its VMID whether it runs or not, so merely stopping it converts an
+out-of-memory failure into `no free clone id`.
+
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
