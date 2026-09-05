@@ -740,9 +740,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn render_daemon_status_reports_running_daemon() {
-        let _process_fixture = crate::test_support::PROCESS_TREE_TEST_LOCK
-            .lock()
-            .expect("process fixture lock");
+        let _process_fixture = crate::test_support::lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         seed_registered_repos(temp.path(), &["owner/status"]);
         let worker = spawn_test_daemon(temp.path(), vec!["owner/status".to_owned()]);
@@ -768,9 +766,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_run_with_repos_reports_already_running() {
-        let _process_fixture = crate::test_support::PROCESS_TREE_TEST_LOCK
-            .lock()
-            .expect("process fixture lock");
+        let _process_fixture = crate::test_support::lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let worker = spawn_test_daemon(temp.path(), vec!["owner/run".to_owned()]);
         wait_for_daemon(temp.path());
@@ -791,9 +787,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn refresh_reuses_prior_daemon_repos_when_none_are_explicit() {
-        let _process_fixture = crate::test_support::PROCESS_TREE_TEST_LOCK
-            .lock()
-            .expect("process fixture lock");
+        let _process_fixture = crate::test_support::lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         // Successful remote registration is deliberately divergent: refresh
         // authority comes from the daemon's configured watch set, not from the
@@ -832,9 +826,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn refresh_explicit_repos_override_prior_status_and_are_normalized() {
-        let _process_fixture = crate::test_support::PROCESS_TREE_TEST_LOCK
-            .lock()
-            .expect("process fixture lock");
+        let _process_fixture = crate::test_support::lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let worker = spawn_test_daemon(temp.path(), vec!["owner/old".to_owned()]);
         wait_for_daemon(temp.path());
