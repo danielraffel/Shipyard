@@ -483,9 +483,8 @@ pub fn assess_live_object(
              resolve against an ambient default and could report an unrelated subject as ended",
             object.kind, object.id, object.subject.authority
         );
-        report.next_action =
-            "qualify the subject reference before probing; a wrong terminal is worse than none"
-                .to_owned();
+        "qualify the subject reference before probing; a wrong terminal is worse than none"
+            .clone_into(&mut report.next_action);
         return report;
     };
 
@@ -510,7 +509,7 @@ pub fn assess_live_object(
                 object.id,
                 boundary.as_str()
             );
-            report.next_action = boundary.next_action().to_owned();
+            boundary.next_action().clone_into(&mut report.next_action);
         }
         SubjectState::Live => {
             report.disagreement = Some(compare(local, None));
@@ -520,7 +519,7 @@ pub fn assess_live_object(
                 "{} `{}` is tracking subject `{qualified}`, which is still live",
                 object.kind, object.id
             );
-            report.next_action = "nothing".to_owned();
+            "nothing".clone_into(&mut report.next_action);
         }
         SubjectState::Terminal {
             outcome, ended_at, ..
@@ -540,7 +539,7 @@ pub fn assess_live_object(
                     outcome.as_str(),
                     thresholds.winddown_grace_secs
                 );
-                report.next_action = "nothing yet; orderly shutdown is not a leak".to_owned();
+                "nothing yet; orderly shutdown is not a leak".clone_into(&mut report.next_action);
             } else {
                 report.state = LeakState::Leaked;
                 report.verdict = ServiceVerdict::Degraded;
