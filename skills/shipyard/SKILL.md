@@ -1003,6 +1003,22 @@ name the `Boundary` (`grammar` / `scope` / `identity` / `permission` / `parse` /
 and `Boundary::next_action` names it. A `transport` failure is explicitly **not**
 an auth fault — do not re-authenticate in response to a timeout.
 
+When judging whether a host's guards are in place, two rules that have each
+already cost real time:
+
+- **`enabled` is not armed.** A timer enabled with no next elapse fires never.
+  And a script present on disk with no unit to invoke it is not a guard at all —
+  that exact combination cost ~19 days of a dead Linux lane.
+- **Never threshold `NRestarts` on its level.** It is monotonic and survives the
+  repair; a healthy host here still reads 36089. Assert the *delta* against a
+  recorded baseline over a known interval. No baseline is `unknown`, not a pass.
+
+And when comparing an installed artifact to the repo, the answer is three-valued:
+in sync / behind (deploy) / **ahead** (upstream the delta, do NOT redeploy).
+Installed copies on this fleet are 227 lines ahead of the repo, including cache
+locking the repo lacks, so a reflexive "drift → redeploy" would destroy live
+protections.
+
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 

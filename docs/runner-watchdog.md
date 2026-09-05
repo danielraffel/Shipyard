@@ -365,6 +365,37 @@ a wall that has a door in it.
 
 Design note: `planning/2026-09-04-fleet-service-assertions.md`.
 
+### A guard is not a guard until something proves it is armed
+
+`src/fleet_guards.rs` asserts two things a host can be wrong about silently.
+
+**Units are armed, not merely present.** A Linux host served zero work for ~19
+days while the reaper that would have recovered it sat on disk: the script was
+installed (a stale copy), and its `.service` and `.timer` were never installed
+at all, so nothing ever invoked it. `enabled` alone is also insufficient — a
+timer that is enabled with **no next elapse** fires never, which is exactly as
+useless as absent. The states are separate values with separate remedies:
+not installed / not enabled / masked / enabled-but-no-next-elapse / armed.
+
+**`NRestarts` must be asserted as a rate, never a level.** The counter is
+monotonic and survives the repair: the host above still reads `NRestarts=36089`
+today while perfectly healthy. A threshold on the absolute value is a
+permanently-red alarm, which is operationally identical to no alarm. The trigger
+is the **delta against a recorded baseline over a known interval**; the absolute
+is reported as context only. A first observation with no baseline is `Unknown`
+(you cannot measure a rate from one sample), and a counter that went *backwards*
+is `Unknown` too rather than a bogus delta — the interval spanned a reset.
+
+**Drift is three-valued, and this matters.** Installed artifacts on this fleet
+were measured **227 changed lines AHEAD** of the repo, including `fcntl` locking
+of a shared cache the repo's main branch lacks. So the verdict is
+`in sync` / `behind the repo` (deploy) / **`ahead of the repo`** (upstream the
+delta, and do **not** redeploy) — plus the size of the delta, so two lines and
+two hundred are not the same alarm. A boolean "drifted" would prompt exactly the
+wrong action here: redeploying would silently strip locking from a cache several
+processes write concurrently. An artifact with no recorded upstream ref is
+`Unknown`; you cannot compare against a ref nobody wrote down.
+
 ## Implementation notes
 
 - Pure detection logic lives in `src/runner_watchdog.rs` and has no I/O.
