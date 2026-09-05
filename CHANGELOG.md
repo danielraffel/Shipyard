@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01920"></a>
+## [0.192.0] - 2026-09-05
+
+- feat(fleet): reconcile a host-health claim against evidence of service ([#578](https://github.com/danielraffel/Shipyard/pull/578))
+
 <a id="v01910"></a>
 ## [0.191.0] - 2026-09-05
 
@@ -1424,6 +1429,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.192.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.192.0
 [0.191.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.191.0
 [0.185.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.185.0
 [0.181.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.181.0
