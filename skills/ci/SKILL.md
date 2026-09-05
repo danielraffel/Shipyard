@@ -334,6 +334,40 @@ selector-eligible runner sits outside its approved prefix or carries the
 opposite capability. Never reuse either lease for secret-bearing or
 `pull_request_target` jobs.
 
+### Survivability: will the lane still be there after an ordinary exit?
+
+`fleet_service` answers *is this lane being served*. It cannot answer *will it
+survive*, and the two come apart badly.
+
+On 2026-09-05 this repository's only macOS runner was `online` and `busy` —
+`Served`, correctly, by every existing assertion. A routine force-push tripped
+`cancel-in-progress`, the cancel arrived at the runner as a signal
+(`Runner will be shutdown for UserCancelled`), and it exited. It never came
+back: not ephemeral, `RunAtLoad` with **no `KeepAlive`**, and not loaded in
+launchd at all. The lane went from `Served` to permanently `Unserved` with no
+state in between, while the host stayed up and kept serving three other
+runners. The precondition was statically visible the whole time.
+
+`fleet_supervision` reads that precondition. `Restartability` per runner
+(`Supervised` / `SelfReplacing` / `Unsupervised` / `Unknown`), rolled up per
+lane into `Survivability` (`Survivable` / `Fragile` / `SinglePointOfFailure` /
+`Unknown`).
+
+Two traps it is built around, both of which produce a confident false fault:
+
+- **A LaunchAgent lives in the per-user GUI domain.** `launchctl list` over SSH
+  prints nothing for a job that is loaded and running, so "not loaded" from an
+  SSH session is not a fact. Query `launchctl print gui/$(id -u)/<label>`, and
+  **always run it against a job you know is loaded first** — without that
+  control an empty result is indistinguishable from a broken query. An
+  unreadable domain is `Unknown { boundary: Scope }`, never a fault.
+- **An empty runner census is a scope error until proven otherwise.** Zero
+  runners yields `Unknown`, not `SinglePointOfFailure`; the org-vs-repo scope
+  mistake already misled this fleet once.
+
+`RunAtLoad` is not supervision. It starts a job once and says nothing about
+what happens when it exits — which is exactly the plist that took the lane out.
+
 ## Runner Metrics For Agents
 
 Runner metrics are optional and provider-neutral. Use them when an agent needs
