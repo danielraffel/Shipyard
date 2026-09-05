@@ -1087,6 +1087,15 @@ raise. Everything here flickers, and a flapping alarm gets ignored along with
 the one real occurrence. Never a single roll-up issue for the fleet — that hides
 the second instance of a fault behind the first.
 
+Before any automated repair: **prove the target is idle, or escalate instead of
+acting.** Only three self-heals are authorized — reap an outlived clone, restart
+a supervisor blind for N cycles *while jobs queue on its labels*, and drop or
+reorder a relay hop failing its budget — and three targets are never touched
+whatever the proof says: a running release build, a required-gate VM, and a
+clone whose provenance cannot be read. Reaping means **destroy, not stop**: an
+orphan holds its VMID whether it runs or not, so merely stopping it converts an
+out-of-memory failure into `no free clone id`.
+
 **A live object whose subject already ended is a defect**, and handing work to
 Shipyard is only safe if it hands back. Judge anything long-running against
 that: absence is never success (a vanished state, an empty probe and a
