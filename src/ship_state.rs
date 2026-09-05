@@ -626,6 +626,21 @@ impl ShipStateStore {
         states
     }
 
+    /// Return only states whose evidence still represents an in-flight ship.
+    ///
+    /// `list_active` is a storage-level view: it intentionally preserves every
+    /// non-archived JSON record for audit and migration. Daemon discovery and
+    /// recovery scans must not repeatedly revisit terminal historical records,
+    /// so this view applies the same terminal-verdict rules used by watch and
+    /// auto-merge without deleting or rewriting any evidence.
+    #[must_use]
+    pub fn list_in_flight(&self) -> Vec<ShipState> {
+        self.list_active()
+            .into_iter()
+            .filter(|state| crate::watch::ship_terminal_verdict(state).is_none())
+            .collect()
+    }
+
     /// Return archived state file paths sorted by filename.
     #[must_use]
     pub fn list_archived(&self) -> Vec<PathBuf> {
@@ -1146,6 +1161,32 @@ mod tests {
             .map(|state| state.pr)
             .collect::<Vec<_>>();
         assert_eq!(prs, vec![7]);
+    }
+
+    #[test]
+    fn list_in_flight_excludes_terminal_historical_records_without_archiving() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let live = sample_state(7, "live");
+        let mut terminal = sample_state(8, "done");
+        terminal.upsert_run(sample_run("cloud", "8"));
+        terminal.update_evidence("cloud", "pass");
+        store.save(&live).expect("live save");
+        store.save(&terminal).expect("terminal save");
+
+        assert_eq!(store.list_active().len(), 2);
+        assert_eq!(
+            store
+                .list_in_flight()
+                .iter()
+                .map(|state| state.pr)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert!(
+            store.state_path(8).exists(),
+            "terminal evidence is retained"
+        );
     }
 
     #[test]

@@ -725,6 +725,30 @@ What it does:
 
 See `docs/cloud-retarget.md` for full context; add-lane complements retarget.
 
+## Before blaming a lane: a runner census needs both scopes and a control
+
+A job stuck `queued` on self-hosted labels has three very different causes that
+produce the *same* empty runner census, so read the census correctly before
+concluding anything:
+
+- **Query both scopes.** `repos/{owner}/{repo}/actions/runners` omits
+  org-registered runners entirely. If a lane's runners register at the org, the
+  repo census returns empty whether the lane is healthy or dead — and a session
+  has already reported "this lane has no server" from exactly that reading. Pair
+  it with `orgs/{org}/actions/runners`.
+- **An empty census is not a fault on its own.** A just-in-time pool at rest
+  registers nothing. Only queued demand distinguishes *unserved* (aged demand,
+  nothing advertises the labels — unschedulable, it will wait forever) from
+  *idle* (nothing registered, nothing asking). An issue was filed on this
+  confusion and closed as wrong.
+- **Pair the absence with a control that must return non-zero.** Run the same
+  query against a label you know is served; if the control also comes back
+  empty, the instrument is broken and the finding is worthless.
+
+If runners *do* advertise the labels and jobs still sit, that is starvation
+(scheduling or capacity), not routing — `shipyard rescue` below, not a variable
+edit. Background: `docs/runner-watchdog.md` § Fleet service assertions.
+
 ## Rescuing wedged runners (`shipyard rescue`)
 
 Use this when a self-hosted runner has wedged — orphaned `Runner.Worker`
@@ -1830,6 +1854,13 @@ A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever the ma
 
 ## Bypass trailers (tip commit)
 
+### Bounded metrics observation
+
+`shipyard metrics import github` is observational and supervises each GitHub CLI
+request under a fixed process-tree deadline. A timeout is an incomplete
+observation, not a zero-job or failure result; preserve the nonzero refusal and
+retry only through a later bounded invocation.
+
 | Gate          | Trailer                                                      |
 |---------------|--------------------------------------------------------------|
 | Version bump  | `Version-Bump: <surface>=<patch\|minor\|major\|skip> reason="..."` |
@@ -1945,3 +1976,7 @@ between service batches preserves already completed safe shutdown but forbids
 remaining mutations and terminal-state publication. This host-local hold does
 not prove GitHub persistent-runner drain, lease/VM idleness, or host capacity;
 those independent fail-closed gates remain required.
+**Webhook failures are typed.** Registrar 404/not-found and retryable
+408/409/429/5xx/timeout outcomes remain distinct from scope/auth failures;
+persisted stale bindings are reconciled only after exact remote evidence is
+re-read.

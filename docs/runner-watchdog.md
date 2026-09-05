@@ -294,9 +294,283 @@ defaults (`max_job_min=90`, `max_queue_age_hours=2`,
   `/tmp/shipyard-killed-builds/<event-id>/` so a misclick is recoverable
   with `--recover`.
 
+## Fleet service assertions — asserting service, not liveness
+
+`src/fleet_service.rs` answers a different question from the rest of this
+document. The watchdog above asks *"is this runner wedged?"*. A service
+assertion asks *"is anything actually serving this lane?"* — and the two come
+apart badly, because a host can be perfectly up and serving nothing.
+
+That is not hypothetical: a Linux lane once went unserved for ~19 days while
+`systemctl status` reported the pool `active (running)` the entire time (it
+was — and failing every 30 seconds, 36,088 times), the required gate kept
+merging, and a GitHub-hosted fallback absorbed the work so the lane's *output*
+stayed green. An uptime ping would have called it healthy every minute of it.
+
+### Verdicts are typed, because the distinctions are the point
+
+| Verdict | Means |
+| --- | --- |
+| `Served` | demand can be satisfied — proven, not assumed |
+| `Idle` | nothing registered **and** nothing asking; a just-in-time pool at rest |
+| `Degraded` | serving, but consuming a budget (latency, blind cycles, a climbing restart counter) |
+| `Starved` | demand exists and an online server exists, but the demand is not being reached |
+| `Unserved` | declared local, served by nobody: aged demand and no online runner in **either** scope |
+| `Unknown` | the instrument could not measure — never folded into a pass |
+
+`Unserved` vs `Idle` is only decidable by pairing the runner census with queued
+demand; an empty census alone cannot tell a dead pool from a resting one.
+`Unserved` vs `Starved` matters because the remedies are opposite — one is a
+routing fix, the other a capacity fix. Verdicts are ordered by severity, so
+`roll_up` takes the worst; `roll_up(&[])` is `Unknown`, since asserting nothing
+is not the same as asserting everything passed.
+
+### Query both runner scopes, always
+
+`repos/{owner}/{repo}/actions/runners` **omits org-registered runners
+entirely**. On the fleet this was written against, three of six declared
+self-hosted lanes are served only by org-scope runners — so a repo-scope-only
+census reports them unserved while they are online, which is the identical
+empty reading it gives when a host is genuinely dead.
+
+`assess_lane_service` takes one census spanning both scopes and records which
+scope satisfied each lane (`LaneReport::served_only_by_org_scope`), so this
+blindness is visible in the output instead of silently changing the answer.
+
+### Routing values have three encodings
+
+`parse_runs_on` handles all of them, because a parser that assumes a JSON array
+drops lanes without saying so:
+
+```
+["self-hosted","macOS","ARM64","pulp-build"]   JSON array  -> SelfHosted
+"macos-15"                                     JSON string -> Hosted
+macos-15                                       bare string -> Hosted
+local-only                                     sentinel    -> names no runner
+```
+
+### A refusal must name its boundary
+
+`Unknown` always carries a `Boundary`, and no measured verdict carries one. The
+facts it separates otherwise collapse into a single opaque failure — the same
+defect as a supervisor logging `self-restarting for fresh gh auth` for what was
+a *timeout*, then performing an auth restart that could not possibly help.
+
+`Grammar` (a command wrapper refused the verb), `Scope` (asked where the answer
+is invisible), `Identity` (wrong principal), `Permission`, `Parse`, and
+`Transport` (timeout or rate limit — explicitly *not* an auth fault). Only
+`Permission` denies that an equivalent path exists; for the rest,
+`Boundary::next_action` names what to try instead, so a caller does not stop at
+a wall that has a door in it.
+
+Design note: `planning/2026-09-04-fleet-service-assertions.md`.
+
+### Supervisor scan blindness is a ratio, never a sample
+
+`src/fleet_supervisor.rs` asserts that a tartci supervisor can *see* the work.
+A supervisor decides whether to boot a VM by scanning the queue; when that scan
+cannot finish in time it logs `SCAN BLIND (gh queue scan failed) N/9`, boots
+nothing, and every job on that lane's labels waits with no error visible
+anywhere in GitHub. The jobs are simply `queued`.
+
+**Do not sample it.** A release supervisor measured on this fleet had **1598 of
+its last 2000 log lines blind** against 80 sighted, with the final ~70 lines
+reading perfectly healthy. Any single-sample check taken at that moment returns
+green. `assess_supervisor_scan` therefore reports the blind/sighted **ratio over
+a window** against `max_blind_ratio`, alongside the supervisor's own
+consecutive-blind counter (`N/9`) against its ceiling — a burst of nine
+consecutive is a different fault from nine scattered, and both are tracked.
+
+There is deliberately **no minimum-window guard**. A "only trust the ratio after
+N cycles" threshold is an escape hatch that lets a short, entirely blind window
+read as a pass, which is a blind spot inside a blindness detector.
+
+### A timeout is not an auth failure
+
+The supervisor's own message for a timeout is `self-restarting the supervisor
+for fresh gh auth`. Authentication was never broken, and the restart it performs
+cannot help. `classify_scan_failure` maps a timeout to `Boundary::Transport`,
+whose `next_action` says not to re-authenticate, and reserves
+`Boundary::Permission` for actual credential evidence (`HTTP 401`, `bad
+credentials`). A rate limit is explicitly *not* credential evidence — it is a
+completed call.
+
+`SupervisorReport` carries two boundary fields on purpose: `boundary` (why *this
+assertion* could not measure, `Some` only when `Unknown`) and
+`observed_boundary` (what the *supervisor's own* failures classify into — the
+field that reads `transport` on a log that says "auth").
+
+### A budget set by absence is the shape of the bug
+
+`assess_scan_budget` takes the lane's declared scan timeout as an `Option`.
+`None` means the lane inherits the 15s default, which is how the release lane
+came to have a budget nobody chose while the gate lane on the same host declared
+180s and absorbed the identical latency. Observed latency is reported as a ratio
+against whichever budget applies, so the same measurements can read `Served`
+under a declared budget and `Degraded` under an inherited one.
+
+### A host can refuse work it could do, and four causes print one line
+
+`src/fleet_slot.rs` covers the case where capacity exists, is free, and is being
+**withheld**. Measured on this fleet: a host with both macOS VM slots free and a
+release job queued, yielding indefinitely to a priority lane whose own two
+supervisors on the same host reported `queued=0`.
+
+`priority_demand=1` / `priority lane 'X' has the slot` is printed for four
+causes whose remedies do not overlap:
+
+| Cause | Correct? | Verdict | Remedy |
+|---|---|---|---|
+| genuine **queued** priority demand | yes | `Served` | wait |
+| an **unusable** job (assigned, in progress, or hosted-only) that cannot take a self-hosted slot | **no** | `Degraded` | stop counting it |
+| the scan **failed** and fell closed to `1` | invisible | `Degraded` | fix the scan |
+| `host_health_yield` on real memory saturation | yes | `Served` | free memory — forcing a boot would harm |
+
+Two of those are correct behaviour and must not raise: raising on correct
+behaviour is what trains an operator to ignore the raise, which is how the real
+defect hid among identical lines in the first place. `WithholdCause` is a
+report-level type mapping onto the shared `ServiceVerdict`, so the crate keeps
+one severity order.
+
+**Cross-supervisor coherence needs no external oracle.** Two supervisors on the
+same host scanning the same repo that contradict each other prove, between
+them, that one is wrong. The check encodes only the sharp case — lane A yields
+*citing* lane B while every supervisor actually serving B reports `queued=0` —
+because supervisors watch different label sets, so differing `queued=` is not
+by itself a contradiction.
+
+### Relay hops: "does the proxy answer?" is the wrong question
+
+`src/fleet_relay.rs` asserts that **each declared hop** connects within a
+budget, in order — not that the relay as a whole responds.
+
+The distinction is the whole incident. A relay was invoked
+`--relay-host macmini --relay-host m1` with macmini unreachable. The relay kept
+working, because the fallback succeeded, so every liveness-shaped question
+stayed green. What it cost was a tax paid on **every** connection before that
+fallback: 18 s via proxy against 2 s direct on one host, 5.5 s against 0.2 s on
+another. The tax silently exceeded a *downstream* timeout — a supervisor whose
+queue scan inherited a 15 s budget went blind, booted no VM, and a release lane
+starved for about a day, twice.
+
+So:
+
+- **Position decides the cost.** A hop failing *before* the first hop that
+  answers is paid by every connection; the identical hop *behind* an answer
+  costs nothing today. Both are `Degraded` — an unreachable fallback is
+  redundancy already lost, not a hop at rest — but the reported tax and
+  `attempted` tell them apart, and the detail is chosen by cost rather than by
+  verdict.
+- **Connect time is a ratio against its budget**, never collapsed to pass/fail.
+  A hop at 4.9 s of a 5 s budget is one bad afternoon from being the incident
+  and must not read like one at 0.2 s.
+- **An unmeasurable hop is `Unknown`** with a named `Boundary`, even when its
+  siblings are healthy.
+- **No hop answers → `Unserved`**: the relay is severed, not taxed.
+
+`any_hop_connected()` ships as a documented *fact*, never a verdict — it is
+precisely the naive question that stayed green throughout the outage.
+
+The proposal side is describe-only: reorder healthy hops first, drop ones that
+cannot connect, and refuse outright if any hop was unmeasured or if the drop
+would leave nothing that connects.
+
+Reproduction note: early attempts to reproduce this used `env -i`, which strips
+the `*_proxy` variables. The control was cleaner than the thing it controlled
+for, and passed every time.
+
+### A guard is not a guard until something proves it is armed
+
+`src/fleet_guards.rs` asserts two things a host can be wrong about silently.
+
+**Units are armed, not merely present.** A Linux host served zero work for ~19
+days while the reaper that would have recovered it sat on disk: the script was
+installed (a stale copy), and its `.service` and `.timer` were never installed
+at all, so nothing ever invoked it. `enabled` alone is also insufficient — a
+timer that is enabled with **no next elapse** fires never, which is exactly as
+useless as absent. The states are separate values with separate remedies:
+not installed / not enabled / masked / enabled-but-no-next-elapse / armed.
+
+**`NRestarts` must be asserted as a rate, never a level.** The counter is
+monotonic and survives the repair: the host above still reads `NRestarts=36089`
+today while perfectly healthy. A threshold on the absolute value is a
+permanently-red alarm, which is operationally identical to no alarm. The trigger
+is the **delta against a recorded baseline over a known interval**; the absolute
+is reported as context only. A first observation with no baseline is `Unknown`
+(you cannot measure a rate from one sample), and a counter that went *backwards*
+is `Unknown` too rather than a bogus delta — the interval spanned a reset.
+
+**Compare only what actually executes.** This is the correction that matters
+most, and it was learned the hard way here. A drift measurement against
+`~/.local/share/tartci` reported hundreds of changed lines; that directory is
+**inert**. The supervisors exec a content-addressed generation under
+`~/.local/share/tartci-generations/<commit>-<manifest16>/`, and the gate
+LaunchAgent names that path directly rather than going through the launcher at
+all. Measured against the generation, the files were **byte-identical** to their
+source commit — zero drift, merely some commits behind head.
+
+So `ArtifactObservation` carries an `ExecProvenance`, and an unproven path
+yields `Undetermined` with `Boundary::Scope` rather than any drift verdict. An
+inert copy of a real thing passes every check except *is this the artifact that
+executes?*
+
+**Drift is three-valued.** `in sync` / `behind the repo` (deploy) /
+**`ahead of the repo`** (upstream the delta, and do **not** redeploy) — plus the
+size of the delta, so two changed lines and two hundred are not the same alarm.
+Collapsing `ahead` into `behind` licenses a redeploy that deletes whatever the
+host was carrying. An artifact with no recorded upstream ref is `Unknown`; you
+cannot compare against a ref nobody wrote down.
+
+For a content-addressed runtime the identity is already recorded twice — the
+generation directory is named `<source_commit>-<manifest_sha256[:16]>`, and the
+install receipt records `support.source_commit`. The assertion is to **resolve
+and compare** those, not to invent an identity scheme. A change reaches such a
+host by PR plus a newly cut generation, never by editing a file in place.
+
+### Escalation leaves the host, and it has hysteresis
+
+`src/fleet_escalation.rs` decides *what* to escalate and *when*; the caller does
+the I/O. The target shape is the one that already works elsewhere in this stack:
+**open a tracking issue on degradation, auto-close it on recovery.**
+
+A journal line on a broken machine is not a signal, because nobody reads that
+machine. The bar: *a lane unserved for an hour should cost a human one glance,
+not nineteen days and a lucky question.*
+
+**Hysteresis is the design, not a refinement.** Every signal here flickers — a
+supervisor blind on 1598 of 2000 cycles reads healthy in its last 70 lines; a
+just-in-time pool registers and deregisters around every job. Reacting to a
+single sample would open and close an issue repeatedly, and a flapping alarm is
+worse than no alarm: it gets ignored, and the one real occurrence is ignored
+with it.
+
+So a subject must raise **continuously** for `raise_after_secs` (default 900)
+before anything opens, and be healthy **continuously** for `clear_after_secs`
+(default 1800) before it closes. Clearing is deliberately slower than raising,
+so a fault that briefly looks fixed does not close its own issue and restart the
+cycle.
+
+Three further rules, each with a reason paid for by an incident:
+
+- **An unchanged body is left alone.** Re-posting the same text every cycle
+  buries the one edit that mattered and teaches the reader to skip the
+  notification.
+- **One issue per subject key, never a fleet roll-up.** A roll-up hides the
+  second instance of a fault behind the first — exactly how a supervisor fault
+  on one host stayed dark for hours after its twin was found and fixed.
+- **`Unknown` escalates like any other fault**, and the body names its
+  `Boundary` and that boundary's `next_action`. An assertion that could not
+  measure is not one that passed.
+
+Every body names the host, the lane, what was already tried, and the next
+action. An alert that only says something is wrong makes its reader start from
+nothing, which is most of the cost of these incidents.
+
 ## Implementation notes
 
 - Pure detection logic lives in `src/runner_watchdog.rs` and has no I/O.
+- Fleet service assertions live in `src/fleet_service.rs`, same shape: no I/O,
+  no ambient clock, `now` injected so tests never touch system time.
 - The CLI shell-out is contained in `src/app/runner_cmd.rs`. It uses the
   existing `gh` invocation pattern from `src/cloud.rs`; no new HTTP
   client dependency.

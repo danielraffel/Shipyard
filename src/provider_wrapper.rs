@@ -70,6 +70,8 @@ const EXECUTION_SENTINEL_FD_ENV: &str = "SHIPYARD_PROVIDER_SENTINEL_FD";
 // fixtures serialized; this is test-only admission control and does not alter
 // production wrapper concurrency.
 const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 1;
+#[cfg(test)]
+const PROVIDER_EXECUTION_TEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(45);
 #[cfg(all(test, not(target_os = "macos")))]
 const PROVIDER_EXECUTION_TEST_CONCURRENCY: usize = 4;
 #[cfg(test)]
@@ -86,20 +88,35 @@ impl Drop for ProviderExecutionTestPermit {
     fn drop(&mut self) {
         if let Ok(mut available) = PROVIDER_EXECUTION_TEST_PERMITS.lock() {
             *available += 1;
-            PROVIDER_EXECUTION_TEST_READY.notify_one();
+            // Wake all waiters so a permit is not stranded behind a waiter
+            // whose test thread was descheduled during a loaded suite.
+            PROVIDER_EXECUTION_TEST_READY.notify_all();
         }
     }
 }
 
 #[cfg(test)]
 fn provider_execution_test_permit() -> Result<ProviderExecutionTestPermit, ProviderWrapperRefusal> {
+    let deadline = std::time::Instant::now() + PROVIDER_EXECUTION_TEST_ADMISSION_DEADLINE;
     let mut available = PROVIDER_EXECUTION_TEST_PERMITS
         .lock()
         .map_err(|_| refusal("provider wrapper test execution permits are poisoned"))?;
     while *available == 0 {
-        available = PROVIDER_EXECUTION_TEST_READY
-            .wait(available)
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(refusal(
+                "provider wrapper test fixture admission deadline exceeded",
+            ));
+        }
+        let (next, timeout) = PROVIDER_EXECUTION_TEST_READY
+            .wait_timeout(available, remaining)
             .map_err(|_| refusal("provider wrapper test execution permits are poisoned"))?;
+        available = next;
+        if timeout.timed_out() && *available == 0 {
+            return Err(refusal(
+                "provider wrapper test fixture admission deadline exceeded",
+            ));
+        }
     }
     *available -= 1;
     Ok(ProviderExecutionTestPermit)
