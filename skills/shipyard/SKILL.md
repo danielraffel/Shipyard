@@ -1103,9 +1103,17 @@ ungated while its three siblings were gated, and it took `main` red on Windows.
 `cargo clippy --all-targets` on macOS compiles the unix branch, where the
 function is used, so the local gate passes.
 
-If you add or rename a helper in a gated module, check every helper in that
-module, not just the one you touched. Gating one item also orphans its
-**imports**, which fail the same way — that cascade took a second round trip.
+**Prefer one gate on the module over many on its items.** If every test in a
+module needs the platform, write `#[cfg(all(test, unix))] mod tests;` at the
+declaration and none inside. Per-item gating is what fails: it leaves helpers
+and imports visible to the platform that skips the tests, each one a separate
+dead-code or unused-import error, and fixing one reveals the next. Three
+consecutive CI failures on one PR were that exact loop; collapsing 18 gates to
+1 ended it. A single gate cannot be applied inconsistently.
+
+If you must gate per item, check every helper **and every import** in the
+module, not just the one you touched — gating an item orphans its imports,
+which fail the same way.
 
 **Verify it instead of reasoning about it.** The skipping platform's view is
 simply "the gated branch does not exist", and you can reproduce that natively:
