@@ -365,6 +365,50 @@ a wall that has a door in it.
 
 Design note: `planning/2026-09-04-fleet-service-assertions.md`.
 
+### Supervisor scan blindness is a ratio, never a sample
+
+`src/fleet_supervisor.rs` asserts that a tartci supervisor can *see* the work.
+A supervisor decides whether to boot a VM by scanning the queue; when that scan
+cannot finish in time it logs `SCAN BLIND (gh queue scan failed) N/9`, boots
+nothing, and every job on that lane's labels waits with no error visible
+anywhere in GitHub. The jobs are simply `queued`.
+
+**Do not sample it.** A release supervisor measured on this fleet had **1598 of
+its last 2000 log lines blind** against 80 sighted, with the final ~70 lines
+reading perfectly healthy. Any single-sample check taken at that moment returns
+green. `assess_supervisor_scan` therefore reports the blind/sighted **ratio over
+a window** against `max_blind_ratio`, alongside the supervisor's own
+consecutive-blind counter (`N/9`) against its ceiling — a burst of nine
+consecutive is a different fault from nine scattered, and both are tracked.
+
+There is deliberately **no minimum-window guard**. A "only trust the ratio after
+N cycles" threshold is an escape hatch that lets a short, entirely blind window
+read as a pass, which is a blind spot inside a blindness detector.
+
+### A timeout is not an auth failure
+
+The supervisor's own message for a timeout is `self-restarting the supervisor
+for fresh gh auth`. Authentication was never broken, and the restart it performs
+cannot help. `classify_scan_failure` maps a timeout to `Boundary::Transport`,
+whose `next_action` says not to re-authenticate, and reserves
+`Boundary::Permission` for actual credential evidence (`HTTP 401`, `bad
+credentials`). A rate limit is explicitly *not* credential evidence — it is a
+completed call.
+
+`SupervisorReport` carries two boundary fields on purpose: `boundary` (why *this
+assertion* could not measure, `Some` only when `Unknown`) and
+`observed_boundary` (what the *supervisor's own* failures classify into — the
+field that reads `transport` on a log that says "auth").
+
+### A budget set by absence is the shape of the bug
+
+`assess_scan_budget` takes the lane's declared scan timeout as an `Option`.
+`None` means the lane inherits the 15s default, which is how the release lane
+came to have a budget nobody chose while the gate lane on the same host declared
+180s and absorbed the identical latency. Observed latency is reported as a ratio
+against whichever budget applies, so the same measurements can read `Served`
+under a declared budget and `Degraded` under an inherited one.
+
 ### A guard is not a guard until something proves it is armed
 
 `src/fleet_guards.rs` asserts two things a host can be wrong about silently.
