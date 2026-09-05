@@ -566,6 +566,61 @@ Every body names the host, the lane, what was already tried, and the next
 action. An alert that only says something is wrong makes its reader start from
 nothing, which is most of the cost of these incidents.
 
+### The leak assertion, and the handback contract
+
+`src/fleet_lifecycle.rs` generalises three leaks found on one day into a single
+assertion: **a live object whose subject has already ended is itself a defect.**
+Three VM clones outlived their jobs by nineteen days; a queued run that could
+not be cancelled became an immortal demand signal; a `--follow` watcher polled
+for three days and thirteen hours past its pull request's merge. Each was found
+by a person happening to look.
+
+Not a rare shape: of **188 ship-states measured on one host, 46 — a quarter —**
+carried empty evidence and no dispatched runs, which reports "in flight"
+forever. 44 belonged to one repository; the oldest was forty days old.
+
+**Absence is never success.** A narrow fix for the watcher was designed and
+adversarially reviewed, and the review found it could emit **exit 0 for a pull
+request closed without merging** — a false success strictly worse than the bug.
+So `SubjectState::Terminal` carries *how* the subject ended, `succeeded()` is
+true only for a positively observed `Succeeded`, and there is no path from "I
+cannot see it" to a pass.
+
+**The authority wins on terminality in both directions.** Local evidence is
+authoritative for *quality*, never for whether the subject ended. The four
+quadrants:
+
+| Subject | Local | Winner | Verdict | Losing signal |
+|---|---|---|---|---|
+| terminal | terminal | agree | hand back with the subject's outcome | recorded |
+| active | active | agree | keep tracking | recorded, quiet |
+| **terminal** | **appears active** | subject | hand back, **after deciding cancel vs drain** | recorded, **raises** |
+| **active** | **appears terminal** | subject | **do NOT hand back** | recorded, quiet |
+
+Row 4 is the everyday wait on review, a required check, or the merge queue —
+locally complete and upstream open. Terminating there is the false terminal, and
+it is why the authority cannot simply override in one direction only.
+
+Row 3 is the only row needing a policy: **drain if the remaining cost is
+provably bounded and small, cancel otherwise.** Unbounded work is not drainable;
+**unmeasured** work is escalated rather than cancelled, because an absence of
+measurement is not a licence to cancel work somebody still needs. Whatever is
+chosen is stated — silently abandoning the work is the leak in miniature.
+
+**The losing signal is never discarded.** Two disagreements are findings in
+their own right: a subject that landed past a *failing* gate, and one that
+closed unmerged although validation *passed*.
+
+`Merged` is monotonic; `Closed` is revocable, because pull requests reopen and a
+terminal that cannot be revoked strands a live subject as permanently ended. A
+successor never inherits a terminal, or a replacement is born dead.
+
+An under-qualified subject reference is refused before probing: it resolves
+against an ambient default and can report an unrelated subject as ended. A wrong
+terminal is worse than none.
+
+Contract: `planning/2026-09-05-shipyard-handback-contract.md`.
+
 ## Implementation notes
 
 - Pure detection logic lives in `src/runner_watchdog.rs` and has no I/O.
