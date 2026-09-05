@@ -79,6 +79,8 @@ pub mod executor;
 pub mod fleet_epoch;
 /// Typed service assertions: is a declared lane actually being served?
 pub mod fleet_service;
+/// Typed slot assertions: is a free macOS VM slot being withheld, and why?
+pub mod fleet_slot;
 /// Repo-local gate script resolution for `shipyard pr`.
 pub mod gate_scripts;
 /// Shared GitHub CLI command boundary and auth resolution.
