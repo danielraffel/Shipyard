@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01960"></a>
+## [0.196.0] - 2026-09-05
+
+- test(fleet): force the ETXTBSY race, and fix the second site it was hiding ([#573](https://github.com/danielraffel/Shipyard/pull/573))
+
 <a id="v01930"></a>
 ## [0.193.0] - 2026-09-05
 
@@ -1434,6 +1439,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.196.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.196.0
 [0.193.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.193.0
 [0.192.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.192.0
 [0.191.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.191.0
