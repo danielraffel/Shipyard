@@ -77,11 +77,11 @@ pub(crate) mod execution_termination;
 pub mod executor;
 /// Fail-closed check that a host has converged to the declared fleet epoch.
 pub mod fleet_epoch;
-/// Typed relay assertions: does every declared hop connect inside its budget?
-pub mod fleet_relay;
 /// Typed guard assertions: is a declared guard actually armed on the host, and
 /// is the installed copy still the one the repo believes it deployed?
 pub mod fleet_guards;
+/// Typed relay assertions: does every declared hop connect inside its budget?
+pub mod fleet_relay;
 /// Typed service assertions: is a declared lane actually being served?
 pub mod fleet_service;
 /// Typed slot assertions: is a free macOS VM slot being withheld, and why?
