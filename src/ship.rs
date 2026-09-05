@@ -3761,14 +3761,39 @@ mod tests {
         initial_workers_ready: Barrier,
         refill_started: (Mutex<bool>, Condvar),
         long_observed_refill: Mutex<Option<bool>>,
+        refill_expected: bool,
     }
 
     impl RefillOrderingDispatcher {
-        fn new() -> Self {
+        /// A refill **is** expected, so `long` waits with no deadline: waking
+        /// is itself the proof, and no clock takes part in the verdict.
+        ///
+        /// The bounded form is wrong in this direction. A deadline that fires
+        /// records the same `false` as "the slot was never refilled", so a
+        /// loaded runner is indistinguishable from the regression the test
+        /// exists to catch — and slow becomes fail.
+        ///
+        /// The cost is that a genuine refill regression hangs here rather than
+        /// asserting. That is the right trade: it can only happen when the code
+        /// under test is actually broken, and a hang naming this test says
+        /// exactly what a spurious red does not.
+        fn expecting_a_refill() -> Self {
+            Self::with_expectation(true)
+        }
+
+        /// No refill is expected, so `long` waits a bounded time and gives up.
+        /// A slower host only makes the expected "nothing happened" more
+        /// certain, so this direction cannot flake red.
+        fn expecting_no_refill() -> Self {
+            Self::with_expectation(false)
+        }
+
+        fn with_expectation(refill_expected: bool) -> Self {
             Self {
                 initial_workers_ready: Barrier::new(2),
                 refill_started: (Mutex::new(false), Condvar::new()),
                 long_observed_refill: Mutex::new(None),
+                refill_expected,
             }
         }
 
@@ -3792,13 +3817,20 @@ mod tests {
             if request.target.name == "long" {
                 let (started_lock, started_condvar) = &self.refill_started;
                 let started = started_lock.lock().expect("refill started lock");
-                let (started, _) = started_condvar
-                    .wait_timeout_while(started, StdDuration::from_secs(2), |started| !*started)
-                    .expect("refill start wait");
+                let observed = if self.refill_expected {
+                    *started_condvar
+                        .wait_while(started, |started| !*started)
+                        .expect("refill start wait")
+                } else {
+                    let (started, _) = started_condvar
+                        .wait_timeout_while(started, StdDuration::from_secs(2), |started| !*started)
+                        .expect("refill start wait");
+                    *started
+                };
                 *self
                     .long_observed_refill
                     .lock()
-                    .expect("long observation lock") = Some(*started);
+                    .expect("long observation lock") = Some(observed);
             } else if request.target.name == "refill" {
                 let (started_lock, started_condvar) = &self.refill_started;
                 *started_lock.lock().expect("refill started lock") = true;
@@ -4437,7 +4469,7 @@ mod tests {
         let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship state");
         let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
         let config = empty_config(temp.path());
-        let dispatcher = RefillOrderingDispatcher::new();
+        let dispatcher = RefillOrderingDispatcher::expecting_a_refill();
         let request = |name: &str, priority| RunExecutionRequest {
             branch: format!("feature/{name}"),
             sha: name.to_owned(),
@@ -4500,7 +4532,7 @@ mod tests {
         let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship state");
         let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
         let config = empty_config(temp.path());
-        let dispatcher = RefillOrderingDispatcher::new();
+        let dispatcher = RefillOrderingDispatcher::expecting_no_refill();
         let request = |name: &str, priority| RunExecutionRequest {
             branch: format!("feature/{name}"),
             sha: name.to_owned(),
