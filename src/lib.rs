@@ -81,6 +81,8 @@ pub mod fleet_epoch;
 pub mod fleet_relay;
 /// Typed service assertions: is a declared lane actually being served?
 pub mod fleet_service;
+/// Typed slot assertions: is a free macOS VM slot being withheld, and why?
+pub mod fleet_slot;
 /// Typed supervisor assertions: can the thing that boots VMs see the work?
 pub mod fleet_supervisor;
 /// Repo-local gate script resolution for `shipyard pr`.

@@ -409,6 +409,36 @@ came to have a budget nobody chose while the gate lane on the same host declared
 against whichever budget applies, so the same measurements can read `Served`
 under a declared budget and `Degraded` under an inherited one.
 
+### A host can refuse work it could do, and four causes print one line
+
+`src/fleet_slot.rs` covers the case where capacity exists, is free, and is being
+**withheld**. Measured on this fleet: a host with both macOS VM slots free and a
+release job queued, yielding indefinitely to a priority lane whose own two
+supervisors on the same host reported `queued=0`.
+
+`priority_demand=1` / `priority lane 'X' has the slot` is printed for four
+causes whose remedies do not overlap:
+
+| Cause | Correct? | Verdict | Remedy |
+|---|---|---|---|
+| genuine **queued** priority demand | yes | `Served` | wait |
+| an **unusable** job (assigned, in progress, or hosted-only) that cannot take a self-hosted slot | **no** | `Degraded` | stop counting it |
+| the scan **failed** and fell closed to `1` | invisible | `Degraded` | fix the scan |
+| `host_health_yield` on real memory saturation | yes | `Served` | free memory — forcing a boot would harm |
+
+Two of those are correct behaviour and must not raise: raising on correct
+behaviour is what trains an operator to ignore the raise, which is how the real
+defect hid among identical lines in the first place. `WithholdCause` is a
+report-level type mapping onto the shared `ServiceVerdict`, so the crate keeps
+one severity order.
+
+**Cross-supervisor coherence needs no external oracle.** Two supervisors on the
+same host scanning the same repo that contradict each other prove, between
+them, that one is wrong. The check encodes only the sharp case — lane A yields
+*citing* lane B while every supervisor actually serving B reports `queued=0` —
+because supervisors watch different label sets, so differing `queued=` is not
+by itself a contradiction.
+
 ### Relay hops: "does the proxy answer?" is the wrong question
 
 `src/fleet_relay.rs` asserts that **each declared hop** connects within a
