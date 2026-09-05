@@ -67,7 +67,7 @@ fn loaded_without_a_restart_policy_is_still_unsupervised() {
 
 /// **The planted control for this module's whole reason to exist.**
 ///
-/// A LaunchAgent lives in the per-user GUI domain, so `launchctl list` over SSH
+/// A `LaunchAgent` lives in the per-user GUI domain, so `launchctl list` over SSH
 /// returns nothing for a job that is loaded and running. Reading that silence
 /// as "not loaded" files a fault against a healthy runner. An unqueryable
 /// domain must yield `Unknown`, and must not raise.

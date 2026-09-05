@@ -16,7 +16,7 @@
 //! ```
 //!
 //! It never came back, because nothing was watching it: the runner was **not**
-//! ephemeral, its LaunchAgent declared `RunAtLoad` but no `KeepAlive`, and the
+//! ephemeral, its `LaunchAgent` declared `RunAtLoad` but no `KeepAlive`, and the
 //! job was not loaded in launchd at all. The lane went from `Served` to
 //! permanently `Unserved` with no intervening state, and the host stayed up
 //! throughout — load 7.29, three *other* runners serving on the same machine.
@@ -28,7 +28,7 @@
 //!
 //! ## The rule this module exists to enforce
 //!
-//! **An unreadable observation is never a fault.** A LaunchAgent loads into the
+//! **An unreadable observation is never a fault.** A `LaunchAgent` loads into the
 //! per-user GUI domain, so `launchctl list` over SSH reports *nothing* for a
 //! job that is loaded and running. Three such empty reads in a row look exactly
 //! like a finding. Reading them as `Unsupervised` would file a fault against a
