@@ -37,9 +37,14 @@
 //! **1. Position, because the tax depends on it.** A hop that fails *before*
 //! the first hop that answers is paid by every single connection. The identical
 //! hop failing *after* it is never reached and costs nothing today. Same defect,
-//! two different facts, so [`HopReport::attempted`] decides between a live tax
-//! ([`ServiceVerdict::Degraded`]) and a latent loss of fallback
-//! ([`ServiceVerdict::Idle`]).
+//! two different facts, so [`HopReport::attempted`] and the reported tax
+//! separate a live latency tax from a fallback that has already been lost.
+//!
+//! Both raise. `Idle` in this taxonomy means nothing is asking, and a relay in
+//! use is being asked, so an unreachable fallback is not at rest — it is
+//! redundancy gone, silently, which is precisely the shape of the incident
+//! behind this module. What differs is the message, chosen by what the defect
+//! costs rather than by the verdict.
 //!
 //! **2. The connect time, into pass/fail.** A hop at 4.9s of a 5s budget and a
 //! hop at 0.2s are not the same lane, and the first is one bad afternoon from
@@ -392,10 +397,10 @@ impl RelayReport {
 ///   every other hop is healthy;
 /// * no hop answers at all → [`ServiceVerdict::Unserved`]: the relay is
 ///   severed, not taxed;
-/// * otherwise the worst per-hop verdict, which is [`ServiceVerdict::Degraded`]
-///   when any attempted hop fails or exceeds its budget, and
-///   [`ServiceVerdict::Idle`] when the only defective hops are ones no
-///   connection reaches.
+/// * otherwise the worst per-hop verdict. A failing hop is
+///   [`ServiceVerdict::Degraded`] whether or not any connection reaches it —
+///   an unreachable fallback is redundancy already lost, not a hop at rest —
+///   and the detail distinguishes the two by the tax actually paid.
 #[must_use]
 pub fn assess_relay(
     relay: &str,
@@ -473,11 +478,18 @@ fn classify_hop(
     let (verdict, boundary) = match outcome {
         HopOutcome::Unmeasurable => (ServiceVerdict::Unknown, probe.outcome.boundary()),
         HopOutcome::WithinBudget => (ServiceVerdict::Served, None),
-        // A defect that no connection reaches costs nothing today. Reporting it
-        // at the same severity as one every connection pays is how the paid one
-        // gets lost in the noise.
-        _ if attempted => (ServiceVerdict::Degraded, None),
-        _ => (ServiceVerdict::Idle, None),
+        // A defect no connection currently reaches still raises, and this is
+        // the deliberate call. `Idle` in this taxonomy means nothing is asking;
+        // a relay in use is being asked, so an unreachable fallback is not at
+        // rest — it is redundancy that has already been lost, silently. That is
+        // the exact shape of the incident behind this module: a hop was dead
+        // for days and surfaced only during the outage its deadness deepened.
+        //
+        // Both cases are `Degraded` rather than one being suppressed, but they
+        // are never conflated: `attempted` and the tax figure separate the hop
+        // every connection pays for from the one that costs nothing yet, and
+        // the detail says which.
+        _ => (ServiceVerdict::Degraded, None),
     };
 
     let mut report = HopReport {
@@ -625,9 +637,17 @@ fn decide_relay_verdict(report: &mut RelayReport) {
         .map(|hop| hop.verdict)
         .max()
         .unwrap_or(ServiceVerdict::Unknown);
+    // The message is chosen by what the defect COSTS, not by the verdict. A
+    // dead fallback and a dead first hop are both `Degraded`, and telling them
+    // apart is the entire point of tracking position — describing a shadowed
+    // hop as a latency tax would report a cost nobody is paying.
+    let any_attempted_failure = report
+        .hops
+        .iter()
+        .any(|hop| hop.attempted && hop.verdict.is_raise());
     report.detail = match report.verdict {
-        ServiceVerdict::Degraded => degraded_detail(report),
-        ServiceVerdict::Idle => idle_detail(report),
+        ServiceVerdict::Degraded if any_attempted_failure => degraded_detail(report),
+        ServiceVerdict::Degraded => idle_detail(report),
         _ => served_detail(report),
     };
 }

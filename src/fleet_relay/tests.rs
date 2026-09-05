@@ -224,15 +224,13 @@ fn the_same_dead_hop_is_worse_first_than_last() {
         HopProbe::timed_out("macmini", 18.0),
     ]);
 
-    // Severity differs.
+    // Both raise: a dead fallback is redundancy already lost, and losing it
+    // silently is the failure this module exists to catch. What differs is not
+    // whether anyone hears about it but what it is costing.
     assert_eq!(first.verdict, ServiceVerdict::Degraded);
-    assert_eq!(last.verdict, ServiceVerdict::Idle);
-    assert!(
-        first.verdict > last.verdict,
-        "first-position failure is worse"
-    );
+    assert_eq!(last.verdict, ServiceVerdict::Degraded);
     assert!(first.verdict.is_raise());
-    assert!(!last.verdict.is_raise());
+    assert!(last.verdict.is_raise());
 
     // And so does the per-hop reading of the identical host.
     let dead_first = &first.hops[0];
@@ -242,9 +240,10 @@ fn the_same_dead_hop_is_worse_first_than_last() {
     assert!(dead_first.attempted);
     assert!(!dead_last.attempted);
     assert_eq!(dead_first.verdict, ServiceVerdict::Degraded);
-    assert_eq!(dead_last.verdict, ServiceVerdict::Idle);
+    assert_eq!(dead_last.verdict, ServiceVerdict::Degraded);
 
-    // And the cost differs, which is the reason the severity does.
+    // The cost is what separates them, and it must be legible without the
+    // verdict doing the work.
     assert!(close(first.tax_secs.expect("answered"), 18.0));
     assert!(close(last.tax_secs.expect("answered"), 0.0));
     assert!(
@@ -271,7 +270,7 @@ fn a_dead_hop_is_free_only_once_something_ahead_of_it_answers() {
 
     assert_eq!(shadowed.first_answering_position, Some(1));
     assert!(!shadowed.hops[1].attempted);
-    assert_eq!(shadowed.verdict, ServiceVerdict::Idle);
+    assert_eq!(shadowed.verdict, ServiceVerdict::Degraded);
     assert!(close(shadowed.tax_secs.expect("answered"), 0.0));
 
     // Move the same dead hop ahead of every answer and it becomes a tax again.
@@ -536,4 +535,40 @@ fn control_a_healthy_relay_yields_no_proposed_change() {
     assert_eq!(proposal.proposed_order, proposal.current_order);
     assert!(proposal.dropped.is_empty());
     assert!(proposal.refused_drops.is_empty());
+}
+
+/// Planted control for making a shadowed dead hop raise: a relay whose hops are
+/// all healthy must still be silent. Without this, moving the fallback case to
+/// `Degraded` could have been a change that simply raises on everything.
+#[test]
+fn control_a_wholly_healthy_relay_still_does_not_raise() {
+    let report = assess(&[
+        HopProbe::connected("macmini", 0.16),
+        HopProbe::connected("m1", 0.27),
+    ]);
+
+    assert_eq!(report.verdict, ServiceVerdict::Served);
+    assert!(!report.verdict.is_raise());
+    assert!(report.hops.iter().all(|hop| !hop.verdict.is_raise()));
+}
+
+/// The cost distinction has to survive both cases raising, or collapsing them
+/// would have thrown away the thing position was tracking.
+#[test]
+fn a_paid_dead_hop_and_a_free_one_stay_distinguishable_while_both_raise() {
+    let paid = assess(&[
+        HopProbe::timed_out("macmini", 18.0),
+        HopProbe::connected("m1", 0.27),
+    ]);
+    let free = assess(&[
+        HopProbe::connected("m1", 0.27),
+        HopProbe::timed_out("macmini", 18.0),
+    ]);
+
+    assert!(paid.verdict.is_raise() && free.verdict.is_raise());
+    assert!(close(paid.tax_secs.expect("answered"), 18.0));
+    assert!(close(free.tax_secs.expect("answered"), 0.0));
+    assert!(paid.hops[0].attempted);
+    assert!(!free.hops[1].attempted);
+    assert_ne!(paid.detail, free.detail);
 }
