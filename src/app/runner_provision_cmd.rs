@@ -726,6 +726,9 @@ fn activate_staged_service_install(runner_dir: &Path, staged: &Path) -> Result<(
         }
         return Err(restore_original_runner(runner_dir, &backup, error));
     }
+    // The installer writes RunAtLoad with no KeepAlive, so the service starts
+    // once and is never restarted. Patch it before the job is loaded.
+    service_supervision::supervise_installed_service(runner_dir);
     if let Err(error) = run_in(runner_dir, "./svc.sh", &["start"], "start runner service") {
         // A nonzero start may still have launched Listener/Worker. The runner's
         // `svc.sh uninstall` is the single compound stop+uninstall operation;
@@ -1925,6 +1928,8 @@ fn envelope<W: Write>(
     write_json_envelope(stdout, command, data)
         .map_err(|e| CliFailure::new(1, format!("failed to write JSON: {e}")))
 }
+
+mod service_supervision;
 
 #[cfg(test)]
 mod tests {
