@@ -3,6 +3,16 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01630"></a>
+## [0.163.0] - 2026-09-04
+
+- feat(fleet): assert each declared relay hop against a connect budget ([#568](https://github.com/danielraffel/Shipyard/pull/568))
+
+<a id="v01600"></a>
+## [0.160.0] - 2026-09-04
+
+- docs(skill): the four causes behind a withheld slot ([#565](https://github.com/danielraffel/Shipyard/pull/565))
+
 <a id="v01580"></a>
 ## [0.158.0] - 2026-09-04
 
@@ -1378,6 +1388,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.163.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.163.0
+[0.160.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.160.0
 [0.158.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.158.0
 [0.157.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.157.1
 [0.157.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.157.0
