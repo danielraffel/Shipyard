@@ -479,6 +479,54 @@ Reproduction note: early attempts to reproduce this used `env -i`, which strips
 the `*_proxy` variables. The control was cleaner than the thing it controlled
 for, and passed every time.
 
+### A guard is not a guard until something proves it is armed
+
+`src/fleet_guards.rs` asserts two things a host can be wrong about silently.
+
+**Units are armed, not merely present.** A Linux host served zero work for ~19
+days while the reaper that would have recovered it sat on disk: the script was
+installed (a stale copy), and its `.service` and `.timer` were never installed
+at all, so nothing ever invoked it. `enabled` alone is also insufficient — a
+timer that is enabled with **no next elapse** fires never, which is exactly as
+useless as absent. The states are separate values with separate remedies:
+not installed / not enabled / masked / enabled-but-no-next-elapse / armed.
+
+**`NRestarts` must be asserted as a rate, never a level.** The counter is
+monotonic and survives the repair: the host above still reads `NRestarts=36089`
+today while perfectly healthy. A threshold on the absolute value is a
+permanently-red alarm, which is operationally identical to no alarm. The trigger
+is the **delta against a recorded baseline over a known interval**; the absolute
+is reported as context only. A first observation with no baseline is `Unknown`
+(you cannot measure a rate from one sample), and a counter that went *backwards*
+is `Unknown` too rather than a bogus delta — the interval spanned a reset.
+
+**Compare only what actually executes.** This is the correction that matters
+most, and it was learned the hard way here. A drift measurement against
+`~/.local/share/tartci` reported hundreds of changed lines; that directory is
+**inert**. The supervisors exec a content-addressed generation under
+`~/.local/share/tartci-generations/<commit>-<manifest16>/`, and the gate
+LaunchAgent names that path directly rather than going through the launcher at
+all. Measured against the generation, the files were **byte-identical** to their
+source commit — zero drift, merely some commits behind head.
+
+So `ArtifactObservation` carries an `ExecProvenance`, and an unproven path
+yields `Undetermined` with `Boundary::Scope` rather than any drift verdict. An
+inert copy of a real thing passes every check except *is this the artifact that
+executes?*
+
+**Drift is three-valued.** `in sync` / `behind the repo` (deploy) /
+**`ahead of the repo`** (upstream the delta, and do **not** redeploy) — plus the
+size of the delta, so two changed lines and two hundred are not the same alarm.
+Collapsing `ahead` into `behind` licenses a redeploy that deletes whatever the
+host was carrying. An artifact with no recorded upstream ref is `Unknown`; you
+cannot compare against a ref nobody wrote down.
+
+For a content-addressed runtime the identity is already recorded twice — the
+generation directory is named `<source_commit>-<manifest_sha256[:16]>`, and the
+install receipt records `support.source_commit`. The assertion is to **resolve
+and compare** those, not to invent an identity scheme. A change reaches such a
+host by PR plus a newly cut generation, never by editing a file in place.
+
 ## Implementation notes
 
 - Pure detection logic lives in `src/runner_watchdog.rs` and has no I/O.
