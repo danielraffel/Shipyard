@@ -77,6 +77,8 @@ pub(crate) mod execution_termination;
 pub mod executor;
 /// Fail-closed check that a host has converged to the declared fleet epoch.
 pub mod fleet_epoch;
+/// Decide when a fleet verdict should leave the host and reach a human.
+pub mod fleet_escalation;
 /// Typed guard assertions: is a declared guard actually armed on the host, and
 /// is the installed copy still the one the repo believes it deployed?
 pub mod fleet_guards;

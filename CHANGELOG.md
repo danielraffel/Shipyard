@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01660"></a>
+## [0.166.0] - 2026-09-04
+
+- docs(fleet): escalation leaves the host, and why it needs hysteresis ([#564](https://github.com/danielraffel/Shipyard/pull/564))
+- docs(fleet): armed guards, restart rate not level, three-valued drift ([#566](https://github.com/danielraffel/Shipyard/pull/566))
+
 <a id="v01610"></a>
 ## [0.161.0] - 2026-09-04
 
@@ -1389,6 +1395,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.166.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.166.0
 [0.161.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.161.0
 [0.160.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.160.0
 [0.158.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.158.0

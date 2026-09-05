@@ -1078,6 +1078,15 @@ When you do compare, the answer is three-valued: in sync / behind (deploy) /
 **ahead** (upstream the delta, do NOT redeploy) — collapsing the third into the
 second licenses a redeploy that destroys whatever the host was carrying.
 
+When a fleet fault needs to reach a human, do not leave it in a log on the
+broken host — nobody reads that host. Open a tracking issue and auto-close it on
+recovery (`src/fleet_escalation.rs` decides; the caller does the I/O), and give
+it hysteresis: raise only after a subject has been failing *continuously*, clear
+only after it has been healthy *continuously*, and clear more slowly than you
+raise. Everything here flickers, and a flapping alarm gets ignored along with
+the one real occurrence. Never a single roll-up issue for the fleet — that hides
+the second instance of a fault behind the first.
+
 **A live object whose subject already ended is a defect**, and handing work to
 Shipyard is only safe if it hands back. Judge anything long-running against
 that: absence is never success (a vanished state, an empty probe and a
