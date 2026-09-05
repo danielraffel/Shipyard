@@ -974,6 +974,38 @@ reap_in_progress_max_min = 300
 reap_queued_max_min = 480
 ```
 
+## Fleet Service Assertions (assert service, never liveness)
+
+When asked whether a host or lane is healthy, **do not answer from uptime, from
+`systemctl status`, or from the required gate being green.** All three read
+healthy while a lane is dead. A Linux lane once went unserved for ~19 days with
+the pool unit reporting `active (running)` throughout (it was running — and
+failing every 30 seconds, 36,088 times), the required gate merging normally, and
+a GitHub-hosted fallback quietly absorbing the work.
+
+`src/fleet_service.rs` holds the pure verdict logic. Two rules to carry into any
+fleet diagnosis, whether or not you use the module:
+
+1. **Query both runner scopes.** `repos/{owner}/{repo}/actions/runners` omits
+   org-registered runners entirely. A lane served only at the org scope reads
+   *unserved* from the repo census — the same empty result you get when the host
+   is genuinely dead. Always pair it with `orgs/{org}/actions/runners`.
+2. **An absence needs demand before it means anything.** An idle just-in-time
+   pool registers no runners. `Unserved` (aged queued demand, nothing online
+   advertises the labels) and `Idle` (nothing registered, nothing asking) look
+   identical in a census and mean opposite things. `Starved` — demand plus an
+   online server that is not reaching it — is a third, and its remedy is
+   capacity, not routing.
+
+`Unknown` is a verdict, not a pass: when the census cannot be read, say so and
+name the `Boundary` (`grammar` / `scope` / `identity` / `permission` / `parse` /
+`transport`). Only `permission` means "cannot"; the rest have an equivalent path
+and `Boundary::next_action` names it. A `transport` failure is explicitly **not**
+an auth fault — do not re-authenticate in response to a timeout.
+
+Details: `docs/runner-watchdog.md` and
+`planning/2026-09-04-fleet-service-assertions.md`.
+
 ## Host-Health Pre-Dispatch Gate (optional)
 
 For self-hosted runners *co-located with heavy interactive work*: read a shared
