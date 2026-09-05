@@ -92,6 +92,9 @@ pub mod fleet_selfheal;
 pub mod fleet_service;
 /// Typed slot assertions: is a free macOS VM slot being withheld, and why?
 pub mod fleet_slot;
+/// Assert that a lane's service survives an ordinary exit, not merely that it
+/// is serving right now.
+pub mod fleet_supervision;
 /// Typed supervisor assertions: can the thing that boots VMs see the work?
 pub mod fleet_supervisor;
 /// Repo-local gate script resolution for `shipyard pr`.
