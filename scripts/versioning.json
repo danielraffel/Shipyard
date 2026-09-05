@@ -53,7 +53,13 @@
     "plugin": {
       "label": "Shipyard Claude plugin",
       "version_files": [
-        { "path": ".claude-plugin/plugin.json", "kind": "json_field", "field": "version" }
+        { "path": ".claude-plugin/plugin.json", "kind": "json_field", "field": "version" },
+        {
+          "_comment": "Anchored inside the plugins array deliberately: marketplace.json also carries an unrelated metadata.version, and an unanchored match would rewrite that one instead.",
+          "path": ".claude-plugin/marketplace.json",
+          "kind": "regex",
+          "pattern": "(?ms)\"plugins\"\\s*:\\s*\\[.*?\"version\"\\s*:\\s*\"([^\"]+)\""
+        }
       ],
       "trigger_paths": [
         ".claude-plugin/**",
