@@ -294,9 +294,82 @@ defaults (`max_job_min=90`, `max_queue_age_hours=2`,
   `/tmp/shipyard-killed-builds/<event-id>/` so a misclick is recoverable
   with `--recover`.
 
+## Fleet service assertions — asserting service, not liveness
+
+`src/fleet_service.rs` answers a different question from the rest of this
+document. The watchdog above asks *"is this runner wedged?"*. A service
+assertion asks *"is anything actually serving this lane?"* — and the two come
+apart badly, because a host can be perfectly up and serving nothing.
+
+That is not hypothetical: a Linux lane once went unserved for ~19 days while
+`systemctl status` reported the pool `active (running)` the entire time (it
+was — and failing every 30 seconds, 36,088 times), the required gate kept
+merging, and a GitHub-hosted fallback absorbed the work so the lane's *output*
+stayed green. An uptime ping would have called it healthy every minute of it.
+
+### Verdicts are typed, because the distinctions are the point
+
+| Verdict | Means |
+| --- | --- |
+| `Served` | demand can be satisfied — proven, not assumed |
+| `Idle` | nothing registered **and** nothing asking; a just-in-time pool at rest |
+| `Degraded` | serving, but consuming a budget (latency, blind cycles, a climbing restart counter) |
+| `Starved` | demand exists and an online server exists, but the demand is not being reached |
+| `Unserved` | declared local, served by nobody: aged demand and no online runner in **either** scope |
+| `Unknown` | the instrument could not measure — never folded into a pass |
+
+`Unserved` vs `Idle` is only decidable by pairing the runner census with queued
+demand; an empty census alone cannot tell a dead pool from a resting one.
+`Unserved` vs `Starved` matters because the remedies are opposite — one is a
+routing fix, the other a capacity fix. Verdicts are ordered by severity, so
+`roll_up` takes the worst; `roll_up(&[])` is `Unknown`, since asserting nothing
+is not the same as asserting everything passed.
+
+### Query both runner scopes, always
+
+`repos/{owner}/{repo}/actions/runners` **omits org-registered runners
+entirely**. On the fleet this was written against, three of six declared
+self-hosted lanes are served only by org-scope runners — so a repo-scope-only
+census reports them unserved while they are online, which is the identical
+empty reading it gives when a host is genuinely dead.
+
+`assess_lane_service` takes one census spanning both scopes and records which
+scope satisfied each lane (`LaneReport::served_only_by_org_scope`), so this
+blindness is visible in the output instead of silently changing the answer.
+
+### Routing values have three encodings
+
+`parse_runs_on` handles all of them, because a parser that assumes a JSON array
+drops lanes without saying so:
+
+```
+["self-hosted","macOS","ARM64","pulp-build"]   JSON array  -> SelfHosted
+"macos-15"                                     JSON string -> Hosted
+macos-15                                       bare string -> Hosted
+local-only                                     sentinel    -> names no runner
+```
+
+### A refusal must name its boundary
+
+`Unknown` always carries a `Boundary`, and no measured verdict carries one. The
+facts it separates otherwise collapse into a single opaque failure — the same
+defect as a supervisor logging `self-restarting for fresh gh auth` for what was
+a *timeout*, then performing an auth restart that could not possibly help.
+
+`Grammar` (a command wrapper refused the verb), `Scope` (asked where the answer
+is invisible), `Identity` (wrong principal), `Permission`, `Parse`, and
+`Transport` (timeout or rate limit — explicitly *not* an auth fault). Only
+`Permission` denies that an equivalent path exists; for the rest,
+`Boundary::next_action` names what to try instead, so a caller does not stop at
+a wall that has a door in it.
+
+Design note: `planning/2026-09-04-fleet-service-assertions.md`.
+
 ## Implementation notes
 
 - Pure detection logic lives in `src/runner_watchdog.rs` and has no I/O.
+- Fleet service assertions live in `src/fleet_service.rs`, same shape: no I/O,
+  no ambient clock, `now` injected so tests never touch system time.
 - The CLI shell-out is contained in `src/app/runner_cmd.rs`. It uses the
   existing `gh` invocation pattern from `src/cloud.rs`; no new HTTP
   client dependency.

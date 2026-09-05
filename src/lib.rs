@@ -77,6 +77,8 @@ pub(crate) mod execution_termination;
 pub mod executor;
 /// Fail-closed check that a host has converged to the declared fleet epoch.
 pub mod fleet_epoch;
+/// Typed service assertions: is a declared lane actually being served?
+pub mod fleet_service;
 /// Repo-local gate script resolution for `shipyard pr`.
 pub mod gate_scripts;
 /// Shared GitHub CLI command boundary and auth resolution.
