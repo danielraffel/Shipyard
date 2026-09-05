@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01850"></a>
+## [0.185.0] - 2026-09-05
+
+- fix(watch): an archived ship state is undetermined, not a success ([#571](https://github.com/danielraffel/Shipyard/pull/571))
+- fix(gh): honor configured binary under default policy ([#556](https://github.com/danielraffel/Shipyard/pull/556))
+
 <a id="v01810"></a>
 ## [0.181.0] - 2026-09-05
 
@@ -1411,6 +1417,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.185.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.185.0
 [0.181.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.181.0
 [0.176.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.176.0
 [0.175.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.175.0
