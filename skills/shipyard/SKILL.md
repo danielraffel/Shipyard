@@ -2854,6 +2854,31 @@ stack overflow that CI never sees, because every lane sets
 `RUST_MIN_STACK: 8388608` for the CLI dispatch enum. A control proves your
 instrument works; it does not prove you aimed it at the right thing.
 
+### A daemon background loop must not inherit the reconciler's gating
+
+`should_start_reconcile` gates the reconciler on `subscriber_count() > 0`. That
+is correct for the reconciler and wrong for anything else, because **`shipyard
+watch` never subscribes** — it reads the ship-state file directly. So on a host
+where nothing else is attached, the subscriber count is zero and any loop
+sharing that predicate is dormant while looking configured. A live daemon
+reporting `subscribers=0` is the normal case, not an anomaly.
+
+When adding a background loop, give it its own start predicate. The local
+orphan sweep is purely local (no GitHub, no HTTP), so it has no reason to wait
+for a subscriber at all.
+
+**And give it a real startup delay.** A sweep that runs immediately at boot is
+hazardous in a way its own tests will not show: a host restart destroys the
+in-memory `protected_request_job_ids`, so on the first pass every in-flight job
+looks unprotected and queue-absent, which is exactly the "abandon it" shape.
+The sweep must wait a full interval on startup so that state can be rebuilt.
+
+The trap underneath is a shared constant whose value differs by build: an
+initial delay that is ZERO under `cfg(test)` and a full interval in production
+is safe in every test and hazardous only in the field — a startup bug hidden
+from the suite meant to catch it. Assert the production value unconditionally,
+not the one the test build happens to see.
+
 ## Cutover Discipline
 
 ### Bounded metrics observation
