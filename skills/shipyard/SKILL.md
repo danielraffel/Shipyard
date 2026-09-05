@@ -1025,6 +1025,15 @@ slot, a scan that failed and fell closed to `1`, and a legitimate
 yielding supervisor is neither "unserved" nor "starved"; establish which cause
 applies before touching routing.
 
+For a relay, **"does the proxy answer?" is the wrong question.** Assert each
+declared hop against a connect budget, in order. A dead first hop keeps the
+relay working via fallback while taxing every connection — 18s vs 2s in the
+incident — and that tax lands on whatever downstream timeout is smallest, so it
+surfaces as an unrelated subsystem failing. Report connect time as a ratio
+against budget, never as a boolean. When reproducing a proxy fault, do NOT use
+`env -i`: it strips the `*_proxy` variables, so the control is cleaner than the
+thing it controls for and passes every time.
+
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 

@@ -409,6 +409,46 @@ came to have a budget nobody chose while the gate lane on the same host declared
 against whichever budget applies, so the same measurements can read `Served`
 under a declared budget and `Degraded` under an inherited one.
 
+### Relay hops: "does the proxy answer?" is the wrong question
+
+`src/fleet_relay.rs` asserts that **each declared hop** connects within a
+budget, in order — not that the relay as a whole responds.
+
+The distinction is the whole incident. A relay was invoked
+`--relay-host macmini --relay-host m1` with macmini unreachable. The relay kept
+working, because the fallback succeeded, so every liveness-shaped question
+stayed green. What it cost was a tax paid on **every** connection before that
+fallback: 18 s via proxy against 2 s direct on one host, 5.5 s against 0.2 s on
+another. The tax silently exceeded a *downstream* timeout — a supervisor whose
+queue scan inherited a 15 s budget went blind, booted no VM, and a release lane
+starved for about a day, twice.
+
+So:
+
+- **Position decides the cost.** A hop failing *before* the first hop that
+  answers is paid by every connection; the identical hop *behind* an answer
+  costs nothing today. Both are `Degraded` — an unreachable fallback is
+  redundancy already lost, not a hop at rest — but the reported tax and
+  `attempted` tell them apart, and the detail is chosen by cost rather than by
+  verdict.
+- **Connect time is a ratio against its budget**, never collapsed to pass/fail.
+  A hop at 4.9 s of a 5 s budget is one bad afternoon from being the incident
+  and must not read like one at 0.2 s.
+- **An unmeasurable hop is `Unknown`** with a named `Boundary`, even when its
+  siblings are healthy.
+- **No hop answers → `Unserved`**: the relay is severed, not taxed.
+
+`any_hop_connected()` ships as a documented *fact*, never a verdict — it is
+precisely the naive question that stayed green throughout the outage.
+
+The proposal side is describe-only: reorder healthy hops first, drop ones that
+cannot connect, and refuse outright if any hop was unmeasured or if the drop
+would leave nothing that connects.
+
+Reproduction note: early attempts to reproduce this used `env -i`, which strips
+the `*_proxy` variables. The control was cleaner than the thing it controlled
+for, and passed every time.
+
 ## Implementation notes
 
 - Pure detection logic lives in `src/runner_watchdog.rs` and has no I/O.
