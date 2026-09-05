@@ -1104,7 +1104,22 @@ ungated while its three siblings were gated, and it took `main` red on Windows.
 function is used, so the local gate passes.
 
 If you add or rename a helper in a gated module, check every helper in that
-module, not just the one you touched.
+module, not just the one you touched. Gating one item also orphans its
+**imports**, which fail the same way — that cascade took a second round trip.
+
+**Verify it instead of reasoning about it.** The skipping platform's view is
+simply "the gated branch does not exist", and you can reproduce that natively:
+
+```sh
+sed -i '' 's/#\[cfg(unix)\]/#[cfg(any())]/g' <file>   # always-false cfg
+cargo clippy --all-targets --locked -- -D warnings
+git checkout -- <file>                                  # restore
+```
+
+Anything that lint reports is what the other platform will report. This is much
+cheaper than a CI round trip, and unlike `--target x86_64-pc-windows-msvc` it
+needs no cross toolchain — that target cannot even build this tree's native
+dependencies (`libsqlite3-sys`, `zstd-sys`) without MSVC.
 
 ## Host-Health Pre-Dispatch Gate (optional)
 
