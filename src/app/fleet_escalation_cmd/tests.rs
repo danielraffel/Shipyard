@@ -9,10 +9,8 @@
 use super::*;
 // Gated with the tests that use it: `open_action` is the only consumer and it
 // is unix-only, so an ungated import is an unused-import error on Windows.
-#[cfg(unix)]
 use crate::fleet_escalation::EscalationAction;
 
-#[cfg(unix)]
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     use std::os::unix::fs::PermissionsExt;
     let path = temp.path().join("gh");
@@ -63,7 +61,6 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
 /// The child clears in milliseconds, so probing until an exec succeeds closes
 /// the race by construction rather than by timing guess. Once one exec
 /// succeeds, no write descriptor remains anywhere and later forks are harmless.
-#[cfg(unix)]
 fn wait_until_executable(path: &std::path::Path) {
     for _ in 0..200 {
         // ETXTBSY (26) is the one error worth waiting out; anything else means
@@ -81,7 +78,6 @@ fn wait_until_executable(path: &std::path::Path) {
     panic!("fake gh never became executable: {}", path.display());
 }
 
-#[cfg(unix)]
 fn recording_gh(temp: &tempfile::TempDir, payload: &str) -> (GitHubActions, std::path::PathBuf) {
     let calls = temp.path().join("calls");
     let actions = fake_gh(
@@ -94,7 +90,6 @@ fn recording_gh(temp: &tempfile::TempDir, payload: &str) -> (GitHubActions, std:
     (actions, calls)
 }
 
-#[cfg(unix)]
 fn calls_of(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
@@ -102,7 +97,6 @@ fn calls_of(path: &std::path::Path) -> String {
 // Only the `#[cfg(unix)]` tests build an action, because the fake-`gh` harness
 // needs a `#!/bin/sh` shim. Without the same gate this is dead code on Windows,
 // where `-D warnings` turns that into a build failure.
-#[cfg(unix)]
 fn open_action() -> EscalationAction {
     EscalationAction::Open {
         key: "host=macpro lane=linux".to_owned(),
@@ -118,7 +112,6 @@ fn open_action() -> EscalationAction {
 /// The planted control for the most dangerous property of this module: with
 /// `apply` false it must make **no mutating call at all**. A dry run that
 /// quietly writes is worse than no dry run, because it is trusted.
-#[cfg(unix)]
 #[test]
 fn negative_control_a_dry_run_makes_no_mutating_call() {
     let temp = tempfile::tempdir().expect("temp");
@@ -148,7 +141,6 @@ fn negative_control_a_dry_run_makes_no_mutating_call() {
 
 /// Pairing control: with `apply` true the same open DOES call the API.
 /// Without this, "makes no call" would also pass for a module that never works.
-#[cfg(unix)]
 #[test]
 fn control_applying_an_open_posts_to_the_issues_endpoint() {
     let temp = tempfile::tempdir().expect("temp");
@@ -173,7 +165,6 @@ fn control_applying_an_open_posts_to_the_issues_endpoint() {
 // Each action hits its own endpoint, and only its own
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 #[test]
 fn an_update_patches_the_issue_and_does_not_open_a_new_one() {
     let temp = tempfile::tempdir().expect("temp");
@@ -202,7 +193,6 @@ fn an_update_patches_the_issue_and_does_not_open_a_new_one() {
 /// The comment must be posted before the state change. If the close fails, the
 /// reader is left with an open issue that explains the recovery; reversed, a
 /// failure would leave a silently closed issue and no explanation.
-#[cfg(unix)]
 #[test]
 fn a_close_comments_before_it_closes() {
     let temp = tempfile::tempdir().expect("temp");
@@ -228,7 +218,6 @@ fn a_close_comments_before_it_closes() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn nothing_touches_the_api_even_when_applying() {
     let temp = tempfile::tempdir().expect("temp");
@@ -252,7 +241,6 @@ fn nothing_touches_the_api_even_when_applying() {
 // Reading the open issues back
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 #[test]
 fn tracking_issues_are_matched_by_marker_not_title() {
     let temp = tempfile::tempdir().expect("temp");
@@ -276,7 +264,6 @@ fn tracking_issues_are_matched_by_marker_not_title() {
 /// Planted control: an issue we did not write must never be adopted, however
 /// much its title looks like ours. Editing somebody else's report is worse than
 /// opening a duplicate.
-#[cfg(unix)]
 #[test]
 fn negative_control_an_unmarked_issue_is_never_adopted() {
     let temp = tempfile::tempdir().expect("temp");
@@ -292,7 +279,6 @@ fn negative_control_an_unmarked_issue_is_never_adopted() {
 
 /// The issues endpoint returns pull requests. Closing one as "recovered" would
 /// be a memorable way to lose somebody's work.
-#[cfg(unix)]
 #[test]
 fn pull_requests_are_excluded_even_when_marked() {
     let temp = tempfile::tempdir().expect("temp");
@@ -311,7 +297,6 @@ fn pull_requests_are_excluded_even_when_marked() {
 /// An unreadable list must be an error, not an empty vector. Reading "nothing
 /// is open" from a failed call is how a duplicate gets opened next to the issue
 /// that already exists.
-#[cfg(unix)]
 #[test]
 fn negative_control_an_unreadable_list_errors_rather_than_reading_empty() {
     let temp = tempfile::tempdir().expect("temp");
@@ -335,7 +320,6 @@ fn a_marker_round_trips() {
 
 /// A failed mutation invalidates the snapshot the whole batch was decided
 /// against, so the batch stops rather than pressing on and risking a duplicate.
-#[cfg(unix)]
 #[test]
 fn a_batch_stops_at_the_first_failure() {
     let temp = tempfile::tempdir().expect("temp");
@@ -374,7 +358,6 @@ fn a_batch_stops_at_the_first_failure() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_clean_batch_reports_every_action() {
     let temp = tempfile::tempdir().expect("temp");
