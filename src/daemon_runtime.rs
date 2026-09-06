@@ -2900,7 +2900,7 @@ mod tests {
     #[test]
     fn sweep_runs_with_no_subscribers_while_reconcile_still_waits() {
         let now = StdInstant::now();
-        let due = now - StdDuration::from_secs(1);
+        let due = now.checked_sub(StdDuration::from_secs(1)).unwrap();
 
         // The fix: due, not in flight, and nobody subscribed -> sweep runs.
         assert!(should_start_sweep(false, now, due));
@@ -2940,7 +2940,7 @@ mod tests {
     #[test]
     fn sweep_respects_in_flight_and_deadline() {
         let now = StdInstant::now();
-        let due = now - StdDuration::from_secs(1);
+        let due = now.checked_sub(StdDuration::from_secs(1)).unwrap();
         let not_due = now + StdDuration::from_secs(5);
 
         // Never overlap a sweep with itself.
