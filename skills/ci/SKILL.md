@@ -1905,6 +1905,25 @@ stack overflow that CI never sees, because every lane sets
 `RUST_MIN_STACK: 8388608` for the CLI dispatch enum. A control proves your
 instrument works; it does not prove you aimed it at the right thing.
 
+### All platforms failing identically is a lint, not a build
+
+When Linux, macOS and Windows all go red on the same PR, the reflex is to look
+for a portability break. Check the failing *step number* first: a genuine
+portability break fails at different steps on different platforms, while a lint
+fails at the same early step on all of them because every platform runs it.
+
+`cargo fmt --check` is the common one and it costs a full CI round-trip to
+discover. Reproduce it locally before pushing. `cargo fmt` may not be on PATH
+even when `rustup component add rustfmt` reports the component is up to date:
+`cargo` resolves subcommands by searching PATH for `cargo-fmt`, so invoking
+cargo by absolute path finds neither. Put the toolchain's own bin directory on
+PATH first:
+
+```sh
+export PATH="$(dirname "$(rustup which cargo)"):$PATH"
+cargo fmt --check
+```
+
 ## Troubleshooting
 
 - `shipyard doctor --json` — checks git, ssh, gh, nsc are installed
