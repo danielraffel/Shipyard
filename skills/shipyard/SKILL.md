@@ -2908,6 +2908,31 @@ mutation, and it destroys an uncommitted fix along with it — so the break must
 planted on top of a commit, never on a working tree that holds the only copy of
 the work.
 
+### Canonicalise an identifier; do not demand it arrive canonical
+
+The steward's legacy PR fallback hatch canonicalised a repo slug to lowercase
+and then required `normalized == repository` — i.e. that the caller had *already*
+lowercased it. Any repository whose owner or name carries a capital
+(`Generous-Corp/pulp`, and most repos) therefore could never take the fallback.
+`shipyard pr` pushed the branch, then the handoff refused with
+`--workstream-id must be a canonical GEN-style handle`, leaving a real PR with no
+`shipyard:managed` label and no ship-state — invisible to `shipyard status` and
+to the queue tick. Deterministic, and it looked like a flake.
+
+**Canonicalise the input, then compare** — never make canonical form a
+precondition on the caller. But keep the *comparison* exact once canonicalised:
+matching the id case-insensitively is too loose in the other direction, and
+would accept `OWNER/repo#7` for `owner/repo`, which a separate test pins as
+invalid. The two halves are different decisions and it is worth being explicit
+about which is which.
+
+**And do not infer an agent route from the ambient shell.** A plain handoff
+carries no launch profile and no explicit route, so binding it to one because
+`CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID` happens to be exported — which
+every agent shell does — refuses exactly the case the fallback exists to serve.
+Resolve the fallback shape against `AgentEnvironment::default()` and keep the
+ambient fence for explicit routes, where it belongs.
+
 ## Cutover Discipline
 
 ### Bounded metrics observation

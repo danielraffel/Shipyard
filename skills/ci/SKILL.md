@@ -1946,6 +1946,23 @@ export PATH="$(dirname "$(rustup which cargo)"):$PATH"
 cargo fmt --check
 ```
 
+### A handoff that refuses AFTER the push leaves an invisible PR
+
+When `shipyard pr` fails at the handoff rather than at PR creation, the pull
+request already exists — but with no `shipyard:managed` label and no local
+ship-state, so it is invisible to `shipyard status` and to the queue tick. Do
+**not** re-run `shipyard pr`; that risks a duplicate. Find it and adopt it:
+
+```sh
+ghapp pr list --repo <owner/repo> --head <branch> --state all
+shipyard ship --pr <n>
+```
+
+The known cause of this was a slug-canonicalisation bug in the legacy fallback
+hatch, fixed by making it canonicalise rather than demand canonical input. If
+you see the same symptom again, read the failing step name and check whether the
+handoff or the PR creation failed — they leave very different states behind.
+
 ## Troubleshooting
 
 - `shipyard doctor --json` — checks git, ssh, gh, nsc are installed
