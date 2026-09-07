@@ -3,6 +3,16 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01980"></a>
+## [0.198.0] - 2026-09-06
+
+- fix(daemon): the local orphan sweep must not wait for a subscriber ([#583](https://github.com/danielraffel/Shipyard/pull/583))
+
+<a id="v01970"></a>
+## [0.197.0] - 2026-09-05
+
+- fix(runner): give a provisioned runner service a restart policy ([#579](https://github.com/danielraffel/Shipyard/pull/579))
+
 <a id="v01960"></a>
 ## [0.196.0] - 2026-09-05
 
@@ -1439,6 +1449,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.198.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.198.0
+[0.197.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.197.0
 [0.196.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.196.0
 [0.193.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.193.0
 [0.192.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.192.0
