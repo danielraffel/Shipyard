@@ -203,7 +203,11 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
     let workstream_id = request
         .workstream_id
         .clone()
-        .unwrap_or_else(|| format!("{repo}#{}", pr.number));
+        // Lowercase the slug: the steward's legacy-fallback hatch canonicalises
+        // on a lowercase owner/name, so synthesizing with the origin's original
+        // case (e.g. `Generous-Corp/pulp`) produced an id the hatch could never
+        // match, and the handoff refused AFTER the branch was pushed.
+        .unwrap_or_else(|| format!("{}#{}", repo.to_ascii_lowercase(), pr.number));
     let context_url = request.context_url.clone().or_else(|| pr.pr_url.clone());
     let mut sink = std::io::sink();
     let handoff_args = StewardHandoffArgs {
