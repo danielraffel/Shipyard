@@ -2885,7 +2885,11 @@ impl Drop for PidFileGuard {
     }
 }
 
-#[cfg(test)]
+// Every test here exercises `should_start_sweep`, `should_start_reconcile` and
+// `initial_sweep_delay`, all of which live behind `cfg(unix)` along with the
+// daemon runtime itself. Gating the module the same way keeps the Windows build
+// compiling; it costs no coverage, because the functions do not exist there.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::{Duration as StdDuration, Instant as StdInstant};
