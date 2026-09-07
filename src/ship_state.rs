@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
@@ -313,6 +314,25 @@ impl ShipStateStore {
     pub fn get(&self, pr: u64) -> Option<ShipState> {
         let mut states = self.states_for_pr(pr);
         (states.len() == 1).then(|| states.pop()).flatten()
+    }
+
+    /// Load one repository-scoped state with a bounded wait on the per-PR lock.
+    ///
+    /// `Ok(None)` means the state does not exist. `Err(WouldBlock)` means another
+    /// process holds the lock — almost always a running or hung ship worker.
+    /// Callers MUST keep these apart: `get_scoped` collapses every failure into
+    /// `None`, and a caller that reads `None` as absence will report a hung
+    /// worker as "no ship state found" or as an archived, finished PR. Both are
+    /// confident and wrong, and both are worse than saying the lock is held.
+    pub fn get_scoped_bounded(
+        &self,
+        repository: &str,
+        pr: u64,
+        timeout: Duration,
+    ) -> io::Result<Option<ShipState>> {
+        self.migrate_unrepresented_legacy(pr)?;
+        let lock = ShipStatePrLock::acquire_bounded(&self.lock_path(pr), timeout)?;
+        Ok(self.get_locked_scoped(repository, pr, &lock))
     }
 
     /// Load one repository-scoped state, migrating a matching legacy state on
@@ -880,7 +900,54 @@ pub struct ShipStatePrLock {
     files: Vec<File>,
 }
 
+/// How long a read may wait on a per-PR lock before reporting contention.
+///
+/// A ship worker holds this lock for its entire run, so a *hung* worker (blocked
+/// on `gh`, SSH, or a wedged VM) previously froze every reader of that PR with no
+/// deadline and no message. A bounded wait converts that silent freeze into a
+/// nameable condition.
+pub const PR_LOCK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl ShipStatePrLock {
+    /// Acquire with a deadline, distinguishing contention from every other error.
+    ///
+    /// Returns `ErrorKind::WouldBlock` when the deadline passes with the lock
+    /// still held. That distinction is the whole point: a caller must be able to
+    /// tell "another process holds this" from "this does not exist", because the
+    /// two demand opposite responses and conflating them is how a hung worker
+    /// gets reported as a missing or archived ship state.
+    fn acquire_bounded(path: &Path, timeout: Duration) -> io::Result<Self> {
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        drop(writer_domain);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self { files: vec![file] }),
+                Err(err) if std::time::Instant::now() >= deadline => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "ship-state lock for {} is held by another process after {}s \
+                             (a ship worker may be running, or hung): {err}",
+                            path.display(),
+                            timeout.as_secs()
+                        ),
+                    ));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+
     fn acquire(path: PathBuf) -> io::Result<Self> {
         let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)?;
         if let Some(parent) = path.parent() {
@@ -1040,6 +1107,7 @@ mod tests {
         AbandonRecord, DispatchedRun, ShipState, ShipStateStore, compute_policy_signature,
         same_repository,
     };
+    use fs2::FileExt;
 
     fn sample_state(pr: u64, sha: &str) -> ShipState {
         ShipState::new(
@@ -1066,6 +1134,68 @@ mod tests {
             phase: None,
             required: true,
         }
+    }
+
+    /// Contention must be distinguishable from absence, or a hung worker is
+    /// reported as a finished PR.
+    ///
+    /// `get_scoped` takes the lock with an unbounded wait, so a caller reading a
+    /// PR whose worker is hung does not get an answer at all -- it blocks for as
+    /// long as the worker holds it, which is the shape that left a watcher
+    /// polling for three days. A bounded read turns that silent freeze into a
+    /// nameable `WouldBlock`. The control below is what makes this test meaningful --
+    /// it proves the same call returns the state when the lock is free, so a
+    /// `WouldBlock` under contention cannot be an artifact of a missing file.
+    #[test]
+    fn a_held_pr_lock_reports_contention_instead_of_absence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let state = sample_state(4242, "abc1234");
+        store.save(&state).expect("save");
+
+        // CONTROL: with the lock free the bounded read finds the state. Without
+        // this, a WouldBlock below could just mean the probe never reached it.
+        let found = store
+            .get_scoped_bounded("danielraffel/pulp", 4242, StdDuration::from_millis(200))
+            .expect("uncontended read must succeed");
+        assert_eq!(found.expect("state should exist").pr, 4242);
+
+        // Hold the same lock through a separate file description. flock contends
+        // across descriptions, so this reproduces a running ship worker without
+        // spawning one.
+        let lock_path = temp.path().join("ship").join("4242.lock");
+        let holder = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock");
+        FileExt::lock_exclusive(&holder).expect("hold lock");
+
+        let err = store
+            .get_scoped_bounded("danielraffel/pulp", 4242, StdDuration::from_millis(200))
+            .expect_err("a held lock must not read as success");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        // The defect this exists to fix, demonstrated without hanging the suite:
+        // the unbounded path does not report contention at all, it BLOCKS. Prove
+        // that by giving it a generous window and asserting it never answers --
+        // then leave it stranded on its own thread rather than joining it, since
+        // by construction it cannot return while the lock is held.
+        let (tx, rx) = mpsc::channel();
+        let unbounded_path = temp.path().join("ship");
+        thread::spawn(move || {
+            let store = ShipStateStore::new(unbounded_path).expect("store");
+            let _ = tx.send(store.get_scoped("danielraffel/pulp", 4242).is_some());
+        });
+        assert!(
+            rx.recv_timeout(StdDuration::from_secs(2)).is_err(),
+            "get_scoped must still be blocked; if it answered, the unbounded \
+             wait is gone and this test no longer proves anything"
+        );
+
+        FileExt::unlock(&holder).expect("release");
     }
 
     #[test]

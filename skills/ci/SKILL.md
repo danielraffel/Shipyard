@@ -1905,7 +1905,29 @@ stack overflow that CI never sees, because every lane sets
 `RUST_MIN_STACK: 8388608` for the CLI dispatch enum. A control proves your
 instrument works; it does not prove you aimed it at the right thing.
 
-### All platforms failing identically is a lint, not a build
+### All platforms failing identically is USUALLY a lint — read the step name anyway
+
+**Correction to the first version of this note, paid for on one PR.** #583 went
+all-platforms-red three times in a row and it was three DIFFERENT causes:
+`cargo fmt`, then clippy's `unchecked_time_subtraction`, then a real `cfg`
+break where `cargo check` on macOS passed while Windows failed to compile. The
+pattern got the first two and would have sent me looking for a lint on the
+third.
+
+**The discriminator is the failing STEP NAME, not the platform pattern.** Step 5
+`Check formatting` and step 8 `Run clippy` are lints; step 6 `Run tests` failing
+with `error[E0425]: cannot find value ... in this scope` is a compile break that
+merely shares the shape.
+
+A `cfg(unix)` break is the one a macOS dev cannot see locally, and it hides in
+two places, not one: gating a test module is not enough if the **functions** it
+exercises are themselves ungated while their siblings carry the attribute. When
+a symbol goes missing on Windows, audit **every** reference to it rather than
+fixing the one the error names — the second attempt is otherwise identical to
+the first. A true cross-check is not available locally either: `cargo check
+--target x86_64-pc-windows-msvc` cannot build `libsqlite3-sys` or `zstd-sys`
+without a Windows C toolchain, so say what you actually verified.
+
 
 When Linux, macOS and Windows all go red on the same PR, the reflex is to look
 for a portability break. Check the failing *step number* first: a genuine

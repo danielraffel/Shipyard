@@ -2879,6 +2879,35 @@ is safe in every test and hazardous only in the field — a startup bug hidden
 from the suite meant to catch it. Assert the production value unconditionally,
 not the one the test build happens to see.
 
+### A reader that shares a writer's lock inherits the writer's lifetime
+
+The per-PR ship-state lock is held by a ship worker for its **entire run**. Any
+reader that takes the same lock with an unbounded wait therefore does not get a
+wrong answer when a worker hangs — it gets **no answer**, for as long as the
+worker holds it. That is the shape behind a watcher that polled GitHub for three
+days: the reader was not looping on bad data, it was parked on a lock.
+
+So a read path needs a deadline and a distinguishable outcome.
+`get_scoped_bounded` returns `ErrorKind::WouldBlock` on expiry, because "another
+process holds this" and "no such ship state" demand opposite responses — wait or
+investigate, versus the work is done. A read that collapses both into `None`
+reports a hung worker as a finished PR.
+
+When adding one, assert both halves and include the control: prove the same call
+returns the state when the lock is **free**, or a `WouldBlock` under contention
+could just be a missing file.
+
+**Do not write the "it blocks" half as an ordinary assertion** — it will hang the
+suite rather than fail it, and a hung test looks like an infrastructure problem.
+Drive it from a thread and assert `recv_timeout` **errors**, i.e. that no answer
+arrived, then leave the thread stranded rather than joining it: by construction
+it cannot return while the lock is held.
+
+**Commit before you break-confirm.** `git checkout --` is how you restore the
+mutation, and it destroys an uncommitted fix along with it — so the break must be
+planted on top of a commit, never on a working tree that holds the only copy of
+the work.
+
 ## Cutover Discipline
 
 ### Bounded metrics observation

@@ -709,6 +709,32 @@ This is the consumer-side half of the orphan problem above. The store having no
 lifecycle that marks a state terminal when its subject ended by a path Shipyard
 never observed is the producer-side half, and it is unchanged here.
 
+### Reading a state: contention is not absence
+
+The per-PR lock is held by a ship worker for its **entire run**, so any reader
+that takes it shares the worker's lifetime. `get_scoped` waits on that lock
+unbounded, which means a reader of a PR whose worker is **hung** does not get a
+wrong answer — it gets **no answer**, for as long as the worker holds it. That is
+the shape behind a watcher found polling GitHub for 3 days 13 hours: it was not
+looping on stale data, it was parked on a lock.
+
+`get_scoped_bounded(repository, pr, timeout)` takes a deadline and returns
+`io::ErrorKind::WouldBlock` when it expires. The distinction is the point:
+
+| Result | Meaning | Correct response |
+|---|---|---|
+| `Ok(Some(state))` | the state exists and was read | proceed |
+| `Ok(None)` | no such ship state | the work is done, or was never shipped |
+| `Err(WouldBlock)` | another process holds the lock | a ship worker is running — or hung |
+
+A caller that collapses the last two into "not found" reports a **hung worker as
+a finished PR**, which is the same class of false terminal as the archived-state
+exit code above. `PR_LOCK_READ_TIMEOUT` is the default deadline (10s).
+
+Note that the unbounded path does not merely answer slowly — it does not answer
+at all while the lock is held, so a test asserting that behaviour must drive it
+from a thread and assert that no answer arrives, never call it directly.
+
 ## Separate recovery-worker lifecycle (not `ShipState`)
 
 The merge steward's semantic exception worker deliberately does not add a
