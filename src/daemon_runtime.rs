@@ -1731,6 +1731,7 @@ fn should_start_reconcile(
 /// file directly and never subscribes, so a stranded watcher does not keep the
 /// sweep alive. Orphaned ship-states therefore accumulated without bound (54 of
 /// 95 observed on one host) and could never self-clear.
+#[cfg(unix)]
 fn should_start_sweep(sweep_in_flight: bool, now: Instant, next_sweep_at: Instant) -> bool {
     !sweep_in_flight && now >= next_sweep_at
 }
@@ -1864,6 +1865,7 @@ fn initial_reconcile_delay() -> Duration {
 ///
 /// So the first sweep waits a full interval, giving the execution supervisor
 /// its ticks and reconcile its first pass before anything is judged abandoned.
+#[cfg(unix)]
 fn initial_sweep_delay() -> Duration {
     Duration::from_secs(RECONCILE_INTERVAL_SECONDS)
 }
