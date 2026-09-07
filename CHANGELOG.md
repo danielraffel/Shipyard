@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01981"></a>
+## [0.198.1] - 2026-09-06
+
+- fix(ship-state): bound the PR-lock read so contention is nameable ([#584](https://github.com/danielraffel/Shipyard/pull/584))
+
 <a id="v01980"></a>
 ## [0.198.0] - 2026-09-06
 
@@ -1449,6 +1454,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.198.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.198.1
 [0.198.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.198.0
 [0.197.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.197.0
 [0.196.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.196.0
