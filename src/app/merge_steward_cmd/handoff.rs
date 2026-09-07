@@ -294,6 +294,23 @@ pub(crate) fn steward_handoff_command<W: Write>(
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    // A plain `shipyard pr` handoff carries no launch profile and no explicit
+    // agent route, so it must not be bound to one merely because the shell it
+    // ran in exports CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID -- which every
+    // agent shell does. Resolving it against a default environment keeps the
+    // ambient fence for EXPLICIT routes, where it belongs, while letting the
+    // legacy fallback through.
+    if is_legacy_pr_fallback(args) {
+        return steward_handoff_command_with_resolver(
+            args,
+            cwd,
+            runtime_paths,
+            actions,
+            json_output,
+            stdout,
+            |args| resolve_agent_context_with_environment(args, &AgentEnvironment::default()),
+        );
+    }
     steward_handoff_command_with_resolver(
         args,
         cwd,
@@ -517,9 +534,14 @@ fn is_legacy_pr_fallback(args: &StewardHandoffArgs) -> bool {
         && args.after_handoff == "continue"
         && !args.transfer_agent_owner
         && args.repo.as_deref().is_some_and(|repository| {
+            // Canonicalise the SLUG, but keep the id comparison exact.
+            // Requiring the slug to be already-lowercase made this hatch
+            // unreachable for any repo whose owner carries a capital, which is
+            // most of them. Comparing the id case-insensitively would be too
+            // loose in the other direction -- `OWNER/repo#7` must still be
+            // rejected for `owner/repo`, which an existing test pins.
             let normalized = repository.to_ascii_lowercase();
-            normalized == repository
-                && normalized.split('/').count() == 2
+            normalized.split('/').count() == 2
                 && args.workstream_id == format!("{normalized}#{}", args.pr)
         })
 }
@@ -3787,6 +3809,34 @@ fn main() {{
         routed.agent_provider = Some("codex".to_owned());
         routed.agent_session_id = Some("session-7".to_owned());
         assert!(validate_args(&routed).is_err());
+    }
+
+    /// A mixed-case owner must not make the fallback unreachable.
+    ///
+    /// The hatch canonicalises on a lowercase slug. It also used to require the
+    /// slug to ALREADY be lowercase, which meant any repository whose owner or
+    /// name carries a capital -- `Generous-Corp/pulp`, and most repos -- could
+    /// never take the fallback. `shipyard pr` then pushed the branch and refused
+    /// the handoff, leaving an unowned PR.
+    #[test]
+    fn legacy_pr_fallback_accepts_a_mixed_case_repository_slug() {
+        let mut mixed = args();
+        mixed.repo = Some("Generous-Corp/pulp".to_owned());
+        mixed.pr = 7;
+        // Exactly what ship_cmd::provenance synthesizes.
+        mixed.workstream_id = "generous-corp/pulp#7".to_owned();
+        assert!(
+            is_legacy_pr_fallback(&mixed),
+            "a mixed-case slug must still reach the legacy fallback"
+        );
+        assert!(validate_args(&mixed).is_ok());
+
+        // CONTROL: the hatch is still exact about the PR number, so it cannot be
+        // satisfied by any id that merely looks similar.
+        let mut wrong_pr = mixed.clone();
+        wrong_pr.workstream_id = "generous-corp/pulp#8".to_owned();
+        assert!(!is_legacy_pr_fallback(&wrong_pr));
+        assert!(validate_args(&wrong_pr).is_err());
     }
 
     #[test]
