@@ -340,7 +340,14 @@ fn cross_process_contender_defers_and_owner_death_forces_fresh_observation() {
     let timeout_started = Instant::now();
     output.clear();
     let exit = run(&args, &hanging, &mut output).expect("typed timeout verdict");
-    assert!(timeout_started.elapsed() < Duration::from_secs(1));
+    // The fake `gh` sleeps five seconds against a hundred-millisecond deadline, so any wall
+    // clock well short of that sleep proves the deadline aborted the call. The margin is
+    // deliberately loose rather than tight to the deadline: under `cargo llvm-cov` this binary
+    // is slow enough that a near-deadline bound measures the instrumentation instead.
+    assert!(
+        timeout_started.elapsed() < Duration::from_secs(3),
+        "observation deadline did not abort the hanging call"
+    );
     let verdict = typed_verdict(exit, &output, 1, "observation_failed");
     assert!(verdict["error"].as_str().unwrap().contains("timed out"));
     fs::remove_file(&calls).expect("reset successor calls");
