@@ -218,6 +218,14 @@ esac
     assert!(error.contains("authority changed"), "{error}");
 }
 
+/// The subprocess lock holder exits with one of two codes so that giving up on the parent's
+/// release marker cannot be mistaken for obeying it. Dropping the lock early would leave the
+/// parent measuring an uncontended state while still asserting a contention verdict.
+#[cfg(unix)]
+const LOCK_CHILD_RELEASED_EXIT: i32 = 87;
+#[cfg(unix)]
+const LOCK_CHILD_TIMED_OUT_EXIT: i32 = 86;
+
 #[cfg(unix)]
 #[test]
 #[ignore = "subprocess helper for admission observation lock"]
@@ -233,11 +241,18 @@ fn admission_observation_lock_child() {
             .expect("child lock")
             .expect("child owns lock");
     fs::write(ready, b"ready").expect("ready marker");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The lock has to outlive the parent's contention assertions. The bound only exists so a
+    // panicking parent cannot orphan the holder, so it is far longer than any progress the
+    // parent makes here rather than a guess at how long that progress takes.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !release.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::process::exit(87);
+    std::process::exit(if release.exists() {
+        LOCK_CHILD_RELEASED_EXIT
+    } else {
+        LOCK_CHILD_TIMED_OUT_EXIT
+    });
 }
 
 #[cfg(unix)]
@@ -300,7 +315,12 @@ fn cross_process_contender_defers_and_owner_death_forces_fresh_observation() {
     assert!(!calls.exists(), "contender must not call GitHub");
 
     fs::write(&release, b"release").expect("release child");
-    assert_eq!(child.wait().expect("child exit").code(), Some(87));
+    assert_eq!(
+        child.wait().expect("child exit").code(),
+        Some(LOCK_CHILD_RELEASED_EXIT),
+        "lock holder timed out instead of obeying the release marker, so the contention verdict \
+         above was measured against an already-released lock"
+    );
     let actions = clean_admission_actions(&temp, &calls);
     output.clear();
     let exit = run(&args, &actions, &mut output).expect("fresh successor observation");
