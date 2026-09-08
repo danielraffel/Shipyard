@@ -2964,3 +2964,55 @@ asking for go/no-go, ensure:
 408/409/429/5xx/timeout outcomes remain distinct from scope/auth failures;
 persisted stale bindings are reconciled only after exact remote evidence is
 re-read.
+
+### A shared noun is not a shared subsystem
+
+Removing the Linear-backed agent-workstream layer produced four separate
+near-misses where a name matched the feature and the code did not. Each would
+have deleted something load-bearing:
+
+| Looked removable | What it actually is |
+|---|---|
+| `worker_process_custody.rs` | generic OS process custody, zero references to any workstream code. Only the word "custody" matched. |
+| `verify_current_companion_digest` | the parallel-proof canary's trust boundary (NOFOLLOW open, uid, `nlink == 1`, mode bits, TOCTOU dev/ino recheck). It merely *lived* in the deleted provider module. |
+| `runner steward --ledger` | the merge steward's retry/audit JSON file, not the work ledger. Pulp CI passes it on every run, so cutting it breaks Pulp. |
+| `shipyard-workstream-provider` | a release-pairing artifact. `package_release.py` fails the build without it, `install.sh` requires it, `fleet update` verifies its digest. Only one *entry point* was dead. |
+
+So when scoping a removal here, never decide by name match. Read the
+definition and enumerate its live consumers. The rule that caught all four:
+for every "nothing uses this" finding, run a control query on the same
+instrument that must return non-zero, and compare the counts.
+
+Two related traps in the same work:
+
+- **`cargo check --lib` is blind to `[[bin]]` targets.** A deleted `src/bin/*.rs`
+  whose `[[bin]]` block still stands compiles green on `--lib` and fails the
+  *release*, not the build. Run `cargo check --bins` when touching binaries.
+- **Staged-but-inactive is not dead.** The remote M1 cache observer's controller
+  half has zero production constructors, all of them in tests, and the source
+  says why: "Remote observation requires a separately owned authenticated
+  companion/transport adapter and is intentionally absent." Infrastructure
+  landed ahead of its activation reads exactly like abandoned code. Check for a
+  stated intent before deleting an unreferenced subsystem.
+
+### Removing a field from a persisted record: check serde AND the digest
+
+Two structs in this repo lost fields during the workstream removal, and they
+needed opposite treatment. The deciding factors are `deny_unknown_fields` and
+whether a digest covers the serialized bytes:
+
+- `DurableStewardHandoff` (the steward receipt on disk for every managed PR) has
+  **no** `deny_unknown_fields` and **no** digest over its bytes, so receipts
+  written by older builds still load and ignore the stale keys. Safe to remove
+  fields.
+- The canary job envelope has `deny_unknown_fields` **and** a digest
+  `sha256(domain ‖ serde_json::to_vec(job))` that every receipt stores as
+  `job_sha256`. Tolerant deserialization would have been *worse* than a clean
+  break: an old record would load, re-serialize without the removed field, and
+  produce a digest mismatching its own receipts, i.e. a misleading
+  `AuthenticationFailed` deep in the lifecycle instead of an honest format
+  error. It took a schema bump instead.
+
+The digest domain string is usually selected by `schema_version`, so reusing a
+version number after changing a shape makes one domain name two shapes. Retire
+the number.

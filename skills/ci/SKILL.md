@@ -2237,3 +2237,44 @@ those independent fail-closed gates remain required.
 408/409/429/5xx/timeout outcomes remain distinct from scope/auth failures;
 persisted stale bindings are reconciled only after exact remote evidence is
 re-read.
+
+### The companion binary is release infrastructure, not a feature
+
+`shipyard-workstream-provider` is named after a feature that no longer exists,
+but it is a **release-pairing artifact** and four live paths require it:
+
+- `scripts/package_release.py` — `raise SystemExit("Built companion binary not
+  found")`. The release build fails without it, on every platform.
+- `install.sh` — `REQUIRE_PROVIDER=1` for every version at or above 0.127.0;
+  on macOS the companion ships **inside the DMG** and the installer hard-fails
+  if it is absent.
+- `src/app/fleet_update_cmd.rs` — `fleet update` verifies presence, adjacency,
+  mode 0700, `--version`, and SHA-256 in its auth-generation evidence.
+- `hooks/check-cli.sh` — blocks with "Installation is incomplete" if the
+  same-directory provider is missing or version-mismatched.
+
+Reading only `release.yml`'s asset globs is what makes this look
+Linux/Windows-only; those cover the standalone assets and miss the DMG path
+entirely. Any Mac that installed Shipyard has the binary.
+
+### The companion version gate is two-sided; arm it in the same change that stops publishing
+
+`companion_required_for_tag(tag, MIN_PAIRED_BINARY_TARGET, FIRST_TAG_WITHOUT_COMPANION)`
+is a **range**, not a floor:
+
+- below the bound the companion must be **present**, owned by the invoking
+  user, mode 700, and digest-matched
+- at or above it the companion must be **absent**
+
+`FIRST_TAG_WITHOUT_COMPANION` is `None` today, meaning every release from
+0.127.0 onward still publishes the companion. Arming it therefore has to land
+in the *same* change that stops building, packaging, and installing the
+companion. Arm it early and every host verifies an absence the installer just
+wrote; arm it late (or never) and the first release that drops the companion
+fails verification on every host. Either half alone breaks `fleet update`
+fleet-wide, and nothing in the build or the test suite points at the cause.
+
+The regression test is
+`app::fleet_update_cmd::tests::companion_pairing_applies_to_a_bounded_tag_range`.
+It has been break-confirmed: dropping the upper bound from the predicate makes
+exactly that test fail, with the recompile observed rather than assumed.
