@@ -2278,3 +2278,34 @@ The regression test is
 `app::fleet_update_cmd::tests::companion_pairing_applies_to_a_bounded_tag_range`.
 It has been break-confirmed: dropping the upper bound from the predicate makes
 exactly that test fail, with the recompile observed rather than assumed.
+
+### The companion rule is re-implemented in five places, three of them two-sided
+
+The `>= 0.127.0 implies companion` rule is not centralised. Changing the companion's
+lifecycle means changing all of these together:
+
+| Surface | Gate | Two-sided? |
+|---|---|---|
+| `src/app/fleet_update_cmd.rs:50` | `MIN_PAIRED_BINARY_TARGET` | yes |
+| `install.sh:116-129` | `REQUIRE_PROVIDER`, else `rm -f` the provider | yes |
+| `scripts/release_macos_local.py:465` | `_provider_expected_for_tag` | yes |
+| `hooks/check-cli.sh:100` | `version_gte "$INSTALLED" "0.127.0"` | no |
+| `scripts/package_release.py:649` | unconditional | n/a |
+
+"Two-sided" means the low side does not merely skip the check, it asserts the
+**opposite**: `companion_required = 0` makes `fleet update` verify the companion
+is ABSENT (`command.rs:359-360`, `auth_support.rs:454`, `auth_cmd.rs:298`), and
+`release_macos_local.py:508` raises *"rollback left a newer provider binary
+installed"*.
+
+The consequence is that fixing only the Rust gate is worse than useless: the
+installer writes the companion and `fleet update` then asserts it must not
+exist, failing on every host. Arming `FIRST_TAG_WITHOUT_COMPANION` therefore has
+to land in one commit with the changes that stop building, packaging, and
+installing the companion.
+
+Within the Rust side there is exactly one producer: all six non-test consumers,
+including the journal's `0/1` field and the recovery/republish path, funnel
+through `tag_requires_companion` (`fleet_update_cmd.rs:684`, `command.rs:53/73/93`,
+`evidence.rs:1864`), so a half-fix stranding a resumed update is not possible
+there.

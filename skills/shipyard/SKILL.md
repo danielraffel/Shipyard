@@ -3016,3 +3016,33 @@ whether a digest covers the serialized bytes:
 The digest domain string is usually selected by `schema_version`, so reusing a
 version number after changing a shape makes one domain name two shapes. Retire
 the number.
+
+### Deleting a line can orphan the attribute above it
+
+A large removal broke the Windows build in a way that is invisible on macOS and
+Linux. In `merge_steward_cmd.rs` the source read:
+
+```rust
+#[cfg(unix)]
+pub(crate) use handoff::verify_native_repository_identity;   // removed
+pub(crate) use handoff::{ StewardHandoffArgs, steward_handoff_command, … };
+```
+
+Deleting the middle line left `#[cfg(unix)]` attached to the **next** item, so
+three symbols that `ship_cmd` and `runner_cmd` use on every platform silently
+became unix-only. On unix the gate is true, so every local check, clippy run and
+test pass stayed green. Windows failed to compile, and cascaded into a pile of
+unrelated-looking `cannot find type` errors in the consuming module.
+
+When removing an item, delete its attributes with it, and grep the diff for
+surviving `#[cfg(...)]` lines whose following item changed. The specific shape
+worth sweeping for after any removal is a platform-gated **re-export** consumed
+by ungated code:
+
+```sh
+grep -rn -A1 '#\[cfg(unix)\]\|#\[cfg(windows)\]' src/ | grep 'pub(crate) use\|pub use'
+```
+
+Cross-compiling to check is not always available here: `cargo check --target
+x86_64-pc-windows-msvc` fails on `libsqlite3-sys`, which needs a Windows C
+toolchain. So the grep, plus the Windows CI leg, is the real defence.
