@@ -31,7 +31,8 @@ use crate::executor::local::{LocalTargetConfig, LocalValidationConfig};
 use crate::executor::ssh::{SshTargetConfig, SshValidation};
 use crate::executor::ssh_windows::{WindowsTargetConfig, WindowsValidation};
 use crate::job::{Priority, ValidationMode};
-#[cfg(any(unix, test))]
+#[cfg(feature = "experimental-authority-v5")]
+use crate::record_identity::is_valid_repository_slug;
 use crate::ship::{RunExecutionRequest, ShipExecutionRequest};
 use crate::ship_state::ShipState;
 use crate::warm_pool::{is_backend_eligible, warm_host_key};

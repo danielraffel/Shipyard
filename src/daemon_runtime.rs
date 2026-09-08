@@ -27,7 +27,6 @@ use serde_json::Value;
 #[cfg(unix)]
 use chrono::Utc;
 
-#[cfg(unix)]
 use crate::config::LoadedConfig;
 use crate::daemon_ipc::read_daemon_status;
 #[cfg(unix)]
