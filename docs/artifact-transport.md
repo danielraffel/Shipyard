@@ -234,15 +234,9 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 Do not substitute ad-hoc `ssh`, `rsync`, claimed avoided bytes, or
 model-generated monitoring for the protected adapter.
 
-Terminal success or actionable failure may later be offered to the separate
-transactional wake-delivery subsystem using the immutable correlation and
-receipt digests. This command does not type into cmux/HerdR, guess a target by
-label, or implement a chat bus. Cross-machine wake custody requires its own
-source outbox, destination atomically persisted inbox, exact target
-incarnation/delivery fence, single CAS/lease owner, acknowledgements,
-expiry/revalidation, successor/rebind proof, duplicate suppression, and
-restart/offline-rejoin canaries. A busy or nonempty composer is never an
-authorized delivery target.
+Terminal success or actionable failure is recorded with immutable correlation
+and receipt digests, and nothing more. This command does not notify an agent,
+type into cmux/HerdR, guess a target by label, or implement a chat bus.
 
 Rotate transfer logs with Shipyard's bounded log-retention primitives. Keep the
 terminal receipt and compact metrics longer than verbose transport logs; retain

@@ -60,7 +60,6 @@ fn job(executable_sha256: Sha256Digest) -> ApprovedCanaryJob {
             on_success: true,
             on_actionable_failure: true,
         },
-        native_continuation: None,
         logs: CanaryLogPolicy {
             segment_bytes: 1024,
             max_segments: 2,

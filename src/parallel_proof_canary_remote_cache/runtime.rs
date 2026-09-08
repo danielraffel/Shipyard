@@ -45,6 +45,74 @@ fn handle_remote_m1_cache_request(
     })
 }
 
+/// Verify that this process is the exact companion executable authorized by
+/// the controller before serving an auxiliary read-only protocol.
+#[cfg(unix)]
+fn verify_current_companion_digest(expected_digest: &Sha256Digest) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    use sha2::{Digest, Sha256};
+
+    const MAX_COMPANION_BYTES: u64 = 128 * 1024 * 1024;
+
+    let current =
+        std::env::current_exe().map_err(|_| "companion-identity-unavailable".to_owned())?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(current)
+        .map_err(|_| "companion-open-refused".to_owned())?;
+    let before = file
+        .metadata()
+        .map_err(|_| "companion-metadata-refused".to_owned())?;
+    if !before.is_file()
+        || before.uid() != nix::unistd::Uid::effective().as_raw()
+        || before.nlink() != 1
+        || before.len() == 0
+        || before.len() > MAX_COMPANION_BYTES
+        || before.mode() & 0o111 == 0
+        || before.mode() & 0o022 != 0
+    {
+        return Err("companion-metadata-refused".to_owned());
+    }
+    let mut hasher = Sha256::new();
+    let copied = std::io::copy(&mut file, &mut HashWriter(&mut hasher))
+        .map_err(|_| "companion-read-refused".to_owned())?;
+    let after = file
+        .metadata()
+        .map_err(|_| "companion-metadata-refused".to_owned())?;
+    if copied != before.len()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || hex::encode(hasher.finalize()) != expected_digest.as_str()
+    {
+        return Err("companion-digest-refused".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_current_companion_digest(_expected_digest: &Sha256Digest) -> Result<(), String> {
+    Err("companion-digest-verification-unavailable".to_owned())
+}
+
+#[cfg(unix)]
+struct HashWriter<'a>(&'a mut sha2::Sha256);
+
+#[cfg(unix)]
+impl Write for HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        sha2::Digest::update(self.0, bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn validate_transport_stats(
     output: &RemoteM1CacheTransportOutput,
     request_sha256: &Sha256Digest,

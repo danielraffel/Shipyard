@@ -1,6 +1,5 @@
 use super::*;
 use crate::app::merge_steward_cmd::TerminalProvenanceKind;
-use crate::app::merge_steward_cmd::handoff::ProviderRouteReferenceV1;
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -26,24 +25,11 @@ fn handoff(
         owner_provider: provider.map(str::to_owned),
         resume_transport: transport.map(str::to_owned),
         owner_terminal_provenance: cmux_surface_id.map(|_| TerminalProvenanceKind::Cmux),
-        provider_route: None,
         wake_consumer_available: false,
         failure_contexts: vec!["windows@app=9".to_owned()],
         phase: TerminalHandoffPhase::Recorded,
         created_at: "2026-08-27T00:00:00Z".to_owned(),
         updated_at: "2026-08-27T00:00:00Z".to_owned(),
-    }
-}
-
-fn subrouter_route(generation: u64) -> ProviderRouteReferenceV1 {
-    ProviderRouteReferenceV1 {
-        profile_digest: "a".repeat(64),
-        integrity_hash: "b".repeat(64),
-        generation,
-        revision: 2,
-        provider: "subrouter".to_owned(),
-        account: Some("account-a".to_owned()),
-        model: Some("gpt-5.6-sol".to_owned()),
     }
 }
 
@@ -97,51 +83,14 @@ fn herdr_terminal_does_not_replace_native_agent_transport() {
 }
 
 #[test]
-fn launch_profile_route_is_preserved_beside_native_agent_transport() {
-    let mut terminal = handoff(Some("codex"), Some("codex_queue"), Some("surface-7"));
-    terminal.provider_route = Some(subrouter_route(4));
-    let record = record_for(&terminal).expect("routed record");
-
-    assert!(matches!(
-        record.agent_adapter,
-        Some(AgentAdapterV1::Native { ref provider, .. }) if provider == "codex"
-    ));
-    assert!(matches!(
-        record.provider_adapter,
-        Some(ProviderAdapterV1::LaunchProfile {
-            ref profile_digest,
-            generation: 4,
-            revision: 2,
-            ref provider,
-            ref account,
-            ref model,
-            ..
-        }) if profile_digest == &"a".repeat(64)
-            && provider == "subrouter"
-            && account.as_deref() == Some("account-a")
-            && model.as_deref() == Some("gpt-5.6-sol")
-    ));
-    assert!(!record.dispatch_enabled);
-}
-
-#[test]
-fn fresh_checkpoint_preserves_launch_profile_provider_route() {
+fn fresh_agent_only_route_is_a_fresh_checkpoint_without_adapters() {
     let mut terminal = handoff(None, None, None);
     terminal.owner_disposition = "fresh_agent_only".to_owned();
     terminal.owner_route_id = None;
-    terminal.provider_route = Some(subrouter_route(4));
     let record = record_for(&terminal).expect("fresh checkpoint record");
 
     assert_eq!(record.terminal_adapter, None);
     assert_eq!(record.agent_adapter, None);
-    assert!(matches!(
-        record.provider_adapter,
-        Some(ProviderAdapterV1::LaunchProfile {
-            ref provider,
-            generation: 4,
-            ..
-        }) if provider == "subrouter"
-    ));
     assert_eq!(
         record.routing_disposition,
         ResumeRoutingDisposition::FreshCheckpointRequired
@@ -164,7 +113,6 @@ fn cmux_terminal_route_can_exist_without_native_agent_transport() {
         }) if route_id == "route-exact"
     ));
     assert_eq!(record.agent_adapter, None);
-    assert_eq!(record.provider_adapter, None);
     assert_eq!(
         record.routing_disposition,
         ResumeRoutingDisposition::OriginalOwner
@@ -184,7 +132,6 @@ fn missing_route_stays_recorded_and_unroutable() {
     );
     assert_eq!(record.terminal_adapter, None);
     assert_eq!(record.agent_adapter, None);
-    assert_eq!(record.provider_adapter, None);
     assert!(!record.dispatch_enabled);
 }
 

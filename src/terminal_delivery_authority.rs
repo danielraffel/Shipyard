@@ -2,35 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Exact machine-local endpoint on which a terminal adapter may perform a
-/// bounded operation. This deliberately excludes requested workspace, tab,
-/// surface, and session labels: those identify occupants, not the authenticated
-/// terminal service endpoint.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "adapter", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum TerminalMutationEndpoint {
-    Cmux {
-        executable_path: String,
-        socket_path: String,
-    },
-}
-
-impl TerminalCapabilityRequest {
-    pub(crate) fn mutation_endpoint(&self) -> Option<TerminalMutationEndpoint> {
-        match self {
-            Self::Cmux {
-                cli_path,
-                socket_path,
-                ..
-            } => Some(TerminalMutationEndpoint::Cmux {
-                executable_path: cli_path.clone(),
-                socket_path: socket_path.clone(),
-            }),
-            Self::HerdR { .. } => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LocalProcessIncarnation {
@@ -59,14 +30,6 @@ pub(crate) enum TerminalCapabilityRequest {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct VerifiedTerminalEvidence {
-    pub(crate) terminal_instance: String,
-    pub(crate) workspace_id: String,
-    pub(crate) native_session_id: String,
-    pub(crate) process: LocalProcessIncarnation,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -76,6 +39,13 @@ pub(crate) struct VerifiedTerminalEvidence {
     )
 )]
 pub(crate) enum TerminalCapabilityRefusal {
+    #[cfg_attr(
+        target_os = "macos",
+        expect(
+            dead_code,
+            reason = "the only constructor is the non-macOS capture stub; macOS captures cmux evidence natively"
+        )
+    )]
     Unsupported,
     Unobservable,
     MethodMissing,
@@ -95,11 +65,6 @@ pub(crate) trait TerminalEvidenceAdapter {
         native_session_id: &str,
         provider_kind: &str,
     ) -> Result<TerminalCapabilityRequest, TerminalCapabilityRefusal>;
-
-    fn verify_once(
-        &mut self,
-        request: &TerminalCapabilityRequest,
-    ) -> Result<VerifiedTerminalEvidence, TerminalCapabilityRefusal>;
 }
 
 pub(crate) struct ProductionTerminalEvidenceAdapter;
@@ -120,31 +85,6 @@ impl TerminalEvidenceAdapter for ProductionTerminalEvidenceAdapter {
             native_session_id,
             provider_kind,
         )
-    }
-
-    fn verify_once(
-        &mut self,
-        request: &TerminalCapabilityRequest,
-    ) -> Result<VerifiedTerminalEvidence, TerminalCapabilityRefusal> {
-        match request {
-            TerminalCapabilityRequest::Cmux {
-                cli_path,
-                socket_path,
-                surface_id,
-                native_session_id,
-                provider_kind,
-                process,
-                ..
-            } => verify_cmux(
-                cli_path,
-                socket_path,
-                surface_id,
-                native_session_id,
-                provider_kind,
-                process,
-            ),
-            TerminalCapabilityRequest::HerdR { .. } => Err(TerminalCapabilityRefusal::Unsupported),
-        }
     }
 }
 
@@ -210,56 +150,6 @@ fn capture_cmux(
     _: &str,
     _: &str,
 ) -> Result<TerminalCapabilityRequest, TerminalCapabilityRefusal> {
-    Err(TerminalCapabilityRefusal::Unsupported)
-}
-
-#[cfg(target_os = "macos")]
-fn verify_cmux(
-    cli_path: &str,
-    socket_path: &str,
-    surface_id: &str,
-    native_session_id: &str,
-    provider_kind: &str,
-    process: &LocalProcessIncarnation,
-) -> Result<VerifiedTerminalEvidence, TerminalCapabilityRefusal> {
-    validate_cmux_inputs(
-        cli_path,
-        socket_path,
-        surface_id,
-        native_session_id,
-        provider_kind,
-    )?;
-    require_same_process(process)?;
-    let target = resolve_pid(cli_path, socket_path, process.pid)?;
-    if target.surface_id != surface_id {
-        return Err(TerminalCapabilityRefusal::NoMatch);
-    }
-    require_native_session(
-        cli_path,
-        socket_path,
-        surface_id,
-        native_session_id,
-        provider_kind,
-    )?;
-    require_unique_native_session(cli_path, socket_path, native_session_id)?;
-    require_same_process(process)?;
-    Ok(VerifiedTerminalEvidence {
-        terminal_instance: target.surface_id,
-        workspace_id: target.workspace_id,
-        native_session_id: native_session_id.to_owned(),
-        process: process.clone(),
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn verify_cmux(
-    _: &str,
-    _: &str,
-    _: &str,
-    _: &str,
-    _: &str,
-    _: &LocalProcessIncarnation,
-) -> Result<VerifiedTerminalEvidence, TerminalCapabilityRefusal> {
     Err(TerminalCapabilityRefusal::Unsupported)
 }
 
@@ -681,31 +571,6 @@ fn is_uuid(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    struct FakeAdapter {
-        capture: Result<TerminalCapabilityRequest, TerminalCapabilityRefusal>,
-        verify: Result<VerifiedTerminalEvidence, TerminalCapabilityRefusal>,
-    }
-
-    impl TerminalEvidenceAdapter for FakeAdapter {
-        fn capture_cmux(
-            &mut self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<TerminalCapabilityRequest, TerminalCapabilityRefusal> {
-            self.capture.clone()
-        }
-
-        fn verify_once(
-            &mut self,
-            _: &TerminalCapabilityRequest,
-        ) -> Result<VerifiedTerminalEvidence, TerminalCapabilityRefusal> {
-            self.verify.clone()
-        }
-    }
-
     fn request() -> TerminalCapabilityRequest {
         TerminalCapabilityRequest::Cmux {
             cli_path: "/test/cmux".into(),
@@ -723,43 +588,24 @@ mod tests {
     }
 
     #[test]
-    fn herdr_is_an_explicit_but_refused_capability() {
-        let mut adapter = ProductionTerminalEvidenceAdapter;
-        assert_eq!(
-            adapter.verify_once(&TerminalCapabilityRequest::HerdR {
-                selector: "named".into(),
-                terminal_id: Some("terminal".into()),
-                native_session_id: "native".into(),
-                provider_kind: "codex".into(),
-            }),
-            Err(TerminalCapabilityRefusal::Unsupported)
-        );
-    }
-
-    #[test]
-    fn workspace_rename_does_not_replace_surface_identity() {
-        let evidence = VerifiedTerminalEvidence {
-            terminal_instance: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
-            workspace_id: "cccccccc-cccc-cccc-cccc-cccccccccccc".into(),
-            native_session_id: "native".into(),
-            process: LocalProcessIncarnation {
-                boot_id: "boot".into(),
-                pid: 42,
-                start_identity: "start".into(),
-            },
-        };
-        assert_eq!(
-            evidence.terminal_instance,
-            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-        );
-        assert_ne!(
-            evidence.workspace_id,
-            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-        );
-    }
-
-    #[test]
     fn zero_multiple_and_pid_reuse_refusals_are_not_promoted_to_evidence() {
+        struct FakeAdapter {
+            capture: Result<TerminalCapabilityRequest, TerminalCapabilityRefusal>,
+        }
+
+        impl TerminalEvidenceAdapter for FakeAdapter {
+            fn capture_cmux(
+                &mut self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<TerminalCapabilityRequest, TerminalCapabilityRefusal> {
+                self.capture.clone()
+            }
+        }
+
         for refusal in [
             TerminalCapabilityRefusal::NoMatch,
             TerminalCapabilityRefusal::MultipleMatches,
@@ -767,26 +613,9 @@ mod tests {
         ] {
             let mut adapter = FakeAdapter {
                 capture: Err(refusal),
-                verify: Err(refusal),
             };
             assert_eq!(adapter.capture_cmux("", "", "", "", "codex"), Err(refusal));
-            assert_eq!(adapter.verify_once(&request()), Err(refusal));
         }
-    }
-
-    #[test]
-    fn cmux_request_can_never_cross_promote_to_herdr() {
-        let mut adapter = ProductionTerminalEvidenceAdapter;
-        let herdr = TerminalCapabilityRequest::HerdR {
-            selector: "named".into(),
-            terminal_id: None,
-            native_session_id: "native".into(),
-            provider_kind: "codex".into(),
-        };
-        assert_eq!(
-            adapter.verify_once(&herdr),
-            Err(TerminalCapabilityRefusal::Unsupported)
-        );
         assert!(matches!(request(), TerminalCapabilityRequest::Cmux { .. }));
     }
 

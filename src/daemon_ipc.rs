@@ -20,9 +20,6 @@ use std::thread;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use crate::actionable_wake_producer::ActionableWakeProducerStatus;
-use crate::workstream_continuation_runtime::ContinuationRuntimeStatus;
 use serde_json::Value;
 #[cfg(unix)]
 use serde_json::json;
@@ -128,11 +125,6 @@ pub struct IpcState {
     pub capabilities: Vec<String>,
     /// Rate-limit snapshot if known.
     pub rate_limit: Option<Value>,
-    /// Redacted durable-continuation lane state.
-    pub workstream_continuation: ContinuationRuntimeStatus,
-    /// Redacted durable status of the exact-head actionable wake producer.
-    #[cfg(unix)]
-    pub(crate) actionable_wake_producer: ActionableWakeProducerStatus,
     /// Last recoverable daemon warning/error, if any. Doubles as the
     /// menu-bar app's pause-reason channel: an auth-degraded pause is encoded
     /// here via [`github_auth_degraded_message`].
@@ -723,6 +715,26 @@ fn write_json_line(stream: &mut UnixStream, value: &Value) -> Result<(), std::io
     stream.flush()
 }
 
+/// Constant value published for the removed durable-continuation lane. The key
+/// stays in the status frame so existing consumers keep parsing the schema.
+#[cfg(unix)]
+fn removed_lane_status() -> Value {
+    json!({ "state": "disabled", "reason_code": "feature_removed" })
+}
+
+/// Constant value published for the removed actionable wake producer. The key
+/// stays in the status frame so existing consumers keep parsing the schema.
+#[cfg(unix)]
+fn removed_actionable_wake_producer_status() -> Value {
+    json!({
+        "state": "disabled",
+        "reason_code": "feature_removed",
+        "wake_enqueued": false,
+        "model_calls": 0,
+        "repositories": {},
+    })
+}
+
 #[cfg(unix)]
 fn status_frame(state: &IpcState) -> Value {
     json!({
@@ -738,8 +750,8 @@ fn status_frame(state: &IpcState) -> Value {
         "configured_repos": state.configured_repos,
         "capabilities": state.capabilities,
         "rate_limit": state.rate_limit,
-        "workstream_continuation": state.workstream_continuation,
-        "actionable_wake_producer": state.actionable_wake_producer,
+        "workstream_continuation": removed_lane_status(),
+        "actionable_wake_producer": removed_actionable_wake_producer_status(),
         "last_error": state.last_error,
         "shipyard_version": env!("CARGO_PKG_VERSION"),
         "protocol": IPC_PROTOCOL_VERSION,
@@ -917,31 +929,21 @@ mod tests {
             configured_repos: vec!["org/repo".to_owned(), "org/pending".to_owned()],
             capabilities: Vec::new(),
             rate_limit: None,
-            workstream_continuation:
-                crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
-            actionable_wake_producer:
-                crate::actionable_wake_producer::ActionableWakeProducerStatus::default(),
             last_error: None,
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn status_frame_exposes_only_redacted_continuation_state() {
-        let mut state = dummy_state();
-        state.workstream_continuation =
-            crate::workstream_continuation_runtime::ContinuationRuntimeStatus {
-                state: crate::workstream_continuation_runtime::ContinuationRuntimeState::Refused,
-                reason_code: Some("activation_drift".to_owned()),
-            };
-        let frame = super::status_frame(&state);
-        assert_eq!(frame["workstream_continuation"]["state"], "refused");
+    fn status_frame_keeps_removed_lane_keys_as_constants() {
+        let frame = super::status_frame(&dummy_state());
+        assert_eq!(frame["workstream_continuation"]["state"], "disabled");
         assert_eq!(
             frame["workstream_continuation"]["reason_code"],
-            "activation_drift"
+            "feature_removed"
         );
-        let encoded = frame.to_string();
-        assert!(!encoded.contains("wake-") && !encoded.contains("route-"));
+        assert_eq!(frame["actionable_wake_producer"]["state"], "disabled");
+        assert_eq!(frame["actionable_wake_producer"]["wake_enqueued"], false);
     }
 
     #[cfg(unix)]

@@ -32,12 +32,6 @@ pub(crate) fn is_exact_lower_hex_sha1(value: &str) -> bool {
     is_lower_hex_of_length(value, 40)
 }
 
-/// Whether `value` is an exact lowercase SHA-1 or SHA-256 object identity.
-#[cfg(any(unix, test))]
-pub(crate) fn is_exact_lower_hex_git_sha(value: &str) -> bool {
-    matches!(value.len(), 40 | 64) && is_lower_hex(value)
-}
-
 fn is_lower_hex_of_length(value: &str, length: usize) -> bool {
     value.len() == length && is_lower_hex(value)
 }
@@ -77,11 +71,9 @@ mod tests {
     #[test]
     fn exact_sha_helpers_reject_case_and_length_ambiguity() {
         assert!(is_exact_lower_hex_sha1(&"a".repeat(40)));
-        assert!(is_exact_lower_hex_git_sha(&"b".repeat(40)));
-        assert!(is_exact_lower_hex_git_sha(&"c".repeat(64)));
         assert!(!is_exact_lower_hex_sha1(&"a".repeat(64)));
-        assert!(!is_exact_lower_hex_git_sha(&"A".repeat(40)));
-        assert!(!is_exact_lower_hex_git_sha(&"g".repeat(40)));
-        assert!(!is_exact_lower_hex_git_sha(&"a".repeat(39)));
+        assert!(!is_exact_lower_hex_sha1(&"A".repeat(40)));
+        assert!(!is_exact_lower_hex_sha1(&"g".repeat(40)));
+        assert!(!is_exact_lower_hex_sha1(&"a".repeat(39)));
     }
 }

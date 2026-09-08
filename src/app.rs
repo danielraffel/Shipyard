@@ -25,7 +25,6 @@ mod cloud_cmd;
 mod cloud_read_cmd;
 mod command_evidence_cmd;
 mod config_cmd;
-mod custody_cmd;
 mod daemon_cmd;
 mod dependency_cmd;
 mod doctor_cmd;
@@ -38,115 +37,6 @@ mod init_cmd;
 mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
-#[cfg(unix)]
-pub(crate) use merge_steward_cmd::{DispatchWedgeTargetRequest, DispatchWedgeTargetResult};
-#[cfg(unix)]
-pub(crate) use merge_steward_cmd::{ExactStewardTransition, exact_steward_transition};
-pub(crate) use merge_steward_cmd::{LaunchProfileV1, decode_protected_launch_profile};
-
-#[cfg(unix)]
-pub(crate) struct DaemonStewardRequest<'a> {
-    pub(crate) repository_provider: &'a str,
-    pub(crate) repository_id: &'a str,
-    pub(crate) repository: &'a str,
-    pub(crate) base_ref: &'a str,
-    pub(crate) pull_request: u64,
-    pub(crate) head_sha: &'a str,
-}
-
-#[cfg(unix)]
-pub(crate) struct DaemonStewardCycleResult {
-    pub(crate) dispatch_observations:
-        Result<Vec<crate::dispatch_wedge::DispatchWedgeObservation>, String>,
-}
-
-#[cfg(unix)]
-pub(crate) fn daemon_steward_repository(
-    mode: crate::identity::RuntimeMode,
-    runtime_paths: &crate::paths::RuntimePaths,
-    cwd: &std::path::Path,
-    request: &DaemonStewardRequest<'_>,
-) -> Result<DaemonStewardCycleResult, String> {
-    let actions = crate::cloud::GitHubActions::from_cwd(mode, cwd)
-        .with_repo_override(request.repository)
-        .with_absolute_deadline(std::time::Instant::now() + std::time::Duration::from_secs(60));
-    merge_steward_cmd::verify_native_repository_identity(
-        &actions,
-        request.repository_provider,
-        request.repository_id,
-        request.repository,
-    )?;
-    let args = merge_steward_cmd::StewardCommandArgs {
-        repos: vec![request.repository.to_owned()],
-        base: request.base_ref.to_owned(),
-        opt_out_label: "shipyard:no-auto-merge".to_owned(),
-        provenance_blocking_labels: vec!["5·unresolved".to_owned()],
-        managed_label: "shipyard:managed".to_owned(),
-        handoff_context: "Shipyard managed work".to_owned(),
-        max_transient_reruns: 1,
-        recover_hosted_setup_eviction_priority: false,
-        coalesce: true,
-        preempt_capacity: false,
-        max_preemptions_per_head: 1,
-        apply: true,
-        ledger: None,
-    };
-    let mut sink = Vec::new();
-    let code = merge_steward_cmd::steward_command(
-        &args,
-        cwd,
-        mode,
-        runtime_paths,
-        &actions,
-        true,
-        &mut sink,
-    )
-    .map_err(|error| error.message)?;
-    if code != std::process::ExitCode::SUCCESS {
-        return Err("daemon exact steward cycle was unhealthy".to_owned());
-    }
-    Ok(DaemonStewardCycleResult {
-        dispatch_observations: merge_steward_cmd::observe_dispatch_wedge_target(
-            &actions,
-            request.repository,
-            request.base_ref,
-            request.pull_request,
-            request.head_sha,
-        ),
-    })
-}
-
-#[cfg(unix)]
-pub(crate) fn daemon_dispatch_wedge_observations(
-    mode: crate::identity::RuntimeMode,
-    cwd: &std::path::Path,
-    repository_provider: &str,
-    repository_id: &str,
-    repository: &str,
-    targets: &[merge_steward_cmd::DispatchWedgeTargetRequest],
-) -> Result<Vec<merge_steward_cmd::DispatchWedgeTargetResult>, String> {
-    let actions = daemon_dispatch_probe_actions(mode, cwd, repository);
-    merge_steward_cmd::verify_native_repository_identity(
-        &actions,
-        repository_provider,
-        repository_id,
-        repository,
-    )?;
-    Ok(merge_steward_cmd::observe_dispatch_wedge_targets(
-        &actions, repository, targets,
-    ))
-}
-
-#[cfg(unix)]
-fn daemon_dispatch_probe_actions(
-    mode: crate::identity::RuntimeMode,
-    cwd: &std::path::Path,
-    repository: &str,
-) -> crate::cloud::GitHubActions {
-    crate::cloud::GitHubActions::from_cwd(mode, cwd)
-        .with_repo_override(repository)
-        .with_absolute_deadline(std::time::Instant::now() + std::time::Duration::from_secs(60))
-}
 mod metrics_cmd;
 mod parallel_proof_canary_cmd;
 mod paths_cmd;
@@ -172,7 +62,6 @@ mod update_cmd;
 mod wait_cmd;
 mod watch_cmd;
 mod watch_local_cmd;
-mod work_ledger_cmd;
 
 use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
@@ -193,7 +82,6 @@ use self::cli::{
 use self::cloud_cmd::cloud_command;
 use self::command_evidence_cmd::{run_command_evidence, show_command_evidence};
 use self::config_cmd::config_command;
-use self::custody_cmd::custody_command;
 use self::daemon_cmd::daemon_command;
 use self::dependency_cmd::dependency_command;
 use self::doctor_cmd::doctor;
@@ -229,7 +117,6 @@ use self::update_cmd::update_command;
 use self::wait_cmd::wait_command;
 use self::watch_cmd::{WatchCommandContext, WatchCommandOptions, watch};
 use self::watch_local_cmd::watch_local_command;
-use self::work_ledger_cmd::work_ledger_command;
 
 #[derive(Debug)]
 pub(super) struct CliFailure {
@@ -338,11 +225,6 @@ fn dispatch_with_cwd_provider<W: Write, E: Write, C>(
 where
     C: FnOnce() -> std::io::Result<PathBuf>,
 {
-    if let Command::ProviderSentinelSupervisor = &cli.command {
-        return crate::provider_wrapper::run_provider_sentinel_supervisor_command()
-            .map(|()| ExitCode::SUCCESS)
-            .map_err(|error| CliFailure::new(1, error));
-    }
     let runtime_paths = RuntimePaths::current_with_overrides(
         cli.mode.into(),
         cli.global_dir.clone(),
@@ -353,8 +235,7 @@ where
     // volume's cwd was temporarily unavailable.
     let cwd = if matches!(
         &cli.command,
-        Command::ProviderSentinelSupervisor
-            | Command::Daemon { .. }
+        Command::Daemon { .. }
             | Command::WriterDomainExec { .. }
             | Command::SandboxAuditExec { .. }
             | Command::QueueHold { .. }
@@ -367,9 +248,6 @@ where
     };
 
     match cli.command {
-        Command::ProviderSentinelSupervisor => {
-            unreachable!("handled before path resolution")
-        }
         Command::WriterDomainExec { path, command } => {
             let status = crate::writer_domain_lease::run_guarded_child(&path, &command).map_err(
                 |error| {
@@ -471,16 +349,6 @@ where
                 cli.mode.into(),
                 &cwd,
                 &runtime_paths.global_dir,
-                cli.json,
-                stdout,
-            );
-        }
-        Command::Custody { command } => {
-            return custody_command(
-                command,
-                cli.mode.into(),
-                &runtime_paths.global_dir,
-                &runtime_paths.state_dir,
                 cli.json,
                 stdout,
             );
@@ -659,9 +527,6 @@ where
                 stdout,
             );
         }
-        Command::WorkLedger { command } => {
-            return work_ledger_command(&command, &runtime_paths, &cwd, cli.json, stdout);
-        }
         Command::Wait { command } => {
             return handle_wait_command(
                 command,
@@ -732,8 +597,7 @@ fn handle_operational_variant<W: Write>(
         Command::Runner { command } => {
             handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
         }
-        Command::ProviderSentinelSupervisor
-        | Command::WriterDomainExec { .. }
+        Command::WriterDomainExec { .. }
         | Command::SandboxAuditExec { .. }
         | Command::Paths
         | Command::ExecutionWorker { .. }
@@ -744,7 +608,6 @@ fn handle_operational_variant<W: Write>(
         | Command::Ci { .. }
         | Command::Metrics { .. }
         | Command::Auth { .. }
-        | Command::Custody { .. }
         | Command::Init { .. }
         | Command::Changelog { .. }
         | Command::Branch { .. }
@@ -762,7 +625,6 @@ fn handle_operational_variant<W: Write>(
         | Command::ChangedSurfacePlan { .. }
         | Command::ChangedSurfaceTrialStatus { .. }
         | Command::ParallelProofCanary { .. }
-        | Command::WorkLedger { .. }
         | Command::Cleanup { .. }
         | Command::Targets { .. }
         | Command::Quarantine { .. }
@@ -1076,9 +938,6 @@ fn handle_pr_variant<W: Write>(
         adopt_head,
         workstream_id,
         context_url,
-        launch_profile,
-        after_handoff,
-        task_graph,
         no_steward_handoff,
     } = command
     else {
@@ -1100,9 +959,6 @@ fn handle_pr_variant<W: Write>(
             adopt_head,
             workstream_id,
             context_url,
-            launch_profile,
-            after_handoff,
-            task_graph,
             steward_handoff_preference: if no_steward_handoff {
                 StewardHandoffPreference::Disabled
             } else {
@@ -4747,17 +4603,5 @@ mod tests {
             Some("danielraffel/Shipyard".to_owned())
         );
         assert_eq!(parse_github_repo_slug("file:///tmp/repo"), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn daemon_dispatch_probe_constructor_always_has_deadline() {
-        let temp = tempfile::tempdir().expect("temp");
-        let actions = crate::app::daemon_dispatch_probe_actions(
-            crate::identity::RuntimeMode::Shipyard,
-            temp.path(),
-            "owner/repo",
-        );
-        assert!(actions.has_absolute_deadline_for_tests());
     }
 }

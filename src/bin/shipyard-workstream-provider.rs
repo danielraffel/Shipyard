@@ -1,4 +1,10 @@
-//! Protected stdio entrypoint for Shipyard's cmux workstream provider.
+//! Release-paired Shipyard companion executable.
+//!
+//! The verified installer, `shipyard fleet update`, and the project CLI hook
+//! all require this executable to sit beside `shipyard` in the same directory
+//! at the same version, so it reports its own version and serves the bounded
+//! read-only remote cache observation endpoint the parallel-proof canary
+//! invokes over its authenticated carrier.
 
 fn main() -> std::process::ExitCode {
     let mut arguments = std::env::args_os();
@@ -18,13 +24,6 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
-        (None, None) => match shipyard::workstream_provider_adapter::run_stdio() {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("shipyard-workstream-provider: {error}");
-                std::process::ExitCode::from(2)
-            }
-        },
         _ => {
             eprintln!("shipyard-workstream-provider: unsupported arguments");
             std::process::ExitCode::from(2)

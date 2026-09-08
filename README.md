@@ -46,9 +46,9 @@ Shipyard coordinates these systems; it does not replace GitHub or your build
 system.
 
 All three layers are available now when their executors are configured. Durable
-continuation within the coordination layer is deliberately opt-in and
-policy-gated: it records a specific handoff and refuses when the record, route,
-or current code no longer agrees. It is not a promise that an unconfigured
+stewardship within the coordination layer is deliberately opt-in and
+policy-gated: it records a specific handoff and refuses when the record or the
+current head no longer agrees. It is not a promise that an unconfigured
 project will automatically recover or merge every PR.
 
 ## Common uses
@@ -58,14 +58,13 @@ project will automatically recover or merge every PR.
 - Submit a change and, when stewardship is enabled, let Shipyard watch the
   required tests and merge progress until the work finishes or needs help.
 - Keep long-running work understandable across terminal and daemon restarts
-  without reconstructing its local state from scratch. Moving custody to
-  another machine is a separate, explicit, authenticated setup.
+  without reconstructing its local state from scratch.
 - Use the `ghapp` wrapper for scoped GitHub App authentication without putting
   short-lived credentials into unattended command lines.
 - Keep terminal delivery and model-provider routing separate. `cmux` is the
-  physically implemented terminal adapter today. HerdR endpoint shapes and
-  Subrouter provider routes are registered, but HerdR delivery remains
-  fail-closed until its own live capability checks pass. See [terminal and
+  physically implemented terminal adapter today; HerdR has a registered request
+  shape but every capability check refuses, and a recorded provider route is
+  never treated as proof a provider accepted anything. See [terminal and
   provider adapters](docs/terminal-adapters.md).
 
 ## Highlights
@@ -86,16 +85,13 @@ project will automatically recover or merge every PR.
 - **Parallel-work-aware queue.** Multiple worktrees and clients share one
   machine-global queue with priorities, FIFO scheduling, and
   automatic deduplication.
-- **Durable stewardship and continuation.** An exact PR/head handoff can be
-  persisted in the machine-global work ledger so the trusted daemon, rather
-  than a client polling loop, owns bounded monitoring and continuation across
-  process restarts. Activation is explicit and default-off; every transition
-  is generation-fenced and revalidates the protected route before dispatch.
-- **Optional cross-machine custody.** A separately configured, authenticated
-  transport can hand an accepted work item between trusted machines while
-  preserving its exact identity and restart-safe receipt. It is disabled by
-  default and does not infer custody from a hostname, terminal label, or shared
-  folder. See [durable custody transport](docs/durable-custody-transport.md).
+- **Durable stewardship handoff.** `shipyard runner steward-handoff` records an
+  exact PR/head handoff on GitHub itself: a successful
+  `shipyard/steward-handoff` commit status on that immutable head, the
+  `shipyard:managed` label, and a private crash-consistent JSON receipt beside
+  it. Only heads carrying both management signals may be queued, rerun,
+  cancelled, or recovery-signalled, and the receipt is revalidated against the
+  live PR head before any steward mutation.
 - **Declarative security & governance.** One TOML line picks a profile
   (`solo` or `multi`); one CLI command makes GitHub branch protection,
   tag protection, and workflow token permissions match.
@@ -269,11 +265,9 @@ passed for the exact change.
   managing the queue, partial reruns.
 - [Resuming an interrupted ship](docs/ship-resume.md) — how `shipyard ship`
   recovers across closed laptops and restarted sessions.
-- [Launch profiles](docs/launch-profile.md) — protected, generation-bound
-  resume and fresh-agent metadata for default-off daemon continuation.
 - [Terminal and provider adapters](docs/terminal-adapters.md) — why terminal
   transport is separate from provider routing, including the current cmux
-  boundary and fail-closed, physically unproven HerdR delivery status.
+  boundary and the fail-closed HerdR adapter.
 - [Release automation](RELEASING.md) — `shipyard release-bot setup`,
   `doctor --release-chain`, and the PAT + secret setup for the auto-
   release tag → binaries chain.
@@ -365,19 +359,15 @@ version you're on at any moment: `shipyard --version`.
 ### Do I need to run `shipyard daemon` / enable live mode?
 
 Not for foreground CI. Without the daemon, `shipyard run`, `ship`, `watch`,
-`auto-merge`, and the macOS app retain their polling fallback. The daemon is
-required only when you explicitly enable trusted, subscriber-independent
-workstream continuation: that path owns durable monitoring and generation-
-fenced wake delivery after the submitting terminal or agent disappears.
+`auto-merge`, and the macOS app retain their polling fallback. The daemon adds
+push-instant webhook delivery, ship-state reconciliation, and the orphan sweep;
+it does not take over a foreground command's validation loop.
 
 ### Does it hurt if I don't enable live mode?
 
 Foreground commands still reach the same evidence verdicts; updates arrive on
 a poll cadence (60 s worst case) rather than push-instant. Webhooks aren't
 registered and no Tailscale Funnel is created unless the daemon is running.
-Default-off unattended workstream continuation is different: without its
-trusted daemon consumer, no process owns a durable wake after the subscriber
-exits.
 
 ### I pushed to a repo without running `shipyard ship`. Will it appear in the macOS app?
 
@@ -393,9 +383,8 @@ If live mode is on, the daemon will deliver webhook events for those pushes too,
 - **From the macOS app**: Settings → Live updates → **Off**. The app sends a stop command to the daemon, which unregisters webhooks and resets the Tailscale Funnel config. Nothing persists after that.
 - **From the CLI**: `shipyard daemon stop` does the same teardown.
 
-Stopping the daemon also stops subscriber-independent workstream wake delivery.
-The durable ledger remains on disk, but no new wake is delivered until an
-authorized daemon consumer is enabled again.
+Stopping the daemon returns every command to its polling fallback. Ship-state
+and evidence stay on disk; nothing is discarded by stopping it.
 
 ### How do I remove everything shipyard installed?
 

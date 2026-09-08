@@ -18,7 +18,7 @@ use crate::parallel_proof_canary_driver::ArtifactDeliveryObservation;
 use crate::parallel_proof_canary_driver::DistributedExecutionObservation;
 use crate::parallel_proof_canary_receipt::ArtifactDeliveryMode;
 
-const CURRENT_JOB_SCHEMA_VERSION: u32 = 2;
+const CURRENT_JOB_SCHEMA_VERSION: u32 = 3;
 const LEGACY_JOB_SCHEMA_VERSION: u32 = 1;
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;

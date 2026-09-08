@@ -249,11 +249,6 @@ fn foreground_json_uses_the_final_post_validation_state() {
         context_url: Some("https://linear.example/GEN-43".to_owned()),
         head: "a".repeat(40),
         monitoring_transferred: true,
-        agent_disposition: "continue".to_owned(),
-        pause_required: false,
-        publication_work_id: Some("wi_exact".to_owned()),
-        publication_route_ref: Some("route_exact".to_owned()),
-        publication_wake_id: Some("wake_exact".to_owned()),
     };
     output.clear();
     render_json(&mut output, 7751, &outcome, &state, &[], Some(&transfer))
@@ -262,10 +257,6 @@ fn foreground_json_uses_the_final_post_validation_state() {
     assert_eq!(
         value.pointer("/steward_handoff/monitoring_transferred"),
         Some(&Value::Bool(true))
-    );
-    assert_eq!(
-        value.pointer("/steward_handoff/publication_wake_id"),
-        Some(&Value::String("wake_exact".to_owned()))
     );
 }
 

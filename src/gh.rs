@@ -849,26 +849,6 @@ fn parse_json_helper_stdout(
     Ok(token)
 }
 
-impl GhClient {
-    pub(crate) fn app_installation_id(&self, cwd: &Path) -> Result<u64, GhPrepareError> {
-        // Installation access tokens are opaque and GitHub exposes no
-        // token-authenticated endpoint that returns their installation ID.
-        // The machine-global command helper is therefore the trusted mint
-        // boundary: it resolves the repository installation with an App JWT,
-        // mints that installation's token, and returns both in one response.
-        // Callers separately use the token to re-read the exact repository/PR.
-        let token = self
-            .resolve_token_with_timeout(cwd, Some(Duration::from_secs(15)))?
-            .ok_or(GhPrepareError::HelperStdoutMalformed)?;
-        if token.kind.as_deref() != Some("github-app-installation") {
-            return Err(GhPrepareError::HelperStdoutMalformed);
-        }
-        token
-            .installation_id
-            .ok_or(GhPrepareError::HelperStdoutMalformed)
-    }
-}
-
 fn inferred_token_kind(token: &str) -> Option<String> {
     // GitHub installation access tokens use the documented `ghs_` prefix.
     // Recording the sanitized kind lets security-sensitive callers require

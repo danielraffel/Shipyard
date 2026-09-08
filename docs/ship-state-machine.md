@@ -219,7 +219,7 @@ real ship-state write from overlapping that audit.
 | `shipyard ship` schema-v3 selected execution | Protected-base build/test policy plus trusted machine-global activation | Replaces `build` and `test` atomically. `--resume-from test` first authenticates every eligible target read-only, then hard-refuses any schema-v3 transaction before activation persistence or substitution because it could skip producer builds and test stale warm artifacts. If all plans are schema v2 or ineligible, Shipyard preserves the original stages, performs no second observation or activation, and resumes the ordinary test stage. Restart schema v3 from `build` or start fresh. A missing canonical build stage follows the full-preserving fallback. |
 | `shipyard ship` stale-base shadow comparison | Exact PR head SHA; old and live protected bases; complete base delta; conflict-free synthesized integration commit/tree; trusted machine-global `shadow_compare` policy | Keeps stale base as the authoritative full-suite disposition. A bounded shadow assessment may materialize a content-addressed integration checkout and run selected-versus-full there. Activation, result, checkout custody, cleanup intent, and restart recovery remain exact-identity fenced. Any ambiguity preserves ordinary full validation; the shadow receipt is always blocked from merge authority and cannot mutate the PR, queue, or runner. |
 | `shipyard pr` metadata-only authority | Trusted machine-global `[metadata_authority]` repository policy; exact protected base/head/tree/merge base and complete changed-path closure; configured hosted checks terminal green at the exact head | Replaces native targets with an immutable metadata receipt, so the scheduler allocates no local worker, VM, configure, build, or test capacity. The daemon reloads trusted policy and rechecks the local head/tree plus live GitHub head/check state before accepting the zero-target job. Unknown paths, incomplete observations, stale or duplicate checks, SHA drift, malformed policy, or missing provenance preserve ordinary full validation at submission or refuse stale execution. Tracked project and checkout-local config cannot activate or widen this authority. |
-| `shipyard pr` with provenance and/or steward handoff | Project `[pr.provenance]` argv plus the submitting process environment; protected `origin/<base>:.shipyard/config.toml`, or explicit `--workstream-id` / `--context-url` / private `--launch-profile` | After the exact PR and head are resolved, runs the configured provenance hook before any durable receipt or validation dispatch. A required hook failure exits with no steward status/label or queued validation. On success, the handoff first persists private crash-consistent intent, writes `shipyard/steward-handoff`, revalidates the open PR and exact head, adds `shipyard:managed`, and advances the private receipt to ready/managed. With an exact launch profile and enabled trusted consumer it then publishes a zero-wake canonical ledger obligation and only afterward reports `monitoring_transferred=true`; provider delivery cannot decide disposition. `continue` is the default, while `pause` requires a digest-bound durable task graph proving no independent runnable work. Public status exposes only an opaque route id. Replay is idempotent. Explicit `shipyard ship --pr` recovery does not rerun submitter provenance. |
+| `shipyard pr` with provenance and/or steward handoff | Project `[pr.provenance]` argv plus the submitting process environment; protected `origin/<base>:.shipyard/config.toml`, or explicit `--workstream-id` / `--context-url` | After the exact PR and head are resolved, runs the configured provenance hook before any durable receipt or validation dispatch. A required hook failure exits with no steward status/label or queued validation. On success, the handoff first persists private crash-consistent intent, writes `shipyard/steward-handoff`, revalidates the open PR and exact head, adds `shipyard:managed`, and advances the private receipt to ready/managed. Public status exposes only an opaque route id. Replay is idempotent. Explicit `shipyard ship --pr` recovery does not rerun submitter provenance. |
 | `shipyard ship` (fresh)     | `ShipStateStore.get_scoped(repo, pr)` (auto-resume decision; returns None) | Saves fresh state BEFORE preflight (cli.py:2675). Calls `_update_ship_state_from_job` once after `_execute_job` ends. `archive_scoped(repo, pr)` on MERGED. |
 | `shipyard ship --no-resume` | Same                                                | `ShipStateStore.archive_and_replace(state)` archives the prior attempt and returns a replacement carrying the incremented attempt counter; the CLI persists that replacement. |
 | `shipyard ship --resume`    | Refuses on SHA/policy drift via `_detect_ship_state_drift` | Refreshes `pr_url` / `pr_title` / `commit_subject` on the existing state and saves (cli.py:2679–2689). |
@@ -259,7 +259,7 @@ authoritative even when an unrelated hosted check has a similar target name.
     queue insertion. *Recovery: first prove the head change is intentional,
     then rerun with explicit `--adopt-head`; never enable automatic adoption.*
   - Configured PR provenance is malformed, cannot start, or exits nonzero while required → `shipyard pr` exits before the steward status/label or queue/validation state is created. The argv is executed directly, exact PR facts are expanded and exported as `SHIPYARD_PR_*`, and the submitting process environment supplies agent/router context. *Recovery: repair provenance and rerun `shipyard pr`; do not use a recovery agent to overwrite submitter attribution.*
-  - Requested steward handoff fails (invalid workstream/context, GitHub write denial, closed PR, exact-head mismatch, conflicting route ownership, or ambiguous provider identity) → `shipyard pr` exits before queue or validation state is created. Private intent is crash-consistent before the first GitHub mutation; status is written before the label and the head is re-read between them, so a concurrent head move can leave only a harmless stale-head status, never a managed label authorized by that stale receipt. Replay paginates status observations and uses the newest matching status to reconcile an uncertain write. Intentional owner replacement requires an explicit transfer with the same immutable work identity. *Recovery: resolve the failure and resubmit the current exact head; do not infer transfer or pause from an existing receipt.*
+  - Requested steward handoff fails (invalid workstream/context, GitHub write denial, closed PR, exact-head mismatch, conflicting route ownership, or ambiguous provider identity) → `shipyard pr` exits before queue or validation state is created. Private intent is crash-consistent before the first GitHub mutation; status is written before the label and the head is re-read between them, so a concurrent head move can leave only a harmless stale-head status, never a managed label authorized by that stale receipt. Replay paginates status observations and uses the newest matching status to reconcile an uncertain write. Intentional owner replacement requires an explicit transfer with the same immutable work identity. *Recovery: resolve the failure and resubmit the current exact head; do not infer a transfer from an existing receipt.*
   - `git push` fails silently → `find_pr_for_branch` may still find an existing PR; the local SHA may not match the remote. A fresh state is saved for a branch whose tip may not be pushed. *Recovery: none automatic — the drift check on the next resume will catch it, but between the stale push and the next resume the state claims a SHA that doesn't exist on the remote.*
   - `gh pr create` fails after the REST fallback also fails → `create_pr` raises `GhError`; `ship` exits without saving state because the save at cli.py:2675 runs only after the PR has been found or created. *Recovery: retry or create the PR through REST and run `shipyard ship --pr <n>` to track it.*
   - `save` fails (disk, permission) → `save` raises; tmp file is cleaned up by the `except` branch in `core/ship_state.py`. *Recovery: resolve disk issue, retry.*
@@ -773,92 +773,6 @@ change native queue state, push commits, sign, publish, or release. Timeout,
 invalid output, policy/config drift, and quota/provider exhaustion terminalize
 as typed failure evidence; valid classifications always terminalize as escalation so
 other repositories and PRs continue through deterministic stewardship.
-
-## Canonical work-ledger shadow (no authority yet)
-
-`shipyard work-ledger import` scans the legacy `ShipState`, queue request and
-outcome, recovery, terminal-handoff, and resume-record lifecycles into one
-selected, redacted projection. The default is a deterministic dry run and does
-not create storage. `--apply` writes the projection idempotently to the
-machine-global `work-ledger/work-items.sqlite3`; it does not edit or delete a
-legacy record, schedule work, dispatch a wake, call a model, mutate GitHub, or
-project to Linear.
-
-Every imported record starts in the closed `shadow_imported` lifecycle state;
-legacy status text is evidence, not native authority. Promotion requires one
-structurally complete continuation contract containing both success and failure
-outcomes. Native transitions use a closed legal graph, fence work and owner
-generations, and insert a deterministic audit event in the same transaction as
-the state change and optional outbox wake.
-
-The schema deliberately keeps logical goal, owner, terminal runtime,
-agent/session adapter, and provider-routing adapter identities separate. PR,
-product-acceptance, and continuation terminal truth are separate columns;
-legacy lifecycle completion is recorded as `unknown` rather than promoted to a
-stronger terminal claim. Terminal, agent, and provider adapter kinds are strings
-so cmux/HerdR, Codex/Claude/agy/Qwen/Kimi, and Subrouter additions do not require
-a lifecycle redesign. Private owner, goal, source, and route values are stored as
-opaque SHA-256 references; raw prompts, terminal text, credentials, tokens,
-provider accounts, and route identifiers are not imported. Native repair routes
-use a separate integrity-bound protected registry. cmux and HerdR terminal
-runtime provenance is independent of Codex/Claude/named agent sessions and
-explicit Direct/Subrouter/CLIProxyAPI provider routing. Every agent/session
-route, including Codex, Claude, Qwen, agy, Kimi, and future named agents, binds
-an independently registered agent-adapter object. Versioned registered terminal
-and provider variants allow future adapters without changing lifecycle truth or
-the database schema. Route registration and wake resolution remain
-nondispatchable unless every referenced adapter record is active and exactly
-matches axis, name, generation, revision, and
-implementation/configuration/capability digests.
-Automatic work-ledger v1-to-v2 migration is limited to route-free ledgers.
-Existing v1 route payloads do not contain the mandatory exact agent-adapter
-binding, so a route-bearing v1 ledger is preserved unchanged and refused until
-its routes receive explicit reconciliation; the migration never invents that
-provenance.
-The registry preserves
-the native resume identity, HerdR session/workspace/tab/pane tuple, account and
-model references, one canonical wrapper reference, protected session-header
-reference plus digest, executable/configuration
-digests, generations, revisions, and exact head. Missing, stale, malformed, or
-integrity-mismatched provenance is nondispatchable and is never treated as
-Direct or silently converted to a fresh-agent route.
-
-The database opens fail-closed with `WAL`, `synchronous=FULL`, foreign keys,
-integrity checking, protected filesystem permissions, and the host-global
-writer-domain fence. Apply upgrades that fence to an exclusive bounded snapshot
-barrier from legacy scan through SQLite commit. Schema versions newer than the binary, malformed legacy
-JSON, symlinked legacy sources, corruption, truncation, and failed writes abort
-the whole operation. The future transition API fences work and owner
-generations and commits a state change, deterministic audit event, and optional
-wake intent in one SQLite transaction. A rejected wake or event therefore rolls
-back the state transition.
-Wake identity is derived from the work ID, transitioned work generation, owner
-generation, protected route reference, and payload digest; callers cannot
-substitute an arbitrary retry identity without failing the transaction.
-Schema v3 adds a durable attempt record for each wake claim; schema v4 adds
-append-only consumer ownership epochs. The inert consumer holds one host-local
-exclusive lease across profile resolution, claim, provider invocation, and
-finalization, so another live consumer cannot masquerade as restart recovery.
-The claim binds the route's protected launch-profile reference and provider
-identity before invoking a provider and finalizes acknowledgement, retry,
-failure, or uncertainty afterward. It passes the exact launch-profile argv
-array without shell translation, reconciles only an explicitly idempotent
-claimed delivery after restart once the previous consumer lease is gone, and
-never retries an ambiguous non-idempotent delivery. Successful acknowledgement
-and transition to agent-owned repair are one transaction. This contract remains
-inaccessible to the CLI and daemon.
-`activation_enabled=false` and `dispatch_enabled=false` are invariant CLI
-outputs until later scheduler, adapter, and physical canary gates land.
-The adjacent `work-ledger policy` surface stores per-repository primary-platform
-and compatibility-blocking policy behind an exact revision fence. It requires
-every repository's primary platform explicitly (Pulp, Forge, and
-Vellum use macOS), defaults to independent compatibility lanes, and records the
-complete compatibility-lane inventory and the subset with declared artifact
-dependencies. Unknown lanes fail closed. Other cross-lane
-blocking requires evidenced shared-integrity fault. The read-only shadow
-observer consumes policy only for explicit repository enrollment and attaches
-the exact revision to evidence; policy cannot activate, dispatch, or make a
-blocking decision in this phase.
 
 ## External dependency matrix
 
