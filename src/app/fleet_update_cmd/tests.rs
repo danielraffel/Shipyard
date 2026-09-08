@@ -1153,6 +1153,39 @@ fn exact_release_tag_is_required() {
 }
 
 #[test]
+fn companion_pairing_applies_to_a_bounded_tag_range() {
+    const REMOVED_AT: [u64; 3] = [0, 200, 0];
+    let bounded =
+        |tag: &str| companion_required_for_tag(tag, MIN_PAIRED_BINARY_TARGET, Some(REMOVED_AT));
+
+    // Below the pairing floor the companion was never published.
+    assert!(!bounded("v0.126.2"));
+    // Inside the paired range those releases really do ship a companion, so it
+    // must still be present, mode-checked, and digest-matched.
+    assert!(bounded("v0.127.0"));
+    assert!(bounded("v0.199.0"));
+    assert!(bounded("v0.199.7"));
+    // At or above the removal tag the companion was never published either, so
+    // requiring it would verify a file the release cannot contain.
+    assert!(!bounded("v0.200.0"));
+    assert!(!bounded("v0.201.3"));
+    assert!(!bounded("v1.0.0"));
+    // An open upper bound keeps every paired target paired.
+    assert!(companion_required_for_tag(
+        "v0.200.0",
+        MIN_PAIRED_BINARY_TARGET,
+        None
+    ));
+
+    // Tripwire: the shipped gate is still open-ended because releases continue
+    // to publish the companion. Arming `FIRST_TAG_WITHOUT_COMPANION` reddens
+    // these two, and must land with the packaging and installer changes that
+    // actually stop publishing it.
+    assert!(tag_requires_companion("v0.199.0"));
+    assert!(tag_requires_companion("v0.200.0"));
+}
+
+#[test]
 fn fleet_plan_refuses_pre_atomic_generation_targets_before_rendering() {
     let class = host(Some("m5-lan"), Some("/Users/ci/.local/bin/shipyard"));
     for target in ["v0.130.0", "v0.131.0", "v0.132.0", "v0.136.0"] {

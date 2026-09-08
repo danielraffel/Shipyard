@@ -172,9 +172,6 @@ esac"#,
     let request = ShipStewardHandoff {
         workstream_id: None,
         context_url: None,
-        launch_profile: None,
-        after_handoff: "continue".to_owned(),
-        task_graph: None,
     };
     let pr = ResolvedPrContext {
         number: 42,
@@ -199,9 +196,6 @@ esac"#,
 
     assert_eq!(receipt.workstream_id, "danielraffel/pulp#42");
     assert!(!receipt.monitoring_transferred);
-    assert!(receipt.publication_work_id.is_none());
-    assert!(receipt.publication_route_ref.is_none());
-    assert!(receipt.publication_wake_id.is_none());
     assert_eq!(
         receipt.context_url.as_deref(),
         Some(pr.pr_url.as_deref().unwrap())

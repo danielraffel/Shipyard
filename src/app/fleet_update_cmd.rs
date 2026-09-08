@@ -48,6 +48,17 @@ const HOST_UPDATE_TIMEOUT: Duration = Duration::from_mins(10);
 const REMOTE_UPDATE_TIMEOUT: Duration = Duration::from_mins(9);
 const MIN_FLEET_UPDATE_TARGET: [u64; 3] = [0, 137, 0];
 const MIN_PAIRED_BINARY_TARGET: [u64; 3] = [0, 127, 0];
+/// First target tag whose release publishes no companion binary.
+///
+/// `None` means every release from `MIN_PAIRED_BINARY_TARGET` onward still
+/// publishes the paired companion, which is the current release shape.
+///
+/// The companion gate is two-sided: below this bound the companion must be
+/// present, owned by the invoking user, mode 700, and digest-matched, while at
+/// or above it the companion must be *absent*. Arming this therefore has to
+/// land in the same change that stops building, packaging, and installing the
+/// companion, or every host verifies an absence the installer just wrote.
+const FIRST_TAG_WITHOUT_COMPANION: Option<[u64; 3]> = None;
 const MIN_AUTH_RESOLVER_TARGET: [u64; 3] = [0, 131, 0];
 const COMPANION_BINARY_NAME: &str = "shipyard-workstream-provider";
 const REMOTE_BEFORE_PRIMARY_SHA256_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_PRIMARY_SHA256=";
@@ -380,7 +391,16 @@ fn normalize_exact_tag(raw: &str) -> Result<String, CliFailure> {
 }
 
 fn tag_requires_companion(tag: &str) -> bool {
-    tag_at_least(tag, MIN_PAIRED_BINARY_TARGET)
+    companion_required_for_tag(tag, MIN_PAIRED_BINARY_TARGET, FIRST_TAG_WITHOUT_COMPANION)
+}
+
+/// Companion pairing covers the half-open tag range `[minimum, removed_at)`.
+///
+/// A target below `minimum` predates paired releases and a target at or above
+/// `removed_at` postdates them; both are unpaired, and the callers treat an
+/// unpaired target as one whose companion must be absent.
+fn companion_required_for_tag(tag: &str, minimum: [u64; 3], removed_at: Option<[u64; 3]>) -> bool {
+    tag_at_least(tag, minimum) && !removed_at.is_some_and(|bound| tag_at_least(tag, bound))
 }
 
 fn tag_supports_auth_resolver(tag: &str) -> bool {

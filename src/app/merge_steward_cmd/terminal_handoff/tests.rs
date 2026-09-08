@@ -1,9 +1,8 @@
 use super::*;
 use crate::app::merge_steward_cmd::TerminalProvenanceKind;
-use crate::app::merge_steward_cmd::handoff::ProviderRouteReferenceV1;
 use crate::app::merge_steward_cmd::ledger::load_ledger;
 use crate::app::merge_steward_cmd::resume_record::{
-    AgentAdapterV1, ProviderAdapterV1, ResumeRecordPhase, TerminalAdapterV1,
+    AgentAdapterV1, ResumeRecordPhase, TerminalAdapterV1,
 };
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -18,19 +17,6 @@ fn owner(route: &str) -> TerminalOwnerRoute {
         provider: Some("codex".to_owned()),
         resume_transport: Some("codex_queue".to_owned()),
         terminal_provenance: Some(TerminalProvenanceKind::Absent),
-        provider_route: None,
-    }
-}
-
-fn subrouter_provider_route(generation: u64) -> ProviderRouteReferenceV1 {
-    ProviderRouteReferenceV1 {
-        profile_digest: "a".repeat(64),
-        integrity_hash: "b".repeat(64),
-        generation,
-        revision: 2,
-        provider: "subrouter".to_owned(),
-        account: Some("account-a".to_owned()),
-        model: Some("gpt-5.6-sol".to_owned()),
     }
 }
 
@@ -44,7 +30,6 @@ fn fresh_agent_owner() -> TerminalOwnerRoute {
         provider: None,
         resume_transport: None,
         terminal_provenance: None,
-        provider_route: None,
     }
 }
 
@@ -261,78 +246,6 @@ fn legacy_absent_provenance_enriches_to_cmux_without_weakening_route_fences() {
 }
 
 #[test]
-fn legacy_handoff_accepts_only_fenced_provider_route_enrichment() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let path = temp.path().join("merge-steward.json");
-    let mut ledger = StewardLedger::default();
-    persist_actionable_failure(
-        &path,
-        &mut ledger,
-        "owner/repo",
-        "main",
-        7,
-        HEAD,
-        Some(owner("route-a")),
-        vec!["windows@app=9".to_owned()],
-    )
-    .expect("legacy handoff");
-
-    let mut mismatched = owner("route-a");
-    mismatched.provider_route = Some(subrouter_provider_route(2));
-    persist_actionable_failure(
-        &path,
-        &mut ledger,
-        "owner/repo",
-        "main",
-        7,
-        HEAD,
-        Some(mismatched),
-        vec!["windows@app=9".to_owned()],
-    )
-    .expect_err("provider generation cannot exceed the unchanged owner generation");
-    assert!(
-        ledger
-            .terminal_handoffs
-            .values()
-            .all(|handoff| handoff.provider_route.is_none())
-    );
-
-    let mut enriched = owner("route-a");
-    enriched.provider_route = Some(subrouter_provider_route(1));
-    persist_actionable_failure(
-        &path,
-        &mut ledger,
-        "owner/repo",
-        "main",
-        7,
-        HEAD,
-        Some(enriched),
-        vec!["windows@app=9".to_owned()],
-    )
-    .expect("validated provider route enriches the legacy handoff");
-    let restarted = load_ledger(&path).expect("restart enriched ledger");
-    assert!(
-        restarted
-            .terminal_handoffs
-            .values()
-            .all(|handoff| handoff.provider_route.is_some())
-    );
-    assert!(matches!(
-        restarted
-            .resume_records
-            .values()
-            .next()
-            .expect("resume")
-            .provider_adapter,
-        Some(ProviderAdapterV1::LaunchProfile {
-            ref provider,
-            generation: 1,
-            ..
-        }) if provider == "subrouter"
-    ));
-}
-
-#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "the monotonic route lifecycle is clearer as one ordered scenario"
@@ -436,8 +349,7 @@ fn route_resolution_and_owner_transfer_are_monotonic() {
     )
     .expect("validated route resolves unroutable snapshot");
 
-    let mut trusted = owner("trusted-route");
-    trusted.provider_route = Some(subrouter_provider_route(1));
+    let trusted = owner("trusted-route");
     persist_actionable_failure(
         &path,
         &mut ledger,
@@ -477,23 +389,17 @@ fn route_resolution_and_owner_transfer_are_monotonic() {
         "unroutable_private_route"
     );
     assert_eq!(degraded_record.owner_route_id, None);
-    assert_eq!(
-        degraded_record.provider_route,
-        Some(subrouter_provider_route(1))
-    );
+    assert_eq!(degraded_record.owner_provider, None);
+    assert_eq!(degraded_record.resume_transport, None);
     let degraded_resume = ledger
         .resume_records
         .values()
         .find(|record| record.pr_number == 9)
         .expect("degraded resume record");
-    assert!(matches!(
-        degraded_resume.provider_adapter,
-        Some(ProviderAdapterV1::LaunchProfile {
-            ref provider,
-            generation: 1,
-            ..
-        }) if provider == "subrouter"
-    ));
+    assert_eq!(
+        degraded_resume.routing_disposition,
+        crate::app::merge_steward_cmd::resume_record::ResumeRoutingDisposition::UnroutablePrivateRoute
+    );
 }
 
 #[test]
@@ -777,7 +683,6 @@ fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
     let mut ledger = StewardLedger::default();
     let mut herdr_owner = owner("herdr-route");
     herdr_owner.terminal_provenance = Some(TerminalProvenanceKind::HerdR);
-    herdr_owner.provider_route = Some(subrouter_provider_route(1));
     persist_actionable_failure(
         &path,
         &mut ledger,
@@ -818,16 +723,6 @@ fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
             ref transport,
             ref route_id,
         }) if provider == "codex" && transport == "codex_queue" && route_id == "herdr-route"
-    ));
-    assert!(matches!(
-        resume.provider_adapter,
-        Some(ProviderAdapterV1::LaunchProfile {
-            ref profile_digest,
-            generation: 1,
-            revision: 2,
-            ref provider,
-            ..
-        }) if profile_digest == &"a".repeat(64) && provider == "subrouter"
     ));
     assert!(!resume.dispatch_enabled);
 }
@@ -957,7 +852,6 @@ fn retention_discards_only_applied_records_and_fails_closed_on_pending_capacity(
                 owner_provider: None,
                 resume_transport: None,
                 owner_terminal_provenance: None,
-                provider_route: None,
                 wake_consumer_available: false,
                 failure_contexts: Vec::new(),
                 phase: TerminalHandoffPhase::Pending,

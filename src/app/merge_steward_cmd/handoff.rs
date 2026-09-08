@@ -1,7 +1,3 @@
-use super::launch_profile::{
-    LaunchProfileV1, launch_profile_digest, launch_profile_integrity_hash, load_launch_profile,
-    validate_launch_profile,
-};
 use super::{
     CliFailure, GitHubActions, HANDOFF_CONTEXT, MANAGED_LABEL, Path, TerminalProvenanceKind,
     UNMANAGED_LABEL, Value, Write, gh_json, is_full_sha, observation::encode_path_segment,
@@ -14,24 +10,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
-#[cfg(not(test))]
-use crate::config::LoadedConfig;
 use crate::paths::RuntimePaths;
 use crate::queue::replace_file_with_windows_retry;
 use crate::terminal_delivery_authority::{
     ProductionTerminalEvidenceAdapter, TerminalCapabilityRequest, TerminalEvidenceAdapter,
 };
-use crate::work_ledger::{
-    FreshAgentLaunchProfile, NativePublicationReport, NativePublicationRequest, WorkLedger,
-};
-use crate::workstream_activation_loader::{
-    ReadyWorkstreamActivation, WorkstreamActivationLoader, WorkstreamActivationState,
-};
-
-mod disposition;
-use disposition::{AgentDisposition, StoredDispositionProofV1, load_pause_proof};
 
 #[derive(Clone)]
 pub(crate) struct StewardHandoffArgs {
@@ -44,10 +29,6 @@ pub(crate) struct StewardHandoffArgs {
     pub(crate) agent_session_id: Option<String>,
     pub(crate) agent_parent_session_id: Option<String>,
     pub(crate) agent_surface_id: Option<String>,
-    pub(crate) launch_profile: Option<std::path::PathBuf>,
-    pub(crate) task_graph: Option<std::path::PathBuf>,
-    pub(crate) goal_managed: bool,
-    pub(crate) after_handoff: String,
     pub(crate) transfer_agent_owner: bool,
     pub(crate) apply: bool,
 }
@@ -91,10 +72,6 @@ struct AgentResumeContext {
     terminal_provenance: TerminalProvenance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_authority: Option<TerminalCapabilityRequest>,
-    goal_managed: bool,
-    goal_lifecycle: GoalLifecycle,
-    goal_status: GoalStatus,
-    goal_status_provenance: GoalStatusProvenance,
     resume_transport: String,
 }
 
@@ -104,10 +81,6 @@ struct AgentRouteReference {
     owner_id: String,
     provider: String,
     origin_machine: String,
-    goal_managed: bool,
-    goal_lifecycle: GoalLifecycle,
-    goal_status: GoalStatus,
-    goal_status_provenance: GoalStatusProvenance,
     resume_transport: String,
     #[serde(default)]
     terminal_provenance: TerminalProvenanceKind,
@@ -123,21 +96,6 @@ struct StoredAgentRoute {
     revision: u64,
     created_at: String,
     updated_at: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct StoredLaunchProfileV1 {
-    generation: u64,
-    revision: u64,
-    profile_digest: String,
-    integrity_hash: String,
-    profile: LaunchProfileV1,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct LaunchProfileCandidateV1 {
-    profile_digest: String,
-    profile: LaunchProfileV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -190,35 +148,6 @@ impl TerminalProvenance {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum GoalLifecycle {
-    Unmanaged,
-    Managed,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum GoalStatus {
-    Unmanaged,
-    Unknown,
-    Active,
-    Paused,
-    Blocked,
-    Complete,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum GoalStatusProvenance {
-    // cmux lifecycle is intentionally not goal lifecycle. Until an exact
-    // session's latest structured update_goal event is captured by a future
-    // authority reader, downstream automation must treat goal status as
-    // unknown rather than infer it from a running terminal/session.
-    NotObserved,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct DurableStewardHandoff {
     schema_version: u32,
@@ -235,55 +164,15 @@ struct DurableStewardHandoff {
     repair_route: RepairRoute,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_route: Option<AgentRouteReference>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    launch_profile: Option<StoredLaunchProfileV1>,
-    goal_lifecycle: GoalLifecycle,
-    goal_status: GoalStatus,
-    goal_status_provenance: GoalStatusProvenance,
     phase: HandoffPhase,
-    #[serde(default)]
-    requested_agent_disposition: AgentDisposition,
-    #[serde(default)]
-    agent_disposition: AgentDisposition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    disposition_proof: Option<StoredDispositionProofV1>,
-    #[serde(default)]
-    pause_required: bool,
     wake_consumer_available: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    native_publication: Option<NativePublicationReceiptV1>,
     created_at: String,
     updated_at: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct NativePublicationReceiptV1 {
-    schema_version: u32,
-    state: NativePublicationStateV1,
-    work_id: String,
-    route_ref: String,
-    wake_id: String,
-    profile_digest: String,
-    #[serde(default)]
-    repo_policy_revision: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum NativePublicationStateV1 {
-    Pending,
-    Accepted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StewardHandoffTransferReport {
     pub(crate) wake_consumer_available: bool,
-    pub(crate) agent_disposition: String,
-    pub(crate) pause_required: bool,
-    pub(crate) publication_work_id: Option<String>,
-    pub(crate) publication_route_ref: Option<String>,
-    pub(crate) publication_wake_id: Option<String>,
 }
 
 pub(crate) fn steward_handoff_command<W: Write>(
@@ -294,10 +183,10 @@ pub(crate) fn steward_handoff_command<W: Write>(
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    // A plain `shipyard pr` handoff carries no launch profile and no explicit
-    // agent route, so it must not be bound to one merely because the shell it
-    // ran in exports CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID -- which every
-    // agent shell does. Resolving it against a default environment keeps the
+    // A plain `shipyard pr` handoff carries no explicit agent route, so it must
+    // not be bound to one merely because the shell it ran in exports
+    // CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID -- which every agent shell
+    // does. Resolving it against a default environment keeps the
     // ambient fence for EXPLICIT routes, where it belongs, while letting the
     // legacy fallback through.
     if is_legacy_pr_fallback(args) {
@@ -362,28 +251,6 @@ where
         .ok_or_else(|| CliFailure::new(1, "repository was not resolved"))?;
     verify_exact_open_pr(actions, &repo, args.pr, &args.head)?;
     let agent = resolve_handoff_agent(args, resolve_agent)?;
-    let launch_profile = args
-        .launch_profile
-        .as_deref()
-        .map(load_launch_profile)
-        .transpose()?
-        .map(|profile| prepare_launch_profile_candidate(profile, &repo, &args.head))
-        .transpose()?;
-    let requested_disposition = AgentDisposition::parse(&args.after_handoff)?;
-    let disposition_proof = args
-        .task_graph
-        .as_deref()
-        .map(|path| load_pause_proof(path, &args.workstream_id))
-        .transpose()?;
-    if !args.apply
-        && requested_disposition == AgentDisposition::Pause
-        && disposition_proof.is_none()
-    {
-        return Err(CliFailure::new(
-            1,
-            "--after-handoff pause requires --task-graph for a new or dry-run handoff",
-        ));
-    }
     let origin_machine = if args.apply {
         resolve_origin_machine(runtime_paths)?
     } else {
@@ -392,11 +259,8 @@ where
     let agent_route = agent
         .as_ref()
         .map(|agent| agent_route_reference(agent, &origin_machine));
-    validate_launch_profile_route(launch_profile.as_ref(), agent_route.as_ref())?;
 
     let mut wake_consumer_available = false;
-    let mut agent_disposition = AgentDisposition::Continue;
-    let mut pause_required = false;
     if args.apply {
         let directory = handoff_directory(runtime_paths, &repo, args.pr);
         ensure_private_directory(&directory)?;
@@ -405,14 +269,12 @@ where
         let route_path = agent_route
             .as_ref()
             .map(|route| agent_route_path(runtime_paths, &route.route_id));
-        let mut receipt = prepare_handoff_receipt_with_profile_and_disposition(
+        let mut receipt = prepare_handoff_receipt(
             load_handoff(&path)?,
             args,
             &repo,
             &origin_machine,
             agent_route.clone(),
-            launch_profile,
-            disposition_proof,
         )?;
         let starting_phase = receipt.phase;
         if let (Some(agent), Some(route), Some(route_path)) =
@@ -445,22 +307,7 @@ where
         add_label(actions, &repo, args.pr, MANAGED_LABEL)?;
         verify_exact_open_pr(actions, &repo, args.pr, &args.head)?;
         receipt = persist_handoff(&path, receipt, HandoffPhase::Managed)?;
-        if receipt.launch_profile.is_some() {
-            let ready = ready_workstream_activation(runtime_paths)?;
-            receipt = publish_managed_handoff(
-                runtime_paths,
-                actions,
-                &path,
-                receipt,
-                &repo,
-                args.pr,
-                &args.head.to_ascii_lowercase(),
-                &ready,
-            )?;
-        }
         wake_consumer_available = receipt.wake_consumer_available;
-        agent_disposition = receipt.agent_disposition;
-        pause_required = receipt.pause_required;
         remove_label(actions, &repo, args.pr, UNMANAGED_LABEL)?;
         debug_assert_eq!(receipt.phase, HandoffPhase::Managed);
     }
@@ -472,8 +319,6 @@ where
         &origin_machine,
         json_output,
         wake_consumer_available,
-        agent_disposition,
-        pause_required,
         stdout,
     )?;
     Ok(ExitCode::SUCCESS)
@@ -489,27 +334,12 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
             "--head must be a full 40-character SHA-1",
         ));
     }
-    if crate::work_ledger::validate_workstream_handle(&args.workstream_id).is_err()
-        && !is_legacy_pr_fallback(args)
-    {
-        return Err(CliFailure::new(
-            1,
-            "--workstream-id must be a canonical GEN-style handle",
-        ));
-    }
     if let Some(url) = args.context_url.as_deref()
         && !(url.starts_with("https://") || url.starts_with("http://"))
     {
         return Err(CliFailure::new(
             1,
             "--context-url must use http:// or https://",
-        ));
-    }
-    let disposition = AgentDisposition::parse(&args.after_handoff)?;
-    if disposition == AgentDisposition::Continue && args.task_graph.is_some() {
-        return Err(CliFailure::new(
-            1,
-            "--task-graph is accepted only with --after-handoff pause",
         ));
     }
     if args.transfer_agent_owner
@@ -524,14 +354,10 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
 }
 
 fn is_legacy_pr_fallback(args: &StewardHandoffArgs) -> bool {
-    args.launch_profile.is_none()
-        && !args.goal_managed
-        && args.agent_provider.is_none()
+    args.agent_provider.is_none()
         && args.agent_session_id.is_none()
         && args.agent_parent_session_id.is_none()
         && args.agent_surface_id.is_none()
-        && args.task_graph.is_none()
-        && args.after_handoff == "continue"
         && !args.transfer_agent_owner
         && args.repo.as_deref().is_some_and(|repository| {
             // Canonicalise the SLUG, but keep the id comparison exact.
@@ -539,7 +365,7 @@ fn is_legacy_pr_fallback(args: &StewardHandoffArgs) -> bool {
             // unreachable for any repo whose owner carries a capital, which is
             // most of them. Comparing the id case-insensitively would be too
             // loose in the other direction -- `OWNER/repo#7` must still be
-            // rejected for `owner/repo`, which an existing test pins.
+            // rejected for `owner/repo`.
             let normalized = repository.to_ascii_lowercase();
             normalized.split('/').count() == 2
                 && args.workstream_id == format!("{normalized}#{}", args.pr)
@@ -550,16 +376,7 @@ fn validate_resolved_workstream_identity(
     args: &StewardHandoffArgs,
     agent: Option<&AgentResumeContext>,
 ) -> Result<(), CliFailure> {
-    if crate::work_ledger::validate_workstream_handle(&args.workstream_id).is_ok() {
-        return Ok(());
-    }
-    if !is_legacy_pr_fallback(args) {
-        return Err(CliFailure::new(
-            1,
-            "--workstream-id must be a canonical GEN-style handle",
-        ));
-    }
-    if agent.is_some() {
+    if is_legacy_pr_fallback(args) && agent.is_some() {
         return Err(CliFailure::new(
             1,
             "legacy PR fallback cannot bind an agent route or managed lifecycle",
@@ -585,7 +402,6 @@ struct AgentEnvironment {
     codex_session: Option<String>,
     claude_session: Option<String>,
     surface_id: Option<String>,
-    goal_managed: bool,
     herdr_env: Option<String>,
     herdr_session: Option<String>,
     herdr_workspace_id: Option<String>,
@@ -606,7 +422,6 @@ fn resolve_agent_context(
         surface_id: env::var("CMUX_SURFACE_ID")
             .ok()
             .filter(|value| !value.trim().is_empty()),
-        goal_managed: env::var("SHIPYARD_GOAL_MANAGED").as_deref() == Ok("1"),
         herdr_env: env::var("HERDR_ENV").ok(),
         herdr_session: env::var("HERDR_SESSION").ok(),
         herdr_workspace_id: env::var("HERDR_WORKSPACE_ID").ok(),
@@ -673,13 +488,6 @@ fn resolve_agent_context_with_environment(
     args: &StewardHandoffArgs,
     environment: &AgentEnvironment,
 ) -> Result<Option<AgentResumeContext>, CliFailure> {
-    let goal_managed = args.goal_managed || environment.goal_managed;
-    if args.after_handoff == "pause" && !goal_managed {
-        return Err(CliFailure::new(
-            1,
-            "--after-handoff pause requires --goal-managed",
-        ));
-    }
     let explicit_provider = args.agent_provider.as_deref();
     let explicit_session = args.agent_session_id.as_deref();
     if explicit_provider.is_some() != explicit_session.is_some() {
@@ -714,12 +522,6 @@ fn resolve_agent_context_with_environment(
             return Err(CliFailure::new(
                 1,
                 "agent parent/surface route fields require a resumable agent session",
-            ));
-        }
-        if goal_managed {
-            return Err(CliFailure::new(
-                1,
-                "--goal-managed requires a resumable agent session",
             ));
         }
         return Ok(None);
@@ -759,18 +561,6 @@ fn resolve_agent_context_with_environment(
         surface_provenance,
         terminal_provenance,
         terminal_authority: None,
-        goal_managed,
-        goal_lifecycle: if goal_managed {
-            GoalLifecycle::Managed
-        } else {
-            GoalLifecycle::Unmanaged
-        },
-        goal_status: if goal_managed {
-            GoalStatus::Unknown
-        } else {
-            GoalStatus::Unmanaged
-        },
-        goal_status_provenance: GoalStatusProvenance::NotObserved,
     }))
 }
 
@@ -1020,11 +810,9 @@ fn agent_route_reference(agent: &AgentResumeContext, origin_machine: &str) -> Ag
                     &agent.provider,
                     &agent.session_id,
                     agent.parent_session_id.as_deref().unwrap_or_default(),
-                    if agent.goal_managed {
-                        "goal"
-                    } else {
-                        "session"
-                    },
+                    // Preserved verbatim so existing durable route IDs keep
+                    // hashing to the same value.
+                    "session",
                     &agent.resume_transport,
                     &terminal_binding,
                 ],
@@ -1037,11 +825,9 @@ fn agent_route_reference(agent: &AgentResumeContext, origin_machine: &str) -> Ag
                 &agent.provider,
                 &agent.session_id,
                 agent.parent_session_id.as_deref().unwrap_or_default(),
-                if agent.goal_managed {
-                    "goal"
-                } else {
-                    "session"
-                },
+                // Preserved verbatim so existing durable route IDs keep
+                // hashing to the same value.
+                "session",
                 &agent.resume_transport,
             ],
         ),
@@ -1051,10 +837,6 @@ fn agent_route_reference(agent: &AgentResumeContext, origin_machine: &str) -> Ag
         owner_id,
         provider: agent.provider.clone(),
         origin_machine: origin_machine.to_owned(),
-        goal_managed: agent.goal_managed,
-        goal_lifecycle: agent.goal_lifecycle,
-        goal_status: agent.goal_status,
-        goal_status_provenance: agent.goal_status_provenance,
         resume_transport: agent.resume_transport.clone(),
         terminal_provenance: agent.terminal_provenance.kind(),
     }
@@ -1072,626 +854,6 @@ fn handoff_directory(runtime_paths: &RuntimePaths, repo: &str, pr: u64) -> std::
 fn handoff_path(directory: &Path, head: &str) -> std::path::PathBuf {
     directory.join(format!("{}.json", head.to_ascii_lowercase()))
 }
-
-#[cfg(unix)]
-#[allow(dead_code)] // Explicit manual compatibility path; active stewardship requires v2 identity.
-pub(super) fn migrate_legacy_native_policy_authority(
-    state_dir: &Path,
-    repo: &str,
-    pr: u64,
-    head: &str,
-) -> Result<(), String> {
-    let path = state_dir
-        .join("merge-steward")
-        .join("handoffs")
-        .join(encode_path_segment(&repo.to_ascii_lowercase()))
-        .join(format!("pr-{pr}"))
-        .join(format!("{}.json", head.to_ascii_lowercase()));
-    let mut receipt = load_handoff(&path)
-        .map_err(|error| error.message)?
-        .ok_or_else(|| "legacy native handoff receipt is unavailable".to_owned())?;
-    validate_handoff_receipt_integrity(&receipt, repo, pr, head).map_err(|error| error.message)?;
-    let publication = receipt
-        .native_publication
-        .as_mut()
-        .ok_or_else(|| "legacy native publication receipt is unavailable".to_owned())?;
-    if !receipt.wake_consumer_available
-        || publication.schema_version != 1
-        || publication.state != NativePublicationStateV1::Accepted
-        || publication.repo_policy_revision != 0
-    {
-        return Err("legacy native publication is not accepted migration authority".to_owned());
-    }
-    crate::work_ledger::bind_legacy_native_policy(state_dir, repo, pr, head, &publication.work_id)
-        .map_err(|error| error.to_string())?;
-    let ledger = WorkLedger::open_existing(state_dir)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "native work ledger is unavailable".to_owned())?;
-    let policy = ledger
-        .repo_policy(repo)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "explicit repository policy is unavailable".to_owned())?;
-    publication.schema_version = 2;
-    publication.repo_policy_revision = policy.revision;
-    receipt.schema_version = 4;
-    persist_handoff(&path, receipt, HandoffPhase::Managed).map_err(|error| error.message)?;
-    Ok(())
-}
-
-/// Load and normalize one exact managed handoff into native ledger authority.
-///
-/// This reader performs no mutation. Publication policy is intentionally
-/// applied later, before the ledger can create storage.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn native_publication_request(
-    runtime_paths: &RuntimePaths,
-    actions: &GitHubActions,
-    repo: &str,
-    pr: u64,
-    head: &str,
-) -> Result<NativePublicationRequest, CliFailure> {
-    if repo != repo.to_ascii_lowercase()
-        || repo.trim() != repo
-        || pr == 0
-        || !is_full_sha(head)
-        || head != head.to_ascii_lowercase()
-    {
-        return Err(CliFailure::new(
-            1,
-            "native publication requires canonical repo, PR, and lowercase exact head",
-        ));
-    }
-    let path = handoff_path(&handoff_directory(runtime_paths, repo, pr), head);
-    let trusted_actions = trusted_native_publication_actions(runtime_paths, actions, repo)?;
-    let source_authority = observe_native_source_authority(&trusted_actions, repo, pr, head)?;
-    let ledger = WorkLedger::open_existing(&runtime_paths.state_dir)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?
-        .ok_or_else(|| CliFailure::new(1, "explicit repository policy is unavailable"))?;
-    let repo_policy = ledger
-        .repo_policy(&source_authority.canonical_repository)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?
-        .ok_or_else(|| CliFailure::new(1, "explicit repository policy is unavailable"))?;
-    let receipt = load_handoff(&path)?
-        .ok_or_else(|| CliFailure::new(1, "exact-head durable handoff receipt is unavailable"))?;
-    validate_handoff_receipt_integrity(&receipt, repo, pr, head)?;
-    if receipt.phase != HandoffPhase::Managed {
-        return Err(CliFailure::new(
-            1,
-            "native publication requires a managed durable handoff",
-        ));
-    }
-    let route = receipt.agent_route.as_ref().ok_or_else(|| {
-        CliFailure::new(
-            1,
-            "native publication requires an exact private agent route",
-        )
-    })?;
-    let private_route = load_agent_route(&agent_route_path(runtime_paths, &route.route_id))?
-        .ok_or_else(|| CliFailure::new(1, "managed handoff lost its private agent route"))?;
-    let recomputed_route =
-        agent_route_reference(&private_route.agent, &private_route.origin_machine);
-    if private_route.schema_version != 2
-        || private_route.revision == 0
-        || private_route.route_id != route.route_id
-        || private_route.owner_id != route.owner_id
-        || private_route.origin_machine != receipt.origin_machine
-        || recomputed_route != *route
-    {
-        return Err(CliFailure::new(
-            1,
-            "managed handoff and private agent route identity disagree",
-        ));
-    }
-    let stored = receipt
-        .launch_profile
-        .as_ref()
-        .ok_or_else(|| CliFailure::new(1, "native publication requires an exact launch profile"))?;
-    let profile = &stored.profile;
-    let session = profile.session.as_ref().ok_or_else(|| {
-        CliFailure::new(1, "native publication requires exact session provenance")
-    })?;
-    let bootstrap = profile.continuation_bootstrap.as_ref().ok_or_else(|| {
-        CliFailure::new(
-            1,
-            "native publication requires continuation bootstrap authority",
-        )
-    })?;
-    if !profile.permits_fresh_agent()
-        || route.provider != session.agent_provider
-        || private_route.agent.session_id != session.provider_session_id
-        || receipt.workstream_id != bootstrap.workstream_handle
-        || receipt.context_url != bootstrap.context_url
-    {
-        return Err(CliFailure::new(
-            1,
-            "handoff route, launch profile, and continuation authority disagree",
-        ));
-    }
-    profile.validate_native_fresh_agent_grammar()?;
-    let protected_profile_bytes = profile
-        .protected_profile_bytes()
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let native_resume_bytes = serde_json::to_vec(&profile.resume_argv)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let route_environment_bytes = serde_json::to_vec(&profile.route_environment)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let route_wrapper = profile
-        .resume_argv
-        .first()
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .ok_or_else(|| CliFailure::new(1, "native resume wrapper is missing"))?;
-
-    Ok(NativePublicationRequest {
-        repository_provider: source_authority.repository_provider,
-        repository_id: source_authority.repository_id,
-        legacy_repository_alias: (source_authority.canonical_repository != receipt.repo)
-            .then(|| receipt.repo.to_ascii_lowercase()),
-        repository: source_authority.canonical_repository,
-        pull_request: receipt.pr,
-        head_sha: receipt.head_sha.to_ascii_lowercase(),
-        base_ref: source_authority.base_ref,
-        base_sha: source_authority.base_sha,
-        github_installation_id: source_authority.installation_id,
-        repo_policy_revision: repo_policy.revision,
-        terminal_authority: private_route
-            .agent
-            .terminal_authority
-            .or_else(test_terminal_authority)
-            .ok_or_else(|| {
-                CliFailure::new(1, "native publication requires live terminal authority")
-            })?,
-        workstream_handle: bootstrap.workstream_handle.clone(),
-        plan_sha256: bootstrap.plan_sha256.clone(),
-        root_revision: bootstrap.root_revision,
-        issue_revision: bootstrap.issue_revision,
-        projection_revision: bootstrap.projection_revision,
-        material_event_revision: bootstrap.material_event_revision,
-        context_url: bootstrap.context_url.clone(),
-        origin_machine: receipt.origin_machine.clone(),
-        owner_id: receipt.owner_id.clone(),
-        owner_generation: receipt.ownership_generation,
-        agent_provider: route.provider.clone(),
-        agent_session_id: private_route.agent.session_id,
-        route_account: profile
-            .provider
-            .account
-            .clone()
-            .unwrap_or_else(|| "unselected-account".into()),
-        route_model: profile
-            .provider
-            .model
-            .clone()
-            .unwrap_or_else(|| "unselected-model".into()),
-        route_wrapper,
-        native_resume_digest: hex::encode(Sha256::digest(native_resume_bytes)),
-        route_environment_digest: hex::encode(Sha256::digest(route_environment_bytes)),
-        route_id: route.route_id.clone(),
-        profile_generation: stored.generation,
-        profile_revision: stored.revision,
-        profile_provider: profile.provider.provider.clone(),
-        profile_digest: stored.profile_digest.clone(),
-        protected_profile_bytes,
-        success_continuation_digest: bootstrap.success_continuation_digest.clone(),
-        failure_continuation_digest: bootstrap.failure_continuation_digest.clone(),
-    })
-}
-
-#[cfg(test)]
-#[allow(clippy::unnecessary_wraps)]
-fn trusted_native_publication_actions(
-    _: &RuntimePaths,
-    actions: &GitHubActions,
-    repo: &str,
-) -> Result<GitHubActions, CliFailure> {
-    Ok(actions.clone().with_repo_override(repo))
-}
-
-#[cfg(not(test))]
-fn trusted_native_publication_actions(
-    runtime_paths: &RuntimePaths,
-    _: &GitHubActions,
-    repo: &str,
-) -> Result<GitHubActions, CliFailure> {
-    let config = LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let cwd = std::env::current_dir()
-        .map_err(|error| CliFailure::new(1, format!("resolve native authority cwd: {error}")))?;
-    Ok(GitHubActions::from_loaded_config(cwd, &config).with_repo_override(repo))
-}
-
-#[cfg(test)]
-#[allow(clippy::unnecessary_wraps)]
-fn test_terminal_authority() -> Option<TerminalCapabilityRequest> {
-    Some(TerminalCapabilityRequest::Cmux {
-        cli_path: "/test/cmux".into(),
-        socket_path: "/test/cmux.sock".into(),
-        surface_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
-        workspace_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
-        native_session_id: "provider-session-7".into(),
-        provider_kind: "codex".into(),
-        process: crate::terminal_delivery_authority::LocalProcessIncarnation {
-            boot_id: "test-boot".into(),
-            pid: 42,
-            start_identity: "test-start".into(),
-        },
-    })
-}
-
-#[cfg(not(test))]
-fn test_terminal_authority() -> Option<TerminalCapabilityRequest> {
-    None
-}
-
-struct NativeSourceAuthority {
-    installation_id: u64,
-    repository_provider: String,
-    repository_id: String,
-    canonical_repository: String,
-    base_ref: String,
-    base_sha: String,
-}
-
-/// Exact GitHub evidence for an already-merged native work-ledger row.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TerminalMergeAuthority {
-    pub(crate) installation_id: u64,
-    pub(crate) repository_provider: String,
-    pub(crate) repository_id: String,
-    pub(crate) canonical_repository: String,
-    pub(crate) pull_request_node_id: String,
-    pub(crate) pull_request: u64,
-    pub(crate) head_sha: String,
-    pub(crate) base_ref: String,
-    pub(crate) merge_sha: String,
-    pub(crate) merged_at: String,
-}
-
-/// Exact authority for a PR closed without merging. This is intentionally a
-/// separate type so callers cannot mistake closure evidence for merge proof.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClosedUnmergedAuthority {
-    pub(crate) installation_id: u64,
-    pub(crate) repository_provider: String,
-    pub(crate) repository_id: String,
-    pub(crate) canonical_repository: String,
-    pub(crate) pull_request_node_id: String,
-    pub(crate) pull_request: u64,
-    pub(crate) head_sha: String,
-    pub(crate) base_ref: String,
-    pub(crate) closed_at: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TerminalGitHubAuthority {
-    Merged(TerminalMergeAuthority),
-    ClosedUnmerged(ClosedUnmergedAuthority),
-}
-
-pub(crate) fn closed_unmerged_authority_from_snapshots(
-    installation_id: u64,
-    repo: &str,
-    pr: u64,
-    head: &str,
-    repository: &Value,
-    snapshot: &Value,
-) -> Result<ClosedUnmergedAuthority, CliFailure> {
-    if installation_id == 0 || pr == 0 || !is_full_sha(head) || head != head.to_ascii_lowercase() {
-        return Err(CliFailure::new(1, "terminal merge target is invalid"));
-    }
-    let repository_id = repository
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty() && v.len() <= 512)
-        .ok_or_else(|| {
-            CliFailure::new(1, "terminal reconciliation repository ID is unavailable")
-        })?;
-    let canonical_repository = repository
-        .get("nameWithOwner")
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase)
-        .filter(|v| *v == repo)
-        .ok_or_else(|| {
-            CliFailure::new(
-                1,
-                "terminal reconciliation canonical repository is unavailable or changed",
-            )
-        })?;
-    let observed_head = snapshot
-        .get("headRefOid")
-        .and_then(Value::as_str)
-        .filter(|v| is_full_sha(v));
-    let base_ref = snapshot
-        .get("baseRefName")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty() && v.len() <= 255);
-    let node = snapshot
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty() && v.len() <= 512);
-    let closed_at = snapshot
-        .get("closedAt")
-        .and_then(Value::as_str)
-        .filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok());
-    if snapshot.get("state").and_then(Value::as_str) != Some("CLOSED")
-        || snapshot.get("mergeCommit").is_some_and(|v| !v.is_null())
-        || snapshot.get("mergedAt").is_some_and(|v| !v.is_null())
-        || observed_head != Some(head)
-        || base_ref.is_none()
-        || node.is_none()
-        || closed_at.is_none()
-    {
-        return Err(CliFailure::new(
-            1,
-            "terminal reconciliation closed-unmerged authority is incomplete or changed",
-        ));
-    }
-    Ok(ClosedUnmergedAuthority {
-        installation_id,
-        repository_provider: "github.com".to_owned(),
-        repository_id: repository_id.to_owned(),
-        canonical_repository,
-        pull_request_node_id: node.expect("checked").to_owned(),
-        pull_request: pr,
-        head_sha: head.to_owned(),
-        base_ref: base_ref.expect("checked").to_owned(),
-        closed_at: closed_at.expect("checked").to_owned(),
-    })
-}
-
-/// Observe exact terminal PR authority without conflating a closed PR with a merge.
-pub(crate) fn observe_terminal_github_authority(
-    actions: &GitHubActions,
-    repo: &str,
-    pr: u64,
-    head: &str,
-) -> Result<TerminalGitHubAuthority, CliFailure> {
-    if pr == 0 || !is_full_sha(head) || head != head.to_ascii_lowercase() {
-        return Err(CliFailure::new(
-            1,
-            "terminal reconciliation target is invalid",
-        ));
-    }
-    let installation_id = actions
-        .app_installation_id()
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let repository = gh_json(
-        actions,
-        &[
-            "repo".into(),
-            "view".into(),
-            repo.to_owned(),
-            "--json".into(),
-            "id,nameWithOwner".into(),
-        ],
-        "observe terminal reconciliation repository identity",
-    )
-    .map_err(|error| CliFailure::new(1, error))?;
-    let snapshot = gh_json(
-        actions,
-        &[
-            "pr".into(),
-            "view".into(),
-            pr.to_string(),
-            "--repo".into(),
-            repo.to_owned(),
-            "--json".into(),
-            "id,state,headRefOid,baseRefName,mergeCommit,mergedAt,closedAt".into(),
-        ],
-        "observe terminal reconciliation authority",
-    )
-    .map_err(|error| CliFailure::new(1, error))?;
-    match snapshot.get("state").and_then(Value::as_str) {
-        Some("MERGED") => terminal_merge_authority_from_snapshots(
-            installation_id,
-            repo,
-            pr,
-            head,
-            &repository,
-            &snapshot,
-        )
-        .map(TerminalGitHubAuthority::Merged),
-        Some("CLOSED") => closed_unmerged_authority_from_snapshots(
-            installation_id,
-            repo,
-            pr,
-            head,
-            &repository,
-            &snapshot,
-        )
-        .map(TerminalGitHubAuthority::ClosedUnmerged),
-        _ => Err(CliFailure::new(
-            1,
-            "terminal reconciliation authority is not terminal or changed",
-        )),
-    }
-}
-
-fn terminal_merge_authority_from_snapshots(
-    installation_id: u64,
-    repo: &str,
-    pr: u64,
-    head: &str,
-    repository: &Value,
-    snapshot: &Value,
-) -> Result<TerminalMergeAuthority, CliFailure> {
-    if installation_id == 0 || pr == 0 || !is_full_sha(head) || head != head.to_ascii_lowercase() {
-        return Err(CliFailure::new(1, "terminal merge target is invalid"));
-    }
-    let repository_id = repository
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 512)
-        .ok_or_else(|| {
-            CliFailure::new(1, "terminal reconciliation repository ID is unavailable")
-        })?;
-    let canonical_repository = repository
-        .get("nameWithOwner")
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase)
-        .filter(|value| value == repo)
-        .ok_or_else(|| {
-            CliFailure::new(
-                1,
-                "terminal reconciliation canonical repository is unavailable or changed",
-            )
-        })?;
-    let pull_request_node_id = snapshot
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 512);
-    let observed_head = snapshot
-        .get("headRefOid")
-        .and_then(Value::as_str)
-        .filter(|value| is_full_sha(value));
-    let base_ref = snapshot
-        .get("baseRefName")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 255);
-    let merge_sha = snapshot
-        .get("mergeCommit")
-        .and_then(|value| value.get("oid"))
-        .and_then(Value::as_str)
-        .filter(|value| is_full_sha(value));
-    let merged_at = snapshot
-        .get("mergedAt")
-        .and_then(Value::as_str)
-        .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok());
-    if snapshot.get("state").and_then(Value::as_str) != Some("MERGED")
-        || observed_head != Some(head)
-        || pull_request_node_id.is_none()
-        || base_ref.is_none()
-        || merge_sha.is_none()
-        || merged_at.is_none()
-    {
-        return Err(CliFailure::new(
-            1,
-            "terminal reconciliation merge authority is incomplete or changed",
-        ));
-    }
-    Ok(TerminalMergeAuthority {
-        installation_id,
-        repository_provider: "github.com".to_owned(),
-        repository_id: repository_id.to_owned(),
-        canonical_repository,
-        pull_request_node_id: pull_request_node_id.expect("checked").to_owned(),
-        pull_request: pr,
-        head_sha: head.to_owned(),
-        base_ref: base_ref.expect("checked").to_owned(),
-        merge_sha: merge_sha.expect("checked").to_ascii_lowercase(),
-        merged_at: merged_at.expect("checked").to_owned(),
-    })
-}
-
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn verify_native_repository_identity(
-    actions: &GitHubActions,
-    repository_provider: &str,
-    repository_id: &str,
-    repository: &str,
-) -> Result<(), String> {
-    if repository_provider != "github.com" {
-        return Err("native steward repository provider is unsupported".to_owned());
-    }
-    let observed = gh_json(
-        actions,
-        &[
-            "repo".into(),
-            "view".into(),
-            repository.to_owned(),
-            "--json".into(),
-            "id,nameWithOwner".into(),
-        ],
-        "authenticate native steward repository identity",
-    )?;
-    let observed_id = observed.get("id").and_then(Value::as_str);
-    let observed_repository = observed
-        .get("nameWithOwner")
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase);
-    if observed_id != Some(repository_id) || observed_repository.as_deref() != Some(repository) {
-        return Err("native steward repository identity changed".to_owned());
-    }
-    Ok(())
-}
-
-fn observe_native_source_authority(
-    actions: &GitHubActions,
-    repo: &str,
-    pr: u64,
-    head: &str,
-) -> Result<NativeSourceAuthority, CliFailure> {
-    let installation_id = actions
-        .app_installation_id()
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let repository = gh_json(
-        actions,
-        &[
-            "repo".into(),
-            "view".into(),
-            repo.to_owned(),
-            "--json".into(),
-            "id,nameWithOwner".into(),
-        ],
-        "observe immutable native publication repository identity",
-    )
-    .map_err(|error| CliFailure::new(1, error))?;
-    let repository_id = repository
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 512)
-        .ok_or_else(|| CliFailure::new(1, "native publication repository ID is unavailable"))?;
-    let canonical_coordinate = repository
-        .get("nameWithOwner")
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase);
-    let canonical_repository = canonical_coordinate.ok_or_else(|| {
-        CliFailure::new(1, "native publication canonical repository is unavailable")
-    })?;
-    let snapshot = gh_json(
-        actions,
-        &[
-            "pr".into(),
-            "view".into(),
-            pr.to_string(),
-            "--repo".into(),
-            repo.to_owned(),
-            "--json".into(),
-            "state,headRefOid,baseRefName,baseRefOid".into(),
-        ],
-        "observe exact native publication source",
-    )
-    .map_err(|error| CliFailure::new(1, error))?;
-    let pull_request = &snapshot;
-    let observed_head = pull_request.get("headRefOid").and_then(Value::as_str);
-    let base_ref = pull_request
-        .get("baseRefName")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
-    let base_sha = pull_request
-        .get("baseRefOid")
-        .and_then(Value::as_str)
-        .filter(|value| is_full_sha(value));
-    if pull_request.get("state").and_then(Value::as_str) != Some("OPEN")
-        || observed_head != Some(head)
-        || base_ref.is_none()
-        || base_sha.is_none()
-    {
-        return Err(CliFailure::new(
-            1,
-            "native publication source head/base authority changed",
-        ));
-    }
-    Ok(NativeSourceAuthority {
-        installation_id,
-        repository_provider: "github.com".to_owned(),
-        repository_id: repository_id.to_owned(),
-        canonical_repository,
-        base_ref: base_ref.expect("checked").to_owned(),
-        base_sha: base_sha.expect("checked").to_ascii_lowercase(),
-    })
-}
-
 pub(crate) fn steward_handoff_transfer_report(
     runtime_paths: &RuntimePaths,
     repo: &str,
@@ -1707,20 +869,6 @@ pub(crate) fn steward_handoff_transfer_report(
     }
     Ok(StewardHandoffTransferReport {
         wake_consumer_available: receipt.wake_consumer_available,
-        agent_disposition: receipt.agent_disposition.as_str().to_owned(),
-        pause_required: receipt.pause_required,
-        publication_work_id: receipt
-            .native_publication
-            .as_ref()
-            .map(|publication| publication.work_id.clone()),
-        publication_route_ref: receipt
-            .native_publication
-            .as_ref()
-            .map(|publication| publication.route_ref.clone()),
-        publication_wake_id: receipt
-            .native_publication
-            .as_ref()
-            .map(|publication| publication.wake_id.clone()),
     })
 }
 
@@ -1734,20 +882,6 @@ pub(super) struct TerminalOwnerRoute {
     pub(super) provider: Option<String>,
     pub(super) resume_transport: Option<String>,
     pub(super) terminal_provenance: Option<TerminalProvenanceKind>,
-    pub(super) provider_route: Option<ProviderRouteReferenceV1>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(super) struct ProviderRouteReferenceV1 {
-    pub(super) profile_digest: String,
-    pub(super) integrity_hash: String,
-    pub(super) generation: u64,
-    pub(super) revision: u64,
-    pub(super) provider: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) account: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) model: Option<String>,
 }
 
 pub(super) fn terminal_owner_route(
@@ -1769,7 +903,6 @@ pub(super) fn terminal_owner_route(
     if receipt.phase != HandoffPhase::Managed {
         return Ok(None);
     }
-    let provider_route = provider_route_reference(&receipt);
     let route = receipt.agent_route;
     let (owner_id, terminal_provenance) = if let Some(route) = route.as_ref() {
         let stored_path = state_dir
@@ -1826,7 +959,6 @@ pub(super) fn terminal_owner_route(
         provider: route.as_ref().map(|route| route.provider.clone()),
         terminal_provenance,
         resume_transport: route.map(|route| route.resume_transport),
-        provider_route,
     }))
 }
 
@@ -1837,8 +969,8 @@ pub(super) fn terminal_owner_route_or_unresolved(
     head: &str,
 ) -> Option<TerminalOwnerRoute> {
     // Route transport is not deployed authority. Corrupt, missing, or stale
-    // private state therefore remains an unroutable ledger obligation instead
-    // of blocking deterministic stewardship or authorizing a fresh agent.
+    // private state therefore remains an unroutable obligation instead of
+    // blocking deterministic stewardship or authorizing a fresh agent.
     match terminal_owner_route(state_dir, repo, pr, head) {
         Ok(owner) => owner,
         Err(_) => unresolved_terminal_owner(state_dir, repo, pr, head),
@@ -1863,7 +995,6 @@ fn unresolved_terminal_owner(
     {
         return None;
     }
-    let provider_route = provider_route_reference(&receipt);
     Some(TerminalOwnerRoute {
         origin_machine: receipt.origin_machine,
         owner_id: receipt.owner_id,
@@ -1873,23 +1004,7 @@ fn unresolved_terminal_owner(
         provider: None,
         resume_transport: None,
         terminal_provenance: None,
-        provider_route,
     })
-}
-
-fn provider_route_reference(receipt: &DurableStewardHandoff) -> Option<ProviderRouteReferenceV1> {
-    receipt
-        .launch_profile
-        .as_ref()
-        .map(|stored| ProviderRouteReferenceV1 {
-            profile_digest: stored.profile_digest.clone(),
-            integrity_hash: stored.integrity_hash.clone(),
-            generation: stored.generation,
-            revision: stored.revision,
-            provider: stored.profile.provider.provider.clone(),
-            account: stored.profile.provider.account.clone(),
-            model: stored.profile.provider.model.clone(),
-        })
 }
 
 fn agent_route_path(runtime_paths: &RuntimePaths, route_id: &str) -> std::path::PathBuf {
@@ -1957,7 +1072,7 @@ fn load_handoff(path: &Path) -> Result<Option<DurableStewardHandoff>, CliFailure
     }
 }
 
-#[cfg(test)]
+#[allow(clippy::too_many_lines)]
 fn prepare_handoff_receipt(
     existing: Option<DurableStewardHandoff>,
     args: &StewardHandoffArgs,
@@ -1965,87 +1080,16 @@ fn prepare_handoff_receipt(
     origin_machine: &str,
     agent_route: Option<AgentRouteReference>,
 ) -> Result<DurableStewardHandoff, CliFailure> {
-    prepare_handoff_receipt_with_profile(existing, args, repo, origin_machine, agent_route, None)
-}
-
-#[cfg(test)]
-fn prepare_handoff_receipt_with_profile(
-    existing: Option<DurableStewardHandoff>,
-    args: &StewardHandoffArgs,
-    repo: &str,
-    origin_machine: &str,
-    agent_route: Option<AgentRouteReference>,
-    launch_profile: Option<LaunchProfileCandidateV1>,
-) -> Result<DurableStewardHandoff, CliFailure> {
-    prepare_handoff_receipt_with_profile_and_disposition(
-        existing,
-        args,
-        repo,
-        origin_machine,
-        agent_route,
-        launch_profile,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_lines)]
-fn prepare_handoff_receipt_with_profile_and_disposition(
-    existing: Option<DurableStewardHandoff>,
-    args: &StewardHandoffArgs,
-    repo: &str,
-    origin_machine: &str,
-    agent_route: Option<AgentRouteReference>,
-    launch_profile: Option<LaunchProfileCandidateV1>,
-    disposition_proof: Option<StoredDispositionProofV1>,
-) -> Result<DurableStewardHandoff, CliFailure> {
     let normalized_repo = repo.to_ascii_lowercase();
     let normalized_head = args.head.to_ascii_lowercase();
-    let requested_disposition = AgentDisposition::parse(&args.after_handoff)?;
     let owner_id = agent_route.as_ref().map_or_else(
         || "fresh-agent-only".to_owned(),
         |route| route.owner_id.clone(),
     );
-    let goal_lifecycle = agent_route
-        .as_ref()
-        .map_or(GoalLifecycle::Unmanaged, |route| route.goal_lifecycle);
-    let goal_status = agent_route
-        .as_ref()
-        .map_or(GoalStatus::Unmanaged, |route| route.goal_status);
-    let goal_status_provenance = agent_route
-        .as_ref()
-        .map_or(GoalStatusProvenance::NotObserved, |route| {
-            route.goal_status_provenance
-        });
-    validate_launch_profile_route(launch_profile.as_ref(), agent_route.as_ref())?;
     if let Some(existing) = existing {
         validate_existing_handoff(&existing, args, &normalized_repo, &normalized_head)?;
-        let disposition_proof = match requested_disposition {
-            AgentDisposition::Continue => None,
-            AgentDisposition::Pause => Some(
-                disposition_proof
-                    .or_else(|| existing.disposition_proof.clone())
-                    .filter(|proof| proof.valid_for(&args.workstream_id))
-                    .ok_or_else(|| {
-                        CliFailure::new(
-                            1,
-                            "--after-handoff pause requires a valid durable task-graph proof",
-                        )
-                    })?,
-            ),
-        };
         if args.transfer_agent_owner {
-            return transfer_handoff_owner(
-                existing,
-                args,
-                origin_machine,
-                owner_id,
-                agent_route,
-                goal_lifecycle,
-                goal_status,
-                goal_status_provenance,
-                disposition_proof,
-                launch_profile,
-            );
+            return transfer_handoff_owner(existing, args, origin_machine, owner_id, agent_route);
         }
         if existing.owner_id != owner_id {
             return Err(CliFailure::new(
@@ -2057,12 +1101,6 @@ fn prepare_handoff_receipt_with_profile_and_disposition(
             return Err(CliFailure::new(
                 1,
                 "same-owner handoff route metadata changed; explicit ownership transfer is required",
-            ));
-        }
-        if !same_launch_profile_replay(existing.launch_profile.as_ref(), launch_profile.as_ref()) {
-            return Err(CliFailure::new(
-                1,
-                "same-owner handoff cannot change or omit its launch profile",
             ));
         }
         if existing.workstream_id != args.workstream_id || existing.context_url != args.context_url
@@ -2078,14 +1116,6 @@ fn prepare_handoff_receipt_with_profile_and_disposition(
                 "same-owner handoff origin machine changed; explicit ownership transfer is required",
             ));
         }
-        if existing.requested_agent_disposition != requested_disposition
-            || existing.disposition_proof != disposition_proof
-        {
-            return Err(CliFailure::new(
-                1,
-                "same-owner handoff cannot change agent disposition or task-graph proof",
-            ));
-        }
         return Ok(existing);
     }
     if args.transfer_agent_owner {
@@ -2094,15 +1124,6 @@ fn prepare_handoff_receipt_with_profile_and_disposition(
             "--transfer-agent-owner requires an existing exact-head handoff receipt",
         ));
     }
-    let disposition_proof = match requested_disposition {
-        AgentDisposition::Continue => None,
-        AgentDisposition::Pause => Some(disposition_proof.ok_or_else(|| {
-            CliFailure::new(
-                1,
-                "--after-handoff pause requires --task-graph proving no independent runnable work",
-            )
-        })?),
-    };
     Ok(new_handoff_receipt(
         args,
         normalized_repo,
@@ -2110,56 +1131,7 @@ fn prepare_handoff_receipt_with_profile_and_disposition(
         origin_machine,
         owner_id,
         agent_route,
-        goal_lifecycle,
-        goal_status,
-        goal_status_provenance,
-        requested_disposition,
-        disposition_proof,
-        launch_profile,
     ))
-}
-
-fn validate_launch_profile_route(
-    profile: Option<&LaunchProfileCandidateV1>,
-    route: Option<&AgentRouteReference>,
-) -> Result<(), CliFailure> {
-    let Some(profile) = profile else {
-        return Ok(());
-    };
-    if let Some(route) = route {
-        let Some(session) = profile.profile.session.as_ref() else {
-            return Err(CliFailure::new(
-                1,
-                "an exact-session launch profile requires provider-session provenance",
-            ));
-        };
-        if opaque_id(
-            "owner",
-            &[&session.agent_provider, &session.provider_session_id],
-        ) != route.owner_id
-        {
-            return Err(CliFailure::new(
-                1,
-                "launch profile provider-session provenance does not match the durable agent route",
-            ));
-        }
-        return Ok(());
-    }
-    if profile.profile.recovery_policy
-        != super::launch_profile::RecoveryPolicyV1::FreshCheckpointOnly
-    {
-        return Err(CliFailure::new(
-            1,
-            "an exact-session launch profile requires a durable agent route",
-        ));
-    }
-    if profile.profile.session.is_some() {
-        return Err(CliFailure::new(
-            1,
-            "a fresh-checkpoint-only profile cannot claim existing provider-session provenance",
-        ));
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2170,16 +1142,8 @@ fn new_handoff_receipt(
     origin_machine: &str,
     owner_id: String,
     agent_route: Option<AgentRouteReference>,
-    goal_lifecycle: GoalLifecycle,
-    goal_status: GoalStatus,
-    goal_status_provenance: GoalStatusProvenance,
-    requested_disposition: AgentDisposition,
-    disposition_proof: Option<StoredDispositionProofV1>,
-    launch_profile: Option<LaunchProfileCandidateV1>,
 ) -> DurableStewardHandoff {
     let now = Utc::now().to_rfc3339();
-    let launch_profile =
-        launch_profile.map(|profile| bind_launch_profile(profile, agent_route.as_ref(), 1, 1));
     DurableStewardHandoff {
         schema_version: 4,
         repo: normalized_repo,
@@ -2197,16 +1161,7 @@ fn new_handoff_receipt(
             RepairRoute::FreshAgentOnly
         },
         agent_route,
-        launch_profile,
-        goal_lifecycle,
-        goal_status,
-        goal_status_provenance,
-        requested_agent_disposition: requested_disposition,
-        agent_disposition: AgentDisposition::Continue,
-        pause_required: false,
-        disposition_proof,
         wake_consumer_available: false,
-        native_publication: None,
         phase: HandoffPhase::Intent,
         created_at: now.clone(),
         updated_at: now,
@@ -2233,102 +1188,13 @@ fn validate_handoff_receipt_integrity(
         || {
             receipt.repair_route == RepairRoute::FreshAgentOnly
                 && receipt.owner_id == "fresh-agent-only"
-                && receipt.goal_lifecycle == GoalLifecycle::Unmanaged
-                && receipt.goal_status == GoalStatus::Unmanaged
-                && receipt.goal_status_provenance == GoalStatusProvenance::NotObserved
         },
         |route| {
             receipt.repair_route == RepairRoute::OriginalAgent
                 && receipt.owner_id == route.owner_id
                 && receipt.origin_machine == route.origin_machine
-                && receipt.goal_lifecycle == route.goal_lifecycle
-                && receipt.goal_status == route.goal_status
-                && receipt.goal_status_provenance == route.goal_status_provenance
         },
     );
-    let disposition_consistent = match receipt.schema_version {
-        2 => {
-            receipt.requested_agent_disposition == AgentDisposition::Continue
-                && receipt.agent_disposition == AgentDisposition::Continue
-                && !receipt.pause_required
-                && receipt.disposition_proof.is_none()
-        }
-        3 | 4 => match receipt.requested_agent_disposition {
-            AgentDisposition::Continue => {
-                receipt.agent_disposition == AgentDisposition::Continue
-                    && !receipt.pause_required
-                    && receipt.disposition_proof.is_none()
-            }
-            AgentDisposition::Pause => {
-                receipt
-                    .disposition_proof
-                    .as_ref()
-                    .is_some_and(|proof| proof.valid_for(&receipt.workstream_id))
-                    && receipt
-                        .agent_route
-                        .as_ref()
-                        .is_some_and(|route| route.goal_managed)
-                    && if receipt.wake_consumer_available {
-                        receipt.agent_disposition == AgentDisposition::Pause
-                            && receipt.pause_required
-                    } else {
-                        receipt.agent_disposition == AgentDisposition::Continue
-                            && !receipt.pause_required
-                    }
-            }
-        },
-        _ => false,
-    };
-    let launch_profile_consistent = receipt.launch_profile.as_ref().is_none_or(|stored| {
-        stored.generation > 0
-            && stored.revision > 0
-            && validate_launch_profile(&stored.profile).is_ok()
-            && launch_profile_digest(&stored.profile)
-                .is_ok_and(|digest| digest == stored.profile_digest)
-            && launch_profile_integrity_hash(
-                &stored.profile_digest,
-                stored.generation,
-                stored.revision,
-                receipt
-                    .agent_route
-                    .as_ref()
-                    .map(|route| route.route_id.as_str()),
-            ) == stored.integrity_hash
-            && stored.generation == receipt.ownership_generation
-            && launch_profile_session_matches_route(&stored.profile, receipt.agent_route.as_ref())
-            && stored
-                .profile
-                .worktree
-                .repository
-                .eq_ignore_ascii_case(repo)
-            && stored.profile.worktree.head_sha.eq_ignore_ascii_case(head)
-            && (receipt.agent_route.is_some()
-                || stored.profile.recovery_policy
-                    == super::launch_profile::RecoveryPolicyV1::FreshCheckpointOnly)
-    });
-    let publication_consistent = match (
-        receipt.wake_consumer_available,
-        receipt.native_publication.as_ref(),
-        receipt.launch_profile.as_ref(),
-    ) {
-        (false, None, _) => true,
-        (available, Some(publication), Some(profile)) => {
-            ((publication.schema_version == 2 && publication.repo_policy_revision > 0)
-                || (matches!(receipt.schema_version, 2 | 3)
-                    && publication.schema_version == 1
-                    && publication.repo_policy_revision == 0))
-                && publication.profile_digest == profile.profile_digest
-                && valid_publication_identifier(&publication.work_id)
-                && valid_publication_identifier(&publication.route_ref)
-                && valid_publication_identifier(&publication.wake_id)
-                && matches!(
-                    (available, publication.state),
-                    (false, NativePublicationStateV1::Pending)
-                        | (true, NativePublicationStateV1::Accepted)
-                )
-        }
-        _ => false,
-    };
     if !matches!(receipt.schema_version, 2..=4)
         || !receipt.repo.eq_ignore_ascii_case(repo)
         || receipt.pr != pr
@@ -2336,9 +1202,7 @@ fn validate_handoff_receipt_integrity(
         || receipt.ownership_generation == 0
         || receipt.revision == 0
         || !route_consistent
-        || !disposition_consistent
-        || !launch_profile_consistent
-        || !publication_consistent
+        || receipt.wake_consumer_available
     {
         return Err(CliFailure::new(
             1,
@@ -2349,44 +1213,12 @@ fn validate_handoff_receipt_integrity(
     Ok(())
 }
 
-fn valid_publication_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 256
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-}
-
-fn launch_profile_session_matches_route(
-    profile: &LaunchProfileV1,
-    route: Option<&AgentRouteReference>,
-) -> bool {
-    match (profile.session.as_ref(), route) {
-        (Some(session), Some(route)) => {
-            opaque_id(
-                "owner",
-                &[&session.agent_provider, &session.provider_session_id],
-            ) == route.owner_id
-        }
-        (None, None) => {
-            profile.recovery_policy == super::launch_profile::RecoveryPolicyV1::FreshCheckpointOnly
-        }
-        _ => false,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn transfer_handoff_owner(
     mut existing: DurableStewardHandoff,
     args: &StewardHandoffArgs,
     origin_machine: &str,
     owner_id: String,
     agent_route: Option<AgentRouteReference>,
-    goal_lifecycle: GoalLifecycle,
-    goal_status: GoalStatus,
-    goal_status_provenance: GoalStatusProvenance,
-    disposition_proof: Option<StoredDispositionProofV1>,
-    launch_profile: Option<LaunchProfileCandidateV1>,
 ) -> Result<DurableStewardHandoff, CliFailure> {
     if agent_route.is_none() {
         return Err(CliFailure::new(
@@ -2394,487 +1226,25 @@ fn transfer_handoff_owner(
             "--transfer-agent-owner requires an explicit replacement agent route",
         ));
     }
-    if existing.workstream_id != args.workstream_id
-        || existing.context_url != args.context_url
-        || existing.requested_agent_disposition != AgentDisposition::parse(&args.after_handoff)?
-        || existing.disposition_proof != disposition_proof
-    {
+    if existing.workstream_id != args.workstream_id || existing.context_url != args.context_url {
         return Err(CliFailure::new(
             1,
-            "ownership transfer cannot change workstream, context, or disposition",
-        ));
-    }
-    if existing.owner_id == owner_id
-        && existing.agent_route == agent_route
-        && same_launch_profile_replay(existing.launch_profile.as_ref(), launch_profile.as_ref())
-    {
-        return Ok(existing);
-    }
-    if existing.native_publication.is_some() {
-        return Err(CliFailure::new(
-            1,
-            "published native continuation ownership cannot be transferred; create a new exact-head handoff",
+            "ownership transfer cannot change workstream or context",
         ));
     }
     if existing.owner_id == owner_id && existing.agent_route == agent_route {
-        return Err(CliFailure::new(
-            1,
-            "launch profile replacement requires a replacement agent owner",
-        ));
+        return Ok(existing);
     }
     existing.owner_id = owner_id;
     existing.agent_route = agent_route;
     origin_machine.clone_into(&mut existing.origin_machine);
     existing.repair_route = RepairRoute::OriginalAgent;
-    existing.goal_lifecycle = goal_lifecycle;
-    existing.goal_status = goal_status;
-    existing.goal_status_provenance = goal_status_provenance;
-    existing.disposition_proof = disposition_proof;
     let next_generation = existing
         .ownership_generation
         .checked_add(1)
         .ok_or_else(|| CliFailure::new(1, "handoff ownership generation overflow"))?;
-    existing.launch_profile = match (existing.launch_profile.as_ref(), launch_profile) {
-        (Some(previous), Some(profile)) => Some(bind_launch_profile(
-            profile,
-            existing.agent_route.as_ref(),
-            next_generation,
-            previous
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| CliFailure::new(1, "launch-profile revision overflow"))?,
-        )),
-        (None, Some(profile)) => Some(bind_launch_profile(
-            profile,
-            existing.agent_route.as_ref(),
-            next_generation,
-            1,
-        )),
-        (None, None) => None,
-        (Some(_), None) => {
-            return Err(CliFailure::new(
-                1,
-                "ownership transfer cannot omit an existing launch profile",
-            ));
-        }
-    };
     existing.ownership_generation = next_generation;
     Ok(existing)
-}
-
-fn ready_workstream_activation(
-    runtime_paths: &RuntimePaths,
-) -> Result<ReadyWorkstreamActivation, CliFailure> {
-    let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
-    if runtime_paths != &production_paths {
-        return Err(CliFailure::new(
-            1,
-            "automatic native continuation publication requires canonical production roots",
-        ));
-    }
-    let mut loader = WorkstreamActivationLoader::production();
-    match loader.revalidate_for_tick() {
-        WorkstreamActivationState::Ready(ready) => Ok(ready),
-        WorkstreamActivationState::Disabled => Err(CliFailure::new(
-            1,
-            "workstream continuation activation is disabled; monitoring ownership was not transferred",
-        )),
-        WorkstreamActivationState::Refused(reason) => Err(CliFailure::new(
-            1,
-            format!(
-                "workstream continuation activation refused: {}; monitoring ownership was not transferred",
-                reason.code()
-            ),
-        )),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn publish_managed_handoff(
-    runtime_paths: &RuntimePaths,
-    actions: &GitHubActions,
-    path: &Path,
-    receipt: DurableStewardHandoff,
-    repo: &str,
-    pr: u64,
-    head: &str,
-    ready: &ReadyWorkstreamActivation,
-) -> Result<DurableStewardHandoff, CliFailure> {
-    publish_managed_handoff_with_consumer(
-        runtime_paths,
-        actions,
-        path,
-        receipt,
-        repo,
-        pr,
-        head,
-        ready,
-        |_paths, _report| Ok(()),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn publish_managed_handoff_with_consumer<F>(
-    runtime_paths: &RuntimePaths,
-    actions: &GitHubActions,
-    path: &Path,
-    receipt: DurableStewardHandoff,
-    repo: &str,
-    pr: u64,
-    head: &str,
-    ready: &ReadyWorkstreamActivation,
-    _await_consumer: F,
-) -> Result<DurableStewardHandoff, CliFailure>
-where
-    F: FnOnce(&RuntimePaths, &NativePublicationReport) -> Result<(), CliFailure>,
-{
-    let request = native_publication_request(runtime_paths, actions, repo, pr, head)?;
-    if ready.machine_tag != request.origin_machine {
-        return Err(CliFailure::new(
-            1,
-            "durable handoff belongs to a different continuation consumer machine",
-        ));
-    }
-    let planned = WorkLedger::plan_or_apply_native_continuation(
-        &runtime_paths.state_dir,
-        &request,
-        &ready.config,
-        false,
-    )
-    .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let receipt = bind_native_publication_pending(path, receipt, &planned)?;
-    let report = WorkLedger::plan_or_apply_native_continuation(
-        &runtime_paths.state_dir,
-        &request,
-        &ready.config,
-        true,
-    )
-    .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    if report.work_id != planned.work_id
-        || report.route_ref != planned.route_ref
-        || report.wake_id != planned.wake_id
-        || report.profile_digest != planned.profile_digest
-        || report.repo_policy_revision != planned.repo_policy_revision
-    {
-        return Err(CliFailure::new(
-            1,
-            "native continuation publication changed after durable intent",
-        ));
-    }
-    // Managed publication remains wake-free. Its canonical ledger record is
-    // nevertheless a durable daemon obligation, so successful exact replay is
-    // the monitoring-transfer boundary; provider delivery is deliberately not
-    // part of the post-handoff disposition decision.
-    crate::work_ledger::verify_native_policy_binding(&runtime_paths.state_dir, repo, pr, head)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    bind_native_publication_accepted(path, receipt, &report)
-}
-
-fn native_publication_receipt(
-    report: &NativePublicationReport,
-    state: NativePublicationStateV1,
-) -> NativePublicationReceiptV1 {
-    NativePublicationReceiptV1 {
-        schema_version: 2,
-        state,
-        work_id: report.work_id.clone(),
-        route_ref: report.route_ref.clone(),
-        wake_id: report.wake_id.clone(),
-        profile_digest: report.profile_digest.clone(),
-        repo_policy_revision: report.repo_policy_revision,
-    }
-}
-
-fn bind_native_publication_pending(
-    path: &Path,
-    mut receipt: DurableStewardHandoff,
-    report: &NativePublicationReport,
-) -> Result<DurableStewardHandoff, CliFailure> {
-    let pending = native_publication_receipt(report, NativePublicationStateV1::Pending);
-    let accepted = native_publication_receipt(report, NativePublicationStateV1::Accepted);
-    if receipt.wake_consumer_available {
-        if receipt.native_publication.as_ref() == Some(&accepted) {
-            return Ok(receipt);
-        }
-        if receipt
-            .native_publication
-            .as_ref()
-            .is_some_and(|publication| {
-                publication.schema_version == 1
-                    && publication.state == NativePublicationStateV1::Accepted
-                    && publication.work_id == accepted.work_id
-                    && publication.route_ref == accepted.route_ref
-                    && publication.wake_id == accepted.wake_id
-                    && publication.profile_digest == accepted.profile_digest
-            })
-        {
-            receipt.schema_version = 4;
-            receipt.native_publication = Some(accepted);
-            return persist_handoff(path, receipt, HandoffPhase::Managed);
-        }
-        return Err(CliFailure::new(
-            1,
-            "accepted native publication cannot return to pending",
-        ));
-    }
-    match receipt.native_publication.as_ref() {
-        Some(existing) if existing == &pending => Ok(receipt),
-        Some(existing)
-            if existing.schema_version == 1
-                && existing.state == NativePublicationStateV1::Pending
-                && existing.work_id == pending.work_id
-                && existing.route_ref == pending.route_ref
-                && existing.wake_id == pending.wake_id
-                && existing.profile_digest == pending.profile_digest =>
-        {
-            receipt.schema_version = 4;
-            receipt.native_publication = Some(pending);
-            persist_handoff(path, receipt, HandoffPhase::Managed)
-        }
-        Some(_) => Err(CliFailure::new(
-            1,
-            "native publication intent changed for an existing exact-head handoff",
-        )),
-        None => {
-            receipt.native_publication = Some(pending);
-            persist_handoff(path, receipt, HandoffPhase::Managed)
-        }
-    }
-}
-
-fn bind_native_publication_accepted(
-    path: &Path,
-    mut receipt: DurableStewardHandoff,
-    report: &NativePublicationReport,
-) -> Result<DurableStewardHandoff, CliFailure> {
-    let pending = native_publication_receipt(report, NativePublicationStateV1::Pending);
-    let accepted = native_publication_receipt(report, NativePublicationStateV1::Accepted);
-    if receipt.wake_consumer_available {
-        if receipt.native_publication.as_ref() == Some(&accepted) {
-            return Ok(receipt);
-        }
-        return Err(CliFailure::new(
-            1,
-            "accepted monitoring transfer changed its native publication",
-        ));
-    }
-    if receipt.native_publication.as_ref() != Some(&pending) {
-        return Err(CliFailure::new(
-            1,
-            "native publication was not durably pending before monitoring transfer",
-        ));
-    }
-    receipt.native_publication = Some(accepted);
-    receipt.wake_consumer_available = true;
-    match receipt.requested_agent_disposition {
-        AgentDisposition::Continue => {
-            receipt.agent_disposition = AgentDisposition::Continue;
-            receipt.pause_required = false;
-        }
-        AgentDisposition::Pause => {
-            if receipt
-                .disposition_proof
-                .as_ref()
-                .is_none_or(|proof| !proof.valid_for(&receipt.workstream_id))
-                || receipt
-                    .agent_route
-                    .as_ref()
-                    .is_none_or(|route| !route.goal_managed)
-            {
-                return Err(CliFailure::new(
-                    1,
-                    "pause disposition lost its managed-goal task-graph authority",
-                ));
-            }
-            receipt.agent_disposition = AgentDisposition::Pause;
-            receipt.pause_required = true;
-        }
-    }
-    persist_handoff(path, receipt, HandoffPhase::Managed)
-}
-
-fn prepare_launch_profile_candidate(
-    profile: LaunchProfileV1,
-    repo: &str,
-    head: &str,
-) -> Result<LaunchProfileCandidateV1, CliFailure> {
-    if !profile.worktree.repository.eq_ignore_ascii_case(repo)
-        || !profile.worktree.head_sha.eq_ignore_ascii_case(head)
-    {
-        return Err(CliFailure::new(
-            1,
-            "launch profile worktree provenance must match the exact handoff repository and head",
-        ));
-    }
-    verify_launch_profile_worktree(&profile)?;
-    Ok(LaunchProfileCandidateV1 {
-        profile_digest: launch_profile_digest(&profile)?,
-        profile,
-    })
-}
-
-fn verify_launch_profile_worktree(profile: &LaunchProfileV1) -> Result<(), CliFailure> {
-    let claimed_path = Path::new(&profile.worktree.path);
-    let canonical_path = claimed_path.canonicalize().map_err(|error| {
-        CliFailure::new(
-            1,
-            format!("launch profile worktree path is unavailable: {error}"),
-        )
-    })?;
-
-    let top_level = git_worktree_value(&canonical_path, &["rev-parse", "--show-toplevel"])?;
-    let canonical_top_level = Path::new(&top_level).canonicalize().map_err(|error| {
-        CliFailure::new(
-            1,
-            format!("launch profile Git top-level path is unavailable: {error}"),
-        )
-    })?;
-    if canonical_top_level != canonical_path {
-        return Err(CliFailure::new(
-            1,
-            "launch profile path must name the exact Git worktree root",
-        ));
-    }
-
-    let observed_head = git_worktree_value(&canonical_path, &["rev-parse", "HEAD"])?;
-    if !observed_head.eq_ignore_ascii_case(&profile.worktree.head_sha) {
-        return Err(CliFailure::new(
-            1,
-            "launch profile worktree HEAD does not match its claimed exact head",
-        ));
-    }
-    let remote = git_worktree_value(&canonical_path, &["remote", "get-url", "origin"])?;
-    let observed_repo = crate::gh::parse_github_remote_slug(&remote).ok_or_else(|| {
-        CliFailure::new(
-            1,
-            "launch profile worktree origin is not a canonical GitHub repository",
-        )
-    })?;
-    if !observed_repo.eq_ignore_ascii_case(&profile.worktree.repository) {
-        return Err(CliFailure::new(
-            1,
-            "launch profile worktree origin does not match its claimed repository",
-        ));
-    }
-
-    let branch = git_worktree_value(
-        &canonical_path,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )?;
-    if profile.worktree.lineage_id != branch {
-        return Err(CliFailure::new(
-            1,
-            "launch profile lineage ID must match the worktree's exact branch",
-        ));
-    }
-    let lineage_key = format!("branch.{branch}.pulpWorktree");
-    let status = git_worktree_value(
-        &canonical_path,
-        &[
-            "config",
-            "--local",
-            "--get",
-            &format!("{lineage_key}Status"),
-        ],
-    )?;
-    let durable_head = git_worktree_value(
-        &canonical_path,
-        &[
-            "config",
-            "--local",
-            "--get",
-            &format!("{lineage_key}DurableSha"),
-        ],
-    )?;
-    let last_path = git_worktree_value(
-        &canonical_path,
-        &[
-            "config",
-            "--local",
-            "--get",
-            &format!("{lineage_key}LastPath"),
-        ],
-    )?;
-    let canonical_last_path = Path::new(&last_path).canonicalize().map_err(|error| {
-        CliFailure::new(
-            1,
-            format!("launch profile lineage path is unavailable: {error}"),
-        )
-    })?;
-    if status != "active"
-        || !durable_head.eq_ignore_ascii_case(&observed_head)
-        || canonical_last_path != canonical_path
-    {
-        return Err(CliFailure::new(
-            1,
-            "launch profile worktree lineage is not active at the exact path and head",
-        ));
-    }
-    Ok(())
-}
-
-fn git_worktree_value(path: &Path, args: &[&str]) -> Result<String, CliFailure> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()
-        .map_err(|error| {
-            CliFailure::new(
-                1,
-                format!("failed to inspect launch profile worktree: {error}"),
-            )
-        })?;
-    if !output.status.success() {
-        return Err(CliFailure::new(
-            1,
-            "launch profile worktree or lineage authority could not be verified",
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim().to_owned())
-        .map_err(|_| CliFailure::new(1, "launch profile Git metadata was not UTF-8"))
-}
-
-fn bind_launch_profile(
-    candidate: LaunchProfileCandidateV1,
-    route: Option<&AgentRouteReference>,
-    generation: u64,
-    revision: u64,
-) -> StoredLaunchProfileV1 {
-    StoredLaunchProfileV1 {
-        integrity_hash: launch_profile_integrity_hash(
-            &candidate.profile_digest,
-            generation,
-            revision,
-            route.map(|route| route.route_id.as_str()),
-        ),
-        generation,
-        revision,
-        profile_digest: candidate.profile_digest,
-        profile: candidate.profile,
-    }
-}
-
-fn same_launch_profile(
-    existing: Option<&StoredLaunchProfileV1>,
-    incoming: Option<&LaunchProfileCandidateV1>,
-) -> bool {
-    match (existing, incoming) {
-        (None, None) => true,
-        (Some(existing), Some(incoming)) => {
-            existing.profile_digest == incoming.profile_digest
-                && existing.profile == incoming.profile
-        }
-        _ => false,
-    }
-}
-
-fn same_launch_profile_replay(
-    existing: Option<&StoredLaunchProfileV1>,
-    incoming: Option<&LaunchProfileCandidateV1>,
-) -> bool {
-    incoming.is_none() && existing.is_some() || same_launch_profile(existing, incoming)
 }
 
 fn persist_handoff(
@@ -2984,10 +1354,6 @@ fn same_immutable_agent_contract(
     existing.provider == incoming.provider
         && existing.session_id == incoming.session_id
         && existing.parent_session_id == incoming.parent_session_id
-        && existing.goal_managed == incoming.goal_managed
-        && existing.goal_lifecycle == incoming.goal_lifecycle
-        && existing.goal_status == incoming.goal_status
-        && existing.goal_status_provenance == incoming.goal_status_provenance
         && existing.resume_transport == incoming.resume_transport
         && match (&existing.terminal_provenance, &incoming.terminal_provenance) {
             (
@@ -3344,7 +1710,6 @@ pub(super) fn run_steward_write(
     actions.run_gh(args)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render<W: Write>(
     args: &StewardHandoffArgs,
     repo: &str,
@@ -3352,8 +1717,6 @@ fn render<W: Write>(
     origin_machine: &str,
     json_output: bool,
     wake_consumer_available: bool,
-    agent_disposition: AgentDisposition,
-    pause_required: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
     if json_output {
@@ -3363,24 +1726,19 @@ fn render<W: Write>(
             agent_route,
             origin_machine,
             wake_consumer_available,
-            agent_disposition,
-            pause_required,
         )?;
         return write_json_envelope(stdout, "runner.steward-handoff", data)
             .map_err(|error| CliFailure::new(1, error.to_string()));
     }
     writeln!(
         stdout,
-        "steward handoff: mode={} repo={} pr=#{} head={} workstream={} label={} requested_disposition={} disposition={} disposition_supported=true pause_supported=true pause_required={} monitoring_transferred={} wake_consumer_available={} origin_machine={} repair_route={}",
+        "steward handoff: mode={} repo={} pr=#{} head={} workstream={} label={} monitoring_transferred={} wake_consumer_available={} origin_machine={} repair_route={}",
         if args.apply { "apply" } else { "dry-run" },
         repo,
         args.pr,
         args.head,
         args.workstream_id,
         MANAGED_LABEL,
-        args.after_handoff,
-        agent_disposition.as_str(),
-        pause_required,
         wake_consumer_available,
         wake_consumer_available,
         origin_machine,
@@ -3393,15 +1751,12 @@ fn render<W: Write>(
     .map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_json_data(
     args: &StewardHandoffArgs,
     repo: &str,
     agent_route: Option<&AgentRouteReference>,
     origin_machine: &str,
     wake_consumer_available: bool,
-    agent_disposition: AgentDisposition,
-    pause_required: bool,
 ) -> Result<BTreeMap<String, Value>, CliFailure> {
     let mut data = BTreeMap::from([
         ("apply".to_owned(), Value::from(args.apply)),
@@ -3419,17 +1774,6 @@ fn render_json_data(
             Value::from(wake_consumer_available),
         ),
         (
-            "agent_disposition".to_owned(),
-            Value::from(agent_disposition.as_str()),
-        ),
-        (
-            "requested_agent_disposition".to_owned(),
-            Value::from(args.after_handoff.clone()),
-        ),
-        ("agent_disposition_supported".to_owned(), Value::from(true)),
-        ("pause_required".to_owned(), Value::from(pause_required)),
-        ("pause_supported".to_owned(), Value::from(true)),
-        (
             "wake_consumer_available".to_owned(),
             Value::from(wake_consumer_available),
         ),
@@ -3445,24 +1789,7 @@ fn render_json_data(
                 "fresh_agent_only"
             }),
         ),
-        (
-            "goal_lifecycle".to_owned(),
-            Value::from(if agent_route.is_some_and(|route| route.goal_managed) {
-                "managed"
-            } else {
-                "unmanaged"
-            }),
-        ),
-        (
-            "goal_status_provenance".to_owned(),
-            Value::from("not_observed"),
-        ),
     ]);
-    data.insert(
-        "goal_status".to_owned(),
-        serde_json::to_value(agent_route.map_or(GoalStatus::Unmanaged, |route| route.goal_status))
-            .map_err(|error| CliFailure::new(1, error.to_string()))?,
-    );
     if let Some(agent_route) = agent_route {
         data.insert(
             "agent_route".to_owned(),
@@ -3479,126 +1806,6 @@ fn render_json_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn terminal_snapshots(state: &str, head: &str) -> (Value, Value) {
-        let repository = serde_json::json!({
-            "id": "R_test_repository",
-            "nameWithOwner": "Owner/Repo",
-        });
-        let pull = serde_json::json!({
-            "id": "PR_test_terminal",
-            "state": state,
-            "headRefOid": head,
-            "baseRefName": "main",
-            "mergeCommit": {"oid": "c".repeat(40)},
-            "mergedAt": "2026-09-01T12:00:00Z",
-        });
-        (repository, pull)
-    }
-
-    #[test]
-    fn terminal_merge_authority_requires_exact_merged_identity() {
-        let head = "a".repeat(40);
-        let (repository, merged) = terminal_snapshots("MERGED", &head);
-        let authority = terminal_merge_authority_from_snapshots(
-            42,
-            "owner/repo",
-            74,
-            &head,
-            &repository,
-            &merged,
-        )
-        .expect("exact merged authority");
-        assert_eq!(authority.installation_id, 42);
-        assert_eq!(authority.repository_id, "R_test_repository");
-        assert_eq!(authority.canonical_repository, "owner/repo");
-        assert_eq!(authority.pull_request_node_id, "PR_test_terminal");
-        assert_eq!(authority.merge_sha, "c".repeat(40));
-
-        let (_, open_snapshot) = terminal_snapshots("OPEN", &head);
-        let open = terminal_merge_authority_from_snapshots(
-            42,
-            "owner/repo",
-            74,
-            &head,
-            &repository,
-            &open_snapshot,
-        )
-        .expect_err("open PR is not terminal authority");
-        assert!(open.message().contains("incomplete or changed"));
-        let wrong_head = "d".repeat(40);
-        let (_, moved_snapshot) = terminal_snapshots("MERGED", &wrong_head);
-        let moved = terminal_merge_authority_from_snapshots(
-            42,
-            "owner/repo",
-            74,
-            &head,
-            &repository,
-            &moved_snapshot,
-        )
-        .expect_err("moved head is not exact authority");
-        assert!(moved.message().contains("incomplete or changed"));
-
-        let wrong_repository = serde_json::json!({
-            "id": "R_test_repository",
-            "nameWithOwner": "Other/Repo",
-        });
-        let repository_error = terminal_merge_authority_from_snapshots(
-            42,
-            "owner/repo",
-            74,
-            &head,
-            &wrong_repository,
-            &merged,
-        )
-        .expect_err("canonical repository movement must refuse");
-        assert!(repository_error.message().contains("canonical repository"));
-
-        let closed = serde_json::json!({"id":"PR_test_terminal","state":"CLOSED","headRefOid":head,"baseRefName":"main","mergeCommit":null,"mergedAt":null,"closedAt":"2026-09-01T13:00:00Z"});
-        let closed_auth = closed_unmerged_authority_from_snapshots(
-            42,
-            "owner/repo",
-            74,
-            &head,
-            &repository,
-            &closed,
-        )
-        .expect("closed-unmerged authority");
-        assert_eq!(closed_auth.closed_at, "2026-09-01T13:00:00Z");
-        let mut bad = closed.clone();
-        bad["mergeCommit"] = serde_json::json!({"oid":"c".repeat(40)});
-        assert!(
-            closed_unmerged_authority_from_snapshots(
-                42,
-                "owner/repo",
-                74,
-                &head,
-                &repository,
-                &bad,
-            )
-            .is_err()
-        );
-
-        for (label, key, value) in [
-            ("base", "baseRefName", Value::Null),
-            ("merge commit", "mergeCommit", Value::Null),
-            ("merge timestamp", "mergedAt", Value::Null),
-            ("pull request identity", "id", Value::Null),
-        ] {
-            let mut incomplete = merged.clone();
-            incomplete[key] = value;
-            let error = terminal_merge_authority_from_snapshots(
-                42,
-                "owner/repo",
-                74,
-                &head,
-                &repository,
-                &incomplete,
-            )
-            .expect_err(label);
-            assert!(error.message().contains("incomplete or changed"));
-        }
-    }
 
     #[cfg(unix)]
     fn sequenced_gh(
@@ -3746,10 +1953,6 @@ fn main() {{
             agent_session_id: None,
             agent_parent_session_id: None,
             agent_surface_id: None,
-            launch_profile: None,
-            task_graph: None,
-            goal_managed: false,
-            after_handoff: "continue".to_owned(),
             transfer_agent_owner: false,
             apply: false,
         }
@@ -3779,38 +1982,6 @@ fn main() {{
         assert!(validate_args(&invalid).is_err());
     }
 
-    #[test]
-    fn workstream_identifier_requires_the_canonical_gen_style_grammar() {
-        for value in ["GEN 7", "gen-7", "GEN-07", "GEN-7\nspoof", "GEN-7-extra"] {
-            let mut invalid = args();
-            invalid.workstream_id = value.to_owned();
-            assert!(validate_args(&invalid).is_err(), "accepted {value:?}");
-        }
-        assert!(validate_args(&args()).is_ok());
-    }
-
-    #[test]
-    fn legacy_pr_fallback_is_exact_and_cannot_authorize_workstream_custody() {
-        let mut legacy = args();
-        legacy.workstream_id = "owner/repo#7".to_owned();
-        assert!(validate_args(&legacy).is_ok());
-
-        for invalid_id in ["owner/repo#8", "owner/other#7", "OWNER/repo#7"] {
-            let mut invalid = legacy.clone();
-            invalid.workstream_id = invalid_id.to_owned();
-            assert!(validate_args(&invalid).is_err(), "accepted {invalid_id:?}");
-        }
-
-        let mut managed = legacy.clone();
-        managed.goal_managed = true;
-        assert!(validate_args(&managed).is_err());
-
-        let mut routed = legacy;
-        routed.agent_provider = Some("codex".to_owned());
-        routed.agent_session_id = Some("session-7".to_owned());
-        assert!(validate_args(&routed).is_err());
-    }
-
     /// A mixed-case owner must not make the fallback unreachable.
     ///
     /// The hatch canonicalises on a lowercase slug. It also used to require the
@@ -3833,10 +2004,9 @@ fn main() {{
 
         // CONTROL: the hatch is still exact about the PR number, so it cannot be
         // satisfied by any id that merely looks similar.
-        let mut wrong_pr = mixed.clone();
+        let mut wrong_pr = mixed;
         wrong_pr.workstream_id = "generous-corp/pulp#8".to_owned();
         assert!(!is_legacy_pr_fallback(&wrong_pr));
-        assert!(validate_args(&wrong_pr).is_err());
     }
 
     #[test]
@@ -3867,14 +2037,6 @@ fn main() {{
                 },
             ),
             (
-                "ambient goal-managed Codex",
-                AgentEnvironment {
-                    codex_session: Some("codex-managed".to_owned()),
-                    goal_managed: true,
-                    ..AgentEnvironment::default()
-                },
-            ),
-            (
                 "ambient HerdR Codex",
                 AgentEnvironment {
                     codex_session: Some("codex-herdr".to_owned()),
@@ -3894,28 +2056,6 @@ fn main() {{
                     ..AgentEnvironment::default()
                 },
             ),
-            (
-                "ambient goal-managed HerdR Codex",
-                AgentEnvironment {
-                    codex_session: Some("codex-managed-herdr".to_owned()),
-                    goal_managed: true,
-                    herdr_env: Some("1".to_owned()),
-                    herdr_session: Some("herdr-session".to_owned()),
-                    herdr_workspace_id: Some("workspace".to_owned()),
-                    herdr_tab_id: Some("tab".to_owned()),
-                    herdr_pane_id: Some("pane".to_owned()),
-                    ..AgentEnvironment::default()
-                },
-            ),
-            (
-                "ambient goal-managed cmux Claude",
-                AgentEnvironment {
-                    claude_session: Some("claude-managed-cmux".to_owned()),
-                    surface_id: Some("surface".to_owned()),
-                    goal_managed: true,
-                    ..AgentEnvironment::default()
-                },
-            ),
         ];
         for (name, environment) in environments {
             let error = resolve_handoff_agent(&legacy, |args| {
@@ -3930,44 +2070,21 @@ fn main() {{
                 error.message()
             );
         }
-
-        let goal_only = AgentEnvironment {
-            goal_managed: true,
-            ..AgentEnvironment::default()
-        };
-        let error = resolve_handoff_agent(&legacy, |args| {
-            resolve_agent_context_with_environment(args, &goal_only)
-        })
-        .expect_err("ambient managed lifecycle without an agent must be refused");
-        assert!(
-            error
-                .message()
-                .contains("--goal-managed requires a resumable agent session")
-        );
     }
 
     #[test]
     fn agent_identity_requires_a_complete_provider_session_pair() {
-        let mut managed = args();
-        managed.goal_managed = true;
-        managed.after_handoff = "pause".to_owned();
-        managed.agent_provider = Some("codex".to_owned());
-        assert!(resolve_agent_context(&managed).is_err());
+        let mut partial = args();
+        partial.agent_provider = Some("codex".to_owned());
+        assert!(resolve_agent_context(&partial).is_err());
 
-        managed.agent_session_id = Some("019d-test-thread".to_owned());
+        partial.agent_session_id = Some("019d-test-thread".to_owned());
         let context =
-            resolve_agent_context_with_environment(&managed, &AgentEnvironment::default())
+            resolve_agent_context_with_environment(&partial, &AgentEnvironment::default())
                 .expect("valid context")
                 .expect("captured context");
         assert_eq!(context.provider, "codex");
         assert_eq!(context.resume_transport, "codex_queue");
-        assert!(context.goal_managed);
-        assert_eq!(context.goal_lifecycle, GoalLifecycle::Managed);
-        assert_eq!(context.goal_status, GoalStatus::Unknown);
-        assert_eq!(
-            context.goal_status_provenance,
-            GoalStatusProvenance::NotObserved
-        );
     }
 
     #[test]
@@ -4131,57 +2248,11 @@ fn main() {{
     }
 
     #[test]
-    fn pause_without_a_task_graph_fails_before_transport_and_dry_run_is_truthful() {
-        let mut paused = explicit_agent_args("codex", "paused-session");
-        paused.goal_managed = true;
-        paused.after_handoff = "pause".to_owned();
-        let agent = resolve_agent_context_with_environment(&paused, &AgentEnvironment::default())
-            .expect("resolve agent")
-            .expect("agent");
-        let route = agent_route_reference(&agent, "m3");
-        let error = prepare_handoff_receipt_with_profile_and_disposition(
-            None,
-            &paused,
-            "owner/repo",
-            "m3",
-            Some(route.clone()),
-            None,
-            None,
-        )
-        .expect_err("pause cannot be prepared without task-graph authority");
-        assert!(error.message().contains("task-graph"));
-
-        paused.apply = false;
-        let mut output = Vec::new();
-        render(
-            &paused,
-            "owner/repo",
-            Some(&route),
-            "m3",
-            true,
-            false,
-            AgentDisposition::Continue,
-            false,
-            &mut output,
-        )
-        .expect("render dry run");
-        let value: Value = serde_json::from_slice(&output).expect("dry-run json");
-        assert_eq!(value["requested_agent_disposition"], "pause");
-        assert_eq!(value["agent_disposition"], "continue");
-        assert_eq!(value["agent_disposition_supported"], true);
-        assert_eq!(value["pause_supported"], true);
-        assert_eq!(value["pause_required"], false);
-        assert_eq!(value["wake_consumer_available"], false);
-        assert_eq!(value["monitoring_transferred"], false);
-    }
-
-    #[test]
     fn ambiguous_provider_environment_and_explicit_orphan_route_fields_fail_closed() {
         let environment = AgentEnvironment {
             codex_session: Some("codex-session".to_owned()),
             claude_session: Some("claude-session".to_owned()),
             surface_id: None,
-            goal_managed: false,
             ..AgentEnvironment::default()
         };
         let error = resolve_agent_context_with_environment(&args(), &environment)
@@ -4237,12 +2308,6 @@ fn main() {{
         assert_eq!(handoff.owner_id, "fresh-agent-only");
         assert_eq!(handoff.repair_route, RepairRoute::FreshAgentOnly);
         assert_eq!(handoff.agent_route, None);
-        assert_eq!(handoff.goal_lifecycle, GoalLifecycle::Unmanaged);
-        assert_eq!(handoff.goal_status, GoalStatus::Unmanaged);
-        assert_eq!(
-            handoff.goal_status_provenance,
-            GoalStatusProvenance::NotObserved
-        );
     }
 
     #[test]
@@ -4258,7 +2323,6 @@ fn main() {{
             Some(temp.path().join("state")),
         );
         let mut managed = args();
-        managed.goal_managed = true;
         managed.agent_provider = Some("claude".to_owned());
         managed.agent_session_id = Some("session-7".to_owned());
         managed.agent_parent_session_id = Some("coordinator-1".to_owned());
@@ -4302,11 +2366,7 @@ fn main() {{
         assert_eq!(receipt.phase, HandoffPhase::Managed);
         assert_eq!(receipt.revision, 4);
         assert_eq!(receipt.head_sha, managed.head);
-        assert_eq!(receipt.agent_disposition, AgentDisposition::Continue);
-        assert!(!receipt.pause_required);
         assert!(!receipt.wake_consumer_available);
-        assert_eq!(receipt.goal_lifecycle, GoalLifecycle::Managed);
-        assert_eq!(receipt.goal_status, GoalStatus::Unknown);
         let terminal_owner =
             terminal_owner_route(&paths.state_dir, "owner/repo", managed.pr, &managed.head)
                 .expect("read terminal owner after restart")
@@ -4616,30 +2676,6 @@ fn main() {{
             "unpersisted-machine"
         );
         assert!(!paths.state_dir.exists());
-    }
-
-    #[test]
-    fn same_owner_replay_rejects_disposition_change() {
-        let mut first = explicit_agent_args("codex", "stable-session");
-        first.goal_managed = true;
-        let route = route_for(&first, "m3");
-        let receipt =
-            prepare_handoff_receipt(None, &first, "owner/repo", "m3", Some(route.clone()))
-                .expect("first handoff");
-        let temp = tempfile::tempdir().expect("temp");
-        let receipt = persist_handoff(
-            &temp.path().join("receipt.json"),
-            receipt,
-            HandoffPhase::Intent,
-        )
-        .expect("persist receipt");
-
-        let mut changed = first;
-        changed.after_handoff = "pause".to_owned();
-        let error =
-            prepare_handoff_receipt(Some(receipt), &changed, "owner/repo", "m3", Some(route))
-                .expect_err("disposition cannot change on replay");
-        assert!(error.message().contains("task-graph proof"));
     }
 
     #[test]
@@ -5132,7 +3168,3 @@ fn main() {{
         assert_eq!(std::fs::read_to_string(count).expect("count"), "1");
     }
 }
-
-#[cfg(all(test, unix))]
-#[path = "handoff/launch_profile_tests.rs"]
-mod launch_profile_tests;

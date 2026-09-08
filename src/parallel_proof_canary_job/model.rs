@@ -131,30 +131,6 @@ pub struct CanaryWakePredicate {
     pub on_actionable_failure: bool,
 }
 
-/// Exact existing native continuation authority selected before job admission.
-///
-/// This record deliberately contains no route construction inputs. The native
-/// work ledger must already contain the exact work, staged route, and protected
-/// launch profile. Canary completion may only consume that authority.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CanaryNativeContinuationBinding {
-    /// Binding schema, independent of the canary job and receipt schemas.
-    pub schema_version: u32,
-    /// Exact existing native work item.
-    pub work_item_id: String,
-    /// Native work generation observed at canary admission.
-    pub work_generation: u64,
-    /// Exact native owner generation.
-    pub owner_generation: u64,
-    /// Existing staged route selected by native publication.
-    pub route_ref: String,
-    /// Existing protected launch-profile reference.
-    pub profile_ref: String,
-    /// Digest of the exact protected profile bytes used as the wake payload.
-    pub payload_digest: String,
-}
-
 /// Bounded redacted log segmentation policy.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -195,9 +171,6 @@ pub struct ApprovedCanaryJob {
     pub cancellation: CanaryCancellationPolicy,
     /// Terminal wake classification.
     pub wake: CanaryWakePredicate,
-    /// Existing native continuation authority. Required by schema v2 jobs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_continuation: Option<CanaryNativeContinuationBinding>,
     /// Redacted rotated log bounds.
     pub logs: CanaryLogPolicy,
 }
@@ -211,12 +184,6 @@ impl ApprovedCanaryJob {
         ) {
             return Err(ParallelProofError::UnsupportedSchemaVersion(
                 self.schema_version,
-            ));
-        }
-        if (self.schema_version == CURRENT_JOB_SCHEMA_VERSION) != self.native_continuation.is_some()
-        {
-            return Err(ParallelProofError::InvalidField(
-                "canary native continuation binding",
             ));
         }
         validate_id(&self.job_id, "canary job id")?;
@@ -244,23 +211,6 @@ impl ApprovedCanaryJob {
             return Err(ParallelProofError::InvalidField("canary job policy"));
         }
         self.operation.validate()?;
-        if let Some(binding) = &self.native_continuation
-            && (binding.schema_version != 1
-                || binding.work_generation == 0
-                || binding.owner_generation == 0
-                || binding.work_item_id.is_empty()
-                || binding.route_ref.is_empty()
-                || binding.profile_ref.is_empty()
-                || binding.payload_digest.len() != 64
-                || !binding
-                    .payload_digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-        {
-            return Err(ParallelProofError::InvalidField(
-                "canary native continuation binding",
-            ));
-        }
         self.operation.digest()?;
         Ok(())
     }
@@ -272,7 +222,7 @@ impl ApprovedCanaryJob {
             if self.schema_version == LEGACY_JOB_SCHEMA_VERSION {
                 "shipyard.canary-job.envelope.v1"
             } else {
-                "shipyard.canary-job.envelope.v2"
+                "shipyard.canary-job.envelope.v3"
             },
             self,
         )
@@ -470,12 +420,6 @@ pub struct CanaryWakeAcknowledgement {
     pub controller_id: String,
     /// Approval authority reused for wake acknowledgement.
     pub approval_sha256: Sha256Digest,
-    /// Deterministic native outbox identity proven before acknowledgement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_wake_id: Option<String>,
-    /// Digest of the exact native delivery receipt and terminal receipt link.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_delivery_sha256: Option<Sha256Digest>,
     /// Controller acknowledgement timestamp.
     pub acknowledged_at_ms: u64,
 }

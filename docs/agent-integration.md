@@ -6,9 +6,9 @@ delivery work around it. That keeps a model from spending a long session
 repeatedly asking whether a test or merge state changed.
 
 This integration is optional. A normal `shipyard run` or `shipyard ship` works
-without a long-lived daemon. The daemon-backed continuation path is enabled
-only by explicit trusted policy and a specific handoff. It stops safely when
-its evidence is incomplete or code judgment is needed.
+without a long-lived daemon. The durable steward handoff is enabled only by
+explicit policy and a specific, exact-head handoff. It stops safely when its
+evidence is incomplete or code judgment is needed.
 
 ## Start with the CLI
 
@@ -46,23 +46,21 @@ does not invent product decisions or silently edit code.
 
 ## Optional durable handoff
 
-For long-running or restart-prone work, an explicit steward handoff stores the
-PR, exact commit, workstream context, and a bounded continuation route in the
-machine-global work ledger. The trusted daemon can receive verified GitHub
-events, reconcile with GitHub when an event is missed, and keep routine
-monitoring outside the coding tool's context window. It asks for help when a
-decision or repair is needed.
+For long-running or restart-prone work, an explicit steward handoff records the
+PR, exact commit, and workstream context on GitHub itself: a successful
+`shipyard/steward-handoff` commit status on that immutable head, the
+`shipyard:managed` label, and a private crash-consistent JSON receipt beside
+them. `shipyard runner steward` then treats that exact head as managed, and the
+trusted daemon can receive verified GitHub events, reconcile with GitHub when an
+event is missed, and keep routine monitoring outside the coding tool's context
+window. It asks for help when a decision or repair is needed.
 
-That durable record is local to its machine by default. Moving custody to
-another machine requires the separate, default-off
-[authenticated custody transport](durable-custody-transport.md); a shared
-folder, hostname, or terminal label is never enough. If the handoff is missing,
-stale, or no longer matches the current PR, Shipyard refuses rather than
-guessing a replacement session.
+The private receipt is local to the machine that wrote it. If the handoff is
+missing, stale, or no longer matches the current PR head, Shipyard refuses
+rather than guessing a replacement.
 
-See [launch profiles](launch-profile.md) and
-[terminal and provider adapters](terminal-adapters.md) for the current
-continuation, cmux, HerdR, and provider-routing boundaries.
+See [terminal and provider adapters](terminal-adapters.md) for the current
+cmux, HerdR, and provider-routing boundaries.
 
 ## Coding-tool choices
 

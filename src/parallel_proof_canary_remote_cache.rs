@@ -25,7 +25,6 @@ use crate::parallel_proof_canary_cache::{
 };
 use crate::parallel_proof_canary_controller::StrictSshCanaryTarget;
 use crate::process::ProcessTree;
-use crate::workstream_provider_adapter::verify_current_companion_digest;
 
 /// Current strict remote-cache companion protocol.
 pub const REMOTE_M1_CACHE_PROTOCOL_SCHEMA: u32 = 1;

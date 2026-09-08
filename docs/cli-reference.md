@@ -10,11 +10,6 @@ shipyard doctor --rate-limit --repo OWNER/REPO  # resolve auth for an exact repo
 shipyard auth doctor --repo OWNER/REPO          # same override, auth-only
 shipyard auth export --output shipyard-auth.toml        # export non-secret auth config
 shipyard auth import shipyard-auth.toml --scope local   # import auth config locally
-shipyard custody doctor                                  # read-only custody receiver/policy checks
-shipyard custody provision --input /owner/private/custody.toml  # dry-run setup plan
-shipyard custody provision --input /owner/private/custody.toml --apply  # atomic machine-global install
-shipyard custody disable --policy-digest <sha256>  # dry-run exact-generation removal
-shipyard custody disable --policy-digest <sha256> --apply  # atomic exact-generation removal
 shipyard targets               # show targets + reachability
 shipyard targets add <name>    # interactively add a new target
 shipyard targets remove <name> # remove a target
@@ -117,30 +112,14 @@ shipyard runner steward --recover-hosted-setup-eviction-priority --apply
 shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable authority blocker
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
-shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --agent-provider codex --agent-session-id SESSION --launch-profile ./launch-profile.json --apply
-shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --agent-provider codex --agent-session-id SESSION --launch-profile ./launch-profile.json --after-handoff pause --task-graph ./task-graph.json --apply
-shipyard pr --workstream-id GEN-7 --context-url https://linear.app/... --launch-profile ./launch-profile.json
+shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
 shipyard runner recovery-worker --drain --apply     # process one bounded pending snapshot (maximum 32)
-shipyard work-ledger status                         # inspect canonical shadow storage; does not create it
-shipyard work-ledger inventory                      # bounded immutable local-work view; does not create storage
-shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" # authentic-v11 exact-row reconciliation plan; no writes
-shipyard work-ledger publish --repo OWNER/REPO --pr 123 --head "$SHA" --apply # writer-fenced migrate/bind/publication
-shipyard work-ledger reconcile-terminal              # bounded redacted inventory of terminal repairs plus typed unbound handoff rows
-shipyard work-ledger reconcile-terminal --repo OWNER/REPO --pr 123 --head "$SHA" # exact dry-run; verifies local and typed terminal GitHub authority
-shipyard work-ledger reconcile-terminal --repo OWNER/REPO --pr 123 --head "$SHA" --apply # bind one already-terminal row; exact replay is write-free
-shipyard work-ledger import                         # deterministic redacted legacy-import plan; no writes
-shipyard work-ledger import --apply                 # idempotently populate shadow storage; no activation/dispatch
-shipyard work-ledger policy list                    # list revision-fenced per-repository lane policy
-shipyard work-ledger policy set --repo generous-corp/forge --primary-platform macos --compatibility-lane linux --compatibility-lane windows
-shipyard work-ledger policy set --repo generous-corp/forge --primary-platform macos --compatibility-lane linux --declared-dependency-lane linux --expected-revision 0 --apply
 
 # On the protected base branch, make every `shipyard pr` submission durable
 # immediately after PR creation. A PR branch cannot opt itself in.
 # Optional CLI --workstream-id/--context-url values override the fallbacks.
-# --launch-profile atomically publishes a zero-wake daemon obligation when the trusted consumer is enabled.
-# --after-handoff defaults to continue; pause also requires --task-graph proof.
 # In .shipyard/config.toml:
 # [merge_steward]
 # auto_handoff = true
@@ -157,41 +136,11 @@ increments a private ownership generation; ambient sessions cannot silently
 adopt a receipt. Machine identity is persisted privately on first use rather
 than recomputed from mutable host environment variables.
 
-`work-ledger status` supports an authentic schema-v11 ledger through the same
-immutable, race-checked snapshot boundary as inventory; it does not migrate or
-open a WAL. When native publication encounters that released schema, dry-run
-returns a typed disposition for every bound row. Exactly one row must match the
-authenticated work ID, repository, PR, head, and workstream. Apply reacquires
-the exact snapshot under the exclusive writer domain, migrates schema 11 to
-schema 14, enriches only that row with immutable repository identity, and
-requires an exact reread/replay. Foreign lineage, ambiguous or changed
-snapshots, coordinate drift, and any unbound row refuse the operation.
-
-`work-ledger reconcile-terminal` is the narrow repair for a native
-`terminal_handoff` that reached terminal state before its immutable workstream
-projection binding was recorded. With no target it returns a bounded,
-redacted, no-write inventory of exact terminal repairs and every other unbound
-terminal handoff. Non-repairable rows are typed as a clean publication
-precursor, managed-unbound state, or blocked, with bounded related-state counts
-and explicit blockers; they are never silently omitted or made eligible for the
-terminal repair. A targeted command is dry-run by default and
-requires the exact repository, PR, and head. Apply additionally requires the
-protected launch profile and continuation contracts, the exact route and
-authoritative wake, and authenticated GitHub App reads proving one typed
-terminal outcome at that head/base. A merged outcome requires its exact merge
-commit and timestamp. A closed-without-merge outcome requires its exact close
-timestamp and absent merge evidence, and is recorded as `closed_unmerged`
-without creating or implying merge authority. Apply requires a second
-identical GitHub read under exclusive writer custody. It adds only the immutable provider receipt, projection binding, and
-terminal-to-terminal audit event; the binding insert also mints its
-schema-required inert ownership-root identity. That root grants no authority:
-the repair cannot create agent ownership, holder material, bootstrap
-eligibility, or a lease, nor can it revise wakes, routes, continuations,
-custody, activation, or projection intents.
-Historical unrelated wakes are preserved. Ambiguity, incomplete authority,
-head/base movement, an existing ownership root without a binding, or any
-mismatch refuses. Repeating the exact targeted command after success is a
-write-free replay.
+`--workstream-id` is a free-form string: Shipyard stores it verbatim on the
+private receipt and publishes it as the `Managed handoff <id>` status
+description. It is not parsed and no particular handle shape is required.
+`--context-url` is likewise stored verbatim and published as the status
+`target_url`; the only check is that it uses `http://` or `https://`.
 
 Semantic blockers receive one deduplicated `shipyard:needs-agent` label and
 failed `shipyard/steward-recovery` status, which are cleared after recovery.
@@ -255,88 +204,6 @@ at most one model call even if normalized evidence changes. A retarget, newer
 head, recovered check, or changed merge state supersedes the old request
 instead of spending an attempt on stale evidence.
 
-`work-ledger` is a migration and inspection surface, not an activation switch.
-`work-ledger inventory` returns at most 256 deterministically ordered items and
-reports whether the result is complete. It opens only existing ledger storage,
-never takes writer custody, and never creates or migrates a database. Each item
-binds the canonical `GEN-N` workstream handle and exact work/owner generation to
-the provider, immutable repository ID, canonical repository coordinate, PR,
-and head. A valid migrated legacy `NULL,NULL` repository identity is retained
-and makes `complete=false`; malformed or half-bound identity refuses the entire
-snapshot rather than returning ambiguous data.
-Its versioned SQLite database uses WAL, full synchronous durability, foreign
-keys, integrity checks, protected permissions, and the machine writer-domain
-fence. Import selects canonical lifecycle fields and opaque digests from the
-legacy ship, queue, recovery, and steward stores; it never copies raw prompts,
-terminal text, credentials, provider tokens, or private route identifiers.
-Imported work remains explicitly `shadow_imported` and lacks an activation-
-eligible continuation contract. Native route records keep terminal, agent, and
-provider axes separate and integrity-bound; missing provider provenance never
-means Direct and cannot dispatch. Native transitions are closed/typed and
-commit their deterministic event with any outbox wake.
-The schema also contains durable per-attempt wake delivery records. An internal
-consumer contract can claim and finalize one canonical wake around an exact
-argv-array provider call, reconcile idempotent restart claims, and retain
-non-idempotent ambiguity as `uncertain`. It has no CLI or daemon activation
-surface; it cannot run under the default-off policy.
-Dry-run is byte-stable and creates no database. Apply is idempotent and leaves
-every legacy record authoritative and untouched. Apply holds a bounded
-exclusive production-writer snapshot barrier from legacy scan through the
-SQLite commit, so it cannot materialize a mixed live-state snapshot. Both
-`activation_enabled` and `dispatch_enabled` remain false in this phase.
-When the daemon is running, it independently reads policy-covered native
-nonterminal exact `(repo, PR, head)` projections from this ledger; inert
-`shadow_imported` history is never scheduled. It coalesces relevant
-webhooks for two seconds (with a ten-second maximum coalescing age) and performs
-an eight-target round-robin catch-up every five minutes, even with zero IPC
-subscribers. Webhook overflow is requeued, the same target has a 30-second
-cooldown, at most four reads run concurrently, and a rolling-hour 240-request
-ceiling bounds passive cost by reserving each selected target's worst-case page
-budget durably before a pass, reconciling it to actual cost afterward, and
-conservatively restoring in-flight or recent usage after restart.
-A shared one-minute deadline covers auth preparation and reads so one slow batch
-cannot starve later triggers. Each target uses a read-only, producer-
-provenanced head/check snapshot through its exact repository App route and the
-daemon's trusted machine-global configuration only; repository and local
-overlays cannot replace unattended auth. Non-App command credentials fail
-closed; one repository-scoped App installation token is pinned for the complete
-paginated target observation. The App token is attached only to the
-configured, validated native privileged `gh` executable under a cleared child
-environment. Rollups paginate at most 1,000 contexts
-and fail closed beyond that bound; request evidence counts every page. Unchanged observations and
-initial baselines emit no event. Auth preparation is bounded and is not counted
-as a GitHub request when it fails before the command boundary.
-A changed snapshot emits `shadow_observation_transition` to IPC and the
-daemon's retained supervised stderr log with request count,
-wall-clock latency, exact-head verdict, policy revision, and zero model calls.
-Fetch failure and recovery also emit once per state change; repeated identical
-failures stay quiet and expose only a stable error class, never command output.
-The observer cannot update the ledger, GitHub, an outbox, Linear, or an agent.
-Its failed-check count is observation evidence, not rerun authority. A later
-active phase must resolve exact failed Actions job IDs, preview the complete
-dependency closure, estimate worker-minutes against a revision-fenced per-repo
-ceiling, and refuse `gh run rerun --failed` whenever closure is unknown or
-larger than the classified failed-job set. This shadow phase never reruns CI and
-does not invent closure or cost data from check-rollup names.
-Legacy import is currently supported only on Unix hosts, where the configured
-state directory and every relative component are opened through pinned
-no-follow handles. Windows import is explicitly deferred and does not block
-the macOS stewardship rollout; status and policy surfaces remain available.
-Repository policy is independently revision-fenced. `policy set` requires an
-explicit primary lane (Pulp, Forge, and Vellum use `macos`), an explicit
-repeatable compatibility-lane inventory, and defaults to `independent`
-compatibility scheduling; Linux/Windows may
-block another lane only through the default
-`declared_dependency_or_shared_integrity` rule. Repeat
-`--declared-dependency-lane` only for a real artifact dependency; otherwise a
-compatibility lane can block only with evidenced shared-integrity failure.
-Dry-run is the default and an
-apply with a stale expected revision refuses rather than overwriting a newer
-decision. The shadow observer consumes the policy only as an explicit
-repository-enrollment and evidence seam; it does not make a blocking decision.
-Pulp, Forge, and Vellum can revise their macOS-first and compatibility rules
-independently without enabling dispatch. A repository without a policy is not
-observed.
 An apply-mode repository or GitHub preflight error remains pending without
 spending the attempt, but is durably moved behind untouched pending work so a
 persistently unavailable repository cannot block the machine-global queue.

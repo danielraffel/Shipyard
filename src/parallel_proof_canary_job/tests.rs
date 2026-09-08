@@ -53,7 +53,6 @@ mod tests {
                 on_success: true,
                 on_actionable_failure: true,
             },
-            native_continuation: None,
             logs: CanaryLogPolicy {
                 segment_bytes: 1024,
                 max_segments: 3,
@@ -417,8 +416,6 @@ mod tests {
                     receipt_sha256: replay.snapshot.latest().digest().unwrap(),
                     controller_id: job.owner.controller_id.clone(),
                     approval_sha256: job.owner.approval_sha256.clone(),
-                    native_wake_id: None,
-                    native_delivery_sha256: None,
                     acknowledged_at_ms: 2_200,
                 },
             )
@@ -429,74 +426,22 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_wake_ack_requires_native_delivery_receipt() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = CanaryJobStore::open(temp.path().join("jobs")).unwrap();
+    fn retired_envelope_schema_is_unsupported_and_domains_name_the_exact_shape() {
         let mut job = job();
-        job.schema_version = CURRENT_JOB_SCHEMA_VERSION;
-        job.native_continuation = Some(CanaryNativeContinuationBinding {
-            schema_version: 1,
-            work_item_id: format!("wi_{}", "a".repeat(64)),
-            work_generation: 4,
-            owner_generation: 1,
-            route_ref: format!("route_{}", "b".repeat(64)),
-            profile_ref: format!("opaque:sha256:{}", "c".repeat(64)),
-            payload_digest: "d".repeat(64),
-        });
-        store.submit(&job).unwrap();
-        let prepared = store.load(&job.job_id).unwrap();
-        let CanaryJobReceiptState::Prepared {
-            launch_nonce_sha256,
-        } = &prepared.latest().receipt
-        else {
-            panic!("expected prepared receipt");
-        };
-        store
-            .claim_launch(&prepared, launch_nonce_sha256.clone(), 1_100)
-            .unwrap();
-        let mut backend = FakeBackend {
-            discovery: Some(Ok(CanaryProcessObservation::Missing)),
-            ..FakeBackend::default()
-        };
-        let terminal = reconcile_canary_job(&store, &job.job_id, 1_200, &mut backend).unwrap();
-        let base = CanaryWakeAcknowledgement {
-            job_sha256: job.digest().unwrap(),
-            receipt_sha256: terminal.snapshot.latest().digest().unwrap(),
-            controller_id: job.owner.controller_id.clone(),
-            approval_sha256: job.owner.approval_sha256.clone(),
-            native_wake_id: None,
-            native_delivery_sha256: None,
-            acknowledged_at_ms: 1_300,
-        };
-        assert!(matches!(
-            store.acknowledge_wake(&job.job_id, &base),
-            Err(ParallelProofError::AuthenticationFailed)
-        ));
-        store
-            .acknowledge_wake(
-                &job.job_id,
-                &CanaryWakeAcknowledgement {
-                    native_wake_id: Some(
-                        native_wake_id(job.native_continuation.as_ref().unwrap()).unwrap(),
-                    ),
-                    native_delivery_sha256: Some(
-                        native_wake_delivery_digest(
-                            job.native_continuation.as_ref().unwrap(),
-                            &base.job_sha256,
-                            &base.receipt_sha256,
-                            &native_wake_id(job.native_continuation.as_ref().unwrap()).unwrap(),
-                        )
-                        .unwrap(),
-                    ),
-                    ..base
-                },
-            )
-            .unwrap();
-        assert!(
-            !reconcile_canary_job(&store, &job.job_id, 1_400, &mut backend)
-                .unwrap()
-                .wake
+        assert_eq!(
+            job.digest().unwrap(),
+            domain_digest("shipyard.canary-job.envelope.v1", &job).unwrap()
         );
+        job.schema_version = CURRENT_JOB_SCHEMA_VERSION;
+        assert_eq!(
+            job.digest().unwrap(),
+            domain_digest("shipyard.canary-job.envelope.v3", &job).unwrap()
+        );
+        job.schema_version = 2;
+        assert!(matches!(
+            job.validate(),
+            Err(ParallelProofError::UnsupportedSchemaVersion(2))
+        ));
     }
 
     #[test]

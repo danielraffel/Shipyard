@@ -377,7 +377,6 @@ impl CanaryJobStore {
             || acknowledgement.controller_id != snapshot.job.owner.controller_id
             || acknowledgement.approval_sha256 != snapshot.job.owner.approval_sha256
             || acknowledgement.acknowledged_at_ms < *completed_at_ms
-            || !valid_native_wake_acknowledgement(&snapshot.job, acknowledgement)
         {
             return Err(ParallelProofError::AuthenticationFailed);
         }
@@ -521,7 +520,6 @@ impl CanaryJobStore {
                     || acknowledgement.controller_id != snapshot.job.owner.controller_id
                     || acknowledgement.approval_sha256 != snapshot.job.owner.approval_sha256
                     || acknowledgement.acknowledged_at_ms < *completed_at_ms
-                    || !valid_native_wake_acknowledgement(&snapshot.job, &acknowledgement)
                 {
                     return Err(ParallelProofError::AuthenticationFailed);
                 }

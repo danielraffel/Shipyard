@@ -9,8 +9,6 @@
 
 //! Core library for Shipyard.
 
-#[cfg(unix)]
-mod actionable_wake_producer;
 // Windows release builds retain selected Unix controller modules so their
 // explicit fail-closed stubs remain type-checked. Keep lint accommodations on
 // those modules instead of suppressing Windows diagnostics crate-wide.
@@ -43,7 +41,6 @@ pub mod cloud_records;
 pub mod config;
 /// Pure, fail-closed translation from CTest JSON-v1 metadata into a canonical test inventory.
 pub mod ctest_inventory;
-pub(crate) mod custody_transport;
 /// Unix socket IPC primitives for daemon subscribers and status reads.
 pub mod daemon_ipc;
 /// Minimal daemon runtime and lifecycle helpers.
@@ -58,15 +55,6 @@ pub mod dependency;
 /// Fetches failing-job metadata + parses a bounded log tail so
 /// `Validation failed.` becomes an actionable, structured block.
 pub mod diagnostics;
-/// Read-only GitHub dispatch-wedge classification and durable wake publication.
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "dispatch-wedge production is owned by the Unix daemon; keep pure Windows tests type-checked"
-    )
-)]
-pub(crate) mod dispatch_wedge;
 /// Doctor report generation for machine and environment checks.
 pub mod doctor;
 /// Durable evidence records and cross-branch lookup helpers.
@@ -190,7 +178,6 @@ pub mod prepared_state;
 mod process;
 /// Proof gates for applying a routing profile to GitHub variables.
 pub mod profile_apply;
-pub(crate) mod provider_wrapper;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
 /// Crash-safe, opt-in recovery of exact ship work missing from the queue.
@@ -216,8 +203,6 @@ pub mod reroute;
 pub mod runner_provision;
 /// Self-hosted runner watchdog detection logic.
 pub mod runner_watchdog;
-/// Subscriber-independent, read-only canonical-ledger shadow observation.
-pub mod shadow_scheduler;
 /// Ship execution orchestration helpers.
 pub mod ship;
 /// Read-only orphan/liveness classification for in-flight ship states.
@@ -238,10 +223,6 @@ pub mod stale_pr_wedge;
 /// pipeline; diagnostic subcommands deliberately skip this.
 pub mod supervised;
 mod terminal_delivery_authority;
-/// Optional local outbox and adapter contract for external transition projection.
-pub mod transition_projection;
-#[cfg_attr(windows, allow(dead_code, unused_imports))]
-pub(crate) mod transition_projection_runner;
 /// Working-tree drift detection shared by future `shipyard run` wiring.
 pub mod tree_drift;
 /// Tunnel readiness, Tailscale probe decoding, and supervisor retry policy.
@@ -258,17 +239,9 @@ pub mod warm_pool;
 pub mod watch;
 /// GitHub webhook signature validation and event decoding.
 pub mod webhook;
-/// Shadow-only canonical work-item ledger and legacy-state importer.
-pub mod work_ledger;
 pub(crate) mod worker_process_custody;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;
-pub(crate) mod workstream_activation_loader;
-/// Trusted machine-global policy for future workstream continuation dispatch.
-pub mod workstream_continuation_config;
-pub(crate) mod workstream_continuation_runtime;
-/// Digest-pinnable cmux adapter for fresh workstream continuation sessions.
-pub mod workstream_provider_adapter;
 /// Host-global production-writer coordination for sandbox E2E isolation.
 mod writer_domain_lease;
 

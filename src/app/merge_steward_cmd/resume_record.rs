@@ -25,8 +25,6 @@ pub(super) struct ResumeRecordV1 {
     pub(super) terminal_adapter: Option<TerminalAdapterV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) agent_adapter: Option<AgentAdapterV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) provider_adapter: Option<ProviderAdapterV1>,
     pub(super) dispatch_enabled: bool,
     pub(super) phase: ResumeRecordPhase,
     pub(super) created_at: String,
@@ -50,22 +48,6 @@ pub(super) enum AgentAdapterV1 {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(super) enum ProviderAdapterV1 {
-    LaunchProfile {
-        profile_digest: String,
-        integrity_hash: String,
-        generation: u64,
-        revision: u64,
-        provider: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        account: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ResumeRoutingDisposition {
@@ -86,7 +68,6 @@ struct ResumeRouteV1 {
     disposition: ResumeRoutingDisposition,
     terminal_adapter: Option<TerminalAdapterV1>,
     agent_adapter: Option<AgentAdapterV1>,
-    provider_adapter: Option<ProviderAdapterV1>,
 }
 
 /// Rebuild the inert resume-intent projection from authoritative terminal handoffs.
@@ -134,7 +115,6 @@ fn record_for(handoff: &TerminalHandoff) -> Result<ResumeRecordV1, CliFailure> {
         handoff,
         route.terminal_adapter.as_ref(),
         route.agent_adapter.as_ref(),
-        route.provider_adapter.as_ref(),
     );
     let now = Utc::now().to_rfc3339();
     Ok(ResumeRecordV1 {
@@ -150,7 +130,6 @@ fn record_for(handoff: &TerminalHandoff) -> Result<ResumeRecordV1, CliFailure> {
         routing_disposition: route.disposition,
         terminal_adapter: route.terminal_adapter,
         agent_adapter: route.agent_adapter,
-        provider_adapter: route.provider_adapter,
         dispatch_enabled: false,
         phase: if handoff.phase == TerminalHandoffPhase::Resolved {
             ResumeRecordPhase::Resolved
@@ -175,13 +154,11 @@ fn route(handoff: &TerminalHandoff) -> Result<ResumeRouteV1, CliFailure> {
             ));
         }
     };
-    let provider_adapter = provider_adapter(handoff);
     if disposition != ResumeRoutingDisposition::OriginalOwner {
         return Ok(ResumeRouteV1 {
             disposition,
             terminal_adapter: None,
             agent_adapter: None,
-            provider_adapter,
         });
     }
 
@@ -190,7 +167,6 @@ fn route(handoff: &TerminalHandoff) -> Result<ResumeRouteV1, CliFailure> {
             disposition: ResumeRoutingDisposition::UnroutablePrivateRoute,
             terminal_adapter: None,
             agent_adapter: None,
-            provider_adapter,
         });
     };
     let terminal_adapter = match handoff.owner_terminal_provenance {
@@ -215,42 +191,24 @@ fn route(handoff: &TerminalHandoff) -> Result<ResumeRouteV1, CliFailure> {
         }
         _ => None,
     };
-    if terminal_adapter.is_none() && agent_adapter.is_none() && provider_adapter.is_none() {
+    if terminal_adapter.is_none() && agent_adapter.is_none() {
         return Ok(ResumeRouteV1 {
             disposition: ResumeRoutingDisposition::UnroutablePrivateRoute,
             terminal_adapter: None,
             agent_adapter: None,
-            provider_adapter: None,
         });
     }
     Ok(ResumeRouteV1 {
         disposition,
         terminal_adapter,
         agent_adapter,
-        provider_adapter,
     })
-}
-
-fn provider_adapter(handoff: &TerminalHandoff) -> Option<ProviderAdapterV1> {
-    handoff
-        .provider_route
-        .as_ref()
-        .map(|route| ProviderAdapterV1::LaunchProfile {
-            profile_digest: route.profile_digest.clone(),
-            integrity_hash: route.integrity_hash.clone(),
-            generation: route.generation,
-            revision: route.revision,
-            provider: route.provider.clone(),
-            account: route.account.clone(),
-            model: route.model.clone(),
-        })
 }
 
 fn resume_id(
     handoff: &TerminalHandoff,
     terminal_adapter: Option<&TerminalAdapterV1>,
     agent_adapter: Option<&AgentAdapterV1>,
-    provider_adapter: Option<&ProviderAdapterV1>,
 ) -> String {
     let mut digest = Sha256::new();
     digest.update(b"shipyard-resume-record-v1\0");
@@ -294,32 +252,6 @@ fn resume_id(
             }
         }
         None => digest.update(b"agent_absent\0"),
-    }
-    match provider_adapter {
-        Some(ProviderAdapterV1::LaunchProfile {
-            profile_digest,
-            integrity_hash,
-            generation,
-            revision,
-            provider,
-            account,
-            model,
-        }) => {
-            digest.update(b"provider_launch_profile\0");
-            for field in [
-                profile_digest.as_str(),
-                integrity_hash.as_str(),
-                provider.as_str(),
-                account.as_deref().unwrap_or_default(),
-                model.as_deref().unwrap_or_default(),
-            ] {
-                digest.update(field.len().to_be_bytes());
-                digest.update(field.as_bytes());
-            }
-            digest.update(generation.to_be_bytes());
-            digest.update(revision.to_be_bytes());
-        }
-        None => digest.update(b"provider_absent\0"),
     }
     format!("resume-{}", hex::encode(digest.finalize()))
 }
@@ -375,7 +307,6 @@ fn same_payload(existing: &ResumeRecordV1, incoming: &ResumeRecordV1) -> bool {
         && existing.routing_disposition == incoming.routing_disposition
         && existing.terminal_adapter == incoming.terminal_adapter
         && existing.agent_adapter == incoming.agent_adapter
-        && existing.provider_adapter == incoming.provider_adapter
         && existing.dispatch_enabled == incoming.dispatch_enabled
         && existing.phase == incoming.phase
 }

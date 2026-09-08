@@ -34,7 +34,6 @@ fn terminal_owner_route(route_id: &str) -> TerminalOwnerRoute {
         provider: Some("codex".to_owned()),
         resume_transport: Some("codex_queue".to_owned()),
         terminal_provenance: Some(TerminalProvenanceKind::Absent),
-        provider_route: None,
     }
 }
 

@@ -902,17 +902,6 @@ impl DaemonCanaryJobRuntime {
                 .map_err(|error| error.to_string())
             };
             match result {
-                Ok(Some(transition)) if transition.wake => {
-                    if transition.snapshot.is_terminal()
-                        && let Err(error) = capacity.release(&capacity_claim)
-                    {
-                        first_error.get_or_insert_with(|| error.to_string());
-                        continue;
-                    }
-                    if let Err(error) = self.deliver_terminal_wake(&transition, now_ms) {
-                        first_error.get_or_insert(error);
-                    }
-                }
                 Ok(Some(transition)) if transition.snapshot.is_terminal() => {
                     if let Err(error) = capacity.release(&capacity_claim) {
                         first_error.get_or_insert_with(|| error.to_string());
@@ -930,52 +919,6 @@ impl DaemonCanaryJobRuntime {
             processed_jobs,
             warning: first_error,
         })
-    }
-
-    fn deliver_terminal_wake(
-        &self,
-        transition: &crate::parallel_proof_canary_job::CanaryJobTransition,
-        now_ms: u64,
-    ) -> Result<(), String> {
-        let binding = transition
-            .snapshot
-            .job
-            .native_continuation
-            .as_ref()
-            .ok_or_else(|| {
-                "terminal canary wake lacks admitted native continuation authority".to_owned()
-            })?;
-        let ledger = crate::work_ledger::WorkLedger::open_existing(&self.state_dir)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "native work ledger is unavailable for canary wake".to_owned())?;
-        let job_sha256 = transition
-            .snapshot
-            .job
-            .digest()
-            .map_err(|error| error.to_string())?;
-        let terminal_receipt_sha256 = transition
-            .snapshot
-            .latest()
-            .digest()
-            .map_err(|error| error.to_string())?;
-        let delivery = ledger
-            .deliver_canary_terminal_wake(binding, &job_sha256, &terminal_receipt_sha256)
-            .map_err(|error| error.to_string())?;
-        self.store
-            .acknowledge_wake(
-                &transition.snapshot.job.job_id,
-                &crate::parallel_proof_canary_job::CanaryWakeAcknowledgement {
-                    job_sha256,
-                    receipt_sha256: terminal_receipt_sha256,
-                    controller_id: transition.snapshot.job.owner.controller_id.clone(),
-                    approval_sha256: transition.snapshot.job.owner.approval_sha256.clone(),
-                    native_wake_id: Some(delivery.wake_id),
-                    native_delivery_sha256: Some(delivery.receipt_sha256),
-                    acknowledged_at_ms: now_ms,
-                },
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
     }
 }
 

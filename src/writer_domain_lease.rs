@@ -61,13 +61,6 @@ pub(crate) struct ProductionWriterDomainLease {
     _thread_bound: PhantomData<Rc<()>>,
 }
 
-/// Type-level proof that the current thread owns the exclusive production
-/// snapshot domain rather than an ordinary shared writer lease.
-#[derive(Debug)]
-pub(crate) struct ProductionSnapshotLease {
-    _lease: ProductionWriterDomainLease,
-}
-
 impl Drop for ProductionWriterDomainLease {
     fn drop(&mut self) {
         THREAD_WRITER_DOMAIN.with(|slot| {
@@ -103,68 +96,6 @@ pub(crate) fn acquire_for_protected_path(
     acquire_thread_lease_at(&runtime_paths.state_dir, DEFAULT_ACQUIRE_TIMEOUT).map(Some)
 }
 
-/// Acquire an exclusive production snapshot barrier for a bounded migration.
-/// Nested writers on this thread reuse the exclusive lease; all other
-/// production writers wait at the normal shared-domain acquisition point.
-pub(crate) fn acquire_exclusive_for_protected_path(
-    path: &Path,
-) -> io::Result<Option<ProductionSnapshotLease>> {
-    if !is_current_protected_path(path)? {
-        return Ok(None);
-    }
-    let already_held = THREAD_WRITER_DOMAIN.with(|slot| slot.borrow().is_some());
-    if already_held {
-        return Err(io::Error::other(
-            "cannot upgrade an active writer-domain lease to an exclusive snapshot",
-        ));
-    }
-    let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
-    let domain = acquire_exclusive_at(&runtime_paths.state_dir, DEFAULT_ACQUIRE_TIMEOUT)?;
-    THREAD_WRITER_DOMAIN.with(|slot| {
-        let previous = slot.replace(Some(ThreadWriterDomainLease { domain, depth: 1 }));
-        debug_assert!(previous.is_none());
-    });
-    Ok(Some(ProductionSnapshotLease {
-        _lease: ProductionWriterDomainLease {
-            _thread_bound: PhantomData,
-        },
-    }))
-}
-
-/// Acquire an exclusive production snapshot barrier without creating either
-/// writer-domain lock file.
-///
-/// Read-only authority paths use this form so a dry-run can never materialize
-/// coordination state. A production tree whose lock generation has not yet
-/// been established is refused; the next real writer establishes it through
-/// the ordinary creating acquisition path.
-pub(crate) fn acquire_existing_exclusive_for_protected_path(
-    path: &Path,
-) -> io::Result<Option<ProductionSnapshotLease>> {
-    if !is_current_protected_path(path)? {
-        return Ok(None);
-    }
-    let already_held = THREAD_WRITER_DOMAIN.with(|slot| slot.borrow().is_some());
-    if already_held {
-        return Err(io::Error::other(
-            "cannot upgrade an active writer-domain lease to an exclusive snapshot",
-        ));
-    }
-    let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
-    let domain = acquire_existing_exclusive_at(&runtime_paths.state_dir, DEFAULT_ACQUIRE_TIMEOUT)?;
-    THREAD_WRITER_DOMAIN.with(|slot| {
-        let previous = slot.replace(Some(ThreadWriterDomainLease { domain, depth: 1 }));
-        debug_assert!(previous.is_none());
-    });
-    Ok(Some(ProductionSnapshotLease {
-        _lease: ProductionWriterDomainLease {
-            _thread_bound: PhantomData,
-        },
-    }))
-}
-
-/// Report whether a path belongs to the current machine's production writer
-/// domain without acquiring its lease.
 pub(crate) fn is_current_protected_path(path: &Path) -> io::Result<bool> {
     let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
     is_protected_path(path, &home_dir(), &runtime_paths)
@@ -428,35 +359,6 @@ fn acquire_at(state_dir: &Path, timeout: Duration) -> io::Result<File> {
     Ok(domain)
 }
 
-fn acquire_exclusive_at(state_dir: &Path, timeout: Duration) -> io::Result<File> {
-    fs::create_dir_all(state_dir)?;
-    let deadline = Instant::now() + timeout;
-    let turnstile_path = state_dir.join(WRITER_DOMAIN_TURNSTILE_NAME);
-    let turnstile = open_lock_file(&turnstile_path)?;
-    acquire_lock(&turnstile, LockKind::Exclusive, deadline, &turnstile_path)?;
-
-    let domain_path = state_dir.join(WRITER_DOMAIN_LOCK_NAME);
-    let domain = open_lock_file(&domain_path)?;
-    let result = acquire_lock(&domain, LockKind::Exclusive, deadline, &domain_path);
-    let _ = FileExt::unlock(&turnstile);
-    result?;
-    Ok(domain)
-}
-
-fn acquire_existing_exclusive_at(state_dir: &Path, timeout: Duration) -> io::Result<File> {
-    let deadline = Instant::now() + timeout;
-    let turnstile_path = state_dir.join(WRITER_DOMAIN_TURNSTILE_NAME);
-    let turnstile = open_existing_lock_file(&turnstile_path)?;
-    acquire_lock(&turnstile, LockKind::Exclusive, deadline, &turnstile_path)?;
-
-    let domain_path = state_dir.join(WRITER_DOMAIN_LOCK_NAME);
-    let domain = open_existing_lock_file(&domain_path)?;
-    let result = acquire_lock(&domain, LockKind::Exclusive, deadline, &domain_path);
-    let _ = FileExt::unlock(&turnstile);
-    result?;
-    Ok(domain)
-}
-
 #[derive(Clone, Copy)]
 enum LockKind {
     Shared,
@@ -502,10 +404,6 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         options.mode(0o600);
     }
     options.open(path)
-}
-
-fn open_existing_lock_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).write(true).open(path)
 }
 
 fn lock_is_contended(error: &io::Error) -> bool {
@@ -642,10 +540,7 @@ mod tests {
 
     #[test]
     fn detached_daemon_sources_never_bypass_protected_stdio_fence() {
-        for (name, source) in [
-            ("daemon_runtime.rs", include_str!("daemon_runtime.rs")),
-            ("shadow_scheduler.rs", include_str!("shadow_scheduler.rs")),
-        ] {
+        for (name, source) in [("daemon_runtime.rs", include_str!("daemon_runtime.rs"))] {
             for raw_macro in ["eprintln!", "eprint!", "println!", "print!"] {
                 assert!(
                     !source.contains(raw_macro),
@@ -756,66 +651,6 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(is_writer_domain_overlap(&error.to_string()));
         FileExt::unlock(&exclusive).expect("unlock exclusive");
-    }
-
-    #[test]
-    fn exclusive_migration_snapshot_blocks_production_writers_until_release() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let exclusive =
-            acquire_exclusive_at(temp.path(), Duration::from_millis(50)).expect("exclusive");
-        let error = acquire_at(temp.path(), Duration::from_millis(30))
-            .expect_err("writer must wait behind migration snapshot");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        drop(exclusive);
-        drop(acquire_at(temp.path(), Duration::from_millis(50)).expect("writer after snapshot"));
-    }
-
-    #[test]
-    fn read_only_snapshot_barrier_never_creates_missing_lock_generation() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let before = fs::read_dir(temp.path()).expect("empty directory").count();
-
-        let error = acquire_existing_exclusive_at(temp.path(), Duration::from_millis(50))
-            .expect_err("missing read barrier must refuse without creating it");
-
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert_eq!(
-            fs::read_dir(temp.path())
-                .expect("unchanged directory")
-                .count(),
-            before
-        );
-        assert!(!temp.path().join(WRITER_DOMAIN_LOCK_NAME).exists());
-        assert!(!temp.path().join(WRITER_DOMAIN_TURNSTILE_NAME).exists());
-    }
-
-    #[test]
-    fn read_only_snapshot_barrier_excludes_an_existing_writer_generation() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        drop(acquire_at(temp.path(), Duration::from_millis(50)).expect("establish generation"));
-        let snapshot = acquire_existing_exclusive_at(temp.path(), Duration::from_millis(50))
-            .expect("snapshot");
-        let error = acquire_at(temp.path(), Duration::from_millis(30))
-            .expect_err("writer must wait behind read-only snapshot");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        drop(snapshot);
-        drop(acquire_at(temp.path(), Duration::from_millis(50)).expect("writer after snapshot"));
-    }
-
-    #[test]
-    fn read_only_snapshot_never_passes_a_live_production_writer() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let writer = acquire_at(temp.path(), Duration::from_millis(50)).expect("writer");
-
-        let error = acquire_existing_exclusive_at(temp.path(), Duration::from_millis(30))
-            .expect_err("snapshot must wait or refuse while a writer can change authority");
-
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        drop(writer);
-        drop(
-            acquire_existing_exclusive_at(temp.path(), Duration::from_millis(50))
-                .expect("snapshot after writer"),
-        );
     }
 
     #[test]
