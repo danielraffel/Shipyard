@@ -384,7 +384,6 @@ pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
 mod handoff;
 #[cfg(test)]
 pub(crate) use handoff::steward_handoff_command_without_ambient;
-#[cfg(unix)]
 pub(crate) use handoff::{
     StewardHandoffArgs, steward_handoff_command, steward_handoff_transfer_report,
 };
