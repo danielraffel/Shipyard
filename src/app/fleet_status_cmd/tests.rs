@@ -2,14 +2,11 @@ use super::*;
 
 #[cfg(unix)]
 fn executable_script(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fixture");
-    let mut permissions = std::fs::metadata(path)
-        .expect("fixture metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(path, permissions).expect("fixture permissions");
+    crate::test_support::write_executable_script_with_mode(
+        path,
+        &format!("#!/bin/sh\nset -eu\n{body}\n"),
+        0o700,
+    );
 }
 
 #[cfg(unix)]
@@ -683,13 +680,8 @@ fn expected_host_config_rejects_missing_or_malformed_labels() {
 
 #[cfg(unix)]
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = temp.path().join("gh");
-    fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake gh");
-    let mut permissions = fs::metadata(&path).expect("fake gh metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).expect("chmod fake gh");
+    crate::test_support::write_executable_script(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));
     GitHubActions::new(temp.path()).with_gh_binary_for_tests(path)
 }
 

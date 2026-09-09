@@ -284,14 +284,10 @@ fn policy_rejects_a_script_wrapper_named_codex() {
     let wrapper = temp
         .path()
         .join(if cfg!(windows) { "codex.exe" } else { "codex" });
-    fs::write(&wrapper, "#!/bin/sh\nexit 0\n").expect("wrapper fixture");
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&wrapper).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&wrapper, permissions).expect("executable wrapper");
-    }
+    crate::test_support::write_executable_script(&wrapper, "#!/bin/sh\nexit 0\n");
+    #[cfg(not(unix))]
+    fs::write(&wrapper, "#!/bin/sh\nexit 0\n").expect("wrapper fixture");
     let mut configured = valid_policy();
     configured
         .data

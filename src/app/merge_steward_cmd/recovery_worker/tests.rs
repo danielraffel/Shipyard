@@ -692,14 +692,13 @@ fn witnesses_for_two_prs_in_one_repository_do_not_invalidate_each_other() {
 #[cfg(unix)]
 #[test]
 fn expired_absolute_worker_deadline_never_launches_the_model() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let worker = temp.path().join("worker.sh");
-    fs::write(&worker, "#!/bin/sh\n: > launched\n").expect("worker fixture");
-    let mut permissions = fs::metadata(&worker).expect("metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&worker, permissions).expect("executable fixture");
+    crate::test_support::write_executable_script_with_mode(
+        &worker,
+        "#!/bin/sh\n: > launched\n",
+        0o700,
+    );
     let policy = RecoveryWorkerPolicy {
         enabled: true,
         provider: "local-test".to_owned(),
@@ -735,13 +734,11 @@ fn expired_absolute_worker_deadline_never_launches_the_model() {
 #[cfg(unix)]
 #[test]
 fn supervised_worker_receives_request_on_stdin_and_returns_valid_json() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let worker = temp.path().join("worker.py");
-    fs::write(
-            &worker,
-            r#"#!/usr/bin/env python3
+    crate::test_support::write_executable_script_with_mode(
+        &worker,
+        r#"#!/usr/bin/env python3
 import json, os, sys
 request = json.load(sys.stdin)
 assert request["task"].startswith("Route this exact-head failure")
@@ -758,11 +755,8 @@ json.dump({
   "focused_tests": []
 }, sys.stdout)
 "#,
-        )
-        .expect("worker fixture");
-    let mut permissions = fs::metadata(&worker).expect("metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&worker, permissions).expect("executable fixture");
+        0o700,
+    );
     let policy = RecoveryWorkerPolicy {
         enabled: true,
         provider: "local-test".to_owned(),
