@@ -47,12 +47,8 @@ head drift, cancellation, timeout, and ambiguous process loss each need an
 explicit disposition or wake owner.
 
 Until the receipt reports `monitoring_transferred=true`, the originating agent
-retains the last monitoring obligation. Durable publication creates a
-zero-wake daemon obligation; it does not launch a provider process. Stop
-monitor-only children after transfer, but continue independent runnable work by
-default. Park only when the exact machine-readable tuple is
-`monitoring_transferred=true`, `agent_disposition=pause`, and
-`pause_required=true`, backed by `--after-handoff pause --task-graph`.
+retains the last monitoring obligation. Stop monitor-only children after
+transfer, but continue independent runnable work by default.
 
 Shipyard records terminal provenance using explicit terminal contracts. A
 HerdR handoff requires `HERDR_ENV=1` plus workspace, tab, and pane identity;
@@ -65,16 +61,6 @@ and provider-session identifiers stay in Shipyard's private ledger and are not
 published to GitHub. Typed provenance is only a wake address: until a trusted
 consumer advertises availability, it does not authorize pausing, resuming, or
 transferring monitoring.
-
-When an exact wrapper or provider-specific resume command must survive the
-handoff, pass a private `LaunchProfileV1` JSON file with `--launch-profile`.
-Preserve launch and resume argv as exact arrays; never translate provider flags
-or put credentials in the profile. The contract also binds opaque
-provider/account/model metadata, checkpoint generation/digest, and exact
-repository/worktree/head/lineage provenance. Shipyard never executes the
-stored argv directly. It validates the prompt-free native grammar, projects
-typed model/reasoning options into the pinned provider adapter, and reports
-transfer only after durable publication. See `docs/launch-profile.md`.
 
 After an acknowledged handoff whose receipt proves monitoring is transferred:
 
@@ -93,9 +79,6 @@ After an acknowledged handoff whose receipt proves monitoring is transferred:
   blindly repeated. Session death, quota exhaustion, host reboot, and
   offline/rejoin must not erase an acknowledged obligation.
 
-See `docs/post-handoff-disposition.md` for the task-graph schema, crash windows,
-and Pulp/Forge Modular/Forge Sequencer/Vellum workflow rules.
-
 This contract applies to bounded jobs as well as PRs: CMake/CTest proofs,
 artifact builds, release publication, notarization, benchmark matrices, cache
 prewarming, and fleet canaries are examples. Do not hand Shipyard open-ended
@@ -108,59 +91,6 @@ authority. Linear may receive an asynchronous, idempotent projection for human
 visibility and planning, but Linear failure must never block execution, wake,
 repair routing, queue admission, or merge. Never project provider session IDs,
 credentials, private paths, or raw prompts.
-
-## Custody carrier setup and teardown
-
-Cross-machine custody stays default-off until the owner supplies the complete
-private host contract. Start with the no-write plan, apply only that exact
-manifest, and retain the returned policy digest:
-
-```bash
-shipyard --json custody provision --input /owner/private/custody.toml
-shipyard --json custody provision --input /owner/private/custody.toml --apply
-shipyard --json custody doctor
-```
-
-The manifest must be owner-only and contain both top-level
-`schema_version = 1` and `custody_transport.setup_contract_version = 1`.
-Doctor validates bounded include-expanded `/usr/sbin/sshd -T` output rather
-than scanning one config file: it requires `ExposeAuthInfo yes`, the exact
-`Subsystem shipyard-custody-v1 <receiver> --mode shipyard work-ledger
-custody-receive` argv, and an effective `AuthorizedKeysFile` that resolves to
-the configured path. Authorized-key checks accept OpenSSH options such as
-`restrict` but still bind the exact peer key. Each outbound private identity
-and inbound public key is directional and digest-pinned.
-
-SSH provisioning is not sufficient readiness. The same policy must bind valid
-owner-only destination-bootstrap, native-publication, and private-profile
-receipts for the exact machine, incarnation, route, and authority. Shipyard
-does not create or infer those prerequisites. Missing, unknown, legacy, stale,
-or mismatched setup evidence remains not-ready; migrate a legacy policy through
-supported exact-digest removal and reprovisioning, never manual TOML edits.
-
-Return the carrier to default-off through the supported dry-run/apply pair:
-
-```bash
-shipyard --json custody disable --policy-digest <doctor-policy-digest>
-shipyard --json custody disable --policy-digest <doctor-policy-digest> --apply
-shipyard --json custody doctor
-```
-
-Disable rereads the exact generation under the exclusive writer-domain lease,
-refuses while custody state is active or indeterminate, commits a durable
-intent before config publication, removes only the matching
-`[custody_transport]` table, and commits an immutable completion receipt only
-after exact config and custody-schema/history readback. Intents are globally
-sequenced and chained to the prior receipt: an unresolved generation blocks all
-provisioning, while an identical supported reprovision creates a distinct next
-disable generation. Re-running after interruption resumes only the pending
-intent; drift, live/orphan SQLite sidecars, custody topology mismatch,
-ambiguity, and malformed or replayed receipts refuse. Dry-run creates no lock
-or SQLite files. Disable preserves unrelated machine configuration and all
-custody history, and never deletes SSH keys, `authorized_keys`, `known_hosts`,
-or terminal custody receipts. See
-[`docs/durable-custody-transport.md`](../../docs/durable-custody-transport.md)
-for the full manifest and host-runbook boundary.
 
 ## First Steps
 
@@ -1817,8 +1747,8 @@ exact-head management authority before making the final POST.
 Stewardship is opt-in per immutable head. Prefer making the receipt atomic with
 PR creation: set `[merge_steward].auto_handoff = true` on the protected base
 branch and run `shipyard pr`, optionally adding `--workstream-id ID
---context-url URL --launch-profile PRIVATE_JSON`. Shipyard never trusts the PR
-branch to enable that default.
+--context-url URL`. Shipyard never trusts the PR branch to enable that
+default.
 Immediately after the PR exists and before validation starts, Shipyard writes
 the receipt; without explicit values it uses `OWNER/REPO#PR` and the PR URL.
 Use `--no-steward-handoff` only as an explicit project-default override.
@@ -1851,7 +1781,7 @@ wait behind unrelated work only to fail at worker start. Never auto-adopt.
 
 For an already-created PR, the submitting agent must run
 `shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
---workstream-id ID [--context-url URL] [--launch-profile PRIVATE_JSON] --apply`.
+--workstream-id ID [--context-url URL] --apply`.
 That command writes a
 successful `shipyard/steward-handoff` status on the expected head, re-reads the
 PR, and only then adds `shipyard:managed` and removes `shipyard:unmanaged`.
@@ -1892,101 +1822,7 @@ rather than blocking unrelated stewardship.
 See [references/merge-steward.md](references/merge-steward.md) for the config,
 schema, limits, and exact authority boundary.
 
-Use `shipyard work-ledger status --json` to inspect whether the canonical
-lifecycle shadow exists without creating it. Authentic schema v11 is inspected
-through the same immutable snapshot boundary as inventory, without migration or
-WAL creation. Native publication dry-run returns a typed disposition for every
-bound v11 row; apply revalidates the exact snapshot under the exclusive writer
-domain, migrates and binds only the authenticated work ID/repository/PR/head/
-workstream tuple, then requires exact reread/replay. Foreign lineage, ambiguity,
-TOCTOU drift, or any unrelated unbound work row refuses. Use `shipyard work-ledger
-inventory --json` for a bounded, deterministically ordered immutable view of
-local work. Inventory opens only existing storage, never creates or migrates a
-database or takes writer custody. A valid migrated legacy `NULL,NULL`
-repository identity makes `complete=false`; malformed or half-bound identity
-and a noncanonical `GEN-N` handle refuse the whole snapshot.
-
-Use `shipyard work-ledger reconcile-terminal --json` to inventory native
-`terminal_handoff` rows that lack their immutable projection binding. The
-bounded, redacted, no-write result separates exact already-terminal repair
-targets from clean publication precursors, managed-unbound rows, and blocked
-rows; bounded related-state counts and explicit blockers prevent incomplete
-rows from disappearing or becoming repair authority. Select
-one exact repository/PR/head for a dry-run; add `--apply` only after reviewing
-the authenticated terminal-head/base proof. Terminal authority is typed: a
-merged PR requires its exact merge commit and merge timestamp, while a PR
-closed without merging requires an exact close timestamp and the absence of
-merge evidence. The latter is recorded as `closed_unmerged`; it never mints or
-implies merge authority. An exact dispatching row is eligible
-only when one exact wake/delivery is durably uncertain and its activation epoch
-is released; dry-run projects the terminal receipt without writing. Apply
-re-reads the same typed GitHub outcome inside the writer transaction, atomically
-terminalizes that fenced row with evidence bound to the GitHub/wake/delivery identities, then
-continues the ordinary terminal projection repair. Apply may add only the immutable provider receipt, projection
-binding, its schema-required inert ownership-root identity, and the
-dispatch-to-terminal and terminal-to-terminal audit events. The root is not ownership authority: apply
-creates no agent ownership, holder material, bootstrap eligibility, or lease.
-It never creates or changes a route, wake, continuation, custody record,
-activation epoch, or projection intent. Historical unrelated wakes remain unchanged. Ambiguous
-targets, active activation/work, incomplete local authority, GitHub movement, an orphan ownership root,
-or any receipt/binding/event disagreement refuse. The same exact targeted
-command after success is a write-free replay; do not use direct SQL.
-
-Use `shipyard work-ledger import
---json` for the deterministic no-write plan, then `--apply` only when a shadow
-import is intended. Import is idempotent, redacted, and fail-closed: it selects
-canonical fields and opaque digests from legacy stores, leaves those stores
-authoritative and untouched, and cannot schedule, wake, call a model, mutate
-GitHub, or project to Linear. Both activation and dispatch remain disabled.
-
-### Successor ownership recovery
-
-Normal context acknowledgement atomically mints the ledger-owned root, first
-lease, and holder material. `work-ledger ownership bootstrap` is only for an
-acknowledged pre-v13 ownership. Holder material is secret mutation authority:
-read it from an owner-only file or strict stdin and write every bootstrap,
-renew, or adoption result to a new owner-only `--holder-output`; never put the
-material in argv, public inventory, status, or logs.
-
-- `shipyard work-ledger ownership renew --ownership <ao_id>
-  --expected-generation <n> --expires-at <RFC3339> --holder <file-or-stdin>
-  --holder-output <new-file>` rotates both the lease generation and holder.
-  Replace the old holder; it cannot authorize later mutations.
-- `shipyard work-ledger ownership release --ownership <ao_id>
-  --expected-generation <n> --holder <file-or-stdin>` records the explicit durable
-  release while leaving the acknowledged ownership adoptable.
-- `shipyard work-ledger ownership adopt --ownership <ao_id>
-  --expected-generation <n> --expires-at <RFC3339> --proof <file-or-stdin>
-  --holder-output <new-file>` accepts only exact JSON proof
-  `{"kind":"expired","expected_expires_at":"<RFC3339>"}` or
-  `{"kind":"explicit_release","release_digest":"<64hex>"}`. Adoption is
-  atomic, increments `owner_generation`, and safely replays the same successor
-  generation and material into a new output file. Supplying `--holder
-  <private-file>` authenticates attachment to that exact already-active holder;
-  it cannot authorize a different successor.
-
-There is no confirmed-dead mode: do not invent issuer receipts, infer death
-from a missing session, or use Linear/correlation identifiers as the root UUID.
-For remote custody, run `work-ledger ownership custody-prepare` with the exact
-current lease generation and holder, then allow the daemon reconciler to drive
-prepare/acknowledge/finalize or authenticated abort. Adoption rotates the
-holder/session identity but does not rotate the static transport-daemon
-endpoint policy. Custody authorization binds repository provider/id, PR, head,
-workstream, root UUID, lease ID/generation/expiry, and re-reads the live tuple
-at each commit; never bypass the reconciler with direct database edits.
-
-Use `shipyard --json work-ledger custody-inventory --message wm_<64hex>` to
-query only the protected destination selected by the source ledger's exact
-active custody rebind. Accepted or processed custody returns a fully
-revalidated bounded `complete` or `partial` inventory. Pending or claimed
-custody returns `uncertain` without SSH; cancelled, superseded, missing, or
-contradictory custody returns `refused`. The request binds the complete
-source/target/rebind/transfer tuple and travels through the existing forced SSH
-subsystem with no host or shell argument. Optional `--correlation-hints` reads
-an owner-only no-follow file containing immutable Linear workspace/root UUID
-and provider repository IDs; hints appear only in local output and never cross
-the wire, affect the digest, or select authority.
-The daemon does run a subscriber-independent **read-only shadow observer** over
+The daemon runs a subscriber-independent **read-only shadow observer** over
 policy-covered native nonterminal exact PR heads; inert `shadow_imported`
 history is never scheduled. Relevant webhooks debounce for two
 seconds with a ten-second maximum burst age; overflow is requeued. A missed-
@@ -2044,33 +1880,11 @@ exact head and generations. Terminal runtime (cmux or opted-in HerdR), agent
 session, and provider routing (explicit Direct, Subrouter, or CLIProxyAPI) are
 separate. Missing provenance fails closed without direct-provider or fresh-agent
 fallback. Protected session-header material has both a resolvable opaque
-reference and a digest, and the native session and launch profile must agree on
-one wrapper reference. Registered future terminal/provider adapters preserve
+reference and a digest. Registered future terminal/provider adapters preserve
 the same versioned lifecycle boundary and require an active protected adapter
 record with exact generation, revision, and implementation/configuration/
 capability digests. Imported records remain inert until both continuation outcomes exist
 and a legal typed transition records its audit event transactionally.
-The internal wake-consumer seam holds a host-local exclusive lease, records
-append-only ownership epochs, binds the protected launch-profile and provider
-identities, and durably claims and finalizes exact-array provider launches. No
-CLI, daemon, or schedule can activate it. Restart may reconcile an idempotent
-claim only after the prior live lease is gone; ambiguous non-idempotent delivery
-stays `uncertain` and is never blindly repeated.
-Use `shipyard work-ledger policy set` to plan a per-repository platform policy;
-apply requires the exact current revision. The primary platform is explicit
-(use macOS for Pulp, Forge, and Vellum), with a complete repeatable
-`--compatibility-lane` inventory and independent compatibility scheduling.
-Repository identity is canonical lowercase across daemon arguments, handoffs,
-and policy lookup, even when the daemon is launched with GitHub's display-case
-spelling.
-Repeat `--declared-dependency-lane` only for an inventoried lane with a real
-artifact dependency; unknown lanes fail closed and other
-cross-lane blocking requires evidenced shared-integrity fault. A policy row
-enrolls that repository in shadow observation and is attached to evidence, but
-cannot influence GitHub or queue state in the current phase. Keep separate
-revision-fenced rows for `generous-corp/pulp`, `generous-corp/forge`, and
-`generous-corp/vellum`; change one row when a repository needs a different
-platform or dependency rule rather than changing a fleet-wide default.
 
 The preferred unattended credential has Commit statuses and Issues read/write.
 A local read-oriented GitHub App that receives the exact integration-permission
