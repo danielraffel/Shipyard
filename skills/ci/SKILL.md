@@ -2278,3 +2278,16 @@ including the journal's `0/1` field and the recovery/republish path, funnel
 through `tag_requires_companion` (`fleet_update_cmd.rs:684`, `command.rs:53/73/93`,
 `evidence.rs:1864`), so a half-fix stranding a resumed update is not possible
 there.
+
+### A contention test that flakes only on a loaded runner: suspect the helper's exit code
+
+When a cross-process contention test fails intermittently on a slow host and the
+failure names the *verdict* (`observation_in_progress` vs `admit`), check the
+subprocess helper's timeout path before reading anything into the admission
+logic. If the helper releases its lock on a deadline and exits with the same code
+as a commanded release, the parent cannot detect that its contention assertion
+was measured against an already-unlocked state, and the reported failure points
+away from the cause. Reproducing it needs the host to be slow, not the code to be
+wrong, so a green local rerun is not evidence. The worked example and the
+two-direction control are in the `shipyard` skill under "A subprocess helper's
+exit code must distinguish \"obeyed\" from \"gave up\"".

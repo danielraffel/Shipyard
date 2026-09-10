@@ -2895,3 +2895,38 @@ grep -rn -A1 '#\[cfg(unix)\]\|#\[cfg(windows)\]' src/ | grep 'pub(crate) use\|pu
 Cross-compiling to check is not always available here: `cargo check --target
 x86_64-pc-windows-msvc` fails on `libsqlite3-sys`, which needs a Windows C
 toolchain. So the grep, plus the Windows CI leg, is the real defence.
+
+### A subprocess helper's exit code must distinguish "obeyed" from "gave up"
+
+Cross-process tests here spawn the test binary as its own lock holder, hand it a
+release marker path, and assert its exit code. `admission_observation_lock_child`
+waited five seconds for that marker and then exited `87` **whether or not the
+marker ever appeared**, so one code meant two opposite things:
+
+```rust
+let deadline = Instant::now() + Duration::from_secs(5);
+while !release.exists() && Instant::now() < deadline { … }
+std::process::exit(87);            // released on command, or gave up — same code
+```
+
+That makes the parent's `assert_eq!(code, Some(87))` unfalsifiable, and it is
+worse than a merely weak assertion: when the holder gives up early it also
+**drops the lock**, so the parent's earlier "a contender must defer" verdict was
+measured against an unlocked state. The test then fails at the verdict, pointing
+at admission logic that is fine, and it only does so on a host slow enough to
+exceed the window — which is why it reads as an unreproducible flake
+(`cross_process_contender_defers_and_owner_death_forces_fresh_observation`
+passes in ~2.8s locally against a 5s budget).
+
+Write the two outcomes as two codes, and size the bound as an orphan guard
+rather than as a guess at how long the parent takes:
+
+```rust
+std::process::exit(if release.exists() { RELEASED_EXIT } else { TIMED_OUT_EXIT });
+```
+
+Confirm it in both directions by running the helper directly — `--exact <name>
+--ignored`, with the three `SHIPYARD_ADMISSION_LOCK_CHILD_*` variables set —
+once with a marker written and once with none. Before this change the no-marker
+run exited 87 after 5s; a fix is only real when that run reports the timeout
+code.
