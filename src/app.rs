@@ -1262,8 +1262,19 @@ fn handle_ship_state_command<W: Write>(
             let config = LoadedConfig::load_from_cwd(mode, cwd)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             let stale_after = crate::ship_liveness::orphan_stale_after(&config);
+            // Read-only: `list` never mutates a record. The lifecycle read fails
+            // closed (auth error => `Unknown` => the record stays flagged), and
+            // `ship_state_list` only calls it for records the queue already
+            // flagged, so a healthy store issues no GitHub calls at all.
+            let gh_client = crate::gh::GhClient::from_cwd(mode, cwd).ok();
+            let mut lifecycle_of = |repo: &str, pr: u64| {
+                crate::ship_liveness::PrLifecycle::from_gh_state(
+                    crate::gh::pr_lifecycle_state(gh_client.as_ref(), repo, pr, cwd, None)
+                        .as_deref(),
+                )
+            };
             crate::ship_liveness::with_liveness_context(state_dir, stale_after, |liveness| {
-                ship_state_list(store, liveness, json, stdout)
+                ship_state_list(store, liveness, &mut lifecycle_of, json, stdout)
             })
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
