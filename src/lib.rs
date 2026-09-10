@@ -313,6 +313,147 @@ pub(crate) mod test_support {
         let _guard = lock_process_tree_for_test();
     }
 
+    /// Write an executable shell fixture without ever holding a writable
+    /// descriptor on it in this process.
+    ///
+    /// A test that writes a script and then runs it races the rest of the
+    /// suite. Writing the file here leaves a writable descriptor open on the
+    /// inode for the duration of the write, and any other test thread that
+    /// spawns a process in that window forks first and execs second. The forked
+    /// child inherits a duplicate of that descriptor until its own exec runs,
+    /// because `O_CLOEXEC` closes descriptors at exec and not at fork. While
+    /// the duplicate is open the kernel refuses to exec the inode and returns
+    /// `ETXTBSY` (`Text file busy`, os error 26).
+    ///
+    /// Giving each test its own directory does not help: the descriptor refers
+    /// to the inode, not the path. Staging the script and renaming it into
+    /// place does not help either, for the same reason. Only Linux enforces the
+    /// rule, so the failure is invisible on macOS and surfaces on the Linux
+    /// leg, most often under coverage instrumentation where every process lives
+    /// longer and the fork window widens.
+    ///
+    /// So a child process opens the file, writes it, and marks it executable,
+    /// and this call waits for that child to exit. No thread of this process
+    /// ever owns a writable descriptor on the script, no sibling fork can
+    /// inherit one, and the file is exec-ready the moment this returns.
+    pub(crate) fn write_executable_script(path: &Path, contents: &str) {
+        write_executable_script_with_mode(path, contents, 0o755);
+    }
+
+    /// `write_executable_script` with an explicit permission mode.
+    pub(crate) fn write_executable_script_with_mode(path: &Path, contents: &str, mode: u32) {
+        use std::io::Write as _;
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"cat > "$1" && chmod "$2" "$1""#)
+            .arg("shipyard-write-executable-script")
+            .arg(path)
+            .arg(format!("{mode:o}"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn writer for {}: {error}", path.display()));
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .unwrap_or_else(|| panic!("writer stdin for {}", path.display()));
+        // A writer that died early, on a missing parent directory say, closes
+        // the pipe and this write then fails with EPIPE. The child's own exit
+        // status and stderr name the real cause, so report those first and keep
+        // the write error as a fallback.
+        let written = stdin.write_all(contents.as_bytes());
+        drop(stdin);
+
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|error| panic!("await writer for {}: {error}", path.display()));
+        assert!(
+            output.status.success(),
+            "writer failed for {}: {} {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        written.unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    }
+
+    #[test]
+    fn a_script_it_writes_is_executable_immediately() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("fixture");
+        write_executable_script(&path, "#!/bin/sh\nexit 7\n");
+        let status = Command::new(&path).status().expect("run fixture");
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    fn it_honours_an_explicit_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("fixture");
+        write_executable_script_with_mode(&path, "#!/bin/sh\nexit 7\n", 0o700);
+        let mode = std::fs::metadata(&path)
+            .expect("fixture metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// Force the race the helper exists to remove, then show the helper is
+    /// clear of it.
+    ///
+    /// The subject runs first and proves this body and mode execute at all. The
+    /// control then proves that the identical body, written in this process with
+    /// the handle still open, is refused with errno 26. Without that pairing the
+    /// subject would pass on any kernel that never enforces `ETXTBSY` and would
+    /// be proving nothing. Only Linux enforces it, so this runs only there.
+    ///
+    /// The control deliberately never re-execs after closing its handle. That
+    /// exec is the very shape this helper exists to remove: a sibling thread
+    /// that forked during the write still holds an inherited duplicate, so the
+    /// exec can fail for a reason that has nothing to do with this test. The
+    /// subject already establishes that the body and mode are runnable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_retained_write_handle_is_the_race_the_helper_removes() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let body = "#!/bin/sh\nexit 7\n";
+
+        let fixed = temp.path().join("fixed");
+        write_executable_script(&fixed, body);
+        assert_eq!(
+            Command::new(&fixed).status().expect("run fixture").code(),
+            Some(7),
+            "the helper must write a body that execs immediately"
+        );
+
+        let busy = temp.path().join("busy");
+        let mut handle = std::fs::File::create(&busy).expect("create control");
+        handle.write_all(body.as_bytes()).expect("write control");
+        handle.flush().expect("flush control");
+        let mut permissions = std::fs::metadata(&busy)
+            .expect("control metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&busy, permissions).expect("chmod control");
+        let refused = Command::new(&busy)
+            .status()
+            .expect_err("exec must be refused while the write handle is open");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(26),
+            "control did not reproduce ETXTBSY, so this test proves nothing"
+        );
+        drop(handle);
+    }
+
     /// Compile a tiny native fixture when a security boundary deliberately
     /// rejects script wrappers. The fixture is scoped to the caller's tempdir.
     pub(crate) fn compile_native_test_program(

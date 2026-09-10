@@ -2,13 +2,8 @@ use super::*;
 
 #[cfg(unix)]
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = temp.path().join("gh");
-    fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake gh");
-    let mut permissions = fs::metadata(&path).expect("fake gh metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).expect("chmod fake gh");
+    crate::test_support::write_executable_script(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));
     let config = crate::config::LoadedConfig {
         data: toml::Table::new(),
         global_dir: temp.path().join("global"),

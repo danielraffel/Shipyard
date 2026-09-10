@@ -184,12 +184,9 @@ fn valid_status_provenance_revocation_supersedes_but_malformed_status_errors() {
 #[cfg(unix)]
 #[test]
 fn app_bound_failure_uses_bounded_rest_identity_hydration() {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = temp.path().join("gh");
-    fs::write(
+    crate::test_support::write_executable_script(
         &binary,
         r#"#!/bin/sh
 set -eu
@@ -199,11 +196,7 @@ case "$*" in
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
-    )
-    .expect("fake gh");
-    let mut permissions = fs::metadata(&binary).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&binary, permissions).expect("permissions");
+    );
     let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary);
     let request = app_bound_request();
 
@@ -222,9 +215,6 @@ esac
 #[cfg(unix)]
 #[test]
 fn truncated_rollup_uses_complete_rest_checks_and_statuses_without_app_binding() {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = temp.path().join("gh");
     let request = unbound_request();
@@ -264,10 +254,7 @@ esac
         super::super::super::HANDOFF_CONTEXT,
         super::super::super::RECOVERY_CONTEXT,
     );
-    fs::write(&binary, script).expect("fake gh");
-    let mut permissions = fs::metadata(&binary).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&binary, permissions).expect("permissions");
+    crate::test_support::write_executable_script(&binary, &script);
     let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary);
 
     assert!(matches!(
@@ -280,12 +267,9 @@ esac
 #[cfg(unix)]
 #[test]
 fn github_transport_rejects_stdout_and_stderr_past_explicit_byte_limits() {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = temp.path().join("gh");
-    fs::write(
+    crate::test_support::write_executable_script(
         &binary,
         r#"#!/bin/sh
 set -eu
@@ -295,11 +279,7 @@ case "${1:-}" in
   *) exit 3 ;;
 esac
 "#,
-    )
-    .expect("fake gh");
-    let mut permissions = fs::metadata(&binary).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&binary, permissions).expect("permissions");
+    );
     let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary);
 
     for stream in ["stdout", "stderr"] {
@@ -319,14 +299,13 @@ esac
 #[test]
 fn github_transport_does_not_wait_on_an_escaped_descendants_stdio() {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = temp.path().join("gh");
     let pid_path = temp.path().join("gh.pid");
     let ready_path = temp.path().join("gh.ready");
-    fs::write(
+    crate::test_support::write_executable_script(
         &binary,
         r#"#!/bin/sh
 set -eu
@@ -346,11 +325,7 @@ IFS= read -r signal < "$2"
 [ "$signal" = ready ]
 printf ready
 "#,
-    )
-    .expect("fake gh");
-    let mut permissions = fs::metadata(&binary).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&binary, permissions).expect("permissions");
+    );
     let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary);
 
     // The direct gh process exits only after its child has escaped the

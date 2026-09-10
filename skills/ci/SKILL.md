@@ -1863,10 +1863,21 @@ expected — waking is then the proof — and keep the bound only where "nothing
 happened" is the expected result.
 
 **Write-then-exec (`ETXTBSY`, errno 26).** A fixture written and immediately
-executed can fail with `ETXTBSY` while the writing fd is still open. Renaming
-into place does **not** fix it: the fd refers to the inode, not the path. Probe
-the binary until it runs (`--probe` short-circuit so the probe stays out of the
-call log). Linux enforces this and macOS does not, so it is invisible locally.
+executed can fail with `ETXTBSY` while *any* process holds a writing fd on that
+inode, and it need not be your own. `O_CLOEXEC` closes at exec, not at fork, so
+a sibling test thread that spawns a child during your `fs::write` leaves that
+child holding an inherited duplicate of your write fd until it execs, and your
+own exec is what fails. Neither a per-test `tempdir` nor a rename into place
+helps, because the fd refers to the inode and not to the path. Write the fixture
+from a child process instead: `crate::test_support::write_executable_script`
+(and `write_executable_script_with_mode` when the mode is not `0o755`) pipes the
+body to a `/bin/sh` writer and waits for it, so no thread of the test process
+ever holds a writable fd on the script and a sibling fork has nothing to
+inherit. The handful of sites predating that helper absorb the race instead, by
+probing the binary until it runs (`--probe` short-circuit so the probe stays out
+of the call log); prefer the helper in new code. Linux enforces this and macOS
+does not, so it is invisible locally and usually surfaces first on the coverage
+lane, whose instrumentation widens the window.
 
 **Running a different command than CI does.** Before concluding the repo is
 broken, read the workflow's own command and env. `cargo test --lib` aborts on a

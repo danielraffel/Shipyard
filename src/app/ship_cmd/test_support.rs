@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 use toml::Table;
@@ -71,10 +69,7 @@ pub(super) fn seed_repo_with_local_origin(repo: &std::path::Path, remote: &std::
 
 #[cfg(unix)]
 pub(super) fn fake_gh(path: &std::path::Path, script_body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{script_body}\n")).expect("fake gh");
-    let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).expect("chmod");
+    crate::test_support::write_executable_script(path, &format!("#!/bin/sh\n{script_body}\n"));
 }
 
 pub(super) fn loaded_config(root: &std::path::Path) -> LoadedConfig {

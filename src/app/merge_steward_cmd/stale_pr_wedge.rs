@@ -757,8 +757,6 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // End-to-end fixture keeps the two reads and sole POST visible.
     fn exact_final_revalidation_sends_one_cancel_and_persists_receipt() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("temp");
         let calls = temp.path().join("calls");
         let gh = temp.path().join("gh");
@@ -780,10 +778,7 @@ esac
 "#,
             calls.display()
         );
-        fs::write(&gh, script).expect("fake gh");
-        let mut permissions = fs::metadata(&gh).expect("gh metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&gh, permissions).expect("chmod gh");
+        crate::test_support::write_executable_script(&gh, &script);
         let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(gh);
 
         let mut live_pr = super::super::parse_pr(
