@@ -28,6 +28,15 @@
 //!   not proof; only flagged once the state is also time-stale.
 //! - [`OrphanEvidence::TimeFallback`] — the queue could not be consulted; the
 //!   pure `updated_at` staleness heuristic is used, also time-gated.
+//!
+//! Queue evidence alone is not enough to call a record a *stall*, because it
+//! only answers "is a worker still working on this?". A pull request reaches a
+//! terminal state on GitHub's timeline, not Shipyard's — GitHub-native
+//! auto-merge lands a PR with no Shipyard worker involved at all. A record left
+//! in flight against a merged or closed PR is therefore a leftover, not an
+//! orphan blocking a merge. [`reconcile_finding`] folds [`PrLifecycle`] into the
+//! queue verdict so the two are reported differently, and fails closed: an
+//! unreadable PR state keeps the orphan verdict.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -91,6 +100,111 @@ impl OrphanEvidence {
             Self::TimeFallback => "no update and queue unavailable",
         }
     }
+}
+
+/// The pull request's own lifecycle, as GitHub reports it.
+///
+/// The queue can only answer "is a worker still working on this?". It cannot
+/// answer "does this record still describe live work?", because a pull request
+/// merges or closes on GitHub's timeline, not Shipyard's — GitHub-native
+/// auto-merge in particular lands a PR without any Shipyard worker reaching a
+/// verdict. A ship-state left in flight against a merged PR is therefore not a
+/// stalled validation at all; it is a leftover record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrLifecycle {
+    /// The PR is open — a stalled record really is holding up live work.
+    Open,
+    /// The PR merged. The record describes work that already landed.
+    Merged,
+    /// The PR was closed without merging. The record describes abandoned work.
+    Closed,
+    /// The PR state could not be read. Fails closed: treated as still open, so
+    /// an unreachable GitHub never silently downgrades a real orphan.
+    #[default]
+    Unknown,
+}
+
+impl PrLifecycle {
+    /// Map GitHub's `state` field (`OPEN` / `CLOSED` / `MERGED`, case-insensitive).
+    /// Anything unrecognised — including `None` — is [`PrLifecycle::Unknown`].
+    #[must_use]
+    pub fn from_gh_state(state: Option<&str>) -> Self {
+        match state.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("merged") => Self::Merged,
+            Some(value) if value.eq_ignore_ascii_case("closed") => Self::Closed,
+            Some(value) if value.eq_ignore_ascii_case("open") => Self::Open,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Machine-stable label used in JSON and human output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the pull request has reached a terminal state, so no Shipyard
+    /// verdict can ever be owed on it again.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Merged | Self::Closed)
+    }
+}
+
+/// A ship-state that is in flight against a pull request that already reached a
+/// terminal state. The record is stale, not stalled: nothing is waiting on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ResolvedReport {
+    /// Which terminal state the pull request reached.
+    pub lifecycle: PrLifecycle,
+    /// How the record *would* have been flagged had the PR still been open.
+    pub evidence: OrphanEvidence,
+    /// Minutes since the ship-state's `updated_at`.
+    pub stalled_minutes: i64,
+}
+
+/// What a stalled in-flight ship-state actually is, once its pull request's own
+/// lifecycle is taken into account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LivenessFinding {
+    /// The PR is open, or its state could not be read: a genuine suspected
+    /// orphan. `lifecycle` is carried so a caller can distinguish "provably
+    /// still open" from "unverified", which are different things to tell an
+    /// operator.
+    Orphaned {
+        /// The queue-derived orphan classification.
+        report: OrphanReport,
+        /// [`PrLifecycle::Open`] or [`PrLifecycle::Unknown`].
+        lifecycle: PrLifecycle,
+    },
+    /// The PR is merged or closed: a leftover record, reapable.
+    Resolved(ResolvedReport),
+}
+
+/// Reconcile a queue-derived orphan report against the pull request's own
+/// lifecycle.
+///
+/// The queue evidence establishes only that no worker is finishing this record.
+/// Whether that matters depends entirely on the PR: a merged or closed PR can
+/// never be owed a verdict, so its record is [`LivenessFinding::Resolved`]
+/// (reapable) rather than an orphan blocking anything. An open — or unreadable —
+/// PR keeps the orphan verdict, so a GitHub outage can never hide a real stall.
+#[must_use]
+pub fn reconcile_finding(report: OrphanReport, lifecycle: PrLifecycle) -> LivenessFinding {
+    if lifecycle.is_terminal() {
+        return LivenessFinding::Resolved(ResolvedReport {
+            lifecycle,
+            evidence: report.evidence,
+            stalled_minutes: report.stalled_minutes,
+        });
+    }
+    LivenessFinding::Orphaned { report, lifecycle }
 }
 
 /// A ship-state judged (probably) orphaned, with the evidence that established
@@ -730,5 +844,75 @@ mod tests {
             context.classify(&other, Utc::now()).is_none(),
             "fresh unmatched PR must not flag"
         );
+    }
+
+    #[test]
+    fn pr_lifecycle_parses_gh_state_case_insensitively() {
+        assert_eq!(
+            PrLifecycle::from_gh_state(Some("MERGED")),
+            PrLifecycle::Merged
+        );
+        assert_eq!(
+            PrLifecycle::from_gh_state(Some("merged")),
+            PrLifecycle::Merged
+        );
+        assert_eq!(
+            PrLifecycle::from_gh_state(Some(" CLOSED ")),
+            PrLifecycle::Closed
+        );
+        assert_eq!(PrLifecycle::from_gh_state(Some("OPEN")), PrLifecycle::Open);
+        // An unreadable or unexpected state must never be mistaken for a
+        // terminal one: the caller keeps its orphan verdict.
+        assert_eq!(PrLifecycle::from_gh_state(None), PrLifecycle::Unknown);
+        assert_eq!(PrLifecycle::from_gh_state(Some("")), PrLifecycle::Unknown);
+        assert_eq!(
+            PrLifecycle::from_gh_state(Some("draft")),
+            PrLifecycle::Unknown
+        );
+        assert!(!PrLifecycle::Unknown.is_terminal());
+        assert!(!PrLifecycle::Open.is_terminal());
+        assert!(PrLifecycle::Merged.is_terminal());
+        assert!(PrLifecycle::Closed.is_terminal());
+    }
+
+    #[test]
+    fn reconcile_finding_downgrades_only_terminal_pull_requests() {
+        let report = OrphanReport {
+            evidence: OrphanEvidence::QueueTerminal,
+            stalled_minutes: 135,
+        };
+
+        match reconcile_finding(report, PrLifecycle::Merged) {
+            LivenessFinding::Resolved(resolved) => {
+                assert_eq!(resolved.lifecycle, PrLifecycle::Merged);
+                // The evidence and the stall duration survive the downgrade:
+                // the record really did stall, it just blocks nothing now.
+                assert_eq!(resolved.evidence, OrphanEvidence::QueueTerminal);
+                assert_eq!(resolved.stalled_minutes, 135);
+            }
+            other @ LivenessFinding::Orphaned { .. } => {
+                panic!("merged PR must resolve, got {other:?}")
+            }
+        }
+
+        assert!(matches!(
+            reconcile_finding(report, PrLifecycle::Closed),
+            LivenessFinding::Resolved(_)
+        ));
+        // Fail closed on both non-terminal cases.
+        for lifecycle in [PrLifecycle::Open, PrLifecycle::Unknown] {
+            match reconcile_finding(report, lifecycle) {
+                LivenessFinding::Orphaned {
+                    report: kept,
+                    lifecycle: seen,
+                } => {
+                    assert_eq!(kept, report);
+                    assert_eq!(seen, lifecycle);
+                }
+                other @ LivenessFinding::Resolved(_) => {
+                    panic!("{lifecycle:?} must stay orphaned, got {other:?}")
+                }
+            }
+        }
     }
 }

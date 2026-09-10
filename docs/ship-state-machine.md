@@ -643,12 +643,58 @@ flagged. The time threshold gates only the weak signals, defaults to 45 minutes,
 and is configurable via `[ship_state] orphan_stale_minutes`. Human output adds an
 `ORPHANED? [<evidence>]:` line; JSON adds `orphaned: [{pr, stalled_minutes,
 evidence}]` (`ship-state list`) / `orphaned_ship_states` (`status`). It cannot
-affect merge readiness — a flagged state is in flight, which auto-merge already
-refuses. Recovery stays operator-driven (`shipyard ship <pr>` to re-validate, or
+affect merge readiness — a flagged state is in flight, which Shipyard's own
+auto-merge gate already refuses. Recovery stays operator-driven (`shipyard ship <pr>` to re-validate, or
 `ship-state discard`) unless the opt-in daemon abandon sweep is enabled — see T14,
 which acts on the strongest (`queue_stale`) evidence this diagnostic surfaces. The
 `QueueMatch` the classifier returns carries the owning `Job` so the sweep records
 the dead worker's id.
+
+### The queue is not the pull request: terminal-PR reconciliation
+
+Queue evidence answers "did the worker die?". It cannot answer "is a verdict
+still owed?", because a PR can leave `OPEN` without Shipyard ever reaching one —
+GitHub-native auto-merge lands a PR on its own required checks, and a PR can be
+closed by hand. The record then stays in flight forever with nothing left to
+wait for.
+
+Measured on a live store: of 157 active records, 8 were flagged, and 5 of those
+8 belonged to PRs that had **already merged**. So the diagnostic was 62% stale,
+and the 3 genuinely stalled PRs were camouflaged by the dead ones. That is the
+failure mode — not the stalling. A detector an operator has learned to ignore
+is worse than no detector, and the note it printed ("auto-merge will not fire
+until it reaches a verdict") was empirically false in the majority of cases.
+
+So `ship-state list` reconciles each flagged record against its PR's real
+lifecycle (`gh::pr_lifecycle_state` → `PrLifecycle`, then
+`ship_liveness::reconcile_finding`) before rendering:
+
+| PR lifecycle | Reported as | Note |
+|---|---|---|
+| `MERGED` / `CLOSED` | `RESOLVED [merged\|closed]` | terminal, so no verdict is owed; the record blocks nothing and names its `ship-state discard` command |
+| `OPEN` | `ORPHANED? [<evidence>]` | says the PR is open and Shipyard will not reach a verdict on its own |
+| unreadable (`Unknown`) | `ORPHANED? [<evidence>]` | **fails closed** — says the PR state could not be read, so the record may already be resolved |
+
+Three properties this contract depends on:
+
+- **Fail closed.** An auth error, a rate limit, or a network failure yields
+  `Unknown`, never `Merged`, so a GitHub outage can never quietly suppress a
+  real stall.
+- **Bounded cost.** The lifecycle lookup runs only for records the queue
+  evidence already flagged, and is additionally capped at
+  `MAX_PR_LIFECYCLE_LOOKUPS` (25) per invocation. A healthy store issues zero
+  GitHub calls; the store above issues 8, not 157; and a mass-orphan event
+  cannot fan out into the burst GitHub throttles separately from the core
+  quota. Records past the cap keep `Unknown`, so the ceiling degrades to
+  fail-closed rather than to a guess.
+- **Read-only.** Reconciliation reclassifies; it never deletes. Reaping stays
+  operator-driven (`ship-state discard`) or age-driven (T12), so an operator
+  reading the list still sees that the record existed and how long it stalled.
+
+JSON gains a sibling `resolved: [{repo, pr, stalled_minutes, evidence,
+pr_lifecycle}]` array and each `orphaned` entry gains `pr_lifecycle`. A consumer
+counting `orphaned` therefore counts only records that can still be waiting on
+Shipyard.
 
 Exact `queue_absent` recovery is a separate, machine-global opt-in. It is off by
 default and requires both the kill switch and an explicit checkout registry:
