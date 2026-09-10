@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02002"></a>
+## [0.200.2] - 2026-09-09
+
+- fix(test): stop a timed-out lock holder from passing as a released one ([#587](https://github.com/danielraffel/Shipyard/pull/587))
+- docs: remove agent-workstream residue from the plugin surface ([#588](https://github.com/danielraffel/Shipyard/pull/588))
+
 <a id="v02001"></a>
 ## [0.200.1] - 2026-09-09
 
@@ -1469,6 +1475,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.200.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.200.2
 [0.200.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.200.1
 [0.200.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.200.0
 [0.199.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.199.0
