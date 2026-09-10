@@ -681,8 +681,12 @@ Three properties this contract depends on:
   `Unknown`, never `Merged`, so a GitHub outage can never quietly suppress a
   real stall.
 - **Bounded cost.** The lifecycle lookup runs only for records the queue
-  evidence already flagged. A healthy store issues zero GitHub calls; the store
-  above would have issued 8, not 157.
+  evidence already flagged, and is additionally capped at
+  `MAX_PR_LIFECYCLE_LOOKUPS` (25) per invocation. A healthy store issues zero
+  GitHub calls; the store above issues 8, not 157; and a mass-orphan event
+  cannot fan out into the burst GitHub throttles separately from the core
+  quota. Records past the cap keep `Unknown`, so the ceiling degrades to
+  fail-closed rather than to a guess.
 - **Read-only.** Reconciliation reclassifies; it never deletes. Reaping stays
   operator-driven (`ship-state discard`) or age-driven (T12), so an operator
   reading the list still sees that the record existed and how long it stalled.

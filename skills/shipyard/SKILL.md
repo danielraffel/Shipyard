@@ -1570,10 +1570,13 @@ daemon's own runtime mode, so an isolated daemon reads its own overlay.
   running a diagnostic in a fresh directory materializes nothing.
 - A state stops being reported the moment a live worker touches it or it reaches
   a verdict.
-- The PR lifecycle lookup is **bounded by the flag**: it runs only for records
-  the queue evidence already flagged, so a healthy store issues zero GitHub
-  calls. Do not move it above `classify`, or `ship-state list` becomes one API
-  call per active record (157 on a real store, versus 8).
+- The PR lifecycle lookup is **bounded twice**: it runs only for records the
+  queue evidence already flagged, and no more than `MAX_PR_LIFECYCLE_LOOKUPS`
+  (25) times per invocation. A healthy store issues zero GitHub calls. Do not
+  move it above `classify`, or `ship-state list` becomes one API call per
+  active record (157 on a real store, versus 8); and do not lift the cap — a
+  mass-orphan event is exactly the burst GitHub throttles independently of the
+  core quota. Records past the cap keep `Unknown` and stay flagged.
 - `Unknown` is a lifecycle value, not an error to swallow. Any unreadable PR
   state — auth failure, rate limit, network — must keep the orphan verdict, so
   a GitHub outage can never make real stalls disappear from the list.

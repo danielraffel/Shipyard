@@ -23,20 +23,35 @@ pub(super) type PrLifecycleReader<'a> = &'a mut dyn FnMut(&str, u64) -> PrLifecy
 /// The lookup is deliberately not run for every record: a healthy store holds
 /// hundreds of finished records, and asking GitHub about each one would turn a
 /// local diagnostic into a rate-limit hazard. Flagged records are a handful.
+/// Hard ceiling on PR-lifecycle lookups per `ship-state list`.
+///
+/// Each lookup is one `gh pr view`, so an uncapped loop turns a diagnostic that
+/// used to cost nothing into one API call per flagged record. That is fine at
+/// the observed scale (8 flagged out of 157 active), but a mass-orphan event —
+/// a daemon crash with dozens in flight — would fan out into a burst, and
+/// GitHub throttles bursts independently of the core quota. Beyond the budget
+/// the remaining records simply keep `Unknown`, which fails closed: they stay
+/// flagged and say their PR state could not be read, which is the truth.
+const MAX_PR_LIFECYCLE_LOOKUPS: usize = 25;
+
 fn classify_states(
     states: &[ShipState],
     liveness: &LivenessContext<'_>,
     lifecycle_of: PrLifecycleReader<'_>,
     now: chrono::DateTime<Utc>,
 ) -> Vec<Option<LivenessFinding>> {
+    let mut budget = MAX_PR_LIFECYCLE_LOOKUPS;
     states
         .iter()
         .map(|state| {
             let report = liveness.classify(state, now)?;
-            Some(reconcile_finding(
-                report,
-                lifecycle_of(&state.repo, state.pr),
-            ))
+            let lifecycle = if budget == 0 {
+                PrLifecycle::Unknown
+            } else {
+                budget -= 1;
+                lifecycle_of(&state.repo, state.pr)
+            };
+            Some(reconcile_finding(report, lifecycle))
         })
         .collect()
 }
@@ -432,8 +447,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        abbreviate_sha, ship_state_discard, ship_state_list, ship_state_reconcile_with,
-        ship_state_show,
+        MAX_PR_LIFECYCLE_LOOKUPS, abbreviate_sha, ship_state_discard, ship_state_list,
+        ship_state_reconcile_with, ship_state_show,
     };
     use crate::reconcile::ReconcileFetchError;
     use crate::ship_liveness::{DEFAULT_ORPHAN_STALE_MINUTES, LivenessContext, PrLifecycle};
@@ -754,6 +769,53 @@ mod tests {
         assert!(
             text.contains("could not be read"),
             "an unverified PR must say so rather than assert a consequence; text was: {text}"
+        );
+    }
+
+    /// The lookup budget must be a hard ceiling, not a hope. An uncapped loop
+    /// turns `ship-state list` into one `gh pr view` per flagged record, and a
+    /// mass-orphan event would fan that into exactly the burst GitHub throttles
+    /// independently of the core quota. Records past the budget fail closed.
+    #[test]
+    fn pr_lifecycle_lookups_are_capped_and_the_remainder_fails_closed() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let flagged = MAX_PR_LIFECYCLE_LOOKUPS + 7;
+        for pr in 0..flagged {
+            let pr = u64::try_from(pr).expect("small") + 1;
+            let mut state = sample_state(pr, &format!("{pr:040}"));
+            state.updated_at = Utc::now() - Duration::minutes(DEFAULT_ORPHAN_STALE_MINUTES + 10);
+            store.save(&state).expect("state should save");
+        }
+        let mut asked = Vec::new();
+        let mut out = Vec::new();
+
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut fixed_lifecycle(PrLifecycle::Merged, &mut asked),
+            true,
+            &mut out,
+        )
+        .expect("list should render");
+
+        assert_eq!(
+            asked.len(),
+            MAX_PR_LIFECYCLE_LOOKUPS,
+            "every flagged record past the budget must be answered without an API call"
+        );
+        let payload: Value = serde_json::from_slice(&out).expect("json payload");
+        let resolved = payload["resolved"].as_array().expect("resolved array");
+        let orphaned = payload["orphaned"].as_array().expect("orphaned array");
+        assert_eq!(resolved.len(), MAX_PR_LIFECYCLE_LOOKUPS);
+        assert_eq!(orphaned.len(), flagged - MAX_PR_LIFECYCLE_LOOKUPS);
+        // Fail closed: unlooked-up records stay flagged rather than being
+        // guessed resolved.
+        assert!(
+            orphaned
+                .iter()
+                .all(|entry| entry["pr_lifecycle"] == "unknown"),
+            "{payload}"
         );
     }
 
