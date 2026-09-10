@@ -1493,8 +1493,30 @@ not-yet-started) job is never flagged, however old `updated_at` looks. The
 `queue_stale`/`queue_terminal` signals surface a genuinely dead ship in ~3
 minutes; the weak (`queue_absent`/`time_fallback`) signals require the staleness
 threshold. Human output prints `ORPHANED? [<evidence>]: ...`; JSON gains
-`orphaned: [{pr, stalled_minutes, evidence}]` (`ship-state list`) /
-`orphaned_ship_states: [...]` (`status`).
+`orphaned: [{pr, stalled_minutes, evidence, pr_lifecycle}]` (`ship-state list`)
+/ `orphaned_ship_states: [...]` (`status`).
+
+**Queue evidence alone cannot tell you a verdict is still owed.** Every signal
+above answers "did the worker die?" — none answers "is anyone still waiting?"
+A PR can leave `OPEN` without Shipyard ever reaching a verdict: GitHub-native
+auto-merge lands it on its own required checks, or a human closes it. The
+record then sits in flight forever with nothing left to wait for. Measured on a
+live store: 157 active records, 8 flagged, **5 of the 8 already merged**. The
+detector was 62% stale, so the 3 real stalls were camouflaged — and the note it
+printed, "auto-merge will not fire until it reaches a verdict", was false for
+the majority of them.
+
+So `ship-state list` resolves each **flagged** record's PR lifecycle
+(`gh::pr_lifecycle_state`) and reconciles it before rendering:
+
+| PR lifecycle | Line | What it means |
+|---|---|---|
+| `MERGED` / `CLOSED` | `RESOLVED [merged\|closed]` | terminal → no verdict is owed; blocks nothing, and the line names the exact `shipyard ship-state discard <pr>` to clear it |
+| `OPEN` | `ORPHANED? [<evidence>]` | really is waiting on Shipyard; re-run `shipyard ship <pr>` |
+| unreadable | `ORPHANED? [<evidence>]` | **fails closed** — says the PR state could not be read, so the record may already be resolved |
+
+JSON gains a sibling `resolved: [...]` array with the same fields, so a consumer
+counting `orphaned` counts only records that can still be waiting on Shipyard.
 
 The threshold defaults to 45 minutes and is configurable:
 
@@ -1505,9 +1527,12 @@ auto_resume = false          # opt-in daemon abandon sweep (default off)
 ```
 
 Detection (`shipyard ship-state list` / `status`) is **report-only** — it never
-mutates anything and cannot affect merge readiness (a flagged state is in flight,
-which auto-merge already refuses; the harm it surfaces is the *inverse* — a PR
-that silently never merges).
+mutates anything, including the lifecycle reconciliation above (it reclassifies,
+it never deletes). It cannot affect merge readiness: a flagged state is in
+flight, which *Shipyard's* auto-merge gate already refuses. Note that this is
+not the same as the PR being unable to merge — GitHub-native auto-merge lands
+PRs on their required checks regardless — which is exactly why the record needs
+reconciling against the PR rather than trusting the queue alone.
 
 **Opt-in abandon sweep (`auto_resume`, default off).** When enabled, the daemon's
 periodic reconcile pass runs `ship_resume::sweep_orphaned_ship_states`: for a
@@ -1545,6 +1570,13 @@ daemon's own runtime mode, so an isolated daemon reads its own overlay.
   running a diagnostic in a fresh directory materializes nothing.
 - A state stops being reported the moment a live worker touches it or it reaches
   a verdict.
+- The PR lifecycle lookup is **bounded by the flag**: it runs only for records
+  the queue evidence already flagged, so a healthy store issues zero GitHub
+  calls. Do not move it above `classify`, or `ship-state list` becomes one API
+  call per active record (157 on a real store, versus 8).
+- `Unknown` is a lifecycle value, not an error to swallow. Any unreadable PR
+  state — auth failure, rate limit, network — must keep the orphan verdict, so
+  a GitHub outage can never make real stalls disappear from the list.
 
 ### `RunAtLoad` is not supervision
 

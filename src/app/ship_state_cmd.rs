@@ -9,42 +9,148 @@ use crate::output::write_json_envelope;
 use crate::reconcile::{
     ReconcileFetchError, fetch_status_check_rollup_with_cwd, reconcile_ship_state,
 };
-use crate::ship_liveness::LivenessContext;
+use crate::ship_liveness::{LivenessContext, LivenessFinding, PrLifecycle, reconcile_finding};
 use crate::ship_state::{ShipState, ShipStateStore};
+
+/// Resolves a pull request's current lifecycle. Production passes a `gh`-backed
+/// reader; tests inject a fixture so no test ever touches the network or the
+/// live record store.
+pub(super) type PrLifecycleReader<'a> = &'a mut dyn FnMut(&str, u64) -> PrLifecycle;
+
+/// Classify every active ship-state once, resolving the PR lifecycle **only**
+/// for records the queue already flagged.
+///
+/// The lookup is deliberately not run for every record: a healthy store holds
+/// hundreds of finished records, and asking GitHub about each one would turn a
+/// local diagnostic into a rate-limit hazard. Flagged records are a handful.
+fn classify_states(
+    states: &[ShipState],
+    liveness: &LivenessContext<'_>,
+    lifecycle_of: PrLifecycleReader<'_>,
+    now: chrono::DateTime<Utc>,
+) -> Vec<Option<LivenessFinding>> {
+    states
+        .iter()
+        .map(|state| {
+            let report = liveness.classify(state, now)?;
+            Some(reconcile_finding(
+                report,
+                lifecycle_of(&state.repo, state.pr),
+            ))
+        })
+        .collect()
+}
+
+/// Emits the machine-readable `ship-state:list` envelope. `orphaned` keeps only
+/// records that can still be waiting on Shipyard; a record whose PR already
+/// reached a terminal state moves to `resolved`, so a consumer counting
+/// `orphaned` is not misled by leftovers.
+fn write_list_json<W: Write>(
+    states: &[ShipState],
+    findings: &[Option<LivenessFinding>],
+    stdout: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut orphaned = Vec::new();
+    let mut resolved = Vec::new();
+    for (state, finding) in states.iter().zip(findings) {
+        let (bucket, evidence, stalled_minutes, lifecycle) = match finding {
+            Some(LivenessFinding::Orphaned { report, lifecycle }) => (
+                &mut orphaned,
+                report.evidence,
+                report.stalled_minutes,
+                *lifecycle,
+            ),
+            Some(LivenessFinding::Resolved(report)) => (
+                &mut resolved,
+                report.evidence,
+                report.stalled_minutes,
+                report.lifecycle,
+            ),
+            None => continue,
+        };
+        bucket.push(serde_json::json!({
+            "repo": state.repo,
+            "pr": state.pr,
+            "stalled_minutes": stalled_minutes,
+            "evidence": evidence.as_str(),
+            "pr_lifecycle": lifecycle.as_str(),
+        }));
+    }
+    let mut data = BTreeMap::new();
+    data.insert("states".to_owned(), serde_json::to_value(states)?);
+    data.insert("orphaned".to_owned(), Value::Array(orphaned));
+    data.insert("resolved".to_owned(), Value::Array(resolved));
+    write_json_envelope(stdout, "ship-state:list", data)
+}
+
+/// Writes the operator-facing note under one record.
+///
+/// The orphan note deliberately does NOT claim "auto-merge will not fire". That
+/// wording was measurably false: GitHub-native auto-merge lands PRs whose
+/// ship-state never reached a verdict, so most flagged records on a real store
+/// belonged to PRs that had already merged. State only what is known, and say
+/// so plainly when the PR's own state could not be read.
+fn write_liveness_note<W: Write>(
+    state: &ShipState,
+    finding: LivenessFinding,
+    stdout: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match finding {
+        LivenessFinding::Orphaned { report, lifecycle } => {
+            let consequence = if lifecycle == PrLifecycle::Open {
+                "the PR is still open and Shipyard will not reach a verdict on its own"
+            } else {
+                "the PR state could not be read, so this record may already be resolved"
+            };
+            writeln!(
+                stdout,
+                "    ORPHANED? [{}]: in flight, {} ({}m stalled); {} — re-run \
+                 `shipyard ship`, or `ship-state discard` if it is truly dead.",
+                report.evidence.as_str(),
+                report.evidence.cause(),
+                report.stalled_minutes,
+                consequence,
+            )?;
+        }
+        LivenessFinding::Resolved(report) => {
+            let landed = if report.lifecycle == PrLifecycle::Merged {
+                "the PR already merged"
+            } else {
+                "the PR was closed without merging"
+            };
+            writeln!(
+                stdout,
+                "    RESOLVED [{}]: {}, so no verdict is owed; this record never \
+                 finalized and is {}m stale. It blocks nothing — clear it with \
+                 `shipyard ship-state discard {}`.",
+                report.lifecycle.as_str(),
+                landed,
+                report.stalled_minutes,
+                state.pr,
+            )?;
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn ship_state_list<W: Write>(
     store: &ShipStateStore,
     liveness: &LivenessContext<'_>,
+    lifecycle_of: PrLifecycleReader<'_>,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let states = store.list_active();
     let now = Utc::now();
+    let findings = classify_states(&states, liveness, lifecycle_of, now);
     if json {
-        let orphaned = states
-            .iter()
-            .filter_map(|state| {
-                liveness.classify(state, now).map(|report| {
-                    serde_json::json!({
-                        "repo": state.repo,
-                        "pr": state.pr,
-                        "stalled_minutes": report.stalled_minutes,
-                        "evidence": report.evidence.as_str(),
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut data = BTreeMap::new();
-        data.insert("states".to_owned(), serde_json::to_value(&states)?);
-        data.insert("orphaned".to_owned(), Value::Array(orphaned));
-        write_json_envelope(stdout, "ship-state:list", data)?;
-        return Ok(());
+        return write_list_json(&states, &findings, stdout);
     }
     if states.is_empty() {
         writeln!(stdout, "No active ship state.")?;
         return Ok(());
     }
-    for state in &states {
+    for (state, finding) in states.iter().zip(&findings) {
         let age = now
             .signed_duration_since(state.updated_at)
             .num_minutes()
@@ -67,16 +173,8 @@ pub(super) fn ship_state_list<W: Write>(
             age,
             title
         )?;
-        if let Some(report) = liveness.classify(state, now) {
-            writeln!(
-                stdout,
-                "    ORPHANED? [{}]: in flight, {} ({}m stalled); auto-merge will not fire \
-                 until it reaches a verdict — re-run `shipyard ship`, or `ship-state discard` \
-                 if it is truly dead.",
-                report.evidence.as_str(),
-                report.evidence.cause(),
-                report.stalled_minutes,
-            )?;
+        if let Some(finding) = finding {
+            write_liveness_note(state, *finding, stdout)?;
         }
         if !state.pr_url.is_empty() {
             writeln!(stdout, "    {}", state.pr_url)?;
@@ -338,7 +436,7 @@ mod tests {
         ship_state_show,
     };
     use crate::reconcile::ReconcileFetchError;
-    use crate::ship_liveness::{DEFAULT_ORPHAN_STALE_MINUTES, LivenessContext};
+    use crate::ship_liveness::{DEFAULT_ORPHAN_STALE_MINUTES, LivenessContext, PrLifecycle};
     use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
 
     fn store(temp: &TempDir) -> ShipStateStore {
@@ -350,6 +448,25 @@ mod tests {
     /// `crate::ship_liveness` unit tests.
     fn time_ctx() -> LivenessContext<'static> {
         LivenessContext::time_only(Duration::minutes(DEFAULT_ORPHAN_STALE_MINUTES))
+    }
+
+    /// The pre-existing default for tests that predate PR-lifecycle
+    /// reconciliation: GitHub is never consulted, so every flagged record keeps
+    /// the (fail-closed) orphan verdict.
+    fn unknown_lifecycle() -> impl FnMut(&str, u64) -> PrLifecycle {
+        |_repo: &str, _pr: u64| PrLifecycle::Unknown
+    }
+
+    /// A fixture lifecycle reader that records which PRs it was asked about, so
+    /// a test can prove the lookup is bounded to flagged records only.
+    fn fixed_lifecycle(
+        lifecycle: PrLifecycle,
+        asked: &mut Vec<u64>,
+    ) -> impl FnMut(&str, u64) -> PrLifecycle + '_ {
+        move |_repo: &str, pr: u64| {
+            asked.push(pr);
+            lifecycle
+        }
     }
 
     fn sample_state(pr: u64, sha: &str) -> ShipState {
@@ -389,7 +506,14 @@ mod tests {
         let store = store(&temp);
         let mut out = Vec::new();
 
-        ship_state_list(&store, &time_ctx(), false, &mut out).expect("list should render");
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut unknown_lifecycle(),
+            false,
+            &mut out,
+        )
+        .expect("list should render");
 
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
@@ -408,7 +532,14 @@ mod tests {
         store.save(&state).expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_list(&store, &time_ctx(), false, &mut out).expect("list should render");
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut unknown_lifecycle(),
+            false,
+            &mut out,
+        )
+        .expect("list should render");
 
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("danielraffel/pulp PR #42"));
@@ -432,7 +563,14 @@ mod tests {
             .expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_list(&store, &time_ctx(), true, &mut out).expect("list should render");
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut unknown_lifecycle(),
+            true,
+            &mut out,
+        )
+        .expect("list should render");
 
         let payload: Value = serde_json::from_slice(&out).expect("json payload");
         assert_eq!(payload["command"], "ship-state:list");
@@ -457,7 +595,14 @@ mod tests {
         store.save(&done).expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_list(&store, &time_ctx(), true, &mut out).expect("list should render");
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut unknown_lifecycle(),
+            true,
+            &mut out,
+        )
+        .expect("list should render");
 
         let payload: Value = serde_json::from_slice(&out).expect("json payload");
         let orphaned = payload["orphaned"].as_array().expect("orphaned array");
@@ -477,7 +622,14 @@ mod tests {
         store.save(&state).expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_list(&store, &time_ctx(), false, &mut out).expect("list should render");
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut unknown_lifecycle(),
+            false,
+            &mut out,
+        )
+        .expect("list should render");
 
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("PR #5"));
@@ -486,6 +638,220 @@ mod tests {
             "text was: {text}"
         );
         assert!(text.contains("re-run `shipyard ship`"));
+    }
+
+    /// Plants the measured defect: a record left in flight against a PR that
+    /// has already **merged**. Before PR-lifecycle reconciliation this rendered
+    /// as `ORPHANED? … auto-merge will not fire until it reaches a verdict`,
+    /// which was false — the PR merged anyway. On a live store 5 of the 8
+    /// flagged records were merged PRs, so the detector was 62% stale and an
+    /// operator learned to ignore it.
+    #[test]
+    fn merged_pr_record_is_reported_resolved_not_orphaned() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let mut state = sample_state(8148, "838ec05b2f370000000000000000000000000000");
+        state.updated_at = Utc::now() - Duration::minutes(138);
+        store.save(&state).expect("state should save");
+        let mut asked = Vec::new();
+        let mut out = Vec::new();
+
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut fixed_lifecycle(PrLifecycle::Merged, &mut asked),
+            false,
+            &mut out,
+        )
+        .expect("list should render");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(asked, vec![8148], "only the flagged record is looked up");
+        assert!(
+            text.contains("RESOLVED [merged]"),
+            "a merged PR's leftover record must read as resolved; text was: {text}"
+        );
+        assert!(
+            text.contains("shipyard ship-state discard 8148"),
+            "the operator needs the exact reaping command; text was: {text}"
+        );
+        assert!(
+            !text.contains("ORPHANED?"),
+            "a merged PR is not an orphan blocking a merge; text was: {text}"
+        );
+        assert!(
+            !text.contains("auto-merge will not fire"),
+            "this claim was measurably false for merged PRs; text was: {text}"
+        );
+    }
+
+    /// Positive control for the test above. Same record, same age, same code
+    /// path — only the PR lifecycle differs. If this stopped reporting an
+    /// orphan, the fix would be suppressing real stalls rather than
+    /// reconciling them, and the merged-PR assertion above would pass for the
+    /// wrong reason.
+    #[test]
+    fn open_pr_record_is_still_reported_orphaned() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let mut state = sample_state(8146, "c6f51d12d4050000000000000000000000000000");
+        state.updated_at = Utc::now() - Duration::minutes(282);
+        store.save(&state).expect("state should save");
+        let mut asked = Vec::new();
+        let mut out = Vec::new();
+
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut fixed_lifecycle(PrLifecycle::Open, &mut asked),
+            false,
+            &mut out,
+        )
+        .expect("list should render");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(asked, vec![8146]);
+        assert!(
+            text.contains("ORPHANED? [time_fallback]"),
+            "text was: {text}"
+        );
+        assert!(
+            text.contains("the PR is still open"),
+            "an open PR's consequence must be stated plainly; text was: {text}"
+        );
+        assert!(!text.contains("RESOLVED"), "text was: {text}");
+        assert!(
+            !text.contains("auto-merge will not fire"),
+            "the false claim must be gone from every branch; text was: {text}"
+        );
+    }
+
+    /// Fail-closed control: an unreadable PR state must keep the orphan
+    /// verdict, so a GitHub outage can never quietly hide a real stall.
+    #[test]
+    fn unreadable_pr_state_keeps_the_orphan_verdict() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let mut state = sample_state(8145, "b3211f5994980000000000000000000000000000");
+        state.updated_at = Utc::now() - Duration::minutes(333);
+        store.save(&state).expect("state should save");
+        let mut out = Vec::new();
+
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut unknown_lifecycle(),
+            false,
+            &mut out,
+        )
+        .expect("list should render");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("ORPHANED? [time_fallback]"),
+            "text was: {text}"
+        );
+        assert!(
+            text.contains("could not be read"),
+            "an unverified PR must say so rather than assert a consequence; text was: {text}"
+        );
+    }
+
+    /// A closed-without-merging PR is also terminal: no verdict can be owed.
+    #[test]
+    fn closed_pr_record_is_reported_resolved() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let mut state = sample_state(9001, "9001000000000000000000000000000000000000");
+        state.updated_at = Utc::now() - Duration::minutes(600);
+        store.save(&state).expect("state should save");
+        let mut asked = Vec::new();
+        let mut out = Vec::new();
+
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut fixed_lifecycle(PrLifecycle::Closed, &mut asked),
+            false,
+            &mut out,
+        )
+        .expect("list should render");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("RESOLVED [closed]"), "text was: {text}");
+        assert!(text.contains("closed without merging"), "text was: {text}");
+        assert!(!text.contains("ORPHANED?"), "text was: {text}");
+    }
+
+    /// The JSON surface is what tooling reads. A merged PR's record must leave
+    /// `orphaned` entirely — a consumer counting that array is exactly who was
+    /// being misled.
+    #[test]
+    fn list_json_moves_merged_records_out_of_orphaned() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let mut merged = sample_state(8134, "4841cb30a7790000000000000000000000000000");
+        merged.updated_at = Utc::now() - Duration::minutes(647);
+        store.save(&merged).expect("state should save");
+        let mut asked = Vec::new();
+        let mut out = Vec::new();
+
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut fixed_lifecycle(PrLifecycle::Merged, &mut asked),
+            true,
+            &mut out,
+        )
+        .expect("list should render");
+
+        let payload: Value = serde_json::from_slice(&out).expect("json payload");
+        assert!(
+            payload["orphaned"]
+                .as_array()
+                .expect("orphaned array")
+                .is_empty(),
+            "a merged PR must not be counted as orphaned: {payload}"
+        );
+        let resolved = payload["resolved"].as_array().expect("resolved array");
+        assert_eq!(resolved.len(), 1, "{payload}");
+        assert_eq!(resolved[0]["pr"], 8134);
+        assert_eq!(resolved[0]["pr_lifecycle"], "merged");
+        assert_eq!(resolved[0]["evidence"], "time_fallback");
+    }
+
+    /// The lifecycle lookup costs a GitHub call, so it must never run for the
+    /// hundreds of already-finished records a healthy store holds. Only records
+    /// the queue already flagged are looked up.
+    #[test]
+    fn lifecycle_lookup_skips_records_the_queue_never_flagged() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        // Terminal verdict → never flagged, however old.
+        let mut done = sample_state(100, "1000000000000000000000000000000000000000");
+        done.update_evidence("linux", "pass");
+        done.dispatched_runs.push(sample_run("linux", "run-100"));
+        done.updated_at = Utc::now() - Duration::days(20);
+        store.save(&done).expect("state should save");
+        // Fresh in-flight → inside the staleness gate, so also never flagged.
+        let fresh = sample_state(101, "1010000000000000000000000000000000000000");
+        store.save(&fresh).expect("state should save");
+        let mut asked = Vec::new();
+        let mut out = Vec::new();
+
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut fixed_lifecycle(PrLifecycle::Merged, &mut asked),
+            false,
+            &mut out,
+        )
+        .expect("list should render");
+
+        assert!(
+            asked.is_empty(),
+            "unflagged records must cost no GitHub calls, asked about: {asked:?}"
+        );
     }
 
     #[test]

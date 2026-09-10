@@ -1086,6 +1086,37 @@ pub fn pr_merged_head_sha(
     )
 }
 
+/// Read a pull request's lifecycle state (`OPEN` / `CLOSED` / `MERGED`) as
+/// GitHub reports it, or `None` when it cannot be read.
+///
+/// This is deliberately *not* `pr_merged_head_sha().is_some()`: that helper
+/// collapses "the PR is open" and "the lookup failed" into the same `None`,
+/// which is exactly the distinction a diagnostic has to preserve — a record
+/// whose PR is provably merged is resolved, while a record whose PR state is
+/// unknown must stay flagged. Fails closed: any transport error, missing
+/// token, or malformed response yields `None` (unknown), never a state.
+#[must_use]
+pub fn pr_lifecycle_state(
+    client: Option<&GhClient>,
+    repo: &str,
+    pr: u64,
+    cwd: &Path,
+    snapshot_file: Option<&Path>,
+) -> Option<String> {
+    pr_view_state_json(
+        client,
+        repo,
+        pr,
+        cwd,
+        snapshot_file,
+        None,
+        PR_OBSERVATION_TIMEOUT,
+    )?
+    .get("state")
+    .and_then(Value::as_str)
+    .map(str::to_owned)
+}
+
 fn pr_merged_head_sha_with_options(
     client: Option<&GhClient>,
     repo: &str,
@@ -1095,7 +1126,41 @@ fn pr_merged_head_sha_with_options(
     binary_override: Option<&Path>,
     timeout: Duration,
 ) -> Option<String> {
-    let value = if let Some(path) = snapshot_file {
+    let value = pr_view_state_json(
+        client,
+        repo,
+        pr,
+        cwd,
+        snapshot_file,
+        binary_override,
+        timeout,
+    )?;
+    let merged = value
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("merged"));
+    if !merged {
+        return None;
+    }
+    value
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// One `gh pr view --json state,headRefOid` fetch, shared by every caller that
+/// needs the PR's current state. `snapshot_file` short-circuits the network for
+/// tests. Fails closed to `None`.
+fn pr_view_state_json(
+    client: Option<&GhClient>,
+    repo: &str,
+    pr: u64,
+    cwd: &Path,
+    snapshot_file: Option<&Path>,
+    binary_override: Option<&Path>,
+    timeout: Duration,
+) -> Option<Value> {
+    if let Some(path) = snapshot_file {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -1128,19 +1193,7 @@ fn pr_merged_head_sha_with_options(
             .ok()
             .filter(|out| out.status.success())
             .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
-    };
-    let value = value?;
-    let merged = value
-        .get("state")
-        .and_then(Value::as_str)
-        .is_some_and(|state| state.eq_ignore_ascii_case("merged"));
-    if !merged {
-        return None;
     }
-    value
-        .get("headRefOid")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
 }
 
 fn ttl_seconds(value: u64) -> i64 {
