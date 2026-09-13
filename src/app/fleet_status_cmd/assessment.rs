@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::capacity::HostCapacity;
+use crate::fleet_slot::QueuedJobReport;
 use crate::merge_queue_liveness::{MergeQueueLivenessReport, ReleaseLivenessReport};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -96,6 +97,21 @@ pub(super) struct RoutingMismatch {
     pub(super) reason: String,
 }
 
+/// Result of the wedged-queued-job sweep.
+///
+/// `examined` is carried alongside the findings on purpose. An empty
+/// `raising` list means either "no queued job is wedged" or "no queued job was
+/// looked at", and nothing else in the output distinguishes those. Reporting
+/// the count the sweep actually reached makes a silent instrument visible
+/// instead of reading as a clean pass.
+#[derive(Debug, Default)]
+pub(super) struct WedgedQueuedJobs {
+    /// Queued jobs the sweep classified.
+    pub(super) examined: usize,
+    /// Those whose verdict raises.
+    pub(super) raising: Vec<QueuedJobReport>,
+}
+
 #[derive(Debug)]
 pub(super) struct QueuedSummary {
     pub(super) readable: bool,
@@ -141,6 +157,7 @@ pub(in crate::app) struct FleetAssessment {
     pub(super) runners: RunnerInventory,
     pub(super) expected_hosts: Vec<ExpectedHostStatus>,
     pub(super) routing_mismatches: Vec<RoutingMismatch>,
+    pub(super) wedged_queued: WedgedQueuedJobs,
     pub(super) observation_reason_codes: Vec<ObservationReason>,
     pub(super) observation_incomplete: bool,
     pub(super) should_fail: bool,

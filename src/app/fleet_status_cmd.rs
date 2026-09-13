@@ -28,6 +28,10 @@ use crate::capacity::{
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::executor::ssh::shlex_quote;
+use crate::fleet_service::{RegisteredRunner, RunnerScope};
+use crate::fleet_slot::{
+    QueuedJobObservation, QueuedJobReport, WedgeThresholds, assess_queued_job,
+};
 use crate::merge_queue_liveness::{
     ActiveRunObservation, CheckObservation, JobObservation, MergeQueueLivenessInputs,
     MergeQueueLivenessReport, assess_merge_queue_liveness, assess_release_liveness,
@@ -45,7 +49,7 @@ pub(in crate::app) use assessment::FleetAssessment;
 use assessment::{
     DoctorProbe, ExpectedHostConfig, ExpectedHostStatus, HostFleetStatus, MergeQueueProbe,
     ObservationReason, QueuedSummary, ReleaseProbe, RepositoryRunner, RoutingMismatch,
-    RunnerInventory, StorageProbe,
+    RunnerInventory, StorageProbe, WedgedQueuedJobs,
 };
 use observation::{
     classify_observation_error, fetch_observed_workflow_runs, inspect_merge_queue_liveness,
@@ -166,6 +170,17 @@ pub(super) fn collect_fleet_assessment(
         |_| Vec::new(),
         |observed| detect_routing_mismatches(&observed.runs, &runners),
     );
+    let wedged_queued = observed_runs.as_ref().map_or_else(
+        |_| WedgedQueuedJobs::default(),
+        |observed| {
+            detect_wedged_queued_jobs(
+                &observed.runs,
+                &runners,
+                WedgeThresholds::default(),
+                Utc::now(),
+            )
+        },
+    );
     let queue = observed_runs.as_ref().map_or_else(
         |reason| QueuedSummary {
             readable: false,
@@ -252,6 +267,7 @@ pub(super) fn collect_fleet_assessment(
         || !runners.readable
         || expected_hosts.iter().any(|host| host.problem.is_some())
         || !routing_mismatches.is_empty()
+        || !wedged_queued.raising.is_empty()
         || !queue.readable
         || queued_age_with_capacity
         || !merge_queue.readable
@@ -288,6 +304,7 @@ pub(super) fn collect_fleet_assessment(
         runners,
         expected_hosts,
         routing_mismatches,
+        wedged_queued,
         observation_reason_codes,
         observation_incomplete,
         should_fail,
@@ -938,6 +955,99 @@ fn detect_routing_mismatches(
             })
         })
         .collect()
+}
+
+/// Classify every queued job the observation window reached, and return the
+/// ones whose verdict raises.
+///
+/// This is the caller side of [`assess_queued_job`]: the pure classifier had no
+/// live caller, so a run GitHub would neither schedule nor cancel raised
+/// nothing. Demand is a precondition of the assertion by construction — its
+/// input *is* a queued job — so an idle lane with nothing queued produces no
+/// report and cannot be mistaken for a fault.
+///
+/// Two deliberate narrowings, both of which lose real wedges rather than
+/// manufacture false ones:
+///
+/// * Only a wholly queued run is classified. A job can enter the queue long
+///   after its workflow starts, and the run's `created_at` is the only age
+///   proxy available, so using it on a partially started run would read
+///   upstream runtime as queue age.
+/// * A job requesting no labels is skipped. `advertises_all` is a superset
+///   test and is vacuously true on an empty slice, so an unlabelled job would
+///   match every registered runner and could be reported as wedged on the
+///   strength of a runner that could never have run it.
+///
+/// The census behind `inventory` is repository-scoped, while the lane-service
+/// vocabulary asks for both scopes. A missed org runner yields
+/// `capable_runner_online = false`, which classifies as `NoCapableRunner` and
+/// verdict `Served` — so the gap can hide a real wedge and cannot invent one.
+fn detect_wedged_queued_jobs(
+    runs: &[ActiveRunObservation],
+    inventory: &RunnerInventory,
+    thresholds: WedgeThresholds,
+    now: DateTime<Utc>,
+) -> WedgedQueuedJobs {
+    // A census that could not be read is not a census that found nothing.
+    if !inventory.readable {
+        return WedgedQueuedJobs::default();
+    }
+    let registered = inventory
+        .runners
+        .iter()
+        .map(|runner| RegisteredRunner {
+            name: runner.name.clone(),
+            scope: RunnerScope::Repo,
+            online: runner.status.eq_ignore_ascii_case("online"),
+            busy: runner.busy,
+            labels: runner.labels.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut examined = 0usize;
+    let mut raising: Vec<QueuedJobReport> = Vec::new();
+    for run in runs {
+        if run.status != "queued" {
+            continue;
+        }
+        let Some(queued_since) = run
+            .created_at
+            .as_deref()
+            .and_then(|created_at| DateTime::parse_from_rfc3339(created_at).ok())
+            .map(|ts| ts.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        for job in &run.jobs {
+            if job.status != "queued" || job.labels.is_empty() {
+                continue;
+            }
+            examined += 1;
+            let capable = registered
+                .iter()
+                .filter(|runner| runner.online && runner.advertises_all(&job.labels))
+                .collect::<Vec<_>>();
+            let report = assess_queued_job(
+                &QueuedJobObservation {
+                    run_id: run.run_id.to_string(),
+                    name: job.name.clone(),
+                    queued_since,
+                    capable_runner_online: !capable.is_empty(),
+                    capable_runner_idle: capable.iter().any(|runner| !runner.busy),
+                    // Nothing in the observation model carries a
+                    // cancellation-request timestamp, so the unclearable state
+                    // is unreachable from this caller rather than inferred.
+                    cancel_requested_at: None,
+                },
+                thresholds,
+                now,
+            );
+            if report.verdict.is_raise() {
+                raising.push(report);
+            }
+        }
+    }
+    WedgedQueuedJobs { examined, raising }
 }
 
 fn normalized_target(target: &str) -> String {
