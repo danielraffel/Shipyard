@@ -613,3 +613,68 @@ fn workflow_parser_reads_the_routing_facts() {
             .contains(&"PULP_OVERFLOW_BUILD_MACOS_RUNS_ON_JSON".to_owned())
     );
 }
+
+// ---------------------------------------------------------------------------
+// API budget. The number is measured, not estimated: a budget nobody measures
+// is a wish, and GitHub's secondary limit trips on burst shape rather than on
+// quota.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_warm_cache_costs_zero_api_calls() {
+    use super::gather::{CACHE_TTL_SECS, cache_path, gather};
+    use crate::cloud::GitHubActions;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path();
+    // Seed the cache the way a prior cold gather would have.
+    let seeded = serde_json::json!({
+        "fetched_at": now(),
+        "repo": "Generous-Corp/pulp",
+        "base": "main",
+        "variables": [["PULP_PREAMBLE_RUNS_ON_JSON", "[\"ubuntu-latest\"]"]],
+        "census": [],
+        "census_boundary": serde_json::Value::Null,
+        "required_contexts": ["macos"],
+        "contexts_source": "branch_protection",
+    });
+    std::fs::write(
+        cache_path(state, "Generous-Corp/pulp"),
+        serde_json::to_string(&seeded).expect("serialize"),
+    )
+    .expect("write cache");
+
+    // A client pointed at a directory with no `gh` configured: if the cache
+    // were missed, the calls would be attempted and counted. They are not.
+    let actions = GitHubActions::new(dir.path());
+    let facts = gather(
+        &actions,
+        state,
+        "Generous-Corp/pulp",
+        "main",
+        now() + chrono::Duration::seconds(CACHE_TTL_SECS - 1),
+        false,
+    );
+    assert_eq!(
+        facts.api_calls, 0,
+        "a warm cache must cost nothing; this is what makes the gate cheap enough to run on \
+         every ship"
+    );
+    assert_eq!(facts.required_contexts, Some(vec!["macos".to_owned()]));
+
+    // The control: one second past the TTL the cache must be ignored, or the
+    // assertion above is satisfied by a cache that never expires — which would
+    // make the gate report a runner census from an arbitrarily distant past.
+    let cold = gather(
+        &actions,
+        state,
+        "Generous-Corp/pulp",
+        "main",
+        now() + chrono::Duration::seconds(CACHE_TTL_SECS + 1),
+        false,
+    );
+    assert!(
+        cold.api_calls > 0,
+        "past the TTL the facts must be re-fetched, not served stale"
+    );
+}
