@@ -1249,6 +1249,63 @@ requested and not honoured — is unreachable from this caller: nothing in the
 observation model carries a cancellation-request timestamp, so it is passed as
 `None` rather than inferred from something that is not it.
 
+### A host that answers every probe while nothing is serving on it
+
+Capacity, the doctor digest and storage all describe the *host*. A host can
+answer all three cleanly while the process that actually takes work has been
+dead for hours — which is what happened in every incident this workstream
+exists for. The host was up. The runner was not.
+
+`fleet status` now reads the attestation artifact each host's attester writes
+every 300s to `$HOME/.tartci/state/host-attestation.json`, and turns it into
+two kinds of finding: a persistent runner that is **loaded and crash-looping**,
+and an attestation that **could not be read at all**. Both fold into
+`problem_count`, reach the text and JSON surfaces, and clear `routable`.
+
+**The raise predicate is `loaded && crash_loop`, never `verdict == "broken"`.**
+Measured across the fleet at the time of writing: one host reports 2 broken
+runners, another 8, a third 0 — and exactly one entry fleet-wide is `loaded`.
+A broken verdict on an unloaded runner is history, not a fault: the plist is
+not running, so nothing is failing to serve. Raising on the verdict alone would
+report ten faults where one exists, and an operator who sees ten false faults
+stops reading the check.
+
+Three things the probe refuses to flatten:
+
+- **An unreadable attestation is a finding, named by boundary.** `Scope`,
+  `Transport`, `Parse` and `Absent` are different facts. A LaunchAgent lives in
+  the per-user GUI domain, so `launchctl list` over a non-interactive ssh
+  session enumerates nothing *for a perfectly healthy job* — the attester
+  reports whether it could read that domain, and a false there is `Scope`. Map
+  it to `Absent` and every healthy host reads as having no runners.
+- **A stale artifact is not a current reading.** A file older than twice its
+  own declared cadence is `Transport`-unreadable. Staleness is checked before
+  any field inside the document is believed, because a stale artifact repeats
+  its last word with total confidence.
+- **A document that does not parse is not a host with no runners.** A truncated
+  or half-written artifact refuses as `Parse`. That is the exact shape of the
+  failure this check exists to catch, so it must never read as a clean census
+  of zero.
+
+**`routable` deliberately does not name `attestation.readable`.** It was
+written that way first, and the break-confirm loop proved the term
+unfalsifiable: an unreadable attestation always raises exactly one problem, so
+`problem_count == 0` had already cleared `routable` before that conjunct was
+consulted. No inversion of it could turn any test red. A guard nothing can
+break implies a protection that is not there, so it was removed and the real
+coupling — the unreadable arm of `attestation_problems` — is pinned by a test
+that *does* go red, carrying a readable-host control so its assertion cannot
+pass for an unrelated reason.
+
+Limits worth knowing before trusting a verdict. The probe trusts the attester's
+own declared cadence and only bounds it with a default when the artifact omits
+one, so a writer that lies about its interval widens its own staleness ceiling.
+Crash-loop detection is the attester's verdict, not a rate computed here; this
+code decides only whether that verdict should raise. And a host whose attester
+was never installed reads as `Transport`-unreadable, indistinguishable from one
+whose attester died — both are findings, so nothing hides, but the two are not
+separated.
+
 ## Host-Health Pre-Dispatch Gate (optional)
 
 For self-hosted runners *co-located with heavy interactive work*: read a shared

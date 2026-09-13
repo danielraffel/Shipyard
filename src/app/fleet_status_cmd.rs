@@ -28,7 +28,7 @@ use crate::capacity::{
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::executor::ssh::shlex_quote;
-use crate::fleet_service::{RegisteredRunner, RunnerScope};
+use crate::fleet_service::{Boundary, RegisteredRunner, RunnerScope};
 use crate::fleet_slot::{
     QueuedJobObservation, QueuedJobReport, WedgeThresholds, assess_queued_job,
 };
@@ -47,9 +47,9 @@ mod render;
 
 pub(in crate::app) use assessment::FleetAssessment;
 use assessment::{
-    DoctorProbe, ExpectedHostConfig, ExpectedHostStatus, HostFleetStatus, MergeQueueProbe,
-    ObservationReason, QueuedSummary, ReleaseProbe, RepositoryRunner, RoutingMismatch,
-    RunnerInventory, StorageProbe, WedgedQueuedJobs,
+    AttestationProbe, BrokenRunner, DoctorProbe, ExpectedHostConfig, ExpectedHostStatus,
+    HostFleetStatus, MergeQueueProbe, ObservationReason, QueuedSummary, ReleaseProbe,
+    RepositoryRunner, RoutingMismatch, RunnerInventory, StorageProbe, WedgedQueuedJobs,
 };
 use observation::{
     classify_observation_error, fetch_observed_workflow_runs, inspect_merge_queue_liveness,
@@ -159,6 +159,7 @@ pub(super) fn collect_fleet_assessment(
             probe.capacity,
             probe.doctor,
             probe.storage,
+            probe.attestation,
             FLEET_LANE_TARGET,
             runners.readable,
         ));
@@ -321,6 +322,7 @@ struct HostProbeBundle {
     capacity: HostCapacity,
     doctor: DoctorProbe,
     storage: StorageProbe,
+    attestation: AttestationProbe,
 }
 
 fn probe_hosts_concurrently(classes: &[HostClassConfig]) -> Vec<HostProbeBundle> {
@@ -368,6 +370,7 @@ fn probe_host_until_using(
         let capacity = scope.spawn(|| probe_host_capacity_until(class, deadline));
         let doctor = scope.spawn(|| probe_doctor_until(class, deadline));
         let storage = scope.spawn(|| storage_probe(class, deadline));
+        let attestation = scope.spawn(|| probe_attestation_until(class, deadline));
         HostProbeBundle {
             capacity: capacity.join().unwrap_or_else(|_| HostCapacity {
                 class: class.class.clone(),
@@ -386,6 +389,12 @@ fn probe_host_until_using(
                 disk_path: class.tart_home.clone().unwrap_or_else(|| ".".to_owned()),
                 disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
                 ..StorageProbe::default()
+            }),
+            attestation: attestation.join().unwrap_or_else(|_| AttestationProbe {
+                readable: false,
+                boundary: Some(Boundary::Transport.as_str().to_owned()),
+                source: "attestation probe panicked".to_owned(),
+                ..AttestationProbe::default()
             }),
         }
     })
@@ -410,6 +419,12 @@ fn unreadable_host_bundle(class: &HostClassConfig, reason: &str) -> HostProbeBun
             disk_path: class.tart_home.clone().unwrap_or_else(|| ".".to_owned()),
             disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
             ..StorageProbe::default()
+        },
+        attestation: AttestationProbe {
+            readable: false,
+            boundary: Some(Boundary::Transport.as_str().to_owned()),
+            source: reason.to_owned(),
+            ..AttestationProbe::default()
         },
     }
 }
@@ -639,6 +654,7 @@ fn analyze_host(
     capacity: HostCapacity,
     doctor: DoctorProbe,
     storage: StorageProbe,
+    attestation: AttestationProbe,
     target: &str,
     central_runner_inventory_readable: bool,
 ) -> HostFleetStatus {
@@ -675,7 +691,8 @@ fn analyze_host(
         .cloned()
         .collect::<Vec<_>>();
     let storage_problems = storage_problems(&storage);
-    let problem_count = problems.len() + storage_problems.len();
+    let attestation_problems = attestation_problems(&attestation);
+    let problem_count = problems.len() + storage_problems.len() + attestation_problems.len();
     let github_runner_count = digest
         .and_then(|value| value.get("github_runners"))
         .and_then(Value::as_array)
@@ -700,6 +717,9 @@ fn analyze_host(
         && capacity.free() > 0
         && doctor.readable
         && storage.readable
+        // An unreadable attestation is not named here on purpose: it raises an
+        // attestation problem, so `problem_count` below already carries it. A
+        // second conjunct would be a guard no test could break.
         && problem_count == 0
         && fresh_supervisor_count > 0;
     HostFleetStatus {
@@ -716,6 +736,8 @@ fn analyze_host(
         supervisors,
         storage,
         storage_problems,
+        attestation,
+        attestation_problems,
     }
 }
 
@@ -794,6 +816,252 @@ fn probe_storage_until(class: &HostClassConfig, deadline: Instant) -> StoragePro
         }
     };
     storage_probe_from_output(&output, disk_path)
+}
+
+/// The attester declares its own cadence; a reading older than this many
+/// intervals means the writer stopped, not that the host is quiet.
+const ATTESTATION_STALENESS_FACTOR: i64 = 2;
+
+/// Used only when the artifact omits its own interval, so a missing cadence
+/// cannot silently disable the staleness gate.
+const ATTESTATION_DEFAULT_INTERVAL_SECS: u64 = 300;
+
+/// `$HOME` is expanded on the far side on purpose: the artifact lives under the
+/// attester's own home directory, which differs per host and is not knowable
+/// here. Quoting the path would defeat that and read a literal `~`.
+fn attestation_probe_script() -> String {
+    "p=\"$HOME\"/.tartci/state/host-attestation.json; if [ -r \"$p\" ]; then cat \"$p\"; else \
+     echo 'host attestation artifact absent' >&2; exit 66; fi"
+        .to_owned()
+}
+
+fn probe_attestation_until(class: &HostClassConfig, deadline: Instant) -> AttestationProbe {
+    probe_attestation_until_at(class, deadline, Utc::now())
+}
+
+fn probe_attestation_until_at(
+    class: &HostClassConfig,
+    deadline: Instant,
+    now: DateTime<Utc>,
+) -> AttestationProbe {
+    let script = attestation_probe_script();
+    let output = if let Some(host) = &class.ssh {
+        let mut command = Command::new("ssh");
+        let remote = remote_observer_command(
+            &format!(
+                "env PATH={REMOTE_OBSERVER_PATH} sh -c {}",
+                shlex_quote(&script)
+            ),
+            deadline,
+        );
+        command
+            .args(observer_ssh_probe_options())
+            .arg(host)
+            .arg(remote);
+        run_output_until(&mut command, deadline, "ssh attestation probe")
+    } else {
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        run_output_until(&mut command, deadline, "attestation probe")
+    };
+    let base_source = if class.ssh.is_some() { "ssh" } else { "local" };
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return AttestationProbe {
+                readable: false,
+                boundary: Some(Boundary::Transport.as_str().to_owned()),
+                source: match error {
+                    BoundedOutputError::TimedOut { .. } => {
+                        format!("{base_source} attestation probe timed out")
+                    }
+                    _ => format!("{base_source} attestation probe unreadable: {error}"),
+                },
+                ..AttestationProbe::default()
+            };
+        }
+    };
+    attestation_probe_from_output(&output, base_source, now)
+}
+
+/// Collect the runners the attester itself called broken.
+///
+/// A runner absent from `persistent_runners` and one in a document that omits
+/// the array both yield nothing here; the caller has already refused any
+/// document it could not read, so an empty census means an empty census.
+fn broken_runners_from_document(document: &Value) -> Vec<BrokenRunner> {
+    document
+        .get("persistent_runners")
+        .and_then(Value::as_array)
+        .map_or_else(Vec::new, |entries| {
+            entries
+                .iter()
+                .filter(|entry| entry.get("verdict").and_then(Value::as_str) == Some("broken"))
+                .map(|entry| BrokenRunner {
+                    label: entry
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    loaded: entry
+                        .get("loaded")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    crash_loop: entry
+                        .get("crash_loop")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    runs: entry.get("runs").and_then(Value::as_u64).unwrap_or(0),
+                    registered: entry
+                        .get("registered")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+                .collect()
+        })
+}
+
+/// Parse one host's attestation artifact into a verdict.
+///
+/// Every refusal path sets `readable = false` and names a boundary, because a
+/// reading that could not be taken must never be indistinguishable from one
+/// that found nothing wrong.
+fn attestation_probe_from_output(
+    output: &Output,
+    base_source: &str,
+    now: DateTime<Utc>,
+) -> AttestationProbe {
+    let unreadable = |boundary: Boundary, detail: String| AttestationProbe {
+        readable: false,
+        boundary: Some(boundary.as_str().to_owned()),
+        source: detail,
+        ..AttestationProbe::default()
+    };
+
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+        return unreadable(
+            Boundary::Transport,
+            format!("{base_source} attestation exit {code}"),
+        );
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let Ok(document) = serde_json::from_str::<Value>(&raw) else {
+        return unreadable(
+            Boundary::Parse,
+            format!("{base_source} attestation is not JSON"),
+        );
+    };
+
+    // A launchd LaunchAgent lives in the per-user GUI domain, so a
+    // non-interactive session cannot enumerate it. The attester runs inside
+    // that domain and reports whether it could read it; when it could not, the
+    // runner census below is blind rather than empty.
+    let launchd_readable = document.get("launchd_readable").and_then(Value::as_bool);
+    if launchd_readable == Some(false) {
+        return AttestationProbe {
+            readable: false,
+            boundary: Some(Boundary::Scope.as_str().to_owned()),
+            source: format!("{base_source} attestation could not read the launchd GUI domain"),
+            launchd_readable,
+            ..AttestationProbe::default()
+        };
+    }
+
+    let interval_secs = document
+        .get("interval_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(ATTESTATION_DEFAULT_INTERVAL_SECS);
+
+    // A stale artifact repeats its last word with total confidence, so age is
+    // checked before any field inside it is believed.
+    let Some(written_raw) = document.get("written_at").and_then(Value::as_str) else {
+        return unreadable(
+            Boundary::Parse,
+            format!(
+                "{base_source} attestation carried no written_at, so its age cannot be bounded"
+            ),
+        );
+    };
+    let Ok(written_at) = DateTime::parse_from_rfc3339(written_raw) else {
+        return unreadable(
+            Boundary::Parse,
+            format!("{base_source} attestation written_at is not RFC3339: {written_raw}"),
+        );
+    };
+    let written_at = written_at.with_timezone(&Utc);
+    let age_secs = now.signed_duration_since(written_at).num_seconds();
+    let ceiling = ATTESTATION_STALENESS_FACTOR
+        .saturating_mul(i64::try_from(interval_secs).unwrap_or(i64::MAX));
+    if age_secs > ceiling {
+        return AttestationProbe {
+            readable: false,
+            boundary: Some(Boundary::Transport.as_str().to_owned()),
+            source: format!(
+                "{base_source} attestation last wrote {age_secs}s ago, past the {ceiling}s ceiling \
+                 — the attester stopped writing"
+            ),
+            written_at: Some(written_raw.to_owned()),
+            age_secs: Some(age_secs),
+            interval_secs: Some(interval_secs),
+            launchd_readable,
+            ..AttestationProbe::default()
+        };
+    }
+
+    let runners = broken_runners_from_document(&document);
+
+    AttestationProbe {
+        readable: true,
+        boundary: None,
+        source: format!("{base_source} attestation"),
+        written_at: Some(written_raw.to_owned()),
+        age_secs: Some(age_secs),
+        interval_secs: Some(interval_secs),
+        launchd_readable,
+        writer_sha256: document
+            .get("generation")
+            .and_then(|g| g.get("writer_sha256"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        persistent_runner_count: document
+            .get("persistent_runners")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        jit_lane_count: document
+            .get("jit_lanes")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        broken: runners,
+    }
+}
+
+/// Turn one host's attestation into the problems that should raise.
+///
+/// An unreadable attestation is a problem in its own right: the check exists to
+/// notice a host that stopped serving, and a probe that cannot see is exactly
+/// the state in which that failure hides.
+fn attestation_problems(attestation: &AttestationProbe) -> Vec<String> {
+    if !attestation.readable {
+        let boundary = attestation.boundary.as_deref().unwrap_or("unknown");
+        return vec![format!(
+            "attestation_unreadable:{boundary}:{}",
+            attestation.source
+        )];
+    }
+    attestation
+        .crash_looping()
+        .map(|runner| {
+            format!(
+                "runner_crash_loop:{}:{} spawns, registered={}",
+                runner.label, runner.runs, runner.registered
+            )
+        })
+        .collect()
 }
 
 fn is_host_github_observation_problem(problem: &Value) -> bool {
