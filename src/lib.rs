@@ -117,6 +117,7 @@ pub(crate) mod immutable_store;
 pub mod init_config;
 /// Job and target-result domain types used by executors and queues.
 pub mod job;
+pub mod landability;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
 /// Bounded log rotation, terminal classification, and retention primitives.

@@ -2941,3 +2941,51 @@ Confirm it in both directions by running the helper directly — `--exact <name>
 once with a marker written and once with none. Before this change the no-marker
 run exited 87 after 5s; a fix is only real when that run reports the timeout
 code.
+
+---
+
+## `src/landability/` — the schedulability classifier and its one production caller
+
+`src/fleet_service.rs` shipped fully tested with **zero production callers**, and
+a classifier nothing calls is indistinguishable from one that does not exist.
+`src/landability/` is the wire, plus the parts `fleet_service` deliberately does
+not own.
+
+| module | owns |
+|---|---|
+| `workflow.rs` | a deliberately small reader for `jobs:` — id, `name`, `needs`, `runs-on`, and every `vars.*` reference. **Not a YAML parser and must not become one.** |
+| `assess.rs` | required context → producing jobs → transitive `needs` closure → one lane verdict per job |
+| `attestation.rs` | reads the tartci-written host attestation; decides whether a record is evidence |
+| `gather.rs` | the four API calls and the 300 s cache |
+| `gate.rs` | the submission gate; the only thing that turns a verdict into a refusal |
+
+### Things that will bite a future change
+
+- **`fold_attestation` refines only `Idle`.** Every other verdict was already
+  decided by the census. Widening it would make a census result depend on a host
+  file, which is the wrong direction.
+- **A refusal requires a *fresh* attestation.** With none readable the verdict is
+  `Unknown`, because a dead sensor must not be able to block every ship on the
+  fleet — and equally must not be able to vouch for anything.
+- **Freshness is not sufficient.** A record whose writer could not read the host
+  profile or the launchd domain is disqualified even when it is seconds old. The
+  first deployment of the writer ran under macOS's `/usr/bin/python3` (3.9, no
+  `tomllib`), so the profile parsed as empty and the record declared zero lanes
+  without saying it had failed to look.
+- **The `name:` over-approximation errs permissively on purpose.** A job's name
+  is often an expression; every string literal in it is treated as a name the
+  job may render to. That pulls *more* lanes into a closure, never fewer, which
+  is the safe direction for a check whose false positive is a refused ship.
+- **`resolve_runs_on_expr` recognises four forms and nothing else.** Anything
+  unrecognised is `Unparsable` → `Unknown`, and the job is listed by id so a
+  workflow author can see their expression escaped the analysis. Do not add
+  guessing.
+
+### Testing
+
+Every test in `src/landability/tests.rs` is a negative control built on data
+captured from the 2026-09-13 incident, and each sits beside a control that must
+*not* refuse. Before believing a change is safe, break it and watch the right
+tests fail: breaking the `needs` walk, the org-scope census, the staleness
+check, the attestation fold, or the unread-variable guard each fails a specific
+test while `e1_control_hosted_routing_does_not_block` keeps passing.

@@ -340,6 +340,19 @@ pub(super) enum Command {
         command: Option<QuarantineCommand>,
     },
     /// Check environment, dependencies, targets, and effective GitHub auth.
+    /// Report whether each required status context can be scheduled onto a
+    /// runner that exists, and self-check the classifier while doing it.
+    ///
+    /// Exit 0 clean, 7 when a required context is unschedulable, 1 when the
+    /// instrument's own control lanes fail to discriminate.
+    Landability {
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Base branch whose protection and workflows are read.
+        #[arg(long, value_name = "BRANCH")]
+        base: Option<String>,
+    },
     Doctor {
         /// Exact OWNER/REPO used to resolve configured auth token placeholders.
         #[arg(long, value_name = "OWNER/REPO")]
@@ -383,6 +396,14 @@ pub(super) enum Command {
         /// fleet epoch.
         #[arg(long = "allow-fleet-epoch-drift")]
         allow_fleet_epoch_drift: bool,
+        /// Waive an unserved-lane refusal for a specific runner label.
+        /// Prints the full landability diagnosis as a warning and proceeds.
+        /// Never set by automation.
+        #[arg(long = "allow-unserved-lane", value_name = "LABEL")]
+        allow_unserved_lanes: Vec<String>,
+        /// Skip the landability gate entirely for this invocation.
+        #[arg(long = "skip-landability")]
+        skip_landability: bool,
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
@@ -427,6 +448,14 @@ pub(super) enum Command {
         /// fleet epoch.
         #[arg(long = "allow-fleet-epoch-drift")]
         allow_fleet_epoch_drift: bool,
+        /// Waive an unserved-lane refusal for a specific runner label.
+        /// Prints the full landability diagnosis as a warning and proceeds.
+        /// Never set by automation.
+        #[arg(long = "allow-unserved-lane", value_name = "LABEL")]
+        allow_unserved_lanes: Vec<String>,
+        /// Skip the landability gate entirely for this invocation.
+        #[arg(long = "skip-landability")]
+        skip_landability: bool,
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
@@ -457,6 +486,14 @@ pub(super) enum Command {
         /// fleet epoch.
         #[arg(long = "allow-fleet-epoch-drift")]
         allow_fleet_epoch_drift: bool,
+        /// Waive an unserved-lane refusal for a specific runner label.
+        /// Prints the full landability diagnosis as a warning and proceeds.
+        /// Never set by automation.
+        #[arg(long = "allow-unserved-lane", value_name = "LABEL")]
+        allow_unserved_lanes: Vec<String>,
+        /// Skip the landability gate entirely for this invocation.
+        #[arg(long = "skip-landability")]
+        skip_landability: bool,
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,

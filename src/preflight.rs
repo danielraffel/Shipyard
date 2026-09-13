@@ -18,6 +18,13 @@ pub const EXIT_HOST_UNHEALTHY: u8 = 4;
 /// Exit code used when this host has not converged to the declared fleet epoch.
 pub const EXIT_FLEET_EPOCH_DRIFT: u8 = 5;
 
+/// Exit code used when a required status context cannot be scheduled onto any
+/// runner that exists.
+///
+/// Re-exported from [`crate::landability`] so every submission exit code is
+/// readable in one place.
+pub use crate::landability::EXIT_LANE_UNSERVED;
+
 /// One unreachable target discovered during preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetPreflightFailure {
@@ -126,6 +133,17 @@ pub enum ShipPreflightError {
         /// Rendered status explaining the gap and how to close it.
         status: String,
     },
+    /// A required status context cannot be scheduled onto any runner.
+    ///
+    /// Distinct from every other variant here because nothing about *this
+    /// host* is wrong: the work would be accepted, queued, and then wait
+    /// forever on a label no runner carries. Waiting does not fix it and
+    /// re-dispatching makes it worse.
+    LaneUnserved {
+        /// Rendered diagnosis naming the context, the jobs, the census in both
+        /// scopes and the per-host attestation.
+        diagnosis: String,
+    },
     /// The opt-in host-health gate hard-stopped a saturated self-hosted host.
     HostUnhealthy {
         /// Level label (currently always `critical`).
@@ -136,7 +154,12 @@ pub enum ShipPreflightError {
 }
 
 /// Optional bypasses for explicit operator-controlled validation runs.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+///
+/// Each flag waives a *different* gate with a different blast radius, so they
+/// stay separate booleans rather than collapsing into one "force" that would
+/// silently widen whichever gate is added next.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ShipPreflightOptions {
     /// Skip checkout-root mismatch enforcement.
     pub allow_root_mismatch: bool,
@@ -145,6 +168,12 @@ pub struct ShipPreflightOptions {
     /// Proceed even when this host has not converged to the declared fleet
     /// epoch. An explicit operator override, never a default.
     pub allow_fleet_epoch_drift: bool,
+    /// Runner labels whose unserved verdict the operator has waived for this
+    /// run. Prints the full diagnosis as a warning and proceeds. Never set by
+    /// automation.
+    pub allow_unserved_lanes: Vec<String>,
+    /// Skip the landability gate entirely.
+    pub skip_landability: bool,
 }
 
 impl Display for ShipPreflightError {
@@ -207,6 +236,12 @@ impl Display for ShipPreflightError {
                  dispatching from here could produce a result nobody can reproduce. Options:\n\
                  \x20 - Run tools/fleet/apply.sh to converge this host, OR\n\
                  \x20 - Pass --allow-fleet-epoch-drift to proceed anyway."
+            ),
+            Self::LaneUnserved { diagnosis } => write!(
+                formatter,
+                "{diagnosis}\n\
+                 Shipyard's own validation is not the question here: this submission would be \n\
+                 accepted, queued, and then wait forever on a label no runner carries."
             ),
             Self::HostUnhealthy { level, reason } => write!(
                 formatter,
@@ -275,6 +310,9 @@ pub fn collect_ship_preflight_with_options(
     dispatcher: &ExecutorDispatcher,
     options: ShipPreflightOptions,
 ) -> Result<ShipPreflightReport, ShipPreflightError> {
+    // Moved out rather than cloned so `options` is genuinely consumed; the
+    // remaining fields are `Copy` and stay readable after the partial move.
+    let allow_unserved_lanes = options.allow_unserved_lanes;
     let expected_root = Some(normalize_path(
         &expected_root(config).unwrap_or_else(|| cwd.to_path_buf()),
     ));
@@ -321,6 +359,15 @@ pub fn collect_ship_preflight_with_options(
         crate::host_health::HostHealthOutcome::Block { level, reason } => {
             return Err(ShipPreflightError::HostUnhealthy { level, reason });
         }
+    }
+
+    // Landability: can the PR's required contexts be scheduled at all? This is
+    // the question Shipyard did not ask on 2026-09-13, and the reason four
+    // independently validated PRs sat BLOCKED for hours on a check that was
+    // never going to appear. It runs before target probes because a refusal
+    // here makes those probes pointless.
+    if !options.skip_landability {
+        landability_gate(config, cwd, state_dir, allow_unserved_lanes, &mut warnings)?;
     }
 
     let target_reports = targets
@@ -376,6 +423,40 @@ pub fn collect_ship_preflight_with_options(
         failures,
         skew_note: daemon_skew_note(state_dir),
     })
+}
+
+/// Refuse when a required status context cannot be scheduled onto any runner.
+///
+/// Split out of the preflight body so the landability decision is readable on
+/// its own: it is the only gate here that says nothing about *this host*.
+fn landability_gate(
+    config: &LoadedConfig,
+    cwd: &Path,
+    state_dir: &Path,
+    allow_unserved_lanes: Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(), ShipPreflightError> {
+    let Some(repo) = crate::landability::gate::resolve_repo(config, cwd) else {
+        return Ok(());
+    };
+    let base = crate::landability::gate::resolve_base(config);
+    let outcome = crate::landability::gate::run(
+        config,
+        cwd,
+        state_dir,
+        &repo,
+        &base,
+        &crate::landability::GateOptions {
+            allow_unserved_lanes,
+            skip: false,
+            ignore_cache: false,
+        },
+    );
+    warnings.extend(outcome.warnings);
+    if let Some(diagnosis) = outcome.refusal {
+        return Err(ShipPreflightError::LaneUnserved { diagnosis });
+    }
+    Ok(())
 }
 
 fn target_report(

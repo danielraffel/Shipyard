@@ -210,6 +210,35 @@ real ship-state write from overlapping that audit.
                        next attempt]
 ```
 
+## Preflight refusals happen before any state is written
+
+`ship --pr` runs `run_ship_preflight` before durable ship state mutates, so a
+preflight refusal leaves **no** `ShipState` behind: there is nothing to
+reconcile, nothing to orphan, and re-running the command after the cause is
+fixed starts from a clean sheet rather than resuming a half-written record.
+
+Five refusals, each with its own exit code so the remedy is unambiguous:
+
+| exit | error | what is wrong |
+|---|---|---|
+| 1 | `RootMismatch` | the command is running in a different checkout than the one the config owns |
+| 3 | `BackendUnreachable` | a validation target did not answer its probe |
+| 4 | `HostUnhealthy` | the opt-in host-health gate hard-stopped a saturated self-hosted host |
+| 5 | `FleetEpochDrift` | this host never applied the declared fleet manifest |
+| 7 | `LaneUnserved` | a **required status context** cannot be scheduled onto any runner that exists |
+
+Exit 7 is the odd one out, and worth stating plainly in a document about ship
+state: **nothing about this host is wrong.** The submission would be accepted,
+a run would be created, and its first job would queue forever on a label no
+runner carries. The resulting `ShipState` would be entirely well-formed — the
+right SHA, one attempt, not orphaned — while the pull request could never
+merge. That combination held for about six hours on 2026-09-13 and is precisely
+what the state machine cannot represent, because the failure is outside it.
+
+The gate never dispatches, cancels, or retries in response. See
+`skills/shipyard/SKILL.md` for the classifier and `src/landability/` for the
+implementation.
+
 ## Entry points and which states they read/write
 
 | CLI command                 | Reads                                               | Writes                                                  |
