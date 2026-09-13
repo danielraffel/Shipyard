@@ -2302,3 +2302,72 @@ away from the cause. Reproducing it needs the host to be slow, not the code to b
 wrong, so a green local rerun is not evidence. The worked example and the
 two-direction control are in the `shipyard` skill under "A subprocess helper's
 exit code must distinguish \"obeyed\" from \"gave up\"".
+
+---
+
+## The submission preflight now answers "can this PR land", not just "did validation pass"
+
+`shipyard status` reporting `running: 0 / pending: 0` and `mac: local
+reachable=true`, with `ship-state list` showing the correct SHA and one attempt,
+is fully compatible with **every pull request in the repository being
+unmergeable**. On 2026-09-13 that state held in `Generous-Corp/pulp` for about
+six hours: a routing variable named a runner label no runner carried, so every
+`build.yml` run queued forever at its first job and the required context never
+appeared at all — not red, not pending, simply absent from `statusCheckRollup`.
+
+`ship` and `pr` now refuse that submission up front with **exit 7**
+(`EXIT_LANE_UNSERVED`). Four API calls cold, zero warm (a 300 s fact cache).
+
+```sh
+shipyard landability --repo OWNER/REPO --base main   # the on-demand surface
+```
+
+### Reading the verdict
+
+| verdict | meaning | what to do |
+|---|---|---|
+| `Served` | an online runner in some scope advertises every label | proceed |
+| `Idle` | nothing registered, but a fresh host attestation supervises the lane (a JIT pool between jobs) | proceed |
+| `Starved` | an online, not-busy runner **does** carry the labels and work queues anyway | runner-group access, ephemeral consumption, or a `workflows` permission — **not** a runner restore |
+| `Unserved` | no runner in either scope, and no fresh attestation declares the lane | restore the runner, or unset the routing variable so the job falls back to the workflow's own literal |
+| `Unknown` | the census, the variables, the protection read or the expression could not be understood | warns, never blocks; fix the instrument before believing any verdict from that run |
+
+Only `Unserved` blocks. Everything else is a statement about the *instrument* or
+about a problem with a different owner, and an instrument that cannot see must
+not be able to stop the fleet — nor fold its own blindness into a pass.
+
+### Non-obvious things it had to get right
+
+- **The `needs` closure is the check, not the producing job.** A required
+  context is produced by one job but gated by its whole transitive `needs`
+  closure. In the incident the context's own job routed through a healthy
+  variable and the two preamble jobs it needed routed through the broken one, so
+  a producer-only check returns a clean answer mid-outage. Six lanes gate one
+  context there.
+- **Both runner scopes, always.** `repos/{owner}/{repo}/actions/runners` omits
+  org-registered runners entirely and returns the same empty list whether a lane
+  is org-served or dead. A partial census is treated as *unreadable*, never as
+  empty.
+- **An empty census cannot decide a JIT lane.** Refusing on "zero runners carry
+  these labels" would refuse on every ship and be switched off within a week.
+  `assess_lane_service` requires aged demand for `Unserved`; at preflight there
+  is no demand, so the host attestation supplies the missing input.
+- **An unread routing variable is not an unset one.** When the variables call
+  fails, every `fromJSON(vars.X || '"ubuntu-latest"')` job looks unset, falls
+  back to the hosted literal, and reports `Served`. Observed live on a host
+  whose App token was returning 404: five confident `served` verdicts for lanes
+  that were never measured. An unread variable is `Unknown`; an unset one still
+  resolves to the workflow's literal, because that is genuinely what GitHub
+  will use.
+- **Detection never dispatches.** The consuming repository's contract row
+  `[default] #4` — a runnerless required lane is HELD, never a retry storm. On
+  2026-09-13 four blind re-dispatches helped nothing and created a second wedge
+  by filling the concurrency group.
+
+### The command checks itself on every run
+
+Two synthetic lanes against the same census and attestation set: one nothing can
+serve (must be `Unserved`, or `Unknown` where no host attests) and one GitHub
+always serves (must be `Served`). If they stop discriminating, `landability`
+exits non-zero rather than reporting a clean result it did not measure. That
+fleet had five sensors dead for weeks to months and none reported its own death.
