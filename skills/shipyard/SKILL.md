@@ -1199,6 +1199,56 @@ Two traps it is built around, both of which produce a confident false fault:
 `RunAtLoad` is not supervision. It starts a job once and says nothing about
 what happens when it exits — which is exactly the plist that took the lane out.
 
+### A queued job that nobody will ever pick up
+
+The lane assertions ask *is a runner serving this lane*. None of them asks
+*is this specific job going anywhere*, and a repository can answer the first
+question cleanly while the second is stuck.
+
+The shape: every registered runner is `online`, at least one is idle, and a
+queued job carrying labels none of them advertise sits in the queue for hours.
+`fleet_service` reports the lane `Served` — correctly, because it is — and
+`fleet status` exits 0. Nothing in the output mentions the job.
+
+`fleet_slot::assess_queued_job` classifies one queued job against the census:
+`Waiting`, `NoCapableRunner`, `Wedged`, `Unclearable`. `fleet_status` now
+sweeps the queued jobs it observed through it and reports
+`wedged_queued_jobs` on both the text and JSON surfaces, raising the exit code
+when a verdict raises.
+
+Four guards, each one a way the sweep could manufacture a finding or hide one:
+
+- **An unreadable census is not an empty census.** `RunnerInventory.readable`
+  is checked before anything else; a census that could not be read reports
+  nothing rather than concluding no runner is capable. This is the same
+  scope-error trap that has already misled this fleet — the failure mode is a
+  confident `Wedged` on a repository whose runners were simply not visible.
+- **An unlabelled job matches everything.** `advertises_all(&[])` is vacuously
+  true, so a job with no labels would count every online runner as capable and
+  could be reported wedged the moment they are all busy. Jobs with an empty
+  label set are skipped.
+- **A run's `created_at` is not a job's queue time.** A run that started an
+  hour ago does not lend that hour to a job queued inside it a minute ago. Only
+  runs still `queued` contribute their timestamp; a started run's jobs are not
+  aged against it.
+- **Busy is saturation, not a wedge.** `capable_runner_idle` is what separates
+  "the fleet is full" from "nothing here will ever take this job". A capable
+  runner that is merely busy must not raise.
+
+**The sweep reports what it examined, not only what it found.** An empty
+findings list means either no queued job is wedged or no queued job was looked
+at, and nothing else in the output separates them — so `examined` is printed
+even on a clean pass. A silent instrument and a healthy fleet read identically
+otherwise, which is the failure this whole workstream exists to catch.
+
+Two limits worth knowing before trusting a verdict. The census is repo-scope
+only, so an org-level runner that would serve the job is invisible; that case
+fails safe, because `NoCapableRunner` maps to `Served` and defers to the lane
+assertion rather than raising on its own. And `Unclearable` — a cancellation
+requested and not honoured — is unreachable from this caller: nothing in the
+observation model carries a cancellation-request timestamp, so it is passed as
+`None` rather than inferred from something that is not it.
+
 ## Host-Health Pre-Dispatch Gate (optional)
 
 For self-hosted runners *co-located with heavy interactive work*: read a shared
