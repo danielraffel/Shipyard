@@ -40,6 +40,8 @@ pub struct AssessInput<'a> {
     pub census: &'a [RegisteredRunner],
     /// Boundary that stopped the census, if any.
     pub census_boundary: Option<Boundary>,
+    /// Boundary that stopped the routing-variable read, if any.
+    pub variables_boundary: Option<Boundary>,
     /// Host attestations.
     pub attestations: &'a AttestationSet,
     /// Thresholds for the underlying service assertion.
@@ -154,14 +156,35 @@ fn assess_job(
             now,
         )],
         RunsOnResolution::Variable { name, fallback } => {
+            // An unread variable and an unset one are indistinguishable from
+            // here, and only one of them is safe to assume. Falling back to
+            // the workflow's hosted literal when the variables call FAILED
+            // reports `Served` for a lane that was never measured — observed
+            // live on a host whose App token was returning 404, which produced
+            // five confident `served` verdicts out of nothing.
+            if let Some(boundary) = input.variables_boundary {
+                return vec![unknown_lane(
+                    context,
+                    &job.id,
+                    role,
+                    &format!(
+                        "vars.{name} could not be read, so this lane was not measured; the \
+                         workflow's own fallback is NOT assumed"
+                    ),
+                    boundary,
+                    now,
+                    input,
+                )];
+            }
             let raw = input
                 .variables
                 .iter()
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| value.clone())
-                // An unset variable is not a hole: the workflow's own literal
-                // is what GitHub will use, and treating "unset" as unknown
-                // would alarm on every correctly-defaulted job.
+                // An unset variable, on the other hand, IS a hole the workflow
+                // fills itself: its own literal is what GitHub will use, and
+                // treating that as unknown would alarm on every correctly
+                // defaulted job.
                 .or(fallback);
             match raw {
                 Some(raw) => vec![assess_lane(

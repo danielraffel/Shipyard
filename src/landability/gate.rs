@@ -216,6 +216,7 @@ pub fn run(
         variables: &facts.variables,
         census: &facts.census,
         census_boundary: facts.census_boundary,
+        variables_boundary: facts.variables_boundary,
         attestations: &attestations,
         thresholds: LaneServiceThresholds::default(),
         allow_unserved: &options.allow_unserved_lanes,

@@ -186,6 +186,7 @@ fn e1_incident_state_refuses_and_names_the_preamble_lane() {
         variables: &variables,
         census: &census,
         census_boundary: None,
+        variables_boundary: None,
         attestations: &attestations,
         thresholds: LaneServiceThresholds::default(),
         allow_unserved: &[],
@@ -262,6 +263,7 @@ fn e1_control_hosted_routing_does_not_block() {
         variables: &variables,
         census: &census,
         census_boundary: None,
+        variables_boundary: None,
         attestations: &attestations,
         thresholds: LaneServiceThresholds::default(),
         allow_unserved: &[],
@@ -676,5 +678,116 @@ fn a_warm_cache_costs_zero_api_calls() {
     assert!(
         cold.api_calls > 0,
         "past the TTL the facts must be re-fetched, not served stale"
+    );
+}
+
+/// An unreadable routing variable must not fall back to the workflow's own
+/// literal.
+///
+/// Found live on a host whose App token was returning 404: the variables call
+/// failed, every `fromJSON(vars.X || '"ubuntu-latest"')` job looked like an
+/// *unset* variable, the hosted literal parsed as `Hosted`, and the tool
+/// printed five confident `served` verdicts for lanes it had not measured at
+/// all. An unread variable and an unset one are indistinguishable from the
+/// classifier's position, and only one of them is safe to assume.
+#[test]
+fn an_unreadable_routing_variable_is_unknown_not_the_workflow_fallback() {
+    let jobs = parse_workflow_jobs(BUILD_YML);
+    let attestations = AttestationSet {
+        hosts: vec![fresh_attestation("m5", &["self-hosted", "macOS", "ARM64"])],
+        unreadable: Vec::new(),
+    };
+    let contexts = vec!["macos".to_owned()];
+    let census = incident_census();
+    let input = AssessInput {
+        contexts: &contexts,
+        contexts_source: "branch_protection",
+        jobs: &jobs,
+        // The variables call failed, so nothing was read.
+        variables: &[],
+        census: &census,
+        census_boundary: None,
+        variables_boundary: Some(Boundary::Transport),
+        attestations: &attestations,
+        thresholds: LaneServiceThresholds::default(),
+        allow_unserved: &[],
+    };
+    let report = assess(&input, now());
+    assert!(
+        !report.lanes.is_empty(),
+        "a run that assessed zero lanes proves nothing"
+    );
+    assert!(
+        report
+            .lanes
+            .iter()
+            .all(|lane| lane.verdict == Schedulability::Unknown),
+        "with the variables unread every routed lane must be Unknown, never Served: {:#?}",
+        report
+            .lanes
+            .iter()
+            .map(|lane| (lane.job_id.clone(), lane.verdict))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        report.blocking().is_empty(),
+        "Unknown warns, it never blocks: a blind instrument must not stop the fleet"
+    );
+}
+
+/// The control for the test above: with the variables readable, the same
+/// workflow and census produce real verdicts rather than a wall of Unknown.
+#[test]
+fn readable_variables_still_produce_real_verdicts() {
+    let jobs = parse_workflow_jobs(BUILD_YML);
+    let attestations = AttestationSet {
+        hosts: vec![fresh_attestation(
+            "m5",
+            &[
+                "self-hosted",
+                "macOS",
+                "ARM64",
+                "pulp-build",
+                "pulp-build-vm",
+            ],
+        )],
+        unreadable: Vec::new(),
+    };
+    let contexts = vec!["macos".to_owned()];
+    let variables = vec![
+        (
+            "PULP_PREAMBLE_RUNS_ON_JSON".to_owned(),
+            r#"["ubuntu-latest"]"#.to_owned(),
+        ),
+        (
+            "PULP_ALIAS_RUNS_ON_JSON".to_owned(),
+            r#"["ubuntu-latest"]"#.to_owned(),
+        ),
+        (
+            "PULP_LOCAL_MACOS_RUNS_ON_JSON".to_owned(),
+            r#"["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm"]"#.to_owned(),
+        ),
+    ];
+    let census = incident_census();
+    let input = AssessInput {
+        contexts: &contexts,
+        contexts_source: "branch_protection",
+        jobs: &jobs,
+        variables: &variables,
+        census: &census,
+        census_boundary: None,
+        variables_boundary: None,
+        attestations: &attestations,
+        thresholds: LaneServiceThresholds::default(),
+        allow_unserved: &[],
+    };
+    let report = assess(&input, now());
+    assert!(
+        report
+            .lanes
+            .iter()
+            .any(|lane| lane.verdict == Schedulability::Served),
+        "readable variables must yield at least one real verdict: {:#?}",
+        report.lanes
     );
 }

@@ -52,6 +52,16 @@ pub struct FleetFacts {
     pub census: Vec<RegisteredRunner>,
     /// Boundary that stopped the census, if any.
     pub census_boundary: Option<Boundary>,
+    /// Boundary that stopped the routing-variable read, if any.
+    ///
+    /// Load-bearing, and discovered the hard way: when the variables call
+    /// fails, every `fromJSON(vars.X || '"ubuntu-latest"')` job looks like an
+    /// *unset* variable and falls back to the workflow's own hosted literal —
+    /// which parses as `Hosted` and reports **Served**. On a host whose App
+    /// token was returning 404 this produced five confident `served` verdicts
+    /// for lanes it had not measured at all. An unread variable is
+    /// `Unknown`, never a fallback.
+    pub variables_boundary: Option<Boundary>,
     /// Required contexts from branch protection, when readable.
     pub required_contexts: Option<Vec<String>>,
     /// Which source supplied the contexts.
@@ -82,6 +92,8 @@ struct CachedFacts {
     variables: Vec<(String, String)>,
     census: Vec<CachedRunner>,
     census_boundary: Option<String>,
+    #[serde(default)]
+    variables_boundary: Option<String>,
     required_contexts: Option<Vec<String>>,
     contexts_source: String,
 }
@@ -153,6 +165,7 @@ pub fn gather(
                 })
                 .collect(),
             census_boundary: facts.census_boundary.map(|b| b.as_str().to_owned()),
+            variables_boundary: facts.variables_boundary.map(|b| b.as_str().to_owned()),
             required_contexts: facts.required_contexts.clone(),
             contexts_source: facts.contexts_source.clone(),
         },
@@ -222,9 +235,13 @@ fn fetch_variables(actions: &GitHubActions, repo: &str, facts: &mut FleetFacts) 
     ) {
         Ok(raw) => facts.variables = parse_variables(&raw),
         Err(error) => {
-            facts
-                .warnings
-                .push(format!("actions variables unreadable: {error}"));
+            facts.variables_boundary = Some(Boundary::Transport);
+            facts.warnings.push(format!(
+                "actions variables unreadable: {error} - every lane routed through a \
+                 `vars.*_RUNS_ON_JSON` is reported Unknown rather than falling back to the \
+                 workflow's literal, because an unread variable and an unset one are \
+                 indistinguishable from here and only one of them is safe to assume"
+            ));
         }
     }
 }
@@ -299,18 +316,23 @@ fn from_cache(cached: CachedFacts) -> FleetFacts {
                 labels: runner.labels,
             })
             .collect(),
-        census_boundary: cached.census_boundary.as_deref().map(|value| match value {
-            "scope" => Boundary::Scope,
-            "permission" => Boundary::Permission,
-            "identity" => Boundary::Identity,
-            "grammar" => Boundary::Grammar,
-            "parse" => Boundary::Parse,
-            _ => Boundary::Transport,
-        }),
+        variables_boundary: cached.variables_boundary.as_deref().map(str_to_boundary),
+        census_boundary: cached.census_boundary.as_deref().map(str_to_boundary),
         required_contexts: cached.required_contexts,
         contexts_source: cached.contexts_source,
         warnings: Vec::new(),
         api_calls: 0,
+    }
+}
+
+fn str_to_boundary(value: &str) -> Boundary {
+    match value {
+        "scope" => Boundary::Scope,
+        "permission" => Boundary::Permission,
+        "identity" => Boundary::Identity,
+        "grammar" => Boundary::Grammar,
+        "parse" => Boundary::Parse,
+        _ => Boundary::Transport,
     }
 }
 
