@@ -383,6 +383,25 @@ pub fn fold_attestation(
     }
 }
 
+/// Rewrite an `Idle` census detail for a lane the attestation turned into a
+/// refusal.
+///
+/// `assess_lane_service` writes "indistinguishable from a just-in-time pool at
+/// rest", which is the honest thing to say when the census is the only
+/// evidence — and reads as hedging inside a refusal that was decided by the
+/// attestation. The refusal text is the product, so it states the census fact
+/// plainly and leaves the reason on the attestation line where it belongs.
+fn census_detail_for_refusal(labels: &[String], matches: usize) -> String {
+    if matches == 0 {
+        format!("0 runners in either scope advertise [{}]", labels.join(","))
+    } else {
+        format!(
+            "{matches} runner(s) advertise [{}] and every one is offline",
+            labels.join(",")
+        )
+    }
+}
+
 /// Assess one lane end to end: parse the routing value, classify it against the
 /// census, then fold in the host attestation.
 ///
@@ -415,6 +434,11 @@ pub fn assess_lane(
         now,
     );
     let (verdict, attested_by, attestation_faults) = fold_attestation(&report, attestations, now);
+    let mut report = report;
+    if verdict == Schedulability::Unserved && report.verdict == ServiceVerdict::Idle {
+        report.detail =
+            census_detail_for_refusal(report.declaration.labels(), report.matches.len());
+    }
     LaneAssessment {
         context: context.to_owned(),
         job_id: job_id.to_owned(),
