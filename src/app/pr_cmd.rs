@@ -24,6 +24,10 @@ pub(super) struct PrCommandArgs {
     pub(super) allow_unreachable_targets: bool,
     /// Proceed even when this host has not converged to the declared fleet epoch.
     pub(super) allow_fleet_epoch_drift: bool,
+    /// Runner labels whose unserved verdict the operator waived.
+    pub(super) allow_unserved_lanes: Vec<String>,
+    /// Skip the landability gate for this invocation.
+    pub(super) skip_landability: bool,
     pub(super) skip_targets: Vec<String>,
     pub(super) skip_bump: Vec<String>,
     pub(super) bump_reason: Option<String>,
@@ -147,6 +151,8 @@ pub(super) fn pr_command<W: Write>(
             pr_snapshot_file: None,
             allow_unreachable_targets: args.allow_unreachable_targets,
             allow_fleet_epoch_drift: args.allow_fleet_epoch_drift,
+            allow_unserved_lanes: args.allow_unserved_lanes.clone(),
+            skip_landability: args.skip_landability,
             skip_targets: args.skip_targets,
             adopt_head: args.adopt_head,
             steward_handoff,
@@ -585,6 +591,8 @@ mod tests {
             apply_bumps: true,
             allow_unreachable_targets: false,
             allow_fleet_epoch_drift: false,
+            allow_unserved_lanes: Vec::new(),
+            skip_landability: false,
             skip_targets: Vec::new(),
             skip_bump: Vec::new(),
             bump_reason: None,

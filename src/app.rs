@@ -34,6 +34,7 @@ mod fleet_status_cmd;
 mod fleet_update_cmd;
 mod governance_cmd;
 mod init_cmd;
+mod landability_cmd;
 mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
@@ -395,6 +396,17 @@ where
                 stdout,
             );
         }
+        Command::Landability { repo, base } => {
+            return landability_cmd::landability_command(
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                repo,
+                base,
+                cli.json,
+                stdout,
+            );
+        }
         Command::Quarantine { command } => {
             return quarantine_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
@@ -628,6 +640,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Cleanup { .. }
         | Command::Targets { .. }
         | Command::Quarantine { .. }
+        | Command::Landability { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }
         | Command::MergeQueue { .. }
@@ -878,6 +891,8 @@ fn handle_ship_variant<W: Write>(
         resume_from,
         allow_unreachable_targets,
         allow_fleet_epoch_drift,
+        allow_unserved_lanes,
+        skip_landability,
         skip_targets,
         adopt_head,
         foreground,
@@ -902,6 +917,8 @@ fn handle_ship_variant<W: Write>(
             pr_snapshot_file: None,
             allow_unreachable_targets,
             allow_fleet_epoch_drift,
+            allow_unserved_lanes,
+            skip_landability,
             skip_targets,
             adopt_head,
             steward_handoff: None,
@@ -930,6 +947,8 @@ fn handle_pr_variant<W: Write>(
         no_apply_bumps,
         allow_unreachable_targets,
         allow_fleet_epoch_drift,
+        allow_unserved_lanes,
+        skip_landability,
         skip_targets,
         skip_bump,
         bump_reason,
@@ -951,6 +970,8 @@ fn handle_pr_variant<W: Write>(
             apply_bumps: apply_bumps && !no_apply_bumps,
             allow_unreachable_targets,
             allow_fleet_epoch_drift,
+            allow_unserved_lanes,
+            skip_landability,
             skip_targets,
             skip_bump,
             bump_reason,
@@ -991,6 +1012,8 @@ fn handle_run_variant<W: Write>(
         allow_root_mismatch,
         allow_unreachable_targets,
         allow_fleet_epoch_drift,
+        allow_unserved_lanes,
+        skip_landability,
         skip_targets,
         no_warm,
         allow_tree_drift,
@@ -1017,6 +1040,8 @@ fn handle_run_variant<W: Write>(
             root_mismatch: RootMismatchPolicy::from_flag(allow_root_mismatch),
             reachability: ReachabilityPolicy::from_flag(allow_unreachable_targets),
             allow_fleet_epoch_drift,
+            allow_unserved_lanes,
+            skip_landability,
             skip_targets,
             warm: WarmPolicy::from_no_warm_flag(no_warm),
             tree_drift: TreeDriftPolicy::from_flag(allow_tree_drift),
