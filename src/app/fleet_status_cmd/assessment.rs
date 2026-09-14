@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::capacity::HostCapacity;
+use crate::fleet_slot::QueuedJobReport;
 use crate::merge_queue_liveness::{MergeQueueLivenessReport, ReleaseLivenessReport};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -37,6 +38,8 @@ pub(super) struct HostFleetStatus {
     pub(super) supervisors: Vec<Value>,
     pub(super) storage: StorageProbe,
     pub(super) storage_problems: Vec<String>,
+    pub(super) attestation: AttestationProbe,
+    pub(super) attestation_problems: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -48,6 +51,52 @@ pub(super) struct StorageProbe {
     pub(super) disk_floor_kibibyte: u64,
     pub(super) ccache_size_kibibyte: Option<u64>,
     pub(super) ccache_max_kibibyte: Option<u64>,
+}
+
+/// One persistent runner the host attester reported as broken.
+///
+/// A dormant plist and a crash loop both read as `broken` in the artifact, so
+/// this carries the two fields that separate them. Only a loaded, looping
+/// runner is a service fault; an unloaded one is migration residue.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(super) struct BrokenRunner {
+    pub(super) label: String,
+    pub(super) loaded: bool,
+    pub(super) crash_loop: bool,
+    pub(super) runs: u64,
+    pub(super) registered: bool,
+}
+
+/// A host's self-attestation, read from the artifact its launchd attester writes.
+///
+/// `readable` is false whenever the probe could not reach a judgement, and
+/// `boundary` names why. The two travel together: a boundary is set if and only
+/// if the probe is unreadable, so an unreadable attestation can never be folded
+/// into a pass.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(super) struct AttestationProbe {
+    pub(super) readable: bool,
+    pub(super) source: String,
+    pub(super) boundary: Option<String>,
+    pub(super) written_at: Option<String>,
+    pub(super) age_secs: Option<i64>,
+    pub(super) interval_secs: Option<u64>,
+    pub(super) launchd_readable: Option<bool>,
+    pub(super) writer_sha256: Option<String>,
+    pub(super) persistent_runner_count: usize,
+    pub(super) jit_lane_count: usize,
+    pub(super) broken: Vec<BrokenRunner>,
+}
+
+impl AttestationProbe {
+    /// The runners that are actually failing service: loaded and looping.
+    ///
+    /// A runner whose plist is installed but not loaded spawns nothing, so it
+    /// cannot be failing to serve. Reporting one as a fault would bury the
+    /// single real crash loop under nine dormant entries.
+    pub(super) fn crash_looping(&self) -> impl Iterator<Item = &BrokenRunner> {
+        self.broken.iter().filter(|r| r.loaded && r.crash_loop)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -96,6 +145,21 @@ pub(super) struct RoutingMismatch {
     pub(super) reason: String,
 }
 
+/// Result of the wedged-queued-job sweep.
+///
+/// `examined` is carried alongside the findings on purpose. An empty
+/// `raising` list means either "no queued job is wedged" or "no queued job was
+/// looked at", and nothing else in the output distinguishes those. Reporting
+/// the count the sweep actually reached makes a silent instrument visible
+/// instead of reading as a clean pass.
+#[derive(Debug, Default)]
+pub(super) struct WedgedQueuedJobs {
+    /// Queued jobs the sweep classified.
+    pub(super) examined: usize,
+    /// Those whose verdict raises.
+    pub(super) raising: Vec<QueuedJobReport>,
+}
+
 #[derive(Debug)]
 pub(super) struct QueuedSummary {
     pub(super) readable: bool,
@@ -141,6 +205,7 @@ pub(in crate::app) struct FleetAssessment {
     pub(super) runners: RunnerInventory,
     pub(super) expected_hosts: Vec<ExpectedHostStatus>,
     pub(super) routing_mismatches: Vec<RoutingMismatch>,
+    pub(super) wedged_queued: WedgedQueuedJobs,
     pub(super) observation_reason_codes: Vec<ObservationReason>,
     pub(super) observation_incomplete: bool,
     pub(super) should_fail: bool,

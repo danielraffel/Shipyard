@@ -1,4 +1,5 @@
 use super::*;
+use crate::fleet_slot::QueuedJobState;
 
 #[cfg(unix)]
 fn executable_script(path: &Path, body: &str) {
@@ -28,6 +29,314 @@ fn isolated_storage_probe_until(class: &HostClassConfig, deadline: Instant) -> S
             ..StorageProbe::default()
         },
     }
+}
+
+fn wedge_runner(name: &str, status: &str, busy: bool, labels: &[&str]) -> RepositoryRunner {
+    RepositoryRunner {
+        id: 900,
+        name: name.to_owned(),
+        status: status.to_owned(),
+        busy,
+        labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+    }
+}
+
+fn wedge_inventory(runners: Vec<RepositoryRunner>) -> RunnerInventory {
+    RunnerInventory {
+        readable: true,
+        source: "github".to_owned(),
+        runners,
+    }
+}
+
+fn wedge_run(created_at: &str, job_labels: &[&str]) -> ActiveRunObservation {
+    ActiveRunObservation {
+        run_id: 4242,
+        workflow: "Build and Test".to_owned(),
+        head_branch: "main".to_owned(),
+        head_sha: Some("cafebabe".to_owned()),
+        status: "queued".to_owned(),
+        created_at: Some(created_at.to_owned()),
+        pull_requests: vec![],
+        url: None,
+        jobs: vec![JobObservation {
+            name: "macOS (arm64)".to_owned(),
+            status: "queued".to_owned(),
+            runner_name: None,
+            labels: job_labels.iter().map(|label| (*label).to_owned()).collect(),
+        }],
+    }
+}
+
+fn wedge_now() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-09-12T12:00:00Z")
+        .expect("fixed clock parses")
+        .with_timezone(&Utc)
+}
+
+#[test]
+fn wedged_queued_job_raises_while_a_capable_runner_sits_idle() {
+    // The incident shape: a run queued far past the threshold whose labels two
+    // online, idle runners advertise. Every liveness-shaped reading is green —
+    // the runners are registered, online, and answering — and the work is not
+    // moving.
+    let inventory = wedge_inventory(vec![
+        wedge_runner(
+            "pulp-build-m5",
+            "online",
+            false,
+            &["self-hosted", "macOS", "ARM64", "pulp-build-pr-head"],
+        ),
+        wedge_runner("pulp-build-m1", "online", false, &["self-hosted", "macOS"]),
+    ]);
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 1, "the sweep must report what it looked at");
+    assert_eq!(found.raising.len(), 1);
+    assert_eq!(found.raising[0].state, QueuedJobState::Wedged);
+    assert!(found.raising[0].verdict.is_raise());
+    assert_eq!(found.raising[0].queued_secs, 10_800);
+}
+
+#[test]
+fn control_a_busy_capable_runner_is_saturation_not_a_wedge() {
+    // The planted negative control for the assertion above. The only change is
+    // that the capable runner is busy, which is ordinary saturation. If this
+    // ever raises, the check is reporting a full fleet as a broken one.
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-m5",
+        "online",
+        true,
+        &["self-hosted", "macOS", "ARM64"],
+    )]);
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(
+        found.examined, 1,
+        "a silent instrument and a clean pass must not read alike"
+    );
+    assert!(found.raising.is_empty());
+}
+
+#[test]
+fn control_an_unlabelled_job_cannot_manufacture_a_wedge() {
+    // `advertises_all` is a superset test and is vacuously true on an empty
+    // slice, so without the guard an unlabelled job matches every runner and
+    // is reported as wedged on the strength of a runner that could never have
+    // been assigned it.
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-m5",
+        "online",
+        false,
+        &["self-hosted", "macOS", "ARM64"],
+    )]);
+    let runs = vec![wedge_run("2026-09-12T09:00:00Z", &[])];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 0);
+    assert!(found.raising.is_empty());
+}
+
+#[test]
+fn control_a_started_run_does_not_lend_its_runtime_to_a_downstream_job() {
+    // A job can enter the queue long after its workflow starts, and the run's
+    // `created_at` is the only age proxy available. Reading it on a run that is
+    // already in progress turns upstream runtime into queue age.
+    let mut runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+    runs[0].status = "in_progress".to_owned();
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-m5",
+        "online",
+        false,
+        &["self-hosted", "macOS", "ARM64"],
+    )]);
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 0);
+    assert!(found.raising.is_empty());
+}
+
+#[test]
+fn control_an_unreadable_census_reports_nothing_rather_than_a_pass() {
+    // A census that could not be read cannot establish a wedge, and must not be
+    // folded into a clean result. `examined = 0` is the signal that the sweep
+    // reached nothing.
+    let inventory = RunnerInventory {
+        readable: false,
+        source: "github: rate limited".to_owned(),
+        runners: vec![],
+    };
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 0);
+    assert!(found.raising.is_empty());
+}
+
+#[test]
+fn no_capable_runner_defers_to_the_lane_service_assertion() {
+    // Nothing online advertises the labels. That is a routing question, and the
+    // repository-scoped census here cannot see an org-scoped runner — so the
+    // verdict must stay non-raising rather than claim a wedge it cannot prove.
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-linux",
+        "online",
+        false,
+        &["self-hosted", "Linux", "X64"],
+    )]);
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 1);
+    assert!(found.raising.is_empty());
+}
+
+fn wedge_assessment(wedged_queued: WedgedQueuedJobs) -> FleetAssessment {
+    FleetAssessment {
+        repo: "owner/repo".to_owned(),
+        target: "macos".to_owned(),
+        free: 2,
+        routable_free_slots: 1,
+        capacity_unreadable: false,
+        doctor_unreadable: false,
+        supervisor_unhealthy: false,
+        problem_hosts: false,
+        queued_age_threshold_secs: 900,
+        queue_run_limit: 50,
+        queued_age_with_capacity: false,
+        queue: QueuedSummary {
+            readable: true,
+            source: "github".to_owned(),
+            count: 0,
+            oldest_age_secs: None,
+        },
+        base: "main".to_owned(),
+        merge_queue_stall_threshold_secs: 900,
+        merge_queue: MergeQueueProbe {
+            readable: true,
+            source: "github".to_owned(),
+            report: None,
+            reason_codes: Vec::new(),
+        },
+        release_stale_threshold_secs: 86_400,
+        release: ReleaseProbe {
+            readable: true,
+            source: "github".to_owned(),
+            report: None,
+            reason_codes: Vec::new(),
+        },
+        hosts: Vec::new(),
+        runners: RunnerInventory {
+            readable: true,
+            source: "github".to_owned(),
+            runners: Vec::new(),
+        },
+        expected_hosts: Vec::new(),
+        routing_mismatches: Vec::new(),
+        wedged_queued,
+        observation_reason_codes: Vec::new(),
+        observation_incomplete: false,
+        should_fail: false,
+    }
+}
+
+#[test]
+fn a_wedged_queued_finding_reaches_both_json_surfaces() {
+    // A detector whose output never renders is another orphan. The one-shot
+    // command envelope and the watch event share one writer, so the finding has
+    // to arrive on both or the assertion is unobservable from either.
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-m5",
+        "online",
+        false,
+        &["self-hosted", "macOS", "ARM64"],
+    )]);
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+    assert_eq!(found.raising.len(), 1);
+
+    let assessment = wedge_assessment(found);
+    let mut command_output = Vec::new();
+    render_fleet_assessment(&assessment, true, &mut command_output).expect("command JSON");
+    let command: Value = serde_json::from_slice(&command_output).expect("command document");
+    let mut watch_output = Vec::new();
+    render_fleet_watch_event(&assessment, &mut watch_output).expect("watch JSON");
+    let watch: Value = serde_json::from_slice(&watch_output).expect("watch document");
+
+    assert_eq!(command["wedged_queued_jobs"]["examined"], 1);
+    assert_eq!(
+        command["wedged_queued_jobs"]["raising"][0]["state"],
+        "wedged"
+    );
+    assert_eq!(
+        command["wedged_queued_jobs"]["raising"][0]["queued_secs"],
+        10_800
+    );
+    assert_eq!(command["wedged_queued_jobs"], watch["wedged_queued_jobs"]);
+}
+
+#[test]
+fn control_a_sweep_that_found_nothing_still_reports_what_it_examined() {
+    // "Looked at three and found no wedge" and "looked at nothing" must not
+    // render identically — that difference is the only thing separating a clean
+    // pass from a silent instrument.
+    let looked = wedge_assessment(WedgedQueuedJobs {
+        examined: 3,
+        raising: Vec::new(),
+    });
+    let mut looked_output = Vec::new();
+    render_fleet_assessment(&looked, true, &mut looked_output).expect("command JSON");
+    let looked_document: Value = serde_json::from_slice(&looked_output).expect("command document");
+
+    assert_eq!(looked_document["wedged_queued_jobs"]["examined"], 3);
+    assert_eq!(
+        looked_document["wedged_queued_jobs"]["raising"],
+        serde_json::json!([])
+    );
+
+    let blind = wedge_assessment(WedgedQueuedJobs::default());
+    let mut blind_output = Vec::new();
+    render_fleet_assessment(&blind, true, &mut blind_output).expect("command JSON");
+    let blind_document: Value = serde_json::from_slice(&blind_output).expect("command document");
+
+    assert_eq!(blind_document["wedged_queued_jobs"]["examined"], 0);
+    assert_ne!(
+        looked_document["wedged_queued_jobs"],
+        blind_document["wedged_queued_jobs"]
+    );
 }
 
 #[cfg(unix)]
@@ -156,6 +465,15 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
     probes[1].storage.disk_available_kibibyte = Some(DEFAULT_DISK_FLOOR_KIBIBYTE.saturating_mul(2));
     probes[1].storage.ccache_size_kibibyte = Some(1);
     probes[1].storage.ccache_max_kibibyte = Some(2);
+    // The healthy class declares no ssh host, so its attestation probe reads
+    // THIS machine's real artifact and reports whatever the live fleet is doing.
+    // Replace the whole observation rather than patching `readable`: a live
+    // crash-looping runner would otherwise decide a concurrency test's verdict.
+    probes[1].attestation = AttestationProbe {
+        readable: true,
+        source: "test fixture".to_owned(),
+        ..AttestationProbe::default()
+    };
 
     let hosts = probes
         .into_iter()
@@ -164,6 +482,7 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
                 probe.capacity,
                 probe.doctor,
                 probe.storage,
+                probe.attestation,
                 FLEET_LANE_TARGET,
                 true,
             )
@@ -212,6 +531,7 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
         },
         expected_hosts: Vec::new(),
         routing_mismatches: Vec::new(),
+        wedged_queued: WedgedQueuedJobs::default(),
         observation_reason_codes: Vec::new(),
         observation_incomplete: false,
         should_fail: true,
@@ -267,6 +587,7 @@ fn assessment_renders_command_and_watch_json_without_round_trip() {
         },
         expected_hosts: Vec::new(),
         routing_mismatches: Vec::new(),
+        wedged_queued: WedgedQueuedJobs::default(),
         observation_reason_codes: Vec::new(),
         observation_incomplete: false,
         should_fail: false,
@@ -403,7 +724,8 @@ fn analyze_host_scopes_health_to_requested_target() {
             ccache_size_kibibyte: Some(1),
             ccache_max_kibibyte: Some(2),
         },
-        "macos",
+        healthy_attestation(),
+        FLEET_LANE_TARGET,
         true,
     );
     assert!(host.routable);
@@ -446,7 +768,14 @@ fn central_runner_inventory_supersedes_host_github_rate_limit_problem() {
         ccache_max_kibibyte: Some(2),
     };
 
-    let centrally_observed = analyze_host(capacity, doctor, storage, "macos", true);
+    let centrally_observed = analyze_host(
+        capacity,
+        doctor,
+        storage,
+        healthy_attestation(),
+        "macos",
+        true,
+    );
     assert!(centrally_observed.routable);
     assert_eq!(centrally_observed.problem_count, 0);
 }
@@ -1425,5 +1754,465 @@ fn release_api_paths_encode_custom_tags_and_branch_refs() {
     assert_eq!(
         base_version_path("owner/repo", "release/1.2 + patch"),
         "repos/owner/repo/contents/VERSION?ref=release%2F1.2%20%2B%20patch"
+    );
+}
+
+/// A readable attestation with nothing wrong, for tests whose subject is some
+/// other probe. Constructed rather than parsed so a parser change cannot
+/// silently turn an unrelated test's fixture unreadable.
+fn healthy_capacity() -> HostCapacity {
+    HostCapacity {
+        class: "m5".to_owned(),
+        ssh: Some("m5".to_owned()),
+        cap: 2,
+        running: Some(0),
+        source: "test".to_owned(),
+    }
+}
+
+fn healthy_doctor() -> DoctorProbe {
+    DoctorProbe {
+        readable: true,
+        source: "test".to_owned(),
+        digest: Some(serde_json::json!({
+            "config": {"heartbeat_stale_secs": 900},
+            "supervisors": [{
+                "runner":"pulp-vm-m5-01",
+                "labels":"self-hosted,macOS,ARM64",
+                "owner_pid_alive":true,
+                "heartbeat_age_secs":5
+            }]
+        })),
+    }
+}
+
+fn healthy_storage() -> StorageProbe {
+    StorageProbe {
+        readable: true,
+        source: "test".to_owned(),
+        disk_path: "/Users/ci/VMs".to_owned(),
+        disk_available_kibibyte: Some(DEFAULT_DISK_FLOOR_KIBIBYTE * 2),
+        disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
+        ccache_size_kibibyte: Some(1),
+        ccache_max_kibibyte: Some(2),
+    }
+}
+
+fn healthy_attestation() -> AttestationProbe {
+    AttestationProbe {
+        readable: true,
+        source: "test".to_owned(),
+        written_at: Some("2026-09-13T18:00:00Z".to_owned()),
+        age_secs: Some(30),
+        interval_secs: Some(300),
+        launchd_readable: Some(true),
+        persistent_runner_count: 3,
+        ..AttestationProbe::default()
+    }
+}
+
+fn attestation_output(body: &str) -> Output {
+    Command::new("sh")
+        .args(["-c", "printf '%s' \"$FIXTURE\""])
+        .env("FIXTURE", body)
+        .output()
+        .expect("sh")
+}
+
+fn attestation_fixture(written_at: &str, runners: &Value) -> String {
+    serde_json::json!({
+        "schema": 1,
+        "host": "m5",
+        "written_at": written_at,
+        "interval_secs": 300,
+        "launchd_readable": true,
+        "generation": {"writer_sha256": "f657fef51ea2"},
+        "persistent_runners": runners,
+        "jit_lanes": [],
+    })
+    .to_string()
+}
+
+fn parsed_at(body: &str, now: &str) -> AttestationProbe {
+    let now = DateTime::parse_from_rfc3339(now)
+        .expect("fixture clock")
+        .with_timezone(&Utc);
+    attestation_probe_from_output(&attestation_output(body), "ssh", now)
+}
+
+#[test]
+fn only_a_loaded_crash_looping_runner_is_a_service_fault() {
+    let body = attestation_fixture(
+        "2026-09-13T18:00:00Z",
+        &serde_json::json!([
+            {"label":"pulp-preamble-m5","verdict":"broken","loaded":true,
+             "crash_loop":true,"runs":8082,"registered":false},
+            {"label":"v8builder","verdict":"broken","loaded":false,
+             "crash_loop":false,"runs":0,"registered":false},
+            // The case the `loaded` half of the predicate exists for: a runner
+            // that was crash-looping and has since been unloaded. Its history
+            // is still in the artifact; it is no longer failing to serve.
+            {"label":"unloaded-looper","verdict":"broken","loaded":false,
+             "crash_loop":true,"runs":904,"registered":false},
+            // The case the `crash_loop` half exists for. Every other loaded
+            // entry here is `verdict:"ok"`, which the broken filter deletes
+            // before the predicate is reached — so without this row the
+            // conjunct decides nothing any test can observe.
+            {"label":"stuck-but-not-looping","verdict":"broken","loaded":true,
+             "crash_loop":false,"runs":3,"registered":false},
+            {"label":"shipyard.queue-tick","verdict":"ok","loaded":true,
+             "crash_loop":false,"runs":12,"registered":true},
+        ]),
+    );
+    let probe = parsed_at(&body, "2026-09-13T18:01:00Z");
+
+    assert!(probe.readable);
+    let problems = attestation_problems(&probe);
+    assert_eq!(
+        problems.len(),
+        1,
+        "exactly one runner is failing service: {problems:?}"
+    );
+    assert!(
+        problems[0].contains("pulp-preamble-m5"),
+        "the raised problem must name the looping runner: {problems:?}"
+    );
+    assert!(
+        !problems[0].contains("unloaded-looper"),
+        "an unloaded runner is not failing to serve, whatever its history"
+    );
+    assert!(
+        !problems[0].contains("stuck-but-not-looping"),
+        "a loaded runner the attester called broken for some reason other than \
+         looping is not a crash loop, and this check reports crash loops"
+    );
+}
+
+/// A `written_at` ahead of our own clock must not read as fresh.
+///
+/// The age is a signed difference against a one-sided ceiling, so a host whose
+/// attester stamps local wall-clock time as UTC reports a negative age forever
+/// — and its artifact stays "fresh" long after the writer dies.
+#[test]
+fn an_attestation_stamped_in_the_future_cannot_be_aged() {
+    let body = attestation_fixture(
+        "2026-09-13T19:00:00Z",
+        &serde_json::json!([
+            {"label":"pulp-preamble-m5","verdict":"broken","loaded":true,
+             "crash_loop":true,"runs":8082,"registered":false},
+        ]),
+    );
+    let probe = parsed_at(&body, "2026-09-13T18:00:00Z");
+
+    assert!(
+        !probe.readable,
+        "an artifact written an hour in the future cannot be aged"
+    );
+    assert_eq!(probe.boundary.as_deref(), Some("parse"));
+    assert!(
+        probe.source.contains("in the future"),
+        "the refusal must name the clock disagreement rather than claim the \
+         attester stopped writing: {}",
+        probe.source
+    );
+}
+
+/// Without this the refusal above is indistinguishable from one that rejects
+/// every host whose clock is not bit-identical to ours.
+#[test]
+fn control_a_clock_a_few_seconds_ahead_is_still_readable() {
+    let body = attestation_fixture(
+        "2026-09-13T18:00:10Z",
+        &serde_json::json!([
+            {"label":"shipyard.queue-tick","verdict":"ok","loaded":true,
+             "crash_loop":false,"runs":12,"registered":true},
+        ]),
+    );
+    let probe = parsed_at(&body, "2026-09-13T18:00:00Z");
+
+    assert!(
+        probe.readable,
+        "ten seconds of ordinary clock jitter is not a fault: {}",
+        probe.source
+    );
+}
+
+/// A document that never says whether it could read the launchd domain has not
+/// reported an empty census — it has reported nothing, and the difference is
+/// the whole point of the field.
+#[test]
+fn an_attestation_that_omits_launchd_readability_is_a_blind_census() {
+    let body = serde_json::json!({
+        "schema": 1, "host": "m5", "written_at": "2026-09-13T18:00:00Z",
+        "interval_secs": 300, "persistent_runners": [], "jit_lanes": [],
+    })
+    .to_string();
+    let probe = parsed_at(&body, "2026-09-13T18:01:00Z");
+
+    assert!(
+        !probe.readable,
+        "a missing launchd_readable must not be read as true"
+    );
+    assert_eq!(probe.boundary.as_deref(), Some("parse"));
+    assert_eq!(probe.launchd_readable, None);
+}
+
+/// A plist that is installed but not loaded spawns nothing, so it cannot be
+/// failing to serve. The fleet carries nine such entries from a lane
+/// migration; raising on `verdict == "broken"` alone would report ten faults
+/// where one exists and train the reader to ignore the check.
+#[test]
+fn control_dormant_broken_runners_raise_nothing_but_are_still_counted() {
+    let body = attestation_fixture(
+        "2026-09-13T18:00:00Z",
+        &serde_json::json!([
+            {"label":"studio-01","verdict":"broken","loaded":false,
+             "crash_loop":false,"runs":0,"registered":false},
+            {"label":"studio-02","verdict":"broken","loaded":false,
+             "crash_loop":false,"runs":0,"registered":false},
+        ]),
+    );
+    let probe = parsed_at(&body, "2026-09-13T18:01:00Z");
+
+    assert!(attestation_problems(&probe).is_empty());
+    // Without this the empty verdict above is ambiguous: a parser that read no
+    // runners at all would also raise nothing.
+    assert_eq!(
+        probe.persistent_runner_count, 2,
+        "the probe must report what it examined"
+    );
+    assert_eq!(probe.broken.len(), 2, "both entries were seen and judged");
+}
+
+#[test]
+fn an_attestation_past_its_staleness_ceiling_is_unreadable_not_healthy() {
+    let body = attestation_fixture("2026-09-13T18:00:00Z", &serde_json::json!([]));
+    // 900s against a 300s cadence: the writer stopped.
+    let probe = parsed_at(&body, "2026-09-13T18:15:00Z");
+
+    assert!(!probe.readable);
+    assert_eq!(probe.boundary.as_deref(), Some("transport"));
+    assert_eq!(probe.age_secs, Some(900));
+    assert_eq!(
+        attestation_problems(&probe).len(),
+        1,
+        "a guard that stopped writing is itself the finding"
+    );
+}
+
+/// The same bytes, read inside the cadence, must pass — otherwise the test
+/// above would also pass against a parser that called everything stale.
+#[test]
+fn control_the_same_attestation_read_within_its_cadence_is_readable() {
+    let body = attestation_fixture("2026-09-13T18:00:00Z", &serde_json::json!([]));
+    let probe = parsed_at(&body, "2026-09-13T18:04:00Z");
+
+    assert!(probe.readable, "{}", probe.source);
+    assert!(probe.boundary.is_none());
+    assert!(attestation_problems(&probe).is_empty());
+}
+
+#[test]
+fn a_non_json_payload_is_a_parse_boundary_not_an_empty_census() {
+    // A truncated or half-written artifact must not read as a host with no
+    // runners; that is the exact shape of the failure this check exists for.
+    let probe = parsed_at("{\"schema\": 1, \"persistent_run", "2026-09-13T18:01:00Z");
+
+    assert!(!probe.readable);
+    assert_eq!(probe.boundary.as_deref(), Some("parse"));
+    // The boundary alone does not discriminate: a document that parses but
+    // carries no written_at also refuses as `parse`. Name the reason, or this
+    // test passes whether or not the JSON check runs at all.
+    assert!(
+        probe.source.contains("is not JSON"),
+        "the refusal must say the payload did not parse: {}",
+        probe.source
+    );
+    assert_eq!(probe.persistent_runner_count, 0);
+    assert_eq!(attestation_problems(&probe).len(), 1);
+}
+
+#[test]
+fn an_attestation_without_a_timestamp_cannot_be_aged() {
+    let body = serde_json::json!({
+        "schema": 1, "interval_secs": 300, "launchd_readable": true,
+        "persistent_runners": [], "jit_lanes": [],
+    })
+    .to_string();
+    let probe = parsed_at(&body, "2026-09-13T18:00:00Z");
+
+    assert!(!probe.readable);
+    assert_eq!(probe.boundary.as_deref(), Some("parse"));
+}
+
+/// A `LaunchAgent` lives in the per-user GUI domain, so the attester reports
+/// when it could not enumerate it. That is a blind census, not an empty one —
+/// mapping it to `absent` would report every runner as gone.
+#[test]
+fn an_unreadable_launchd_domain_is_a_scope_boundary_not_an_absence() {
+    let body = serde_json::json!({
+        "schema": 1, "written_at": "2026-09-13T18:00:00Z", "interval_secs": 300,
+        "launchd_readable": false, "persistent_runners": [], "jit_lanes": [],
+    })
+    .to_string();
+    let probe = parsed_at(&body, "2026-09-13T18:01:00Z");
+
+    assert!(!probe.readable);
+    assert_eq!(probe.boundary.as_deref(), Some("scope"));
+    assert_eq!(probe.launchd_readable, Some(false));
+}
+
+#[test]
+fn a_missing_artifact_is_unreadable_rather_than_a_clean_host() {
+    let output = Command::new("sh")
+        .args(["-c", "exit 66"])
+        .output()
+        .expect("sh");
+    let now = DateTime::parse_from_rfc3339("2026-09-13T18:00:00Z")
+        .expect("fixture clock")
+        .with_timezone(&Utc);
+    let probe = attestation_probe_from_output(&output, "ssh", now);
+
+    assert!(!probe.readable);
+    assert_eq!(probe.boundary.as_deref(), Some("transport"));
+    assert_eq!(attestation_problems(&probe).len(), 1);
+}
+
+/// The artifact lives under the attester's own home, which differs per host,
+/// so the path must expand on the far side. `shlex_quote` single-quotes the
+/// whole script, which kills `~` but leaves `"$HOME"` for the remote `sh -c`.
+#[cfg(unix)]
+#[test]
+fn the_probe_script_expands_home_on_the_host_it_runs_on() {
+    let script = attestation_probe_script();
+    assert!(
+        !script.contains('~'),
+        "a literal ~ would not expand: {script}"
+    );
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let state = home.path().join(".tartci/state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let body = attestation_fixture("2026-09-13T18:00:00Z", &serde_json::json!([]));
+    std::fs::write(state.join("host-attestation.json"), &body).expect("fixture");
+
+    // Quoted exactly as the ssh path quotes it, so the test fails if quoting
+    // ever swallows the expansion.
+    let wrapped = format!("sh -c {}", shlex_quote(&script));
+    let output = Command::new("sh")
+        .args(["-c", &wrapped])
+        .env("HOME", home.path())
+        .output()
+        .expect("sh");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let now = DateTime::parse_from_rfc3339("2026-09-13T18:01:00Z")
+        .expect("fixture clock")
+        .with_timezone(&Utc);
+    let probe = attestation_probe_from_output(&output, "ssh", now);
+    assert!(probe.readable, "{}", probe.source);
+    assert_eq!(probe.writer_sha256.as_deref(), Some("f657fef51ea2"));
+}
+
+/// A finding that renders nowhere is not a check. This asserts the crash-loop
+/// verdict survives all the way to both surfaces the operator actually reads.
+#[test]
+fn an_unreadable_attestation_makes_a_host_unroutable() {
+    // `routable` does not test `attestation.readable` directly; it relies on the
+    // unreadable arm of attestation_problems raising. This pins that coupling,
+    // so removing the arm cannot quietly route work to a host nobody can see.
+    let blind = AttestationProbe {
+        readable: false,
+        boundary: Some("transport".to_owned()),
+        source: "ssh attestation exit 66".to_owned(),
+        ..AttestationProbe::default()
+    };
+    let host = analyze_host(
+        healthy_capacity(),
+        healthy_doctor(),
+        healthy_storage(),
+        blind,
+        FLEET_LANE_TARGET,
+        true,
+    );
+
+    assert_eq!(host.problem_count, 1, "the blind read must be a problem");
+    assert!(!host.routable, "a host nobody can observe is not routable");
+
+    // Control: the identical host with a readable attestation IS routable, so
+    // the assertion above cannot be passing for an unrelated reason.
+    let seeing = analyze_host(
+        healthy_capacity(),
+        healthy_doctor(),
+        healthy_storage(),
+        healthy_attestation(),
+        FLEET_LANE_TARGET,
+        true,
+    );
+    assert_eq!(seeing.problem_count, 0);
+    assert!(seeing.routable, "the control host must be routable");
+}
+
+#[test]
+fn an_attestation_finding_reaches_both_json_surfaces() {
+    let body = attestation_fixture(
+        "2026-09-13T18:00:00Z",
+        &serde_json::json!([
+            {"label":"pulp-preamble-m5","verdict":"broken","loaded":true,
+             "crash_loop":true,"runs":8082,"registered":false},
+        ]),
+    );
+    let attestation = parsed_at(&body, "2026-09-13T18:01:00Z");
+    let host = analyze_host(
+        healthy_capacity(),
+        healthy_doctor(),
+        healthy_storage(),
+        attestation,
+        FLEET_LANE_TARGET,
+        true,
+    );
+
+    assert_eq!(
+        host.problem_count, 1,
+        "the crash loop must count as a problem"
+    );
+    assert!(!host.routable, "a host with a looping runner is not clean");
+
+    let mut assessment = wedge_assessment(WedgedQueuedJobs::default());
+    assessment.hosts = vec![host];
+
+    let mut command_output = Vec::new();
+    render_fleet_assessment(&assessment, true, &mut command_output).expect("command JSON");
+    let command: Value = serde_json::from_slice(&command_output).expect("command document");
+    let mut watch_output = Vec::new();
+    render_fleet_watch_event(&assessment, &mut watch_output).expect("watch JSON");
+    let watch: Value = serde_json::from_slice(&watch_output).expect("watch document");
+
+    for (surface, document) in [("command", &command), ("watch", &watch)] {
+        let raised = &document["hosts"][0]["attestation_problems"];
+        assert_eq!(
+            raised.as_array().map_or(0, Vec::len),
+            1,
+            "the {surface} surface dropped the finding: {document}"
+        );
+        assert!(
+            raised[0]
+                .as_str()
+                .is_some_and(|problem| problem.contains("pulp-preamble-m5")),
+            "the {surface} surface must name the runner: {document}"
+        );
+        assert_eq!(document["hosts"][0]["attestation"]["readable"], true);
+    }
+
+    let mut text_output = Vec::new();
+    render_fleet_assessment(&assessment, false, &mut text_output).expect("text");
+    let text = String::from_utf8(text_output).expect("utf8");
+    assert!(
+        text.contains("attestation: runner_crash_loop:pulp-preamble-m5"),
+        "the human surface dropped the finding:\n{text}"
     );
 }

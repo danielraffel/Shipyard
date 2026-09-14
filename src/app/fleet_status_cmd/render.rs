@@ -117,6 +117,13 @@ fn write_fleet_json<W: Write>(
         serde_json::to_value(&view.routing_mismatches).expect("routing mismatches serialize"),
     );
     data.insert(
+        "wedged_queued_jobs".to_owned(),
+        serde_json::json!({
+            "examined": view.wedged_queued.examined,
+            "raising": view.wedged_queued.raising,
+        }),
+    );
+    data.insert(
         "expected_hosts".to_owned(),
         serde_json::to_value(&view.expected_hosts).expect("expected hosts serialize"),
     );
@@ -159,6 +166,9 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<
                 writeln!(stdout, "    storage: {problem}").map_err(text_write_failure)?;
             }
         }
+        for problem in &host.attestation_problems {
+            writeln!(stdout, "    attestation: {problem}").map_err(text_write_failure)?;
+        }
     }
     writeln!(
         stdout,
@@ -193,6 +203,7 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<
         )
         .map_err(text_write_failure)?;
     }
+    write_wedged_queued_text(stdout, view)?;
     write_expected_hosts_text(stdout, view)?;
     writeln!(
         stdout,
@@ -211,6 +222,36 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<
         writeln!(
             stdout,
             "fleet-status: attention required (see fields above)"
+        )
+        .map_err(text_write_failure)?;
+    }
+    Ok(())
+}
+
+/// Report the wedged-queued sweep, count first.
+///
+/// The examined count is printed even when nothing raised: an empty findings
+/// list means either "no queued job is wedged" or "no queued job was looked at",
+/// and only the count separates the two.
+fn write_wedged_queued_text<W: Write>(
+    stdout: &mut W,
+    view: &FleetAssessment,
+) -> Result<(), CliFailure> {
+    writeln!(
+        stdout,
+        "  queued jobs: examined={} wedged={}",
+        view.wedged_queued.examined,
+        view.wedged_queued.raising.len()
+    )
+    .map_err(text_write_failure)?;
+    for report in &view.wedged_queued.raising {
+        writeln!(
+            stdout,
+            "    wedged queued job: run={} state={} queued_secs={} detail={}",
+            report.run_id,
+            report.state.as_str(),
+            report.queued_secs,
+            report.detail
         )
         .map_err(text_write_failure)?;
     }
@@ -281,6 +322,14 @@ fn host_to_json(host: &HostFleetStatus) -> Value {
     m.insert(
         "storage_problems".to_owned(),
         Value::from(host.storage_problems.clone()),
+    );
+    m.insert(
+        "attestation".to_owned(),
+        serde_json::to_value(&host.attestation).expect("attestation probe serializes"),
+    );
+    m.insert(
+        "attestation_problems".to_owned(),
+        Value::from(host.attestation_problems.clone()),
     );
     m.insert(
         "github_runner_count".to_owned(),

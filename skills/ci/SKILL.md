@@ -363,6 +363,119 @@ Two traps it is built around, both of which produce a confident false fault:
 `RunAtLoad` is not supervision. It starts a job once and says nothing about
 what happens when it exits — which is exactly the plist that took the lane out.
 
+### A queued job that nobody will ever pick up
+
+The lane assertions ask *is a runner serving this lane*. None of them asks
+*is this specific job going anywhere*, and a repository can answer the first
+question cleanly while the second is stuck.
+
+The shape: every registered runner is `online`, at least one is idle, and a
+queued job carrying labels none of them advertise sits in the queue for hours.
+`fleet_service` reports the lane `Served` — correctly, because it is — and
+`fleet status` exits 0. Nothing in the output mentions the job.
+
+`fleet_slot::assess_queued_job` classifies one queued job against the census:
+`Waiting`, `NoCapableRunner`, `Wedged`, `Unclearable`. `fleet_status` now
+sweeps the queued jobs it observed through it and reports
+`wedged_queued_jobs` on both the text and JSON surfaces, raising the exit code
+when a verdict raises.
+
+Four guards, each one a way the sweep could manufacture a finding or hide one:
+
+- **An unreadable census is not an empty census.** `RunnerInventory.readable`
+  is checked before anything else; a census that could not be read reports
+  nothing rather than concluding no runner is capable. This is the same
+  scope-error trap that has already misled this fleet — the failure mode is a
+  confident `Wedged` on a repository whose runners were simply not visible.
+- **An unlabelled job matches everything.** `advertises_all(&[])` is vacuously
+  true, so a job with no labels would count every online runner as capable and
+  could be reported wedged the moment they are all busy. Jobs with an empty
+  label set are skipped.
+- **A run's `created_at` is not a job's queue time.** A run that started an
+  hour ago does not lend that hour to a job queued inside it a minute ago. Only
+  runs still `queued` contribute their timestamp; a started run's jobs are not
+  aged against it.
+- **Busy is saturation, not a wedge.** `capable_runner_idle` is what separates
+  "the fleet is full" from "nothing here will ever take this job". A capable
+  runner that is merely busy must not raise.
+
+**The sweep reports what it examined, not only what it found.** An empty
+findings list means either no queued job is wedged or no queued job was looked
+at, and nothing else in the output separates them — so `examined` is printed
+even on a clean pass. A silent instrument and a healthy fleet read identically
+otherwise, which is the failure this whole workstream exists to catch.
+
+Two limits worth knowing before trusting a verdict. The census is repo-scope
+only, so an org-level runner that would serve the job is invisible; that case
+fails safe, because `NoCapableRunner` maps to `Served` and defers to the lane
+assertion rather than raising on its own. And `Unclearable` — a cancellation
+requested and not honoured — is unreachable from this caller: nothing in the
+observation model carries a cancellation-request timestamp, so it is passed as
+`None` rather than inferred from something that is not it.
+
+### A host that answers every probe while nothing is serving on it
+
+Capacity, the doctor digest and storage all describe the *host*. A host can
+answer all three cleanly while the process that actually takes work has been
+dead for hours — which is what happened in every incident this workstream
+exists for. The host was up. The runner was not.
+
+`fleet status` now reads the attestation artifact each host's attester writes
+every 300s to `$HOME/.tartci/state/host-attestation.json`, and turns it into
+two kinds of finding: a persistent runner that is **loaded and crash-looping**,
+and an attestation that **could not be read at all**. Both fold into
+`problem_count`, reach the text and JSON surfaces, and clear `routable`.
+
+**The raise predicate is `loaded && crash_loop`, never `verdict == "broken"`.**
+Measured across the fleet at the time of writing: one host reports 2 broken
+runners, another 8, a third 0 — and exactly one entry fleet-wide is `loaded`.
+A broken verdict on an unloaded runner is history, not a fault: the plist is
+not running, so nothing is failing to serve. Raising on the verdict alone would
+report ten faults where one exists, and an operator who sees ten false faults
+stops reading the check.
+
+Three things the probe refuses to flatten:
+
+- **An unreadable attestation is a finding, named by boundary.** `Scope`,
+  `Transport` and `Parse` are different facts. `Boundary` carries no "absent"
+  variant — a missing artifact is `Transport`, not a fourth thing. A LaunchAgent
+  lives in the per-user GUI domain, so `launchctl list` over a non-interactive
+  ssh session enumerates nothing *for a perfectly healthy job* — the attester
+  reports whether it could read that domain, and a false there is `Scope`. Read
+  that as an empty census instead and every healthy host looks like it has no
+  runners; a document omitting the field altogether is refused as `Parse` for
+  the same reason, since silence is not a claim that the domain was readable.
+- **A stale artifact is not a current reading.** A file older than twice its
+  own declared cadence is `Transport`-unreadable. Staleness is checked before
+  any field inside the document is believed, because a stale artifact repeats
+  its last word with total confidence. Age is a *signed* difference, so a
+  timestamp ahead of our clock is refused as `Parse` — left one-sided, a host
+  that stamps local time as UTC reads as fresh forever, and the gate quietly
+  stops existing on exactly the host that needs it.
+- **A document that does not parse is not a host with no runners.** A truncated
+  or half-written artifact refuses as `Parse`. That is the exact shape of the
+  failure this check exists to catch, so it must never read as a clean census
+  of zero.
+
+**`routable` deliberately does not name `attestation.readable`.** It was
+written that way first, and the break-confirm loop proved the term
+unfalsifiable: an unreadable attestation always raises exactly one problem, so
+`problem_count == 0` had already cleared `routable` before that conjunct was
+consulted. No inversion of it could turn any test red. A guard nothing can
+break implies a protection that is not there, so it was removed and the real
+coupling — the unreadable arm of `attestation_problems` — is pinned by a test
+that *does* go red, carrying a readable-host control so its assertion cannot
+pass for an unrelated reason.
+
+Limits worth knowing before trusting a verdict. The probe trusts the attester's
+own declared cadence and only bounds it with a default when the artifact omits
+one, so a writer that lies about its interval widens its own staleness ceiling.
+Crash-loop detection is the attester's verdict, not a rate computed here; this
+code decides only whether that verdict should raise. And a host whose attester
+was never installed reads as `Transport`-unreadable, indistinguishable from one
+whose attester died — both are findings, so nothing hides, but the two are not
+separated.
+
 ## Runner Metrics For Agents
 
 Runner metrics are optional and provider-neutral. Use them when an agent needs
