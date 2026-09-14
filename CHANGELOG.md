@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02010"></a>
+## [0.201.0] - 2026-09-13
+
+- Assert queued-job service in fleet status, with negative controls ([#592](https://github.com/danielraffel/Shipyard/pull/592))
+
 <a id="v02003"></a>
 ## [0.200.3] - 2026-09-09
 
@@ -1480,6 +1485,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.201.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.201.0
 [0.200.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.200.3
 [0.200.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.200.2
 [0.200.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.200.1
