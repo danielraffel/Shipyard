@@ -3,6 +3,16 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02041"></a>
+## [0.204.1] - 2026-09-13
+
+- fix: unbreak main — a Liquid delimiter and a non-unix dead-code warning ([#595](https://github.com/danielraffel/Shipyard/pull/595))
+
+<a id="v02040"></a>
+## [0.204.0] - 2026-09-13
+
+- feat(landability): refuse a PR whose required gate will never be requested ([#594](https://github.com/danielraffel/Shipyard/pull/594))
+
 <a id="v02030"></a>
 ## [0.203.0] - 2026-09-13
 
@@ -1495,6 +1505,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.204.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.204.1
+[0.204.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.204.0
 [0.203.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.203.0
 [0.202.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.202.0
 [0.201.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.201.0
