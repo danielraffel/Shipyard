@@ -1,4 +1,5 @@
 use super::*;
+use crate::fleet_slot::QueuedJobState;
 
 #[cfg(unix)]
 fn executable_script(path: &Path, body: &str) {
@@ -28,6 +29,314 @@ fn isolated_storage_probe_until(class: &HostClassConfig, deadline: Instant) -> S
             ..StorageProbe::default()
         },
     }
+}
+
+fn wedge_runner(name: &str, status: &str, busy: bool, labels: &[&str]) -> RepositoryRunner {
+    RepositoryRunner {
+        id: 900,
+        name: name.to_owned(),
+        status: status.to_owned(),
+        busy,
+        labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+    }
+}
+
+fn wedge_inventory(runners: Vec<RepositoryRunner>) -> RunnerInventory {
+    RunnerInventory {
+        readable: true,
+        source: "github".to_owned(),
+        runners,
+    }
+}
+
+fn wedge_run(created_at: &str, job_labels: &[&str]) -> ActiveRunObservation {
+    ActiveRunObservation {
+        run_id: 4242,
+        workflow: "Build and Test".to_owned(),
+        head_branch: "main".to_owned(),
+        head_sha: Some("cafebabe".to_owned()),
+        status: "queued".to_owned(),
+        created_at: Some(created_at.to_owned()),
+        pull_requests: vec![],
+        url: None,
+        jobs: vec![JobObservation {
+            name: "macOS (arm64)".to_owned(),
+            status: "queued".to_owned(),
+            runner_name: None,
+            labels: job_labels.iter().map(|label| (*label).to_owned()).collect(),
+        }],
+    }
+}
+
+fn wedge_now() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-09-12T12:00:00Z")
+        .expect("fixed clock parses")
+        .with_timezone(&Utc)
+}
+
+#[test]
+fn wedged_queued_job_raises_while_a_capable_runner_sits_idle() {
+    // The incident shape: a run queued far past the threshold whose labels two
+    // online, idle runners advertise. Every liveness-shaped reading is green —
+    // the runners are registered, online, and answering — and the work is not
+    // moving.
+    let inventory = wedge_inventory(vec![
+        wedge_runner(
+            "pulp-build-m5",
+            "online",
+            false,
+            &["self-hosted", "macOS", "ARM64", "pulp-build-pr-head"],
+        ),
+        wedge_runner("pulp-build-m1", "online", false, &["self-hosted", "macOS"]),
+    ]);
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 1, "the sweep must report what it looked at");
+    assert_eq!(found.raising.len(), 1);
+    assert_eq!(found.raising[0].state, QueuedJobState::Wedged);
+    assert!(found.raising[0].verdict.is_raise());
+    assert_eq!(found.raising[0].queued_secs, 10_800);
+}
+
+#[test]
+fn control_a_busy_capable_runner_is_saturation_not_a_wedge() {
+    // The planted negative control for the assertion above. The only change is
+    // that the capable runner is busy, which is ordinary saturation. If this
+    // ever raises, the check is reporting a full fleet as a broken one.
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-m5",
+        "online",
+        true,
+        &["self-hosted", "macOS", "ARM64"],
+    )]);
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(
+        found.examined, 1,
+        "a silent instrument and a clean pass must not read alike"
+    );
+    assert!(found.raising.is_empty());
+}
+
+#[test]
+fn control_an_unlabelled_job_cannot_manufacture_a_wedge() {
+    // `advertises_all` is a superset test and is vacuously true on an empty
+    // slice, so without the guard an unlabelled job matches every runner and
+    // is reported as wedged on the strength of a runner that could never have
+    // been assigned it.
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-m5",
+        "online",
+        false,
+        &["self-hosted", "macOS", "ARM64"],
+    )]);
+    let runs = vec![wedge_run("2026-09-12T09:00:00Z", &[])];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 0);
+    assert!(found.raising.is_empty());
+}
+
+#[test]
+fn control_a_started_run_does_not_lend_its_runtime_to_a_downstream_job() {
+    // A job can enter the queue long after its workflow starts, and the run's
+    // `created_at` is the only age proxy available. Reading it on a run that is
+    // already in progress turns upstream runtime into queue age.
+    let mut runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+    runs[0].status = "in_progress".to_owned();
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-m5",
+        "online",
+        false,
+        &["self-hosted", "macOS", "ARM64"],
+    )]);
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 0);
+    assert!(found.raising.is_empty());
+}
+
+#[test]
+fn control_an_unreadable_census_reports_nothing_rather_than_a_pass() {
+    // A census that could not be read cannot establish a wedge, and must not be
+    // folded into a clean result. `examined = 0` is the signal that the sweep
+    // reached nothing.
+    let inventory = RunnerInventory {
+        readable: false,
+        source: "github: rate limited".to_owned(),
+        runners: vec![],
+    };
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 0);
+    assert!(found.raising.is_empty());
+}
+
+#[test]
+fn no_capable_runner_defers_to_the_lane_service_assertion() {
+    // Nothing online advertises the labels. That is a routing question, and the
+    // repository-scoped census here cannot see an org-scoped runner — so the
+    // verdict must stay non-raising rather than claim a wedge it cannot prove.
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-linux",
+        "online",
+        false,
+        &["self-hosted", "Linux", "X64"],
+    )]);
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+
+    assert_eq!(found.examined, 1);
+    assert!(found.raising.is_empty());
+}
+
+fn wedge_assessment(wedged_queued: WedgedQueuedJobs) -> FleetAssessment {
+    FleetAssessment {
+        repo: "owner/repo".to_owned(),
+        target: "macos".to_owned(),
+        free: 2,
+        routable_free_slots: 1,
+        capacity_unreadable: false,
+        doctor_unreadable: false,
+        supervisor_unhealthy: false,
+        problem_hosts: false,
+        queued_age_threshold_secs: 900,
+        queue_run_limit: 50,
+        queued_age_with_capacity: false,
+        queue: QueuedSummary {
+            readable: true,
+            source: "github".to_owned(),
+            count: 0,
+            oldest_age_secs: None,
+        },
+        base: "main".to_owned(),
+        merge_queue_stall_threshold_secs: 900,
+        merge_queue: MergeQueueProbe {
+            readable: true,
+            source: "github".to_owned(),
+            report: None,
+            reason_codes: Vec::new(),
+        },
+        release_stale_threshold_secs: 86_400,
+        release: ReleaseProbe {
+            readable: true,
+            source: "github".to_owned(),
+            report: None,
+            reason_codes: Vec::new(),
+        },
+        hosts: Vec::new(),
+        runners: RunnerInventory {
+            readable: true,
+            source: "github".to_owned(),
+            runners: Vec::new(),
+        },
+        expected_hosts: Vec::new(),
+        routing_mismatches: Vec::new(),
+        wedged_queued,
+        observation_reason_codes: Vec::new(),
+        observation_incomplete: false,
+        should_fail: false,
+    }
+}
+
+#[test]
+fn a_wedged_queued_finding_reaches_both_json_surfaces() {
+    // A detector whose output never renders is another orphan. The one-shot
+    // command envelope and the watch event share one writer, so the finding has
+    // to arrive on both or the assertion is unobservable from either.
+    let inventory = wedge_inventory(vec![wedge_runner(
+        "pulp-build-m5",
+        "online",
+        false,
+        &["self-hosted", "macOS", "ARM64"],
+    )]);
+    let runs = vec![wedge_run(
+        "2026-09-12T09:00:00Z",
+        &["self-hosted", "macos", "arm64"],
+    )];
+    let found =
+        detect_wedged_queued_jobs(&runs, &inventory, WedgeThresholds::default(), wedge_now());
+    assert_eq!(found.raising.len(), 1);
+
+    let assessment = wedge_assessment(found);
+    let mut command_output = Vec::new();
+    render_fleet_assessment(&assessment, true, &mut command_output).expect("command JSON");
+    let command: Value = serde_json::from_slice(&command_output).expect("command document");
+    let mut watch_output = Vec::new();
+    render_fleet_watch_event(&assessment, &mut watch_output).expect("watch JSON");
+    let watch: Value = serde_json::from_slice(&watch_output).expect("watch document");
+
+    assert_eq!(command["wedged_queued_jobs"]["examined"], 1);
+    assert_eq!(
+        command["wedged_queued_jobs"]["raising"][0]["state"],
+        "wedged"
+    );
+    assert_eq!(
+        command["wedged_queued_jobs"]["raising"][0]["queued_secs"],
+        10_800
+    );
+    assert_eq!(command["wedged_queued_jobs"], watch["wedged_queued_jobs"]);
+}
+
+#[test]
+fn control_a_sweep_that_found_nothing_still_reports_what_it_examined() {
+    // "Looked at three and found no wedge" and "looked at nothing" must not
+    // render identically — that difference is the only thing separating a clean
+    // pass from a silent instrument.
+    let looked = wedge_assessment(WedgedQueuedJobs {
+        examined: 3,
+        raising: Vec::new(),
+    });
+    let mut looked_output = Vec::new();
+    render_fleet_assessment(&looked, true, &mut looked_output).expect("command JSON");
+    let looked_document: Value = serde_json::from_slice(&looked_output).expect("command document");
+
+    assert_eq!(looked_document["wedged_queued_jobs"]["examined"], 3);
+    assert_eq!(
+        looked_document["wedged_queued_jobs"]["raising"],
+        serde_json::json!([])
+    );
+
+    let blind = wedge_assessment(WedgedQueuedJobs::default());
+    let mut blind_output = Vec::new();
+    render_fleet_assessment(&blind, true, &mut blind_output).expect("command JSON");
+    let blind_document: Value = serde_json::from_slice(&blind_output).expect("command document");
+
+    assert_eq!(blind_document["wedged_queued_jobs"]["examined"], 0);
+    assert_ne!(
+        looked_document["wedged_queued_jobs"],
+        blind_document["wedged_queued_jobs"]
+    );
 }
 
 #[cfg(unix)]
@@ -212,6 +521,7 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
         },
         expected_hosts: Vec::new(),
         routing_mismatches: Vec::new(),
+        wedged_queued: WedgedQueuedJobs::default(),
         observation_reason_codes: Vec::new(),
         observation_incomplete: false,
         should_fail: true,
@@ -267,6 +577,7 @@ fn assessment_renders_command_and_watch_json_without_round_trip() {
         },
         expected_hosts: Vec::new(),
         routing_mismatches: Vec::new(),
+        wedged_queued: WedgedQueuedJobs::default(),
         observation_reason_codes: Vec::new(),
         observation_incomplete: false,
         should_fail: false,
