@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02042"></a>
+## [0.204.2] - 2026-09-13
+
+- fix(clippy): assert_eq, and measure clippy on the toolchain CI actually uses ([#596](https://github.com/danielraffel/Shipyard/pull/596))
+
 <a id="v02041"></a>
 ## [0.204.1] - 2026-09-13
 
@@ -1505,6 +1510,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.204.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.204.2
 [0.204.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.204.1
 [0.204.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.204.0
 [0.203.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.203.0
