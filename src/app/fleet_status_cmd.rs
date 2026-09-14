@@ -826,6 +826,11 @@ const ATTESTATION_STALENESS_FACTOR: i64 = 2;
 /// cannot silently disable the staleness gate.
 const ATTESTATION_DEFAULT_INTERVAL_SECS: u64 = 300;
 
+/// Seconds a host's clock may run ahead of ours before its artifact is refused.
+/// Jitter between NTP-disciplined fleet hosts is sub-second; a full minute is
+/// still absorbed, and anything past it is a real clock fault rather than noise.
+const ATTESTATION_MAX_CLOCK_SKEW_SECS: i64 = 60;
+
 /// `$HOME` is expanded on the far side on purpose: the artifact lives under the
 /// attester's own home directory, which differs per host and is not knowable
 /// here. Quoting the path would defeat that and read a literal `~`.
@@ -957,12 +962,45 @@ fn attestation_probe_from_output(
         );
     };
 
+    attestation_probe_from_document(&document, base_source, now)
+}
+
+/// Judge a parsed attestation document.
+///
+/// Split from the transport half above so that reading bytes off a host and
+/// deciding what those bytes assert stay separately testable — and so neither
+/// grows without the other being looked at.
+fn attestation_probe_from_document(
+    document: &Value,
+    base_source: &str,
+    now: DateTime<Utc>,
+) -> AttestationProbe {
+    let unreadable = |boundary: Boundary, detail: String| AttestationProbe {
+        readable: false,
+        boundary: Some(boundary.as_str().to_owned()),
+        source: detail,
+        ..AttestationProbe::default()
+    };
+
     // A launchd LaunchAgent lives in the per-user GUI domain, so a
     // non-interactive session cannot enumerate it. The attester runs inside
     // that domain and reports whether it could read it; when it could not, the
     // runner census below is blind rather than empty.
     let launchd_readable = document.get("launchd_readable").and_then(Value::as_bool);
-    if launchd_readable == Some(false) {
+    // Absent, null or non-boolean is not a claim that the domain was readable.
+    // Treating it as one would let a partially written or older artifact take
+    // the believe-the-census path, which is the blind-reads-as-empty failure
+    // this arm exists to refuse.
+    let Some(launchd_domain_readable) = launchd_readable else {
+        return unreadable(
+            Boundary::Parse,
+            format!(
+                "{base_source} attestation did not report launchd readability, so a blind \
+                 runner census cannot be told from an empty one"
+            ),
+        );
+    };
+    if !launchd_domain_readable {
         return AttestationProbe {
             readable: false,
             boundary: Some(Boundary::Scope.as_str().to_owned()),
@@ -995,6 +1033,28 @@ fn attestation_probe_from_output(
     };
     let written_at = written_at.with_timezone(&Utc);
     let age_secs = now.signed_duration_since(written_at).num_seconds();
+    // `age_secs` is signed and the ceiling below is a one-sided test, so an
+    // artifact stamped in the future reads as fresh no matter how long its
+    // writer has been dead — the staleness gate silently defeating itself on
+    // exactly the host that needs it. A clock too far ahead is refused here,
+    // and named as the clock fault it is rather than flattened into "the
+    // attester stopped writing", which is a different and untrue claim.
+    if age_secs < -ATTESTATION_MAX_CLOCK_SKEW_SECS {
+        let ahead = age_secs.saturating_neg();
+        return AttestationProbe {
+            readable: false,
+            boundary: Some(Boundary::Parse.as_str().to_owned()),
+            source: format!(
+                "{base_source} attestation was written {ahead}s in the future — the writer's \
+                 clock disagrees with ours, so its age cannot be bounded"
+            ),
+            written_at: Some(written_raw.to_owned()),
+            age_secs: Some(age_secs),
+            interval_secs: Some(interval_secs),
+            launchd_readable,
+            ..AttestationProbe::default()
+        };
+    }
     let ceiling = ATTESTATION_STALENESS_FACTOR
         .saturating_mul(i64::try_from(interval_secs).unwrap_or(i64::MAX));
     if age_secs > ceiling {
@@ -1013,8 +1073,28 @@ fn attestation_probe_from_output(
         };
     }
 
-    let runners = broken_runners_from_document(&document);
+    readable_attestation(
+        document,
+        base_source,
+        written_raw,
+        age_secs,
+        interval_secs,
+        launchd_readable,
+    )
+}
 
+/// Build the probe for a document that survived every refusal above.
+///
+/// Reached only once the artifact has been proved current and its census
+/// proved sighted, so every count here is an assertion rather than a default.
+fn readable_attestation(
+    document: &Value,
+    base_source: &str,
+    written_raw: &str,
+    age_secs: i64,
+    interval_secs: u64,
+    launchd_readable: Option<bool>,
+) -> AttestationProbe {
     AttestationProbe {
         readable: true,
         boundary: None,
@@ -1036,7 +1116,7 @@ fn attestation_probe_from_output(
             .get("jit_lanes")
             .and_then(Value::as_array)
             .map_or(0, Vec::len),
-        broken: runners,
+        broken: broken_runners_from_document(document),
     }
 }
 

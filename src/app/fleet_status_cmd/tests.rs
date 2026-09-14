@@ -1854,6 +1854,12 @@ fn only_a_loaded_crash_looping_runner_is_a_service_fault() {
             // is still in the artifact; it is no longer failing to serve.
             {"label":"unloaded-looper","verdict":"broken","loaded":false,
              "crash_loop":true,"runs":904,"registered":false},
+            // The case the `crash_loop` half exists for. Every other loaded
+            // entry here is `verdict:"ok"`, which the broken filter deletes
+            // before the predicate is reached — so without this row the
+            // conjunct decides nothing any test can observe.
+            {"label":"stuck-but-not-looping","verdict":"broken","loaded":true,
+             "crash_loop":false,"runs":3,"registered":false},
             {"label":"shipyard.queue-tick","verdict":"ok","loaded":true,
              "crash_loop":false,"runs":12,"registered":true},
         ]),
@@ -1875,6 +1881,80 @@ fn only_a_loaded_crash_looping_runner_is_a_service_fault() {
         !problems[0].contains("unloaded-looper"),
         "an unloaded runner is not failing to serve, whatever its history"
     );
+    assert!(
+        !problems[0].contains("stuck-but-not-looping"),
+        "a loaded runner the attester called broken for some reason other than \
+         looping is not a crash loop, and this check reports crash loops"
+    );
+}
+
+/// A `written_at` ahead of our own clock must not read as fresh.
+///
+/// The age is a signed difference against a one-sided ceiling, so a host whose
+/// attester stamps local wall-clock time as UTC reports a negative age forever
+/// — and its artifact stays "fresh" long after the writer dies.
+#[test]
+fn an_attestation_stamped_in_the_future_cannot_be_aged() {
+    let body = attestation_fixture(
+        "2026-09-13T19:00:00Z",
+        &serde_json::json!([
+            {"label":"pulp-preamble-m5","verdict":"broken","loaded":true,
+             "crash_loop":true,"runs":8082,"registered":false},
+        ]),
+    );
+    let probe = parsed_at(&body, "2026-09-13T18:00:00Z");
+
+    assert!(
+        !probe.readable,
+        "an artifact written an hour in the future cannot be aged"
+    );
+    assert_eq!(probe.boundary.as_deref(), Some("parse"));
+    assert!(
+        probe.source.contains("in the future"),
+        "the refusal must name the clock disagreement rather than claim the \
+         attester stopped writing: {}",
+        probe.source
+    );
+}
+
+/// Without this the refusal above is indistinguishable from one that rejects
+/// every host whose clock is not bit-identical to ours.
+#[test]
+fn control_a_clock_a_few_seconds_ahead_is_still_readable() {
+    let body = attestation_fixture(
+        "2026-09-13T18:00:10Z",
+        &serde_json::json!([
+            {"label":"shipyard.queue-tick","verdict":"ok","loaded":true,
+             "crash_loop":false,"runs":12,"registered":true},
+        ]),
+    );
+    let probe = parsed_at(&body, "2026-09-13T18:00:00Z");
+
+    assert!(
+        probe.readable,
+        "ten seconds of ordinary clock jitter is not a fault: {}",
+        probe.source
+    );
+}
+
+/// A document that never says whether it could read the launchd domain has not
+/// reported an empty census — it has reported nothing, and the difference is
+/// the whole point of the field.
+#[test]
+fn an_attestation_that_omits_launchd_readability_is_a_blind_census() {
+    let body = serde_json::json!({
+        "schema": 1, "host": "m5", "written_at": "2026-09-13T18:00:00Z",
+        "interval_secs": 300, "persistent_runners": [], "jit_lanes": [],
+    })
+    .to_string();
+    let probe = parsed_at(&body, "2026-09-13T18:01:00Z");
+
+    assert!(
+        !probe.readable,
+        "a missing launchd_readable must not be read as true"
+    );
+    assert_eq!(probe.boundary.as_deref(), Some("parse"));
+    assert_eq!(probe.launchd_readable, None);
 }
 
 /// A plist that is installed but not loaded spawns nothing, so it cannot be

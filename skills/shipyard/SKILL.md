@@ -1273,15 +1273,21 @@ stops reading the check.
 Three things the probe refuses to flatten:
 
 - **An unreadable attestation is a finding, named by boundary.** `Scope`,
-  `Transport`, `Parse` and `Absent` are different facts. A LaunchAgent lives in
-  the per-user GUI domain, so `launchctl list` over a non-interactive ssh
-  session enumerates nothing *for a perfectly healthy job* — the attester
-  reports whether it could read that domain, and a false there is `Scope`. Map
-  it to `Absent` and every healthy host reads as having no runners.
+  `Transport` and `Parse` are different facts. `Boundary` carries no "absent"
+  variant — a missing artifact is `Transport`, not a fourth thing. A LaunchAgent
+  lives in the per-user GUI domain, so `launchctl list` over a non-interactive
+  ssh session enumerates nothing *for a perfectly healthy job* — the attester
+  reports whether it could read that domain, and a false there is `Scope`. Read
+  that as an empty census instead and every healthy host looks like it has no
+  runners; a document omitting the field altogether is refused as `Parse` for
+  the same reason, since silence is not a claim that the domain was readable.
 - **A stale artifact is not a current reading.** A file older than twice its
   own declared cadence is `Transport`-unreadable. Staleness is checked before
   any field inside the document is believed, because a stale artifact repeats
-  its last word with total confidence.
+  its last word with total confidence. Age is a *signed* difference, so a
+  timestamp ahead of our clock is refused as `Parse` — left one-sided, a host
+  that stamps local time as UTC reads as fresh forever, and the gate quietly
+  stops existing on exactly the host that needs it.
 - **A document that does not parse is not a host with no runners.** A truncated
   or half-written artifact refuses as `Parse`. That is the exact shape of the
   failure this check exists to catch, so it must never read as a clean census
