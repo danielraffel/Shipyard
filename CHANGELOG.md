@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02030"></a>
+## [0.203.0] - 2026-09-13
+
+- feat(landability): refuse to queue work into a lane no runner can serve ([#591](https://github.com/danielraffel/Shipyard/pull/591))
+
 <a id="v02020"></a>
 ## [0.202.0] - 2026-09-13
 
@@ -1490,6 +1495,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.203.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.203.0
 [0.202.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.202.0
 [0.201.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.201.0
 [0.200.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.200.3
