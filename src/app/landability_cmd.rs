@@ -623,7 +623,11 @@ fn run_self_check(
     }
 }
 
-#[cfg(test)]
+// Every test here builds a real git checkout and shells out to `git`, so the
+// whole module is unix-only. Gating the MODULE rather than each item keeps a
+// non-unix build free of "unused import" / "never used" warnings, which a
+// `-D warnings` clippy gate turns into a hard failure.
+#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
     use std::path::Path;
@@ -672,7 +676,6 @@ mod tests {
     /// T8 — the live control pair. Real inputs, not mocks: the host's own
     /// checked-out workflows, evaluated against a base name no `branches:`
     /// filter can admit and against the configured base.
-    #[cfg(unix)]
     #[test]
     fn t8_the_trigger_controls_discriminate_on_a_filtered_producer() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -694,7 +697,6 @@ mod tests {
     /// reporting health it did not establish. An unfiltered producer admits
     /// every base including the control name, which is correct behaviour and
     /// therefore useless as a negative control.
-    #[cfg(unix)]
     #[test]
     fn t8_an_unfiltered_producer_is_not_measurable_never_a_pass() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -710,7 +712,6 @@ mod tests {
     /// The break line for T8: a classifier that admitted everything. The
     /// control must catch it, which is the whole point of running it live on
     /// every invocation rather than only in CI.
-    #[cfg(unix)]
     #[test]
     fn t8_a_producer_that_excludes_the_configured_base_fails_the_positive_control() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -729,7 +730,6 @@ mod tests {
     }
 
     /// A refused `on:` block is counted and named, never silently skipped.
-    #[cfg(unix)]
     #[test]
     fn t8_a_refused_on_block_is_counted_in_the_detail() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -746,7 +746,6 @@ mod tests {
     /// T6's corpus control: the reader's own accounting must add up to the
     /// directory listing. A reader that silently stopped seeing files would
     /// otherwise report a clean, complete-looking pass over nothing.
-    #[cfg(unix)]
     #[test]
     fn the_whole_directory_scan_accounts_for_every_file_it_listed() {
         let temp = tempfile::tempdir().expect("tempdir");

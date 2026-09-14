@@ -413,3 +413,67 @@ fn a_star_never_crosses_a_slash_but_a_double_star_does() {
     assert!(!matches_pattern("a/*/c", "a/b/x/c").expect("ok"));
     assert!(matches_pattern("a/**/c", "a/b/x/c").expect("ok"));
 }
+
+/// Not about the reader — about the *documentation* of the reader, and it lives
+/// here because this is the module whose prose needs to talk about GitHub
+/// expression delimiters.
+///
+/// Every tracked Markdown file in this repository is rendered through Jekyll's
+/// Liquid templating by GitHub Pages. An **unterminated** `{{` is a Liquid
+/// syntax error that fails that build. It is easy to write by accident when
+/// documenting workflow syntax, and the Pages build is not a required pull
+/// request check — so the first signal is a red `main`. That is exactly how it
+/// happened: a sentence describing which forms the `on:` reader refuses
+/// contained a bare delimiter, and `main` went red after the merge.
+#[test]
+fn no_tracked_markdown_carries_an_unterminated_liquid_delimiter() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "*.md"])
+        .output()
+        .expect("git ls-files runs");
+    assert!(listed.status.success(), "git ls-files failed");
+    let files: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+
+    // The control: a scan that listed nothing would pass vacuously, which is
+    // the failure mode this whole module is about.
+    assert!(
+        files.len() > 10,
+        "only {} markdown file(s) listed; the scan is measuring nothing",
+        files.len()
+    );
+
+    let mut offenders = Vec::new();
+    let mut scanned_with_delimiters = 0usize;
+    for file in &files {
+        let Ok(text) = std::fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        for (index, line) in text.lines().enumerate() {
+            if !line.contains("{{") {
+                continue;
+            }
+            scanned_with_delimiters += 1;
+            if !line.contains("}}") {
+                offenders.push(format!("{file}:{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+
+    // Second control: if nothing in the corpus contains `{{` at all, the check
+    // above can never fire and its silence means nothing.
+    assert!(
+        scanned_with_delimiters > 0,
+        "no line in any tracked markdown contains `{{{{`; the detector cannot fail"
+    );
+    assert!(
+        offenders.is_empty(),
+        "unterminated Liquid delimiter(s) will fail the GitHub Pages build:\n{}",
+        offenders.join("\n")
+    );
+}
