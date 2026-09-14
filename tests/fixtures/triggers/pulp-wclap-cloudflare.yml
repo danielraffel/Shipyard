@@ -1,0 +1,30 @@
+on:
+  push:
+    branches: [main]
+    paths:
+      - "core/format/src/wasm/wclap-*.mjs"
+      - "examples/web-demos/wclap-build/**"
+      - "examples/pulp-gain/**"
+      - "tools/cmake/PulpWclap.cmake"
+      - "tools/cmake/wasi-toolchain.cmake"
+      - ".github/workflows/wclap-cloudflare.yml"
+  # No event-level paths filter on pull_request: this lane is a REQUIRED status check,
+  # and a required check that is path-filtered leaves unrelated PRs stuck forever on
+  # "Expected — Waiting for status". The job therefore always reports, but its first
+  # step classifies the PR diff and skips the expensive proof for unrelated changes.
+  # Relevant core/web changes still catch the real silent-breakage risk this lane exists for:
+  # the wasm UI build hand-lists its sources (PulpWebUi.cmake), so a CORE refactor
+  # (core/view/**, core/canvas/**) that splits a TU breaks the link with nothing under
+  # examples/web-demos/** touched — invisible to a path-filtered lane. Deploy stays
+  # owner-gated + main-only, so a PR run builds + proves and never deploys.
+  pull_request:
+  # Run this required check on queued merge groups so a merge queue on `main` can
+  # land PRs. `merge_group` does not honour a paths filter (like the pull_request
+  # lane above, on purpose), so the job always reports. Its trusted base-to-group
+  # diff classifier skips the expensive proof for unrelated groups while relevant
+  # changes still build + prove. Deploy stays owner-gated + main-only.
+  merge_group:
+  # Weekly drift check — a broken build is a red run, not a dead site.
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:

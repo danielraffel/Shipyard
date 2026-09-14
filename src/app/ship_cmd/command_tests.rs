@@ -125,6 +125,7 @@ fn ship_command_runs_local_target_merges_and_archives_state() {
     let code = ship_command(
         ShipCommandArgs {
             allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
             skip_landability: true,
             pr: Some(42),
             base: "main".to_owned(),
@@ -212,6 +213,7 @@ fn ship_command_green_merge_failure_keeps_active_state_and_exits_success() {
     let code = ship_command(
         ShipCommandArgs {
             allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
             skip_landability: true,
             pr: Some(43),
             base: "main".to_owned(),
@@ -576,6 +578,7 @@ fn ship_command_preflight_failure_happens_before_state_mutation() {
     let error = ship_command(
         ShipCommandArgs {
             allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
             skip_landability: true,
             pr: Some(44),
             base: "main".to_owned(),
@@ -650,6 +653,7 @@ exit 2
     let error = ship_command(
         ShipCommandArgs {
             allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
             skip_landability: true,
             pr: Some(7823),
             base: "main".to_owned(),
@@ -712,6 +716,7 @@ exit 2
     let lane_policy = crate::lane_policy::resolve_lane_policy(&config, &repo);
     let args = ShipCommandArgs {
         allow_unserved_lanes: Vec::new(),
+        allow_unreachable_triggers: Vec::new(),
         skip_landability: true,
         pr: Some(7823),
         base: "main".to_owned(),
@@ -775,6 +780,7 @@ fn ship_command_skip_target_excludes_unreachable_target_before_preflight() {
     let code = ship_command(
         ShipCommandArgs {
             allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
             skip_landability: true,
             pr: Some(45),
             base: "main".to_owned(),
@@ -851,6 +857,7 @@ exit 2
     let code = ship_command(
         ShipCommandArgs {
             allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
             skip_landability: true,
             pr: None,
             base: "main".to_owned(),
@@ -963,6 +970,7 @@ exit 2
     let code = ship_command(
         ShipCommandArgs {
             allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
             skip_landability: true,
             pr: None,
             base: "develop/test".to_owned(),

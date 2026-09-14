@@ -23,7 +23,7 @@ pub const EXIT_FLEET_EPOCH_DRIFT: u8 = 5;
 ///
 /// Re-exported from [`crate::landability`] so every submission exit code is
 /// readable in one place.
-pub use crate::landability::EXIT_LANE_UNSERVED;
+pub use crate::landability::{EXIT_LANE_UNSERVED, EXIT_TRIGGER_UNREACHABLE};
 
 /// One unreachable target discovered during preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,6 +133,17 @@ pub enum ShipPreflightError {
         /// Rendered status explaining the gap and how to close it.
         status: String,
     },
+    /// A required status context will never be **requested**.
+    ///
+    /// Links (1)-(3) of the chain, and a different owner from every other
+    /// variant here: the remedy is on the pull request (its base, a push) or
+    /// in the workflow file, and it belongs to the author rather than to a
+    /// fleet operator. Waiting never resolves it.
+    TriggerUnreachable {
+        /// Rendered diagnosis naming the context, the workflow, the clause as
+        /// written in the file, and the remedies.
+        diagnosis: String,
+    },
     /// A required status context cannot be scheduled onto any runner.
     ///
     /// Distinct from every other variant here because nothing about *this
@@ -172,6 +183,10 @@ pub struct ShipPreflightOptions {
     /// run. Prints the full diagnosis as a warning and proceeds. Never set by
     /// automation.
     pub allow_unserved_lanes: Vec<String>,
+    /// Workflow paths whose trigger fault the operator has waived for this
+    /// run. Deliberately not covered by `allow_unserved_lanes`: a lane fault
+    /// is fixed on the fleet, a trigger fault on the pull request.
+    pub allow_unreachable_triggers: Vec<String>,
     /// Skip the landability gate entirely.
     pub skip_landability: bool,
 }
@@ -236,6 +251,12 @@ impl Display for ShipPreflightError {
                  dispatching from here could produce a result nobody can reproduce. Options:\n\
                  \x20 - Run tools/fleet/apply.sh to converge this host, OR\n\
                  \x20 - Pass --allow-fleet-epoch-drift to proceed anyway."
+            ),
+            Self::TriggerUnreachable { diagnosis } => write!(
+                formatter,
+                "{diagnosis}\n\
+                 Nothing is wrong with this host or with the fleet: the required run would never \n\
+                 be created, so no runner would ever be asked for it."
             ),
             Self::LaneUnserved { diagnosis } => write!(
                 formatter,
@@ -302,6 +323,7 @@ fn local_host_name() -> String {
 }
 
 /// Run preflight and return the Python-compatible report on success.
+#[allow(clippy::too_many_lines)]
 pub fn collect_ship_preflight_with_options(
     config: &LoadedConfig,
     cwd: &Path,
@@ -313,6 +335,7 @@ pub fn collect_ship_preflight_with_options(
     // Moved out rather than cloned so `options` is genuinely consumed; the
     // remaining fields are `Copy` and stay readable after the partial move.
     let allow_unserved_lanes = options.allow_unserved_lanes;
+    let allow_unreachable_triggers = options.allow_unreachable_triggers;
     let expected_root = Some(normalize_path(
         &expected_root(config).unwrap_or_else(|| cwd.to_path_buf()),
     ));
@@ -367,7 +390,14 @@ pub fn collect_ship_preflight_with_options(
     // never going to appear. It runs before target probes because a refusal
     // here makes those probes pointless.
     if !options.skip_landability {
-        landability_gate(config, cwd, state_dir, allow_unserved_lanes, &mut warnings)?;
+        landability_gate(
+            config,
+            cwd,
+            state_dir,
+            allow_unserved_lanes,
+            allow_unreachable_triggers,
+            &mut warnings,
+        )?;
     }
 
     let target_reports = targets
@@ -434,6 +464,7 @@ fn landability_gate(
     cwd: &Path,
     state_dir: &Path,
     allow_unserved_lanes: Vec<String>,
+    allow_unreachable_triggers: Vec<String>,
     warnings: &mut Vec<String>,
 ) -> Result<(), ShipPreflightError> {
     let Some(repo) = crate::landability::gate::resolve_repo(config, cwd) else {
@@ -448,11 +479,20 @@ fn landability_gate(
         &base,
         &crate::landability::GateOptions {
             allow_unserved_lanes,
+            allow_unreachable_triggers,
+            evidence: None,
             skip: false,
             ignore_cache: false,
         },
     );
     warnings.extend(outcome.warnings);
+    // The earliest broken link is the one reported. A lane that cannot be
+    // scheduled is irrelevant while the run that would use it is never going
+    // to be created, and reporting the later fault would send the author to
+    // the fleet owner for a problem on their own pull request.
+    if let Some(diagnosis) = outcome.trigger_refusal {
+        return Err(ShipPreflightError::TriggerUnreachable { diagnosis });
+    }
     if let Some(diagnosis) = outcome.refusal {
         return Err(ShipPreflightError::LaneUnserved { diagnosis });
     }

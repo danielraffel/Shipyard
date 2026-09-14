@@ -54,6 +54,7 @@ pub struct AssessInput<'a> {
 #[must_use]
 pub fn assess(input: &AssessInput<'_>, now: DateTime<Utc>) -> LandabilityReport {
     let mut report = LandabilityReport {
+        reachability: Vec::new(),
         contexts: input.contexts.to_vec(),
         contexts_source: input.contexts_source.to_owned(),
         lanes: Vec::new(),
