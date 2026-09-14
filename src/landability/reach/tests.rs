@@ -610,7 +610,7 @@ fn severity_ranks_the_earliest_broken_link_worst() {
             pair[1].as_str()
         );
     }
-    assert!(order.iter().filter(|verdict| verdict.blocks()).count() == 5);
+    assert_eq!(order.iter().filter(|verdict| verdict.blocks()).count(), 5);
 }
 
 #[test]
