@@ -710,6 +710,7 @@ mod tests {
     use std::fs;
 
     use crate::config::{LoadedConfig, LocalOverlaySource};
+    #[cfg(unix)]
     use crate::identity::RuntimeMode;
 
     use super::*;

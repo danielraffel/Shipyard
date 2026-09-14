@@ -2573,7 +2573,8 @@ spent on a state that was never going to change.
 the dangerous error. `trigger.rs` has the **opposite** safety direction — a
 mis-read filter that *admits* is a false pass, which is the failure this whole
 thing exists to end. So it is **exact, or `Unknown`. Never a partial filter
-list.** It refuses on `${{` inside the `on:` block, YAML anchors/aliases, tabs,
+list.** It refuses on **any GitHub expression** inside the `on:` block (its
+value is not knowable statically), YAML anchors/aliases, tabs,
 duplicate keys, multi-document files, unknown activity types, a pattern outside
 GitHub's documented subset (`^`/`$` are the tell of a regex), `branches` **and**
 `branches-ignore` together, a negated `-ignore` pattern, and a `paths` filter
