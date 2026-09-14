@@ -1,0 +1,16 @@
+on:
+  workflow_dispatch:
+  # This gate is the only automated check in the repo, so it has to run on a PR
+  # rather than only on demand. It is also a 120-minute job on a SHARED
+  # self-hosted Mac, so the trigger is narrowed twice: pure docs/planning edits
+  # are skipped outright, and a rapid push series on one PR collapses to a
+  # single run instead of stacking builds on the runner. Anything that can
+  # reach the product -- src, include, test, native-ui, resources, tools, the
+  # SDK pin, CMakeLists.txt, this workflow -- still runs, deliberately: a gate
+  # that opts out by default is not a gate.
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'planning/**'
+      - '**/*.md'

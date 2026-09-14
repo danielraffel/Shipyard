@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use toml::Table;
@@ -273,6 +274,50 @@ impl GitHubCommandOutput {
     }
 }
 
+/// Narrow pull-request facts the trigger-reachability classifier needs.
+#[derive(Clone, Debug)]
+pub struct PullRequestTriggerFacts {
+    /// Pull request number.
+    pub number: u64,
+    /// Current base branch, after any retarget.
+    pub base_ref: String,
+    /// Current head SHA.
+    pub head_sha: String,
+    /// When the pull request was opened.
+    pub created_at: Option<DateTime<Utc>>,
+    /// Whether an App (rather than a human) authored it.
+    pub author_is_app: bool,
+}
+
+/// One `base_ref_changed` timeline entry.
+#[derive(Clone, Debug)]
+pub struct BaseRefChange {
+    /// When the retarget happened.
+    pub at: DateTime<Utc>,
+    /// The base the pull request was retargeted away from.
+    pub from: Option<String>,
+}
+
+/// One workflow run observed on a head SHA.
+///
+/// Carries no `pull_requests[]` field on purpose — see
+/// [`GitHubActions::workflow_runs_for_head_sha`].
+#[derive(Clone, Debug)]
+pub struct HeadShaRun {
+    /// Run id.
+    pub id: u64,
+    /// Event that created it.
+    pub event: String,
+    /// `.github/workflows/…` path.
+    pub path: String,
+    /// `queued` / `in_progress` / `completed`.
+    pub status: String,
+    /// Conclusion once completed.
+    pub conclusion: Option<String>,
+    /// Creation time.
+    pub created_at: DateTime<Utc>,
+}
+
 /// Shell-backed GitHub Actions client.
 #[derive(Clone, Debug)]
 pub struct GitHubActions {
@@ -471,6 +516,135 @@ impl GitHubActions {
         }
         let stdout = self.run_gh(&args)?;
         parse_first_workflow_run(&stdout)
+    }
+
+    /// Facts about one pull request needed to decide whether its required
+    /// contexts were ever *requested*.
+    ///
+    /// One call. Deliberately narrow: base ref, head SHA, creation time.
+    pub fn pull_request_trigger_facts(
+        &self,
+        repository: &str,
+        number: u64,
+    ) -> Result<PullRequestTriggerFacts, GitHubError> {
+        let raw = self.run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repository}/pulls/{number}"),
+        ])?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| GitHubError::new(format!("pull request JSON malformed: {error}")))?;
+        Ok(PullRequestTriggerFacts {
+            number,
+            base_ref: value
+                .pointer("/base/ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            head_sha: value
+                .pointer("/head/sha")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            created_at: value
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                .map(|at| at.with_timezone(&Utc)),
+            author_is_app: value
+                .pointer("/user/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("Bot"),
+        })
+    }
+
+    /// Every workflow run on one head SHA, repository-wide.
+    ///
+    /// **Keyed on `head_sha` and nothing else.** A run's `pull_requests[]`
+    /// association is not usable evidence: the one genuine `pull_request` run
+    /// on the pull request that motivated this code came back with
+    /// `pull_requests: []`, so a detector filtering on that array reports *no
+    /// run* for a pull request whose run exists. One call answers the
+    /// question for every required context at once.
+    pub fn workflow_runs_for_head_sha(
+        &self,
+        repository: &str,
+        head_sha: &str,
+    ) -> Result<Vec<HeadShaRun>, GitHubError> {
+        let raw = self.run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repository}/actions/runs?head_sha={head_sha}&per_page=50"),
+        ])?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| GitHubError::new(format!("runs JSON malformed: {error}")))?;
+        Ok(value
+            .get("workflow_runs")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        Some(HeadShaRun {
+                            id: item.get("id")?.as_u64()?,
+                            event: item.get("event")?.as_str()?.to_owned(),
+                            path: item.get("path")?.as_str()?.to_owned(),
+                            status: item
+                                .get("status")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            conclusion: item
+                                .get("conclusion")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
+                            created_at: item
+                                .get("created_at")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                                .map_or_else(Utc::now, |at| at.with_timezone(&Utc)),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// The most recent `base_ref_changed` event on a pull request's timeline.
+    ///
+    /// The conditional third call: spent only when the first two already say
+    /// "the base is admitted now and no pull-request run exists on the head",
+    /// which is the only shape a retarget can explain.
+    pub fn pull_request_base_changes(
+        &self,
+        repository: &str,
+        number: u64,
+    ) -> Result<Option<BaseRefChange>, GitHubError> {
+        let raw = self.run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repository}/issues/{number}/timeline?per_page=100"),
+        ])?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| GitHubError::new(format!("timeline JSON malformed: {error}")))?;
+        let Some(items) = value.as_array() else {
+            return Ok(None);
+        };
+        Ok(items
+            .iter()
+            .filter(|item| {
+                item.get("event").and_then(serde_json::Value::as_str) == Some("base_ref_changed")
+            })
+            .filter_map(|item| {
+                let at = item
+                    .get("created_at")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|text| DateTime::parse_from_rfc3339(text).ok())?
+                    .with_timezone(&Utc);
+                let from = item
+                    .pointer("/base_ref/from")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                Some(BaseRefChange { at, from })
+            })
+            .max_by_key(|change| change.at))
     }
 
     /// Fetch the status of one workflow run.

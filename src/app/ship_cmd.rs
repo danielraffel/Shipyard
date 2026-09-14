@@ -41,7 +41,8 @@ use crate::pr::{
 use crate::pr_text::{compose_pr_body_with_policy, compose_pr_title};
 use crate::preflight::{
     EXIT_BACKEND_UNREACHABLE, EXIT_FLEET_EPOCH_DRIFT, EXIT_HOST_UNHEALTHY, EXIT_LANE_UNSERVED,
-    ShipPreflightError, ShipPreflightOptions, collect_ship_preflight_with_options,
+    EXIT_TRIGGER_UNREACHABLE, ShipPreflightError, ShipPreflightOptions,
+    collect_ship_preflight_with_options,
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
@@ -75,6 +76,8 @@ pub(super) struct ShipCommandArgs {
     pub(super) allow_fleet_epoch_drift: bool,
     /// Runner labels whose unserved verdict the operator waived.
     pub(super) allow_unserved_lanes: Vec<String>,
+    /// Workflow paths whose trigger fault the operator waived.
+    pub(super) allow_unreachable_triggers: Vec<String>,
     /// Skip the landability gate for this invocation.
     pub(super) skip_landability: bool,
     pub(super) skip_targets: Vec<String>,
@@ -557,6 +560,7 @@ fn prepare_ship_targets<W: Write>(
             allow_unreachable_targets: args.allow_unreachable_targets,
             allow_fleet_epoch_drift: args.allow_fleet_epoch_drift,
             allow_unserved_lanes: args.allow_unserved_lanes.clone(),
+            allow_unreachable_triggers: args.allow_unreachable_triggers.clone(),
             skip_landability: args.skip_landability,
         },
     )
@@ -582,6 +586,7 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
         ShipPreflightError::BackendUnreachable { .. } => EXIT_BACKEND_UNREACHABLE,
         ShipPreflightError::HostUnhealthy { .. } => EXIT_HOST_UNHEALTHY,
         ShipPreflightError::FleetEpochDrift { .. } => EXIT_FLEET_EPOCH_DRIFT,
+        ShipPreflightError::TriggerUnreachable { .. } => EXIT_TRIGGER_UNREACHABLE,
         ShipPreflightError::LaneUnserved { .. } => EXIT_LANE_UNSERVED,
     };
     CliFailure::new(code, error.to_string())

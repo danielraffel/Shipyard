@@ -343,8 +343,9 @@ pub(super) enum Command {
     /// Report whether each required status context can be scheduled onto a
     /// runner that exists, and self-check the classifier while doing it.
     ///
-    /// Exit 0 clean, 7 when a required context is unschedulable, 1 when the
-    /// instrument's own control lanes fail to discriminate.
+    /// Exit 0 clean, 8 when a required context will never be requested,
+    /// 7 when one is requested but unschedulable, 1 when the instrument's own
+    /// control lanes fail to discriminate.
     Landability {
         /// Exact OWNER/REPO. Defaults to the `origin` remote.
         #[arg(long, value_name = "OWNER/REPO")]
@@ -352,6 +353,11 @@ pub(super) enum Command {
         /// Base branch whose protection and workflows are read.
         #[arg(long, value_name = "BRANCH")]
         base: Option<String>,
+        /// Classify an existing pull request, spending up to three extra API
+        /// reads to decide whether its gate was ever actually requested.
+        /// Without it the classification is static and costs nothing.
+        #[arg(long, value_name = "NUMBER")]
+        pr: Option<u64>,
     },
     Doctor {
         /// Exact OWNER/REPO used to resolve configured auth token placeholders.
@@ -401,6 +407,13 @@ pub(super) enum Command {
         /// Never set by automation.
         #[arg(long = "allow-unserved-lane", value_name = "LABEL")]
         allow_unserved_lanes: Vec<String>,
+        /// Waive an unreachable-trigger refusal for a specific workflow.
+        /// Use for a stacked pull request the author intends to leave
+        /// unchecked until its parent lands. Deliberately NOT covered by
+        /// --allow-unserved-lane: that waives a fleet fault, this waives a
+        /// fault on the pull request itself.
+        #[arg(long = "allow-unreachable-trigger", value_name = "WORKFLOW")]
+        allow_unreachable_triggers: Vec<String>,
         /// Skip the landability gate entirely for this invocation.
         #[arg(long = "skip-landability")]
         skip_landability: bool,
@@ -453,6 +466,13 @@ pub(super) enum Command {
         /// Never set by automation.
         #[arg(long = "allow-unserved-lane", value_name = "LABEL")]
         allow_unserved_lanes: Vec<String>,
+        /// Waive an unreachable-trigger refusal for a specific workflow.
+        /// Use for a stacked pull request the author intends to leave
+        /// unchecked until its parent lands. Deliberately NOT covered by
+        /// --allow-unserved-lane: that waives a fleet fault, this waives a
+        /// fault on the pull request itself.
+        #[arg(long = "allow-unreachable-trigger", value_name = "WORKFLOW")]
+        allow_unreachable_triggers: Vec<String>,
         /// Skip the landability gate entirely for this invocation.
         #[arg(long = "skip-landability")]
         skip_landability: bool,
@@ -491,9 +511,22 @@ pub(super) enum Command {
         /// Never set by automation.
         #[arg(long = "allow-unserved-lane", value_name = "LABEL")]
         allow_unserved_lanes: Vec<String>,
+        /// Waive an unreachable-trigger refusal for a specific workflow.
+        /// Use for a stacked pull request the author intends to leave
+        /// unchecked until its parent lands. Deliberately NOT covered by
+        /// --allow-unserved-lane: that waives a fleet fault, this waives a
+        /// fault on the pull request itself.
+        #[arg(long = "allow-unreachable-trigger", value_name = "WORKFLOW")]
+        allow_unreachable_triggers: Vec<String>,
         /// Skip the landability gate entirely for this invocation.
         #[arg(long = "skip-landability")]
         skip_landability: bool,
+        /// Open this pull request against a base that is not the configured
+        /// base branch, on purpose. The trigger verdict is printed either
+        /// way; without this flag a non-default base refuses with exit 8 and
+        /// creates nothing.
+        #[arg(long = "stacked")]
+        stacked: bool,
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,

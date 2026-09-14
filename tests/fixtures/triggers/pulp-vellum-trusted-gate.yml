@@ -1,0 +1,15 @@
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+  merge_group:
+  # Manual re-run. This check is REQUIRED and posts its own commit status, so a
+  # wedged or cancelled run leaves a PR unmergeable with no way back except
+  # pushing a commit to fire `synchronize` — which rewrites the history under
+  # review. Dispatch is restricted to users with write access.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to evaluate
+        required: true
+        type: string

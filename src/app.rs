@@ -396,13 +396,14 @@ where
                 stdout,
             );
         }
-        Command::Landability { repo, base } => {
+        Command::Landability { repo, base, pr } => {
             return landability_cmd::landability_command(
                 cli.mode.into(),
                 &cwd,
                 &runtime_paths.state_dir,
                 repo,
                 base,
+                pr,
                 cli.json,
                 stdout,
             );
@@ -892,6 +893,7 @@ fn handle_ship_variant<W: Write>(
         allow_unreachable_targets,
         allow_fleet_epoch_drift,
         allow_unserved_lanes,
+        allow_unreachable_triggers,
         skip_landability,
         skip_targets,
         adopt_head,
@@ -918,6 +920,7 @@ fn handle_ship_variant<W: Write>(
             allow_unreachable_targets,
             allow_fleet_epoch_drift,
             allow_unserved_lanes,
+            allow_unreachable_triggers,
             skip_landability,
             skip_targets,
             adopt_head,
@@ -948,7 +951,9 @@ fn handle_pr_variant<W: Write>(
         allow_unreachable_targets,
         allow_fleet_epoch_drift,
         allow_unserved_lanes,
+        allow_unreachable_triggers,
         skip_landability,
+        stacked,
         skip_targets,
         skip_bump,
         bump_reason,
@@ -971,7 +976,9 @@ fn handle_pr_variant<W: Write>(
             allow_unreachable_targets,
             allow_fleet_epoch_drift,
             allow_unserved_lanes,
+            allow_unreachable_triggers,
             skip_landability,
+            stacked,
             skip_targets,
             skip_bump,
             bump_reason,
@@ -1013,6 +1020,7 @@ fn handle_run_variant<W: Write>(
         allow_unreachable_targets,
         allow_fleet_epoch_drift,
         allow_unserved_lanes,
+        allow_unreachable_triggers,
         skip_landability,
         skip_targets,
         no_warm,
@@ -1041,6 +1049,7 @@ fn handle_run_variant<W: Write>(
             reachability: ReachabilityPolicy::from_flag(allow_unreachable_targets),
             allow_fleet_epoch_drift,
             allow_unserved_lanes,
+            allow_unreachable_triggers,
             skip_landability,
             skip_targets,
             warm: WarmPolicy::from_no_warm_flag(no_warm),

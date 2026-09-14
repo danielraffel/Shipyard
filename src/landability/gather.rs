@@ -66,6 +66,15 @@ pub struct FleetFacts {
     pub required_contexts: Option<Vec<String>>,
     /// Which source supplied the contexts.
     pub contexts_source: String,
+    /// The protection endpoint answered, and the answer was "nothing is
+    /// required on this branch".
+    ///
+    /// Distinct from an unreadable protection read, and the distinction is
+    /// load-bearing: "GitHub says nothing is required" is a *finding* (a
+    /// repository where auto-merge would merge untested), while "the call
+    /// failed" is a statement about the instrument. Folding them together
+    /// would make every transport blip look like an unprotected branch.
+    pub protection_absent: bool,
     /// Instrument problems worth printing.
     pub warnings: Vec<String>,
     /// How many API calls this gather actually made. Reported rather than
@@ -96,6 +105,8 @@ struct CachedFacts {
     variables_boundary: Option<String>,
     required_contexts: Option<Vec<String>>,
     contexts_source: String,
+    #[serde(default)]
+    protection_absent: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -168,6 +179,7 @@ pub fn gather(
             variables_boundary: facts.variables_boundary.map(|b| b.as_str().to_owned()),
             required_contexts: facts.required_contexts.clone(),
             contexts_source: facts.contexts_source.clone(),
+            protection_absent: facts.protection_absent,
         },
     );
 
@@ -205,6 +217,7 @@ fn fetch_required_contexts(
                     })
                     .unwrap_or_default();
                 if contexts.is_empty() {
+                    facts.protection_absent = true;
                     facts.warnings.push(
                         "branch protection returned no required contexts; falling back to \
                          [governance] required_status_checks"
@@ -219,10 +232,35 @@ fn fetch_required_contexts(
                 .warnings
                 .push(format!("branch protection JSON malformed: {error}")),
         },
-        Err(error) => facts.warnings.push(format!(
-            "branch protection unreadable ({error}); using [governance] required_status_checks \
-             from config, which may be a narrower set"
-        )),
+        Err(error) => {
+            // A 404 here is an ANSWER, not a failure: GitHub says this branch
+            // is not protected, so nothing is required on it. Treating that as
+            // an unreadable instrument would hide the finding that matters —
+            // auto-merge on such a branch merges with nothing run.
+            let text = error.to_lowercase();
+            if text.contains("branch not found") {
+                // A base that does not exist on the remote is a different
+                // fact from one that exists and is unprotected, and only the
+                // second is a finding about the repository. Conflating them
+                // would report every typo'd `--base` as "auto-merge would
+                // merge untested".
+                facts.warnings.push(format!(
+                    "base branch `{base}` does not exist on the remote ({error}); nothing about \
+                     branch protection could be read"
+                ));
+            } else if text.contains("branch not protected") || text.contains("not found") {
+                facts.protection_absent = true;
+                facts.warnings.push(format!(
+                    "branch `{base}` is NOT protected ({error}); nothing on GitHub's side requires \
+                     any status check to merge"
+                ));
+            } else {
+                facts.warnings.push(format!(
+                    "branch protection unreadable ({error}); using [governance] \
+                     required_status_checks from config, which may be a narrower set"
+                ));
+            }
+        }
     }
 }
 
@@ -320,6 +358,7 @@ fn from_cache(cached: CachedFacts) -> FleetFacts {
         census_boundary: cached.census_boundary.as_deref().map(str_to_boundary),
         required_contexts: cached.required_contexts,
         contexts_source: cached.contexts_source,
+        protection_absent: cached.protection_absent,
         warnings: Vec::new(),
         api_calls: 0,
     }

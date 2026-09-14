@@ -2483,4 +2483,111 @@ Two synthetic lanes against the same census and attestation set: one nothing can
 serve (must be `Unserved`, or `Unknown` where no host attests) and one GitHub
 always serves (must be `Served`). If they stop discriminating, `landability`
 exits non-zero rather than reporting a clean result it did not measure. That
-fleet had five sensors dead for weeks to months and none reported its own death.
+fleet had five sensors dead for weeks to months and none reported its own death. Since the trigger work landed it also asserts a **trigger** pair on the host's
+own checked-out workflows: a base name no `branches:` filter admits must come
+back `base_excluded`, and the configured base must come back `triggered`.
+
+---
+
+## "Will the required context ever be REQUESTED?" — exit 8, and why it is not exit 7
+
+Exit 7 above answers *can the required contexts be scheduled*. That presupposes
+a run will be **requested**, and on 2026-09-14 one was not. `danielraffel/spectr`
+#120 was opened against a feature base; its gate declares
+`on.pull_request.branches: [main]`; GitHub evaluated that trigger exactly as
+documented and created no run. The pull request sat `CLEAN` with an **empty**
+check rollup for 2 h 48 m. Nothing was red, nothing was queued, nothing was
+broken, and no instrument said so. It moved only when a human pushed an empty
+commit.
+
+One question, five links, and every link fails independently:
+
+```text
+(1) something REQUIRES C  ->  (2) a workflow W PRODUCES C under a PR-shaped event
+-> (3) W's `on:` ADMITS this PR  ->  (4) W's jobs are SCHEDULABLE (exit 7)
+-> (5) a run EXISTS on the head
+```
+
+Links 1-3 and 5 are **exit 8** (`EXIT_TRIGGER_UNREACHABLE`). Separate from 7
+because the remedies are disjoint: a 7 is fixed on the fleet by an operator with
+SSH access, an 8 is fixed on the pull request or the workflow file by its author,
+immediately. `--allow-unserved-lane` therefore does **not** wave an 8 through;
+the equally narrow escape is `--allow-unreachable-trigger <workflow>`, for the
+one legitimate case — a stacked pull request the author intends to leave
+unchecked until its parent lands.
+
+Cost at `shipyard pr`: **zero additional API calls.** The protection read is the
+one the lane gate already makes; workflows, base and diff are local. The
+post-open path (`landability --pr N`) spends at most three more, the third only
+when the first two cannot already answer.
+
+### Reading the verdict
+
+| verdict | meaning | waiting helps? |
+|---|---|---|
+| `triggered` | nothing in links 1-3 stops it; with `--pr N`, a real run exists on the head | **only** here, and then the lane verdict says whether it terminates |
+| `not_required` | Shipyard requires it, branch protection does not — **auto-merge would merge with nothing run** | no, and it merges |
+| `no_producer` | no configured workflow renders a job to this name; its trigger was NOT checked | no |
+| `wrong_evidence` | the only runs on the head are `workflow_dispatch` / `push` | no |
+| `retargeted` | base admitted now, `base_ref_changed` fired, no run since, and the workflow lacks `edited` | no |
+| `paths_excluded` | every changed file is filtered out. **Two signs:** protected → the check stays *Pending forever* and blocks; unprotected → an intended skip | no |
+| `base_excluded` | `branches:` / `branches-ignore:` does not admit this base | no |
+| `event_excluded` | the workflow declares no event that can report on a pull request | no |
+| `unknown` | the `on:` block was refused, or the diff could not be read | fix the instrument first |
+
+Only one row is helped by waiting. That is the entire product: the 2 h 48 m was
+spent on a state that was never going to change.
+
+### Non-obvious things it had to get right
+
+- **Never key on a run's `pull_requests[]`.** The one genuine `pull_request` run
+  on #120 came back with `pull_requests: []`. A detector filtering on that array
+  reports *no run* for a pull request whose run exists — the checked-in capture
+  in `tests/fixtures/triggers/` is that exact response. Key on `head_sha` +
+  `event`, nothing else.
+- **A `workflow_dispatch` run is never evidence.** It checks out the branch tip,
+  not `refs/pull/N/merge`, so under a strict policy it is the wrong proof even
+  where GitHub accepts it — and Shipyard's own cloud backend *is* a dispatch
+  source on some repositories, so its own runs must not be read as the gate. The
+  remedy for absence is a **push** (`synchronize`); the remedy for a red run is a
+  **rerun**. They are not interchangeable.
+- **The tool prints the empty-commit command; it never runs it.** An empty commit
+  is a dispatch by another name. Contract `[default] #4`.
+- **Run evidence outranks every static clause.** A run that exists is a fact; a
+  filter verdict is a prediction that one would be created. Classifying `--pr N`
+  from a checkout on another branch gives the wrong diff entirely, so the runs
+  are consulted first and the checkout mismatch is printed.
+- **A run exists is not the same as a run was requested.** `ship-state`'s
+  `runs=1` on #120 counted a Shipyard-internal attempt; the workflow-runs API,
+  filtered to the head SHA and, as a control, to the branch across all events,
+  returned exactly **one** run ever — created 2 h 48 m after the pull request
+  opened.
+- **`--base` that is not the configured base branch refuses before any side
+  effect**, unless `--stacked` is passed; either way the verdict is printed at
+  open time, because the author needs to know that the gate fires only after a
+  retarget **and** a push.
+
+### Where the `on:` reader refuses, and why the list is long on purpose
+
+`workflow.rs` over-approximates: for a *scheduling* question a missed lane is
+the dangerous error. `trigger.rs` has the **opposite** safety direction — a
+mis-read filter that *admits* is a false pass, which is the failure this whole
+thing exists to end. So it is **exact, or `Unknown`. Never a partial filter
+list.** It refuses on `${{` inside the `on:` block, YAML anchors/aliases, tabs,
+duplicate keys, multi-document files, unknown activity types, a pattern outside
+GitHub's documented subset (`^`/`$` are the tell of a regex), `branches` **and**
+`branches-ignore` together, a negated `-ignore` pattern, and a `paths` filter
+against a diff over GitHub's 300-file evaluation limit.
+
+Two traps worth stating because both cost time:
+
+- **`?` is a quantifier on the PRECEDING character**, not a single-character
+  wildcard. GitHub's own example is `config?.json` matching `config.json` and
+  `confi.json`. Implementing it as a traditional glob would admit
+  `config1.json`, which GitHub excludes.
+- **A `---` is a document separator only at column 0.** Pulp's
+  `release-cli.yml` carries a markdown horizontal rule inside a release-body
+  block scalar; trimming before that test made the reader refuse the file
+  outright. The **whole-directory control** — `parsed + refused` compared
+  against a listing of `.github/workflows/`, printed on every run — is what made
+  that visible instead of silent. It reads 77 / 77 on Pulp.

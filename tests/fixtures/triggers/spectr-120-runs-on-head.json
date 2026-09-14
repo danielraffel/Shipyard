@@ -1,0 +1,17 @@
+{
+  "total_count": 1,
+  "workflow_runs": [
+    {
+      "id": 34803741815,
+      "name": "Spectr M5 Product Acceptance",
+      "head_branch": "fix/help-overlay-about-and-copy",
+      "head_sha": "d8f07bcb30b12175b82b4c5b47b34354da0872bd",
+      "path": ".github/workflows/m5-product-acceptance.yml",
+      "event": "pull_request",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-09-14T03:46:32Z",
+      "pull_requests": []
+    }
+  ]
+}

@@ -3067,6 +3067,8 @@ not own.
 | module | owns |
 |---|---|
 | `workflow.rs` | a deliberately small reader for `jobs:` — id, `name`, `needs`, `runs-on`, and every `vars.*` reference. **Not a YAML parser and must not become one.** |
+| `trigger.rs` | the `on:` reader. A **sibling** of `workflow.rs`, not an extension, because its safety direction is the opposite one (below). |
+| `reach.rs` | links (1)-(3) and (5): will the required context ever be *requested*? Eight verdicts, exit 8. |
 | `assess.rs` | required context → producing jobs → transitive `needs` closure → one lane verdict per job |
 | `attestation.rs` | reads the tartci-written host attestation; decides whether a record is evidence |
 | `gather.rs` | the four API calls and the 300 s cache |
@@ -3074,6 +3076,32 @@ not own.
 
 ### Things that will bite a future change
 
+- **`trigger.rs` and `workflow.rs` err in OPPOSITE directions, deliberately.**
+  The jobs reader over-approximates: for a *scheduling* question a missed lane
+  is the dangerous error, so more jobs are pulled into a closure than strictly
+  run. The `on:` reader must never do that — a mis-read filter that *admits* a
+  pull request the real filter excludes is a false pass, and a false pass there
+  is the exact failure the module exists to end. It is **exact, or `Unknown`.
+  Never a partial filter list.** If you find yourself adding a "best effort"
+  path to `trigger.rs`, you are writing the bug.
+- **Job-level `if:` is not evaluated, and must not be.** A job skipped by `if:`
+  reports **Success** to branch protection; a workflow skipped by a `branches`
+  or `paths` filter leaves the required check *Pending forever*. Only the second
+  is an absence risk. Evaluating `if:` needs the whole expression language and
+  the run context and buys nothing.
+- **Run evidence is consulted before every static clause.** A run that exists is
+  a fact; a filter verdict is a prediction that one would be created. This
+  matters concretely: `landability --pr N` from a checkout on another branch
+  produces a diff that is not the pull request's, so a path-filter verdict there
+  is about the checkout. The mismatch is printed.
+- **`[merge] require_platforms` x `[targets.*].workflow` is a THIRD context
+  source, and it is narrow on purpose.** It exists for a repository where
+  neither branch protection nor `[governance] required_status_checks` names
+  anything — spectr, whose `main` is unprotected, is the case. A single-job
+  workflow yields that job's rendered name; a multi-job workflow is narrowed to
+  jobs matching the platform or target and yields nothing otherwise. An earlier
+  version enumerated every job name in the file, which on Pulp's `build.yml`
+  produced a dozen confident claims about requirements nobody declared.
 - **`fold_attestation` refines only `Idle`.** Every other verdict was already
   decided by the census. Widening it would make a census result depend on a host
   file, which is the wrong direction.
@@ -3102,3 +3130,23 @@ captured from the 2026-09-13 incident, and each sits beside a control that must
 tests fail: breaking the `needs` walk, the org-scope census, the staleness
 check, the attestation fold, or the unread-variable guard each fails a specific
 test while `e1_control_hosted_routing_does_not_block` keeps passing.
+
+The trigger half follows the same rule in `src/landability/{trigger,reach}/tests.rs`,
+against captures rather than invented YAML: the `on:` blocks of the five Pulp
+workflows that produce its five required contexts, spectr's single gate, and the
+runs-on-head response for the pull request that motivated the work — which
+carries `pull_requests: []` on a genuine `pull_request` run, and is checked in
+precisely so nobody keys a detector on that array again. Each failing fixture
+sits beside a control that must flip: the same gate on its admitted base, the
+same diff with a source file in it, the same head with the real run present.
+
+Two reader traps that cost time:
+
+- **`?` is a quantifier on the PRECEDING character.** GitHub's example is
+  `config?.json` matching `config.json` and `confi.json`. The traditional glob
+  reading admits `config1.json`, which GitHub excludes.
+- **`---` is a document separator only at column 0.** An indented one is content
+  — Pulp's `release-cli.yml` has a markdown rule inside a release-body block
+  scalar. The whole-directory control (`parsed + refused` against a listing of
+  `.github/workflows/`, printed every run) is what surfaced that; without it the
+  file was silently unchecked.

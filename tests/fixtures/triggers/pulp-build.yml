@@ -1,0 +1,67 @@
+on:
+  pull_request:
+    branches: [main, 'develop/**']
+  # Publish the Linux/Windows ccache + FetchContent caches that PR runs restore
+  # from. Only a non-PR run on the default branch may write to GitHub's cloud
+  # cache — a PR-run cache entry is scoped to the PR's own ref and is invisible
+  # to every other PR — so without this trigger the `Save …` steps below are
+  # unreachable and the restore steps are a permanent miss. A push run drops the
+  # macOS leg (see resolve-provider) and skips the reporting aliases: it exists
+  # to warm caches, not to gate anything.
+  push:
+    branches: [main]
+  # Run the required macos/linux/windows alias gates on queued merge groups so
+  # a GitHub merge queue on `main` can land PRs. The `merge_group` event does
+  # not support `paths` filters, so it fires on every group; the classify job
+  # still diffs the merged tree against origin/main and skip-safe groups
+  # short-circuit as before.
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      runner_provider:
+        # Default is github-hosted: Namespace is drained and no
+        # PULP_NAMESPACE_BUILD_*_RUNS_ON_JSON repo variables are set, so
+        # resolve-provider fails fast on the `namespace` route. The
+        # option is retained only for a future re-enable.
+        description: "Runner provider for Linux/Windows build legs (Namespace is drained — keep github-hosted)"
+        required: false
+        default: github-hosted
+        type: choice
+        options:
+          - github-hosted
+          - namespace
+      linux_runner_selector_json:
+        description: "Optional JSON string/array for Linux runs-on when routing through Namespace"
+        required: false
+        default: ""
+        type: string
+      windows_runner_selector_json:
+        description: "Optional JSON string/array for Windows runs-on when routing through Namespace"
+        required: false
+        default: ""
+        type: string
+      macos_runner_selector_json:
+        description: "Optional JSON string/array for macOS runs-on when routing through Namespace; omit to keep macOS local-only"
+        required: false
+        default: ""
+        type: string
+      local_proof:
+        description: "Run only the bounded protected-main Pulp repository-isolation proof"
+        required: false
+        default: false
+        type: boolean
+      run_windows:
+        description: "Include the hosted Windows leg; disable for a trusted Linux-only Mac Pro dispatch"
+        required: false
+        default: true
+        type: boolean
+
+# Cancel superseded runs when a new commit lands on the same PR.
+# Stops stale build matrix runs (20-30 min each) from eating runner
+# capacity when a PR accumulates fixup commits. workflow_dispatch
+# runs share the same group so a manual retrigger cancels any
+# auto-triggered run in flight.
+#
+# Push runs on main are exempt: they all share the `refs/heads/main` group, so
+# cancel-in-progress would let a rapid second merge kill the first run's
+# cache-save step and leave the cache stale exactly when main is busiest.

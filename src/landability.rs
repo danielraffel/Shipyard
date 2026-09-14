@@ -78,12 +78,15 @@ pub mod assess;
 pub mod attestation;
 pub mod gate;
 pub mod gather;
+pub mod reach;
+pub mod trigger;
 pub mod workflow;
 
 pub use assess::{AssessInput, assess};
 pub use attestation::{AttestationSet, HostAttestation, LaneCoverage};
 pub use gate::{GateOptions, GateOutcome};
 pub use gather::{FleetFacts, gather};
+pub use trigger::{Admit, EventFilter, TriggerUnknown, Triggers, parse_workflow_triggers};
 pub use workflow::{RunsOnResolution, WorkflowJob, parse_workflow_jobs, resolve_runs_on_expr};
 
 /// Exit code used when a required context cannot be scheduled onto any runner.
@@ -92,6 +95,18 @@ pub use workflow::{RunsOnResolution, WorkflowJob, parse_workflow_jobs, resolve_r
 /// host-health and fleet-epoch codes, because the remedy is different: nothing
 /// about this host is wrong, and waiting will not fix it.
 pub const EXIT_LANE_UNSERVED: u8 = 7;
+
+/// Exit code used when a required context will never be **requested**.
+///
+/// Deliberately distinct from [`EXIT_LANE_UNSERVED`]: the remedies are
+/// disjoint. A 7 is fixed on the fleet by an operator with SSH access; an 8 is
+/// fixed on the pull request or the workflow file by its author, immediately.
+/// Automation that branched on one code for both would send every trigger
+/// fault to the fleet owner, and `--allow-unserved-lane` — which exists so a
+/// human who just restored a runner can ship before the census catches up —
+/// must not be able to wave through a pull request whose gate will never be
+/// asked for.
+pub const EXIT_TRIGGER_UNREACHABLE: u8 = 8;
 
 /// How stale a host attestation may be before it stops counting as evidence.
 ///
@@ -209,6 +224,14 @@ pub struct LandabilityReport {
     pub fresh_attesters: Vec<String>,
     /// Instrument problems worth printing even when nothing blocks.
     pub warnings: Vec<String>,
+    /// Per-context trigger reachability: links (1)-(3) of the chain.
+    ///
+    /// Carried on the same report, and rendered before the lane blocks,
+    /// because an operator wants one answer to "which link is broken, and
+    /// whose fix is it". Two tools that each knew half would reproduce the
+    /// exact failure both incidents share: a green half-answer read as a
+    /// whole one.
+    pub reachability: Vec<reach::ContextReachability>,
 }
 
 impl LandabilityReport {

@@ -26,8 +26,12 @@ pub(super) struct PrCommandArgs {
     pub(super) allow_fleet_epoch_drift: bool,
     /// Runner labels whose unserved verdict the operator waived.
     pub(super) allow_unserved_lanes: Vec<String>,
+    /// Workflow paths whose trigger fault the operator waived.
+    pub(super) allow_unreachable_triggers: Vec<String>,
     /// Skip the landability gate for this invocation.
     pub(super) skip_landability: bool,
+    /// The author intends a stacked pull request against a non-default base.
+    pub(super) stacked: bool,
     pub(super) skip_targets: Vec<String>,
     pub(super) skip_bump: Vec<String>,
     pub(super) bump_reason: Option<String>,
@@ -66,6 +70,140 @@ fn normalize_base(input: &str) -> &str {
     input.strip_prefix("origin/").unwrap_or(input)
 }
 
+/// Refuse a pull request opened against a base the configured base branch is
+/// not, unless the author says they meant it.
+///
+/// The cheapest detector in this design, and on its own it catches the shape
+/// of the 2026-09-14 incident **at open time**: the base is an argument, the
+/// workflow is in the checkout, and nothing about the question needs the pull
+/// request to exist. Every input is local, so this costs zero API calls.
+///
+/// With `--stacked` it still prints the verdict, because the author needs to
+/// know at open time that the gate fires only after a retarget **and** a push
+/// — not after the retarget alone.
+fn stacked_base_guard<W: Write>(
+    args: &PrCommandArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let configured = crate::landability::gate::resolve_base(config);
+    if args.base == configured {
+        return Ok(());
+    }
+
+    let contexts = shipyard_and_config_contexts(config, cwd, &args.base);
+    let verdict = describe_stacked_base(config, cwd, &args.base, &configured, &contexts);
+    writeln!(stdout, "{verdict}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+
+    if args.stacked {
+        return Ok(());
+    }
+    Err(CliFailure::new(
+        crate::landability::EXIT_TRIGGER_UNREACHABLE,
+        format!(
+            "--base `{}` is not the configured base branch `{configured}`. No pull request was \
+             created. Pass --stacked if you intend a stacked pull request that stays unchecked \
+             until its parent lands; the verdict above says what its gate will do.",
+            args.base
+        ),
+    ))
+}
+
+/// Required contexts from config alone, for the open-time verdict.
+fn shipyard_and_config_contexts(
+    config: &LoadedConfig,
+    cwd: &Path,
+    base: &str,
+) -> Vec<crate::landability::reach::RequiredContext> {
+    let mut out: Vec<crate::landability::reach::RequiredContext> = Vec::new();
+    let mut push = |name: String, source: &str| {
+        if out.iter().any(|entry| entry.name == name) {
+            return;
+        }
+        out.push(crate::landability::reach::RequiredContext {
+            name,
+            // Nothing was read from GitHub here; protection is unknown, and
+            // `protection_readable: false` below keeps that from being
+            // rendered as an R0 finding.
+            protected: true,
+            shipyard_source: Some(source.to_owned()),
+        });
+    };
+    for context in crate::landability::gate::configured_contexts(config) {
+        push(context, "[governance] required_status_checks");
+    }
+    for (context, _) in crate::landability::gate::shipyard_required_contexts(config, cwd, base) {
+        push(context, "[merge] require_platforms");
+    }
+    out
+}
+
+/// Render what each required context's trigger will do on this base.
+fn describe_stacked_base(
+    config: &LoadedConfig,
+    cwd: &Path,
+    base: &str,
+    configured: &str,
+    contexts: &[crate::landability::reach::RequiredContext],
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = format!(
+        "▸ stacked base: --base `{base}` is not the configured base branch `{configured}`\n"
+    );
+    if contexts.is_empty() {
+        out.push_str(
+            "    no required contexts are configured, so nothing can be said about what will \
+             run — which is not the same as nothing being wrong\n",
+        );
+        return out;
+    }
+
+    let mut warnings = Vec::new();
+    let mut extra: Vec<String> =
+        crate::landability::gate::shipyard_required_contexts(config, cwd, base)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+    extra.sort_unstable();
+    extra.dedup();
+    let workflows = crate::landability::gate::read_workflows_under_test_public(
+        config,
+        cwd,
+        base,
+        &extra,
+        &mut warnings,
+    );
+    let changed = crate::landability::gate::changed_paths(cwd, base).unwrap_or_default();
+    let input = crate::landability::reach::ReachInput {
+        contexts,
+        workflows: &workflows,
+        base,
+        changed_paths: &changed,
+        // No protection read happened, so R0 must not be inferred.
+        protection_readable: false,
+        evidence: None,
+        allow_unreachable: &[],
+    };
+    for assessment in crate::landability::reach::assess_reachability(&input) {
+        let _ = writeln!(
+            out,
+            "    [{}] {} <- {}",
+            assessment.verdict.as_str(),
+            assessment.context,
+            assessment.workflow.as_deref().unwrap_or("(no producer)")
+        );
+        if let Some(clause) = &assessment.clause {
+            let _ = writeln!(out, "        {clause}");
+        }
+        for remedy in &assessment.remedies {
+            let _ = writeln!(out, "        - {remedy}");
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn pr_command<W: Write>(
     mut args: PrCommandArgs,
@@ -79,6 +217,9 @@ pub(super) fn pr_command<W: Write>(
     // slice points INTO args.base; introduce a temporary to decouple.
     let normalized = normalize_base(&args.base).to_owned();
     args.base = normalized;
+
+    // Before ANY side effect — no trailer, no bump, no push, no pull request.
+    stacked_base_guard(&args, config, cwd, stdout)?;
 
     if !args.skip_bump.is_empty() && args.bump_reason.is_none() {
         return Err(CliFailure::new(
@@ -152,6 +293,7 @@ pub(super) fn pr_command<W: Write>(
             allow_unreachable_targets: args.allow_unreachable_targets,
             allow_fleet_epoch_drift: args.allow_fleet_epoch_drift,
             allow_unserved_lanes: args.allow_unserved_lanes.clone(),
+            allow_unreachable_triggers: args.allow_unreachable_triggers.clone(),
             skip_landability: args.skip_landability,
             skip_targets: args.skip_targets,
             adopt_head: args.adopt_head,
@@ -568,6 +710,7 @@ mod tests {
     use std::fs;
 
     use crate::config::{LoadedConfig, LocalOverlaySource};
+    use crate::identity::RuntimeMode;
 
     use super::*;
 
@@ -592,7 +735,9 @@ mod tests {
             allow_unreachable_targets: false,
             allow_fleet_epoch_drift: false,
             allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
             skip_landability: false,
+            stacked: false,
             skip_targets: Vec::new(),
             skip_bump: Vec::new(),
             bump_reason: None,
@@ -794,6 +939,152 @@ mod tests {
         .expect("untrusted branch config");
 
         assert!(!protected_base_auto_handoff(&repo, "main"));
+    }
+
+    /// Build a repository whose gate admits only `main`, with the real spectr
+    /// `on:` block and a job whose rendered name is the required context.
+    #[cfg(unix)]
+    fn repo_with_main_only_gate(temp: &Path) -> PathBuf {
+        let remote = temp.join("remote.git");
+        let repo = temp.join("repo");
+        git(temp, &["init", "--bare", remote.to_str().unwrap()]);
+        fs::create_dir_all(repo.join(".github/workflows")).expect("workflow dir");
+        fs::create_dir_all(repo.join(".shipyard")).expect("config dir");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(&repo, &["config", "user.name", "test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(
+            repo.join(".github/workflows/gate.yml"),
+            "on:\n  pull_request:\n    branches: [main]\n\njobs:\n  gate:\n    name: The \
+             Gate\n    runs-on: ubuntu-latest\n",
+        )
+        .expect("workflow");
+        fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[ship]\nbase_branch = \"main\"\n\n[governance]\nrequired_status_checks = \
+             [\"The Gate\"]\n\n[landability]\nworkflows = [\".github/workflows/gate.yml\"]\n",
+        )
+        .expect("config");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(&repo, &["checkout", "-b", "feature/child"]);
+        repo
+    }
+
+    #[cfg(unix)]
+    fn config_at(repo: &Path) -> LoadedConfig {
+        LoadedConfig::load_from_cwd(RuntimeMode::Isolated, repo).expect("config loads")
+    }
+
+    /// T9 — the stacked-base guard. The cheapest detector in the design: the
+    /// base is an argument and the workflow is in the checkout, so this
+    /// catches the 2026-09-14 shape at open time with zero API calls and
+    /// before any side effect.
+    #[cfg(unix)]
+    #[test]
+    fn t9_a_non_default_base_refuses_with_exit_8_and_creates_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = repo_with_main_only_gate(temp.path());
+        let config = config_at(&repo);
+        let args = PrCommandArgs {
+            base: String::from("feature/parent"),
+            ..pr_args()
+        };
+        let mut out = Vec::new();
+
+        let failure = stacked_base_guard(&args, &config, &repo, &mut out)
+            .expect_err("a non-default base must refuse");
+
+        assert_eq!(
+            failure.code,
+            crate::landability::EXIT_TRIGGER_UNREACHABLE,
+            "exit 8, not 7: the remedy is on the pull request, not the fleet"
+        );
+        assert!(
+            failure.message.contains("No pull request was created"),
+            "{}",
+            failure.message
+        );
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(printed.contains("base_excluded"), "{printed}");
+        assert!(printed.contains("branches: [main]"), "{printed}");
+    }
+
+    /// The control. Same instrument, same repository, the configured base.
+    #[cfg(unix)]
+    #[test]
+    fn t9_control_the_configured_base_passes_the_guard_silently() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = repo_with_main_only_gate(temp.path());
+        let config = config_at(&repo);
+        let args = PrCommandArgs {
+            base: String::from("main"),
+            ..pr_args()
+        };
+        let mut out = Vec::new();
+
+        stacked_base_guard(&args, &config, &repo, &mut out).expect("the control must pass");
+
+        assert!(
+            out.is_empty(),
+            "the guard must say nothing on the configured base: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// `--stacked` prints the same verdict and proceeds — the author needs to
+    /// know at open time that the gate fires only after a retarget AND a push.
+    #[cfg(unix)]
+    #[test]
+    fn t9_stacked_proceeds_but_still_prints_the_verdict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = repo_with_main_only_gate(temp.path());
+        let config = config_at(&repo);
+        let args = PrCommandArgs {
+            base: String::from("feature/parent"),
+            stacked: true,
+            ..pr_args()
+        };
+        let mut out = Vec::new();
+
+        stacked_base_guard(&args, &config, &repo, &mut out).expect("--stacked proceeds");
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(printed.contains("base_excluded"), "{printed}");
+        assert!(
+            printed.contains("edited"),
+            "the permanent fix must be named: {printed}"
+        );
+    }
+
+    /// The break line for T9: comparing against a literal instead of the
+    /// configured base branch. With this, a repository whose base is not
+    /// `main` stops being guarded at all.
+    #[cfg(unix)]
+    #[test]
+    fn t9_the_guard_reads_the_configured_base_not_a_literal_main() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = repo_with_main_only_gate(temp.path());
+        fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[ship]\nbase_branch = \"release\"\n",
+        )
+        .expect("config");
+        let config = config_at(&repo);
+        let args = PrCommandArgs {
+            base: String::from("main"),
+            ..pr_args()
+        };
+        let mut out = Vec::new();
+
+        let failure = stacked_base_guard(&args, &config, &repo, &mut out)
+            .expect_err("`main` is NOT the configured base here, so it must refuse");
+        assert_eq!(failure.code, crate::landability::EXIT_TRIGGER_UNREACHABLE);
     }
 
     #[cfg(unix)]
