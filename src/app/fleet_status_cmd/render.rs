@@ -166,6 +166,9 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<
                 writeln!(stdout, "    storage: {problem}").map_err(text_write_failure)?;
             }
         }
+        for problem in &host.attestation_problems {
+            writeln!(stdout, "    attestation: {problem}").map_err(text_write_failure)?;
+        }
     }
     writeln!(
         stdout,
@@ -319,6 +322,14 @@ fn host_to_json(host: &HostFleetStatus) -> Value {
     m.insert(
         "storage_problems".to_owned(),
         Value::from(host.storage_problems.clone()),
+    );
+    m.insert(
+        "attestation".to_owned(),
+        serde_json::to_value(&host.attestation).expect("attestation probe serializes"),
+    );
+    m.insert(
+        "attestation_problems".to_owned(),
+        Value::from(host.attestation_problems.clone()),
     );
     m.insert(
         "github_runner_count".to_owned(),
