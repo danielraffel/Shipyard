@@ -16,6 +16,18 @@ from pathlib import Path
 
 WRAPPER = Path(__file__).with_name("ghapp")
 
+# The macOS Xcode license shim, reproduced exactly. Executable, present, and it
+# exits 69 without running anything -- the state /usr/bin/python3 and
+# /usr/bin/git were in on m3 on 2026-09-15 for seven hours. The first line is
+# the cause; a wrapper's own summary lands after it, which is why a tail-only
+# capture keeps the wrong half.
+XCODE_LICENSE_SHIM = (
+    "#!/bin/sh\n"
+    "echo 'You have not agreed to the Xcode license agreements. You must agree"
+    " to both license agreements below in order to use Xcode.' >&2\n"
+    "exit 69\n"
+)
+
 
 class GhappWrapperTests(unittest.TestCase):
     def test_privileged_grammar_matches_verified_fleet_native_help(self) -> None:
@@ -2009,6 +2021,140 @@ class GhappWrapperTests(unittest.TestCase):
                 result = self.run_wrapper(*command)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.guard_log.read_text().strip(), " ".join(command))
+
+
+    def test_dead_python_override_fails_loudly_and_prints_the_cause(self) -> None:
+        """End-to-end: the shipped wrapper, with a dead interpreter pinned."""
+        shim = self.root / "dead-python3"
+        shim.write_text(XCODE_LICENSE_SHIM, encoding="utf-8")
+        shim.chmod(0o755)
+        self.environment["SHIPYARD_GHAPP_PYTHON_BINARY"] = str(shim)
+
+        result = self.run_wrapper("api", "rate_limit", "--repo", "owner/repo")
+
+        self.assertNotEqual(result.returncode, 0)
+        # The cause, not merely the wrapper's own conclusion about its input.
+        self.assertIn(
+            "You have not agreed to the Xcode license agreements", result.stderr
+        )
+        self.assertIn(str(shim), result.stderr)
+        self.assertIn("does not run", result.stderr)
+
+    def test_dead_git_override_fails_loudly_and_prints_the_cause(self) -> None:
+        shim = self.root / "dead-git"
+        shim.write_text(XCODE_LICENSE_SHIM, encoding="utf-8")
+        shim.chmod(0o755)
+        self.environment["SHIPYARD_GHAPP_GIT_BINARY"] = str(shim)
+
+        result = self.run_wrapper("api", "rate_limit", "--repo", "owner/repo")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "You have not agreed to the Xcode license agreements", result.stderr
+        )
+        self.assertIn(str(shim), result.stderr)
+
+class GhappInterpreterHealthTests(unittest.TestCase):
+    """An interpreter is acceptable only if it RUNS, not if it is executable."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def write_stub(self, name: str, body: str) -> Path:
+        path = self.root / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def probe_block(self) -> str:
+        """The selection helpers as they appear in the wrapper, not a copy.
+
+        A reimplementation here would pass while the shipped wrapper regressed,
+        which is the class of test this whole change exists to stop writing.
+        """
+        wrapper = WRAPPER.read_text(encoding="utf-8")
+        start = wrapper.index("shipyard_rejected_candidates=()")
+        end = wrapper.index('python_binary="${SHIPYARD_GHAPP_PYTHON_BINARY:-}"')
+        block = wrapper[start:end]
+        self.assertIn("shipyard_probe_binary() {", block)
+        return block
+
+    def run_probe(self, candidate: Path, *probe_argv: str) -> subprocess.CompletedProcess[str]:
+        script = (
+            "set -uo pipefail\n"
+            + self.probe_block()
+            + '\nif shipyard_probe_binary python "$1" "${@:2}"; then\n'
+            '    echo ACCEPTED\n'
+            "else\n"
+            '    echo REJECTED\n'
+            "    shipyard_print_rejected_candidates\n"
+            "fi\n"
+        )
+        return subprocess.run(
+            ["/bin/bash", "-c", script, "probe", str(candidate), *probe_argv],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_executable_but_dead_interpreter_is_rejected_with_its_own_stderr(self) -> None:
+        shim = self.write_stub("python3", XCODE_LICENSE_SHIM)
+        self.assertTrue(os.access(shim, os.X_OK), "control: the shim must pass -x")
+
+        result = self.run_probe(shim, "-I", "-c", "import sys")
+
+        self.assertIn("REJECTED", result.stdout)
+        self.assertIn("You have not agreed to the Xcode license agreements", result.stderr)
+        self.assertIn(str(shim), result.stderr)
+        self.assertIn("exit 69", result.stderr)
+
+    def test_a_working_interpreter_is_accepted_and_records_nothing(self) -> None:
+        result = self.run_probe(Path(sys.executable), "-I", "-c", "import sys")
+
+        self.assertIn("ACCEPTED", result.stdout)
+        self.assertNotIn("does not run", result.stderr)
+
+    def test_dead_git_is_rejected_by_the_same_probe(self) -> None:
+        shim = self.write_stub("git", XCODE_LICENSE_SHIM)
+
+        result = self.run_probe(shim, "--version")
+
+        self.assertIn("REJECTED", result.stdout)
+        self.assertIn("You have not agreed to the Xcode license agreements", result.stderr)
+
+    def test_candidate_order_prefers_a_homebrew_build_over_the_xcode_shim(self) -> None:
+        wrapper = WRAPPER.read_text(encoding="utf-8")
+        for kind, expected in (
+            ("python3", "/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3"),
+            ("git", "/opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git"),
+        ):
+            with self.subTest(kind=kind):
+                needle = f"for candidate in {expected}; do"
+                self.assertTrue(
+                    needle in wrapper,
+                    f"ghapp no longer selects {kind} in the order {expected!r}",
+                )
+
+    def test_no_candidate_is_accepted_on_an_executability_test_alone(self) -> None:
+        """`-x` may screen an absent path; it may never be the acceptance test."""
+        wrapper = WRAPPER.read_text(encoding="utf-8")
+        start = wrapper.index("shipyard_rejected_candidates=()")
+        end = wrapper.index("git_binary=")
+        selection = wrapper[start:end]
+        for loop in re.finditer(r"for candidate in [^\n]+\n(.*?)\n    done", selection, re.S):
+            body = loop.group(1)
+            self.assertTrue(
+                "shipyard_probe_binary" in body,
+                "a candidate loop accepts without an execution probe",
+            )
+            self.assertFalse(
+                '-x "$candidate"' in body,
+                "a candidate loop accepts on an -x test alone",
+            )
 
 
 if __name__ == "__main__":

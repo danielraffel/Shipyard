@@ -232,19 +232,114 @@ if [[ "$helper" != /* || ! -f "$helper" || ! -x "$helper" ]]; then
     exit 1
 fi
 
+# Interpreter and git selection: accept a binary only if it RUNS.
+#
+# An `-x` test asks whether a path is executable, which is not the question. On
+# macOS /usr/bin/python3 and /usr/bin/git are Xcode license shims: executable,
+# present, and after an unattended Xcode update they exit 69 without running
+# anything, printing "You have not agreed to the Xcode license agreements." to a
+# stderr nobody captured. Selecting by `-x` yields an ABSOLUTE path, so no PATH
+# edit can route around the dead one -- which is why the first remedy tried
+# during the 2026-09-15 fleet outage changed nothing. Probe by executing, order
+# the candidates so a working Homebrew build wins, and say what a rejected
+# candidate said before falling through to the next one.
+shipyard_rejected_candidates=()
+
+# Record a rejected candidate verbatim. Kept whole rather than tail-truncated:
+# a wrapped tool prints its underlying cause BEFORE its own summary, so keeping
+# the tail keeps the summary and drops the fault.
+shipyard_note_rejected_candidate() {
+    local kind="$1" candidate="$2" rc="$3" probe_err="$4" line
+    local record="ghapp: ${kind} candidate ${candidate} is present but does not run (exit ${rc})"
+    if [[ -n "$probe_err" ]]; then
+        while IFS= read -r line; do
+            [[ -n "${line//[[:space:]]/}" ]] || continue
+            record+=$'\n'"ghapp:     ${line}"
+        done <<< "$probe_err"
+    else
+        record+=$'\n'"ghapp:     (candidate printed nothing on stderr)"
+    fi
+    shipyard_rejected_candidates+=("$record")
+}
+
+shipyard_print_rejected_candidates() {
+    local record
+    for record in ${shipyard_rejected_candidates+"${shipyard_rejected_candidates[@]}"}; do
+        printf '%s\n' "$record" >&2
+    done
+}
+
+# Exit 0 when "$@" runs. On failure the candidate's own stderr is recorded.
+shipyard_probe_binary() {
+    local kind="$1" candidate="$2"
+    shift 2
+    local probe_err probe_rc
+    if [[ "$candidate" != /* || ! -x "$candidate" ]]; then
+        return 1
+    fi
+    probe_err="$("$candidate" "$@" 2>&1 >/dev/null)" && probe_rc=0 || probe_rc=$?
+    if [[ "$probe_rc" == 0 ]]; then
+        return 0
+    fi
+    shipyard_note_rejected_candidate "$kind" "$candidate" "$probe_rc" "$probe_err"
+    return 1
+}
+
 python_binary="${SHIPYARD_GHAPP_PYTHON_BINARY:-}"
-if [[ -z "$python_binary" ]]; then
-    for candidate in /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
-        if [[ -x "$candidate" ]]; then
+if [[ -n "$python_binary" ]]; then
+    # An explicit override is authoritative: if it is dead, say so and stop.
+    # Silently falling back would hide the operator's own broken configuration.
+    if [[ "$python_binary" != /* ]]; then
+        echo "ghapp: set SHIPYARD_GHAPP_PYTHON_BINARY to an absolute Python 3 executable" >&2
+        exit 1
+    fi
+    if ! shipyard_probe_binary python "$python_binary" -I -c 'import sys'; then
+        shipyard_print_rejected_candidates
+        echo "ghapp: SHIPYARD_GHAPP_PYTHON_BINARY names a Python 3 that does not run" >&2
+        exit 1
+    fi
+else
+    for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+        if shipyard_probe_binary python "$candidate" -I -c 'import sys'; then
             python_binary="$candidate"
             break
         fi
     done
+    if [[ -z "$python_binary" ]]; then
+        shipyard_print_rejected_candidates
+        echo "ghapp: set SHIPYARD_GHAPP_PYTHON_BINARY to an absolute Python 3 executable" >&2
+        exit 1
+    fi
+    if [[ "${#shipyard_rejected_candidates[@]}" -gt 0 ]]; then
+        # A candidate that is present but dead is a latent host defect: the next
+        # tool that selects by `-x` -- and several LaunchAgents do -- picks it.
+        # Name it once, on stderr, without failing a call that can still work.
+        printf 'ghapp: warning: using %s; %s earlier candidate(s) are present but do not run (rerun with SHIPYARD_GHAPP_DIAGNOSE_INTERPRETER=1 for their output)\n' \
+            "$python_binary" "${#shipyard_rejected_candidates[@]}" >&2
+        if [[ -n "${SHIPYARD_GHAPP_DIAGNOSE_INTERPRETER:-}" ]]; then
+            shipyard_print_rejected_candidates
+        fi
+    fi
 fi
-if [[ -z "$python_binary" || "$python_binary" != /* || ! -x "$python_binary" ]]; then
-    echo "ghapp: set SHIPYARD_GHAPP_PYTHON_BINARY to an absolute Python 3 executable" >&2
-    exit 1
+
+git_binary="${SHIPYARD_GHAPP_GIT_BINARY:-}"
+if [[ -n "$git_binary" ]]; then
+    if [[ "$git_binary" != /* ]] || ! shipyard_probe_binary git "$git_binary" --version; then
+        shipyard_print_rejected_candidates
+        echo "ghapp: SHIPYARD_GHAPP_GIT_BINARY must name an absolute git that runs" >&2
+        exit 1
+    fi
+else
+    for candidate in /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git; do
+        if shipyard_probe_binary git "$candidate" --version; then
+            git_binary="$candidate"
+            break
+        fi
+    done
 fi
+# git is only needed to resolve repo context from a checkout; an explicit
+# --repo never reaches it. So a dead git is not fatal here -- it is fatal at
+# the point of use, where the message can say what was actually being done.
 
 mint_token_json() {
     if [[ -n "$cache_dir" ]]; then
@@ -315,7 +410,20 @@ api_url_for_host() {
     printf '%s' "https://api.github.com"
 }
 
+shipyard_require_git() {
+    # Called only on paths that genuinely need a checkout. A dead git must name
+    # itself here rather than degrade into "this is not a git checkout", which
+    # is the same silent-misattribution failure this probe exists to end.
+    if [[ -n "$git_binary" ]]; then
+        return 0
+    fi
+    shipyard_print_rejected_candidates
+    echo "ghapp: no working git found to resolve the repository from this checkout; pass --repo OWNER/REPO or set SHIPYARD_GHAPP_GIT_BINARY" >&2
+    exit 1
+}
+
 checkout_repo_target() {
+    shipyard_require_git
     local resolved_remote=""
     local remote_name=""
     local remote_url=""
@@ -326,11 +434,11 @@ checkout_repo_target() {
             remotes+=("$remote_name")
             remote_count=$((remote_count + 1))
         fi
-    done < <(PATH="$trusted_path" /usr/bin/git remote 2>/dev/null || true)
+    done < <(PATH="$trusted_path" "$git_binary" remote 2>/dev/null || true)
 
     if [[ "$remote_count" -gt 0 ]]; then
         for remote_name in "${remotes[@]}"; do
-            if [[ "$(PATH="$trusted_path" /usr/bin/git config --get "remote.$remote_name.gh-resolved" 2>/dev/null || true)" == "base" ]]; then
+            if [[ "$(PATH="$trusted_path" "$git_binary" config --get "remote.$remote_name.gh-resolved" 2>/dev/null || true)" == "base" ]]; then
                 if [[ -n "$resolved_remote" ]]; then
                     echo "ghapp: checkout has multiple gh default remotes; use --repo OWNER/REPO" >&2
                     exit 1
@@ -340,9 +448,9 @@ checkout_repo_target() {
         done
     fi
     if [[ -n "$resolved_remote" ]]; then
-        remote_url="$(PATH="$trusted_path" /usr/bin/git config --get "remote.$resolved_remote.url" 2>/dev/null || true)"
+        remote_url="$(PATH="$trusted_path" "$git_binary" config --get "remote.$resolved_remote.url" 2>/dev/null || true)"
     elif [[ "$remote_count" == 1 ]]; then
-        remote_url="$(PATH="$trusted_path" /usr/bin/git config --get "remote.${remotes[0]}.url" 2>/dev/null || true)"
+        remote_url="$(PATH="$trusted_path" "$git_binary" config --get "remote.${remotes[0]}.url" 2>/dev/null || true)"
     elif [[ "$remote_count" -gt 1 ]]; then
         echo "ghapp: checkout repository is ambiguous across remotes; use --repo OWNER/REPO or gh repo set-default" >&2
         exit 1
@@ -1010,8 +1118,9 @@ if [[ "${1:-}" == "release" && "${2:-}" == "upload" ]]; then
         if [[ -z "$release_upload_tag" || "$release_upload_tag" == -* || \
               "$release_upload_tag" == *$'\n'* || \
               "$release_upload_tag" == *$'\r'* || "$release_upload_tag" == *://* ]] || \
-           ! PATH="$trusted_path" /usr/bin/git check-ref-format \
-               "refs/tags/$release_upload_tag" >/dev/null 2>&1; then
+           { shipyard_require_git; \
+             ! PATH="$trusted_path" "$git_binary" check-ref-format \
+               "refs/tags/$release_upload_tag" >/dev/null 2>&1; }; then
             echo "ghapp: release upload tag is malformed or ambiguous" >&2
             exit 1
         fi
