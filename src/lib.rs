@@ -230,6 +230,8 @@ pub mod tree_drift;
 pub mod tunnel;
 /// Fail-closed policy primitives for contributor-controlled review requests.
 pub mod untrusted;
+/// Terminal-verdict consumption over durable ship-state records.
+pub mod verdicts;
 /// Pure truth evaluators for `shipyard wait`.
 pub mod wait;
 /// Transport orchestration and snapshot fetching for `shipyard wait`.

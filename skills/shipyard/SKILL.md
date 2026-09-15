@@ -585,6 +585,33 @@ Repositories that require signed bot commits should set
 helper path. Hook installation then regenerates the required secret-backed SSH
 signing step instead of relying on edits to the owned workflow.
 
+## Unconsumed terminal verdicts (`shipyard verdicts`)
+
+Shipyard records what every validation concluded. Nothing reads the record
+once the dispatching agent has finished its turn, and a finished-and-failed
+ship is not orphaned, so `ship-state list` never shows it.
+
+```sh
+shipyard verdicts            # 0 clean · 1 actionable · 5 partly blind
+shipyard verdicts --json
+```
+
+Two rules keep the output worth reading:
+
+- **A verdict is paired with the PR's disposition.** Only a non-passing
+  verdict on a still-open PR is actionable. Failures on merged PRs are
+  spent — on a live store they were 41 of 45 resolvable rows, and listing
+  them is how a diagnostic teaches people to ignore it.
+- **Lookups are batched per repository**, one `pr list` per repo rather
+  than one `pr view` per record. Reading durable state costs nothing; this
+  is not a poll, and it does not inherit `ship-state list`'s 25-lookup cap.
+
+The census printed on every run (`scanned/terminal/passed/failed/cancelled/
+resolved/unresolved/actionable`) is the instrument's own control. Rows the
+scan could not resolve are counted as `unresolved` and named; the command
+then refuses to print an all-clear and exits `5`. Absence of actionable
+work is only reported as good news when `unresolved` is zero.
+
 ## Local/SSH VM Watch
 
 Use `shipyard watch local` for long target-backed jobs that are not GitHub

@@ -26,6 +26,8 @@ use crate::native_executable::{resolve_native_executable_from_path, validate_nat
 const DEFAULT_REFRESH_SKEW_SECONDS: u64 = 60;
 const GH_TOKEN_ENV: &str = "GH_TOKEN";
 const PR_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Timeout for one batched repository-wide pull-request listing.
+const PR_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Auth-aware GitHub CLI command factory.
 #[derive(Clone)]
@@ -1151,6 +1153,62 @@ fn pr_merged_head_sha_with_options(
 /// One `gh pr view --json state,headRefOid` fetch, shared by every caller that
 /// needs the PR's current state. `snapshot_file` short-circuits the network for
 /// tests. Fails closed to `None`.
+/// Resolve every listed pull request in one repository with a single call.
+///
+/// `ship-state list` resolves one pull request per `gh pr view` and caps the
+/// loop at 25 to avoid a burst; this asks `gh pr list` once for the whole
+/// repository instead, so the cap and the burst both disappear. Returns
+/// `number -> state` exactly as GitHub reported it; callers decide what an
+/// absent entry means.
+///
+/// `None` means the call itself could not be made or parsed. That is
+/// deliberately distinct from an empty map, so a caller can tell "no such pull
+/// requests" from "I could not look".
+#[must_use]
+pub fn pr_states_batched(
+    client: Option<&GhClient>,
+    repo: &str,
+    cwd: &Path,
+    limit: u32,
+) -> Option<HashMap<u64, String>> {
+    let client = client?.clone().with_repo_override(repo).ok()?;
+    let mut cmd = client
+        .prepare_command_with_auth_timeout(
+            cwd,
+            None,
+            GhSupervision::Supervised,
+            GhAuthPolicy::Default,
+            PR_LIST_TIMEOUT,
+        )
+        .ok()?;
+    cmd.args([
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "all",
+        "--limit",
+        &limit.to_string(),
+        "--json",
+        "number,state",
+    ]);
+    let output = run_helper_with_timeout(&mut cmd, "gh", PR_LIST_TIMEOUT)
+        .ok()
+        .filter(|out| out.status.success())?;
+    let parsed = serde_json::from_slice::<Value>(&output.stdout).ok()?;
+    let entries = parsed.as_array()?;
+    let mut states = HashMap::new();
+    for entry in entries {
+        if let Some(number) = entry.get("number").and_then(Value::as_u64)
+            && let Some(state) = entry.get("state").and_then(Value::as_str)
+        {
+            states.insert(number, state.to_owned());
+        }
+    }
+    Some(states)
+}
+
 fn pr_view_state_json(
     client: Option<&GhClient>,
     repo: &str,

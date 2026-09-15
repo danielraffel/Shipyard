@@ -244,7 +244,7 @@ fn admission_observation_lock_child() {
     // The lock has to outlive the parent's contention assertions. The bound only exists so a
     // panicking parent cannot orphan the holder, so it is far longer than any progress the
     // parent makes here rather than a guess at how long that progress takes.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while !release.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
