@@ -602,9 +602,11 @@ Two rules keep the output worth reading:
   verdict on a still-open PR is actionable. Failures on merged PRs are
   spent — on a live store they were 41 of 45 resolvable rows, and listing
   them is how a diagnostic teaches people to ignore it.
-- **Lookups are batched per repository**, one `pr list` per repo rather
-  than one `pr view` per record. Reading durable state costs nothing; this
-  is not a poll, and it does not inherit `ship-state list`'s 25-lookup cap.
+- **Lookups are batched per repository**: one `gh pr list` per repo rather
+  than one `gh pr view` per record, so cost scales with the lookup window
+  (`--limit`, paginated at 100) and not with how many records are held.
+  Reading the durable records costs nothing; this is not a poll, and it
+  does not inherit `ship-state list`'s 25-lookup cap.
 
 The census printed on every run (`scanned/terminal/passed/failed/cancelled/
 resolved/unresolved/actionable`) is the instrument's own control. Rows the

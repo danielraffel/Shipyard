@@ -5,11 +5,12 @@
 //! finished its turn by the time the verdict lands. This command reads the
 //! records Shipyard already wrote and says which of them still need someone.
 //!
-//! Resolution is **batched per repository**: one `pr list` call covers every
-//! candidate in that repository. The per-record alternative is what
-//! `ship-state list` does, and its own source notes why that is a hazard —
-//! it caps lookups at 25 and leaves the remainder unresolved. One call per
-//! repository removes both the cap and the burst.
+//! Resolution is **batched per repository**: one `pr list` invocation covers
+//! every candidate in that repository, so lookup cost scales with the chosen
+//! window rather than with how many records the store holds. The per-record
+//! alternative is what `ship-state list` does, and its own source notes why
+//! that is a hazard — it caps lookups at 25 and leaves the remainder
+//! unresolved. Batching per repository removes both the cap and the burst.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -168,7 +169,10 @@ fn render<W: Write>(
         if let Some(extra) = unresolved.len().checked_sub(MAX_UNRESOLVED_ROWS_SHOWN)
             && extra > 0
         {
-            writeln!(stdout, "  … and {extra} more unresolved (see --json for all)")?;
+            writeln!(
+                stdout,
+                "  … and {extra} more unresolved (see --json for all)"
+            )?;
         }
     }
 

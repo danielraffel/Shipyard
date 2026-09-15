@@ -30,3 +30,6 @@ For each actionable row, decide from the verdict: `failed` is investigated,
 
 Use `--json` when another tool consumes the result; the envelope carries
 the full unresolved list and a `supports_all_clear` judgement.
+
+Lookups are batched per repository (`gh pr list`, paginated at 100), so a
+wider `--limit` costs more pages but never more calls per record.

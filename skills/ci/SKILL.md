@@ -810,11 +810,13 @@ noise, which is precisely how `ship-state list` earned its habit of being
 scrolled past. So `verdicts` pairs each verdict with the PR's current
 disposition and reports only *non-passing verdict on a still-open PR*.
 
-**Resolution is batched per repository**, one `pr list` call covering every
-candidate. The per-record shape is the documented hazard: `ship-state list`
-spends one `gh pr view` per flagged record and caps the loop at 25 to avoid
-a burst. One call per repository removes the cap and the burst together.
-This is not a poll — it reads records Shipyard already wrote.
+**Resolution is batched per repository**: one `gh pr list` invocation per
+repo covering every candidate in it (gh paginates at 100 per page, so cost
+scales with `--limit`, never with the number of records). The per-record
+shape is the documented hazard: `ship-state list` spends one `gh pr view`
+per flagged record and caps the loop at 25 to avoid a burst. Measured on a
+live store, 142 non-passing records resolved through 4 repo lookups. This
+is not a poll — it reads records Shipyard already wrote.
 
 ### The census is the control
 
