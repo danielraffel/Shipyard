@@ -963,6 +963,41 @@ If runners *do* advertise the labels and jobs still sit, that is starvation
 (scheduling or capacity), not routing — `shipyard rescue` below, not a variable
 edit. Background: `docs/runner-watchdog.md` § Fleet service assertions.
 
+## Zero runners fleet-wide: suspect the admission gate's own observation cost
+
+`runner admission-clean` is the gate TartCI calls immediately before registering
+a just-in-time runner, and it fails closed: any verdict other than a typed
+`admit` discards the already-booted VM. A gate that cannot *observe* therefore
+looks exactly like a fleet with no capacity — VMs mint, boot, are refused and are
+torn down, on every host at once, while the backlog that caused it keeps growing.
+
+The shape to watch for: **the gate's observation must never depend on a snapshot
+whose cost scales with the backlog it exists to drain.** A per-PR field attached
+to a whole-open-PR query is the classic instance. `statusCheckRollup` costs
+roughly 19 KB per pull request, so past roughly thirty open pull requests a
+single GraphQL call exceeds GitHub's budget and fails wholesale.
+
+Reading that failure correctly:
+
+- **The error is not stable.** Near the threshold GitHub returns HTTP 504 or a
+  truncated body (`unexpected end of JSON input`) roughly interchangeably. Never
+  key handling, a log line, or a test on the string `504`; classify by outcome
+  (could not observe). The verdict already does this — both land on `error` /
+  `observation_failed`.
+- **It is stochastic, so a single run proves nothing.** Sample at least six times
+  before calling such a query healthy or broken.
+- **`gh pr list --limit` is a total cap, not a page size.** Lowering it makes the
+  query pass because it returns fewer pull requests, not because it got cheaper
+  per row. A census that silently drops half its rows is a wrong answer, not a
+  fast one.
+- **A cheap pre-filter beats a cheaper census.** Every consumer of a pull
+  request's checks is gated behind the managed label, so the expensive per-head
+  work belongs behind that label rather than spread across every open PR.
+
+Because TartCI invokes `shipyard` by name from `PATH`, a gate fix ships by
+replacing that binary. No TartCI generation, supervisor restart or `pool off` is
+involved — each admission call is a fresh process.
+
 ## Rescuing wedged runners (`shipyard rescue`)
 
 Use this when a self-hosted runner has wedged — orphaned `Runner.Worker`

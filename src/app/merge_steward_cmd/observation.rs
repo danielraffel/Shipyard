@@ -58,7 +58,7 @@ pub(super) fn observe_repo(
     let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
         merge_queue_snapshot(actions, &repo, base)?;
     let mut prs = pull_requests(actions, &repo, base, &queue_positions)?;
-    hydrate_required_check_identities(actions, &repo, &required_checks, &mut prs)?;
+    hydrate_census_check_identities(actions, &repo, &required_checks, &mut prs)?;
     let mut runs = active_runs(actions, &repo)?;
     let capacity_preemption_policy = CapacityPreemptionPolicy::for_repository(&repo);
     let front_head = queue_positions
@@ -437,7 +437,13 @@ pub(super) fn pull_requests(
         "--limit".to_owned(),
         "1000".to_owned(),
         "--json".to_owned(),
-        "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
+        // `statusCheckRollup` is deliberately absent. It costs roughly 19 KB per
+        // pull request, so one request for every open PR exceeds GitHub's budget
+        // and fails wholesale exactly when the backlog is deepest -- which is
+        // when admission is needed most. Checks are reconstructed per head in
+        // `hydrate_required_check_identities`, for the only pull requests that
+        // can have them consulted.
+        "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels".to_owned(),
     ];
     let value = gh_json(actions, &args, "open PR list")?;
     let rows = value
@@ -460,8 +466,29 @@ pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<Ob
         .filter(|id| !id.is_empty())
         .ok_or_else(|| format!("PR #{number} missing node ID"))?
         .to_owned();
+    let labels = row
+        .get("labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|label| label.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let rollup = row.get("statusCheckRollup").and_then(Value::as_array);
-    let check_rollup_maybe_truncated = rollup.is_some_and(|checks| checks.len() == 100);
+    // A rollup that is present but at the page cap may be incomplete. A rollup
+    // that is absent entirely was never observed, which is not the same as a
+    // head with no checks -- so it must not be reported as a complete empty set.
+    // Only a managed pull request ever has its checks consulted: every consumer
+    // is gated behind the managed label, so marking just those reconstructs the
+    // full check set for them while leaving the rest free of a per-PR fetch.
+    let check_rollup_maybe_truncated = rollup.map_or_else(
+        || {
+            labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case(super::MANAGED_LABEL))
+        },
+        |checks| checks.len() == 100,
+    );
     let checks = rollup
         .into_iter()
         .flatten()
@@ -491,14 +518,7 @@ pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<Ob
                 .get("autoMergeRequest")
                 .is_some_and(|request| !request.is_null()),
             queue_position: positions.get(&number).copied(),
-            labels: row
-                .get("labels")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|label| label.get("name").and_then(Value::as_str))
-                .map(str::to_owned)
-                .collect(),
+            labels,
             checks,
         },
         check_rollup_maybe_truncated,
@@ -571,6 +591,31 @@ pub(super) fn hydrate_required_check_identities(
     hydrate_required_check_identities_with_deadline(actions, repo, required_checks, prs, None)
 }
 
+/// Hydrate check identity for a whole open-pull-request census.
+///
+/// Hydration costs one round trip per pull request, so over a census it scales
+/// with the backlog -- the same coupling that makes a global snapshot fail
+/// exactly when the queue is deepest. Only a managed pull request can have its
+/// checks reach a decision, so the census hydrates those and leaves the rest,
+/// while the single-pull-request callers below still hydrate unconditionally.
+pub(super) fn hydrate_census_check_identities(
+    actions: &GitHubActions,
+    repo: &str,
+    required_checks: &[RequiredCheck],
+    prs: &mut [ObservedPr],
+) -> Result<(), String> {
+    for pr in prs.iter_mut().filter(|pr| checks_are_consulted(pr)) {
+        hydrate_required_check_identities_with_deadline(
+            actions,
+            repo,
+            required_checks,
+            std::slice::from_mut(pr),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn hydrate_required_check_identities_before(
     actions: &GitHubActions,
     repo: &str,
@@ -618,6 +663,21 @@ fn hydrate_required_check_identities_with_deadline(
         }
     }
     Ok(())
+}
+
+/// Whether this pull request's check set can reach a decision.
+///
+/// Every consumer of `StewardPullRequest::checks` is gated behind the managed
+/// label: an unmanaged pull request is classified `Unmanaged` before its checks
+/// are weighed, and `pull_request_is_managed` conjoins the label with the
+/// handoff status. Hydrating a head whose checks cannot change an outcome costs
+/// a round trip per open pull request, which is the cost that must not scale
+/// with the backlog.
+fn checks_are_consulted(pr: &ObservedPr) -> bool {
+    pr.fact
+        .labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(super::MANAGED_LABEL))
 }
 
 fn hydrate_complete_head_checks(
