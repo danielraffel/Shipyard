@@ -17,6 +17,55 @@ When updating a durable friction report, reconcile its landed commit, PR, and
 release status in the same change; do not leave historical "local/unpushed"
 claims after the implementation has merged.
 
+## Webhook drift: compare, never cache
+
+A successful registration is a statement about the past. Nothing in GitHub
+notifies the daemon when the hook it registered stops being correct, so a local
+record saying "I registered URL X" can outlive the fact by an unbounded period —
+and it did: a host's tailnet name changed (Tailscale re-registers a duplicate
+node under a `-N` suffix and the old name stops resolving), the hook kept the
+dead name, and every delivery failed to connect for a long time with no symptom,
+because nothing consumed the feed.
+
+- `shipyard daemon reconcile [--json]` compares the URL this host intends
+  against the URL GitHub holds, plus recent delivery health. Exit codes: 0 in
+  sync, 1 warn, 2 alarm, 3 blocked on a human action. Use it before concluding
+  a daemon is healthy from `daemon status` alone — status prints what the daemon
+  INTENDS, which was correct throughout the outage.
+- A registration believed good is re-asserted on a schedule
+  (`WEBHOOK_REVERIFY_INTERVAL`). Do not "optimize" that away by suppressing the
+  re-check after a success; the suppression is the bug.
+- An unreadable identity is never "no drift". The Tailscale CLI is not on a
+  non-interactive PATH, so `command -v tailscale` returns empty on a healthy
+  host; the binary is resolved from explicit candidate paths and a failure to
+  read `.Self.DNSName` is reported as an alarm, not as agreement.
+
+## A webhook 403 has three causes and only one is a credential
+
+`PATCH`/`POST` on repository hooks can return HTTP 403 for three unrelated
+reasons, and they need opposite responses:
+
+| GitHub says | Actually means | Who fixes it |
+|---|---|---|
+| `Resource not accessible by integration` | App installation lacks `repository_hooks` | a human, in the App's settings |
+| mentions `admin:repo_hook` | classic token missing a scope | one `gh auth refresh` |
+| `Bad credentials` / 401 | the credential is dead or anonymous | rotate or re-auth |
+
+`RegistrarError::AppPermissionDenied` is the first; do not fold it into
+`AuthDegraded`. Reporting a permission fault as a credential fault is what drove
+the external daemon-health watchdog to clear token caches every five minutes
+against a credential that was working fine.
+
+## A config PATCH replaces; it does not merge
+
+`PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.
+Patching only `config[url]` therefore CLEARS the shared secret, and GitHub
+answers 200 with a hook whose every visible field is correct. Always send the
+complete config — `url`, `content_type`, `insecure_ssl`, `secret` — and read the
+response back to confirm the secret survived. GitHub returns a fixed mask rather
+than the value, so presence is the strongest available check; never log the
+secret itself.
+
 ## Metrics authority
 
 When reviewing stewardship scorecards, treat GitHub `created_at` plus
