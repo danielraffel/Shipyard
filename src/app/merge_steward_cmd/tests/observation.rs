@@ -770,3 +770,88 @@ fn disabled_preemption_policy_performs_no_job_hydration_reads() {
     .expect("disabled policy skips hydration");
     assert!(runs[0].jobs.is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn open_pull_request_census_does_not_request_the_check_rollup() {
+    let temp = tempfile::tempdir().expect("temp");
+    let argv_path = temp.path().join("argv");
+    let rows = serde_json::json!([{
+        "id": "PR_1",
+        "number": 1,
+        "isDraft": false,
+        "baseRefName": "main",
+        "headRefOid": format!("{:040x}", 1),
+        "headRefName": "feature-1",
+        "mergeStateStatus": "CLEAN",
+        "autoMergeRequest": null,
+        "labels": []
+    }]);
+    let rows_path = temp.path().join("prs.json");
+    fs::write(&rows_path, serde_json::to_vec(&rows).expect("rows JSON")).expect("write rows");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            "printf '%s' \"$*\" > '{}'\ncat '{}'\n",
+            argv_path.display(),
+            rows_path.display()
+        ),
+    );
+
+    let prs = pull_requests(&actions, "owner/repo", "main", &BTreeMap::new()).expect("census");
+    assert_eq!(prs.len(), 1);
+
+    let argv = fs::read_to_string(&argv_path).expect("captured argv");
+    // Control: the capture really observed the census argv, so the assertion
+    // below is a measurement rather than an empty read.
+    assert!(
+        argv.contains("mergeStateStatus"),
+        "argv capture observed nothing: {argv}"
+    );
+    assert!(
+        !argv.contains("statusCheckRollup"),
+        "the open-PR census must not request a per-PR check rollup: {argv}"
+    );
+}
+
+#[test]
+fn absent_check_rollup_marks_only_managed_pull_requests_for_hydration() {
+    let positions = BTreeMap::new();
+    let row = |number: u64, labels: serde_json::Value| {
+        serde_json::json!({
+            "id": format!("PR_{number}"),
+            "number": number,
+            "isDraft": false,
+            "baseRefName": "main",
+            "headRefOid": format!("{number:040x}"),
+            "headRefName": format!("feature-{number}"),
+            "mergeStateStatus": "CLEAN",
+            "autoMergeRequest": null,
+            "labels": labels
+        })
+    };
+
+    let managed = parse_pr(
+        &row(1, serde_json::json!([{"name": "shipyard:managed"}])),
+        &positions,
+    )
+    .expect("managed PR");
+    let unmanaged = parse_pr(&row(2, serde_json::json!([])), &positions).expect("unmanaged PR");
+
+    assert!(
+        managed.check_rollup_maybe_truncated,
+        "a managed PR whose rollup was never observed must be hydrated per head"
+    );
+    assert!(
+        !unmanaged.check_rollup_maybe_truncated,
+        "an unmanaged PR must not buy a per-head hydration round trip"
+    );
+    assert!(managed.fact.checks.is_empty());
+
+    // An observed rollup keeps its existing meaning for the single-PR callers
+    // that still request it: complete below the page cap, suspect at it.
+    let mut observed = row(3, serde_json::json!([]));
+    observed["statusCheckRollup"] = serde_json::json!([]);
+    let observed = parse_pr(&observed, &positions).expect("observed rollup");
+    assert!(!observed.check_rollup_maybe_truncated);
+}
