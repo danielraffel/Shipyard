@@ -981,18 +981,51 @@ mod tests {
         let identity = HostIdentity::from_node_name("daniels-mac-studio-3.taile2001.ts.net");
         let url = "https://daniels-mac-studio-3.taile2001.ts.net/webhook";
 
-        // Measured on a LIVE, working host: scattered refusals whose longest
-        // consecutive run was 2, interleaved with successes. Must NOT alarm.
+        // Transcribed from one page of deliveries on a LIVE, working host:
+        // eight refusals scattered through twenty attempts, longest
+        // consecutive run 2. A rule that counted total failures rather than
+        // the CURRENT run would alarm here (8 >= 5) and call a healthy host
+        // dead, so this fixture is deliberately large enough to tell the two
+        // rules apart.
+        let ok = DeliveryOutcome::Delivered;
+        let bad = DeliveryOutcome::Rejected { status_code: 400 };
         let mut noisy = healthy_observed(url);
         noisy.recent_deliveries = vec![
-            DeliveryOutcome::Delivered,
-            DeliveryOutcome::Delivered,
-            DeliveryOutcome::Rejected { status_code: 400 },
-            DeliveryOutcome::Rejected { status_code: 400 },
-            DeliveryOutcome::Delivered,
-            DeliveryOutcome::Delivered,
-            DeliveryOutcome::Delivered,
+            ok.clone(),
+            ok.clone(),
+            bad.clone(),
+            bad.clone(),
+            ok.clone(),
+            ok.clone(),
+            ok.clone(),
+            bad.clone(),
+            bad.clone(),
+            ok.clone(),
+            ok.clone(),
+            bad.clone(),
+            ok.clone(),
+            bad.clone(),
+            bad.clone(),
+            ok.clone(),
+            ok.clone(),
+            ok.clone(),
+            bad.clone(),
+            ok.clone(),
         ];
+        assert_eq!(
+            noisy
+                .recent_deliveries
+                .iter()
+                .filter(|outcome| !outcome.succeeded())
+                .count(),
+            8,
+            "fixture must carry enough total failures to trip a total-count rule"
+        );
+        assert_eq!(
+            leading_rejected_run(&noisy.recent_deliveries),
+            0,
+            "and must currently be delivering"
+        );
         let report = reconcile(
             &identity,
             Some(&desired(url)),
@@ -1085,6 +1118,29 @@ mod tests {
         assert_eq!(leading_unreachable_run(&deliveries), 2);
         assert_eq!(leading_rejected_run(&deliveries), 0);
         assert_eq!(leading_unreachable_run(&[]), 0);
+
+        // The helpers measure the CURRENT run, not a total. A history with
+        // many failures that is delivering again right now must read as zero,
+        // which is what separates "is broken" from "has ever been broken".
+        let dead = DeliveryOutcome::Unreachable {
+            detail: "connection_error".to_owned(),
+        };
+        let refused = DeliveryOutcome::Rejected { status_code: 401 };
+        let recovered = vec![
+            DeliveryOutcome::Delivered,
+            dead.clone(),
+            refused.clone(),
+            dead.clone(),
+            refused.clone(),
+            dead.clone(),
+            refused.clone(),
+            dead.clone(),
+            refused.clone(),
+            dead.clone(),
+            refused.clone(),
+        ];
+        assert_eq!(leading_unreachable_run(&recovered), 0);
+        assert_eq!(leading_rejected_run(&recovered), 0);
     }
 
     // --- report mechanics --------------------------------------------------
