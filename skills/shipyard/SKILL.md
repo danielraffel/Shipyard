@@ -33,6 +33,49 @@ the daily implementation as of `v0.51.0` / `v0.51.1`, but do not replace
 Pulp pins, reset Tailscale Funnel, or merge GUI cutover support without a clear
 go/no-go for that operation.
 
+## The gate scripts are shared with Pulp — and defaulted to Pulp's layout
+
+`scripts/version_bump_check.py` and `scripts/skill_sync_check.py` are the same
+gates Pulp carries. Pulp keeps its config at `tools/scripts/versioning.json`;
+Shipyard keeps its own at `scripts/versioning.json`. The scripts hard-coded
+Pulp's path, so a **bare invocation in this repo never found its config**:
+
+```
+$ python3 scripts/version_bump_check.py --mode=report --base origin/main
+version_bump_check: config not found: .../tools/scripts/versioning.json
+```
+
+It was invisible because `.githooks/pre-push` always passes `--config "$CFG"`
+explicitly. Anyone running a gate by hand — an agent checking its own work —
+got a gate that checked nothing. `resolve_config()` now searches this repo's
+layout first and names **every** path it tried when it finds none.
+
+The second half was worse. Each gate's catch-all branch was
+`*) echo "[pre-push] <gate>: internal error" >&2 ;;` — it printed and continued
+**without setting `fail`**, so a gate that could not run was indistinguishable
+from a clean one. The exit-code contract every caller must honour:
+
+| code | meaning | caller must |
+|------|---------|-------------|
+| 0 | ran, check passed | continue |
+| 1 | ran, check FAILED | block |
+| 2+ | **could NOT run** (config missing, crash) | **block** |
+
+`gate_could_not_run` in the hook does that, and `$gate_rc` captures the status
+before `case` consumes `$?`. Two things follow:
+
+* **Adding a gate means adding its blocking branch** —
+  `scripts/test_prepush_cannot_measure.py` fails if any catch-all still falls
+  open, and its control counts *both* halves so a drifted regex cannot report
+  "nothing falls open" over zero coverage.
+* **A pre-versioning checkout still skips**, but loudly: it now names the
+  missing inputs and says nothing was verified. A silent `exit 0` there reads
+  exactly like a clean run.
+
+When asserting a gate "ran", check for `rc in (0, 1)` — not `rc == 0`. Zero is
+"ran and passed"; conflating it with "ran" is the same mistake one level up.
+`scripts/**` maps to this skill, so a change to either gate needs a note here.
+
 ## Durable work handoff
 
 Do not spend an agent session polling a pull request, build, benchmark, release,

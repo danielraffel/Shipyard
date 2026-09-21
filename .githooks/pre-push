@@ -28,33 +28,58 @@ CFG="$ROOT/scripts/versioning.json"
 DSC="$ROOT/scripts/doc_sync_check.py"
 DSM="$ROOT/scripts/doc_sync_map.json"
 
-if [ ! -f "$VBC" ] || [ ! -f "$SSC" ] || [ ! -f "$CFG" ]; then
-    exit 0  # pre-versioning checkout; no-op
+# Documented exemption: a checkout from before the versioning gates existed
+# genuinely has nothing to check. Preserved, but made LOUD and specific — a
+# silent `exit 0` here is indistinguishable from a clean gate run, which is the
+# same false green this hook now refuses everywhere else.
+missing_gate_inputs=""
+[ -f "$VBC" ] || missing_gate_inputs="$missing_gate_inputs $VBC"
+[ -f "$SSC" ] || missing_gate_inputs="$missing_gate_inputs $SSC"
+[ -f "$CFG" ] || missing_gate_inputs="$missing_gate_inputs $CFG"
+if [ -n "$missing_gate_inputs" ]; then
+    echo "[pre-push] SKIPPED — version/skill gates did not run: pre-versioning checkout." >&2
+    echo "[pre-push]   Missing:$missing_gate_inputs" >&2
+    echo "[pre-push]   Nothing was verified. This is a SKIP, not a pass." >&2
+    exit 0
 fi
+
+# A gate that could not RUN is not a gate that passed.
+#
+# Exit-code contract: 0 = ran and passed, 1 = ran and FAILED, 2+ = COULD NOT
+# RUN (missing/unreadable config, or a crash) — it checked nothing. 2+ used to
+# print "internal error" and fall through as a pass, so a gate that could not
+# find its config reported SUCCESS. That false green is how a missing version
+# bump rides to main with no tag and no release.
+gate_could_not_run() {
+    local name="$1" status="$2"
+    echo "[pre-push] $name: COULD NOT RUN (exit $status) — treating as a FAILURE." >&2
+    echo "[pre-push]   The gate performed no check, so it cannot report a pass." >&2
+    echo "[pre-push]   Its output above names the config it looked for." >&2
+}
 
 BASE="${SHIPYARD_PREPUSH_BASE:-origin/main}"
 fail=0
 
 "$PYTHON" "$SSC" --base "$BASE" --config "$CFG" --mode=report
-case $? in
+gate_rc=$?; case $gate_rc in
     0) ;;
     1) fail=1 ;;
-    *) echo "[pre-push] skill_sync_check: internal error" >&2 ;;
+    *) gate_could_not_run "skill_sync_check" "$gate_rc"; fail=1 ;;
 esac
 
 "$PYTHON" "$VBC" --base "$BASE" --config "$CFG" --mode=report
-case $? in
+gate_rc=$?; case $gate_rc in
     0) ;;
     1) fail=1 ;;
-    *) echo "[pre-push] version_bump_check: internal error" >&2 ;;
+    *) gate_could_not_run "version_bump_check" "$gate_rc"; fail=1 ;;
 esac
 
 if [ -f "$DSC" ] && [ -f "$DSM" ]; then
     "$PYTHON" "$DSC" --base "$BASE" --map "$DSM" --mode=report
-    case $? in
+    gate_rc=$?; case $gate_rc in
         0) ;;
         1) fail=1 ;;
-        *) echo "[pre-push] doc_sync_check: internal error" >&2 ;;
+        *) gate_could_not_run "doc_sync_check" "$gate_rc"; fail=1 ;;
     esac
 fi
 
