@@ -47,7 +47,11 @@ class ConfigResolutionTest(unittest.TestCase):
                 combined = proc.stdout + proc.stderr
                 self.assertNotIn("config not found", combined)
                 self.assertNotIn("CANNOT MEASURE", combined)
-                self.assertEqual(proc.returncode, 0, combined)
+                # The contract under test is that the gate RAN, not that it
+                # was happy: 0 and 1 are both real verdicts. Asserting 0 here
+                # would conflate "could not measure" with "measured and
+                # failed" — the very distinction this file exists to keep.
+                self.assertIn(proc.returncode, (0, 1), combined)
 
     def test_missing_config_fails_closed_naming_the_paths(self) -> None:
         for script in ("version_bump_check.py", "skill_sync_check.py"):
