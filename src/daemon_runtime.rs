@@ -59,6 +59,17 @@ const SHIP_STATE_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const WEBHOOK_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 
+/// How often a registration believed to be correct is re-verified anyway.
+///
+/// A successful registration is a statement about the PAST. The remote side can
+/// change underneath it — a hook edited by hand, a config PATCH that dropped
+/// the secret, or this host's own published name changing — and none of those
+/// produce a local event. Re-asserting the desired state on a schedule turns a
+/// cached belief back into a checked fact, and is the difference between a
+/// drift that self-corrects within the hour and one that persists until a human
+/// trips over it.
+const WEBHOOK_REVERIFY_INTERVAL: Duration = Duration::from_mins(30);
+
 /// Foreground daemon runtime configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonRunConfig {
@@ -539,7 +550,7 @@ fn sync_tunnel_registration(
             return;
         }
         if register_webhooks(registration, registration_error, repos, url, secret) {
-            registration_sync.record_success(url);
+            registration_sync.record_success(url, now);
         } else {
             registration_sync.record_failure(url, now);
         }
@@ -554,13 +565,21 @@ struct RegistrationSyncState {
     registered_url: Option<String>,
     failed_url: Option<String>,
     next_retry_at: Option<Instant>,
+    /// When the currently-believed-good registration must be re-checked.
+    ///
+    /// Without this, one success suppresses every later comparison for the
+    /// lifetime of the process, which is precisely how a registration goes on
+    /// being "known good" long after it stopped being good.
+    reverify_at: Option<Instant>,
 }
 
 #[cfg(unix)]
 impl RegistrationSyncState {
     fn should_attempt(&self, url: &str, now: Instant) -> bool {
         if self.registered_url.as_deref() == Some(url) {
-            return false;
+            // Believed good — but belief expires. Re-assert on a schedule so
+            // remote drift cannot hide behind a stale local success.
+            return self.reverify_at.is_some_and(|due| now >= due);
         }
         if self.failed_url.as_deref() == Some(url)
             && self.next_retry_at.is_some_and(|retry_at| now < retry_at)
@@ -570,15 +589,19 @@ impl RegistrationSyncState {
         true
     }
 
-    fn record_success(&mut self, url: &str) {
+    fn record_success(&mut self, url: &str, now: Instant) {
         self.registered_url = Some(url.to_owned());
         self.failed_url = None;
         self.next_retry_at = None;
+        self.reverify_at = Some(now + WEBHOOK_REVERIFY_INTERVAL);
     }
 
     fn record_failure(&mut self, url: &str, now: Instant) {
         self.failed_url = Some(url.to_owned());
         self.next_retry_at = Some(now + WEBHOOK_REGISTRATION_RETRY_INTERVAL);
+        // A failed attempt invalidates any prior belief about this URL.
+        self.registered_url = None;
+        self.reverify_at = None;
     }
 }
 
@@ -1524,6 +1547,16 @@ fn register_webhooks(
 
 #[cfg(unix)]
 fn registration_error_message(repo: &str, error: &RegistrarError) -> String {
+    if let Some(permission) = error.missing_app_permission() {
+        // Distinct from an auth failure ON PURPOSE. Both are HTTP 403, but this
+        // one means the credential is valid and simply not allowed to do this.
+        // Reporting it as degraded auth sends every downstream watchdog to
+        // rotate and clear credentials in a loop it can never win, so the
+        // message names the grant, the human, and the futility of retrying.
+        return format!(
+            "webhook registration for {repo} is BLOCKED on a GitHub App permission: `{permission}` is not granted. A human must grant it in the App's settings and accept it on {repo}. This is not a credential problem — refreshing or clearing tokens will not help. Polling continues meanwhile."
+        );
+    }
     if error.is_missing_webhook_scope() {
         format!(
             "GitHub webhook management for {repo} needs one-time authorization. Polling continues; live webhooks need: {WEBHOOK_SCOPE_COMMAND}"
@@ -2050,13 +2083,63 @@ mod tests {
         let url = "https://node.tailnet.ts.net/webhook";
 
         assert!(state.should_attempt(url, now));
-        state.record_success(url);
+        state.record_success(url, now);
 
         assert!(!state.should_attempt(url, now + Duration::from_secs(30)));
         assert!(state.should_attempt(
             "https://other.tailnet.ts.net/webhook",
             now + Duration::from_secs(30)
         ));
+    }
+
+    /// A success must not silence the comparison forever.
+    ///
+    /// The whole outage class is a cached belief outliving the fact it recorded:
+    /// the registration succeeded once, so nothing ever looked again, so a hook
+    /// edited or invalidated out of band stayed broken indefinitely.
+    #[cfg(unix)]
+    #[test]
+    fn registration_sync_reverifies_a_believed_good_url_on_a_schedule() {
+        let now = Instant::now();
+        let mut state = RegistrationSyncState::default();
+        let url = "https://node.tailnet.ts.net/webhook";
+
+        state.record_success(url, now);
+
+        // Control: inside the window the suppression still holds, so this test
+        // cannot pass merely because suppression stopped working entirely.
+        let just_before = (now + super::WEBHOOK_REVERIFY_INTERVAL)
+            .checked_sub(Duration::from_secs(1))
+            .expect("instant inside the reverify window");
+        assert!(!state.should_attempt(url, just_before));
+
+        assert!(
+            state.should_attempt(url, now + super::WEBHOOK_REVERIFY_INTERVAL),
+            "a believed-good registration must be re-checked once its belief expires"
+        );
+        assert!(
+            state.should_attempt(url, now + super::WEBHOOK_REVERIFY_INTERVAL * 4),
+            "and must stay due until it is actually re-checked"
+        );
+    }
+
+    /// A failure must clear the belief, not sit beside it.
+    #[cfg(unix)]
+    #[test]
+    fn registration_sync_failure_revokes_a_previous_success() {
+        let now = Instant::now();
+        let mut state = RegistrationSyncState::default();
+        let url = "https://node.tailnet.ts.net/webhook";
+
+        state.record_success(url, now);
+        assert!(!state.should_attempt(url, now));
+
+        state.record_failure(url, now);
+        assert!(
+            state.should_attempt(url, now + super::WEBHOOK_REGISTRATION_RETRY_INTERVAL),
+            "after a failure the URL must not still be considered registered"
+        );
+        assert_eq!(state.registered_url, None);
     }
 
     #[cfg(unix)]

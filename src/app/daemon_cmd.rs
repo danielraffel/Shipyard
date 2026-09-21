@@ -14,6 +14,11 @@ use crate::daemon_runtime::{
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
+use crate::registrar::{Registrar, SUBSCRIBED_EVENTS};
+use crate::webhook_reconcile::{
+    CONSECUTIVE_FAILED_DELIVERY_ALARM, DesiredWebhook, Finding, FindingCode, HostIdentity,
+    ReconcileReport, Severity, reconcile,
+};
 
 /// Ensure the daemon that owns queued execution is live.
 pub(super) fn ensure_execution_daemon(
@@ -134,7 +139,189 @@ pub(super) fn daemon_command<W: Write>(
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             Ok(ExitCode::SUCCESS)
         }
+        DaemonCommand::Reconcile { repos } => {
+            daemon_reconcile(mode, runtime_paths, json, stdout, &repos)
+        }
     }
+}
+
+/// Compare the webhook this host INTENDS against the one GitHub HOLDS.
+///
+/// The daemon already knows its own tunnel URL and prints it; GitHub already
+/// serves the registered hook. Both were individually correct throughout the
+/// outage that motivated this command. Only the comparison was missing, and a
+/// comparison nobody performs has no symptom — so this exists to perform it on
+/// demand, from a scheduler, and to exit with a code a shell can branch on.
+fn daemon_reconcile<W: Write>(
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    stdout: &mut W,
+    requested_repos: &[String],
+) -> Result<ExitCode, CliFailure> {
+    let identity = crate::tunnel::probe_tailscale().host_identity();
+    let desired = DesiredWebhook::for_identity(&identity, &SUBSCRIBED_EVENTS);
+
+    let repos = resolve_repos(&runtime_paths.state_dir, requested_repos);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let registrar = Registrar::new_with_context(mode, &runtime_paths.state_dir, &cwd);
+
+    let mut reports: Vec<(String, ReconcileReport)> = Vec::new();
+
+    // The daemon's own advertised URL is a third party to this comparison. If
+    // it disagrees with this host's identity, the daemon is serving a stale
+    // name and every hook it registers will inherit the staleness — so the
+    // disagreement is reported before any repository is consulted.
+    let mut preflight = daemon_url_findings(&runtime_paths.state_dir, &identity);
+
+    if repos.is_empty() {
+        preflight.push(Finding::new(
+            FindingCode::ObservationUnreadable,
+            Severity::Warn,
+            "no repositories are configured, so no webhook could be compared".to_owned(),
+            "Pass --repo, or configure repositories, before reading this as a clean result."
+                .to_owned(),
+        ));
+    }
+
+    for repo in &repos {
+        let desired_url = desired
+            .as_ref()
+            .map_or_else(String::new, |desired| desired.callback_url.clone());
+        let observation = registrar.observe(repo, &desired_url);
+        let report = reconcile(
+            &identity,
+            desired.as_ref(),
+            observation.as_ref(),
+            CONSECUTIVE_FAILED_DELIVERY_ALARM,
+        );
+        reports.push((repo.clone(), report));
+    }
+
+    let severity = reports
+        .iter()
+        .map(|(_, report)| report.severity())
+        .chain(preflight.iter().map(|finding| finding.severity))
+        .max()
+        .unwrap_or(Severity::Warn);
+
+    render_reconcile(stdout, json, &identity, &preflight, &reports, severity)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+
+    let code = u8::try_from(ReconcileReport::exit_code(severity)).unwrap_or(2);
+    Ok(ExitCode::from(code))
+}
+
+/// Compare a running daemon's advertised tunnel URL against this host's
+/// identity. Returns no findings when no daemon is running: that is a separate
+/// condition with its own existing check, not a webhook drift.
+fn daemon_url_findings(state_dir: &Path, identity: &HostIdentity) -> Vec<Finding> {
+    let Some(status) = read_daemon_status(state_dir) else {
+        return Vec::new();
+    };
+    let advertised = status
+        .get("tunnel")
+        .and_then(Value::as_object)
+        .and_then(|tunnel| tunnel.get("url"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let HostIdentity::Known(name) = identity else {
+        return Vec::new();
+    };
+    match advertised {
+        Some(url) if !url.contains(name.as_str()) => vec![Finding::new(
+            FindingCode::UrlDrift,
+            Severity::Alarm,
+            format!("the running daemon advertises {url}, which does not name this host ({name})"),
+            "The daemon is serving a stale tunnel URL. Restart it so it \
+             republishes under this host's current name; every hook it \
+             registers until then inherits the stale name."
+                .to_owned(),
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn render_reconcile<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    identity: &HostIdentity,
+    preflight: &[Finding],
+    reports: &[(String, ReconcileReport)],
+    severity: Severity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let identity_text = match identity {
+        HostIdentity::Known(name) => name.clone(),
+        HostIdentity::Unreadable { detail } => format!("UNREADABLE ({detail})"),
+    };
+
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("identity".to_owned(), Value::String(identity_text));
+        data.insert("severity".to_owned(), Value::String(severity.to_string()));
+        data.insert(
+            "exit_code".to_owned(),
+            Value::from(ReconcileReport::exit_code(severity)),
+        );
+        let finding_json = |finding: &Finding| {
+            serde_json::json!({
+                "code": finding.code.as_str(),
+                "severity": finding.severity.to_string(),
+                "summary": finding.summary,
+                "remedy": finding.remedy,
+            })
+        };
+        data.insert(
+            "preflight".to_owned(),
+            Value::Array(preflight.iter().map(finding_json).collect()),
+        );
+        data.insert(
+            "repos".to_owned(),
+            Value::Array(
+                reports
+                    .iter()
+                    .map(|(repo, report)| {
+                        serde_json::json!({
+                            "repo": repo,
+                            "severity": report.severity().to_string(),
+                            "findings": report.findings.iter().map(finding_json).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        write_json_envelope(stdout, "daemon:reconcile", data)?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "host identity: {identity_text}")?;
+    for finding in preflight {
+        writeln!(
+            stdout,
+            "  [{}] {}: {}",
+            finding.severity,
+            finding.code.as_str(),
+            finding.summary
+        )?;
+        writeln!(stdout, "      -> {}", finding.remedy)?;
+    }
+    for (repo, report) in reports {
+        writeln!(stdout, "{repo}: {}", report.severity())?;
+        for finding in &report.findings {
+            writeln!(
+                stdout,
+                "  [{}] {}: {}",
+                finding.severity,
+                finding.code.as_str(),
+                finding.summary
+            )?;
+            if finding.severity != Severity::Ok {
+                writeln!(stdout, "      -> {}", finding.remedy)?;
+            }
+        }
+    }
+    writeln!(stdout, "verdict: {severity}")?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -18,6 +18,7 @@ use wait_timeout::ChildExt;
 use crate::daemon_ipc::rate_limit_is_anonymous;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
+use crate::webhook_reconcile::{DeliveryOutcome, ObservationFailure, ObservedWebhook};
 
 /// GitHub webhook events Shipyard subscribes to.
 pub const SUBSCRIBED_EVENTS: [&str; 6] = [
@@ -33,6 +34,13 @@ pub const SUBSCRIBED_EVENTS: [&str; 6] = [
 pub const WEBHOOK_SCOPE_COMMAND: &str = "gh auth refresh -h github.com -s admin:repo_hook";
 
 const GH_API_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Recent deliveries fetched when judging endpoint health.
+///
+/// Comfortably wider than the consecutive-failure alarm threshold, so a run
+/// that trips the alarm is visible inside a single page and a healthy endpoint
+/// still shows enough history to prove the window was not simply short.
+const DELIVERY_WINDOW: usize = 30;
 
 /// Durable repo-to-hook mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +64,21 @@ pub enum RegistrarError {
     GhFailed {
         /// Registrar operation being attempted.
         action: &'static str,
+        /// Combined stdout/stderr from `gh`.
+        output: String,
+    },
+    /// The GitHub App installation lacks the `repository_hooks` permission.
+    ///
+    /// GitHub renders this as a bare `403 Resource not accessible by
+    /// integration`, which is indistinguishable from a dead token by status
+    /// code alone. It is NOT a token problem: the credential is valid and
+    /// authenticating fine. Only a human can fix it, in the App's settings, so
+    /// it must never be folded into a retry or a credential-refresh loop.
+    AppPermissionDenied {
+        /// Registrar operation being attempted.
+        action: &'static str,
+        /// The permission a human must grant.
+        permission: &'static str,
         /// Combined stdout/stderr from `gh`.
         output: String,
     },
@@ -125,6 +148,15 @@ impl std::fmt::Display for RegistrarError {
             Self::GhFailed { action, output } => {
                 write!(formatter, "{action} hook failed: {}", output.trim())
             }
+            Self::AppPermissionDenied {
+                action,
+                permission,
+                output,
+            } => write!(
+                formatter,
+                "{action} hook refused: {}. The GitHub App installation is missing `{permission}`; a human must grant it in the App's settings and accept it on the repository. The credential itself is valid — refreshing or clearing it changes nothing.",
+                output.trim()
+            ),
             Self::MissingWebhookScope { action, output } => {
                 write!(
                     formatter,
@@ -184,6 +216,24 @@ impl RegistrarError {
     #[must_use]
     pub fn is_missing_webhook_scope(&self) -> bool {
         matches!(self, Self::MissingWebhookScope { .. })
+    }
+
+    /// True when the GitHub App installation lacks the webhook permission.
+    ///
+    /// Deliberately checked before [`Self::is_auth_degraded`] by callers: both
+    /// are HTTP 403, but only one is fixed by touching credentials.
+    #[must_use]
+    pub fn is_app_permission_denied(&self) -> bool {
+        matches!(self, Self::AppPermissionDenied { .. })
+    }
+
+    /// The permission a human must grant, for an app-permission failure.
+    #[must_use]
+    pub fn missing_app_permission(&self) -> Option<&'static str> {
+        match self {
+            Self::AppPermissionDenied { permission, .. } => Some(permission),
+            _ => None,
+        }
     }
 
     /// True when GitHub rejected the request because the token isn't
@@ -373,6 +423,86 @@ impl Registrar {
         Ok(())
     }
 
+    /// Read the webhook state GitHub ACTUALLY holds for `repo`.
+    ///
+    /// This is the observed half of the reconcile. It deliberately does not
+    /// consult, and cannot be satisfied by, any local record of what was
+    /// registered: a local note saying "I registered URL X" is an intention,
+    /// and the entire failure class this guards against is an intention that
+    /// stopped matching reality. Every failure is returned as a typed
+    /// [`ObservationFailure`] so no caller can accidentally read "could not
+    /// look" as "looked, nothing wrong".
+    pub fn observe(
+        &self,
+        repo: &str,
+        desired_url: &str,
+    ) -> Result<ObservedWebhook, ObservationFailure> {
+        let repo = canonical_repo(repo);
+        let client = self
+            .configured_gh_client(&repo)
+            .map_err(|error| observation_failure_from(&error))?;
+        self.observe_with_client(&repo, desired_url, &client, None)
+    }
+
+    /// Observe with an explicit `gh` binary.
+    pub fn observe_with_gh(
+        &self,
+        repo: &str,
+        desired_url: &str,
+        gh_binary: &Path,
+    ) -> Result<ObservedWebhook, ObservationFailure> {
+        let repo = canonical_repo(repo);
+        let client = GhClient::ambient();
+        self.observe_with_client(&repo, desired_url, &client, Some(gh_binary))
+    }
+
+    fn observe_with_client(
+        &self,
+        repo: &str,
+        desired_url: &str,
+        client: &GhClient,
+        gh_binary: Option<&Path>,
+    ) -> Result<ObservedWebhook, ObservationFailure> {
+        // Prefer durable local provenance for WHICH hook is ours. Matching by
+        // URL cannot identify a hook whose URL has drifted — that is the very
+        // condition being detected — and several hosts legitimately register
+        // their own hooks on the same repository, so a URL sweep must never be
+        // allowed to adopt a peer's.
+        let recorded = self.by_repo.get(repo).copied();
+        let hooks = list_hooks(client, &self.cwd, gh_binary, repo)
+            .map_err(|error| observation_failure_from(&error))?;
+
+        let hook = match recorded {
+            Some(hook_id) => hooks
+                .iter()
+                .find(|hook| hook.get("id").and_then(serde_json::Value::as_u64) == Some(hook_id))
+                .ok_or(ObservationFailure::HookMissing {
+                    hook_id: Some(hook_id),
+                })?,
+            None => hooks
+                .iter()
+                .find(|hook| {
+                    hook.get("config")
+                        .and_then(|config| config.get("url"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(desired_url)
+                })
+                .ok_or(ObservationFailure::HookMissing { hook_id: None })?,
+        };
+
+        let hook_id = hook
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| ObservationFailure::Unreadable {
+                detail: "GitHub returned a hook without an id".to_owned(),
+            })?;
+
+        let deliveries = list_deliveries(client, &self.cwd, gh_binary, repo, hook_id)
+            .map_err(|error| observation_failure_from(&error))?;
+
+        Ok(decode_observed_hook(hook, &deliveries))
+    }
+
     fn save(&self) -> Result<(), RegistrarError> {
         let _writer_domain =
             crate::writer_domain_lease::acquire_for_protected_path(&self.state_path)?;
@@ -548,6 +678,151 @@ fn list_matching_hooks(
     Ok(matches)
 }
 
+/// Fetch every webhook GitHub holds for `repo`, flattened across pages.
+fn list_hooks(
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
+    repo: &str,
+) -> Result<Vec<serde_json::Value>, RegistrarError> {
+    let output = run_gh(
+        client,
+        cwd,
+        gh_binary,
+        &[
+            "api",
+            "--paginate",
+            "--slurp",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &format!("repos/{repo}/hooks?per_page=100"),
+        ],
+        None,
+    )?;
+    if output.status != 0 {
+        return Err(classify_gh_failure("list", output.combined_output()));
+    }
+    let pages = serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&output.stdout)?;
+    Ok(pages.into_iter().flatten().collect())
+}
+
+/// Fetch the most recent delivery attempts for one hook, newest first.
+///
+/// One page is deliberate. The question this answers is "is the endpoint
+/// failing RIGHT NOW", which a fixed recent window answers and a full history
+/// only dilutes; paginating further would also spend request quota on
+/// deliveries too old to act on.
+fn list_deliveries(
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
+    repo: &str,
+    hook_id: u64,
+) -> Result<Vec<serde_json::Value>, RegistrarError> {
+    let output = run_gh(
+        client,
+        cwd,
+        gh_binary,
+        &[
+            "api",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &format!("repos/{repo}/hooks/{hook_id}/deliveries?per_page={DELIVERY_WINDOW}"),
+        ],
+        None,
+    )?;
+    if output.status != 0 {
+        return Err(classify_gh_failure("deliveries", output.combined_output()));
+    }
+    Ok(serde_json::from_str::<Vec<serde_json::Value>>(
+        &output.stdout,
+    )?)
+}
+
+/// Translate a hook payload plus its delivery records into the observed state.
+///
+/// A delivery record that cannot be parsed is treated as UNREACHABLE rather
+/// than skipped. Skipping would let a decoding change quietly shorten a failure
+/// run below the alarm threshold, turning a parser bug into silence — the same
+/// shape as the outage this module exists to prevent.
+#[must_use]
+pub fn decode_observed_hook(
+    hook: &serde_json::Value,
+    deliveries: &[serde_json::Value],
+) -> ObservedWebhook {
+    let config = hook.get("config");
+    ObservedWebhook {
+        hook_id: hook
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        callback_url: config
+            .and_then(|config| config.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        active: hook
+            .get("active")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        events: hook
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        secret_present: hook_config_has_secret(hook),
+        recent_deliveries: deliveries
+            .iter()
+            .map(|delivery| {
+                let status_code = delivery
+                    .get("status_code")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|code| u16::try_from(code).ok());
+                let status_text = delivery
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                status_code.map_or_else(
+                    || DeliveryOutcome::Unreachable {
+                        detail: "delivery record had no readable status code".to_owned(),
+                    },
+                    |code| DeliveryOutcome::classify(code, status_text),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Map a registrar failure onto the observed side's typed failure.
+///
+/// Every arm lands on an [`ObservationFailure`]; there is no arm that returns
+/// a successful, empty observation. That is the point — "the look failed" and
+/// "the look found nothing wrong" must not share a representation.
+#[must_use]
+pub fn observation_failure_from(error: &RegistrarError) -> ObservationFailure {
+    if let Some(permission) = error.missing_app_permission() {
+        return ObservationFailure::PermissionDenied {
+            permission,
+            detail: error.to_string(),
+        };
+    }
+    if error.is_missing_webhook_scope() {
+        return ObservationFailure::PermissionDenied {
+            permission: crate::webhook_reconcile::WEBHOOK_READ_PERMISSION,
+            detail: error.to_string(),
+        };
+    }
+    ObservationFailure::Unreadable {
+        detail: error.to_string(),
+    }
+}
+
 fn update_hook(
     client: &GhClient,
     cwd: &Path,
@@ -589,6 +864,16 @@ fn update_hook(
     validate_updated_hook(hook_id, url, &output.stdout)
 }
 
+/// Confirm GitHub committed the complete requested hook state.
+///
+/// The secret check is not defensive padding. `PATCH /repos/{o}/{r}/hooks/{id}`
+/// REPLACES the `config` object rather than merging into it, so a patch that
+/// omits `secret` clears it — and GitHub answers 200 with a hook that looks
+/// entirely correct. The feed then keeps arriving unsigned until someone
+/// notices, which is the quiet half of this failure class: every visible field
+/// agrees, and only the field nobody can read has changed. Reading back
+/// PRESENCE is the strongest available check, since GitHub returns a fixed mask
+/// and never the value itself.
 fn validate_updated_hook(hook_id: u64, url: &str, output: &str) -> Result<(), RegistrarError> {
     let value = serde_json::from_str::<serde_json::Value>(output)?;
     let returned_url = value
@@ -599,6 +884,15 @@ fn validate_updated_hook(hook_id: u64, url: &str, output: &str) -> Result<(), Re
         return Err(RegistrarError::HookReconciliationMismatch {
             hook_id,
             detail: "callback URL differs".to_owned(),
+        });
+    }
+    if !hook_config_has_secret(&value) {
+        return Err(RegistrarError::HookReconciliationMismatch {
+            hook_id,
+            detail: "shared secret is absent after the patch: a config PATCH \
+                     replaces rather than merges, so the secret must be sent \
+                     with every update"
+                .to_owned(),
         });
     }
     if value.get("active").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -627,6 +921,17 @@ fn validate_updated_hook(hook_id: u64, url: &str, output: &str) -> Result<(), Re
         });
     }
     Ok(())
+}
+
+/// True when a hook payload reports a configured shared secret.
+///
+/// GitHub masks the value, so any non-empty string means "a secret is set".
+/// The key being absent means it is not.
+fn hook_config_has_secret(hook: &serde_json::Value) -> bool {
+    hook.get("config")
+        .and_then(|config| config.get("secret"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|secret| !secret.trim().is_empty())
 }
 
 fn delete_hook(
@@ -660,9 +965,25 @@ fn delete_hook(
 }
 
 fn classify_gh_failure(action: &'static str, output: String) -> RegistrarError {
-    // Order matters: a missing repo-hook scope is a 403 too, but it's a
-    // one-time grant, not a dead token — keep it distinct and check first.
-    if mentions_webhook_scope(&output) {
+    // Order matters, and three different faults all arrive as HTTP 403.
+    //
+    //   1. The App installation lacks `repository_hooks` — valid credential,
+    //      missing grant. Only a human can fix it.
+    //   2. A classic `gh` token lacks the `admin:repo_hook` scope — a one-time
+    //      `gh auth refresh`.
+    //   3. The credential is genuinely dead or anonymous.
+    //
+    // Checking the generic auth signature first would swallow (1) and (2) and
+    // send an operator to rotate a credential that was never the problem —
+    // which is exactly how a watchdog ends up clearing token caches in a loop
+    // against a permissions fault it can never fix.
+    if mentions_app_permission_denied(&output) {
+        RegistrarError::AppPermissionDenied {
+            action,
+            permission: crate::webhook_reconcile::WEBHOOK_WRITE_PERMISSION,
+            output,
+        }
+    } else if mentions_webhook_scope(&output) {
         RegistrarError::MissingWebhookScope { action, output }
     } else if mentions_auth_failure(&output) {
         RegistrarError::AuthDegraded { action, output }
@@ -691,6 +1012,17 @@ fn mentions_transient(output: &str) -> bool {
     .any(|status| lowered.contains(status))
         || lowered.contains("timed out")
         || lowered.contains("temporarily unavailable")
+}
+
+/// True when `gh api` output carries GitHub's App-permission refusal.
+///
+/// GitHub returns this phrase, verbatim, when an App installation is missing a
+/// permission the endpoint requires. It carries no status code of its own and
+/// no hint about WHICH permission, so the endpoint being called supplies that.
+fn mentions_app_permission_denied(output: &str) -> bool {
+    output
+        .to_ascii_lowercase()
+        .contains("resource not accessible by integration")
 }
 
 fn mentions_webhook_scope(output: &str) -> bool {
@@ -1296,6 +1628,11 @@ mod tests {
         MissingWebhookScope,
         Unauthorized,
         AnonRateLimit,
+        /// GitHub answers 200 to the PATCH but the returned config has no
+        /// secret — the shape a config-replacing PATCH leaves behind.
+        PatchDropsSecret,
+        /// The App installation lacks `repository_hooks`.
+        AppPermissionDenied,
     }
 
     #[cfg(unix)]
@@ -1316,6 +1653,8 @@ mod tests {
             | GhStubMode::Delete404
             | GhStubMode::MissingWebhookScope
             | GhStubMode::Unauthorized
+            | GhStubMode::PatchDropsSecret
+            | GhStubMode::AppPermissionDenied
             | GhStubMode::AnonRateLimit => "{\"id\":4242}",
         };
         let delete_branch = match mode {
@@ -1331,6 +1670,8 @@ mod tests {
             | GhStubMode::MissingId
             | GhStubMode::MissingWebhookScope
             | GhStubMode::Unauthorized
+            | GhStubMode::PatchDropsSecret
+            | GhStubMode::AppPermissionDenied
             | GhStubMode::AnonRateLimit => "  *\" -X DELETE \"*) exit 0 ;;",
         };
         let create_branch = match mode {
@@ -1343,6 +1684,9 @@ mod tests {
             GhStubMode::AnonRateLimit => String::from(
                 "  *\" -X POST \"*) printf 'HTTP 403: API rate limit exceeded for 203.0.113.7. (But here is the good news: Authenticated requests get a higher rate limit.)\\n' >&2; exit 1 ;;",
             ),
+            GhStubMode::AppPermissionDenied => String::from(
+                "  *\" -X POST \"*) printf 'gh: Resource not accessible by integration (HTTP 403)\\n' >&2; exit 1 ;;",
+            ),
             GhStubMode::Ok
             | GhStubMode::AdoptExisting
             | GhStubMode::AdoptPatchFails
@@ -1350,6 +1694,7 @@ mod tests {
             | GhStubMode::Ambiguous
             | GhStubMode::WrongUrl
             | GhStubMode::Delete404
+            | GhStubMode::PatchDropsSecret
             | GhStubMode::MissingId => {
                 format!("  *\" -X POST \"*) printf '%s\\n' '{create_response}' ;;")
             }
@@ -1390,21 +1735,31 @@ esac
             create_branch = create_branch,
             delete_branch = delete_branch,
             list_response = list_response,
-            patch_branch = match mode {
-                GhStubMode::AdoptPatchFails => {
-                    "printf 'patch failed\\n' >&2; exit 1 ;;"
-                }
-                GhStubMode::AdoptPatchIncomplete => {
-                    "printf '%s\\n' '{\"active\":true,\"events\":[\"push\"],\"config\":{\"url\":\"https://example.test/webhook\"}}' ;;"
-                }
-                _ => "cat \"$LOG_DIR/stdin-$COUNT\" ;;",
-            },
+            patch_branch = patch_branch_for(mode),
         );
         // Invoke a stable system executable and let it read a closed per-test
         // script from the isolated cwd. This avoids racing Linux exec against
         // a freshly generated executable while preserving the exact gh argv.
         fs::write(temp.join("api"), script).expect("write gh stub script");
         PathBuf::from("/bin/sh")
+    }
+
+    /// The stub's PATCH response body, per mode.
+    #[cfg(unix)]
+    fn patch_branch_for(mode: GhStubMode) -> &'static str {
+        match mode {
+            GhStubMode::AdoptPatchFails => "printf 'patch failed\\n' >&2; exit 1 ;;",
+            GhStubMode::AdoptPatchIncomplete => {
+                "printf '%s\\n' '{\"active\":true,\"events\":[\"push\"],\"config\":{\"url\":\"https://example.test/webhook\"}}' ;;"
+            }
+            // Echo the request back with the secret stripped: GitHub's
+            // config-replacing PATCH answers 200 and every other field is
+            // exactly what was asked for.
+            GhStubMode::PatchDropsSecret => {
+                "python3 -c 'import json,sys; b=json.load(sys.stdin); b.get(\"config\",{}).pop(\"secret\",None); print(json.dumps(b))' < \"$LOG_DIR/stdin-$COUNT\" ;;"
+            }
+            _ => "cat \"$LOG_DIR/stdin-$COUNT\" ;;",
+        }
     }
 
     #[cfg(unix)]
@@ -1420,5 +1775,166 @@ esac
     #[cfg(unix)]
     fn read_json_log(temp: &Path, name: &str) -> Value {
         serde_json::from_str(&read_log(temp, name)).expect(name)
+    }
+
+    /// A config PATCH replaces rather than merges, so a 200 with a correct URL
+    /// is not proof the update was complete.
+    #[cfg(unix)]
+    #[test]
+    fn a_patch_that_silently_clears_the_secret_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::PatchDropsSecret);
+        let mut registrar = stub_registrar(temp.path());
+
+        // Control: creation on this same stub succeeds, so a later failure
+        // cannot be the stub simply refusing everything.
+        let hook_id = registrar
+            .ensure_registered_with_gh("owner/repo", "https://a.test/webhook", "s1", &gh)
+            .expect("create must succeed on this stub");
+        assert_eq!(hook_id, 4242);
+
+        let mut reloaded = stub_registrar(temp.path());
+        let error = reloaded
+            .ensure_registered_with_gh("owner/repo", "https://b.test/webhook", "s2", &gh)
+            .expect_err("a patch that drops the secret must not be accepted");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("secret"),
+            "the failure must name the secret, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("s2"),
+            "the secret value must never be printed"
+        );
+    }
+
+    /// A GitHub App 403 is not a credential fault, and must not be reported as
+    /// one: that misreport is what drives watchdogs to clear token caches in a
+    /// loop against a permission only a human can grant.
+    #[cfg(unix)]
+    #[test]
+    fn an_app_permission_403_is_not_reported_as_degraded_auth() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::AppPermissionDenied);
+        let mut registrar = stub_registrar(temp.path());
+
+        let error = registrar
+            .ensure_registered_with_gh("owner/repo", "https://a.test/webhook", "s", &gh)
+            .expect_err("create must fail");
+
+        assert!(error.is_app_permission_denied());
+        assert_eq!(
+            error.missing_app_permission(),
+            Some(crate::webhook_reconcile::WEBHOOK_WRITE_PERMISSION)
+        );
+        assert!(
+            !error.is_auth_degraded(),
+            "a valid credential lacking a grant must not be classed as degraded auth"
+        );
+        assert!(!error.is_missing_webhook_scope());
+        assert!(
+            !error.is_transient(),
+            "a permission grant must not be retried"
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("repository_hooks: write"));
+        assert!(
+            !rendered.contains("gh auth status"),
+            "must not send an operator to inspect a credential that is fine: {rendered}"
+        );
+
+        // Control: a genuinely dead credential on the same classifier still
+        // reports as degraded auth, so this is a distinction and not a blanket
+        // reclassification of every 403.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::Unauthorized);
+        let mut registrar = stub_registrar(temp.path());
+        let error = registrar
+            .ensure_registered_with_gh("owner/repo", "https://a.test/webhook", "s", &gh)
+            .expect_err("create must fail");
+        assert!(error.is_auth_degraded());
+        assert!(!error.is_app_permission_denied());
+    }
+
+    #[test]
+    fn an_app_permission_failure_maps_to_a_blocked_observation() {
+        use crate::webhook_reconcile::{ObservationFailure, WEBHOOK_WRITE_PERMISSION};
+
+        let denied = super::RegistrarError::AppPermissionDenied {
+            action: "list",
+            permission: WEBHOOK_WRITE_PERMISSION,
+            output: "403 Resource not accessible by integration".to_owned(),
+        };
+        assert!(matches!(
+            super::observation_failure_from(&denied),
+            ObservationFailure::PermissionDenied { permission, .. } if permission == WEBHOOK_WRITE_PERMISSION
+        ));
+
+        // Control: an unrelated failure on the same mapper stays Unreadable —
+        // it must not be silently upgraded into a permission diagnosis.
+        let timed_out = super::RegistrarError::GhTimedOut;
+        assert!(matches!(
+            super::observation_failure_from(&timed_out),
+            ObservationFailure::Unreadable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_hook_payload_decodes_into_the_observed_state() {
+        use crate::webhook_reconcile::DeliveryOutcome;
+
+        let hook = serde_json::json!({
+            "id": 667_647_843_u64,
+            "name": "web",
+            "active": true,
+            "events": ["workflow_job", "workflow_run"],
+            "config": {"url": "https://host.ts.net/webhook", "secret": "********"},
+        });
+        let deliveries = vec![
+            serde_json::json!({"status_code": 200, "status": "OK"}),
+            serde_json::json!({"status_code": 502, "status": "connection_error"}),
+        ];
+        let observed = super::decode_observed_hook(&hook, &deliveries);
+
+        assert_eq!(observed.hook_id, 667_647_843);
+        assert_eq!(observed.callback_url, "https://host.ts.net/webhook");
+        assert!(observed.active);
+        assert!(observed.secret_present);
+        assert_eq!(observed.events.len(), 2);
+        assert_eq!(observed.recent_deliveries[0], DeliveryOutcome::Delivered);
+        assert!(!observed.recent_deliveries[1].reached_endpoint());
+
+        // A hook with no secret decodes as having none. Control against the
+        // masked case above, which decodes as present.
+        let bare = serde_json::json!({
+            "id": 1_u64,
+            "active": true,
+            "events": [],
+            "config": {"url": "https://host.ts.net/webhook"},
+        });
+        assert!(!super::decode_observed_hook(&bare, &[]).secret_present);
+    }
+
+    /// An unparseable delivery must count as a failure, never be dropped.
+    ///
+    /// Dropping it would silently shorten a failure run below the alarm
+    /// threshold and convert a decoding bug into silence.
+    #[test]
+    fn an_undecodable_delivery_counts_as_unreachable_rather_than_vanishing() {
+        let hook = serde_json::json!({
+            "id": 1_u64, "active": true, "events": [],
+            "config": {"url": "https://host.ts.net/webhook", "secret": "********"},
+        });
+        let deliveries = vec![
+            serde_json::json!({"status": "who knows"}),
+            serde_json::json!({"status_code": 200, "status": "OK"}),
+        ];
+        let observed = super::decode_observed_hook(&hook, &deliveries);
+        assert_eq!(
+            observed.recent_deliveries.len(),
+            2,
+            "no delivery record may be discarded"
+        );
+        assert!(!observed.recent_deliveries[0].reached_endpoint());
     }
 }
