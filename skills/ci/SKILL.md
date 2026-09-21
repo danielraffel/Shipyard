@@ -13,6 +13,26 @@ same persisted registration and can unregister through any casing. Registrar
 changes must be committed and pushed to the same PR branch so Shipyard validates
 one exact head; do not create a parallel PR or mutate webhooks manually.
 
+## A live daemon is not a delivering daemon
+
+`shipyard daemon status` reports what the daemon INTENDS — its own tunnel URL —
+which stays correct even when the URL GitHub actually holds has gone stale. A
+host whose tailnet name changed kept a registration under the old name; every
+delivery failed to connect, and because nothing was subscribed to the feed its
+failure produced no symptom at all.
+
+Before calling a daemon healthy, compare the two sides:
+
+```sh
+shipyard daemon reconcile            # 0 in sync · 1 warn · 2 alarm · 3 blocked on a human
+shipyard daemon reconcile --json     # same verdict, machine-readable findings
+```
+
+Exit 3 means a GitHub App permission (`repository_hooks: write`) is missing and
+only a human can grant it, in the App's settings. Do not answer it by
+refreshing the daemon or clearing token caches: the credential is valid, and
+that remedy belongs to a different fault that merely shares the 403 status code.
+
 ## Metrics authority
 
 GitHub job `created_at` is the provider-authoritative queue timestamp. Metrics

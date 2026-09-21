@@ -1581,6 +1581,14 @@ pub(super) enum DaemonCommand {
     },
     /// Report daemon liveness and status.
     Status,
+    /// Compare the webhook this host intends against the one GitHub holds.
+    ///
+    /// Exits 0 in sync, 1 warning, 2 alarm, 3 blocked on a human action.
+    Reconcile {
+        /// Repo(s) to reconcile. Defaults to the configured repositories.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
