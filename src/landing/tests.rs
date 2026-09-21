@@ -252,11 +252,17 @@ fn unreadable_rulesets_report_unknown_not_absent() {
 fn readable_rulesets_with_a_failed_detail_call_report_unknown() {
     // Half a ruleset read is an unread one: the rule that matters may be in
     // the ruleset whose detail call failed.
+    //
+    // GraphQL is given an explicit "no queue" so this exercises the rule that
+    // matters — an unreadable surface outranks a readable surface that found
+    // nothing. Without that vote the verdict would be unknown for the trivial
+    // reason that nothing was measured at all, and the test would pass against
+    // an implementation that folds unreadable into absent.
     let inputs = QueueInputs {
         rulesets: None,
         rulesets_error: Some((Boundary::Transport, "ruleset 42: HTTP 502".to_owned())),
         protection: Payload::Json(protection_payload(true)),
-        graphql_queue: Payload::NotConsulted,
+        graphql_queue: Payload::Json(Value::Null),
     };
     let mut surfaces = Vec::new();
     let finding = determine_queue(&inputs, "main", Some("main"), &mut surfaces);
@@ -721,6 +727,34 @@ fn a_truncated_backlog_says_so() {
     let finding = backlog::from_graphql(&payload);
     assert!(finding.truncated);
     assert!(finding.interpretation.contains("lower bound"));
+}
+
+// ---------------------------------------------------------------------------
+// A base that does not exist
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_absent_base_is_called_out() {
+    let warning = crate::landing::gather::base_warning(Some(false), "master", Some("main"))
+        .expect("a confirmed-absent base must warn");
+    assert!(warning.contains("does not exist"));
+    assert!(
+        warning.contains("`main`"),
+        "naming the real default is what turns the warning into a fix: {warning}"
+    );
+}
+
+#[test]
+fn a_present_base_does_not_warn() {
+    assert!(crate::landing::gather::base_warning(Some(true), "main", Some("main")).is_none());
+}
+
+#[test]
+fn an_unreadable_base_existence_check_does_not_warn() {
+    assert!(
+        crate::landing::gather::base_warning(None, "main", None).is_none(),
+        "warning on an unreadable check would make every permission failure look like a typo"
+    );
 }
 
 // ---------------------------------------------------------------------------

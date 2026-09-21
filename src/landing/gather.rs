@@ -31,7 +31,7 @@ use crate::landing::{LandingReport, SCHEMA_VERSION, SurfaceRead, backlog};
 pub const DEFAULT_RUN_SAMPLE: usize = 30;
 
 /// How many per-run job reads to spend at most.
-pub const DEFAULT_MAX_JOB_READS: usize = 15;
+pub const DEFAULT_MAX_JOB_READS: usize = 20;
 
 /// Everything the report needs, read once.
 pub struct GatherOptions<'a> {
@@ -111,6 +111,17 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         read_error.as_ref(),
     );
 
+    if graphql.base_exists == Some(false) {
+        warnings.push(format!(
+            "branch `{base}` does not exist on this repository{}; every finding below is the \
+             well-formed nothing an absent branch returns, not a description of how work lands",
+            default_branch
+                .as_deref()
+                .map_or_else(String::new, |branch| format!(
+                    " (the default is `{branch}`)"
+                ))
+        ));
+    }
     if matches!(protection, Payload::NotFound) {
         warnings.push(format!(
             "branch `{base}` carries no branch protection, so nothing on GitHub's side requires a \
@@ -135,6 +146,29 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         warnings,
         api_calls,
     }
+}
+
+/// Warn when the base branch does not exist.
+///
+/// Only a confirmed absence warns. An unreadable existence check is silent
+/// here, because warning on it would make every permission failure look like
+/// a typo — and the report already says which surfaces it could not read.
+#[must_use]
+pub fn base_warning(
+    base_exists: Option<bool>,
+    base: &str,
+    default_branch: Option<&str>,
+) -> Option<String> {
+    if base_exists != Some(false) {
+        return None;
+    }
+    Some(format!(
+        "branch `{base}` does not exist on this repository{}; every finding below is the \
+         well-formed nothing an absent branch returns, not a description of how work lands",
+        default_branch.map_or_else(String::new, |branch| format!(
+            " (the default is `{branch}`)"
+        ))
+    ))
 }
 
 /// List the rulesets, then read each branch ruleset's detail.
@@ -231,7 +265,16 @@ fn read_graphql_facts(
                         .collect()
                 })
                 .unwrap_or_default();
+            let base_exists = value
+                .pointer("/data/repository")
+                .filter(|repository| !repository.is_null())
+                .map(|repository| {
+                    repository
+                        .get("baseRef")
+                        .is_some_and(|base_ref| !base_ref.is_null())
+                });
             GraphqlFacts {
+                base_exists,
                 default_branch,
                 backlog: backlog_finding,
                 open_pr_heads: head_shas,
@@ -241,6 +284,7 @@ fn read_graphql_facts(
             let boundary = classify(&error);
             inputs.graphql_queue = Payload::Unreadable(boundary, error.clone());
             GraphqlFacts {
+                base_exists: None,
                 default_branch: None,
                 backlog: backlog::unreadable(boundary, error),
                 open_pr_heads: Vec::new(),
@@ -251,6 +295,13 @@ fn read_graphql_facts(
 
 /// What the single GraphQL round trip yielded.
 struct GraphqlFacts {
+    /// Whether the base branch exists at all.
+    ///
+    /// Load-bearing: a base that does not exist answers every downstream
+    /// question with a well-formed nothing — no protection, no queue, no open
+    /// pull requests — and that reads as a repository with no gates rather
+    /// than as a typo.
+    base_exists: Option<bool>,
     /// The repository's default branch, needed to resolve `~DEFAULT_BRANCH`.
     default_branch: Option<String>,
     /// The open-pull-request backlog.
@@ -275,17 +326,21 @@ fn runs_producing_contexts(
     open_pr_heads: &[String],
     notes: &mut Vec<String>,
 ) -> (Vec<u64>, u32) {
-    const MAX_HEADS: usize = 8;
+    const MAX_HEADS: usize = 6;
+    // More than one candidate per context, because a context is routinely
+    // *satisfied* by a job that was skipped — a reuse path, or a conditional
+    // that did not fire on that particular pull request. One candidate per
+    // context would report such a gate as unplaceable even though it runs on
+    // every other pull request in the backlog.
+    const MAX_PER_CONTEXT: usize = 3;
+
     if contexts.is_empty() || open_pr_heads.is_empty() {
         return (Vec::new(), 0);
     }
     let mut calls = 0u32;
-    // One run per context, so the follow-up job reads are bounded by the
-    // number of required checks rather than by how many workflows a
-    // repository happens to run on a pull request.
-    let mut per_context: Vec<(String, u64)> = Vec::new();
+    let mut candidates: Vec<Vec<u64>> = vec![Vec::new(); contexts.len()];
     for sha in open_pr_heads.iter().take(MAX_HEADS) {
-        if per_context.len() == contexts.len() {
+        if candidates.iter().all(|runs| runs.len() >= MAX_PER_CONTEXT) {
             break;
         }
         calls += 1;
@@ -306,20 +361,31 @@ fn runs_producing_contexts(
             let Some(name) = check.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            if !contexts.iter().any(|context| context == name)
-                || per_context.iter().any(|(known, _)| known == name)
-            {
+            let Some(index) = contexts.iter().position(|context| context == name) else {
+                continue;
+            };
+            if candidates[index].len() >= MAX_PER_CONTEXT {
                 continue;
             }
-            if let Some(run_id) = run_id_from_url(check.get("html_url").and_then(Value::as_str)) {
-                per_context.push((name.to_owned(), run_id));
+            if let Some(run_id) = run_id_from_url(check.get("html_url").and_then(Value::as_str))
+                && !candidates[index].contains(&run_id)
+            {
+                candidates[index].push(run_id);
             }
         }
     }
+
+    // Interleave, so every context gets a first attempt before any gets a
+    // second. A budget spent three-deep on one gate while another has not been
+    // looked at once is the wrong trade.
     let mut runs: Vec<u64> = Vec::new();
-    for (_, run_id) in per_context {
-        if !runs.contains(&run_id) {
-            runs.push(run_id);
+    for round in 0..MAX_PER_CONTEXT {
+        for per_context in &candidates {
+            if let Some(run_id) = per_context.get(round)
+                && !runs.contains(run_id)
+            {
+                runs.push(*run_id);
+            }
         }
     }
     (runs, calls)
@@ -441,6 +507,7 @@ fn read_graphql(actions: &GitHubActions, repo: &str, base: &str) -> Result<Value
     let query = format!(
         "query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ \
            defaultBranchRef {{ name }} \
+           baseRef: ref(qualifiedName: \"refs/heads/{base}\") {{ name }} \
            mergeQueue(branch: \"{base}\") {{ configuration {{ mergeMethod mergingStrategy \
              maximumEntriesToMerge maximumEntriesToBuild minimumEntriesToMerge \
              checkResponseTimeout }} }} \
