@@ -68,6 +68,7 @@ const WEBHOOK_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 /// cached belief back into a checked fact, and is the difference between a
 /// drift that self-corrects within the hour and one that persists until a human
 /// trips over it.
+#[cfg(unix)]
 const WEBHOOK_REVERIFY_INTERVAL: Duration = Duration::from_mins(30);
 
 /// Foreground daemon runtime configuration.
