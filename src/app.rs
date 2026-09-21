@@ -35,6 +35,7 @@ mod fleet_update_cmd;
 mod governance_cmd;
 mod init_cmd;
 mod landability_cmd;
+mod landing_cmd;
 mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
@@ -408,6 +409,25 @@ where
                 stdout,
             );
         }
+        Command::Landing {
+            repo,
+            base,
+            run_sample,
+            max_job_reads,
+        } => {
+            return landing_cmd::landing_command(
+                cli.mode.into(),
+                &cwd,
+                landing_cmd::LandingArgs {
+                    repo,
+                    base,
+                    run_sample,
+                    max_job_reads,
+                    json: cli.json,
+                },
+                stdout,
+            );
+        }
         Command::Quarantine { command } => {
             return quarantine_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
@@ -642,6 +662,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Targets { .. }
         | Command::Quarantine { .. }
         | Command::Landability { .. }
+        | Command::Landing { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }
         | Command::MergeQueue { .. }

@@ -2490,6 +2490,35 @@ appeared at all — not red, not pending, simply absent from `statusCheckRollup`
 shipyard landability --repo OWNER/REPO --base main   # the on-demand surface
 ```
 
+### Before bulk backlog work: `shipyard landing`
+
+`landability` says whether a gate can be scheduled. It does not say how work
+**merges** here, and that is the question to settle before touching a backlog.
+
+```sh
+shipyard landing --repo OWNER/REPO --base main   # read-only; nothing merges
+shipyard --json landing                          # exit 9 when a headline field is UNKNOWN
+```
+
+It reports the merge queue (read from **rulesets**, which is the only REST
+surface that carries one — `branches/{b}/protection` has no merge-queue field
+and its silence is not evidence of absence), strict up-to-date protection, the
+exact enqueue command including the merge method the queue itself declares,
+where each required check last actually executed (from a completed job's
+`runner_name`, not from `runs-on:`), and the open backlog counted by
+`mergeStateStatus`.
+
+**Queue present + strict ON means the action is ENQUEUE.** Merging one pull
+request at a time is a treadmill: each landing puts every other open pull
+request `behind` and forces an individual full-gate revalidation. Hand-rebasing
+a backlog in that state is wasted work. The backlog counts separate the two
+blockers that call for opposite responses — `dirty` needs conflict resolution
+and no queue capacity moves it, while `behind` and `blocked` are exactly what
+the queue absorbs.
+
+An unreadable surface reports `UNKNOWN`, never `absent`. Treat an `UNKNOWN`
+queue as "determine this before doing bulk work", not as "there is no queue".
+
 ### Reading the verdict
 
 | verdict | meaning | what to do |
