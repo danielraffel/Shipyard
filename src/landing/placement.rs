@@ -198,9 +198,9 @@ pub fn classify_checks(
                 )
             } else {
                 format!(
-                    "no job named `{context}` in the {runs_read} most recent completed runs; the \
-                     context may be produced by a job with a different name, or it may not have \
-                     run recently"
+                    "no job named `{context}` in the runs that were read (up to {runs_read} \
+                     recent completed runs); the context may be produced by a job with a \
+                     different name, or it may not have run recently"
                 )
             };
             CheckPlacement {

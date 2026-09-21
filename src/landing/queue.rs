@@ -385,29 +385,22 @@ fn merge_configs(found: Vec<MergeQueueConfig>) -> Option<MergeQueueConfig> {
 /// rulesets" sends the reader somewhere useful, while "the call timed out"
 /// sends them to retry.
 fn strongest_boundary(unreadable: &[(Boundary, String)]) -> Option<(Boundary, String)> {
-    let mut best: Option<(Boundary, String)> = None;
-    for (boundary, detail) in unreadable {
-        let rank = match boundary {
-            Boundary::Permission => 5,
-            Boundary::Identity => 4,
-            Boundary::Scope => 3,
-            Boundary::Grammar => 2,
-            Boundary::Parse => 1,
-            Boundary::Transport => 0,
-        };
-        let current = best.as_ref().map_or(-1i32, |(existing, _)| match existing {
-            Boundary::Permission => 5,
-            Boundary::Identity => 4,
-            Boundary::Scope => 3,
-            Boundary::Grammar => 2,
-            Boundary::Parse => 1,
-            Boundary::Transport => 0,
-        });
-        if rank > current {
-            best = Some((*boundary, detail.clone()));
-        }
+    unreadable
+        .iter()
+        .max_by_key(|(boundary, _)| boundary_rank(*boundary))
+        .map(|(boundary, detail)| (*boundary, detail.clone()))
+}
+
+/// How useful a boundary is to the reader, highest first.
+const fn boundary_rank(boundary: Boundary) -> u8 {
+    match boundary {
+        Boundary::Permission => 5,
+        Boundary::Identity => 4,
+        Boundary::Scope => 3,
+        Boundary::Grammar => 2,
+        Boundary::Parse => 1,
+        Boundary::Transport => 0,
     }
-    best
 }
 
 /// Whether a ruleset's `ref_name` conditions cover the branch being modelled.

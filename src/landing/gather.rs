@@ -474,9 +474,22 @@ fn observe_jobs(
     // A sweep that failed only matters when it was the last chance: contexts
     // already placed from a priority run are measured facts, and reporting
     // them as unknown because a later call failed would throw away a good
-    // measurement.
+    // measurement. But a partial read must still say so, or an unplaced
+    // context reads as "it does not run" rather than "the search was cut
+    // short" - which is the same collapse of blindness into a finding that
+    // the queue verdict refuses.
+    let unplaced = !all_placed(contexts, &observations);
+    if let Some((_, detail)) = &sweep_error
+        && !observations.is_empty()
+        && unplaced
+    {
+        notes.push(format!(
+            "the recent-runs sweep failed ({detail}); a context reported as `no_evidence` below \
+             was not searched exhaustively"
+        ));
+    }
     let read_error = sweep_error.filter(|_| observations.is_empty());
-    if reads >= options.max_job_reads && !all_placed(contexts, &observations) {
+    if reads >= options.max_job_reads && unplaced {
         notes.push(format!(
             "stopped after {reads} per-run job reads; a context still reported as `no_evidence` \
              may simply not have run in that window"
