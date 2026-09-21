@@ -472,14 +472,15 @@ impl Registrar {
         let hooks = list_hooks(client, &self.cwd, gh_binary, repo)
             .map_err(|error| observation_failure_from(&error))?;
 
-        let hook = match recorded {
-            Some(hook_id) => hooks
+        let hook = if let Some(hook_id) = recorded {
+            hooks
                 .iter()
                 .find(|hook| hook.get("id").and_then(serde_json::Value::as_u64) == Some(hook_id))
                 .ok_or(ObservationFailure::HookMissing {
                     hook_id: Some(hook_id),
-                })?,
-            None => {
+                })?
+        } else {
+            {
                 // Without durable provenance the only way to recognise this
                 // host's hook is by the URL it should have. If that is not
                 // known either, the honest answer is that the hook could not
