@@ -229,7 +229,7 @@ fn daemon_url_findings(state_dir: &Path, identity: &HostIdentity) -> Vec<Finding
         return Vec::new();
     };
     match advertised {
-        Some(url) if !url.contains(name.as_str()) => vec![Finding::new(
+        Some(url) if !url_names_host(&url, name) => vec![Finding::new(
             FindingCode::UrlDrift,
             Severity::Alarm,
             format!("the running daemon advertises {url}, which does not name this host ({name})"),
@@ -240,6 +240,26 @@ fn daemon_url_findings(state_dir: &Path, identity: &HostIdentity) -> Vec<Finding
         )],
         _ => Vec::new(),
     }
+}
+
+/// Whether `url`'s host component is exactly `name`.
+///
+/// Substring matching would be close enough for today's inputs and wrong in
+/// general: it accepts a URL that merely mentions the host in its PATH, and it
+/// accepts any host that this name is a prefix of. Both are "the URL is not
+/// this host" answered as agreement, which is the one direction this
+/// comparison must never get wrong — a false match reports no drift, and no
+/// drift is indistinguishable from nobody having looked.
+fn url_names_host(url: &str, name: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split('/').next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = host_port
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(host_port, |(host, _)| host);
+    host.trim_end_matches('.')
+        .eq_ignore_ascii_case(name.trim_end_matches('.'))
 }
 
 fn render_reconcile<W: Write>(
@@ -667,6 +687,61 @@ fn render_daemon_status<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use super::url_names_host;
+
+    /// The daemon's advertised URL is compared against this host's identity to
+    /// catch a daemon serving a stale name. A false MATCH is the dangerous
+    /// direction: it reports no drift, and no drift reads exactly like nobody
+    /// having looked.
+    #[test]
+    fn a_url_that_merely_mentions_the_host_does_not_name_it() {
+        let name = "daniels-mac-studio-3.taile2001.ts.net";
+
+        // Control: the real URL for this host matches, so a rejection below
+        // cannot be the matcher refusing everything.
+        assert!(url_names_host(&format!("https://{name}/webhook"), name));
+
+        // Substring matching accepts both of these. Neither is this host.
+        assert!(
+            !url_names_host(&format!("https://elsewhere.example/{name}"), name),
+            "the host lives in the authority, not the path"
+        );
+        assert!(
+            !url_names_host(
+                "https://daniels-mac-studio-3.taile2001.ts.net/webhook",
+                "daniels-mac-studio"
+            ),
+            "a name must not match a host it is merely a prefix of"
+        );
+    }
+
+    #[test]
+    fn host_matching_ignores_scheme_port_case_and_trailing_dot() {
+        let name = "daniels-mac-studio-3.taile2001.ts.net";
+        assert!(url_names_host(
+            "https://daniels-mac-studio-3.taile2001.ts.net",
+            name
+        ));
+        assert!(url_names_host(
+            "https://daniels-mac-studio-3.taile2001.ts.net:8443/webhook",
+            name
+        ));
+        assert!(url_names_host(
+            "https://DANIELS-MAC-STUDIO-3.TAILE2001.TS.NET/webhook",
+            name
+        ));
+        // `tailscale status --json` reports DNSName with a trailing dot.
+        assert!(url_names_host(
+            "https://daniels-mac-studio-3.taile2001.ts.net./webhook",
+            name
+        ));
+        // A collision-suffixed rename is a different host.
+        assert!(!url_names_host(
+            "https://daniels-mac-studio.taile2001.ts.net/webhook",
+            name
+        ));
+    }
+
     use std::process::ExitCode;
     #[cfg(unix)]
     use std::time::{Duration, Instant};
