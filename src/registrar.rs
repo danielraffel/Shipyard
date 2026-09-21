@@ -479,15 +479,32 @@ impl Registrar {
                 .ok_or(ObservationFailure::HookMissing {
                     hook_id: Some(hook_id),
                 })?,
-            None => hooks
-                .iter()
-                .find(|hook| {
-                    hook.get("config")
-                        .and_then(|config| config.get("url"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(desired_url)
-                })
-                .ok_or(ObservationFailure::HookMissing { hook_id: None })?,
+            None => {
+                // Without durable provenance the only way to recognise this
+                // host's hook is by the URL it should have. If that is not
+                // known either, the honest answer is that the hook could not
+                // be IDENTIFIED — not that it is missing. Reporting absence
+                // here would turn "we could not look" into a finding that
+                // reads like a completed check, which is the exact confusion
+                // this module exists to remove.
+                if desired_url.trim().is_empty() {
+                    return Err(ObservationFailure::Unreadable {
+                        detail: "this host's hook cannot be identified: no local \
+                                 provenance, and no intended URL to match against \
+                                 because the host identity is unreadable"
+                            .to_owned(),
+                    });
+                }
+                hooks
+                    .iter()
+                    .find(|hook| {
+                        hook.get("config")
+                            .and_then(|config| config.get("url"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(desired_url)
+                    })
+                    .ok_or(ObservationFailure::HookMissing { hook_id: None })?
+            }
         };
 
         let hook_id = hook
@@ -1919,6 +1936,37 @@ esac
     ///
     /// Dropping it would silently shorten a failure run below the alarm
     /// threshold and convert a decoding bug into silence.
+    /// "We could not look" must not be reported as "we looked and it is gone".
+    #[cfg(unix)]
+    #[test]
+    fn an_unidentifiable_hook_is_unreadable_not_missing() {
+        use crate::webhook_reconcile::ObservationFailure;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::Ok);
+        let registrar = stub_registrar(temp.path());
+
+        // No local provenance AND no intended URL: the hook is unidentifiable.
+        let failure = registrar
+            .observe_with_gh("owner/repo", "", &gh)
+            .expect_err("an unidentifiable hook must not observe successfully");
+        assert!(
+            matches!(failure, ObservationFailure::Unreadable { .. }),
+            "expected Unreadable, got {failure:?}"
+        );
+
+        // Control: with an intended URL the same call reaches a real verdict
+        // about absence, so the branch above is a distinction and not a
+        // blanket refusal.
+        let failure = registrar
+            .observe_with_gh("owner/repo", "https://known.test/webhook", &gh)
+            .expect_err("the stub lists no hooks");
+        assert!(
+            matches!(failure, ObservationFailure::HookMissing { hook_id: None }),
+            "expected HookMissing, got {failure:?}"
+        );
+    }
+
     #[test]
     fn an_undecodable_delivery_counts_as_unreachable_rather_than_vanishing() {
         let hook = serde_json::json!({
