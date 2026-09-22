@@ -1972,7 +1972,11 @@ labels = ["self-hosted", "Linux", "ARM64", "pulp-host-macbook-air"]
 
 Active expected hosts default to `min_online = 1`; absent or offline matches are
 reported as `expected_host_unavailable`. Inactive hosts remain visible without
-making the command unhealthy. It is read-only and exits non-zero when a host is
+making the command unhealthy. A declared host whose labels cannot serve
+`--target` carries `serves_target: false`, prints under an `other targets`
+heading, and does not raise the top-level verdict — a Linux or Intel-Mac
+shortfall is inventory news, not a fault in the macOS lane you asked about.
+It is read-only and exits non-zero when a host is
 unreadable/unhealthy, a merge-group Linux build requests `ubuntu-latest` while
 an online idle self-hosted Linux x64 runner exists, or queued macOS work is older
 than `--queued-age-threshold-secs` while routable capacity exists. Use
@@ -1981,6 +1985,25 @@ That limit does not cover merge-queue, enrollment, or release calls, so every
 GitHub read in one fleet tick also shares a 30-second absolute deadline. An
 expired tick renders a fail-closed partial assessment; do not wrap the command
 in a longer retry loop or treat missing observations as idle capacity.
+
+**`routable=false` is not always a capacity fact — read `routing_confidence`.**
+A host reports its own GitHub reads, and those share an IP rate limit and the
+host's network, so a read that merely did not complete used to make otherwise
+healthy capacity unroutable: one org-scope timeout produced `routable_free=0`
+against `free=4` while the repo scope read fine seconds later. A failed read is
+now classified `transient` (timeout, 5xx, rate limit), `denied` (401/403, bad
+credentials), or `unclassified`. Only a transient one is retried, so a 403 never
+burns quota on a retry that cannot help. Transient markers are matched *before*
+status codes on purpose: GitHub serves a rate limit as HTTP 403, so a
+status-first reading calls the commonest recoverable failure permanent. When the
+controller's own repo-scope census answered and found online lane runners, a
+host's non-denied read failure is demoted to a named `degraded_observations`
+entry and the report carries `routing_confidence=degraded` plus
+`routing_degraded_reasons` — the gap is never dropped, because "I could not read
+X" and "X says no" must not look alike. A denial keeps its host unroutable, and
+so does any gap with nothing to corroborate it: a tick where nothing was
+readable still reports zero routable slots. `runners.attempts` and
+`runners.boundary` say how the central census itself fared.
 
 The report retains optional workflows, finds queued jobs inside `in_progress`
 workflows, and compares exact merge-group SHAs. A tick spends at most two
