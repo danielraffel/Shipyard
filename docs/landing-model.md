@@ -128,9 +128,9 @@ names the response field it came from, and the report always opens with:
 | `queued` | `isInMergeQueue` is true (position from `mergeQueueEntry`) | nothing; do not re-arm |
 | `armed_not_queued` | `autoMergeRequest` set, not yet admitted | nothing; the queue admits it when checks pass |
 | `never_armed` | open, not armed, no removal in the timeline window | `shipyard ship --pr <n>` |
-| `ejected` | last `RemovedFromMergeQueueEvent` was not `merged`, not queued, not armed | with a new head since: `shipyard ship --pr <n>`; without one: push a fix first |
+| `ejected` | last `RemovedFromMergeQueueEvent` was not `merged`, not queued, not armed | new head since, or `invalid_merge_commit`: `shipyard ship --pr <n>`; same head after `failed_checks`/`merge_conflict`: push a fix first; same head after any other reason (`manual`, ...): confirm with whoever dequeued it |
 | `merged` / `closed` | PR state | nothing |
-| `unknown` | the read failed or was malformed; exit `9` | do not act |
+| `unknown` | the read failed or was malformed, or the timeline window is truncated and shows no removal and no new head; exit `9` | do not act |
 
 History is read in **timeline order**, not by commit date and not from
 `RemovedFromMergeQueueEvent.beforeCommit` (unreliable): a new head is a
@@ -145,7 +145,8 @@ is true the report says `TRUNCATED` and the counts are lower bounds. Actor
 identity is not consulted: every queue mutation is attributed to the same App
 actor whether Shipyard or an agent issued it.
 
-The same classifier guards the `ghapp` wrapper: `ghapp_queue_arm_guard.py`
+Operator overrides for the guard are in `docs/ghapp-guards.md`. The same
+classifier guards the `ghapp` wrapper: `ghapp_queue_arm_guard.py`
 refuses to arm or enqueue a PR in any class whose next action above is not
 "land it". Its Python twin and this Rust classifier assert against the same
 real-response corpus in `tests/fixtures/github/`.

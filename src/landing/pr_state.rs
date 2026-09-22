@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::cloud::GitHubActions;
 use crate::pr_queue_state::{
     PR_QUEUE_STATE_QUERY, PrQueueReport, PrQueueState, REST_AUTO_MERGE_PREFACE,
-    explain_pr_queue_state,
+    explain_pr_queue_state, same_head_requeue_allowed, same_head_requeue_cascades,
 };
 
 /// Machine-readable envelope for one PR's queue state.
@@ -109,15 +109,32 @@ pub fn next_action(state: &PrQueueState, pr: u64) -> String {
             new_head_since_removal: true,
             ..
         } => format!(
-            "Ejected ({reason}) and a new head has been pushed since. Re-land it with \
+            "Removed from the queue ({reason}) and a new head has been pushed since. Re-land \
+             it with \
              `shipyard ship --pr {pr}`."
         ),
-        PrQueueState::Ejected { reason, at, .. } => format!(
-            "Ejected ({reason}{}) and the head has not changed. Re-enqueuing the same head under \
-             ALLGREEN fails its batch-mates: push a fix first, then `shipyard ship --pr {pr}`.",
-            at.as_deref()
-                .map_or_else(String::new, |at| format!(" at {at}"))
-        ),
+        PrQueueState::Ejected { reason, at, .. } => {
+            let at = at.as_deref().unwrap_or("an unknown time");
+            if same_head_requeue_cascades(reason) {
+                format!(
+                    "Ejected for {reason} at {at} and the head has not changed. Re-enqueuing the \
+                     same head under ALLGREEN fails its batch-mates: push a fix first, then \
+                     `shipyard ship --pr {pr}`."
+                )
+            } else if same_head_requeue_allowed(reason) {
+                format!(
+                    "Removed from the queue ({reason}) at {at}: GitHub could not build the merge \
+                     commit, which says nothing against this head. Re-land it with \
+                     `shipyard ship --pr {pr}`."
+                )
+            } else {
+                format!(
+                    "Removed from the queue ({reason}) at {at} and the head has not changed. \
+                     Confirm with whoever dequeued it before re-enqueuing with \
+                     `shipyard ship --pr {pr}`."
+                )
+            }
+        }
         PrQueueState::Unknown { detail } => {
             format!("UNKNOWN ({detail}). Do not act on this PR's queue state until it can be read.")
         }
@@ -293,5 +310,34 @@ mod tests {
             7,
         );
         assert!(unchanged.contains("push a fix first"), "{unchanged}");
+        let manual = next_action(
+            &PrQueueState::Ejected {
+                reason: "manual".to_owned(),
+                at: Some("2026-09-22T21:30:26Z".to_owned()),
+                new_head_since_removal: false,
+                requeues_without_new_head: 0,
+            },
+            7,
+        );
+        assert!(
+            manual.contains("Removed from the queue (manual) at 2026-09-22T21:30:26Z"),
+            "{manual}"
+        );
+        assert!(
+            manual.contains("Confirm with whoever dequeued it"),
+            "{manual}"
+        );
+        assert!(!manual.contains("ALLGREEN"), "{manual}");
+        for state in [
+            PrQueueState::NeverArmed,
+            PrQueueState::Unknown {
+                detail: "x".to_owned(),
+            },
+        ] {
+            let action = next_action(&state, 7);
+            for name in ["GHAPP_ALLOW", "SHIPYARD_INTERNAL"] {
+                assert!(!action.contains(name), "{action}");
+            }
+        }
     }
 }

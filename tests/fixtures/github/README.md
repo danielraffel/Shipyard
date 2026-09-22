@@ -1,6 +1,8 @@
 # Real GitHub responses: merge-queue PR states
 
-Every JSON file in this directory except `expected_classifications.json` is an
+Every JSON file in this directory except `expected_classifications.json` and
+the two `pr_synthetic_*.json` files (which carry a top-level `_synthetic` note and
+are marked `"synthetic": true` in the answer key) is an
 **unedited response captured from the live GitHub API for
 `Generous-Corp/pulp`** on **2026-09-22** (between 14:23 and 14:38 PDT). None of
 them is synthetic. They exist because the synthetic fixtures elsewhere in
@@ -16,6 +18,10 @@ wrong in at least one way that mattered (see "The trap" below).
 | `pr_armed_not_queued.json` | 8678 | Auto-merge enabled, not yet in the queue. |
 | `pr_ejected_requeued.json` | 8702 | Added, Removed(`failed_checks`), Added again with **no commit between**: a re-enqueue of the same head, which under `ALLGREEN` grouping fails its batch-mates. Currently queued at position 3. |
 | `pr_ejected_history.json` | 8638 | One `merge_conflict` removal fixed by a commit, then four `failed_checks` removals each followed by a re-add with no commit between. Later a new commit and a fresh `AutoMergeEnabledEvent`: currently armed after a new head, which is legitimate. |
+| `pr_ejected_new_head.json` | 8722 | Removed from the queue (`manual`), then two new commits; not armed, not queued. Captured 15:3x PDT the same day. |
+| `pr_rearmed_after_manual_removal.json` | 8688 | Removed (`manual`), force-pushed and new commits, then re-armed. Captured 15:3x PDT the same day. |
+| `pr_synthetic_ejected_same_head.json` | 8702 | **SYNTHETIC.** 8702 with its final re-add dropped and marked out of the queue: same-head after `failed_checks`. No live open PR was in this state when the corpus was captured. |
+| `pr_synthetic_truncated_window.json` | 900001 | **SYNTHETIC.** Hand-built: `hasPreviousPage: true` and no removal or new head in the window, which must classify `unknown`. |
 | `pr_merged.json` | 8721 | `MergedEvent` then `RemovedFromMergeQueueEvent(reason: merged)`. The removal is **not** an ejection. |
 | `rest_pull_queued.json` | 8669 | `GET repos/Generous-Corp/pulp/pulls/8669` while the PR was queued, trimmed to the fields that matter. `auto_merge` is `null`. |
 | `ruleset_merge_queue.json` | - | `GET repos/Generous-Corp/pulp/rulesets/19431100` (`MERGE`, `ALLGREEN`, merge 5, build 3). |

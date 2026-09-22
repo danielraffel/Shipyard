@@ -47,8 +47,29 @@ pub const REST_AUTO_MERGE_PREFACE: &str = "REST pulls/<n>.auto_merge is null for
      (GitHub consumes auto-merge on enqueue) — never read it as 'unarmed'.";
 
 /// Removal reasons after which re-adding the *same* head is a known failure:
-/// the head's checks already failed, or it already conflicted.
+/// the head's checks already failed, or it already conflicted. Under `ALLGREEN`
+/// grouping such a re-add fails every batch-mate with it.
 const RETRY_HAZARD_REASONS: &[&str] = &["failed_checks", "merge_conflict"];
+
+/// Whether re-enqueuing the unchanged head after a removal for `reason` is the
+/// `ALLGREEN` cascade (`failed_checks`, `merge_conflict`).
+#[must_use]
+pub fn same_head_requeue_cascades(reason: &str) -> bool {
+    RETRY_HAZARD_REASONS
+        .iter()
+        .any(|hazard| reason.eq_ignore_ascii_case(hazard))
+}
+
+/// Whether the unchanged head may be re-enqueued after a removal for `reason`.
+///
+/// Only `invalid_merge_commit`: GitHub failed to build the merge commit, which
+/// says nothing against the head, and it is the one removal Shipyard's own
+/// admission policy re-arms after. Every other reason needs either a new head
+/// or a person who knows why it was removed.
+#[must_use]
+pub fn same_head_requeue_allowed(reason: &str) -> bool {
+    reason.eq_ignore_ascii_case("invalid_merge_commit")
+}
 
 /// The merge-queue state of one pull request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -273,9 +294,7 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                     .and_then(Value::as_str)
                     .unwrap_or("UNKNOWN")
                     .to_owned();
-                hazard_pending = RETRY_HAZARD_REASONS
-                    .iter()
-                    .any(|hazard| reason.eq_ignore_ascii_case(hazard));
+                hazard_pending = same_head_requeue_cascades(&reason);
                 let at = node
                     .get("createdAt")
                     .and_then(Value::as_str)
@@ -303,6 +322,7 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
         ),
     );
 
+    let last_removal_seen = last_removal.as_ref().map(|(index, _, _)| *index);
     let last_ejection = last_removal
         .filter(|(_, reason, _)| !reason.eq_ignore_ascii_case("merged"))
         .map(|(index, reason, at)| Ejection {
@@ -358,6 +378,18 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                 new_head_since_removal: ejection.new_head_since,
                 requeues_without_new_head: requeues,
             },
+            // A truncated window with no removal and no new head in it could
+            // be hiding an older same-head ejection; that is not "never armed".
+            None if timeline_complete == Some(false)
+                && last_removal_seen.is_none()
+                && last_new_head.is_none() =>
+            {
+                PrQueueState::Unknown {
+                    detail: "timelineItems window is truncated and contains no queue removal and \
+                             no new head, so an older ejection of this head cannot be ruled out"
+                        .to_owned(),
+                }
+            }
             None => PrQueueState::NeverArmed,
         },
         other => {
@@ -552,12 +584,25 @@ mod tests {
                 PrQueueState::ArmedNotQueued { enabled_at, .. } => {
                     assert_eq!(enabled_at.as_deref(), want["enabled_at"].as_str());
                 }
+                PrQueueState::Ejected {
+                    reason,
+                    new_head_since_removal,
+                    ..
+                } => {
+                    assert_eq!(Some(reason.as_str()), want["reason"].as_str(), "{name}");
+                    assert_eq!(
+                        Some(*new_head_since_removal),
+                        want["new_head_since_removal"].as_bool(),
+                        "{name}"
+                    );
+                }
                 _ => {}
             }
             checked += 1;
         }
-        // Control: the loop must actually have visited the corpus.
-        assert_eq!(checked, 6);
+        // Control: the loop must actually have visited the whole corpus,
+        // including the real ejected captures and the labelled synthetic ones.
+        assert_eq!(checked, 10);
     }
 
     #[test]
@@ -612,6 +657,20 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn truncated_window_without_removal_or_new_head_is_unknown() {
+        let value = fixture("pr_synthetic_truncated_window.json");
+        assert!(matches!(
+            classify_pr_queue_state(&value),
+            PrQueueState::Unknown { .. }
+        ));
+        // Control: the same window marked complete is an ordinary never-armed PR.
+        let mut complete = value;
+        complete["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"]["hasPreviousPage"] =
+            Value::from(false);
+        assert_eq!(classify_pr_queue_state(&complete), PrQueueState::NeverArmed);
     }
 
     #[test]

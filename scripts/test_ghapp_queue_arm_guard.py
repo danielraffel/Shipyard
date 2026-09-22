@@ -63,14 +63,20 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
                 self.assertEqual(ejection and ejection["reason"], want["last_ejection_reason"])
                 if "last_ejection_new_head_since" in want:
                     self.assertEqual(ejection["new_head_since"], want["last_ejection_new_head_since"])
-                for key in ("entry_state", "position", "enabled_at"):
+                for key in ("entry_state", "position", "enabled_at", "reason", "new_head_since_removal"):
                     if key in want:
                         self.assertEqual(got[key], want[key])
                 allowed, _ = guard.decide(got)
                 self.assertEqual("allow" if allowed else "refuse", want["guard"])
                 checked += 1
-        # Control: the corpus was actually visited.
-        self.assertEqual(checked, 6)
+        # Control: the whole corpus, real and labelled-synthetic, was visited.
+        self.assertEqual(checked, 10)
+
+    def test_synthetic_fixtures_are_labelled(self) -> None:
+        for name, want in expectations().items():
+            with self.subTest(fixture=name):
+                self.assertEqual(bool(want.get("synthetic")), "_synthetic" in fixture(name))
+                self.assertEqual(bool(want.get("synthetic")), "synthetic" in name)
 
     def test_merged_removal_is_not_an_ejection(self) -> None:
         response = fixture("pr_merged.json")
@@ -143,6 +149,7 @@ class QueueArmGuardTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("already in the merge queue at position 1", message)
         self.assertIn("REST auto_merge=null is expected", message)
+        self.assertIn("`shipyard landing --pr <n>`", message)
         self.assertIn("number=8669", calls[0])
 
     def test_re_enqueued_queued_pr_is_refused(self) -> None:
@@ -160,17 +167,62 @@ class QueueArmGuardTests(unittest.TestCase):
         self.assertIn("already armed since 2026-09-21T23:10:04Z", message)
         self.assertIn("queue will pick it up", message)
 
-    def test_same_head_ejection_is_refused_and_names_the_override(self) -> None:
-        response = fixture("pr_ejected_requeued.json")
-        pr = response["data"]["repository"]["pullRequest"]
-        pr["isInMergeQueue"] = False
-        pr["mergeQueueEntry"] = None
-        pr["timelineItems"]["nodes"].pop()
-        code, message, _ = self.run_guard(["pr", "merge", "8702", "--auto"], [response])
+    def test_same_head_ejection_is_refused_with_the_correct_path(self) -> None:
+        code, message, _ = self.run_guard(
+            ["pr", "merge", "8702", "--auto"], [fixture("pr_synthetic_ejected_same_head.json")]
+        )
         self.assertEqual(code, 1)
         self.assertIn("ejected for failed_checks at 2026-09-22T20:29:00Z", message)
-        self.assertIn("push a fix first", message)
-        self.assertIn("GHAPP_ALLOW_QUEUE_REARM=1", message)
+        self.assertIn("Push a fix first, then `shipyard ship --pr 8702`", message)
+        self.assertIn("see docs/ghapp-guards.md", message)
+
+    def test_manual_same_head_removal_is_refused_with_reason_wording(self) -> None:
+        response = fixture("pr_ejected_new_head.json")
+        pr = response["data"]["repository"]["pullRequest"]
+        nodes = pr["timelineItems"]["nodes"]
+        while nodes[-1]["__typename"] == "PullRequestCommit":
+            nodes.pop()
+        code, message, _ = self.run_guard(["pr", "merge", "8722", "--auto"], [response])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "removed from the queue (manual) at 2026-09-22T21:30:26Z", message
+        )
+        self.assertIn("confirm with whoever dequeued it", message)
+        self.assertNotIn("ALLGREEN", message)
+
+    def test_invalid_merge_commit_same_head_is_allowed(self) -> None:
+        response = fixture("pr_synthetic_ejected_same_head.json")
+        pr = response["data"]["repository"]["pullRequest"]
+        for node in pr["timelineItems"]["nodes"]:
+            if node["__typename"] == "RemovedFromMergeQueueEvent":
+                node["reason"] = "invalid_merge_commit"
+        code, _, _ = self.run_guard(["pr", "merge", "8702", "--auto"], [response])
+        self.assertEqual(code, 0)
+
+    def test_refusal_text_never_names_bypass_or_override_variables(self) -> None:
+        refusals = [
+            (["pr", "merge", "8669", "--auto"], [fixture("pr_queued.json")]),
+            (["pr", "merge", "8678", "--auto"], [fixture("pr_armed_not_queued.json")]),
+            (["pr", "merge", "8702", "--auto"], [fixture("pr_synthetic_ejected_same_head.json")]),
+            (["pr", "merge", "8721", "--auto"], [fixture("pr_merged.json")]),
+            (["pr", "merge", "1", "--auto"], [fixture("pr_synthetic_truncated_window.json")]),
+            (["pr", "merge", "1", "--auto"], [guard.GuardError("HTTP 502")]),
+            (["api", "graphql", "--input", "-"], []),
+        ]
+        for args, responses in refusals:
+            with self.subTest(args=args):
+                code, message, _ = self.run_guard(args, responses)
+                self.assertEqual(code, 1)
+                self.assertIn("docs/ghapp-guards.md", message)
+                for name in ("GHAPP_ALLOW_QUEUE_REARM", "SHIPYARD_INTERNAL_QUEUE_MUTATION"):
+                    self.assertNotIn(name, message)
+
+    def test_truncated_window_is_refused_as_unknown(self) -> None:
+        code, message, _ = self.run_guard(
+            ["pr", "merge", "900001", "--auto"], [fixture("pr_synthetic_truncated_window.json")]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("truncated", message)
 
     def test_ejection_with_new_head_is_allowed(self) -> None:
         response = fixture("pr_ejected_requeued.json")

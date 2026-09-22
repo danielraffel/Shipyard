@@ -20,9 +20,10 @@ Refused: ``queued``, ``armed_not_queued``, ``ejected`` with no new head since
 the last removal, ``merged``, ``closed`` and anything unreadable. Allowed:
 ``never_armed`` and ``ejected`` after a new head.
 
-``SHIPYARD_INTERNAL_QUEUE_MUTATION=1`` marks Shipyard's own exact-head,
-audited enqueue path and bypasses the guard. ``GHAPP_ALLOW_QUEUE_REARM=1`` is
-an explicit human override and always prints a WARNING.
+Shipyard's own exact-head, audited enqueue path carries an internal marker
+and bypasses the guard; an operator override exists and always prints a
+WARNING. Both are documented for humans in docs/ghapp-guards.md and are kept
+out of refusal text.
 
 Actor identity is deliberately not consulted: every queue mutation is
 attributed to the same App actor whether Shipyard or an agent issued it.
@@ -44,6 +45,10 @@ from typing import Any
 
 ARM_MUTATIONS = ("enablepullrequestautomerge", "enqueuepullrequest")
 RETRY_HAZARD_REASONS = ("failed_checks", "merge_conflict")
+SAME_HEAD_REQUEUE_ALLOWED_REASONS = ("invalid_merge_commit",)
+OPERATOR_NOTE = (
+    "An explicit authority override exists for operators; see docs/ghapp-guards.md."
+)
 REST_AUTO_MERGE_NOTE = (
     "REST pulls/<n>.auto_merge is null for every queued PR (GitHub consumes "
     "auto-merge on enqueue); never read it as 'unarmed'."
@@ -218,43 +223,67 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
                 "new_head_since_removal": last_ejection["new_head_since"],
             }
         )
+    elif timeline_complete is False and last_removal is None and last_new_head is None:
+        # A truncated window with no removal and no new head could be hiding an
+        # older same-head ejection; that is not "never armed".
+        result.update(
+            {
+                "class": "unknown",
+                "detail": "timelineItems window is truncated and contains no queue removal and "
+                "no new head, so an older ejection of this head cannot be ruled out",
+            }
+        )
     else:
         result["class"] = "never_armed"
     return result
 
 
 def decide(classification: dict[str, Any]) -> tuple[bool, str]:
-    """Return ``(allowed, message)`` for one classified pull request."""
-    label = f"PR #{classification.get('pr', '?')}"
+    """Return ``(allowed, message)`` for one classified pull request.
+
+    Refusal text names the correct path only. Override mechanisms are
+    documented for operators in docs/ghapp-guards.md and deliberately not
+    spelled out here, where an agent would read them as the next step.
+    """
+    number = classification.get("pr", "?")
+    label = f"PR #{number}"
+    land = f"`shipyard ship --pr {number}`"
     klass = classification.get("class")
+    reason = str(classification.get("reason") or "unknown")
+    at = classification.get("at") or "an unknown time"
     if klass == "never_armed":
         return True, f"{label} is not armed and not queued"
     if klass == "ejected" and classification.get("new_head_since_removal"):
-        return True, f"{label} was ejected ({classification.get('reason')}) and has a new head since"
+        return True, f"{label} was removed ({reason}) and has a new head since"
+    if klass == "ejected" and reason.lower() in SAME_HEAD_REQUEUE_ALLOWED_REASONS:
+        return True, f"{label} was removed ({reason}); GitHub-side, nothing against this head"
     if klass == "queued":
         position = classification.get("position")
         where = f" at position {position}" if position is not None else ""
         return False, (
-            f"{label} is already in the merge queue{where} — nothing to do; "
-            "REST auto_merge=null is expected. " + REST_AUTO_MERGE_NOTE
+            f"{label} is already in the merge queue{where}; nothing to do. "
+            "REST auto_merge=null is expected: " + REST_AUTO_MERGE_NOTE
         )
     if klass == "armed_not_queued":
         since = classification.get("enabled_at") or "an unknown time"
         return False, (
             f"{label} is already armed since {since}; the queue will pick it up. Nothing to do."
         )
+    if klass == "ejected" and reason.lower() in RETRY_HAZARD_REASONS:
+        return False, (
+            f"{label} was ejected for {reason} at {at}; re-enqueuing the same head under "
+            f"ALLGREEN fails its batch-mates. Push a fix first, then {land}."
+        )
     if klass == "ejected":
         return False, (
-            f"{label} was ejected for {classification.get('reason')} at "
-            f"{classification.get('at') or 'an unknown time'}; re-enqueuing the same head under "
-            "ALLGREEN fails its batch-mates — push a fix first; override GHAPP_ALLOW_QUEUE_REARM=1"
+            f"{label} was removed from the queue ({reason}) at {at} and the head has not "
+            f"changed; confirm with whoever dequeued it before re-enqueuing with {land}."
         )
     if klass in ("merged", "closed"):
         return False, f"{label} is {klass}; there is nothing to arm"
     return False, (
         f"{label} merge-queue state could not be determined "
-        f"({classification.get('detail', 'unknown')}); refusing to arm blind. "
-        "Check `shipyard landing --pr <n>`."
+        f"({classification.get('detail', 'unknown')}); refusing to arm blind"
     )
 
 
@@ -482,7 +511,11 @@ def main(args: list[str]) -> int:
         message = f"refusing ambiguous queue-arm request: {error}"
         if override:
             return _override(message)
-        print(f"queue-arm-guard: {message}", file=sys.stderr)
+        print(
+            f"queue-arm-guard: {message}. Inspect the PR with `shipyard landing --pr <n>` and "
+            f"land it with `shipyard ship --pr <n>`. {OPERATOR_NOTE}",
+            file=sys.stderr,
+        )
         return 1
     if targets is None:
         return 0
@@ -493,8 +526,8 @@ def main(args: list[str]) -> int:
     if override:
         return _override(message)
     print(
-        f"queue-arm-guard: refusing: {message}. Check `shipyard landing --pr <n>` and land with "
-        "`shipyard ship --pr <n>`.",
+        f"queue-arm-guard: refusing: {message} Inspect it with `shipyard landing --pr <n>`. "
+        f"{OPERATOR_NOTE}",
         file=sys.stderr,
     )
     return 1
