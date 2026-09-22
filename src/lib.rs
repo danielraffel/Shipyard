@@ -118,6 +118,8 @@ pub mod init_config;
 /// Job and target-result domain types used by executors and queues.
 pub mod job;
 pub mod landability;
+/// Reporting how work actually merges in a repository.
+pub mod landing;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
 /// Bounded log rotation, terminal classification, and retention primitives.

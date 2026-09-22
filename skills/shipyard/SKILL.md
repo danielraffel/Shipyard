@@ -3300,3 +3300,98 @@ Two reader traps that cost time:
   scalar. The whole-directory control (`parsed + refused` against a listing of
   `.github/workflows/`, printed every run) is what surfaced that; without it the
   file was silently unchecked.
+
+---
+
+## `src/landing/` — the repository's landing model
+
+`landability` answers "can this pull request's required contexts be
+*scheduled*". `landing` answers the other half: **what happens to a pull
+request whose contexts are green.** Same discipline, different question, and
+they are siblings rather than one inside the other.
+
+| module | owns |
+|---|---|
+| `queue.rs` | merge-queue determination across the surfaces that can express one, plus strict protection and the enqueue guidance derived from it |
+| `placement.rs` | required context → the runner identity that actually picked its job up |
+| `backlog.rs` | open pull requests counted by `mergeStateStatus` |
+| `gather.rs` | the reads; nothing here mutates |
+| `render.rs` | human and `--json` forms |
+
+### The endpoint that lies by omission
+
+`GET /repos/{o}/{r}/branches/{b}/protection` has **no merge-queue field at
+all**. A repository with an actively enforcing queue answers that call with a
+clean `200 OK` whose every field is accurate and whose omission is total. It
+does not return `false`; it is silent, and silence reads as `false` to anybody
+who only asks there. The cost of that reading is concrete: an agent
+hand-rebased a 38-pull-request backlog one at a time on a repository whose
+`ALLGREEN` queue had been batching five at a time all along.
+
+So branch protection is modelled as a surface that **cannot vote**:
+`SurfaceOutcome::Inexpressible`, printed as `cannot-say`. The queue comes from
+`GET /repos/{o}/{r}/rulesets` plus a **per-ruleset detail call** — the list
+carries no `rules` array, so the list alone can never find a queue however
+carefully you read it — corroborated against GraphQL
+`repository.mergeQueue(branch:)`.
+
+Three traps in that read:
+
+- **A failed detail call unreads the whole surface.** The rule that matters may
+  be in exactly the ruleset that 502'd, so a partial ruleset read is `Unknown`,
+  not `Absent`.
+- **`~DEFAULT_BRANCH` needs the default branch to resolve**, which is why the
+  GraphQL query fetches `defaultBranchRef` alongside the queue. An unresolvable
+  alias is treated as covering: over-including reports a queue that may not
+  apply to an unusual base, under-including hides a live one, and only the
+  second costs a session.
+- **GraphQL reports `checkResponseTimeout` in seconds** while the rulesets API
+  and the web UI use minutes. It is normalized to minutes rather than printed
+  in a unit the reader has to convert.
+
+### Combination is fail-closed
+
+Any voting surface finds a queue → `Present`, with the disagreement printed
+rather than resolved silently. Otherwise any voting surface unreadable →
+`Unknown`. Otherwise, and only otherwise, `Absent`. **One readable surface
+finding nothing does not license absence while another is blind** — that
+asymmetry is the whole design, because the expensive error here is the false
+negative, not the false positive.
+
+### Placement comes from the job, never from `runs-on:`
+
+`runs-on:` is a request. It is routinely `fromJSON(vars.X_RUNS_ON_JSON)`, whose
+value is not in the workflow file, and even a literal only says what was asked
+for. `runner_name` / `runner_group_name` on a completed job say what answered.
+
+- A hosted runner is `GitHub Actions <n>` in group `GitHub Actions`. Everything
+  else with a runner identity is self-hosted — including hosted *larger*
+  runners' custom groups, which is why the name prefix is checked as well as
+  the group.
+- **A skipped job carries `runner_name: null`**, and on a conditional-heavy
+  workflow most jobs in any run are skipped. Those are `no_evidence`, never a
+  placement — and "a job with this name was found but never executed" is
+  reported distinctly from "no job with this name", because only the first
+  tells you the context name is right.
+- A required `pull_request` context posts on a **pull request head**, not on the
+  base branch head, which carries `push`-event checks instead. So the run that
+  produced a context is found from open pull-request heads'
+  `commits/{sha}/check-runs`, up to three candidate runs per context
+  (interleaved, so every context gets a first attempt before any gets a
+  second), with the recent-completed-runs sweep as a bounded fallback. More
+  than one candidate is needed because a context is routinely *satisfied* by a
+  skipped job, and one candidate would report such a gate as unplaceable even
+  though it runs on every other pull request in the backlog.
+- The run id is taken from the `/actions/runs/<id>/` segment of a check run's
+  `html_url` and the trailing `/job/<id>` is deliberately ignored: handing the
+  jobs endpoint something that is not an Actions job id returns a coherent,
+  wrong answer rather than an error.
+
+### Tests are paired, and the negative cell is the load-bearing one
+
+`src/landing/tests.rs` carries a `protection_only_queue_verdict` reference
+implementation — the shortcut that ships by default, because branch protection
+is the endpoint everybody reaches for first. The real-world fixture asserts
+both that `determine_queue` reports the queue **and** that the shortcut,
+handed the identical payload, answers `absent`. A test that has never been run
+against a wrong implementation has not been shown to be capable of failing.
