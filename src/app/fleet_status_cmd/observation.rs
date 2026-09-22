@@ -193,15 +193,22 @@ pub(super) fn reconcile_enrollment_snapshot(
             if pull_base != base {
                 continue;
             }
+            // REST `auto_merge` is null for every queued PR (GitHub consumes
+            // the request on enqueue). This entry left the queue snapshot, so a
+            // null here normally means the authority really was cleared, except
+            // when the PR was ejected and re-enqueued between the snapshot and
+            // this read. Re-check membership before reporting a clearance.
+            let auto_merge_cleared = pull.get("auto_merge").is_none_or(Value::is_null)
+                && !pr_is_in_merge_queue(actions, repo, previous_entry.pr)?;
             retained.push(EnrollmentSnapshotEntry {
                 pr: previous_entry.pr,
                 head_sha: previous_entry.head_sha,
                 enqueued_at: previous_entry.enqueued_at,
                 head_observed_at: previous_entry.head_observed_at,
-                auto_merge_cleared: pull.get("auto_merge").is_none_or(Value::is_null),
+                auto_merge_cleared,
                 last_checked_at: Some(Utc::now().to_rfc3339()),
             });
-            if pull.get("auto_merge").is_none_or(Value::is_null) {
+            if auto_merge_cleared {
                 cleared.push(previous_entry.pr);
             }
         }
@@ -238,6 +245,36 @@ pub(super) fn reconcile_enrollment_snapshot(
         .map_err(|error| format!("persist fleet snapshot failed: {error}"))?;
     cleared.sort_unstable();
     Ok((cleared, truncated))
+}
+
+/// Whether GitHub reports the PR in its merge queue right now.
+///
+/// Membership is `isInMergeQueue`; `auto_merge` cannot answer it. An
+/// unreadable answer is an error, never "not queued".
+fn pr_is_in_merge_queue(actions: &GitHubActions, repo: &str, pr: u64) -> Result<bool, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("repo `{repo}` is not OWNER/REPO"))?;
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){isInMergeQueue}}}".to_owned(),
+            "-F".to_owned(),
+            format!("owner={owner}"),
+            "-F".to_owned(),
+            format!("name={name}"),
+            "-F".to_owned(),
+            format!("number={pr}"),
+        ])
+        .map_err(|error| format!("re-check prior queue PR #{pr} membership failed: {error}"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("could not parse PR #{pr} membership JSON: {error}"))?;
+    value
+        .pointer("/data/repository/pullRequest/isInMergeQueue")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("PR #{pr} membership response missing isInMergeQueue"))
 }
 
 pub(super) fn classify_observation_error(reason: &str) -> ObservationReason {

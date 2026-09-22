@@ -1340,7 +1340,7 @@ fn durable_snapshot_detects_open_pr_whose_auto_merge_was_cleared() {
     let actions = fake_gh(
         &temp,
         &format!(
-            "printf x >> '{}'\nprintf '%s' '{{\"state\":\"open\",\"base\":{{\"ref\":\"main\"}},\"auto_merge\":null}}'",
+            "case \"$*\" in\n  *isInMergeQueue*) printf '%s' '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"isInMergeQueue\":false}}}}}}}}' ;;\n  *) printf x >> '{}'\nprintf '%s' '{{\"state\":\"open\",\"base\":{{\"ref\":\"main\"}},\"auto_merge\":null}}' ;;\nesac",
             calls.display()
         ),
     );
@@ -1362,6 +1362,91 @@ fn durable_snapshot_detects_open_pr_whose_auto_merge_was_cleared() {
     assert_eq!(still_cleared, [11]);
     assert!(!still_truncated);
     assert_eq!(fs::read_to_string(calls).expect("calls"), "xx");
+}
+
+/// A PR ejected and re-enqueued between the queue snapshot and the REST read
+/// reports REST `auto_merge: null` (GitHub consumes the request on enqueue)
+/// while GraphQL says it is in the queue. That is not a cleared enrollment.
+#[cfg(unix)]
+#[test]
+fn re_enqueued_pr_with_null_rest_auto_merge_is_not_reported_cleared() {
+    let temp = tempfile::tempdir().expect("temp");
+    let config = crate::config::LoadedConfig {
+        data: toml::Table::new(),
+        global_dir: temp.path().join("global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: crate::config::LocalOverlaySource::None,
+    };
+    let gh = temp.path().join("gh");
+    crate::test_support::write_executable_script(
+        &gh,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *isInMergeQueue*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"isInMergeQueue":true}}}}}}}}' ;;
+  *"repos/owner/repo/pulls/11"*) printf '%s' '{{"state":"open","base":{{"ref":"main"}},"auto_merge":null}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            temp.path().join("calls").display()
+        ),
+    );
+    let actions =
+        GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(gh);
+    let path = enrollment_snapshot_path(temp.path(), "owner/repo", "main");
+    fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    fs::write(
+        &path,
+        r#"{"entries":[{"pr":11,"head_sha":"aaa","observed_at":"2026-07-26T00:00:00Z"}]}"#,
+    )
+    .expect("snapshot");
+
+    let (cleared, truncated) =
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [], true)
+            .expect("reconcile");
+
+    assert!(
+        cleared.is_empty(),
+        "re-enqueued PR falsely reported cleared"
+    );
+    assert!(!truncated);
+    let calls = fs::read_to_string(temp.path().join("calls")).expect("calls");
+    // Control: both reads actually happened, so the verdict rests on the
+    // GraphQL membership answer rather than on a skipped lookup.
+    assert!(calls.contains("repos/owner/repo/pulls/11"), "{calls}");
+    assert!(calls.contains("number=11"), "{calls}");
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(path).expect("snapshot")).expect("JSON");
+    assert_eq!(persisted["entries"][0]["auto_merge_cleared"], false);
+}
+
+/// An unreadable membership re-check fails the observation rather than
+/// guessing "cleared".
+#[cfg(unix)]
+#[test]
+fn unreadable_membership_recheck_fails_closed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"case "$*" in
+  *isInMergeQueue*) echo 'HTTP 502' >&2; exit 1 ;;
+  *) printf '%s' '{"state":"open","base":{"ref":"main"},"auto_merge":null}' ;;
+esac"#,
+    );
+    let path = enrollment_snapshot_path(temp.path(), "owner/repo", "main");
+    fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    fs::write(
+        &path,
+        r#"{"entries":[{"pr":11,"head_sha":"aaa","observed_at":"2026-07-26T00:00:00Z"}]}"#,
+    )
+    .expect("snapshot");
+    let error =
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [], true)
+            .expect_err("unreadable membership must not read as cleared");
+    assert!(error.contains("membership"), "{error}");
 }
 
 #[cfg(unix)]
