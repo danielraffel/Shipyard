@@ -95,6 +95,8 @@ pub mod fleet_supervisor;
 pub mod gate_scripts;
 /// Shared GitHub CLI command boundary and auth resolution.
 pub mod gh;
+/// Install and audit the `ghapp` wrapper's optional queue guards.
+pub mod ghapp_guards;
 /// Branch governance profiles and GitHub branch-protection helpers.
 pub mod governance;
 /// Optional host-health pre-dispatch gate (reads the `host_vitals` signal).

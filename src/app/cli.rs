@@ -114,6 +114,13 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: PinCommand,
     },
+    /// Install or audit the `ghapp` wrapper's queue guards
+    /// (`queue-removal-guard`, `queue-arm-guard`) from this build's copies.
+    Guards {
+        /// Guards subcommand.
+        #[command(subcommand)]
+        command: GuardsCommand,
+    },
     /// Qualify and pin immutable upstream dependencies.
     Dependency {
         /// Dependency family.
@@ -1630,6 +1637,27 @@ pub(super) enum DaemonCommand {
         /// Repo(s) to reconcile. Defaults to the configured repositories.
         #[arg(long = "repo")]
         repos: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum GuardsCommand {
+    /// Report whether each managed guard is installed and identical to this
+    /// build's copy. Exit 1 when any is missing, stale, or not executable.
+    Status {
+        /// Guards directory. Defaults to `$SHIPYARD_GHAPP_GUARDS_DIR` or
+        /// `~/.config/shipyard/guards`, where `ghapp` looks.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Install this build's guards atomically. Never overwrites a symlink.
+    Install {
+        /// Guards directory. Defaults to where `ghapp` looks.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+        /// Report what would change without writing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 

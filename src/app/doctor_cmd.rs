@@ -45,6 +45,12 @@ pub(super) fn doctor<W: Write>(
             report.checks.insert("Runners".to_owned(), section);
         }
     }
+    if let Some(section) = crate::ghapp_guards::doctor_section(
+        &crate::ghapp_guards::default_guards_dir(),
+        &crate::paths::home_dir(),
+    ) {
+        report.checks.insert("ghapp guards".to_owned(), section);
+    }
     if rate_limit {
         let entries = collect_rate_limit_section(mode, cwd, repo);
         report

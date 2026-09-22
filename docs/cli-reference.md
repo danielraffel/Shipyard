@@ -43,6 +43,10 @@ shipyard landing                             # merge queue, strict, enqueue, che
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                      # machine-readable; exit 9 when any headline field is UNKNOWN
 shipyard landing --pr 123                    # one PR: queued / armed_not_queued / ejected / never_armed / merged, with sources
+
+# ghapp queue guards (queue-removal-guard, queue-arm-guard)
+shipyard guards status                       # missing/stale/current vs this build's copies; exit 1 unless all current
+shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
 
 # Monitor

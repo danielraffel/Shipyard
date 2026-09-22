@@ -2429,6 +2429,29 @@ manual authority action requires the loud `GHAPP_ALLOW_QUEUE_REMOVAL=1`
 override. Long-running or pending advisory/self-hosted checks are never queue
 removal authority.
 
+The opposite mistake is guarded too. `scripts/ghapp_queue_arm_guard.py`
+(installed as `queue-arm-guard`, run after the removal guard) intercepts
+`pr merge --auto`, a plain `pr merge` whose base has a merge queue, and GraphQL
+`enablePullRequestAutoMerge` / `enqueuePullRequest` (inline, `query=@file`,
+`--input file`; a stdin body is refused as ambiguous). It reads the PR's live
+`isInMergeQueue` / `mergeQueueEntry` / `autoMergeRequest` / timeline and refuses
+a PR that is already queued (REST `auto_merge` is `null` for every queued PR:
+GitHub consumes it on enqueue), already armed, merged/closed, unreadable, or
+ejected with no new commit or force-push since the last removal (under ALLGREEN
+a same-head re-enqueue fails its batch-mates). `SHIPYARD_INTERNAL_QUEUE_MUTATION=1`
+marks Shipyard's own enqueue and bypasses it; `GHAPP_ALLOW_QUEUE_REARM=1` is the
+loud human override. `shipyard landing --pr <n>` prints the same classification
+with the source field of every fact. Actor identity is never consulted: every
+queue mutation is attributed to the same App actor.
+
+Both queue guards are optional to `ghapp` (absent means skipped), so an
+un-installed or stale copy silently leaves the protection off. `shipyard guards
+install` places this build's exact copies (atomic rename; never overwrites a
+symlink), `shipyard guards status` exits 1 when either is missing or differs by
+content hash, `shipyard doctor` reports them under "ghapp guards" on any host
+with a guards directory or `~/.local/bin/ghapp`, and `shipyard update` refreshes
+them with the newly verified binary when the guards directory exists.
+
 Raw PR closure is protected at the same chokepoint by
 `scripts/ghapp_pr_close_guard.py`. The guard resolves the live base commit and
 always calls GitHub compare as `current-base...PR-head`; in that direction,

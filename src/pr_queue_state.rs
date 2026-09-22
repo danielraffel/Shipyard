@@ -526,8 +526,7 @@ mod tests {
                 report
                     .last_ejection
                     .as_ref()
-                    .map(|ejection| Value::from(ejection.reason.clone()))
-                    .unwrap_or(Value::Null),
+                    .map_or(Value::Null, |ejection| Value::from(ejection.reason.clone())),
                 want["last_ejection_reason"],
                 "{name}"
             );

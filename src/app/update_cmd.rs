@@ -126,6 +126,8 @@ pub(super) fn update_command<W: Write>(
     }
     verify_installed_version(&installed_binary, &target)?;
 
+    refresh_guards_after_update(&installed_binary, json, stdout)?;
+
     if args.refresh_daemon {
         let pid = refresh_daemon_with_installed_binary(mode, runtime_paths, &installed_binary)
             .map_err(|message| {
@@ -208,6 +210,66 @@ fn verify_installed_version_with_command(
 /// Cross the self-update process boundary before refreshing the daemon. The
 /// process that performed the install may predate daemon-spawn fixes in the
 /// release it just installed, so it must not execute its own refresh code.
+/// Refresh the ghapp queue guards with the newly verified binary.
+///
+/// A host that opted into the guards (its guards directory exists) gets this
+/// release's copies, installed by the verified new binary so the guards always
+/// match the version that tested them. A failure never undoes the binary
+/// update; it is reported and `doctor` keeps flagging the stale guard.
+fn refresh_guards_after_update<W: Write>(
+    installed_binary: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let guards_dir = crate::ghapp_guards::default_guards_dir();
+    if guards_dir.is_dir() {
+        let (event, message) =
+            match refresh_guards_with_installed_binary(installed_binary, &guards_dir) {
+                Ok(()) => (
+                    "guards_refreshed",
+                    format!("ghapp guards refreshed in {}.", guards_dir.display()),
+                ),
+                Err(error) => (
+                    "guards_refresh_failed",
+                    format!(
+                        "WARNING: update installed, but ghapp guards were not refreshed: {error}. \
+                     Run `shipyard guards install`."
+                    ),
+                ),
+            };
+        let mut data = BTreeMap::new();
+        data.insert("event".to_owned(), Value::from(event));
+        data.insert(
+            "guards_dir".to_owned(),
+            Value::from(guards_dir.display().to_string()),
+        );
+        render(stdout, json, data, || message.clone())?;
+    }
+    Ok(())
+}
+
+fn refresh_guards_with_installed_binary(
+    installed_binary: &Path,
+    guards_dir: &Path,
+) -> Result<(), String> {
+    let output = Command::new(installed_binary)
+        .args(["guards", "install", "--dir"])
+        .arg(guards_dir)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("failed to execute {}: {error}", installed_binary.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "`{} guards install` exited {}: {}",
+        installed_binary.display(),
+        output.status.code().unwrap_or(-1),
+        stderr.trim()
+    ))
+}
+
 fn refresh_daemon_with_installed_binary(
     mode: RuntimeMode,
     runtime_paths: &RuntimePaths,
@@ -888,6 +950,33 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("fixture never became executable: {}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guard_refresh_runs_the_installed_binary_against_the_guards_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = temp.path().join("args");
+        let binary = temp.path().join("shipyard");
+        write_executable(
+            &binary,
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", log.display()),
+        );
+        let guards = temp.path().join("guards");
+        refresh_guards_with_installed_binary(&binary, &guards).expect("refresh");
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("args"),
+            format!("guards\ninstall\n--dir\n{}\n", guards.display())
+        );
+
+        let failing = temp.path().join("old-shipyard");
+        write_executable(
+            &failing,
+            "#!/bin/sh\necho \"unrecognized subcommand 'guards'\" >&2\nexit 2\n",
+        );
+        let error = refresh_guards_with_installed_binary(&failing, &guards)
+            .expect_err("an older binary without `guards` must be reported");
+        assert!(error.contains("unrecognized subcommand"), "{error}");
     }
 
     #[cfg(unix)]
