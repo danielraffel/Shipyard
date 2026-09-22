@@ -626,6 +626,56 @@ fn gh(client: &GhClient, cwd: &Path) -> Result<Command, String> {
         .map_err(|error| format!("gh command preparation failed: {error}"))
 }
 
+use crate::merge_queue::INTERNAL_QUEUE_MUTATION_ENV;
+
+/// Mark a queue-mutating `gh` command as Shipyard's own.
+///
+/// `gh` may resolve to the `ghapp` wrapper, whose queue-removal and queue-arm
+/// guards refuse ad-hoc arm/enqueue/dequeue requests. Shipyard's calls are
+/// already bound to a validated head and admitted by `queue_admission`, so
+/// they carry this marker instead of being re-judged by a second classifier.
+fn mark_internal_queue_mutation(command: &mut Command) -> &mut Command {
+    command.env(INTERNAL_QUEUE_MUTATION_ENV, "1")
+}
+
+fn native_enqueue_command(
+    client: &GhClient,
+    cwd: &Path,
+    pr_id: &str,
+    head_sha: &str,
+) -> Result<Command, String> {
+    let query = r"mutation($prId:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$prId,expectedHeadOid:$head}){mergeQueueEntry{id}}}";
+    let mut command = gh(client, cwd)?;
+    mark_internal_queue_mutation(&mut command).args([
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={query}"),
+        "-F",
+        &format!("prId={pr_id}"),
+        "-F",
+        &format!("head={head_sha}"),
+    ]);
+    Ok(command)
+}
+
+fn prepare_classic_merge(
+    command: &mut Command,
+    state: &ShipState,
+    merge_method: MergeMethod,
+    delete_branch: bool,
+    admin: bool,
+) {
+    // On a queue-governed base a plain `gh pr merge` enqueues, so the arm
+    // guard would otherwise re-read and re-judge Shipyard's own merge.
+    mark_internal_queue_mutation(command).args(classic_merge_args(
+        state,
+        merge_method,
+        delete_branch,
+        admin,
+    ));
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn merge_pr(
     store: &ShipStateStore,
@@ -838,12 +888,13 @@ fn merge_pr(
             state,
             global_dir,
         )?;
-        command.args(classic_merge_args(
+        prepare_classic_merge(
+            &mut command,
             state,
             merge_method,
             delete_branch && !isolated_branch_cleanup,
             admin,
-        ));
+        );
     }
     let output = command
         .current_dir(cwd)
@@ -1943,8 +1994,7 @@ fn arm_native_queue(
     pr_id: &str,
     guard: MergeQueueMutationGuard,
 ) -> Result<MergeQueueMutationGuard, QueueArmError> {
-    let query = r"mutation($prId:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$prId,expectedHeadOid:$head}){mergeQueueEntry{id}}}";
-    let mut command = match gh(client, cwd) {
+    let mut command = match native_enqueue_command(client, cwd, pr_id, &state.head_sha) {
         Ok(command) => command,
         Err(error) => {
             return Err(QueueArmError::Rejected {
@@ -1953,21 +2003,9 @@ fn arm_native_queue(
             });
         }
     };
-    let output = command
-        .args([
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={query}"),
-            "-F",
-            &format!("prId={pr_id}"),
-            "-F",
-            &format!("head={}", state.head_sha),
-        ])
-        .output()
-        .map_err(|error| {
-            QueueArmError::Uncertain(format!("failed to enqueue merge-queue PR: {error}"))
-        })?;
+    let output = command.output().map_err(|error| {
+        QueueArmError::Uncertain(format!("failed to enqueue merge-queue PR: {error}"))
+    })?;
     if output.status.success() {
         return Ok(guard);
     }
@@ -2106,7 +2144,7 @@ fn run_queue_mutation(
     // The ghapp wrapper rejects raw queue-removal mutations. This marker is
     // limited to Shipyard's exact-head, machine-authorized, write-ahead-audited
     // path and lets that guard distinguish it from an ad-hoc GraphQL call.
-    command.env("SHIPYARD_INTERNAL_QUEUE_MUTATION", "1");
+    mark_internal_queue_mutation(&mut command);
     let guard =
         MergeQueueMutationGuard::acquire_in_mode(store, cwd, mode, global_dir, state, action)?;
     let output = command
@@ -3355,6 +3393,65 @@ mod tests {
                 "-f",
                 "sha=b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
             ]
+        );
+    }
+
+    fn command_env(command: &Command, key: &str) -> Option<String> {
+        command.get_envs().find_map(|(name, value)| {
+            (name == key).then(|| value.map(|value| value.to_string_lossy().into_owned()))?
+        })
+    }
+
+    #[test]
+    fn native_enqueue_carries_the_internal_queue_mutation_marker() {
+        let client = GhClient::ambient();
+        let command = native_enqueue_command(
+            &client,
+            Path::new("/tmp"),
+            "PR_kw",
+            "b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
+        )
+        .expect("enqueue command");
+        assert_eq!(
+            command_env(&command, INTERNAL_QUEUE_MUTATION_ENV).as_deref(),
+            Some("1"),
+            "ghapp's queue-arm guard must recognise Shipyard's own enqueue"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg.contains("enqueuePullRequest")));
+        assert!(args.iter().any(|arg| arg == "prId=PR_kw"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "head=b07b9f1ac9069484e2fa8fdb2319b134c69c3c56")
+        );
+    }
+
+    #[test]
+    fn classic_merge_carries_the_internal_queue_mutation_marker() {
+        let state = ShipState::new(
+            30,
+            "Generous-Corp/forge",
+            "feature/x",
+            "main",
+            "b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
+            "policy",
+        );
+        let mut command = Command::new("gh");
+        prepare_classic_merge(&mut command, &state, MergeMethod::Merge, false, false);
+        assert_eq!(
+            command_env(&command, INTERNAL_QUEUE_MUTATION_ENV).as_deref(),
+            Some("1")
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            classic_merge_args(&state, MergeMethod::Merge, false, false)
         );
     }
 

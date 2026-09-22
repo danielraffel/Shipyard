@@ -620,6 +620,14 @@ continuously-active-writer Phase 2 boundary.
 - **Idempotency:** a later one-shot first polls the queue. An already queued PR
   is not armed again; a terminal removal newer than the current ship-state is
   not rearmed. A new validated head creates newer ship-state and may be armed.
+- **Guard marker:** every queue-mutating `gh` command Shipyard issues itself
+  (the `enqueuePullRequest` arm, the classic `gh pr merge`, the audited
+  disable/dequeue revocations, and the merge steward's enqueue) sets
+  `SHIPYARD_INTERNAL_QUEUE_MUTATION=1`. When `gh` resolves to the `ghapp`
+  wrapper, its queue-removal and queue-arm guards honour that marker instead of
+  re-judging a call Shipyard's own admission rules above already made; reads
+  never carry it. An ad-hoc arm without it is classified live and refused for a
+  queued, armed, merged/closed, unreadable, or same-head-ejected PR.
 - **Revocation authority:** an active ship-state owns native auto-merge and
   queue authority only while its validated `head_sha` still equals the live PR
   head. A same-head base retarget may revoke that authority through the audited

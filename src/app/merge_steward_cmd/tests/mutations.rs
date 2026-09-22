@@ -121,6 +121,20 @@ esac
     assert!(ledger.queue_witnesses.is_empty());
 }
 
+/// Shipyard's own enqueue must carry the marker the `ghapp` queue-arm guard
+/// honours, and its reads must not: the marker is an authority claim.
+#[cfg(unix)]
+fn assert_internal_marker_only_on_enqueue(temp: &tempfile::TempDir) {
+    let log = fs::read_to_string(temp.path().join("queue-mutation-env.log")).expect("env log");
+    let enqueues = log
+        .lines()
+        .filter(|line| line.starts_with("enqueue "))
+        .collect::<Vec<_>>();
+    assert!(!enqueues.is_empty(), "{log}");
+    assert!(enqueues.iter().all(|line| *line == "enqueue 1"), "{log}");
+    assert!(log.lines().any(|line| line == "read unset"), "{log}");
+}
+
 #[cfg(unix)]
 fn queue_recovery_gh(
     temp: &tempfile::TempDir,
@@ -148,6 +162,8 @@ fn queue_recovery_gh(
         &format!(
             r#"
 printf '%s\n' "$*" >> '{}'
+case "$*" in *enqueuePullRequest*) kind=enqueue ;; *) kind=read ;; esac
+printf '%s %s\n' "$kind" "${{SHIPYARD_INTERNAL_QUEUE_MUTATION:-unset}}" >> "$(dirname "$0")/queue-mutation-env.log"
 case "$*" in
   *"repos/owner/repo/commits/main"*)
     reads=0; test ! -f '{}' || reads=$(cat '{}'); reads=$((reads + 1)); printf '%s' "$reads" > '{}'
@@ -325,6 +341,7 @@ fn unreadable_optional_recovery_proof_preserves_ordinary_exact_head_enqueue() {
     let calls = fs::read_to_string(calls_path).expect("calls");
     assert!(calls.contains("enqueuePullRequest"), "{calls}");
     assert!(!calls.contains("jump:true"), "{calls}");
+    assert_internal_marker_only_on_enqueue(&temp);
 }
 
 #[cfg(unix)]
@@ -431,6 +448,7 @@ fn hosted_precheckout_eviction_restores_priority_once_with_write_ahead_receipt()
     let calls = fs::read_to_string(calls_path).expect("calls");
     assert!(calls.contains("jump:true"), "{calls}");
     assert_eq!(calls.matches("enqueuePullRequest").count(), 1, "{calls}");
+    assert_internal_marker_only_on_enqueue(&temp);
     let saved: StewardLedger =
         serde_json::from_slice(&fs::read(ledger_path).expect("ledger")).expect("valid ledger");
     assert_eq!(saved.queue_recovery_receipts.len(), 1);

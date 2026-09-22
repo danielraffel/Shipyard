@@ -923,16 +923,44 @@ impl GitHubActions {
     }
 
     pub(crate) fn run_gh(&self, args: &[String]) -> Result<String, GitHubError> {
+        self.run_gh_with_env(args, &[])
+    }
+
+    /// Run a queue-mutating `gh` command as Shipyard's own exact-head path.
+    ///
+    /// Sets [`crate::merge_queue::INTERNAL_QUEUE_MUTATION_ENV`] so the `ghapp`
+    /// queue guards, reached when `gh` resolves to that wrapper, recognise the
+    /// call rather than re-judging it.
+    pub(crate) fn run_gh_internal_queue_mutation(
+        &self,
+        args: &[String],
+    ) -> Result<String, GitHubError> {
+        self.run_gh_with_env(
+            args,
+            &[(crate::merge_queue::INTERNAL_QUEUE_MUTATION_ENV, "1")],
+        )
+    }
+
+    fn run_gh_with_env(
+        &self,
+        args: &[String],
+        env: &[(&str, &str)],
+    ) -> Result<String, GitHubError> {
         if let Some(timeout) = self.remaining_deadline()? {
-            return self.run_gh_with_timeout_bounded(
+            let output = self.run_gh_with_timeout_output_limits(
                 args,
                 timeout,
-                DEADLINE_GH_STDOUT_BYTES,
-                DEADLINE_GH_STDERR_BYTES,
-            );
+                Some((DEADLINE_GH_STDOUT_BYTES, DEADLINE_GH_STDERR_BYTES)),
+                env,
+            )?;
+            if !output.success() {
+                return Err(output.command_error(args));
+            }
+            return Ok(String::from_utf8_lossy(output.stdout()).to_string());
         }
         let output = self
             .prepare_gh_command()?
+            .envs(env.iter().copied())
             .args(args)
             .output()
             .map_err(|error| {
@@ -965,7 +993,7 @@ impl GitHubActions {
         args: &[String],
         timeout: Duration,
     ) -> Result<GitHubCommandOutput, GitHubError> {
-        self.run_gh_with_timeout_output_limits(args, timeout, None)
+        self.run_gh_with_timeout_output_limits(args, timeout, None, &[])
     }
 
     pub(crate) fn run_gh_with_timeout_bounded(
@@ -984,6 +1012,7 @@ impl GitHubActions {
             args,
             timeout,
             Some((max_stdout_bytes, max_stderr_bytes)),
+            &[],
         )?;
         if !output.success() {
             return Err(output.command_error(args));
@@ -996,6 +1025,7 @@ impl GitHubActions {
         args: &[String],
         timeout: Duration,
         output_limits: Option<(usize, usize)>,
+        env: &[(&str, &str)],
     ) -> Result<GitHubCommandOutput, GitHubError> {
         let timeout = self
             .remaining_deadline()?
@@ -1017,6 +1047,7 @@ impl GitHubActions {
             GitHubError::new(format!("failed to create gh stderr capture: {error}"))
         })?;
         command
+            .envs(env.iter().copied())
             .args(args)
             // Regular-file capture cannot leave a Rust reader blocked when a
             // detached descendant inherits stdio. Each reopened writer has an
