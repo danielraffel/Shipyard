@@ -1476,6 +1476,14 @@ PATH="$trusted_path" "$close_guard" "${guard_arguments[@]}" || exit 1
 if [[ -x "$guards/queue-removal-guard" ]]; then
     PATH="$trusted_path" "$guards/queue-removal-guard" "$@" || exit 1
 fi
+# Optional, like the removal guard: an absent file means the host predates it
+# (`shipyard doctor` reports that). When present it refuses arming or enqueuing
+# a PR that is already queued, already armed, merged/closed, unreadable, or
+# ejected with no new head since; Shipyard's own path carries
+# SHIPYARD_INTERNAL_QUEUE_MUTATION=1.
+if [[ -x "$guards/queue-arm-guard" ]]; then
+    PATH="$trusted_path" "$guards/queue-arm-guard" "$@" || exit 1
+fi
 
 if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
       -n "${release_upload_stage_dir:-}" ]]; then
