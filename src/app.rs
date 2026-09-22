@@ -61,6 +61,7 @@ mod ship_cmd;
 mod ship_state_cmd;
 mod targets_cmd;
 mod update_cmd;
+mod verdicts_cmd;
 mod wait_cmd;
 mod watch_cmd;
 mod watch_local_cmd;
@@ -116,6 +117,7 @@ use self::ship_state_cmd::{
 };
 use self::targets_cmd::targets_command;
 use self::update_cmd::update_command;
+use self::verdicts_cmd::verdicts;
 use self::wait_cmd::wait_command;
 use self::watch_cmd::{WatchCommandContext, WatchCommandOptions, watch};
 use self::watch_local_cmd::watch_local_command;
@@ -626,6 +628,9 @@ fn handle_operational_variant<W: Write>(
         command @ Command::ShipState { .. } => {
             handle_ship_state_variant(&command, mode, cwd, &runtime_paths.state_dir, json, stdout)?;
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Verdicts { limit } => {
+            handle_verdicts_variant(limit, mode, &runtime_paths.state_dir, cwd, json, stdout)
         }
         Command::Runner { command } => {
             handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
@@ -1174,6 +1179,36 @@ fn handle_watch_variant<W: Write>(
         json,
         stdout,
     )
+}
+
+/// Wire the live `gh`-backed batched reader to the verdict scan.
+///
+/// The reader returns one map per repository. A repository the call could not
+/// answer for yields an empty map rather than a fabricated one, so its records
+/// stay unresolved and the scan reports itself as partly blind.
+fn handle_verdicts_variant<W: Write>(
+    limit: u32,
+    mode: RuntimeMode,
+    state_dir: &Path,
+    cwd: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let store = ShipStateStore::new(state_dir.join("ship"))
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let gh_client = crate::gh::GhClient::from_cwd(mode, cwd).ok();
+    let mut resolve = |repo: &str, _wanted: &std::collections::BTreeSet<u64>| {
+        crate::gh::pr_states_batched(gh_client.as_ref(), repo, cwd, limit)
+            .map(|states| {
+                states
+                    .into_iter()
+                    .map(|(pr, state)| (pr, crate::verdicts::PrDisposition::from_state(&state)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    verdicts(&store, &mut resolve, json, stdout)
+        .map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 fn handle_ship_state_variant<W: Write>(

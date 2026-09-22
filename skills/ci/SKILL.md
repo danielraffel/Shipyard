@@ -802,6 +802,71 @@ click on a Tailscale-ready Mac) and troubleshooting. The macOS
 menu-bar app (`shipyard-macos-gui`) is a thin subscriber to this
 same daemon.
 
+## `shipyard verdicts` — the verdict nobody consumed
+
+Every row in the `watch` table below assumes **someone is still there to
+read it**. That assumption is the gap this command closes.
+
+A lane that pushes a PR, reports *"pushed and revalidating"*, and ends its
+turn leaves a validation running with no reader. When that validation
+fails, the failure is recorded correctly and consumed by nobody. It does
+**not** appear in `ship-state list`, because a ship that ran to completion
+and failed is not orphaned — it finished. The measured consequence on one
+live store: 139 failing records present, and no surface that named them.
+
+```sh
+shipyard verdicts          # actionable failures + a census of what was scanned
+shipyard verdicts --json   # same, machine-readable
+shipyard verdicts --limit 800   # widen the per-repository lookup window
+```
+
+Exit codes: `0` nothing to act on **and** nothing unresolved · `1` at least
+one actionable verdict · `5` the scan was partly blind (see below).
+
+**A verdict alone is not actionable.** A failure on a PR that has since
+merged is spent history. Measured on a live store, 41 of 45 resolvable
+failure records were already merged — a raw failure list would be ~91%
+noise, which is precisely how `ship-state list` earned its habit of being
+scrolled past. So `verdicts` pairs each verdict with the PR's current
+disposition and reports only *non-passing verdict on a still-open PR*.
+
+**Resolution is batched per repository**: one `gh pr list` invocation per
+repo covering every candidate in it (gh paginates at 100 per page, so cost
+scales with `--limit`, never with the number of records). The per-record
+shape is the documented hazard: `ship-state list` spends one `gh pr view`
+per flagged record and caps the loop at 25 to avoid a burst. Measured on a
+live store, 142 non-passing records resolved through 4 repo lookups. This
+is not a poll — it reads records Shipyard already wrote.
+
+### The census is the control
+
+Every run prints counts, including the quiet run:
+
+```
+Census  scanned=221 terminal=197 passed=55 failed=139 cancelled=3 resolved=77 unresolved=65 actionable=3 repos_queried=4
+```
+
+`passed + failed + cancelled` must equal `terminal`; if it does not, the
+command says the scan is unreliable rather than reporting a result.
+
+**`unresolved` is the part that matters.** A verdict whose PR state could
+not be read is counted and named, never folded into "clean". A scan with
+`actionable=0` and `unresolved>0` does **not** print the all-clear line —
+it prints that it cannot support one, and exits `5`. This is deliberate:
+a consumer whose own blindness is invisible reproduces the bug it was built
+to close. A high `unresolved` usually means records older than the lookup
+window; raise `--limit`.
+
+`cancelled` is reported separately from `failed` because they ask for
+different moves — re-run versus investigate — and a cancelled lane is the
+one most easily misread as still running.
+
+**What it does not do:** it does not push. Notifying the lane that
+dispatched the ship is not possible once that lane has ended, which is the
+common case. `verdicts` is a pull whose non-consumption accumulates and
+whose blindness is counted — run it at the start of a session, or wire its
+exit code into whatever you already check.
+
 ## When to use `watch` (agent decision guide)
 
 After dispatching a ship (`shipyard ship`), agents have four ways to

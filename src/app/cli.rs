@@ -659,6 +659,16 @@ pub(super) enum Command {
         #[arg(long, default_value_t = 5.0)]
         interval: f64,
     },
+    /// Report finished validations that nobody has consumed.
+    ///
+    /// A validation that ran to completion and failed is not orphaned, so it
+    /// never appears in `ship-state`. This lists terminal verdicts whose pull
+    /// request is still open, resolving each repository in one batched call.
+    Verdicts {
+        /// Limit how many pull requests each repository lookup may return.
+        #[arg(long, default_value_t = 300)]
+        limit: u32,
+    },
     /// Inspect durable in-flight ship-state records.
     #[command(name = "ship-state")]
     ShipState {
