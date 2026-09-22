@@ -207,9 +207,6 @@ fn verify_installed_version_with_command(
     ))
 }
 
-/// Cross the self-update process boundary before refreshing the daemon. The
-/// process that performed the install may predate daemon-spawn fixes in the
-/// release it just installed, so it must not execute its own refresh code.
 /// Refresh the ghapp queue guards with the newly verified binary.
 ///
 /// A host that opted into the guards (its guards directory exists) gets this
@@ -248,6 +245,8 @@ fn refresh_guards_after_update<W: Write>(
     Ok(())
 }
 
+/// Run `guards install` with the verified installed binary, so the installed
+/// guards come from the release that tested them rather than from this process.
 fn refresh_guards_with_installed_binary(
     installed_binary: &Path,
     guards_dir: &Path,
@@ -270,6 +269,9 @@ fn refresh_guards_with_installed_binary(
     ))
 }
 
+/// Cross the self-update process boundary before refreshing the daemon. The
+/// process that performed the install may predate daemon-spawn fixes in the
+/// release it just installed, so it must not execute its own refresh code.
 fn refresh_daemon_with_installed_binary(
     mode: RuntimeMode,
     runtime_paths: &RuntimePaths,

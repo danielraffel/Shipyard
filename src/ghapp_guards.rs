@@ -52,6 +52,14 @@ pub const MANAGED_GUARDS: [ManagedGuard; 2] = [
     },
 ];
 
+/// Printed with every `shipyard guards` report: installing into the shared
+/// directory changes what older Shipyard binaries on the host may do.
+pub const FLEET_NOTE: &str = "note: this directory is shared by every Shipyard binary on the \
+     host. Older binaries enqueue without Shipyard's internal marker, so once queue-arm-guard is \
+     installed their same-head re-enqueues after failed_checks/merge_conflict (the intended \
+     ALLGREEN refusal) or after a manual removal, and any enqueue whose live state cannot be read, \
+     are refused. Update every Shipyard binary on the host first; see docs/ghapp-guards.md.";
+
 /// Where `scripts/ghapp` looks for guards on this host.
 #[must_use]
 pub fn default_guards_dir() -> PathBuf {
@@ -377,6 +385,19 @@ mod tests {
         assert_eq!(
             fs::read(&elsewhere).expect("target"),
             b"owned by someone else"
+        );
+    }
+
+    #[test]
+    fn fleet_note_names_the_blast_radius_and_the_doc_not_the_overrides() {
+        assert!(FLEET_NOTE.contains("failed_checks/merge_conflict"));
+        assert!(FLEET_NOTE.contains("docs/ghapp-guards.md"));
+        assert!(!FLEET_NOTE.contains("GHAPP_ALLOW"));
+        assert!(!FLEET_NOTE.contains("SHIPYARD_INTERNAL"));
+        assert!(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("docs/ghapp-guards.md")
+                .is_file()
         );
     }
 

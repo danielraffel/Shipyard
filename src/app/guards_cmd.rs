@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use super::CliFailure;
 use super::cli::GuardsCommand;
-use crate::ghapp_guards::{GuardState, audit, default_guards_dir, install};
+use crate::ghapp_guards::{FLEET_NOTE, GuardState, audit, default_guards_dir, install};
 use crate::output::write_json_envelope;
 
 pub(super) fn guards_command<W: Write>(
@@ -26,6 +26,7 @@ pub(super) fn guards_command<W: Write>(
                 let mut data = BTreeMap::new();
                 data.insert("dir".to_owned(), serde_json::json!(dir));
                 data.insert("guards".to_owned(), serde_json::json!(rows));
+                data.insert("note".to_owned(), serde_json::json!(FLEET_NOTE));
                 write_json_envelope(stdout, "guards status", data)
                     .map_err(|error| CliFailure::new(1, error.to_string()))?;
             } else {
@@ -33,6 +34,7 @@ pub(super) fn guards_command<W: Write>(
                 for row in &rows {
                     writeln!(stdout, "  {:<22} {}", row.name, describe(&row.state)).map_err(io)?;
                 }
+                writeln!(stdout, "{FLEET_NOTE}").map_err(io)?;
             }
             if rows.iter().all(|row| row.state == GuardState::Current) {
                 Ok(ExitCode::SUCCESS)
@@ -51,6 +53,7 @@ pub(super) fn guards_command<W: Write>(
                 data.insert("dir".to_owned(), serde_json::json!(dir));
                 data.insert("dry_run".to_owned(), serde_json::json!(dry_run));
                 data.insert("guards".to_owned(), serde_json::json!(actions));
+                data.insert("note".to_owned(), serde_json::json!(FLEET_NOTE));
                 write_json_envelope(stdout, "guards install", data)
                     .map_err(|error| CliFailure::new(1, error.to_string()))?;
             } else {
@@ -73,6 +76,7 @@ pub(super) fn guards_command<W: Write>(
                     )
                     .map_err(io)?;
                 }
+                writeln!(stdout, "{FLEET_NOTE}").map_err(io)?;
             }
             if actions.iter().any(|action| action.action == "refused") {
                 return Err(CliFailure::new(

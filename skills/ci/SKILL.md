@@ -2592,7 +2592,9 @@ new head has been pushed since, and how many times an unchanged head was
 re-added), `never_armed`, `merged` or `closed`, citing the GraphQL field each
 fact came from. Land through `shipyard ship --pr <n>`, not `gh pr merge
 --auto`: the `ghapp` queue-arm guard refuses a hand-arm of a queued, armed,
-or same-head-ejected PR (override `GHAPP_ALLOW_QUEUE_REARM=1`).
+or same-head-ejected PR. When it refuses, do what the refusal says (push a fix,
+or confirm a manual dequeue with whoever made it); do not look for a way around
+it. Operator overrides are documented for humans in `docs/ghapp-guards.md`.
 
 ### Reading the verdict
 
