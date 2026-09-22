@@ -83,3 +83,28 @@ queued and armed PRs, so what changes for them is:
 Re-enqueues after `invalid_merge_commit`, and anything after a new head, are
 unaffected. To avoid the transition entirely, update every Shipyard binary on
 the host (and refresh its daemon) before running `shipyard guards install`.
+
+## Growing the real-response corpus
+
+The classifier and the guard are pinned to real GitHub responses in
+`tests/fixtures/github/` (see its README). A synthetic fixture can only encode
+what we already believed, so prefer a live capture whenever one exists.
+
+When a live PR is observed in a state the corpus only covers by truncation or
+synthesis (for example ejected for `failed_checks` and not yet re-enqueued),
+capture it verbatim, read-only:
+
+1. From inside a checkout of the PR's repository (so `ghapp` can resolve it),
+   run the query in `tests/fixtures/github/README.md` with
+   `-f owner=... -f name=... -F number=<n>`. If `pageInfo.hasPreviousPage` is
+   true, page with `timelineItems(first:100, after:$cursor)` until
+   `hasNextPage` is false and concatenate the nodes in order.
+2. Save the response unedited as `tests/fixtures/github/pr_<state>.json`.
+3. Add its expected classification to `expected_classifications.json` and a
+   README row with the PR number and capture time.
+4. Run `cargo test pr_queue_state` and
+   `python3 -m unittest scripts/test_ghapp_queue_arm_guard.py`: both
+   implementations must agree with the new entry.
+
+A real capture of a state supersedes a truncated or synthetic fixture for the
+same state; replace it rather than keeping both.

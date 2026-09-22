@@ -69,23 +69,23 @@
     "last_ejection_new_head_since": true,
     "guard": "refuse"
   },
-  "pr_synthetic_ejected_same_head.json": {
-    "synthetic": true,
-    "pr": 8702,
-    "class": "ejected",
-    "reason": "failed_checks",
-    "new_head_since_removal": false,
-    "requeues_without_new_head": 0,
-    "last_ejection_reason": "failed_checks",
-    "last_ejection_new_head_since": false,
-    "guard": "refuse"
-  },
   "pr_synthetic_truncated_window.json": {
     "synthetic": true,
     "pr": 900001,
     "class": "unknown",
     "requeues_without_new_head": 0,
     "last_ejection_reason": null,
+    "guard": "refuse"
+  },
+  "pr_real_truncated_same_head_ejected.json": {
+    "real_truncated": true,
+    "pr": 8638,
+    "class": "ejected",
+    "reason": "failed_checks",
+    "new_head_since_removal": false,
+    "requeues_without_new_head": 3,
+    "last_ejection_reason": "failed_checks",
+    "last_ejection_new_head_since": false,
     "guard": "refuse"
   }
 }

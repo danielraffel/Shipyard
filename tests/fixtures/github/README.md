@@ -1,8 +1,10 @@
 # Real GitHub responses: merge-queue PR states
 
 Every JSON file in this directory except `expected_classifications.json` and
-the two `pr_synthetic_*.json` files (which carry a top-level `_synthetic` note and
-are marked `"synthetic": true` in the answer key) is an
+the `pr_synthetic_*.json` file (top-level `_synthetic` note, `"synthetic": true` in
+the answer key) and the `pr_real_truncated_*.json` file (a real timeline cut at a
+recorded point, top-level `_provenance`, `"real_truncated": true` in the answer
+key) is an
 **unedited response captured from the live GitHub API for
 `Generous-Corp/pulp`** on **2026-09-22** (between 14:23 and 14:38 PDT). None of
 them is synthetic. They exist because the synthetic fixtures elsewhere in
@@ -20,7 +22,7 @@ wrong in at least one way that mattered (see "The trap" below).
 | `pr_ejected_history.json` | 8638 | One `merge_conflict` removal fixed by a commit, then four `failed_checks` removals each followed by a re-add with no commit between. Later a new commit and a fresh `AutoMergeEnabledEvent`: currently armed after a new head, which is legitimate. |
 | `pr_ejected_new_head.json` | 8722 | Removed from the queue (`manual`), then two new commits; not armed, not queued. Captured 15:3x PDT the same day. |
 | `pr_rearmed_after_manual_removal.json` | 8688 | Removed (`manual`), force-pushed and new commits, then re-armed. Captured 15:3x PDT the same day. |
-| `pr_synthetic_ejected_same_head.json` | 8702 | **SYNTHETIC.** 8702 with its final re-add dropped and marked out of the queue: same-head after `failed_checks`. No live open PR was in this state when the corpus was captured. |
+| `pr_real_truncated_same_head_ejected.json` | 8638 | **Real timeline, truncated; state fields set to what GitHub showed between those events.** 8638's full timeline (23 items, paginated read 2026-09-22T23:19:27Z) cut right after item 16, `RemovedFromMergeQueueEvent(failed_checks)` at 2026-09-22T10:26:42Z; live, the next event was a same-head `AddedToMergeQueueEvent` at 10:32:31Z. `isInMergeQueue=false`, `mergeQueueEntry=null`, `autoMergeRequest=null`, `headRefOid` = the last commit before the cut. Provenance is in the file's `_provenance` object. |
 | `pr_synthetic_truncated_window.json` | 900001 | **SYNTHETIC.** Hand-built: `hasPreviousPage: true` and no removal or new head in the window, which must classify `unknown`. |
 | `pr_merged.json` | 8721 | `MergedEvent` then `RemovedFromMergeQueueEvent(reason: merged)`. The removal is **not** an ejection. |
 | `rest_pull_queued.json` | 8669 | `GET repos/Generous-Corp/pulp/pulls/8669` while the PR was queued, trimmed to the fields that matter. `auto_merge` is `null`. |

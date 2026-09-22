@@ -72,11 +72,25 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         # Control: the whole corpus, real and labelled-synthetic, was visited.
         self.assertEqual(checked, 10)
 
+    def test_real_truncated_same_head_ejection_is_ejected_and_refused(self) -> None:
+        response = fixture("pr_real_truncated_same_head_ejected.json")
+        provenance = response["_provenance"]
+        self.assertEqual(provenance["source_pr"], "Generous-Corp/pulp#8638")
+        self.assertEqual(provenance["cut_event_created_at"], "2026-09-22T10:26:42Z")
+        got = guard.classify_pr_queue_state(response)
+        self.assertEqual(got["class"], "ejected")
+        self.assertEqual(got["reason"], "failed_checks")
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertEqual(got["requeues_without_new_head"], 3)
+        allowed, _ = guard.decide(got)
+        self.assertFalse(allowed)
+
     def test_synthetic_fixtures_are_labelled(self) -> None:
         for name, want in expectations().items():
             with self.subTest(fixture=name):
                 self.assertEqual(bool(want.get("synthetic")), "_synthetic" in fixture(name))
                 self.assertEqual(bool(want.get("synthetic")), "synthetic" in name)
+                self.assertEqual(bool(want.get("real_truncated")), "_provenance" in fixture(name))
 
     def test_merged_removal_is_not_an_ejection(self) -> None:
         response = fixture("pr_merged.json")
@@ -169,11 +183,11 @@ class QueueArmGuardTests(unittest.TestCase):
 
     def test_same_head_ejection_is_refused_with_the_correct_path(self) -> None:
         code, message, _ = self.run_guard(
-            ["pr", "merge", "8702", "--auto"], [fixture("pr_synthetic_ejected_same_head.json")]
+            ["pr", "merge", "8638", "--auto"], [fixture("pr_real_truncated_same_head_ejected.json")]
         )
         self.assertEqual(code, 1)
-        self.assertIn("ejected for failed_checks at 2026-09-22T20:29:00Z", message)
-        self.assertIn("Push a fix first, then `shipyard ship --pr 8702`", message)
+        self.assertIn("ejected for failed_checks at 2026-09-22T10:26:42Z", message)
+        self.assertIn("Push a fix first, then `shipyard ship --pr 8638`", message)
         self.assertIn("see docs/ghapp-guards.md", message)
 
     def test_manual_same_head_removal_is_refused_with_reason_wording(self) -> None:
@@ -191,19 +205,19 @@ class QueueArmGuardTests(unittest.TestCase):
         self.assertNotIn("ALLGREEN", message)
 
     def test_invalid_merge_commit_same_head_is_allowed(self) -> None:
-        response = fixture("pr_synthetic_ejected_same_head.json")
+        response = fixture("pr_real_truncated_same_head_ejected.json")
         pr = response["data"]["repository"]["pullRequest"]
         for node in pr["timelineItems"]["nodes"]:
             if node["__typename"] == "RemovedFromMergeQueueEvent":
                 node["reason"] = "invalid_merge_commit"
-        code, _, _ = self.run_guard(["pr", "merge", "8702", "--auto"], [response])
+        code, _, _ = self.run_guard(["pr", "merge", "8638", "--auto"], [response])
         self.assertEqual(code, 0)
 
     def test_refusal_text_never_names_bypass_or_override_variables(self) -> None:
         refusals = [
             (["pr", "merge", "8669", "--auto"], [fixture("pr_queued.json")]),
             (["pr", "merge", "8678", "--auto"], [fixture("pr_armed_not_queued.json")]),
-            (["pr", "merge", "8702", "--auto"], [fixture("pr_synthetic_ejected_same_head.json")]),
+            (["pr", "merge", "8638", "--auto"], [fixture("pr_real_truncated_same_head_ejected.json")]),
             (["pr", "merge", "8721", "--auto"], [fixture("pr_merged.json")]),
             (["pr", "merge", "1", "--auto"], [fixture("pr_synthetic_truncated_window.json")]),
             (["pr", "merge", "1", "--auto"], [guard.GuardError("HTTP 502")]),

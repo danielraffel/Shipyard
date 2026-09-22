@@ -660,6 +660,23 @@ mod tests {
     }
 
     #[test]
+    fn real_truncated_same_head_ejection_is_ejected_without_new_head() {
+        // 8638's real timeline cut right after a failed_checks removal that was
+        // followed, live, by a same-head re-enqueue.
+        let value = fixture("pr_real_truncated_same_head_ejected.json");
+        assert_eq!(value["_provenance"]["source_pr"], "Generous-Corp/pulp#8638");
+        assert_eq!(
+            classify_pr_queue_state(&value),
+            PrQueueState::Ejected {
+                reason: "failed_checks".to_owned(),
+                at: Some("2026-09-22T10:26:42Z".to_owned()),
+                new_head_since_removal: false,
+                requeues_without_new_head: 3,
+            }
+        );
+    }
+
+    #[test]
     fn truncated_window_without_removal_or_new_head_is_unknown() {
         let value = fixture("pr_synthetic_truncated_window.json");
         assert!(matches!(
