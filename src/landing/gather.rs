@@ -111,16 +111,8 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         read_error.as_ref(),
     );
 
-    if graphql.base_exists == Some(false) {
-        warnings.push(format!(
-            "branch `{base}` does not exist on this repository{}; every finding below is the \
-             well-formed nothing an absent branch returns, not a description of how work lands",
-            default_branch
-                .as_deref()
-                .map_or_else(String::new, |branch| format!(
-                    " (the default is `{branch}`)"
-                ))
-        ));
+    if let Some(warning) = base_warning(graphql.base_exists, base, default_branch.as_deref()) {
+        warnings.push(warning);
     }
     if matches!(protection, Payload::NotFound) {
         warnings.push(format!(
