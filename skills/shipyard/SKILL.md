@@ -3353,8 +3353,12 @@ for. `runner_name` / `runner_group_name` on a completed job say what answered.
 - A required `pull_request` context posts on a **pull request head**, not on the
   base branch head, which carries `push`-event checks instead. So the run that
   produced a context is found from open pull-request heads'
-  `commits/{sha}/check-runs`, at most one run per context, with the
-  recent-completed-runs sweep as a bounded fallback.
+  `commits/{sha}/check-runs`, up to three candidate runs per context
+  (interleaved, so every context gets a first attempt before any gets a
+  second), with the recent-completed-runs sweep as a bounded fallback. More
+  than one candidate is needed because a context is routinely *satisfied* by a
+  skipped job, and one candidate would report such a gate as unplaceable even
+  though it runs on every other pull request in the backlog.
 - The run id is taken from the `/actions/runs/<id>/` segment of a check run's
   `html_url` and the trailing `/job/<id>` is deliberately ignored: handing the
   jobs endpoint something that is not an Actions job id returns a coherent,

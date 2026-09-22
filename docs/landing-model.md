@@ -103,10 +103,12 @@ questions a queue absorbs.
 
 Cold, on a repository with two rulesets and five required contexts: one
 rulesets list, two ruleset details, one branch protection, one GraphQL round
-trip (default branch + queue + backlog), a bounded set of check-run reads to
-find which runs produced the required contexts, and one job read per such run.
-The per-run job reads stop as soon as every context is placed. The report
-prints the number of API calls it actually spent rather than an estimate.
+trip (default branch + base-ref existence + queue + backlog), up to six
+check-run reads to find which runs produced the required contexts, and a job
+read per candidate run. Both loops stop as soon as every context is placed.
+The report prints the number of API calls it actually spent rather than an
+estimate: roughly 5 on a small repository, roughly 30 on one with five
+required contexts and a large backlog.
 
 `--run-sample` and `--max-job-reads` bound the fallback sweep used when the
 check-run route does not cover every context.
