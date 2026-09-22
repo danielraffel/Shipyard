@@ -42,6 +42,7 @@ use crate::process::{BoundedOutputError, run_output_until};
 mod assessment;
 mod observation;
 mod policy;
+mod readability;
 mod release_observation;
 mod render;
 
@@ -64,6 +65,9 @@ use observation::{
 #[cfg(test)]
 pub(in crate::app) use policy::FleetLivenessPolicy;
 pub(in crate::app) use policy::fleet_liveness_policy;
+use readability::{
+    DegradedObservation, LaneCorroboration, ReadBoundary, RoutingConfidence, classify_read_boundary,
+};
 use release_observation::inspect_release_liveness;
 #[cfg(all(test, unix))]
 use release_observation::{ReleasableCommitSummary, count_releasable_commits};
@@ -148,7 +152,13 @@ pub(super) fn collect_fleet_assessment(
     let runners = fetch_repository_runners(&actions, &repo);
     let expected_host_configs =
         parse_expected_hosts(&config.data).map_err(|error| CliFailure::new(2, error))?;
-    let expected_hosts = assess_expected_hosts(&expected_host_configs, &runners);
+    let expected_hosts = assess_expected_hosts(&expected_host_configs, &runners, &args.target);
+    // What the controller itself could see of the lane. A host's own failed
+    // GitHub read is weighed against this rather than taken as a capacity fact.
+    let corroboration = LaneCorroboration {
+        inventory_readable: runners.readable,
+        online_lane_runners: runners.online_lane_runners(FLEET_LANE_TARGET),
+    };
     let mut hosts = Vec::new();
     for probe in host_probes {
         // `--target` is a GitHub job-name substring, not a TartCI routing
@@ -161,7 +171,7 @@ pub(super) fn collect_fleet_assessment(
             probe.storage,
             probe.attestation,
             FLEET_LANE_TARGET,
-            runners.readable,
+            corroboration,
         ));
     }
 
@@ -204,6 +214,12 @@ pub(super) fn collect_fleet_assessment(
         .filter(|host| host.routable)
         .map(|host| host.capacity.free())
         .sum();
+    let routing_degraded_reasons = routing_degraded_reasons(&hosts);
+    let routing_confidence = if routing_degraded_reasons.is_empty() {
+        RoutingConfidence::Confirmed
+    } else {
+        RoutingConfidence::Degraded
+    };
     let eligible_host_classes = classes
         .iter()
         .map(|class| class.class.clone())
@@ -266,7 +282,7 @@ pub(super) fn collect_fleet_assessment(
         || supervisor_unhealthy
         || problem_hosts
         || !runners.readable
-        || expected_hosts.iter().any(|host| host.problem.is_some())
+        || !expected_hosts_needing_attention(&expected_hosts).is_empty()
         || !routing_mismatches.is_empty()
         || !wedged_queued.raising.is_empty()
         || !queue.readable
@@ -288,6 +304,8 @@ pub(super) fn collect_fleet_assessment(
         target: args.target,
         free,
         routable_free_slots,
+        routing_confidence,
+        routing_degraded_reasons,
         capacity_unreadable,
         doctor_unreadable,
         supervisor_unhealthy,
@@ -504,9 +522,70 @@ fn parse_expected_hosts(data: &toml::Table) -> Result<Vec<ExpectedHostConfig>, S
     Ok(parsed)
 }
 
+/// Labels that declare a host's operating system.
+const PLATFORM_LABELS: [(&str, &str); 4] = [
+    ("linux", "linux"),
+    ("macos", "macos"),
+    ("darwin", "macos"),
+    ("windows", "windows"),
+];
+
+/// Architecture labels the macOS VM lane cannot use.
+///
+/// The fleet this command aggregates runs Apple Silicon Tart VMs, so an
+/// Intel-declared Mac is as unable to take a lane job as a Linux box is.
+const NON_APPLE_SILICON_LABELS: [&str; 3] = ["x64", "x86_64", "x86"];
+
+/// Whether a declared host's labels can serve the lane being reported on.
+///
+/// Declared labels are read as constraints, never as a requirement to declare:
+/// a host that names no platform is not excluded, because silence is not a
+/// contradiction. A host that names one is held to it.
+fn expected_host_serves_target(labels: &[String], target: &str) -> bool {
+    let target = normalized_target(target);
+    let lowered = labels
+        .iter()
+        .map(|label| label.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let declared = lowered
+        .iter()
+        .filter_map(|label| {
+            PLATFORM_LABELS
+                .iter()
+                .find(|(name, _)| *name == label)
+                .map(|(_, platform)| *platform)
+        })
+        .collect::<Vec<_>>();
+    if !declared.is_empty() && !declared.iter().any(|platform| *platform == target) {
+        return false;
+    }
+    if target == "macos"
+        && lowered
+            .iter()
+            .any(|label| NON_APPLE_SILICON_LABELS.contains(&label.as_str()))
+    {
+        return false;
+    }
+    true
+}
+
+/// Declared-host problems that belong to the lane being reported on.
+///
+/// A Linux or Intel host short of runners is real inventory news and stays in
+/// the output, but it is not a fault in the macOS lane the reader asked about.
+/// Letting it raise the top-level verdict is what made a healthy fleet read as
+/// needing attention for machines that never serve it.
+fn expected_hosts_needing_attention(hosts: &[ExpectedHostStatus]) -> Vec<&ExpectedHostStatus> {
+    hosts
+        .iter()
+        .filter(|host| host.serves_target && host.problem.is_some())
+        .collect()
+}
+
 fn assess_expected_hosts(
     expected: &[ExpectedHostConfig],
     inventory: &RunnerInventory,
+    target: &str,
 ) -> Vec<ExpectedHostStatus> {
     expected
         .iter()
@@ -554,6 +633,7 @@ fn assess_expected_hosts(
                 matching_runners: matching.iter().map(|runner| runner.name.clone()).collect(),
                 online,
                 idle,
+                serves_target: expected_host_serves_target(&host.labels, target),
                 problem,
             }
         })
@@ -656,7 +736,7 @@ fn analyze_host(
     storage: StorageProbe,
     attestation: AttestationProbe,
     target: &str,
-    central_runner_inventory_readable: bool,
+    corroboration: LaneCorroboration,
 ) -> HostFleetStatus {
     let digest = doctor.digest.as_ref();
     let all_supervisors = digest
@@ -679,17 +759,16 @@ fn analyze_host(
         .count();
     let supervisor_count = supervisors.len();
     let stale_supervisor_count = supervisor_count.saturating_sub(fresh_supervisor_count);
-    let problems = digest
+    let reported_problems = digest
         .and_then(|value| value.get("problems"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter(|problem| problem_matches_target(problem, &all_supervisors, target))
-        .filter(|problem| {
-            !(central_runner_inventory_readable && is_host_github_observation_problem(problem))
-        })
         .cloned()
         .collect::<Vec<_>>();
+    let (problems, degraded_observations) =
+        partition_observation_gaps(reported_problems, corroboration);
     let storage_problems = storage_problems(&storage);
     let attestation_problems = attestation_problems(&attestation);
     let problem_count = problems.len() + storage_problems.len() + attestation_problems.len();
@@ -733,6 +812,7 @@ fn analyze_host(
         stale_vm_count,
         routable,
         problems,
+        degraded_observations,
         supervisors,
         storage,
         storage_problems,
@@ -1144,14 +1224,92 @@ fn attestation_problems(attestation: &AttestationProbe) -> Vec<String> {
         .collect()
 }
 
-fn is_host_github_observation_problem(problem: &Value) -> bool {
-    problem
-        .as_str()
-        .is_some_and(|problem| problem.starts_with("github_unreadable:"))
-        || problem
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| id == "github_unreadable")
+/// Problem identifiers a host raises when its own GitHub read did not answer.
+///
+/// `github_runners_scope_unreadable` belongs here as much as `github_unreadable`
+/// does: both say the host could not see GitHub, neither says the host cannot
+/// run work. Only the first of the two carries a reason, which is why an
+/// unclassified boundary has to be a first-class outcome rather than an error.
+const HOST_GITHUB_OBSERVATION_IDS: [&str; 2] =
+    ["github_unreadable", "github_runners_scope_unreadable"];
+
+/// The host problem's identifier and detail, for a string or object problem.
+fn host_problem_parts(problem: &Value) -> Option<(String, String)> {
+    if let Some(text) = problem.as_str() {
+        let (id, detail) = text.split_once(':').unwrap_or((text, ""));
+        return Some((id.to_owned(), detail.to_owned()));
+    }
+    let id = problem.get("id").and_then(Value::as_str)?;
+    let detail = problem
+        .get("detail")
+        .or_else(|| problem.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some((id.to_owned(), detail.to_owned()))
+}
+
+/// How a host's failed GitHub read should be read, or `None` if the problem is
+/// not a GitHub read at all.
+fn host_github_observation_boundary(problem: &Value) -> Option<ReadBoundary> {
+    let (id, detail) = host_problem_parts(problem)?;
+    if !HOST_GITHUB_OBSERVATION_IDS.contains(&id.as_str()) {
+        return None;
+    }
+    // A scope-unreadable problem names only the scope, never the cause, so its
+    // detail classifies as unclassified rather than as a denial — which is the
+    // correct reading: nothing about that string says GitHub refused.
+    Some(classify_read_boundary(&detail))
+}
+
+/// Split a host's problems into the ones that keep its health verdict and the
+/// ones the controller's own census already answered.
+///
+/// A failed GitHub read is demoted only when both halves hold: it did not
+/// report a denial, and the repo-scope census independently found online lane
+/// runners. Without corroboration every problem is retained, so a tick where
+/// nothing was readable still fails closed.
+fn partition_observation_gaps(
+    problems: Vec<Value>,
+    corroboration: LaneCorroboration,
+) -> (Vec<Value>, Vec<DegradedObservation>) {
+    let mut retained = Vec::new();
+    let mut degraded = Vec::new();
+    for problem in problems {
+        let Some(boundary) = host_github_observation_boundary(&problem) else {
+            retained.push(problem);
+            continue;
+        };
+        if boundary.is_fleet_fact() || !corroboration.corroborates() {
+            retained.push(problem);
+            continue;
+        }
+        degraded.push(DegradedObservation {
+            problem: problem
+                .as_str()
+                .map_or_else(|| problem.to_string(), str::to_owned),
+            boundary,
+            corroborated_by: corroboration.detail(),
+        });
+    }
+    (retained, degraded)
+}
+
+/// Name every host observation the routable-slot count had to work around.
+fn routing_degraded_reasons(hosts: &[HostFleetStatus]) -> Vec<String> {
+    hosts
+        .iter()
+        .flat_map(|host| {
+            let class = host.capacity.class.clone();
+            host.degraded_observations.iter().map(move |gap| {
+                format!(
+                    "{class}: {} [{}] — {}",
+                    gap.problem,
+                    gap.boundary.as_str(),
+                    gap.corroborated_by
+                )
+            })
+        })
+        .collect()
 }
 
 fn storage_probe_script(disk_path: &str) -> String {
@@ -1197,7 +1355,62 @@ fn storage_probe_from_output(output: &Output, fallback_path: &str) -> StoragePro
     probe
 }
 
+/// Backoff before each retry of the repo-scope runner census.
+///
+/// The census is the one read every host's routability verdict leans on, so a
+/// single blip must not decide it. Two retries is the largest budget that still
+/// fits: the whole tick shares one [`FLEET_GITHUB_OBSERVATION_TIMEOUT`]
+/// deadline with the active-run, merge-queue and release reads, and `run_gh`
+/// clamps each call to whatever remains — so 1.25s of waiting plus a third
+/// attempt is affordable where a longer ladder would starve the reads that
+/// follow. Retries stop early on their own once the shared budget is spent, and
+/// a denial is never retried at all.
+const RUNNER_CENSUS_BACKOFF: [Duration; 2] =
+    [Duration::from_millis(250), Duration::from_millis(1000)];
+
 fn fetch_repository_runners(actions: &GitHubActions, repo: &str) -> RunnerInventory {
+    fetch_repository_runners_with_backoff(actions, repo, &RUNNER_CENSUS_BACKOFF)
+}
+
+/// Read the census, retrying only failures a retry can fix.
+///
+/// The returned inventory always carries the boundary and the attempt count on
+/// failure, so "one 403" and "three exhausted timeouts" never render the same.
+fn fetch_repository_runners_with_backoff(
+    actions: &GitHubActions,
+    repo: &str,
+    backoff: &[Duration],
+) -> RunnerInventory {
+    let mut attempt = 0_usize;
+    loop {
+        match fetch_repository_runners_once(actions, repo) {
+            Ok(inventory) => {
+                return RunnerInventory {
+                    attempts: u32::try_from(attempt + 1).unwrap_or(u32::MAX),
+                    ..inventory
+                };
+            }
+            Err(failure) => {
+                let boundary = classify_read_boundary(&failure);
+                if !boundary.worth_retrying() || attempt >= backoff.len() {
+                    return RunnerInventory {
+                        source: format!("{failure} [{}]", boundary.as_str()),
+                        boundary: Some(boundary),
+                        attempts: u32::try_from(attempt + 1).unwrap_or(u32::MAX),
+                        ..RunnerInventory::default()
+                    };
+                }
+                thread::sleep(backoff[attempt]);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+fn fetch_repository_runners_once(
+    actions: &GitHubActions,
+    repo: &str,
+) -> Result<RunnerInventory, String> {
     let raw = actions.run_gh(&[
         "api".to_owned(),
         "--paginate".to_owned(),
@@ -1208,10 +1421,7 @@ fn fetch_repository_runners(actions: &GitHubActions, repo: &str) -> RunnerInvent
     let raw = match raw {
         Ok(raw) => raw,
         Err(error) => {
-            return RunnerInventory {
-                source: format!("github runners unreadable: {error}"),
-                ..RunnerInventory::default()
-            };
+            return Err(format!("github runners unreadable: {error}"));
         }
     };
     let mut runners = Vec::new();
@@ -1219,10 +1429,7 @@ fn fetch_repository_runners(actions: &GitHubActions, repo: &str) -> RunnerInvent
         let value: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(error) => {
-                return RunnerInventory {
-                    source: format!("github runner JSON malformed: {error}"),
-                    ..RunnerInventory::default()
-                };
+                return Err(format!("github runner JSON malformed: {error}"));
             }
         };
         runners.push(RepositoryRunner {
@@ -1248,11 +1455,13 @@ fn fetch_repository_runners(actions: &GitHubActions, repo: &str) -> RunnerInvent
                 .collect(),
         });
     }
-    RunnerInventory {
+    Ok(RunnerInventory {
         readable: true,
         source: "github".to_owned(),
+        boundary: None,
+        attempts: 1,
         runners,
-    }
+    })
 }
 
 fn detect_routing_mismatches(
