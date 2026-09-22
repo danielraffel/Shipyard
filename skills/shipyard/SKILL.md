@@ -17,6 +17,55 @@ When updating a durable friction report, reconcile its landed commit, PR, and
 release status in the same change; do not leave historical "local/unpushed"
 claims after the implementation has merged.
 
+## Webhook drift: compare, never cache
+
+A successful registration is a statement about the past. Nothing in GitHub
+notifies the daemon when the hook it registered stops being correct, so a local
+record saying "I registered URL X" can outlive the fact by an unbounded period —
+and it did: a host's tailnet name changed (Tailscale re-registers a duplicate
+node under a `-N` suffix and the old name stops resolving), the hook kept the
+dead name, and every delivery failed to connect for a long time with no symptom,
+because nothing consumed the feed.
+
+- `shipyard daemon reconcile [--json]` compares the URL this host intends
+  against the URL GitHub holds, plus recent delivery health. Exit codes: 0 in
+  sync, 1 warn, 2 alarm, 3 blocked on a human action. Use it before concluding
+  a daemon is healthy from `daemon status` alone — status prints what the daemon
+  INTENDS, which was correct throughout the outage.
+- A registration believed good is re-asserted on a schedule
+  (`WEBHOOK_REVERIFY_INTERVAL`). Do not "optimize" that away by suppressing the
+  re-check after a success; the suppression is the bug.
+- An unreadable identity is never "no drift". The Tailscale CLI is not on a
+  non-interactive PATH, so `command -v tailscale` returns empty on a healthy
+  host; the binary is resolved from explicit candidate paths and a failure to
+  read `.Self.DNSName` is reported as an alarm, not as agreement.
+
+## A webhook 403 has three causes and only one is a credential
+
+`PATCH`/`POST` on repository hooks can return HTTP 403 for three unrelated
+reasons, and they need opposite responses:
+
+| GitHub says | Actually means | Who fixes it |
+|---|---|---|
+| `Resource not accessible by integration` | App installation lacks `repository_hooks` | a human, in the App's settings |
+| mentions `admin:repo_hook` | classic token missing a scope | one `gh auth refresh` |
+| `Bad credentials` / 401 | the credential is dead or anonymous | rotate or re-auth |
+
+`RegistrarError::AppPermissionDenied` is the first; do not fold it into
+`AuthDegraded`. Reporting a permission fault as a credential fault is what drove
+the external daemon-health watchdog to clear token caches every five minutes
+against a credential that was working fine.
+
+## A config PATCH replaces; it does not merge
+
+`PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.
+Patching only `config[url]` therefore CLEARS the shared secret, and GitHub
+answers 200 with a hook whose every visible field is correct. Always send the
+complete config — `url`, `content_type`, `insecure_ssl`, `secret` — and read the
+response back to confirm the secret survived. GitHub returns a fixed mask rather
+than the value, so presence is the strongest available check; never log the
+secret itself.
+
 ## Metrics authority
 
 When reviewing stewardship scorecards, treat GitHub `created_at` plus
@@ -32,6 +81,49 @@ the daily implementation as of `v0.51.0` / `v0.51.1`, but do not replace
 `/Users/danielraffel/.local/bin/shipyard`, remove preserved backups, change
 Pulp pins, reset Tailscale Funnel, or merge GUI cutover support without a clear
 go/no-go for that operation.
+
+## The gate scripts are shared with Pulp — and defaulted to Pulp's layout
+
+`scripts/version_bump_check.py` and `scripts/skill_sync_check.py` are the same
+gates Pulp carries. Pulp keeps its config at `tools/scripts/versioning.json`;
+Shipyard keeps its own at `scripts/versioning.json`. The scripts hard-coded
+Pulp's path, so a **bare invocation in this repo never found its config**:
+
+```
+$ python3 scripts/version_bump_check.py --mode=report --base origin/main
+version_bump_check: config not found: .../tools/scripts/versioning.json
+```
+
+It was invisible because `.githooks/pre-push` always passes `--config "$CFG"`
+explicitly. Anyone running a gate by hand — an agent checking its own work —
+got a gate that checked nothing. `resolve_config()` now searches this repo's
+layout first and names **every** path it tried when it finds none.
+
+The second half was worse. Each gate's catch-all branch was
+`*) echo "[pre-push] <gate>: internal error" >&2 ;;` — it printed and continued
+**without setting `fail`**, so a gate that could not run was indistinguishable
+from a clean one. The exit-code contract every caller must honour:
+
+| code | meaning | caller must |
+|------|---------|-------------|
+| 0 | ran, check passed | continue |
+| 1 | ran, check FAILED | block |
+| 2+ | **could NOT run** (config missing, crash) | **block** |
+
+`gate_could_not_run` in the hook does that, and `$gate_rc` captures the status
+before `case` consumes `$?`. Two things follow:
+
+* **Adding a gate means adding its blocking branch** —
+  `scripts/test_prepush_cannot_measure.py` fails if any catch-all still falls
+  open, and its control counts *both* halves so a drifted regex cannot report
+  "nothing falls open" over zero coverage.
+* **A pre-versioning checkout still skips**, but loudly: it now names the
+  missing inputs and says nothing was verified. A silent `exit 0` there reads
+  exactly like a clean run.
+
+When asserting a gate "ran", check for `rc in (0, 1)` — not `rc == 0`. Zero is
+"ran and passed"; conflating it with "ran" is the same mistake one level up.
+`scripts/**` maps to this skill, so a change to either gate needs a note here.
 
 ## Durable work handoff
 
@@ -882,6 +974,41 @@ Two things it deliberately will *not* do, both of which would make it useless:
 `fleet_selfheal` already returns `Escalate` instead of acting when idleness
 cannot be proven. This is the other end of that contract — what the caller owes
 on receiving one.
+
+## Zero runners fleet-wide: suspect the admission gate's own observation cost
+
+`runner admission-clean` is the gate TartCI calls immediately before registering
+a just-in-time runner, and it fails closed: any verdict other than a typed
+`admit` discards the already-booted VM. A gate that cannot *observe* therefore
+looks exactly like a fleet with no capacity — VMs mint, boot, are refused and are
+torn down, on every host at once, while the backlog that caused it keeps growing.
+
+The shape to watch for: **the gate's observation must never depend on a snapshot
+whose cost scales with the backlog it exists to drain.** A per-PR field attached
+to a whole-open-PR query is the classic instance. `statusCheckRollup` costs
+roughly 19 KB per pull request, so past roughly thirty open pull requests a
+single GraphQL call exceeds GitHub's budget and fails wholesale.
+
+Reading that failure correctly:
+
+- **The error is not stable.** Near the threshold GitHub returns HTTP 504 or a
+  truncated body (`unexpected end of JSON input`) roughly interchangeably. Never
+  key handling, a log line, or a test on the string `504`; classify by outcome
+  (could not observe). The verdict already does this — both land on `error` /
+  `observation_failed`.
+- **It is stochastic, so a single run proves nothing.** Sample at least six times
+  before calling such a query healthy or broken.
+- **`gh pr list --limit` is a total cap, not a page size.** Lowering it makes the
+  query pass because it returns fewer pull requests, not because it got cheaper
+  per row. A census that silently drops half its rows is a wrong answer, not a
+  fast one.
+- **A cheap pre-filter beats a cheaper census.** Every consumer of a pull
+  request's checks is gated behind the managed label, so the expensive per-head
+  work belongs behind that label rather than spread across every open PR.
+
+Because TartCI invokes `shipyard` by name from `PATH`, a gate fix ships by
+replacing that binary. No TartCI generation, supervisor restart or `pool off` is
+involved — each admission call is a fresh process.
 
 ## Runner Watchdog (self-hosted runner recovery)
 
@@ -1874,7 +2001,11 @@ labels = ["self-hosted", "Linux", "ARM64", "pulp-host-macbook-air"]
 
 Active expected hosts default to `min_online = 1`; absent or offline matches are
 reported as `expected_host_unavailable`. Inactive hosts remain visible without
-making the command unhealthy. It is read-only and exits non-zero when a host is
+making the command unhealthy. A declared host whose labels cannot serve
+`--target` carries `serves_target: false`, prints under an `other targets`
+heading, and does not raise the top-level verdict — a Linux or Intel-Mac
+shortfall is inventory news, not a fault in the macOS lane you asked about.
+It is read-only and exits non-zero when a host is
 unreadable/unhealthy, a merge-group Linux build requests `ubuntu-latest` while
 an online idle self-hosted Linux x64 runner exists, or queued macOS work is older
 than `--queued-age-threshold-secs` while routable capacity exists. Use
@@ -1883,6 +2014,25 @@ That limit does not cover merge-queue, enrollment, or release calls, so every
 GitHub read in one fleet tick also shares a 30-second absolute deadline. An
 expired tick renders a fail-closed partial assessment; do not wrap the command
 in a longer retry loop or treat missing observations as idle capacity.
+
+**`routable=false` is not always a capacity fact — read `routing_confidence`.**
+A host reports its own GitHub reads, and those share an IP rate limit and the
+host's network, so a read that merely did not complete used to make otherwise
+healthy capacity unroutable: one org-scope timeout produced `routable_free=0`
+against `free=4` while the repo scope read fine seconds later. A failed read is
+now classified `transient` (timeout, 5xx, rate limit), `denied` (401/403, bad
+credentials), or `unclassified`. Only a transient one is retried, so a 403 never
+burns quota on a retry that cannot help. Transient markers are matched *before*
+status codes on purpose: GitHub serves a rate limit as HTTP 403, so a
+status-first reading calls the commonest recoverable failure permanent. When the
+controller's own repo-scope census answered and found online lane runners, a
+host's non-denied read failure is demoted to a named `degraded_observations`
+entry and the report carries `routing_confidence=degraded` plus
+`routing_degraded_reasons` — the gap is never dropped, because "I could not read
+X" and "X says no" must not look alike. A denial keeps its host unroutable, and
+so does any gap with nothing to corroborate it: a tick where nothing was
+readable still reports zero routable slots. `runners.attempts` and
+`runners.boundary` say how the central census itself fared.
 
 The report retains optional workflows, finds queued jobs inside `in_progress`
 workflows, and compares exact merge-group SHAs. A tick spends at most two
@@ -3179,3 +3329,98 @@ Two reader traps that cost time:
   scalar. The whole-directory control (`parsed + refused` against a listing of
   `.github/workflows/`, printed every run) is what surfaced that; without it the
   file was silently unchecked.
+
+---
+
+## `src/landing/` — the repository's landing model
+
+`landability` answers "can this pull request's required contexts be
+*scheduled*". `landing` answers the other half: **what happens to a pull
+request whose contexts are green.** Same discipline, different question, and
+they are siblings rather than one inside the other.
+
+| module | owns |
+|---|---|
+| `queue.rs` | merge-queue determination across the surfaces that can express one, plus strict protection and the enqueue guidance derived from it |
+| `placement.rs` | required context → the runner identity that actually picked its job up |
+| `backlog.rs` | open pull requests counted by `mergeStateStatus` |
+| `gather.rs` | the reads; nothing here mutates |
+| `render.rs` | human and `--json` forms |
+
+### The endpoint that lies by omission
+
+`GET /repos/{o}/{r}/branches/{b}/protection` has **no merge-queue field at
+all**. A repository with an actively enforcing queue answers that call with a
+clean `200 OK` whose every field is accurate and whose omission is total. It
+does not return `false`; it is silent, and silence reads as `false` to anybody
+who only asks there. The cost of that reading is concrete: an agent
+hand-rebased a 38-pull-request backlog one at a time on a repository whose
+`ALLGREEN` queue had been batching five at a time all along.
+
+So branch protection is modelled as a surface that **cannot vote**:
+`SurfaceOutcome::Inexpressible`, printed as `cannot-say`. The queue comes from
+`GET /repos/{o}/{r}/rulesets` plus a **per-ruleset detail call** — the list
+carries no `rules` array, so the list alone can never find a queue however
+carefully you read it — corroborated against GraphQL
+`repository.mergeQueue(branch:)`.
+
+Three traps in that read:
+
+- **A failed detail call unreads the whole surface.** The rule that matters may
+  be in exactly the ruleset that 502'd, so a partial ruleset read is `Unknown`,
+  not `Absent`.
+- **`~DEFAULT_BRANCH` needs the default branch to resolve**, which is why the
+  GraphQL query fetches `defaultBranchRef` alongside the queue. An unresolvable
+  alias is treated as covering: over-including reports a queue that may not
+  apply to an unusual base, under-including hides a live one, and only the
+  second costs a session.
+- **GraphQL reports `checkResponseTimeout` in seconds** while the rulesets API
+  and the web UI use minutes. It is normalized to minutes rather than printed
+  in a unit the reader has to convert.
+
+### Combination is fail-closed
+
+Any voting surface finds a queue → `Present`, with the disagreement printed
+rather than resolved silently. Otherwise any voting surface unreadable →
+`Unknown`. Otherwise, and only otherwise, `Absent`. **One readable surface
+finding nothing does not license absence while another is blind** — that
+asymmetry is the whole design, because the expensive error here is the false
+negative, not the false positive.
+
+### Placement comes from the job, never from `runs-on:`
+
+`runs-on:` is a request. It is routinely `fromJSON(vars.X_RUNS_ON_JSON)`, whose
+value is not in the workflow file, and even a literal only says what was asked
+for. `runner_name` / `runner_group_name` on a completed job say what answered.
+
+- A hosted runner is `GitHub Actions <n>` in group `GitHub Actions`. Everything
+  else with a runner identity is self-hosted — including hosted *larger*
+  runners' custom groups, which is why the name prefix is checked as well as
+  the group.
+- **A skipped job carries `runner_name: null`**, and on a conditional-heavy
+  workflow most jobs in any run are skipped. Those are `no_evidence`, never a
+  placement — and "a job with this name was found but never executed" is
+  reported distinctly from "no job with this name", because only the first
+  tells you the context name is right.
+- A required `pull_request` context posts on a **pull request head**, not on the
+  base branch head, which carries `push`-event checks instead. So the run that
+  produced a context is found from open pull-request heads'
+  `commits/{sha}/check-runs`, up to three candidate runs per context
+  (interleaved, so every context gets a first attempt before any gets a
+  second), with the recent-completed-runs sweep as a bounded fallback. More
+  than one candidate is needed because a context is routinely *satisfied* by a
+  skipped job, and one candidate would report such a gate as unplaceable even
+  though it runs on every other pull request in the backlog.
+- The run id is taken from the `/actions/runs/<id>/` segment of a check run's
+  `html_url` and the trailing `/job/<id>` is deliberately ignored: handing the
+  jobs endpoint something that is not an Actions job id returns a coherent,
+  wrong answer rather than an error.
+
+### Tests are paired, and the negative cell is the load-bearing one
+
+`src/landing/tests.rs` carries a `protection_only_queue_verdict` reference
+implementation — the shortcut that ships by default, because branch protection
+is the endpoint everybody reaches for first. The real-world fixture asserts
+both that `determine_queue` reports the queue **and** that the shortcut,
+handed the identical payload, answers `absent`. A test that has never been run
+against a wrong implementation has not been shown to be capable of failing.

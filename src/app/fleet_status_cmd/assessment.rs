@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::readability::{DegradedObservation, ReadBoundary, RoutingConfidence};
 use crate::capacity::HostCapacity;
 use crate::fleet_slot::QueuedJobReport;
 use crate::merge_queue_liveness::{MergeQueueLivenessReport, ReleaseLivenessReport};
@@ -35,11 +36,26 @@ pub(super) struct HostFleetStatus {
     pub(super) stale_vm_count: usize,
     pub(super) routable: bool,
     pub(super) problems: Vec<Value>,
+    /// Host-reported GitHub reads the controller's own census answered in their
+    /// place. They do not count against `problem_count`, and they are the
+    /// reason `routing_confidence` can be degraded while `routable` is true.
+    pub(super) degraded_observations: Vec<DegradedObservation>,
     pub(super) supervisors: Vec<Value>,
     pub(super) storage: StorageProbe,
     pub(super) storage_problems: Vec<String>,
     pub(super) attestation: AttestationProbe,
     pub(super) attestation_problems: Vec<String>,
+}
+
+impl HostFleetStatus {
+    /// Whether every input behind this host's verdict was actually read.
+    pub(super) fn routing_confidence(&self) -> RoutingConfidence {
+        if self.degraded_observations.is_empty() {
+            RoutingConfidence::Confirmed
+        } else {
+            RoutingConfidence::Degraded
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -112,7 +128,26 @@ pub(super) struct RepositoryRunner {
 pub(super) struct RunnerInventory {
     pub(super) readable: bool,
     pub(super) source: String,
+    /// How the failure read, when the census is unreadable. `None` on success,
+    /// so an unreadable inventory can never omit why.
+    pub(super) boundary: Option<ReadBoundary>,
+    /// Attempts the census took, retries included. Reported so a single read
+    /// and an exhausted retry budget cannot look the same.
+    pub(super) attempts: u32,
     pub(super) runners: Vec<RepositoryRunner>,
+}
+
+impl RunnerInventory {
+    /// Online runners advertising every label the named lane requests.
+    pub(super) fn online_lane_runners(&self, target: &str) -> usize {
+        self.runners
+            .iter()
+            .filter(|runner| runner.status.eq_ignore_ascii_case("online"))
+            .filter(|runner| {
+                super::labels_match_target(&Value::from(runner.labels.clone()), target)
+            })
+            .count()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +167,10 @@ pub(super) struct ExpectedHostStatus {
     pub(super) matching_runners: Vec<String>,
     pub(super) online: usize,
     pub(super) idle: usize,
+    /// Whether this declared host's labels can serve the lane the report is
+    /// scoped to. A host that cannot keeps reporting its own problem, but that
+    /// problem does not reach the top-level verdict for a lane it never serves.
+    pub(super) serves_target: bool,
     pub(super) problem: Option<String>,
 }
 
@@ -188,6 +227,10 @@ pub(in crate::app) struct FleetAssessment {
     pub(super) target: String,
     pub(super) free: u32,
     pub(super) routable_free_slots: u32,
+    /// Whether the routable-slot count rests on a reading that was complete.
+    pub(super) routing_confidence: RoutingConfidence,
+    /// What could not be read, named per host. Empty when confirmed.
+    pub(super) routing_degraded_reasons: Vec<String>,
     pub(super) capacity_unreadable: bool,
     pub(super) doctor_unreadable: bool,
     pub(super) supervisor_unhealthy: bool,

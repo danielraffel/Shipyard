@@ -359,6 +359,32 @@ pub(super) enum Command {
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },
+    /// Report how work actually lands in a repository: merge queue, strict
+    /// up-to-date protection, how to enqueue, where each required check runs,
+    /// and the shape of the open backlog.
+    ///
+    /// Every field is measured from the GitHub API rather than read from a
+    /// config file or a document, because those drift. Read-only: nothing
+    /// here merges, enqueues, dispatches, or cancels.
+    ///
+    /// Exit 0 when the mechanism was fully determined, 9 when any headline
+    /// field is UNKNOWN. An unreadable surface is never reported as absence.
+    Landing {
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Base branch whose landing model is reported.
+        #[arg(long, value_name = "BRANCH")]
+        base: Option<String>,
+        /// How many recent completed runs to consider when deriving where a
+        /// required check executes. Defaults to 30.
+        #[arg(long = "run-sample", value_name = "COUNT")]
+        run_sample: Option<usize>,
+        /// Upper bound on per-run job reads spent deriving placement.
+        /// Defaults to 15. Zero skips placement entirely.
+        #[arg(long = "max-job-reads", value_name = "COUNT")]
+        max_job_reads: Option<usize>,
+    },
     Doctor {
         /// Exact OWNER/REPO used to resolve configured auth token placeholders.
         #[arg(long, value_name = "OWNER/REPO")]
@@ -1591,6 +1617,14 @@ pub(super) enum DaemonCommand {
     },
     /// Report daemon liveness and status.
     Status,
+    /// Compare the webhook this host intends against the one GitHub holds.
+    ///
+    /// Exits 0 in sync, 1 warning, 2 alarm, 3 blocked on a human action.
+    Reconcile {
+        /// Repo(s) to reconcile. Defaults to the configured repositories.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

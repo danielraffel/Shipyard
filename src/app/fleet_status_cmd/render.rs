@@ -4,7 +4,8 @@ use std::io::Write;
 use serde_json::Value;
 
 use super::assessment::{
-    FleetAssessment, HostFleetStatus, MergeQueueProbe, QueuedSummary, ReleaseProbe,
+    ExpectedHostStatus, FleetAssessment, HostFleetStatus, MergeQueueProbe, QueuedSummary,
+    ReleaseProbe,
 };
 use crate::app::CliFailure;
 use crate::output::write_json_envelope;
@@ -49,6 +50,14 @@ fn write_fleet_json<W: Write>(
     data.insert(
         "routable_free_slots".to_owned(),
         Value::from(view.routable_free_slots),
+    );
+    data.insert(
+        "routing_confidence".to_owned(),
+        Value::from(view.routing_confidence.as_str()),
+    );
+    data.insert(
+        "routing_degraded_reasons".to_owned(),
+        Value::from(view.routing_degraded_reasons.clone()),
     );
     data.insert(
         "any_unreadable".to_owned(),
@@ -105,6 +114,8 @@ fn write_fleet_json<W: Write>(
         serde_json::json!({
             "readable": view.runners.readable,
             "source": view.runners.source,
+            "boundary": view.runners.boundary.map(super::readability::ReadBoundary::as_str),
+            "attempts": view.runners.attempts,
             "total": view.runners.runners.len(),
             "online": view.runners.runners.iter().filter(|runner| runner.status.eq_ignore_ascii_case("online")).count(),
             "idle": view.runners.runners.iter().filter(|runner| runner.status.eq_ignore_ascii_case("online") && !runner.busy).count(),
@@ -131,16 +142,34 @@ fn write_fleet_json<W: Write>(
         .map_err(|e| CliFailure::new(1, format!("failed to write JSON: {e}")))
 }
 
-fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<(), CliFailure> {
+/// Write the headline capacity claim and, when it leaned on something that
+/// could not be read, what that was.
+///
+/// The confidence marker shares the headline rather than hiding further down:
+/// a routable count and a confident one are different claims, and a reader who
+/// stops after the first line must still be able to tell them apart.
+fn write_fleet_headline<W: Write>(
+    stdout: &mut W,
+    view: &FleetAssessment,
+) -> Result<(), CliFailure> {
     writeln!(
         stdout,
-        "fleet-status repo={repo} target={} free={free} routable_free={routable_free_slots}",
+        "fleet-status repo={repo} target={} free={free} routable_free={routable_free_slots} routing_confidence={confidence}",
         view.target,
         repo = view.repo,
         free = view.free,
-        routable_free_slots = view.routable_free_slots
+        routable_free_slots = view.routable_free_slots,
+        confidence = view.routing_confidence.as_str()
     )
     .map_err(text_write_failure)?;
+    for reason in &view.routing_degraded_reasons {
+        writeln!(stdout, "  routing degraded: {reason}").map_err(text_write_failure)?;
+    }
+    Ok(())
+}
+
+fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<(), CliFailure> {
+    write_fleet_headline(stdout, view)?;
     for host in &view.hosts {
         let running = host
             .capacity
@@ -169,10 +198,20 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<
         for problem in &host.attestation_problems {
             writeln!(stdout, "    attestation: {problem}").map_err(text_write_failure)?;
         }
+        for gap in &host.degraded_observations {
+            writeln!(
+                stdout,
+                "    observation gap: {} [{}] — {}",
+                gap.problem,
+                gap.boundary.as_str(),
+                gap.corroborated_by
+            )
+            .map_err(text_write_failure)?;
+        }
     }
     writeln!(
         stdout,
-        "  runners: total={} online={} idle={} offline={} readable={}",
+        "  runners: total={} online={} idle={} offline={} readable={} attempts={} boundary={}",
         view.runners.runners.len(),
         view.runners
             .runners
@@ -189,7 +228,11 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<
             .iter()
             .filter(|runner| runner.status.eq_ignore_ascii_case("offline"))
             .count(),
-        view.runners.readable
+        view.runners.readable,
+        view.runners.attempts,
+        view.runners
+            .boundary
+            .map_or("-", super::readability::ReadBoundary::as_str)
     )
     .map_err(text_write_failure)?;
     for mismatch in &view.routing_mismatches {
@@ -258,25 +301,55 @@ fn write_wedged_queued_text<W: Write>(
     Ok(())
 }
 
+/// Report declared hosts, lane first, other targets after.
+///
+/// The split is a demotion, not a deletion. A Linux or Intel host that is short
+/// of runners is still inventory news worth printing; what it is not is a fault
+/// in the macOS lane the reader asked about, and printing both in one
+/// undifferentiated list is what pushed a healthy lane to "attention required".
 fn write_expected_hosts_text<W: Write>(
     stdout: &mut W,
     view: &FleetAssessment,
 ) -> Result<(), CliFailure> {
-    for host in &view.expected_hosts {
+    for host in view.expected_hosts.iter().filter(|host| host.serves_target) {
+        write_expected_host_line(stdout, host, "expected host")?;
+    }
+    let mut other_targets = view
+        .expected_hosts
+        .iter()
+        .filter(|host| !host.serves_target)
+        .peekable();
+    if other_targets.peek().is_some() {
         writeln!(
             stdout,
-            "  expected host: name={} active={} online={}/{} idle={} runners={} problem={}",
-            host.name,
-            host.active,
-            host.online,
-            host.min_online,
-            host.idle,
-            host.matching_runners.join(","),
-            host.problem.as_deref().unwrap_or("-")
+            "  other targets (not counted against target={}):",
+            view.target
         )
         .map_err(text_write_failure)?;
     }
+    for host in other_targets {
+        write_expected_host_line(stdout, host, "  expected host")?;
+    }
     Ok(())
+}
+
+fn write_expected_host_line<W: Write>(
+    stdout: &mut W,
+    host: &ExpectedHostStatus,
+    label: &str,
+) -> Result<(), CliFailure> {
+    writeln!(
+        stdout,
+        "  {label}: name={} active={} online={}/{} idle={} runners={} problem={}",
+        host.name,
+        host.active,
+        host.online,
+        host.min_online,
+        host.idle,
+        host.matching_runners.join(","),
+        host.problem.as_deref().unwrap_or("-")
+    )
+    .map_err(text_write_failure)
 }
 
 fn host_to_json(host: &HostFleetStatus) -> Value {
@@ -302,6 +375,14 @@ fn host_to_json(host: &HostFleetStatus) -> Value {
     );
     m.insert("source".to_owned(), Value::from(host.doctor.source.clone()));
     m.insert("routable".to_owned(), Value::from(host.routable));
+    m.insert(
+        "routing_confidence".to_owned(),
+        Value::from(host.routing_confidence().as_str()),
+    );
+    m.insert(
+        "degraded_observations".to_owned(),
+        serde_json::to_value(&host.degraded_observations).expect("degraded observations serialize"),
+    );
     m.insert(
         "supervisor_count".to_owned(),
         Value::from(host.supervisor_count),

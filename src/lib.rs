@@ -118,6 +118,8 @@ pub mod init_config;
 /// Job and target-result domain types used by executors and queues.
 pub mod job;
 pub mod landability;
+/// Reporting how work actually merges in a repository.
+pub mod landing;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
 /// Bounded log rotation, terminal classification, and retention primitives.
@@ -242,6 +244,8 @@ pub mod warm_pool;
 pub mod watch;
 /// GitHub webhook signature validation and event decoding.
 pub mod webhook;
+
+pub mod webhook_reconcile;
 pub(crate) mod worker_process_custody;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;

@@ -429,6 +429,53 @@ impl TailscaleStatus {
     }
 }
 
+impl TailscaleStatus {
+    /// This host's authoritative network identity, for webhook reconciliation.
+    ///
+    /// Every unreadable case returns [`HostIdentity::Unreadable`] carrying WHY,
+    /// never a silent absence. The distinction matters because the CLI is not
+    /// on a non-interactive PATH: a naive `command -v tailscale` probe returns
+    /// empty on a perfectly healthy host, and an empty reading that is allowed
+    /// to mean "no change" turns a broken instrument into a clean bill of
+    /// health. The binary is therefore resolved from explicit candidate paths,
+    /// and a failure to resolve it is reported as loudly as a failure to run
+    /// it.
+    #[must_use]
+    pub fn host_identity(&self) -> crate::webhook_reconcile::HostIdentity {
+        use crate::webhook_reconcile::HostIdentity;
+
+        if self.binary_path.is_none() {
+            return HostIdentity::Unreadable {
+                detail: format!(
+                    "no Tailscale CLI at any known path ({}); it is not on a \
+                     non-interactive PATH, so absence here is an unreadable \
+                     identity, not an unchanged one",
+                    TAILSCALE_CANDIDATE_BINARIES.join(", ")
+                ),
+            };
+        }
+        match self.backend_state.as_deref() {
+            Some("Running") => {}
+            Some(other) => {
+                return HostIdentity::Unreadable {
+                    detail: format!("Tailscale backend state is {other}, not Running"),
+                };
+            }
+            None => {
+                return HostIdentity::Unreadable {
+                    detail: "`tailscale status --json` produced no BackendState".to_owned(),
+                };
+            }
+        }
+        self.dns_name.as_deref().map_or_else(
+            || HostIdentity::Unreadable {
+                detail: "`tailscale status --json` carried no Self.DNSName".to_owned(),
+            },
+            HostIdentity::from_node_name,
+        )
+    }
+}
+
 /// Decode `tailscale status --json` into a readiness snapshot.
 #[must_use]
 pub fn decode_tailscale_status(raw_json: &[u8], binary_path: Option<PathBuf>) -> TailscaleStatus {

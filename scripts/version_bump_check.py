@@ -99,6 +99,29 @@ def repo_root() -> Path:
     )
     return Path(out.stdout.strip())
 
+# The gate scripts are shared with Pulp, whose config lives at
+# tools/scripts/versioning.json. Shipyard keeps its own at scripts/versioning.json.
+# Hard-coding Pulp's layout meant a bare invocation in THIS repo always missed
+# its config, so the gate checked nothing and relied on the caller to notice.
+# Search both layouts, and when neither is present say so naming every path
+# tried — a gate that cannot find its config must fail, never pass.
+CONFIG_CANDIDATES = (
+    Path("scripts") / "versioning.json",
+    Path("tools") / "scripts" / "versioning.json",
+)
+
+
+def resolve_config(root: Path, explicit: str | None) -> tuple[Path | None, list[Path]]:
+    """Return (config, searched). ``config`` is None when nothing was found."""
+    if explicit:
+        chosen = Path(explicit)
+        return (chosen if chosen.exists() else None), [chosen]
+    searched = [root / candidate for candidate in CONFIG_CANDIDATES]
+    for candidate in searched:
+        if candidate.exists():
+            return candidate, searched
+    return None, searched
+
 
 def git_diff_names(base: str, head: str) -> list[str]:
     out = subprocess.run(
@@ -787,9 +810,13 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.repo_root) if args.repo_root else repo_root()
-    cfg_path = Path(args.config) if args.config else root / "tools" / "scripts" / "versioning.json"
-    if not cfg_path.exists():
-        sys.stderr.write(f"version_bump_check: config not found: {cfg_path}\n")
+    cfg_path, searched = resolve_config(root, args.config)
+    if cfg_path is None:
+        sys.stderr.write(
+            "version_bump_check: CANNOT MEASURE — config not found. Searched: "
+            + ", ".join(str(path) for path in searched)
+            + "\nversion_bump_check: the gate checked nothing; exiting 2 (not a pass).\n"
+        )
         return 2
 
     cfg = load_config(cfg_path)

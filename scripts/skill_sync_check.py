@@ -25,6 +25,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+# Shared with the sibling gate so both resolve config identically.
+from version_bump_check import resolve_config
+
 
 # ── Types ───────────────────────────────────────────────────────────────
 
@@ -350,12 +353,13 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.repo_root) if args.repo_root else repo_root()
-    cfg_path = (
-        Path(args.config) if args.config
-        else root / "tools" / "scripts" / "versioning.json"
-    )
-    if not cfg_path.exists():
-        sys.stderr.write(f"skill_sync_check: config not found: {cfg_path}\n")
+    cfg_path, searched = resolve_config(root, args.config)
+    if cfg_path is None:
+        sys.stderr.write(
+            "skill_sync_check: CANNOT MEASURE — config not found. Searched: "
+            + ", ".join(str(path) for path in searched)
+            + "\nskill_sync_check: the gate checked nothing; exiting 2 (not a pass).\n"
+        )
         return 2
 
     cfg = load_config(cfg_path, root)

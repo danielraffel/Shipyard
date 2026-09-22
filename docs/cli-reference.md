@@ -38,6 +38,12 @@ shipyard dependency pulp show             # local policy + exact lock
 shipyard dependency pulp update           # qualify latest/stable/fixed and open an App-authored PR
 shipyard dependency pulp verify           # fresh, cache-bypassing CI verification
 
+# Understand how a repo lands work (read-only)
+shipyard landing                             # merge queue, strict, enqueue, check placement, backlog
+shipyard landing --repo OWNER/REPO --base main
+shipyard --json landing                      # machine-readable; exit 9 when any headline field is UNKNOWN
+shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
+
 # Monitor
 shipyard status                # dashboard: queue + targets + evidence
 shipyard queue-observe         # one read-only queue/PR snapshot; emit on change

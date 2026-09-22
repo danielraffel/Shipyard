@@ -13,6 +13,26 @@ same persisted registration and can unregister through any casing. Registrar
 changes must be committed and pushed to the same PR branch so Shipyard validates
 one exact head; do not create a parallel PR or mutate webhooks manually.
 
+## A live daemon is not a delivering daemon
+
+`shipyard daemon status` reports what the daemon INTENDS — its own tunnel URL —
+which stays correct even when the URL GitHub actually holds has gone stale. A
+host whose tailnet name changed kept a registration under the old name; every
+delivery failed to connect, and because nothing was subscribed to the feed its
+failure produced no symptom at all.
+
+Before calling a daemon healthy, compare the two sides:
+
+```sh
+shipyard daemon reconcile            # 0 in sync · 1 warn · 2 alarm · 3 blocked on a human
+shipyard daemon reconcile --json     # same verdict, machine-readable findings
+```
+
+Exit 3 means a GitHub App permission (`repository_hooks: write`) is missing and
+only a human can grant it, in the App's settings. Do not answer it by
+refreshing the daemon or clearing token caches: the credential is valid, and
+that remedy belongs to a different fault that merely shares the 403 status code.
+
 ## Metrics authority
 
 GitHub job `created_at` is the provider-authoritative queue timestamp. Metrics
@@ -87,7 +107,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Runner provisioning: live cross-repo pool view** | `shipyard runner list [--repo <owner/repo>]` (groups by machine; flags orphaned local dirs) |
 | **Runner provisioning: audit host-class and local PATH drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels, fatally rejects advisory/required label overlap, and strictly checks every in-scope local runner's `.path` against Shipyard's canonical system-first value; malformed/unreadable local inventory fails closed; exit 1 on drift). New/service-less registration preserves that PATH through `config.sh`; drain and stop/uninstall a service-installed runner before reconciliation because Shipyard never stops live capacity implicitly. |
 | **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` + `tart get` per `[host_class.*]`, using configured `tart_home` as `TART_HOME`; counts only running macOS/darwin VMs; `free = Σ max(0, cap − running_macos)`; fail-closed, exit 1 if any host/VM OS unreadable) |
-| **Runner fleet visibility: exact-head queue/release liveness** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (bounded pagination plus one shared 30-second GitHub deadline; deadline expiry renders a fail-closed partial assessment instead of hanging; stable auth/rate/truncation reasons; detects optional/superseded capacity owners and cleared enrollment) |
+| **Runner fleet visibility: exact-head queue/release liveness** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (bounded pagination plus one shared 30-second GitHub deadline; deadline expiry renders a fail-closed partial assessment instead of hanging; stable auth/rate/truncation reasons; detects optional/superseded capacity owners and cleared enrollment). **Read `routing_confidence` next to `routable_free`.** A failed GitHub read is classified `transient` / `denied` / `unclassified`; only a transient one is retried, and one the controller's own repo-scope census can corroborate is demoted to a named `degraded_observations` entry instead of making healthy capacity unroutable. A denial, or a gap with nothing to corroborate it, still reports zero routable slots. A declared expected host that cannot serve `--target` prints under `other targets` and does not raise the verdict. |
 | **Roll one exact Shipyard release across the fleet** | Configure absolute `host_class.<name>.shipyard_bin` and remote `github_cli` paths, explicit `shipyard_mode`/`shipyard_global_dir`/`shipyard_state_dir`, plus self-contained machine-global command auth. Review `shipyard runner fleet-update --to vX.Y.Z --host-class <class> --json`, then add `--apply`; repeat the selector for an ordered subset or use explicit `--all-hosts`. Before any host, Shipyard binds the annotated tag's full tag-object/commit/tree OIDs, release ID, exact checksum-manifest and macOS DMG SHA-256, and `release.yml` build-provenance attestations, closes the mint window, and freezes that authority for every selected host. Release assets stream by immutable asset ID into owner-private hard-capped staging; exact declared size and SHA are verified before attestation, while partial files and escaped pipe holders are bounded by the same process-tree deadline. Missing attestations, manifest/source drift, implicit/duplicate hosts, authority/asset receipt mismatch, cross-host pair-hash mismatch, mixed CLI/provider pairs, or a companion retained by legacy rollback fail closed. Receipts preserve complete authority plus before/after paths, versions, double hashes, daemon identity, and configured repositories; rollout stops at the first failure. |
 
 The first governed replacement of a deployed pre-release-matched legacy auth
@@ -1027,6 +1047,41 @@ concluding anything:
 If runners *do* advertise the labels and jobs still sit, that is starvation
 (scheduling or capacity), not routing — `shipyard rescue` below, not a variable
 edit. Background: `docs/runner-watchdog.md` § Fleet service assertions.
+
+## Zero runners fleet-wide: suspect the admission gate's own observation cost
+
+`runner admission-clean` is the gate TartCI calls immediately before registering
+a just-in-time runner, and it fails closed: any verdict other than a typed
+`admit` discards the already-booted VM. A gate that cannot *observe* therefore
+looks exactly like a fleet with no capacity — VMs mint, boot, are refused and are
+torn down, on every host at once, while the backlog that caused it keeps growing.
+
+The shape to watch for: **the gate's observation must never depend on a snapshot
+whose cost scales with the backlog it exists to drain.** A per-PR field attached
+to a whole-open-PR query is the classic instance. `statusCheckRollup` costs
+roughly 19 KB per pull request, so past roughly thirty open pull requests a
+single GraphQL call exceeds GitHub's budget and fails wholesale.
+
+Reading that failure correctly:
+
+- **The error is not stable.** Near the threshold GitHub returns HTTP 504 or a
+  truncated body (`unexpected end of JSON input`) roughly interchangeably. Never
+  key handling, a log line, or a test on the string `504`; classify by outcome
+  (could not observe). The verdict already does this — both land on `error` /
+  `observation_failed`.
+- **It is stochastic, so a single run proves nothing.** Sample at least six times
+  before calling such a query healthy or broken.
+- **`gh pr list --limit` is a total cap, not a page size.** Lowering it makes the
+  query pass because it returns fewer pull requests, not because it got cheaper
+  per row. A census that silently drops half its rows is a wrong answer, not a
+  fast one.
+- **A cheap pre-filter beats a cheaper census.** Every consumer of a pull
+  request's checks is gated behind the managed label, so the expensive per-head
+  work belongs behind that label rather than spread across every open PR.
+
+Because TartCI invokes `shipyard` by name from `PATH`, a gate fix ships by
+replacing that binary. No TartCI generation, supervisor restart or `pool off` is
+involved — each admission call is a fresh process.
 
 ## Rescuing wedged runners (`shipyard rescue`)
 
@@ -2499,6 +2554,35 @@ appeared at all — not red, not pending, simply absent from `statusCheckRollup`
 ```sh
 shipyard landability --repo OWNER/REPO --base main   # the on-demand surface
 ```
+
+### Before bulk backlog work: `shipyard landing`
+
+`landability` says whether a gate can be scheduled. It does not say how work
+**merges** here, and that is the question to settle before touching a backlog.
+
+```sh
+shipyard landing --repo OWNER/REPO --base main   # read-only; nothing merges
+shipyard --json landing                          # exit 9 when a headline field is UNKNOWN
+```
+
+It reports the merge queue (read from **rulesets**, which is the only REST
+surface that carries one — `branches/{b}/protection` has no merge-queue field
+and its silence is not evidence of absence), strict up-to-date protection, the
+exact enqueue command including the merge method the queue itself declares,
+where each required check last actually executed (from a completed job's
+`runner_name`, not from `runs-on:`), and the open backlog counted by
+`mergeStateStatus`.
+
+**Queue present + strict ON means the action is ENQUEUE.** Merging one pull
+request at a time is a treadmill: each landing puts every other open pull
+request `behind` and forces an individual full-gate revalidation. Hand-rebasing
+a backlog in that state is wasted work. The backlog counts separate the two
+blockers that call for opposite responses — `dirty` needs conflict resolution
+and no queue capacity moves it, while `behind` and `blocked` are exactly what
+the queue absorbs.
+
+An unreadable surface reports `UNKNOWN`, never `absent`. Treat an `UNKNOWN`
+queue as "determine this before doing bulk work", not as "there is no queue".
 
 ### Reading the verdict
 

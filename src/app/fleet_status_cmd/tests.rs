@@ -41,8 +41,26 @@ fn wedge_runner(name: &str, status: &str, busy: bool, labels: &[&str]) -> Reposi
     }
 }
 
+/// A repo-scope census that answered and found the lane served.
+fn corroborated_lane() -> LaneCorroboration {
+    LaneCorroboration {
+        inventory_readable: true,
+        online_lane_runners: 2,
+    }
+}
+
+/// A repo-scope census that could not be read at all.
+fn uncorroborated_lane() -> LaneCorroboration {
+    LaneCorroboration {
+        inventory_readable: false,
+        online_lane_runners: 0,
+    }
+}
+
 fn wedge_inventory(runners: Vec<RepositoryRunner>) -> RunnerInventory {
     RunnerInventory {
+        boundary: None,
+        attempts: 1,
         readable: true,
         source: "github".to_owned(),
         runners,
@@ -181,6 +199,8 @@ fn control_an_unreadable_census_reports_nothing_rather_than_a_pass() {
     // folded into a clean result. `examined = 0` is the signal that the sweep
     // reached nothing.
     let inventory = RunnerInventory {
+        boundary: None,
+        attempts: 1,
         readable: false,
         source: "github: rate limited".to_owned(),
         runners: vec![],
@@ -226,6 +246,8 @@ fn wedge_assessment(wedged_queued: WedgedQueuedJobs) -> FleetAssessment {
         target: "macos".to_owned(),
         free: 2,
         routable_free_slots: 1,
+        routing_confidence: RoutingConfidence::Confirmed,
+        routing_degraded_reasons: Vec::new(),
         capacity_unreadable: false,
         doctor_unreadable: false,
         supervisor_unhealthy: false,
@@ -256,6 +278,8 @@ fn wedge_assessment(wedged_queued: WedgedQueuedJobs) -> FleetAssessment {
         },
         hosts: Vec::new(),
         runners: RunnerInventory {
+            boundary: None,
+            attempts: 1,
             readable: true,
             source: "github".to_owned(),
             runners: Vec::new(),
@@ -484,7 +508,7 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
                 probe.storage,
                 probe.attestation,
                 FLEET_LANE_TARGET,
-                true,
+                corroborated_lane(),
             )
         })
         .collect::<Vec<_>>();
@@ -495,6 +519,8 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
         target: "macos".to_owned(),
         free: 2,
         routable_free_slots: 2,
+        routing_confidence: RoutingConfidence::Confirmed,
+        routing_degraded_reasons: Vec::new(),
         capacity_unreadable: true,
         doctor_unreadable: true,
         supervisor_unhealthy: false,
@@ -525,6 +551,8 @@ fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
         },
         hosts,
         runners: RunnerInventory {
+            boundary: None,
+            attempts: 1,
             readable: true,
             source: "github".to_owned(),
             runners: Vec::new(),
@@ -551,6 +579,8 @@ fn assessment_renders_command_and_watch_json_without_round_trip() {
         target: "macos".to_owned(),
         free: 2,
         routable_free_slots: 1,
+        routing_confidence: RoutingConfidence::Confirmed,
+        routing_degraded_reasons: Vec::new(),
         capacity_unreadable: false,
         doctor_unreadable: false,
         supervisor_unhealthy: false,
@@ -581,6 +611,8 @@ fn assessment_renders_command_and_watch_json_without_round_trip() {
         },
         hosts: Vec::new(),
         runners: RunnerInventory {
+            boundary: None,
+            attempts: 1,
             readable: true,
             source: "github".to_owned(),
             runners: Vec::new(),
@@ -726,7 +758,7 @@ fn analyze_host_scopes_health_to_requested_target() {
         },
         healthy_attestation(),
         FLEET_LANE_TARGET,
-        true,
+        corroborated_lane(),
     );
     assert!(host.routable);
     assert_eq!(host.problem_count, 0);
@@ -774,7 +806,7 @@ fn central_runner_inventory_supersedes_host_github_rate_limit_problem() {
         storage,
         healthy_attestation(),
         "macos",
-        true,
+        corroborated_lane(),
     );
     assert!(centrally_observed.routable);
     assert_eq!(centrally_observed.problem_count, 0);
@@ -844,6 +876,8 @@ fn storage_probe_does_not_override_ccache_config_discovery() {
 #[test]
 fn routing_mismatch_reports_idle_linux_pool_for_hosted_merge_group() {
     let inventory = RunnerInventory {
+        boundary: None,
+        attempts: 1,
         readable: true,
         source: "github".to_owned(),
         runners: vec![RepositoryRunner {
@@ -942,6 +976,8 @@ labels = ["self-hosted", "Linux", "ARM64", "pulp-host-macbook-air"]
     .expect("config");
     let expected = parse_expected_hosts(&config).expect("expected hosts");
     let inventory = RunnerInventory {
+        boundary: None,
+        attempts: 1,
         readable: true,
         source: "github".to_owned(),
         runners: vec![RepositoryRunner {
@@ -958,7 +994,7 @@ labels = ["self-hosted", "Linux", "ARM64", "pulp-host-macbook-air"]
         }],
     };
 
-    let statuses = assess_expected_hosts(&expected, &inventory);
+    let statuses = assess_expected_hosts(&expected, &inventory, "macos");
 
     let macpro = statuses.iter().find(|host| host.name == "macpro").unwrap();
     assert_eq!(macpro.online, 1);
@@ -982,10 +1018,13 @@ labels = ["self-hosted", "Linux", "ARM64", "pulp-host-macbook-air"]
     let unreadable = assess_expected_hosts(
         &expected,
         &RunnerInventory {
+            boundary: None,
+            attempts: 1,
             readable: false,
             source: "rate limited".to_owned(),
             runners: Vec::new(),
         },
+        "macos",
     );
     assert_eq!(
         unreadable
@@ -2137,7 +2176,7 @@ fn an_unreadable_attestation_makes_a_host_unroutable() {
         healthy_storage(),
         blind,
         FLEET_LANE_TARGET,
-        true,
+        corroborated_lane(),
     );
 
     assert_eq!(host.problem_count, 1, "the blind read must be a problem");
@@ -2151,7 +2190,7 @@ fn an_unreadable_attestation_makes_a_host_unroutable() {
         healthy_storage(),
         healthy_attestation(),
         FLEET_LANE_TARGET,
-        true,
+        corroborated_lane(),
     );
     assert_eq!(seeing.problem_count, 0);
     assert!(seeing.routable, "the control host must be routable");
@@ -2173,7 +2212,7 @@ fn an_attestation_finding_reaches_both_json_surfaces() {
         healthy_storage(),
         attestation,
         FLEET_LANE_TARGET,
-        true,
+        corroborated_lane(),
     );
 
     assert_eq!(
@@ -2214,5 +2253,416 @@ fn an_attestation_finding_reaches_both_json_surfaces() {
     assert!(
         text.contains("attestation: runner_crash_loop:pulp-preamble-m5"),
         "the human surface dropped the finding:\n{text}"
+    );
+}
+
+/// A host whose only complaint is that its own GitHub read did not answer.
+fn doctor_reporting(problem: &str) -> DoctorProbe {
+    DoctorProbe {
+        readable: true,
+        source: "test".to_owned(),
+        digest: Some(serde_json::json!({
+            "config": {"heartbeat_stale_secs": 900},
+            "problems": [problem],
+            "supervisors": [{
+                "runner":"pulp-vm-m1-01",
+                "labels":"self-hosted,macOS,ARM64",
+                "owner_pid_alive":true,
+                "heartbeat_age_secs":5
+            }]
+        })),
+    }
+}
+
+fn analyze_with(problem: &str, corroboration: LaneCorroboration) -> HostFleetStatus {
+    analyze_host(
+        healthy_capacity(),
+        doctor_reporting(problem),
+        healthy_storage(),
+        healthy_attestation(),
+        FLEET_LANE_TARGET,
+        corroboration,
+    )
+}
+
+#[test]
+fn an_org_scope_gap_the_repo_census_answered_leaves_the_host_routable() {
+    // The incident shape: one host's org-scope read times out, the repo scope
+    // reads fine seconds later with a busy runner in it, and the fleet reports
+    // routable_free=0 against free=4. Capacity was never the thing that failed.
+    let host = analyze_with(
+        "github_runners_scope_unreadable:organization",
+        corroborated_lane(),
+    );
+
+    assert!(
+        host.routable,
+        "a scope nobody could read is not a capacity fact"
+    );
+    assert_eq!(host.problem_count, 0);
+    assert_eq!(host.routing_confidence(), RoutingConfidence::Degraded);
+    let gap = host
+        .degraded_observations
+        .first()
+        .expect("the gap must still be named");
+    assert!(
+        gap.problem.contains("organization"),
+        "the degraded reason must name what could not be read: {}",
+        gap.problem
+    );
+    assert_eq!(gap.boundary, ReadBoundary::Unclassified);
+
+    // Control: the same host with nothing unreadable claims no degradation, so
+    // the marker cannot be something every host carries.
+    let clean = analyze_host(
+        healthy_capacity(),
+        healthy_doctor(),
+        healthy_storage(),
+        healthy_attestation(),
+        FLEET_LANE_TARGET,
+        corroborated_lane(),
+    );
+    assert_eq!(clean.routing_confidence(), RoutingConfidence::Confirmed);
+    assert!(clean.degraded_observations.is_empty());
+}
+
+#[test]
+fn a_denied_github_read_keeps_its_host_unroutable() {
+    // Control for the case above: GitHub answered, and the answer was no. A
+    // denial does not self-heal on the next tick, so corroboration elsewhere
+    // does not get to wave it through.
+    let host = analyze_with(
+        "github_unreadable:HTTP 403: Resource not accessible by integration",
+        corroborated_lane(),
+    );
+
+    assert!(!host.routable, "a denial is a fleet fact, not a gap");
+    assert_eq!(host.problem_count, 1);
+    assert!(
+        host.degraded_observations.is_empty(),
+        "a denial must never be demoted to an observation gap"
+    );
+    assert_eq!(
+        host_github_observation_boundary(&Value::from(
+            "github_unreadable:HTTP 403: Resource not accessible by integration"
+        )),
+        Some(ReadBoundary::Denied)
+    );
+}
+
+#[test]
+fn a_rate_limited_read_is_transient_even_though_github_serves_it_as_403() {
+    // GitHub answers a rate limit with HTTP 403. Reading the status before the
+    // reason would classify the most common transient failure as permanent and
+    // stop retrying exactly the case a retry fixes.
+    assert_eq!(
+        classify_read_boundary("HTTP 403: API rate limit exceeded"),
+        ReadBoundary::Transient
+    );
+    assert_eq!(
+        classify_read_boundary("HTTP 403: Resource not accessible by integration"),
+        ReadBoundary::Denied
+    );
+    assert_eq!(
+        classify_read_boundary("gh api repos/x/actions/runners timed out after 2700ms"),
+        ReadBoundary::Transient
+    );
+    assert_eq!(
+        classify_read_boundary("github_runners_scope_unreadable"),
+        ReadBoundary::Unclassified
+    );
+}
+
+#[test]
+fn a_fleet_nobody_could_read_is_still_not_routable() {
+    // The guarantee that has to survive the change. With no readable census to
+    // corroborate it, an unreadable scope keeps its host unroutable — the
+    // demotion is bought by a second reading, never assumed.
+    let blind = analyze_with(
+        "github_runners_scope_unreadable:organization",
+        uncorroborated_lane(),
+    );
+    assert!(!blind.routable, "an unreadable fleet must fail closed");
+    assert_eq!(blind.problem_count, 1);
+    assert!(blind.degraded_observations.is_empty());
+
+    // A census that answered but found no online lane runner corroborates
+    // nothing either: half the evidence is not the evidence.
+    let empty_census = analyze_with(
+        "github_runners_scope_unreadable:organization",
+        LaneCorroboration {
+            inventory_readable: true,
+            online_lane_runners: 0,
+        },
+    );
+    assert!(
+        !empty_census.routable,
+        "a census with no lane runner corroborates nothing"
+    );
+    assert_eq!(empty_census.problem_count, 1);
+}
+
+/// A fake `gh` that answers regardless of the host's machine-global config.
+///
+/// [`fake_gh`] inherits whatever global `[github.auth]` the machine carries. A
+/// `token_command` there is expanded against the working directory, which for a
+/// temp dir is not a checkout — so the census fails during credential
+/// preparation and the script under test never runs. Loading an empty global
+/// layer keeps these cases measuring retry behaviour rather than the host.
+#[cfg(unix)]
+fn fake_gh_isolated(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
+    let global = temp.path().join("global-config");
+    fs::create_dir_all(&global).expect("global config dir");
+    let config = crate::config::LoadedConfig::load(
+        Some(global),
+        None,
+        None,
+        crate::config::LocalOverlaySource::None,
+    )
+    .expect("empty config loads");
+    let path = temp.path().join("gh");
+    crate::test_support::write_executable_script(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));
+    GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(path)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_transient_census_failure_is_retried_until_it_answers() {
+    let temp = tempfile::tempdir().expect("temp");
+    let counter = temp.path().join("attempts");
+    let actions = fake_gh_isolated(
+        &temp,
+        &format!(
+            r#"
+printf 'x' >> {counter}
+attempts=$(wc -c < {counter} | tr -d ' ')
+if [ "$attempts" -lt 2 ]; then
+  echo "HTTP 503: Service Unavailable" >&2
+  exit 1
+fi
+printf '%s\n' '{{"id":1,"name":"pulp-vm-01","status":"online","busy":false,"labels":[{{"name":"self-hosted"}},{{"name":"macOS"}},{{"name":"ARM64"}}]}}'
+"#,
+            counter = counter.display()
+        ),
+    );
+
+    let inventory = fetch_repository_runners_with_backoff(
+        &actions,
+        "Generous-Corp/pulp",
+        &[Duration::from_millis(1), Duration::from_millis(1)],
+    );
+
+    assert!(
+        inventory.readable,
+        "a blip must not decide a routability verdict: {}",
+        inventory.source
+    );
+    assert_eq!(inventory.attempts, 2, "the retry must actually have run");
+    assert_eq!(inventory.online_lane_runners("macos"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_denied_census_failure_is_not_retried() {
+    // Control for the case above. Re-asking a refusal cannot change it, and
+    // the retry would spend the quota a refusal is sometimes caused by.
+    let temp = tempfile::tempdir().expect("temp");
+    let counter = temp.path().join("attempts");
+    let actions = fake_gh_isolated(
+        &temp,
+        &format!(
+            r#"
+printf 'x' >> {counter}
+echo "HTTP 403: Resource not accessible by integration" >&2
+exit 1
+"#,
+            counter = counter.display()
+        ),
+    );
+
+    let inventory = fetch_repository_runners_with_backoff(
+        &actions,
+        "Generous-Corp/pulp",
+        &[Duration::from_millis(1), Duration::from_millis(1)],
+    );
+
+    assert!(!inventory.readable);
+    assert_eq!(inventory.boundary, Some(ReadBoundary::Denied));
+    assert_eq!(inventory.attempts, 1, "a denial must not be retried");
+    assert_eq!(
+        fs::read_to_string(&counter).expect("counter").len(),
+        1,
+        "the denial burned more than one call"
+    );
+    assert!(
+        inventory.source.contains("denied"),
+        "an unreadable census must name its boundary: {}",
+        inventory.source
+    );
+}
+
+fn expected_host(name: &str, labels: &[&str]) -> ExpectedHostConfig {
+    ExpectedHostConfig {
+        name: name.to_owned(),
+        active: true,
+        min_online: 1,
+        labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn a_non_macos_expected_host_does_not_drive_a_macos_verdict() {
+    // Both declared machines are unavailable, and neither can serve a macOS
+    // ARM64 job: one is Linux, the other an Intel Mac. Reported, not counted.
+    let expected = [
+        expected_host(
+            "macpro",
+            &["self-hosted", "Linux", "X64", "pulp-host-macpro"],
+        ),
+        expected_host(
+            "macmini",
+            &["self-hosted", "macOS", "X64", "pulp-host-macmini"],
+        ),
+    ];
+    let statuses = assess_expected_hosts(&expected, &wedge_inventory(Vec::new()), "macos");
+
+    assert!(
+        statuses.iter().all(|host| host.problem.is_some()),
+        "the finding must not be deleted, only demoted"
+    );
+    assert!(
+        statuses.iter().all(|host| !host.serves_target),
+        "neither a Linux nor an Intel host serves the macOS lane"
+    );
+    assert!(
+        expected_hosts_needing_attention(&statuses).is_empty(),
+        "a lane nobody asked about must not raise the verdict"
+    );
+}
+
+#[test]
+fn a_macos_expected_host_still_drives_the_macos_verdict() {
+    // Control: the identical shortfall on a machine that does serve the lane.
+    let expected = [expected_host(
+        "studio",
+        &["self-hosted", "macOS", "ARM64", "pulp-host-studio"],
+    )];
+    let statuses = assess_expected_hosts(&expected, &wedge_inventory(Vec::new()), "macos");
+
+    assert!(statuses[0].serves_target);
+    assert_eq!(
+        expected_hosts_needing_attention(&statuses)
+            .iter()
+            .map(|host| host.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["studio"],
+        "a host that serves the lane must still raise it"
+    );
+}
+
+#[test]
+fn an_undeclared_platform_is_not_read_as_a_contradiction() {
+    // Silence about a platform is not a claim about it. The Apple Silicon gate
+    // hosts register no host-identifying platform label, and excluding a host
+    // for failing to declare one would quietly drop the lane's own machines.
+    assert!(expected_host_serves_target(
+        &["self-hosted".to_owned(), "pulp-build-vm".to_owned()],
+        "macos"
+    ));
+    assert!(expected_host_serves_target(
+        &["self-hosted".to_owned(), "Linux".to_owned()],
+        "linux"
+    ));
+    assert!(!expected_host_serves_target(
+        &["self-hosted".to_owned(), "Linux".to_owned()],
+        "macos"
+    ));
+}
+
+#[test]
+fn other_target_hosts_render_in_their_own_section() {
+    let mut assessment = wedge_assessment(WedgedQueuedJobs::default());
+    assessment.target = "macos".to_owned();
+    assessment.expected_hosts = vec![
+        ExpectedHostStatus {
+            name: "macpro".to_owned(),
+            active: true,
+            min_online: 2,
+            labels: vec!["Linux".to_owned()],
+            matching_runners: Vec::new(),
+            online: 0,
+            idle: 0,
+            serves_target: false,
+            problem: Some("expected_host_unavailable:online=0 min_online=2".to_owned()),
+        },
+        ExpectedHostStatus {
+            name: "studio".to_owned(),
+            active: true,
+            min_online: 1,
+            labels: vec!["macOS".to_owned(), "ARM64".to_owned()],
+            matching_runners: vec!["pulp-vm-01".to_owned()],
+            online: 1,
+            idle: 1,
+            serves_target: true,
+            problem: None,
+        },
+    ];
+
+    let mut text = Vec::new();
+    render_fleet_assessment(&assessment, false, &mut text).expect("text");
+    let text = String::from_utf8(text).expect("utf8");
+
+    let section = text
+        .find("other targets (not counted against target=macos)")
+        .expect("the demoted section must be labelled");
+    let macpro = text
+        .find("name=macpro")
+        .expect("macpro must still be printed");
+    assert!(
+        macpro > section,
+        "macpro must sit under the demoted heading:\n{text}"
+    );
+    assert!(
+        text.find("name=studio").expect("studio printed") < section,
+        "a lane host must stay above the demoted heading:\n{text}"
+    );
+}
+
+#[test]
+fn a_degraded_routing_verdict_names_its_gap_on_both_surfaces() {
+    let mut assessment = wedge_assessment(WedgedQueuedJobs::default());
+    assessment.hosts = vec![analyze_with(
+        "github_runners_scope_unreadable:organization",
+        corroborated_lane(),
+    )];
+    assessment.routing_degraded_reasons = routing_degraded_reasons(&assessment.hosts);
+    assessment.routing_confidence = RoutingConfidence::Degraded;
+
+    let mut text = Vec::new();
+    render_fleet_assessment(&assessment, false, &mut text).expect("text");
+    let text = String::from_utf8(text).expect("utf8");
+    assert!(
+        text.contains("routing_confidence=degraded"),
+        "the headline must carry the confidence marker:\n{text}"
+    );
+    assert!(
+        text.contains("routing degraded:") && text.contains("organization"),
+        "the human surface must name the gap:\n{text}"
+    );
+
+    let mut json = Vec::new();
+    render_fleet_assessment(&assessment, true, &mut json).expect("json");
+    let document: Value = serde_json::from_slice(&json).expect("json parses");
+    assert_eq!(document["routing_confidence"], "degraded");
+    assert_eq!(document["hosts"][0]["routing_confidence"], "degraded");
+    assert_eq!(
+        document["hosts"][0]["degraded_observations"][0]["boundary"],
+        "unclassified"
+    );
+    assert!(
+        document["routing_degraded_reasons"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("organization")),
+        "the JSON surface must name the gap: {document}"
     );
 }

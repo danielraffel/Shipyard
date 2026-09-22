@@ -653,7 +653,7 @@ fn refreshed_admission_authority(
     let (_, positions, heads, _) =
         merge_queue_snapshot(actions, &observation.repo, &observation.base)?;
     let mut prs = pull_requests(actions, &observation.repo, &observation.base, &positions)?;
-    hydrate_required_check_identities(actions, &observation.repo, &[], &mut prs)?;
+    hydrate_census_check_identities(actions, &observation.repo, &[], &mut prs)?;
     Ok((prs, heads))
 }
 
@@ -1315,9 +1315,10 @@ use capacity_cancellation::{
 use ledger::{attempt_key, load_ledger, record_audit, save_ledger};
 use observation::{
     active_runs, complete_checks_for_head, fetch_run_jobs, fetch_run_jobs_before, gh_json,
-    gh_json_before, gh_json_timeout, hydrate_required_check_identities,
-    hydrate_required_check_identities_before, merge_queue_snapshot, merge_queue_snapshot_before,
-    observe_repo, parse_job, parse_pr, parse_run, pull_requests, required_checks, resolve_repos,
+    gh_json_before, gh_json_timeout, hydrate_census_check_identities,
+    hydrate_required_check_identities, hydrate_required_check_identities_before,
+    merge_queue_snapshot, merge_queue_snapshot_before, observe_repo, parse_job, parse_pr,
+    parse_run, pull_requests, required_checks, resolve_repos,
 };
 #[cfg(test)]
 use pr_mutations::mutate_pr;
