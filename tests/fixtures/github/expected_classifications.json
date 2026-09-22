@@ -1,0 +1,53 @@
+{
+  "_comment": "Ground truth for the real-response corpus in this directory. Asserted by BOTH the Rust classifier (src/pr_queue_state.rs) and the Python guard classifier (scripts/ghapp_queue_arm_guard.py), so the two implementations cannot drift apart silently.",
+  "pr_queued.json": {
+    "pr": 8669,
+    "class": "queued",
+    "entry_state": "AWAITING_CHECKS",
+    "position": 1,
+    "requeues_without_new_head": 0,
+    "last_ejection_reason": null,
+    "guard": "refuse"
+  },
+  "pr_never_armed.json": {
+    "pr": 8672,
+    "class": "never_armed",
+    "requeues_without_new_head": 0,
+    "last_ejection_reason": null,
+    "guard": "allow"
+  },
+  "pr_armed_not_queued.json": {
+    "pr": 8678,
+    "class": "armed_not_queued",
+    "enabled_at": "2026-09-21T23:10:04Z",
+    "requeues_without_new_head": 0,
+    "last_ejection_reason": null,
+    "guard": "refuse"
+  },
+  "pr_ejected_requeued.json": {
+    "pr": 8702,
+    "class": "queued",
+    "entry_state": "AWAITING_CHECKS",
+    "position": 3,
+    "requeues_without_new_head": 1,
+    "last_ejection_reason": "failed_checks",
+    "last_ejection_new_head_since": false,
+    "guard": "refuse"
+  },
+  "pr_ejected_history.json": {
+    "pr": 8638,
+    "class": "armed_not_queued",
+    "enabled_at": "2026-09-22T18:57:52Z",
+    "requeues_without_new_head": 4,
+    "last_ejection_reason": "failed_checks",
+    "last_ejection_new_head_since": true,
+    "guard": "refuse"
+  },
+  "pr_merged.json": {
+    "pr": 8721,
+    "class": "merged",
+    "requeues_without_new_head": 0,
+    "last_ejection_reason": null,
+    "guard": "refuse"
+  }
+}

@@ -172,6 +172,8 @@ pub mod pin;
 pub mod platform;
 /// Pull request shell boundary used by `ship`.
 pub mod pr;
+/// Classify one pull request's merge-queue state from GraphQL timeline facts.
+pub mod pr_queue_state;
 /// Pull request title/body composition.
 pub mod pr_text;
 /// Submission preflight checks for `ship --pr`.

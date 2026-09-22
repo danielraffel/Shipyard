@@ -1,0 +1,1 @@
+{"data":{"repository":{"pullRequest":{"number":8672,"state":"OPEN","headRefOid":"788ba84d032575e04b0c13e1b2fc4a1b105c6148","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{"nodes":[{"__typename":"PullRequestCommit","commit":{"oid":"788ba84d032575e04b0c13e1b2fc4a1b105c6148","pushedDate":null}}]}}}}}
