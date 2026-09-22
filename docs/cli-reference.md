@@ -42,6 +42,7 @@ shipyard dependency pulp verify           # fresh, cache-bypassing CI verificati
 shipyard landing                             # merge queue, strict, enqueue, check placement, backlog
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                      # machine-readable; exit 9 when any headline field is UNKNOWN
+shipyard landing --pr 123                    # one PR: queued / armed_not_queued / ejected / never_armed / merged, with sources
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
 
 # Monitor

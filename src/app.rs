@@ -416,6 +416,7 @@ where
             base,
             run_sample,
             max_job_reads,
+            pr,
         } => {
             return landing_cmd::landing_command(
                 cli.mode.into(),
@@ -425,6 +426,7 @@ where
                     base,
                     run_sample,
                     max_job_reads,
+                    pr,
                     json: cli.json,
                 },
                 stdout,

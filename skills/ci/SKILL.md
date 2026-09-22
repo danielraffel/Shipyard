@@ -2584,6 +2584,16 @@ the queue absorbs.
 An unreadable surface reports `UNKNOWN`, never `absent`. Treat an `UNKNOWN`
 queue as "determine this before doing bulk work", not as "there is no queue".
 
+**Before arming or enqueuing ONE pull request: `shipyard landing --pr <n>`.**
+REST `pulls/<n>.auto_merge` is `null` for every queued PR — GitHub consumes
+auto-merge on enqueue — so never read that `null` as "unarmed". The command
+classifies the PR as `queued`, `armed_not_queued`, `ejected` (with whether a
+new head has been pushed since, and how many times an unchanged head was
+re-added), `never_armed`, `merged` or `closed`, citing the GraphQL field each
+fact came from. Land through `shipyard ship --pr <n>`, not `gh pr merge
+--auto`: the `ghapp` queue-arm guard refuses a hand-arm of a queued, armed,
+or same-head-ejected PR (override `GHAPP_ALLOW_QUEUE_REARM=1`).
+
 ### Reading the verdict
 
 | verdict | meaning | what to do |

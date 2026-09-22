@@ -384,6 +384,12 @@ pub(super) enum Command {
         /// Defaults to 15. Zero skips placement entirely.
         #[arg(long = "max-job-reads", value_name = "COUNT")]
         max_job_reads: Option<usize>,
+        /// Instead of the repository model, classify one pull request's
+        /// merge-queue state (queued, armed, ejected, never armed, merged)
+        /// from GraphQL queue membership and timeline history, with the
+        /// field each fact came from. One API call. Exit 9 when UNKNOWN.
+        #[arg(long, value_name = "NUMBER")]
+        pr: Option<u64>,
     },
     Doctor {
         /// Exact OWNER/REPO used to resolve configured auth token placeholders.
