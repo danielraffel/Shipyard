@@ -17,7 +17,7 @@ wrong in at least one way that mattered (see "The trap" below).
 | `pr_ejected_requeued.json` | 8702 | Added, Removed(`failed_checks`), Added again with **no commit between**: a re-enqueue of the same head, which under `ALLGREEN` grouping fails its batch-mates. Currently queued at position 3. |
 | `pr_ejected_history.json` | 8638 | One `merge_conflict` removal fixed by a commit, then four `failed_checks` removals each followed by a re-add with no commit between. Later a new commit and a fresh `AutoMergeEnabledEvent`: currently armed after a new head, which is legitimate. |
 | `pr_merged.json` | 8721 | `MergedEvent` then `RemovedFromMergeQueueEvent(reason: merged)`. The removal is **not** an ejection. |
-| `rest_pull_queued.json` | 8669 | `GET repos/Generous-Corp/pulp/pulls/8669` while the PR was queued. `auto_merge` is `null`. |
+| `rest_pull_queued.json` | 8669 | `GET repos/Generous-Corp/pulp/pulls/8669` while the PR was queued, trimmed to the fields that matter. `auto_merge` is `null`. |
 | `ruleset_merge_queue.json` | - | `GET repos/Generous-Corp/pulp/rulesets/19431100` (`MERGE`, `ALLGREEN`, merge 5, build 3). |
 | `classic_protection.json` | - | `GET repos/Generous-Corp/pulp/branches/main/protection`. It has no field that can express a merge queue. |
 
