@@ -200,6 +200,7 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io:
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/github");
 
     #[cfg(unix)]
