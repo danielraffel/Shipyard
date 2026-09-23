@@ -2310,6 +2310,9 @@ fn lagging_only_skips_current_and_ahead_hosts_and_fails_closed_on_unknown() {
     );
 }
 
+// fleet-update refuses to run as a non-Unix controller before it reaches the
+// lock (see non_unix_tests), so the lock contract is Unix-only.
+#[cfg(unix)]
 #[test]
 fn fleet_update_apply_refuses_while_another_rollout_holds_the_lock() {
     let temp = tempfile::tempdir().expect("temp");
@@ -2372,6 +2375,8 @@ fn rollback_target_is_the_pre_update_version_when_a_governed_one_exists() {
     assert!(rollback::rollback_target(&plan, None).is_err());
 }
 
+// The local (controller) plan needs an absolute Unix shipyard_bin path.
+#[cfg(unix)]
 #[test]
 fn the_controller_host_is_always_updated_last() {
     let mut local = named_host("studio");
