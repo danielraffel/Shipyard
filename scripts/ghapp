@@ -6,14 +6,6 @@
 # a JSON-emitting `token` mode for Shipyard's token_command.
 set -euo pipefail
 
-# Probe stderr before anything else can open a file into descriptor 2. When the
-# caller closed it, `api` falls back to a plain exec of native gh: annotating a
-# refusal needs a stderr to write to.
-ghapp_stderr_open=1
-if ! : >&2; then
-    ghapp_stderr_open=0
-fi
-
 public_wrapper_path="${BASH_SOURCE[0]}"
 opened_wrapper_path=""
 if [[ -e "/proc/$$/fd/255" ]]; then
@@ -125,6 +117,14 @@ if [[ "$opened_wrapper_path" == "$installed_public_wrapper_opened" ]]; then
     exec /bin/bash "$selected_generation_wrapper" "$@"
 fi
 # Shipyard-Stable-Public-Trampoline-END
+# Probe stderr before the wrapper opens any file of its own. When the
+# caller closed it, `api` falls back to a plain exec of native gh: annotating a
+# refusal needs a stderr to write to.
+ghapp_stderr_open=1
+if ! : >&2; then
+    ghapp_stderr_open=0
+fi
+
 opened_generation_store=""
 if [[ -d "$generation_store_candidate" && ! -L "$generation_store_candidate" ]]; then
     opened_generation_store="$(cd "$generation_store_candidate" && pwd -P)"
