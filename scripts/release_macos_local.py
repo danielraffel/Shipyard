@@ -566,16 +566,39 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
             file=sys.stderr,
         )
         raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
-    command = [
-        shipyard,
-        "--json",
-        "runner",
-        "fleet-update",
-        "--to",
-        config.tag,
-        "--all-hosts",
-        "--apply",
-    ]
+    # The controller binary is the one already installed, i.e. the previous
+    # release. A controller that predates verified rollouts (no fleet-reconcile)
+    # or a Mac with no [host_class] cannot run this stage; neither makes the
+    # release incomplete, so hand over to the backstop with a warning.
+    code, _, _ = runner.run_status([shipyard, "runner", "fleet-reconcile", "--help"])
+    if code != 0:
+        print(
+            f"WARNING: {shipyard} predates verified fleet rollouts; the fleet was NOT "
+            f"updated to {config.tag} here. Once the controller runs a release with "
+            "`runner fleet-reconcile`, its agent rolls the fleet after the soak.",
+            file=sys.stderr,
+        )
+        return
+    plan = [shipyard, "--json", "runner", "fleet-update", "--to", config.tag, "--all-hosts"]
+    code, _, stderr = runner.run_status(plan)
+    if code != 0 and "No [host_class." in stderr:
+        print(
+            "WARNING: this Mac declares no [host_class.*], so it is not the fleet "
+            f"controller; the fleet was NOT updated to {config.tag} here. The "
+            "controller's fleet-reconcile agent rolls it out after the soak.",
+            file=sys.stderr,
+        )
+        return
+    if code != 0:
+        print(
+            f"FLEET ROLLOUT FAILED for {config.tag}: the rollout plan was refused; "
+            "the release stays published.",
+            file=sys.stderr,
+        )
+        if stderr.strip():
+            print(stderr.strip(), file=sys.stderr)
+        raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
+    command = [*plan, "--apply"]
     print(f"fleet rollout: {' '.join(command)}")
     code, stdout, stderr = runner.run_status(command)
     summaries = [

@@ -274,11 +274,13 @@ fn runner_command_with_actions<W: Write>(
         RunnerCommand::FleetReconcile {
             soak_minutes,
             retry_hours,
+            max_attempts,
             apply,
         } => super::fleet_update_cmd::fleet_reconcile_command(
             &super::fleet_update_cmd::FleetReconcileArgs {
                 soak_minutes,
                 retry_hours,
+                max_attempts,
                 apply,
             },
             mode,

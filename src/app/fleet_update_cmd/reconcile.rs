@@ -12,9 +12,15 @@
 //! - **Fail closed on unknown.** A release or host version that cannot be read
 //!   is reported as UNKNOWN (exit 9) and nothing is rolled out. Unreadable is
 //!   never read as "up to date".
-//! - **Bounded retries.** An attempt is recorded before it starts, and a tag is
-//!   attempted at most once per retry window, so a release that cannot verify
-//!   does not loop against the fleet every tick.
+//! - **Bounded retries.** An attempt is recorded before it starts, a tag is
+//!   attempted at most once per retry window, and after a fixed number of
+//!   attempts (or at once, when the release is ineligible) the tag is terminal:
+//!   it is never retried and an alert is raised.
+//! - **Only lagging hosts, never a downgrade.** A rollout names exactly the
+//!   host classes behind the release. A host *ahead* of the latest release
+//!   stops the whole run with an alert rather than being downgraded.
+//! - **One mutation at a time.** The controller lock spans the decision and the
+//!   rollout; a tick that finds it held records nothing and exits.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,11 +59,19 @@ pub(super) struct HostVersion {
     pub(super) lagging: Option<bool>,
 }
 
+/// Exit code when a host runs a newer version than the latest release.
+pub(super) const EXIT_RECONCILE_AHEAD: u8 = 4;
+/// Exit code when the latest release is terminal for this controller.
+pub(super) const EXIT_RECONCILE_TERMINAL: u8 = 5;
+/// Attempts per tag before it becomes terminal (the CLI default).
+#[cfg(test)]
+pub(super) const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
 /// What the reconciler decided.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub(super) enum ReconcileDecision {
-    /// Every host runs the latest release or newer.
+    /// Every host runs the latest release.
     UpToDate,
     /// Hosts lag, but the release is still inside its soak window.
     Soaking {
@@ -70,17 +84,39 @@ pub(super) enum ReconcileDecision {
         next_attempt: DateTime<Utc>,
         lagging: Vec<String>,
     },
-    /// Hosts lag and a rollout is due.
+    /// This tag stopped being retried. Nothing more happens without an operator.
+    Terminal {
+        reason: String,
+        lagging: Vec<String>,
+    },
+    /// At least one host runs a newer version than the latest release. Nothing
+    /// is rolled out anywhere: "latest" is not what the fleet thinks it is.
+    Ahead { hosts: Vec<String> },
+    /// Hosts lag and a rollout is due, to exactly these host classes.
     Rollout { lagging: Vec<String> },
     /// The release or at least one host version could not be read.
     Unknown { reason: String },
+    /// Another rollout holds the controller lock; nothing was read or recorded.
+    ControllerBusy,
+}
+
+/// Attempts at one tag.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct TagAttempts {
+    #[serde(default)]
+    pub(super) attempts: u32,
+    #[serde(default)]
+    pub(super) last_attempt: Option<DateTime<Utc>>,
+    /// Why the tag is no longer retried.
+    #[serde(default)]
+    pub(super) terminal: Option<String>,
 }
 
 /// Persisted attempt ledger, keyed by tag.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct AttemptLedger {
     #[serde(default)]
-    pub(super) attempts: BTreeMap<String, DateTime<Utc>>,
+    pub(super) tags: BTreeMap<String, TagAttempts>,
 }
 
 pub(super) fn ledger_path(state_dir: &Path) -> PathBuf {
@@ -100,11 +136,8 @@ pub(super) fn read_ledger(state_dir: &Path) -> Result<AttemptLedger, String> {
     }
 }
 
-/// Record an attempt atomically before the rollout starts.
-pub(super) fn record_attempt(state_dir: &Path, tag: &str, at: DateTime<Utc>) -> Result<(), String> {
+fn write_ledger(state_dir: &Path, ledger: &AttemptLedger) -> Result<(), String> {
     let path = ledger_path(state_dir);
-    let mut ledger = read_ledger(state_dir)?;
-    ledger.attempts.insert(tag.to_owned(), at);
     let parent = path
         .parent()
         .ok_or_else(|| "fleet-reconcile ledger path has no parent".to_owned())?;
@@ -112,11 +145,34 @@ pub(super) fn record_attempt(state_dir: &Path, tag: &str, at: DateTime<Utc>) -> 
         .map_err(|error| format!("create fleet-reconcile state dir: {error}"))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("stage fleet-reconcile ledger: {error}"))?;
-    serde_json::to_writer_pretty(&mut temp, &ledger)
+    serde_json::to_writer_pretty(&mut temp, ledger)
         .map_err(|error| format!("write fleet-reconcile ledger: {error}"))?;
     temp.persist(&path)
         .map_err(|error| format!("persist fleet-reconcile ledger: {error}"))?;
     Ok(())
+}
+
+/// Record an attempt atomically before the rollout starts, returning the
+/// attempt count including this one.
+pub(super) fn record_attempt(
+    state_dir: &Path,
+    tag: &str,
+    at: DateTime<Utc>,
+) -> Result<u32, String> {
+    let mut ledger = read_ledger(state_dir)?;
+    let entry = ledger.tags.entry(tag.to_owned()).or_default();
+    entry.attempts += 1;
+    entry.last_attempt = Some(at);
+    let attempts = entry.attempts;
+    write_ledger(state_dir, &ledger)?;
+    Ok(attempts)
+}
+
+/// Stop retrying a tag.
+pub(super) fn mark_terminal(state_dir: &Path, tag: &str, reason: &str) -> Result<(), String> {
+    let mut ledger = read_ledger(state_dir)?;
+    ledger.tags.entry(tag.to_owned()).or_default().terminal = Some(reason.to_owned());
+    write_ledger(state_dir, &ledger)
 }
 
 pub(super) fn parse_version(raw: &str) -> Option<[u64; 3]> {
@@ -142,14 +198,21 @@ pub(super) fn classify_hosts(latest: &PublishedRelease, hosts: &mut [HostVersion
     }
 }
 
+/// Tuning for [`decide`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ReconcilePolicy {
+    pub(super) soak: chrono::Duration,
+    pub(super) retry: chrono::Duration,
+    pub(super) max_attempts: u32,
+}
+
 /// Decide what to do. Pure: every input is passed in.
 pub(super) fn decide(
     latest: Result<&PublishedRelease, &str>,
     hosts: &[HostVersion],
     ledger: &AttemptLedger,
     now: DateTime<Utc>,
-    soak: chrono::Duration,
-    retry: chrono::Duration,
+    policy: ReconcilePolicy,
 ) -> ReconcileDecision {
     let latest = match latest {
         Ok(latest) => latest,
@@ -159,12 +222,17 @@ pub(super) fn decide(
             };
         }
     };
-    if parse_version(&latest.tag).is_none() {
+    let Some(target) = parse_version(&latest.tag) else {
         return ReconcileDecision::Unknown {
             reason: format!(
                 "latest release tag {:?} is not vMAJOR.MINOR.PATCH",
                 latest.tag
             ),
+        };
+    };
+    if hosts.is_empty() {
+        return ReconcileDecision::Unknown {
+            reason: "no host classes are configured".to_owned(),
         };
     }
     let unknown = hosts
@@ -178,15 +246,29 @@ pub(super) fn decide(
             )
         })
         .collect::<Vec<_>>();
-    if hosts.is_empty() {
-        return ReconcileDecision::Unknown {
-            reason: "no host classes are configured".to_owned(),
-        };
-    }
     if !unknown.is_empty() {
         return ReconcileDecision::Unknown {
             reason: format!("host version unreadable: {}", unknown.join(", ")),
         };
+    }
+    let ahead = hosts
+        .iter()
+        .filter(|host| {
+            host.version
+                .as_deref()
+                .and_then(parse_version)
+                .is_some_and(|installed| installed > target)
+        })
+        .map(|host| {
+            format!(
+                "{} ({})",
+                host.host_class,
+                host.version.as_deref().unwrap_or("?")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !ahead.is_empty() {
+        return ReconcileDecision::Ahead { hosts: ahead };
     }
     let lagging = hosts
         .iter()
@@ -196,15 +278,25 @@ pub(super) fn decide(
     if lagging.is_empty() {
         return ReconcileDecision::UpToDate;
     }
-    let soak_until = latest.published_at + soak;
+    let attempts = ledger.tags.get(&latest.tag).cloned().unwrap_or_default();
+    if let Some(reason) = attempts.terminal {
+        return ReconcileDecision::Terminal { reason, lagging };
+    }
+    if attempts.attempts >= policy.max_attempts {
+        return ReconcileDecision::Terminal {
+            reason: format!("gave up after {} attempts", attempts.attempts),
+            lagging,
+        };
+    }
+    let soak_until = latest.published_at + policy.soak;
     if now < soak_until {
         return ReconcileDecision::Soaking {
             soak_until,
             lagging,
         };
     }
-    if let Some(last_attempt) = ledger.attempts.get(&latest.tag).copied() {
-        let next_attempt = last_attempt + retry;
+    if let Some(last_attempt) = attempts.last_attempt {
+        let next_attempt = last_attempt + policy.retry;
         if now < next_attempt {
             return ReconcileDecision::RateLimited {
                 last_attempt,
@@ -214,6 +306,191 @@ pub(super) fn decide(
         }
     }
     ReconcileDecision::Rollout { lagging }
+}
+
+/// Result of one rollout the reconciler started.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub(super) enum RolloutOutcome {
+    Verified,
+    Failed {
+        reason: String,
+    },
+    /// Refused before any host was touched; retrying cannot help.
+    Ineligible {
+        reason: String,
+    },
+}
+
+/// The world the reconciler reads and acts on. Production talks to GitHub and
+/// the hosts; tests substitute every edge.
+pub(super) trait ReconcileEnv {
+    fn now(&self) -> DateTime<Utc>;
+    fn latest_release(&mut self) -> Result<PublishedRelease, String>;
+    /// One entry per configured host class, in configuration order.
+    fn probe_hosts(&mut self) -> Vec<HostVersion>;
+    fn rollout(&mut self, tag: &str, host_classes: &[String]) -> RolloutOutcome;
+    /// Open or refresh the operator alert for this condition.
+    fn alert(&mut self, title: &str, body: &str) -> Result<(), String>;
+}
+
+/// Everything one reconcile tick observed and did.
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct ReconcileReport {
+    pub(super) latest_release: Option<PublishedRelease>,
+    pub(super) hosts: Vec<HostVersion>,
+    pub(super) decision: ReconcileDecision,
+    pub(super) rollout: Option<RolloutOutcome>,
+    pub(super) attempt: Option<u32>,
+    pub(super) terminal: Option<String>,
+    pub(super) alerts: Vec<String>,
+    pub(super) exit_code: u8,
+}
+
+pub(super) fn alert_title(tag: &str) -> String {
+    format!("fleet-reconcile: {tag} could not reach the fleet")
+}
+
+/// One reconcile tick.
+pub(super) fn run_reconcile<E: ReconcileEnv>(
+    env: &mut E,
+    state_dir: &Path,
+    policy: ReconcilePolicy,
+    apply: bool,
+) -> ReconcileReport {
+    let mut report = ReconcileReport {
+        latest_release: None,
+        hosts: Vec::new(),
+        decision: ReconcileDecision::ControllerBusy,
+        rollout: None,
+        attempt: None,
+        terminal: None,
+        alerts: Vec::new(),
+        exit_code: super::EXIT_CONTROLLER_BUSY,
+    };
+    let _lock = match super::controller_lock::try_acquire(state_dir) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return report,
+        Err(reason) => {
+            report.decision = ReconcileDecision::Unknown { reason };
+            report.exit_code = EXIT_RECONCILE_UNKNOWN;
+            return report;
+        }
+    };
+    let now = env.now();
+    let latest = env.latest_release();
+    let mut hosts = env.probe_hosts();
+    if let Ok(latest) = &latest {
+        classify_hosts(latest, &mut hosts);
+    }
+    report.latest_release = latest.as_ref().ok().cloned();
+    let decision = match read_ledger(state_dir) {
+        Ok(ledger) => decide(
+            latest.as_ref().map_err(String::as_str),
+            &hosts,
+            &ledger,
+            now,
+            policy,
+        ),
+        Err(reason) => ReconcileDecision::Unknown { reason },
+    };
+    report.hosts = hosts;
+    report.decision = decision.clone();
+    report.exit_code = match &decision {
+        ReconcileDecision::UpToDate | ReconcileDecision::Soaking { .. } => 0,
+        ReconcileDecision::Unknown { .. } => EXIT_RECONCILE_UNKNOWN,
+        ReconcileDecision::RateLimited { .. } => EXIT_RECONCILE_RATE_LIMITED,
+        ReconcileDecision::Terminal { .. } => EXIT_RECONCILE_TERMINAL,
+        ReconcileDecision::ControllerBusy => super::EXIT_CONTROLLER_BUSY,
+        ReconcileDecision::Ahead { hosts } => {
+            let tag = report
+                .latest_release
+                .as_ref()
+                .map_or("?", |latest| latest.tag.as_str())
+                .to_owned();
+            let body = format!(
+                "Hosts run a newer Shipyard than the latest published release {tag}: {}. \
+                 fleet-reconcile never downgrades, so it rolled nothing out. Check whether \
+                 {tag} is really the release the fleet should run.",
+                hosts.join(", ")
+            );
+            raise(
+                env,
+                &mut report,
+                &format!("fleet-reconcile: hosts ahead of {tag}"),
+                &body,
+            );
+            EXIT_RECONCILE_AHEAD
+        }
+        ReconcileDecision::Rollout { .. } if !apply => 0,
+        ReconcileDecision::Rollout { lagging } => {
+            let latest = latest.expect("a rollout decision requires a readable release");
+            rollout(
+                env,
+                &mut report,
+                state_dir,
+                policy,
+                &latest.tag,
+                lagging,
+                now,
+            )
+        }
+    };
+    report
+}
+
+fn raise<E: ReconcileEnv>(env: &mut E, report: &mut ReconcileReport, title: &str, body: &str) {
+    match env.alert(title, body) {
+        Ok(()) => report.alerts.push(title.to_owned()),
+        Err(error) => report
+            .alerts
+            .push(format!("{title} (ALERT NOT DELIVERED: {error})")),
+    }
+}
+
+fn rollout<E: ReconcileEnv>(
+    env: &mut E,
+    report: &mut ReconcileReport,
+    state_dir: &Path,
+    policy: ReconcilePolicy,
+    tag: &str,
+    lagging: &[String],
+    now: DateTime<Utc>,
+) -> u8 {
+    // Record before mutating: a crash or a failing rollout still counts as an
+    // attempt, so a broken release cannot loop every tick.
+    let attempt = match record_attempt(state_dir, tag, now) {
+        Ok(attempt) => attempt,
+        Err(reason) => {
+            report.decision = ReconcileDecision::Unknown { reason };
+            return EXIT_RECONCILE_UNKNOWN;
+        }
+    };
+    report.attempt = Some(attempt);
+    let outcome = env.rollout(tag, lagging);
+    report.rollout = Some(outcome.clone());
+    let terminal = match &outcome {
+        RolloutOutcome::Verified => return 0,
+        RolloutOutcome::Ineligible { reason } => format!("release is ineligible: {reason}"),
+        RolloutOutcome::Failed { reason } if attempt >= policy.max_attempts => {
+            format!("gave up after {attempt} attempts; last failure: {reason}")
+        }
+        RolloutOutcome::Failed { .. } => return 1,
+    };
+    if let Err(error) = mark_terminal(state_dir, tag, &terminal) {
+        report
+            .alerts
+            .push(format!("could not record terminal state: {error}"));
+    }
+    let body = format!(
+        "fleet-reconcile stopped retrying {tag}: {terminal}.\n\nLagging host classes: {}.\n\n\
+         Fix the release or the hosts, then run `shipyard runner fleet-update --to {tag} \
+         --host-class <class> --apply` by hand.",
+        lagging.join(", ")
+    );
+    raise(env, report, &alert_title(tag), &body);
+    report.terminal = Some(terminal);
+    EXIT_RECONCILE_TERMINAL
 }
 
 /// Read one host's installed `shipyard --version` without mutating anything.
@@ -308,6 +585,14 @@ pub(super) fn parse_latest_release(value: &Value) -> Result<PublishedRelease, St
 mod tests {
     use super::*;
 
+    fn policy() -> ReconcilePolicy {
+        ReconcilePolicy {
+            soak: chrono::Duration::minutes(30),
+            retry: chrono::Duration::hours(6),
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+        }
+    }
+
     fn release(tag: &str, minutes_ago: i64, now: DateTime<Utc>) -> PublishedRelease {
         PublishedRelease {
             tag: tag.to_owned(),
@@ -334,18 +619,11 @@ mod tests {
         now: DateTime<Utc>,
     ) -> ReconcileDecision {
         classify_hosts(latest, &mut hosts);
-        decide(
-            Ok(latest),
-            &hosts,
-            ledger,
-            now,
-            chrono::Duration::minutes(30),
-            chrono::Duration::hours(6),
-        )
+        decide(Ok(latest), &hosts, ledger, now, policy())
     }
 
     #[test]
-    fn a_lagging_host_after_the_soak_triggers_a_rollout() {
+    fn a_rollout_names_only_the_lagging_host_classes() {
         let now = Utc::now();
         let latest = release("v0.208.0", 45, now);
         let decision = run(
@@ -363,12 +641,30 @@ mod tests {
     }
 
     #[test]
-    fn current_or_newer_hosts_are_up_to_date() {
+    fn a_host_ahead_of_latest_stops_everything_and_is_never_downgraded() {
         let now = Utc::now();
         let latest = release("v0.208.0", 45, now);
         let decision = run(
             &latest,
-            vec![host("m1", Some("0.208.0")), host("m5", Some("0.209.1"))],
+            vec![host("m1", Some("0.205.0")), host("m5", Some("0.209.1"))],
+            &AttemptLedger::default(),
+            now,
+        );
+        assert_eq!(
+            decision,
+            ReconcileDecision::Ahead {
+                hosts: vec!["m5 (0.209.1)".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn current_hosts_are_up_to_date() {
+        let now = Utc::now();
+        let latest = release("v0.208.0", 45, now);
+        let decision = run(
+            &latest,
+            vec![host("m1", Some("0.208.0")), host("m5", Some("0.208.0"))],
             &AttemptLedger::default(),
             now,
         );
@@ -392,40 +688,6 @@ mod tests {
     }
 
     #[test]
-    fn a_recent_attempt_rate_limits_the_same_tag_but_not_a_newer_one() {
-        let now = Utc::now();
-        let latest = release("v0.208.0", 120, now);
-        let mut ledger = AttemptLedger::default();
-        ledger
-            .attempts
-            .insert("v0.208.0".to_owned(), now - chrono::Duration::hours(1));
-        let decision = run(&latest, vec![host("m5", Some("0.205.0"))], &ledger, now);
-        assert!(
-            matches!(decision, ReconcileDecision::RateLimited { .. }),
-            "{decision:?}"
-        );
-
-        ledger
-            .attempts
-            .insert("v0.208.0".to_owned(), now - chrono::Duration::hours(7));
-        let decision = run(&latest, vec![host("m5", Some("0.205.0"))], &ledger, now);
-        assert!(
-            matches!(decision, ReconcileDecision::Rollout { .. }),
-            "{decision:?}"
-        );
-
-        ledger
-            .attempts
-            .insert("v0.208.0".to_owned(), now - chrono::Duration::minutes(5));
-        let newer = release("v0.209.0", 60, now);
-        let decision = run(&newer, vec![host("m5", Some("0.205.0"))], &ledger, now);
-        assert!(
-            matches!(decision, ReconcileDecision::Rollout { .. }),
-            "{decision:?}"
-        );
-    }
-
-    #[test]
     fn unreadable_inputs_are_unknown_never_up_to_date() {
         let now = Utc::now();
         let latest = release("v0.208.0", 120, now);
@@ -439,25 +701,30 @@ mod tests {
             matches!(decision, ReconcileDecision::Unknown { ref reason } if reason.contains("m5 (ssh: connect timed out)")),
             "{decision:?}"
         );
-        let decision = decide(
-            Err("HTTP 502"),
-            &[],
-            &AttemptLedger::default(),
-            now,
-            chrono::Duration::minutes(30),
-            chrono::Duration::hours(6),
-        );
-        assert!(matches!(decision, ReconcileDecision::Unknown { .. }));
-        let decision = run(&latest, Vec::new(), &AttemptLedger::default(), now);
-        assert!(matches!(decision, ReconcileDecision::Unknown { .. }));
+        assert!(matches!(
+            decide(
+                Err("HTTP 502"),
+                &[],
+                &AttemptLedger::default(),
+                now,
+                policy()
+            ),
+            ReconcileDecision::Unknown { .. }
+        ));
+        assert!(matches!(
+            run(&latest, Vec::new(), &AttemptLedger::default(), now),
+            ReconcileDecision::Unknown { .. }
+        ));
         let garbage = release("latest", 120, now);
-        let decision = run(
-            &garbage,
-            vec![host("m1", Some("0.1.0"))],
-            &AttemptLedger::default(),
-            now,
-        );
-        assert!(matches!(decision, ReconcileDecision::Unknown { .. }));
+        assert!(matches!(
+            run(
+                &garbage,
+                vec![host("m1", Some("0.1.0"))],
+                &AttemptLedger::default(),
+                now
+            ),
+            ReconcileDecision::Unknown { .. }
+        ));
     }
 
     #[test]
@@ -484,12 +751,23 @@ mod tests {
     }
 
     #[test]
-    fn attempt_ledger_round_trips_and_a_corrupt_one_fails_closed() {
+    fn attempt_ledger_counts_and_a_corrupt_one_fails_closed() {
         let temp = tempfile::tempdir().expect("temp");
         let at = Utc::now();
-        record_attempt(temp.path(), "v0.208.0", at).expect("record");
+        assert_eq!(
+            record_attempt(temp.path(), "v0.208.0", at).expect("record"),
+            1
+        );
+        assert_eq!(
+            record_attempt(temp.path(), "v0.208.0", at).expect("record"),
+            2
+        );
+        mark_terminal(temp.path(), "v0.208.0", "why").expect("terminal");
         let ledger = read_ledger(temp.path()).expect("read");
-        assert_eq!(ledger.attempts.get("v0.208.0"), Some(&at));
+        let entry = &ledger.tags["v0.208.0"];
+        assert_eq!(entry.attempts, 2);
+        assert_eq!(entry.last_attempt, Some(at));
+        assert_eq!(entry.terminal.as_deref(), Some("why"));
         std::fs::write(ledger_path(temp.path()), "not json").expect("corrupt");
         assert!(read_ledger(temp.path()).is_err());
     }
@@ -525,5 +803,232 @@ mod tests {
         assert_eq!(probed.version.as_deref(), Some("0.205.0"), "{probed:?}");
         class.shipyard_bin = Some("relative/shipyard".to_owned());
         assert!(probe_host_version(&class).error.is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // Command-level: run_reconcile against a fake world.
+    // ------------------------------------------------------------------
+
+    struct FakeEnv {
+        now: DateTime<Utc>,
+        latest: Result<PublishedRelease, String>,
+        hosts: Vec<(String, Option<String>)>,
+        outcome: RolloutOutcome,
+        rollouts: Vec<(String, Vec<String>)>,
+        alerts: Vec<(String, String)>,
+    }
+
+    impl FakeEnv {
+        fn new(now: DateTime<Utc>, hosts: &[(&str, &str)], outcome: RolloutOutcome) -> Self {
+            Self {
+                now,
+                latest: Ok(release("v0.208.0", 120, now)),
+                hosts: hosts
+                    .iter()
+                    .map(|(name, version)| ((*name).to_owned(), Some((*version).to_owned())))
+                    .collect(),
+                outcome,
+                rollouts: Vec::new(),
+                alerts: Vec::new(),
+            }
+        }
+    }
+
+    impl ReconcileEnv for FakeEnv {
+        fn now(&self) -> DateTime<Utc> {
+            self.now
+        }
+        fn latest_release(&mut self) -> Result<PublishedRelease, String> {
+            self.latest.clone()
+        }
+        fn probe_hosts(&mut self) -> Vec<HostVersion> {
+            self.hosts
+                .iter()
+                .map(|(name, version)| host(name, version.as_deref()))
+                .collect()
+        }
+        fn rollout(&mut self, tag: &str, host_classes: &[String]) -> RolloutOutcome {
+            self.rollouts.push((tag.to_owned(), host_classes.to_vec()));
+            self.outcome.clone()
+        }
+        fn alert(&mut self, title: &str, body: &str) -> Result<(), String> {
+            self.alerts.push((title.to_owned(), body.to_owned()));
+            Ok(())
+        }
+    }
+
+    fn failed() -> RolloutOutcome {
+        RolloutOutcome::Failed {
+            reason: "m5 failed post-rollout verification".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_failing_release_is_attempted_once_per_window_then_becomes_terminal() {
+        let temp = tempfile::tempdir().expect("temp");
+        let start = Utc::now();
+        let mut env = FakeEnv::new(start, &[("m1", "0.208.0"), ("m5", "0.205.0")], failed());
+
+        let first = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(first.exit_code, 1);
+        assert_eq!(first.attempt, Some(1));
+        // The same tick again: the recorded attempt must hold the rollout off.
+        let again = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert!(
+            matches!(again.decision, ReconcileDecision::RateLimited { .. }),
+            "{:?}",
+            again.decision
+        );
+        assert_eq!(again.exit_code, EXIT_RECONCILE_RATE_LIMITED);
+        assert_eq!(
+            env.rollouts.len(),
+            1,
+            "a recorded attempt must stop a second rollout"
+        );
+
+        env.now = start + chrono::Duration::hours(7);
+        assert_eq!(
+            run_reconcile(&mut env, temp.path(), policy(), true).attempt,
+            Some(2)
+        );
+        assert!(env.alerts.is_empty(), "no alert before the cap");
+        env.now = start + chrono::Duration::hours(14);
+        let third = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(third.exit_code, EXIT_RECONCILE_TERMINAL);
+        assert!(
+            third
+                .terminal
+                .as_deref()
+                .unwrap_or_default()
+                .contains("gave up after 3 attempts")
+        );
+        assert_eq!(env.alerts.len(), 1);
+        assert_eq!(env.alerts[0].0, alert_title("v0.208.0"));
+        assert!(env.alerts[0].1.contains("Lagging host classes: m5"));
+
+        env.now = start + chrono::Duration::days(3);
+        let after = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert!(matches!(after.decision, ReconcileDecision::Terminal { .. }));
+        assert_eq!(env.rollouts.len(), 3, "a terminal tag is never retried");
+        assert_eq!(
+            env.alerts.len(),
+            1,
+            "a terminal tag is not re-alerted every tick"
+        );
+        // Every rollout named only the lagging class.
+        assert!(
+            env.rollouts
+                .iter()
+                .all(|(tag, classes)| tag == "v0.208.0" && classes == &["m5"])
+        );
+    }
+
+    #[test]
+    fn an_ineligible_release_is_terminal_at_once() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = Utc::now();
+        let mut env = FakeEnv::new(
+            now,
+            &[("m5", "0.205.0")],
+            RolloutOutcome::Ineligible {
+                reason: "missing build-provenance attestation".to_owned(),
+            },
+        );
+        let report = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(report.exit_code, EXIT_RECONCILE_TERMINAL);
+        assert_eq!(report.attempt, Some(1));
+        assert_eq!(env.alerts.len(), 1);
+        assert!(env.alerts[0].1.contains("release is ineligible"));
+        env.now = now + chrono::Duration::days(1);
+        run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(env.rollouts.len(), 1);
+    }
+
+    #[test]
+    fn a_verified_rollout_needs_no_alert_and_later_ticks_are_up_to_date() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = Utc::now();
+        let mut env = FakeEnv::new(now, &[("m5", "0.205.0")], RolloutOutcome::Verified);
+        assert_eq!(
+            run_reconcile(&mut env, temp.path(), policy(), true).exit_code,
+            0
+        );
+        env.hosts[0].1 = Some("0.208.0".to_owned());
+        let later = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(later.decision, ReconcileDecision::UpToDate);
+        assert!(env.alerts.is_empty());
+    }
+
+    #[test]
+    fn a_host_ahead_alerts_and_rolls_nothing_out() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut env = FakeEnv::new(
+            Utc::now(),
+            &[("m1", "0.205.0"), ("m5", "0.210.0")],
+            RolloutOutcome::Verified,
+        );
+        let report = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(report.exit_code, EXIT_RECONCILE_AHEAD);
+        assert!(
+            env.rollouts.is_empty(),
+            "never downgrade, never roll the rest either"
+        );
+        assert_eq!(env.alerts.len(), 1);
+        assert!(env.alerts[0].1.contains("m5 (0.210.0)"));
+    }
+
+    #[test]
+    fn report_only_mode_decides_but_records_and_mutates_nothing() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut env = FakeEnv::new(Utc::now(), &[("m5", "0.205.0")], RolloutOutcome::Verified);
+        let report = run_reconcile(&mut env, temp.path(), policy(), false);
+        assert!(matches!(report.decision, ReconcileDecision::Rollout { .. }));
+        assert_eq!(report.exit_code, 0);
+        assert!(env.rollouts.is_empty());
+        assert!(read_ledger(temp.path()).expect("ledger").tags.is_empty());
+    }
+
+    #[test]
+    fn a_held_controller_lock_skips_the_tick_without_recording() {
+        let temp = tempfile::tempdir().expect("temp");
+        let held = super::super::controller_lock::try_acquire(temp.path())
+            .expect("lock")
+            .expect("free");
+        let mut env = FakeEnv::new(Utc::now(), &[("m5", "0.205.0")], RolloutOutcome::Verified);
+        let report = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(report.decision, ReconcileDecision::ControllerBusy);
+        assert_eq!(report.exit_code, super::super::EXIT_CONTROLLER_BUSY);
+        assert!(env.rollouts.is_empty());
+        assert!(
+            !ledger_path(temp.path()).exists(),
+            "a skipped tick records nothing"
+        );
+        drop(held);
+        assert_eq!(
+            run_reconcile(&mut env, temp.path(), policy(), true).exit_code,
+            0
+        );
+    }
+
+    /// Adding a machine is adding a host class: nothing is named in code.
+    #[test]
+    fn a_fourth_host_class_is_enumerated_and_rolled_like_any_other() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut env = FakeEnv::new(
+            Utc::now(),
+            &[
+                ("m1", "0.208.0"),
+                ("m5", "0.208.0"),
+                ("studio", "0.208.0"),
+                ("m7-new-rack", "0.205.0"),
+            ],
+            RolloutOutcome::Verified,
+        );
+        let report = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(report.hosts.len(), 4);
+        assert_eq!(
+            env.rollouts,
+            vec![("v0.208.0".to_owned(), vec!["m7-new-rack".to_owned()])]
+        );
     }
 }

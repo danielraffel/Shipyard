@@ -107,6 +107,47 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
             .map_err(|error| format!("GitHub release-authority response was invalid JSON: {error}"))
     }
 
+    /// Open an issue with this exact title in the release repository, or add a
+    /// comment to the open one, so a repeated alert refreshes rather than
+    /// duplicates.
+    pub(super) fn upsert_issue(&self, title: &str, body: &str) -> Result<(), String> {
+        let repository = release_repository()?;
+        let open = self.api_json(&format!(
+            "repos/{repository}/issues?state=open&per_page=100"
+        ))?;
+        let existing = open.as_array().and_then(|issues| {
+            issues.iter().find_map(|issue| {
+                (issue.get("title").and_then(Value::as_str) == Some(title)
+                    && issue.get("pull_request").is_none())
+                .then(|| issue.get("number").and_then(Value::as_u64))
+                .flatten()
+            })
+        });
+        let mut command = self.command()?;
+        match existing {
+            Some(number) => command.args([
+                "api".to_owned(),
+                "-X".to_owned(),
+                "POST".to_owned(),
+                format!("repos/{repository}/issues/{number}/comments"),
+                "-f".to_owned(),
+                format!("body={body}"),
+            ]),
+            None => command.args([
+                "api".to_owned(),
+                "-X".to_owned(),
+                "POST".to_owned(),
+                format!("repos/{repository}/issues"),
+                "-f".to_owned(),
+                format!("title={title}"),
+                "-f".to_owned(),
+                format!("body={body}"),
+            ]),
+        };
+        command.stdin(Stdio::null());
+        run(&mut command, "fleet alert issue").map(|_| ())
+    }
+
     fn download_asset(&self, asset: &ObservedAsset) -> Result<DownloadedAsset, String> {
         let endpoint = format!(
             "repos/{}/releases/assets/{}",

@@ -63,6 +63,26 @@ echo "  launch_agent=$PLIST"
 echo "  log=$HOME/Library/Logs/shipyard-fleet-reconcile.log"
 [ "$APPLY" = 1 ] || { echo "  action=dry-run (pass --install to apply)"; exit 0; }
 
+# Rehearse exactly what launchd will run, under the plist's environment, but
+# without --apply: a reconcile that cannot read the release or a host would
+# fail every tick, so refuse to load it. 0 (current/soaking/due), 3 (rate
+# limited) and 5 (terminal, already alerted) are healthy; anything else is not.
+AGENT_PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+set +e
+REHEARSAL="$(cd "$HOME" && /usr/bin/env -i HOME="$HOME" PATH="$AGENT_PATH" \
+  "$SHIPYARD" --json runner fleet-reconcile \
+  --soak-minutes "$SOAK_MINUTES" --retry-hours "$RETRY_HOURS" 2>&1)"
+REHEARSAL_EXIT=$?
+set -e
+case "$REHEARSAL_EXIT" in
+  0|3|5) echo "  rehearsal=ok (exit $REHEARSAL_EXIT)" ;;
+  *)
+    echo "fleet-reconcile rehearsal under the agent environment exited $REHEARSAL_EXIT; not loading the agent:" >&2
+    printf '%s\n' "$REHEARSAL" | tail -n 20 >&2
+    exit 1
+    ;;
+esac
+
 umask 077
 mkdir -p "$PLIST_DIR" "$HOME/Library/Logs"
 STAGED="$(mktemp "$PLIST_DIR/.$LABEL.XXXXXX")"

@@ -10,9 +10,12 @@ use serde_json::Value;
 
 mod auth_support;
 mod command;
+mod controller_lock;
 mod evidence;
 mod reconcile;
+mod reconcile_cmd;
 mod release_authority;
+mod rollback;
 mod verify;
 
 #[cfg(all(test, unix))]
@@ -20,6 +23,9 @@ use command::exact_asset_curl_shim;
 #[cfg(all(test, target_os = "macos"))]
 use command::remote_pair_probe;
 use command::{local_update_command, remote_update_command, render_host_result, render_plan};
+pub(super) use reconcile_cmd::{
+    FleetReconcileArgs, fleet_reconcile_command, fleet_version_doctor_section,
+};
 
 #[cfg(all(test, unix))]
 use evidence::execute_plan_with_timeout;
@@ -138,7 +144,7 @@ struct HostUpdatePlan {
 
 pub(super) fn fleet_update_command<W: Write>(
     args: &FleetUpdateArgs,
-    _mode: RuntimeMode,
+    mode: RuntimeMode,
     cwd: &Path,
     runtime_paths: &RuntimePaths,
     json: bool,
@@ -150,6 +156,52 @@ pub(super) fn fleet_update_command<W: Write>(
             "fleet-update requires a Unix rollout controller",
         ));
     }
+    if !args.apply {
+        return run_fleet_update(args, mode, cwd, runtime_paths, json, stdout)
+            .map_err(|failure| failure.failure);
+    }
+    // Apply, verify and any rollback run under one controller lock.
+    let Some(_lock) = controller_lock::try_acquire(&runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error))?
+    else {
+        return Err(CliFailure::new(
+            EXIT_CONTROLLER_BUSY,
+            "another fleet rollout holds the controller lock; not starting a second one",
+        ));
+    };
+    run_fleet_update(args, mode, cwd, runtime_paths, json, stdout)
+        .map_err(|failure| failure.failure)
+}
+
+/// Exit code when another rollout holds the controller lock.
+pub(super) const EXIT_CONTROLLER_BUSY: u8 = 75;
+
+/// Why a rollout did not complete.
+#[derive(Debug)]
+pub(super) struct RolloutFailure {
+    /// True when the release was refused before any host was touched.
+    pub(super) ineligible: bool,
+    pub(super) failure: CliFailure,
+}
+
+impl From<CliFailure> for RolloutFailure {
+    fn from(failure: CliFailure) -> Self {
+        Self {
+            ineligible: false,
+            failure,
+        }
+    }
+}
+
+/// Plan or apply a rollout. The caller holds the controller lock for `apply`.
+pub(super) fn run_fleet_update<W: Write>(
+    args: &FleetUpdateArgs,
+    _mode: RuntimeMode,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, RolloutFailure> {
     let target = normalize_exact_tag(&args.to)?;
     // Fleet mutation topology is machine policy. Never let a repository's
     // tracked overlay select SSH destinations or executable paths.
@@ -160,7 +212,8 @@ pub(super) fn fleet_update_command<W: Write>(
         return Err(CliFailure::new(
             1,
             "No [host_class.<name>] configured — fleet-update has no rollout targets.",
-        ));
+        )
+        .into());
     }
     let selected_classes = select_host_classes(&classes, &args.host_classes, args.all_hosts)?;
     // Eligibility is established once, before the first host can mutate. The
@@ -168,344 +221,30 @@ pub(super) fn fleet_update_command<W: Write>(
     // asset bytes, the checksum manifest, and signed build provenance.
     let release_authority = GitHubReleaseAuthorityVerifier::new(&config, cwd)
         .verify(&target)
-        .map_err(|error| CliFailure::new(1, format!("fleet release is ineligible: {error}")))?;
-    let plans = selected_classes
+        .map_err(|error| RolloutFailure {
+            ineligible: true,
+            failure: CliFailure::new(1, format!("fleet release is ineligible: {error}")),
+        })?;
+    let mut plans = selected_classes
         .iter()
         .map(|class| host_update_plan_with_authority(class, &target, &release_authority))
         .collect::<Result<Vec<_>, _>>()?;
+    order_controller_last(&mut plans);
 
     if !args.apply {
         render_plan(stdout, json, &target, &plans, args.all_hosts)?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    apply_plans(
+    Ok(apply_plans(
         &plans,
         &target,
         json,
         stdout,
         execute_plan,
         verify::verify_host,
-    )
-}
-
-pub(super) struct FleetReconcileArgs {
-    pub(super) soak_minutes: u64,
-    pub(super) retry_hours: u64,
-    pub(super) apply: bool,
-}
-
-/// `shipyard runner fleet-reconcile`: roll the latest published release out to
-/// any host that lags it, once it has soaked. See [`reconcile`].
-pub(super) fn fleet_reconcile_command<W: Write>(
-    args: &FleetReconcileArgs,
-    mode: RuntimeMode,
-    cwd: &Path,
-    runtime_paths: &RuntimePaths,
-    json: bool,
-    stdout: &mut W,
-) -> Result<ExitCode, CliFailure> {
-    if cfg!(not(unix)) {
-        return Err(CliFailure::new(
-            1,
-            "fleet-reconcile requires a Unix rollout controller",
-        ));
-    }
-    let config = LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let classes = parse_host_classes(&config.data).map_err(|error| CliFailure::new(2, error))?;
-    let now = chrono::Utc::now();
-    let latest = release_authority::release_repository().and_then(|repository| {
-        GitHubReleaseAuthorityVerifier::new(&config, cwd)
-            .api_json(&format!("repos/{repository}/releases/latest"))
-            .and_then(|value| reconcile::parse_latest_release(&value))
-    });
-    let mut hosts = classes
-        .iter()
-        .map(reconcile::probe_host_version)
-        .collect::<Vec<_>>();
-    if let Ok(latest) = &latest {
-        reconcile::classify_hosts(latest, &mut hosts);
-    }
-    let soak =
-        chrono::Duration::minutes(i64::try_from(args.soak_minutes).unwrap_or(i64::MAX / 120));
-    let retry = chrono::Duration::hours(i64::try_from(args.retry_hours).unwrap_or(i64::MAX / 7200));
-    let decision = match reconcile::read_ledger(&runtime_paths.state_dir) {
-        Ok(ledger) => reconcile::decide(
-            latest.as_ref().map_err(String::as_str),
-            &hosts,
-            &ledger,
-            now,
-            soak,
-            retry,
-        ),
-        Err(reason) => reconcile::ReconcileDecision::Unknown { reason },
-    };
-    render_reconcile(
-        stdout,
-        json,
-        latest.as_ref().ok(),
-        &hosts,
-        &decision,
-        args.apply,
-    )?;
-    match decision {
-        reconcile::ReconcileDecision::UpToDate | reconcile::ReconcileDecision::Soaking { .. } => {
-            Ok(ExitCode::SUCCESS)
-        }
-        reconcile::ReconcileDecision::Unknown { reason } => Err(CliFailure::new(
-            reconcile::EXIT_RECONCILE_UNKNOWN,
-            format!(
-                "fleet-reconcile could not determine fleet skew; nothing was rolled out: {reason}"
-            ),
-        )),
-        reconcile::ReconcileDecision::RateLimited {
-            next_attempt,
-            lagging,
-            ..
-        } => Err(CliFailure::new(
-            reconcile::EXIT_RECONCILE_RATE_LIMITED,
-            format!(
-                "hosts still lag ({}) and this release was attempted recently; next attempt after {next_attempt}",
-                lagging.join(", ")
-            ),
-        )),
-        reconcile::ReconcileDecision::Rollout { .. } => {
-            let latest = latest.expect("a rollout decision requires a readable release");
-            if !args.apply {
-                return Ok(ExitCode::SUCCESS);
-            }
-            // Record before mutating: a crash or a failing rollout still counts
-            // as an attempt, so a broken release cannot loop every tick.
-            reconcile::record_attempt(&runtime_paths.state_dir, &latest.tag, now)
-                .map_err(|error| CliFailure::new(1, error))?;
-            fleet_update_command(
-                &FleetUpdateArgs {
-                    to: latest.tag.clone(),
-                    host_classes: Vec::new(),
-                    all_hosts: true,
-                    apply: true,
-                },
-                mode,
-                cwd,
-                runtime_paths,
-                json,
-                stdout,
-            )
-        }
-    }
-}
-
-/// Doctor section: each configured host's installed version against the
-/// latest published release, flagged when it lags past the soak.
-pub(super) fn fleet_version_doctor_section(
-    runtime_paths: &RuntimePaths,
-    cwd: &Path,
-    soak_minutes: u64,
-) -> BTreeMap<String, crate::doctor::DoctorEntry> {
-    use crate::doctor::DoctorEntry;
-    let entry =
-        |ok: bool, version: Option<String>, detail: Option<String>, error: Option<String>| {
-            DoctorEntry {
-                ok,
-                version,
-                detail,
-                error,
-            }
-        };
-    let mut rows = BTreeMap::new();
-    let config = match LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
-    {
-        Ok(config) => config,
-        Err(error) => {
-            rows.insert(
-                "config".to_owned(),
-                entry(false, None, None, Some(error.to_string())),
-            );
-            return rows;
-        }
-    };
-    let classes = match parse_host_classes(&config.data) {
-        Ok(classes) if !classes.is_empty() => classes,
-        Ok(_) => {
-            rows.insert(
-                "fleet".to_owned(),
-                entry(
-                    true,
-                    Some("no host classes configured".to_owned()),
-                    None,
-                    None,
-                ),
-            );
-            return rows;
-        }
-        Err(error) => {
-            rows.insert("config".to_owned(), entry(false, None, None, Some(error)));
-            return rows;
-        }
-    };
-    let latest = release_authority::release_repository().and_then(|repository| {
-        GitHubReleaseAuthorityVerifier::new(&config, cwd)
-            .api_json(&format!("repos/{repository}/releases/latest"))
-            .and_then(|value| reconcile::parse_latest_release(&value))
-    });
-    let now = chrono::Utc::now();
-    match &latest {
-        Ok(latest) => rows.insert(
-            "latest-release".to_owned(),
-            entry(
-                true,
-                Some(latest.tag.clone()),
-                Some(format!("published {}", latest.published_at)),
-                None,
-            ),
-        ),
-        Err(error) => rows.insert(
-            "latest-release".to_owned(),
-            entry(false, None, None, Some(format!("UNKNOWN: {error}"))),
-        ),
-    };
-    let mut hosts = classes
-        .iter()
-        .map(reconcile::probe_host_version)
-        .collect::<Vec<_>>();
-    if let Ok(latest) = &latest {
-        reconcile::classify_hosts(latest, &mut hosts);
-    }
-    for host in hosts {
-        let row = fleet_version_row(&host, latest.as_ref().ok(), now, soak_minutes);
-        rows.insert(format!("host:{}", host.host_class), row);
-    }
-    rows
-}
-
-/// Doctor row for one host: ok when current, or behind but still soaking;
-/// failed when it lags past the soak or its version is unknown.
-fn fleet_version_row(
-    host: &reconcile::HostVersion,
-    latest: Option<&reconcile::PublishedRelease>,
-    now: chrono::DateTime<chrono::Utc>,
-    soak_minutes: u64,
-) -> crate::doctor::DoctorEntry {
-    let soak = chrono::Duration::minutes(i64::try_from(soak_minutes).unwrap_or(30));
-    let (ok, detail, error) = match (host.lagging, latest) {
-        (Some(false), _) => (true, None, None),
-        (Some(true), Some(latest)) if now >= latest.published_at + soak => (
-            false,
-            Some(format!(
-                "lags {} past the {soak_minutes}-minute soak; run `shipyard runner fleet-reconcile --apply`",
-                latest.tag
-            )),
-            Some("lagging".to_owned()),
-        ),
-        (Some(true), Some(latest)) => (
-            true,
-            Some(format!(
-                "behind {}, still inside the soak window",
-                latest.tag
-            )),
-            None,
-        ),
-        _ => (
-            false,
-            None,
-            Some(format!(
-                "UNKNOWN: {}",
-                host.error.as_deref().unwrap_or("latest release unreadable")
-            )),
-        ),
-    };
-    crate::doctor::DoctorEntry {
-        ok,
-        version: host.version.clone(),
-        detail,
-        error,
-    }
-}
-
-fn render_reconcile<W: Write>(
-    stdout: &mut W,
-    json: bool,
-    latest: Option<&reconcile::PublishedRelease>,
-    hosts: &[reconcile::HostVersion],
-    decision: &reconcile::ReconcileDecision,
-    apply: bool,
-) -> Result<(), CliFailure> {
-    if json {
-        let mut data = BTreeMap::new();
-        data.insert("event".to_owned(), Value::from("fleet_reconcile"));
-        data.insert(
-            "latest_release".to_owned(),
-            serde_json::to_value(latest).map_err(|error| CliFailure::new(1, error.to_string()))?,
-        );
-        data.insert(
-            "hosts".to_owned(),
-            serde_json::to_value(hosts).map_err(|error| CliFailure::new(1, error.to_string()))?,
-        );
-        data.insert(
-            "decision".to_owned(),
-            serde_json::to_value(decision)
-                .map_err(|error| CliFailure::new(1, error.to_string()))?,
-        );
-        data.insert("apply".to_owned(), Value::Bool(apply));
-        write_json_envelope(stdout, "runner.fleet-reconcile", data)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        return Ok(());
-    }
-    let io = |error: std::io::Error| CliFailure::new(1, error.to_string());
-    match latest {
-        Some(latest) => writeln!(
-            stdout,
-            "latest release {} (published {})",
-            latest.tag, latest.published_at
-        )
-        .map_err(io)?,
-        None => writeln!(stdout, "latest release UNKNOWN").map_err(io)?,
-    }
-    for host in hosts {
-        writeln!(
-            stdout,
-            "  {:<12} {}{}",
-            host.host_class,
-            host.version.as_deref().unwrap_or("UNKNOWN"),
-            match (host.lagging, host.error.as_deref()) {
-                (Some(true), _) => " LAGGING".to_owned(),
-                (_, Some(error)) => format!(" ({error})"),
-                _ => String::new(),
-            }
-        )
-        .map_err(io)?;
-    }
-    let summary = match decision {
-        reconcile::ReconcileDecision::UpToDate => "every host is current".to_owned(),
-        reconcile::ReconcileDecision::Soaking {
-            soak_until,
-            lagging,
-        } => format!(
-            "{} lag; release soaks until {soak_until}",
-            lagging.join(", ")
-        ),
-        reconcile::ReconcileDecision::RateLimited {
-            next_attempt,
-            lagging,
-            ..
-        } => format!(
-            "{} lag; already attempted, next attempt after {next_attempt}",
-            lagging.join(", ")
-        ),
-        reconcile::ReconcileDecision::Rollout { lagging } => format!(
-            "{} lag; {}",
-            lagging.join(", "),
-            if apply {
-                "running the verified fleet rollout"
-            } else {
-                "a rollout is due (pass --apply)"
-            }
-        ),
-        reconcile::ReconcileDecision::Unknown { reason } => format!("UNKNOWN: {reason}"),
-    };
-    writeln!(stdout, "decision: {summary}").map_err(io)?;
-    Ok(())
+        |plan, evidence| rollback_host(&config, cwd, &classes, plan, evidence),
+    )?)
 }
 
 #[cfg(all(test, not(unix)))]
@@ -601,21 +340,24 @@ fn select_host_classes<'a>(
 /// whose update or verification fails, so one bad release cannot spread. Every
 /// outcome ends in a `fleet_summary` receipt that names the verified hosts, the
 /// failed host, and the hosts that were never attempted (and so still lag).
-fn apply_plans<W, F, V>(
+fn apply_plans<W, F, V, R>(
     plans: &[HostUpdatePlan],
     target: &str,
     json: bool,
     stdout: &mut W,
     execute: F,
     verify: V,
+    rollback: R,
 ) -> Result<ExitCode, CliFailure>
 where
     W: Write,
     F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
     V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
+    R: FnMut(&HostUpdatePlan, &HostUpdateEvidence) -> rollback::RollbackOutcome,
 {
     let mut execute = execute;
     let mut verify = verify;
+    let mut rollback = rollback;
     let mut installed_pair_sha256: Option<(String, Option<String>)> = None;
     let mut verified: Vec<verify::HostVerification> = Vec::new();
     for (index, plan) in plans.iter().enumerate() {
@@ -626,6 +368,7 @@ where
             stdout,
             &mut execute,
             &mut verify,
+            &mut rollback,
             &mut installed_pair_sha256,
             &mut verified,
         )?;
@@ -660,13 +403,14 @@ where
 
 /// Update, validate and verify one host. `Ok(Some(reason))` stops the rollout.
 #[allow(clippy::too_many_arguments)]
-fn apply_host<W, F, V>(
+fn apply_host<W, F, V, R>(
     plan: &HostUpdatePlan,
     target: &str,
     json: bool,
     stdout: &mut W,
     execute: &mut F,
     verify: &mut V,
+    rollback: &mut R,
     installed_pair_sha256: &mut Option<(String, Option<String>)>,
     verified: &mut Vec<verify::HostVerification>,
 ) -> Result<Option<String>, CliFailure>
@@ -674,6 +418,7 @@ where
     W: Write,
     F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
     V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
+    R: FnMut(&HostUpdatePlan, &HostUpdateEvidence) -> rollback::RollbackOutcome,
 {
     let evidence = match execute(plan) {
         Ok(evidence) => evidence,
@@ -729,14 +474,101 @@ where
     render_verification(stdout, json, target, &verification)?;
     if verification.verified() {
         verified.push(verification);
-        Ok(None)
-    } else {
-        Ok(Some(format!(
-            "{} failed post-rollout verification: {}",
-            plan.class,
-            verification.failures.join("; ")
-        )))
+        return Ok(None);
     }
+    // The host was mutated and does not verify: restore what it ran before.
+    let outcome = rollback(plan, &evidence);
+    render_rollback(stdout, json, target, plan, &outcome)?;
+    Ok(Some(format!(
+        "{} failed post-rollout verification: {}; {}",
+        plan.class,
+        verification.failures.join("; "),
+        outcome.summary()
+    )))
+}
+
+fn render_rollback<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    target: &str,
+    plan: &HostUpdatePlan,
+    outcome: &rollback::RollbackOutcome,
+) -> Result<(), CliFailure> {
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("event".to_owned(), Value::from("host_rollback"));
+        data.insert("target".to_owned(), Value::from(target));
+        data.insert("host_class".to_owned(), Value::from(plan.class.clone()));
+        data.insert("summary".to_owned(), Value::from(outcome.summary()));
+        data.insert(
+            "outcome".to_owned(),
+            serde_json::to_value(outcome).map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        write_json_envelope(stdout, "runner.fleet-update", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        writeln!(stdout, "{}: {}", plan.class, outcome.summary())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Reinstall the version a host ran before this update, through the same
+/// governed path, and verify it.
+fn rollback_host(
+    config: &LoadedConfig,
+    cwd: &Path,
+    classes: &[HostClassConfig],
+    plan: &HostUpdatePlan,
+    evidence: &HostUpdateEvidence,
+) -> rollback::RollbackOutcome {
+    let tag = match rollback::rollback_target(plan, evidence) {
+        Ok(tag) => tag,
+        Err(reason) => return rollback::RollbackOutcome::Failed { to: None, reason },
+    };
+    let failed = |reason: String| rollback::RollbackOutcome::Failed {
+        to: Some(tag.clone()),
+        reason,
+    };
+    let Some(class) = classes.iter().find(|class| class.class == plan.class) else {
+        return failed("host class vanished from configuration".to_owned());
+    };
+    let authority = match GitHubReleaseAuthorityVerifier::new(config, cwd).verify(&tag) {
+        Ok(authority) => authority,
+        Err(error) => return failed(format!("previous release is ineligible: {error}")),
+    };
+    let rollback_plan = match host_update_plan_with_authority(class, &tag, &authority) {
+        Ok(plan) => plan,
+        Err(error) => return failed(error.message),
+    };
+    let rollback_evidence = match execute_plan(&rollback_plan) {
+        Ok(evidence) => evidence,
+        Err(PlanExecutionError::TimedOut(error) | PlanExecutionError::Failed(error)) => {
+            return failed(error);
+        }
+    };
+    if let Err(error) = validate_evidence(&rollback_plan, &rollback_evidence) {
+        return failed(format!("rollback evidence failed: {error}"));
+    }
+    let verification = verify::verify_host(&rollback_plan, rollback_evidence.daemon_pid);
+    if verification.verified() {
+        rollback::RollbackOutcome::RolledBack {
+            to: tag,
+            verification: Box::new(verification),
+        }
+    } else {
+        failed(format!(
+            "rollback did not verify: {}",
+            verification.failures.join("; ")
+        ))
+    }
+}
+
+/// The controller's own host (no `ssh`) always goes last, whatever order the
+/// configuration or the command line gave. Updating it restarts the daemon of
+/// the machine running the rollout; every remote host is done by then.
+fn order_controller_last(plans: &mut [HostUpdatePlan]) {
+    plans.sort_by_key(|plan| plan.ssh.is_none());
 }
 
 fn render_verification<W: Write>(
@@ -773,6 +605,13 @@ fn render_verification<W: Write>(
                 String::new()
             } else {
                 format!("; {}", verification.failures.join("; "))
+            } + &if verification.guards_replaced.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; replaced differing guards: {}",
+                    verification.guards_replaced.join(", ")
+                )
             }
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;

@@ -26,9 +26,16 @@ class InstallFleetReconcileTests(unittest.TestCase):
         self.home = self.root / "home"
         self.home.mkdir()
         self.calls = self.root / "launchctl-calls"
+        self.rehearsal_env = self.root / "rehearsal-env"
+        self.rehearsal_exit = self.root / "rehearsal-exit"
+        self.rehearsal_exit.write_text("0", encoding="utf-8")
         self.shipyard = executable(
             self.root / "shipyard",
-            'case "$*" in "runner fleet-reconcile --help") exit 0 ;; esac\nexit 2\n',
+            'case "$*" in\n'
+            '  "runner fleet-reconcile --help") exit 0 ;;\n'
+            f'  "--json runner fleet-reconcile "*) /usr/bin/env > "{self.rehearsal_env}"; '
+            f'exit "$(cat "{self.rehearsal_exit}")" ;;\n'
+            "esac\nexit 2\n",
         )
         self.launchctl = executable(
             self.root / "launchctl", f'printf "%s\\n" "$*" >> "{self.calls}"\n'
@@ -81,6 +88,37 @@ class InstallFleetReconcileTests(unittest.TestCase):
         uid = os.getuid()
         self.assertEqual(calls[0], f"bootout gui/{uid}/com.danielraffel.shipyard.fleet-reconcile")
         self.assertEqual(calls[1], f"bootstrap gui/{uid} {self.plist_path()}")
+
+    def test_install_rehearses_under_the_agent_environment_first(self) -> None:
+        result = self.run_installer("--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rehearsal=ok (exit 0)", result.stdout)
+        env = dict(
+            line.split("=", 1) for line in self.rehearsal_env.read_text().splitlines() if "=" in line
+        )
+        self.assertEqual(env["HOME"], str(self.home))
+        self.assertIn(f"{self.home}/.local/bin", env["PATH"])
+        self.assertNotIn("SHIPYARD_LAUNCHCTL_BIN", env, "the rehearsal must not inherit the caller's env")
+
+    def test_a_failing_rehearsal_refuses_to_load(self) -> None:
+        for code in ("9", "4", "75"):
+            with self.subTest(code=code):
+                self.rehearsal_exit.write_text(code, encoding="utf-8")
+                result = self.run_installer("--install")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"exited {code}; not loading the agent", result.stderr)
+                self.assertFalse(self.plist_path().exists())
+                self.assertFalse(self.calls.exists())
+
+    def test_rate_limited_or_terminal_rehearsal_still_loads(self) -> None:
+        self.rehearsal_exit.write_text("3", encoding="utf-8")
+        result = self.run_installer("--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.plist_path().exists())
+
+    def test_dry_run_does_not_rehearse(self) -> None:
+        self.run_installer()
+        self.assertFalse(self.rehearsal_env.exists())
 
     def test_binary_without_fleet_reconcile_is_refused(self) -> None:
         executable(self.shipyard, "exit 2\n")

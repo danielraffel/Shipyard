@@ -25,7 +25,9 @@ const CLI_PREFIX: &str = "SHIPYARD_VERIFY_CLI=";
 const DAEMON_PREFIX: &str = "SHIPYARD_VERIFY_DAEMON=";
 const PIDFILE_PREFIX: &str = "SHIPYARD_VERIFY_DAEMON_PID=";
 const PID_ALIVE_PREFIX: &str = "SHIPYARD_VERIFY_DAEMON_PID_ALIVE=";
+const GUARDS_BEFORE_PREFIX: &str = "SHIPYARD_VERIFY_GUARDS_BEFORE=";
 const GUARDS_INSTALL_PREFIX: &str = "SHIPYARD_VERIFY_GUARDS_INSTALL=";
+const GUARDS_INSTALL_EXIT_PREFIX: &str = "SHIPYARD_VERIFY_GUARDS_INSTALL_EXIT=";
 const GUARDS_PREFIX: &str = "SHIPYARD_VERIFY_GUARDS=";
 const GUARDS_UNSUPPORTED: &str = "unsupported";
 
@@ -44,6 +46,10 @@ pub(super) struct HostVerification {
     /// `current`, `unsupported` (the release ships no guards), or a failure.
     pub(super) guards: String,
     pub(super) guards_installed: bool,
+    /// Guards whose installed copy differed from this release's and was
+    /// replaced (a previous release's copy, or a local edit), with the
+    /// replaced content hash. Always reported, never replaced silently.
+    pub(super) guards_replaced: Vec<String>,
     pub(super) failures: Vec<String>,
 }
 
@@ -78,7 +84,10 @@ pub(super) fn verify_script(plan: &HostUpdatePlan) -> String {
          printf '%s%s\\n' {pid_prefix} \"$pid\"\n\
          if [ -n \"$pid\" ] && /bin/kill -0 \"$pid\" 2>/dev/null; then printf '%s1\\n' {alive}; else printf '%s0\\n' {alive}; fi\n\
          if {binary} guards --help >/dev/null 2>&1; then\n\
-         \x20 printf '%s%s\\n' {install} \"$({binary} --json guards install 2>/dev/null | /usr/bin/tr -d '\\n')\"\n\
+         \x20 printf '%s%s\\n' {before} \"$({binary} --json guards status 2>/dev/null | /usr/bin/tr -d '\\n')\"\n\
+         \x20 install_out=\"$({binary} --json guards install 2>/dev/null)\"; install_exit=$?\n\
+         \x20 printf '%s%s\\n' {install} \"$(printf '%s' \"$install_out\" | /usr/bin/tr -d '\\n')\"\n\
+         \x20 printf '%s%s\\n' {install_exit} \"$install_exit\"\n\
          \x20 printf '%s%s\\n' {guards} \"$({binary} --json guards status 2>/dev/null | /usr/bin/tr -d '\\n')\"\n\
          else\n\
          \x20 printf '%s%s\\n' {guards} {unsupported}\n\
@@ -88,6 +97,8 @@ pub(super) fn verify_script(plan: &HostUpdatePlan) -> String {
         alive = shlex_quote(PID_ALIVE_PREFIX),
         daemon_prefix = shlex_quote(DAEMON_PREFIX),
         install = shlex_quote(GUARDS_INSTALL_PREFIX),
+        install_exit = shlex_quote(GUARDS_INSTALL_EXIT_PREFIX),
+        before = shlex_quote(GUARDS_BEFORE_PREFIX),
         guards = shlex_quote(GUARDS_PREFIX),
         unsupported = shlex_quote(GUARDS_UNSUPPORTED),
     )
@@ -149,6 +160,7 @@ fn failed(plan: &HostUpdatePlan, expected_daemon_pid: u32, reason: String) -> Ho
         expected_daemon_pid,
         guards: "unverified".to_owned(),
         guards_installed: false,
+        guards_replaced: Vec::new(),
         failures: vec![reason],
     }
 }
@@ -218,12 +230,18 @@ pub(super) fn judge(
         }
     }
 
+    let mut guards_replaced = Vec::new();
     let (guards, guards_installed) = match marker(stdout, GUARDS_PREFIX) {
         Some(GUARDS_UNSUPPORTED) => (GUARDS_UNSUPPORTED.to_owned(), false),
         Some(raw) => {
-            let installed = marker(stdout, GUARDS_INSTALL_PREFIX)
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                .is_some();
+            guards_replaced = replaced_guards(marker(stdout, GUARDS_BEFORE_PREFIX));
+            let installed = match install_verdict(stdout) {
+                Ok(()) => true,
+                Err(reason) => {
+                    failures.push(format!("ghapp guards install: {reason}"));
+                    false
+                }
+            };
             match guards_verdict(raw) {
                 Ok(()) => ("current".to_owned(), installed),
                 Err(reason) => {
@@ -254,8 +272,75 @@ pub(super) fn judge(
         expected_daemon_pid,
         guards,
         guards_installed,
+        guards_replaced,
         failures,
     }
+}
+
+/// The install's own exit code and per-guard actions are authoritative: a
+/// non-zero exit, an unreadable receipt, or any refused guard fails the host.
+fn install_verdict(stdout: &str) -> Result<(), String> {
+    let exit = marker(stdout, GUARDS_INSTALL_EXIT_PREFIX)
+        .ok_or_else(|| "exit status was not reported".to_owned())?
+        .trim()
+        .to_owned();
+    let receipt = marker(stdout, GUARDS_INSTALL_PREFIX)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    let refused = receipt
+        .as_ref()
+        .and_then(|value| value.get("guards"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| {
+                    row.get("action").and_then(Value::as_str) != Some("installed")
+                        && row.get("action").and_then(Value::as_str) != Some("replaced")
+                        && row.get("action").and_then(Value::as_str) != Some("unchanged")
+                })
+                .map(|row| {
+                    format!(
+                        "{} {}{}",
+                        row.get("name").and_then(Value::as_str).unwrap_or("?"),
+                        row.get("action").and_then(Value::as_str).unwrap_or("?"),
+                        row.get("detail")
+                            .and_then(Value::as_str)
+                            .map_or_else(String::new, |detail| format!(" ({detail})"))
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+    if exit != "0" {
+        return Err(match refused.filter(|rows| !rows.is_empty()) {
+            Some(rows) => format!("exited {exit}: {}", rows.join(", ")),
+            None => format!("exited {exit}"),
+        });
+    }
+    match refused {
+        None => Err("its receipt was not readable".to_owned()),
+        Some(rows) if !rows.is_empty() => Err(rows.join(", ")),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Guards whose pre-install copy differed from the release's (status
+/// `stale`), named with the hash that was replaced.
+fn replaced_guards(before: Option<&str>) -> Vec<String> {
+    before
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.get("guards").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| row.get("status").and_then(Value::as_str) == Some("stale"))
+        .map(|row| {
+            format!(
+                "{} (replaced sha256 {})",
+                row.get("name").and_then(Value::as_str).unwrap_or("?"),
+                row.get("installed_sha256")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            )
+        })
+        .collect()
 }
 
 fn guards_verdict(raw: &str) -> Result<(), String> {

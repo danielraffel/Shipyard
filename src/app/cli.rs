@@ -1409,8 +1409,10 @@ pub(super) enum RunnerCommand {
     /// latest published release with every configured host's installed
     /// version and, once the release has soaked, run the verified
     /// `fleet-update` rollout. Reports only unless `--apply` is supplied.
-    /// Exit 9 when anything is unreadable (nothing is rolled out), 3 when
-    /// hosts lag but the tag was attempted inside the retry window.
+    /// Only lagging host classes are rolled; a host ahead of the release stops
+    /// the run with an alert (exit 4) and is never downgraded. Exit 9 when
+    /// anything is unreadable (nothing is rolled out), 3 while rate-limited,
+    /// 5 once the tag is terminal, 75 when another rollout holds the lock.
     #[command(name = "fleet-reconcile")]
     FleetReconcile {
         /// Minutes a release must have been public before it is rolled out.
@@ -1419,6 +1421,9 @@ pub(super) enum RunnerCommand {
         /// Hours between attempts at the same tag.
         #[arg(long = "retry-hours", default_value_t = 6)]
         retry_hours: u64,
+        /// Attempts at one tag before it becomes terminal and raises an alert.
+        #[arg(long = "max-attempts", default_value_t = 3)]
+        max_attempts: u32,
         /// Run the rollout when one is due.
         #[arg(long)]
         apply: bool,

@@ -572,28 +572,49 @@ a reviewed ordered subset, or use explicit `--all-hosts`. Missing, unknown, and
 duplicate selection fails closed; apply stops before later hosts after the
 first failure.
 
-Every applied host is then **independently verified** in a fresh process: the
-installed `shipyard --version` must equal the target, `daemon status` must
-answer as that version from the refreshed pid (the daemon's pid file, alive),
-and when the release ships `shipyard guards` the rollout installs its ghapp
-guards and requires `guards status` current. Each host gets a
-`host_verification` receipt, and the run always ends with a `fleet_summary`
-that names verified, failed and not-attempted hosts. A host that updates but
-does not verify fails the rollout like any other failure.
+Every applied host is then **independently verified** in a fresh process:
+- the installed `shipyard --version` must equal the target;
+- `daemon status` must answer as that version from the refreshed pid (the daemon's pid file, alive);
+- when the release ships `shipyard guards`, the rollout runs `guards install`, whose exit status and per-guard actions are authoritative, and requires `guards status` current. A differing guard that is replaced is named in the receipt (`guards_replaced`), never overwritten silently.
+
+A host that updates but does not verify is **rolled back automatically**: the
+version it ran before the update is reinstalled through the same governed path
+(release authority, staged install, daemon refresh) and verified, and the
+receipt says "rolled back to vX". If there is no governed earlier version, or
+the rollback does not verify, it says "ROLLBACK ... FAILED; the host needs an
+operator". Either way no later host is attempted. The controller's own
+(`ssh`-less) host class is always updated last, and one controller lock spans
+apply, verify and rollback (a second rollout exits 75).
 
 A release is done when the fleet verifies it. `scripts/release-macos-local.sh`
 ends with that verified rollout (exit 6 naming lagging hosts; the published
-release is never reverted; `--no-fleet-rollout` opts out with a warning). For
-releases that reached GitHub another way, `shipyard runner fleet-reconcile`
+release is never reverted; `--no-fleet-rollout` opts out with a warning). The
+stage falls back to the backstop with a warning when the controller binary
+predates this (no `runner fleet-reconcile`), or when the Mac declares no
+`[host_class.*]`.
+
+For releases that reached GitHub another way, `shipyard runner fleet-reconcile`
 compares the latest published non-draft release (after `--soak-minutes`,
-default 30) with every host class's installed version and, with `--apply`,
-runs the same verified rollout. It records each attempt before starting and
-retries a tag at most once per `--retry-hours` (default 6, exit 3 while
-rate-limited). Anything unreadable exits 9 and rolls nothing out. Install its
-launchd agent on the controller only with `scripts/install_fleet_reconcile.sh`
-(dry-run by default, `--install` to apply). `shipyard doctor --fleet` reports
-each host's version against the latest release, and flags any host that lags
-past the soak.
+default 30) with every host class's installed version. With `--apply` it rolls
+out to **only the lagging host classes**. It never downgrades: a host running
+a newer version than the latest release stops the whole tick with an alert
+(exit 4). Each attempt is recorded before it starts. A tag is retried at most
+once per `--retry-hours` (default 6, exit 3), and after `--max-attempts`
+(default 3) it becomes terminal (exit 5). An ineligible release is terminal
+immediately. A terminal tag opens or refreshes a GitHub issue titled
+`fleet-reconcile: <tag> could not reach the fleet` on the Shipyard repository
+and shows in `shipyard doctor --fleet`. Anything unreadable exits 9 and rolls
+nothing out. A tick that finds the controller lock held records nothing (exit
+75). Install its launchd agent on the controller only with
+`scripts/install_fleet_reconcile.sh`. That script is a dry run by default;
+`--install` first rehearses the reconcile under the agent's exact environment
+and refuses to load it on failure.
+
+**Adding a machine is adding its `[host_class.<name>]`** (plus its tartci
+profile) to the controller's machine-global config. Nothing in Shipyard names a
+host. `fleet-update --all-hosts`, `fleet-reconcile` and `doctor --fleet`
+enumerate the configured classes, so the new machine is probed, rolled,
+verified and rolled back like the others from the next tick.
 
 For targets v0.134.0 and newer, the fleet transaction stages the exact
 release-matched CLI, helper, wrapper, and typed context in a private,
