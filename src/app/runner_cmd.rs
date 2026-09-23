@@ -271,6 +271,22 @@ fn runner_command_with_actions<W: Write>(
             json,
             stdout,
         ),
+        RunnerCommand::FleetReconcile {
+            soak_minutes,
+            retry_hours,
+            apply,
+        } => super::fleet_update_cmd::fleet_reconcile_command(
+            &super::fleet_update_cmd::FleetReconcileArgs {
+                soak_minutes,
+                retry_hours,
+                apply,
+            },
+            mode,
+            cwd,
+            runtime_paths,
+            json,
+            stdout,
+        ),
         RunnerCommand::LocalLinuxLease {
             repo,
             profile,

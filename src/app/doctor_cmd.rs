@@ -23,6 +23,7 @@ pub(super) fn doctor<W: Write>(
     release_chain: bool,
     runners: bool,
     rate_limit: bool,
+    fleet_section: Option<BTreeMap<String, crate::doctor::DoctorEntry>>,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(repo) = repo {
@@ -56,6 +57,9 @@ pub(super) fn doctor<W: Write>(
         report
             .checks
             .insert("GitHub rate limits".to_owned(), entries);
+    }
+    if let Some(section) = fleet_section {
+        report.checks.insert("Fleet versions".to_owned(), section);
     }
     if json {
         let mut data = BTreeMap::new();

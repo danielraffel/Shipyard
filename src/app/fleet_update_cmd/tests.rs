@@ -1898,3 +1898,43 @@ fn verification_script_installs_guards_and_reads_every_fact_on_the_host() {
     assert!(calls.contains("--json guards status"), "{calls}");
     assert!(calls.contains("--json daemon status"), "{calls}");
 }
+
+#[test]
+fn doctor_flags_a_host_only_once_it_lags_past_the_soak() {
+    let now = chrono::Utc::now();
+    let latest = reconcile::PublishedRelease {
+        tag: "v0.208.0".to_owned(),
+        published_at: now - chrono::Duration::minutes(45),
+    };
+    let row = |version: Option<&str>, lagging: Option<bool>| reconcile::HostVersion {
+        host_class: "m5".to_owned(),
+        ssh: Some("blackbook".to_owned()),
+        version: version.map(ToOwned::to_owned),
+        error: version.is_none().then(|| "ssh: timed out".to_owned()),
+        lagging,
+    };
+    let lagging = fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 30);
+    assert!(!lagging.ok);
+    assert!(
+        lagging
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("lags v0.208.0 past the 30-minute soak")
+    );
+    let soaking = fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 60);
+    assert!(soaking.ok, "{soaking:?}");
+    let current = fleet_version_row(&row(Some("0.208.0"), Some(false)), Some(&latest), now, 30);
+    assert!(current.ok);
+    let unknown = fleet_version_row(&row(None, None), Some(&latest), now, 30);
+    assert!(!unknown.ok);
+    assert!(
+        unknown
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("UNKNOWN: ssh: timed out")
+    );
+    let no_release = fleet_version_row(&row(Some("0.205.0"), None), None, now, 30);
+    assert!(!no_release.ok);
+}

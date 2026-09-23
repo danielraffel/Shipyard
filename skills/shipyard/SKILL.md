@@ -572,6 +572,29 @@ a reviewed ordered subset, or use explicit `--all-hosts`. Missing, unknown, and
 duplicate selection fails closed; apply stops before later hosts after the
 first failure.
 
+Every applied host is then **independently verified** in a fresh process: the
+installed `shipyard --version` must equal the target, `daemon status` must
+answer as that version from the refreshed pid (the daemon's pid file, alive),
+and when the release ships `shipyard guards` the rollout installs its ghapp
+guards and requires `guards status` current. Each host gets a
+`host_verification` receipt, and the run always ends with a `fleet_summary`
+that names verified, failed and not-attempted hosts. A host that updates but
+does not verify fails the rollout like any other failure.
+
+A release is done when the fleet verifies it. `scripts/release-macos-local.sh`
+ends with that verified rollout (exit 6 naming lagging hosts; the published
+release is never reverted; `--no-fleet-rollout` opts out with a warning). For
+releases that reached GitHub another way, `shipyard runner fleet-reconcile`
+compares the latest published non-draft release (after `--soak-minutes`,
+default 30) with every host class's installed version and, with `--apply`,
+runs the same verified rollout. It records each attempt before starting and
+retries a tag at most once per `--retry-hours` (default 6, exit 3 while
+rate-limited). Anything unreadable exits 9 and rolls nothing out. Install its
+launchd agent on the controller only with `scripts/install_fleet_reconcile.sh`
+(dry-run by default, `--install` to apply). `shipyard doctor --fleet` reports
+each host's version against the latest release, and flags any host that lags
+past the soak.
+
 For targets v0.134.0 and newer, the fleet transaction stages the exact
 release-matched CLI, helper, wrapper, and typed context in a private,
 content-addressed auth generation. Starting with v0.137.0, that generation

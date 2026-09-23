@@ -11,6 +11,7 @@ use serde_json::Value;
 mod auth_support;
 mod command;
 mod evidence;
+mod reconcile;
 mod release_authority;
 mod verify;
 
@@ -188,6 +189,325 @@ pub(super) fn fleet_update_command<W: Write>(
     )
 }
 
+pub(super) struct FleetReconcileArgs {
+    pub(super) soak_minutes: u64,
+    pub(super) retry_hours: u64,
+    pub(super) apply: bool,
+}
+
+/// `shipyard runner fleet-reconcile`: roll the latest published release out to
+/// any host that lags it, once it has soaked. See [`reconcile`].
+pub(super) fn fleet_reconcile_command<W: Write>(
+    args: &FleetReconcileArgs,
+    mode: RuntimeMode,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    if cfg!(not(unix)) {
+        return Err(CliFailure::new(
+            1,
+            "fleet-reconcile requires a Unix rollout controller",
+        ));
+    }
+    let config = LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let classes = parse_host_classes(&config.data).map_err(|error| CliFailure::new(2, error))?;
+    let now = chrono::Utc::now();
+    let latest = release_authority::release_repository().and_then(|repository| {
+        GitHubReleaseAuthorityVerifier::new(&config, cwd)
+            .api_json(&format!("repos/{repository}/releases/latest"))
+            .and_then(|value| reconcile::parse_latest_release(&value))
+    });
+    let mut hosts = classes
+        .iter()
+        .map(reconcile::probe_host_version)
+        .collect::<Vec<_>>();
+    if let Ok(latest) = &latest {
+        reconcile::classify_hosts(latest, &mut hosts);
+    }
+    let soak =
+        chrono::Duration::minutes(i64::try_from(args.soak_minutes).unwrap_or(i64::MAX / 120));
+    let retry = chrono::Duration::hours(i64::try_from(args.retry_hours).unwrap_or(i64::MAX / 7200));
+    let decision = match reconcile::read_ledger(&runtime_paths.state_dir) {
+        Ok(ledger) => reconcile::decide(
+            latest.as_ref().map_err(String::as_str),
+            &hosts,
+            &ledger,
+            now,
+            soak,
+            retry,
+        ),
+        Err(reason) => reconcile::ReconcileDecision::Unknown { reason },
+    };
+    render_reconcile(
+        stdout,
+        json,
+        latest.as_ref().ok(),
+        &hosts,
+        &decision,
+        args.apply,
+    )?;
+    match decision {
+        reconcile::ReconcileDecision::UpToDate | reconcile::ReconcileDecision::Soaking { .. } => {
+            Ok(ExitCode::SUCCESS)
+        }
+        reconcile::ReconcileDecision::Unknown { reason } => Err(CliFailure::new(
+            reconcile::EXIT_RECONCILE_UNKNOWN,
+            format!(
+                "fleet-reconcile could not determine fleet skew; nothing was rolled out: {reason}"
+            ),
+        )),
+        reconcile::ReconcileDecision::RateLimited {
+            next_attempt,
+            lagging,
+            ..
+        } => Err(CliFailure::new(
+            reconcile::EXIT_RECONCILE_RATE_LIMITED,
+            format!(
+                "hosts still lag ({}) and this release was attempted recently; next attempt after {next_attempt}",
+                lagging.join(", ")
+            ),
+        )),
+        reconcile::ReconcileDecision::Rollout { .. } => {
+            let latest = latest.expect("a rollout decision requires a readable release");
+            if !args.apply {
+                return Ok(ExitCode::SUCCESS);
+            }
+            // Record before mutating: a crash or a failing rollout still counts
+            // as an attempt, so a broken release cannot loop every tick.
+            reconcile::record_attempt(&runtime_paths.state_dir, &latest.tag, now)
+                .map_err(|error| CliFailure::new(1, error))?;
+            fleet_update_command(
+                &FleetUpdateArgs {
+                    to: latest.tag.clone(),
+                    host_classes: Vec::new(),
+                    all_hosts: true,
+                    apply: true,
+                },
+                mode,
+                cwd,
+                runtime_paths,
+                json,
+                stdout,
+            )
+        }
+    }
+}
+
+/// Doctor section: each configured host's installed version against the
+/// latest published release, flagged when it lags past the soak.
+pub(super) fn fleet_version_doctor_section(
+    runtime_paths: &RuntimePaths,
+    cwd: &Path,
+    soak_minutes: u64,
+) -> BTreeMap<String, crate::doctor::DoctorEntry> {
+    use crate::doctor::DoctorEntry;
+    let entry =
+        |ok: bool, version: Option<String>, detail: Option<String>, error: Option<String>| {
+            DoctorEntry {
+                ok,
+                version,
+                detail,
+                error,
+            }
+        };
+    let mut rows = BTreeMap::new();
+    let config = match LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+    {
+        Ok(config) => config,
+        Err(error) => {
+            rows.insert(
+                "config".to_owned(),
+                entry(false, None, None, Some(error.to_string())),
+            );
+            return rows;
+        }
+    };
+    let classes = match parse_host_classes(&config.data) {
+        Ok(classes) if !classes.is_empty() => classes,
+        Ok(_) => {
+            rows.insert(
+                "fleet".to_owned(),
+                entry(
+                    true,
+                    Some("no host classes configured".to_owned()),
+                    None,
+                    None,
+                ),
+            );
+            return rows;
+        }
+        Err(error) => {
+            rows.insert("config".to_owned(), entry(false, None, None, Some(error)));
+            return rows;
+        }
+    };
+    let latest = release_authority::release_repository().and_then(|repository| {
+        GitHubReleaseAuthorityVerifier::new(&config, cwd)
+            .api_json(&format!("repos/{repository}/releases/latest"))
+            .and_then(|value| reconcile::parse_latest_release(&value))
+    });
+    let now = chrono::Utc::now();
+    match &latest {
+        Ok(latest) => rows.insert(
+            "latest-release".to_owned(),
+            entry(
+                true,
+                Some(latest.tag.clone()),
+                Some(format!("published {}", latest.published_at)),
+                None,
+            ),
+        ),
+        Err(error) => rows.insert(
+            "latest-release".to_owned(),
+            entry(false, None, None, Some(format!("UNKNOWN: {error}"))),
+        ),
+    };
+    let mut hosts = classes
+        .iter()
+        .map(reconcile::probe_host_version)
+        .collect::<Vec<_>>();
+    if let Ok(latest) = &latest {
+        reconcile::classify_hosts(latest, &mut hosts);
+    }
+    for host in hosts {
+        let row = fleet_version_row(&host, latest.as_ref().ok(), now, soak_minutes);
+        rows.insert(format!("host:{}", host.host_class), row);
+    }
+    rows
+}
+
+/// Doctor row for one host: ok when current, or behind but still soaking;
+/// failed when it lags past the soak or its version is unknown.
+fn fleet_version_row(
+    host: &reconcile::HostVersion,
+    latest: Option<&reconcile::PublishedRelease>,
+    now: chrono::DateTime<chrono::Utc>,
+    soak_minutes: u64,
+) -> crate::doctor::DoctorEntry {
+    let soak = chrono::Duration::minutes(i64::try_from(soak_minutes).unwrap_or(30));
+    let (ok, detail, error) = match (host.lagging, latest) {
+        (Some(false), _) => (true, None, None),
+        (Some(true), Some(latest)) if now >= latest.published_at + soak => (
+            false,
+            Some(format!(
+                "lags {} past the {soak_minutes}-minute soak; run `shipyard runner fleet-reconcile --apply`",
+                latest.tag
+            )),
+            Some("lagging".to_owned()),
+        ),
+        (Some(true), Some(latest)) => (
+            true,
+            Some(format!(
+                "behind {}, still inside the soak window",
+                latest.tag
+            )),
+            None,
+        ),
+        _ => (
+            false,
+            None,
+            Some(format!(
+                "UNKNOWN: {}",
+                host.error.as_deref().unwrap_or("latest release unreadable")
+            )),
+        ),
+    };
+    crate::doctor::DoctorEntry {
+        ok,
+        version: host.version.clone(),
+        detail,
+        error,
+    }
+}
+
+fn render_reconcile<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    latest: Option<&reconcile::PublishedRelease>,
+    hosts: &[reconcile::HostVersion],
+    decision: &reconcile::ReconcileDecision,
+    apply: bool,
+) -> Result<(), CliFailure> {
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("event".to_owned(), Value::from("fleet_reconcile"));
+        data.insert(
+            "latest_release".to_owned(),
+            serde_json::to_value(latest).map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        data.insert(
+            "hosts".to_owned(),
+            serde_json::to_value(hosts).map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        data.insert(
+            "decision".to_owned(),
+            serde_json::to_value(decision)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        data.insert("apply".to_owned(), Value::Bool(apply));
+        write_json_envelope(stdout, "runner.fleet-reconcile", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return Ok(());
+    }
+    let io = |error: std::io::Error| CliFailure::new(1, error.to_string());
+    match latest {
+        Some(latest) => writeln!(
+            stdout,
+            "latest release {} (published {})",
+            latest.tag, latest.published_at
+        )
+        .map_err(io)?,
+        None => writeln!(stdout, "latest release UNKNOWN").map_err(io)?,
+    }
+    for host in hosts {
+        writeln!(
+            stdout,
+            "  {:<12} {}{}",
+            host.host_class,
+            host.version.as_deref().unwrap_or("UNKNOWN"),
+            match (host.lagging, host.error.as_deref()) {
+                (Some(true), _) => " LAGGING".to_owned(),
+                (_, Some(error)) => format!(" ({error})"),
+                _ => String::new(),
+            }
+        )
+        .map_err(io)?;
+    }
+    let summary = match decision {
+        reconcile::ReconcileDecision::UpToDate => "every host is current".to_owned(),
+        reconcile::ReconcileDecision::Soaking {
+            soak_until,
+            lagging,
+        } => format!(
+            "{} lag; release soaks until {soak_until}",
+            lagging.join(", ")
+        ),
+        reconcile::ReconcileDecision::RateLimited {
+            next_attempt,
+            lagging,
+            ..
+        } => format!(
+            "{} lag; already attempted, next attempt after {next_attempt}",
+            lagging.join(", ")
+        ),
+        reconcile::ReconcileDecision::Rollout { lagging } => format!(
+            "{} lag; {}",
+            lagging.join(", "),
+            if apply {
+                "running the verified fleet rollout"
+            } else {
+                "a rollout is due (pass --apply)"
+            }
+        ),
+        reconcile::ReconcileDecision::Unknown { reason } => format!("UNKNOWN: {reason}"),
+    };
+    writeln!(stdout, "decision: {summary}").map_err(io)?;
+    Ok(())
+}
+
 #[cfg(all(test, not(unix)))]
 mod non_unix_tests {
     use super::*;
@@ -299,79 +619,16 @@ where
     let mut installed_pair_sha256: Option<(String, Option<String>)> = None;
     let mut verified: Vec<verify::HostVerification> = Vec::new();
     for (index, plan) in plans.iter().enumerate() {
-        let failure = match execute(plan) {
-            Ok(evidence) => {
-                if let Err(error) = validate_evidence(plan, &evidence) {
-                    render_host_result(
-                        stdout,
-                        json,
-                        target,
-                        plan,
-                        false,
-                        Some(&evidence),
-                        Some(&error),
-                    )?;
-                    Some(format!("{} evidence failed: {error}", plan.class))
-                } else {
-                    let observed_pair = (
-                        evidence.after_pair.primary.sha256.clone(),
-                        evidence
-                            .after_pair
-                            .companion
-                            .as_ref()
-                            .map(|companion| companion.sha256.clone()),
-                    );
-                    if let Some(expected_pair) = &installed_pair_sha256
-                        && expected_pair != &observed_pair
-                    {
-                        let detail = format!(
-                            "installed binary pair hashes disagreed with the first successful host: expected {expected_pair:?}, observed {observed_pair:?}"
-                        );
-                        render_host_result(
-                            stdout,
-                            json,
-                            target,
-                            plan,
-                            false,
-                            Some(&evidence),
-                            Some(&detail),
-                        )?;
-                        Some(format!("{} evidence failed: {detail}", plan.class))
-                    } else {
-                        installed_pair_sha256.get_or_insert(observed_pair);
-                        render_host_result(
-                            stdout,
-                            json,
-                            target,
-                            plan,
-                            true,
-                            Some(&evidence),
-                            None,
-                        )?;
-                        let verification = verify(plan, evidence.daemon_pid);
-                        render_verification(stdout, json, target, &verification)?;
-                        if verification.verified() {
-                            verified.push(verification);
-                            None
-                        } else {
-                            Some(format!(
-                                "{} failed post-rollout verification: {}",
-                                plan.class,
-                                verification.failures.join("; ")
-                            ))
-                        }
-                    }
-                }
-            }
-            Err(PlanExecutionError::TimedOut(error)) => {
-                render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
-                Some(format!("{} timed out: {error}", plan.class))
-            }
-            Err(PlanExecutionError::Failed(error)) => {
-                render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
-                Some(format!("{} failed: {error}", plan.class))
-            }
-        };
+        let failure = apply_host(
+            plan,
+            target,
+            json,
+            stdout,
+            &mut execute,
+            &mut verify,
+            &mut installed_pair_sha256,
+            &mut verified,
+        )?;
         if let Some(reason) = failure {
             let not_attempted = plans[index + 1..]
                 .iter()
@@ -399,6 +656,87 @@ where
     }
     render_fleet_summary(stdout, json, target, &verified, None, &[])?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Update, validate and verify one host. `Ok(Some(reason))` stops the rollout.
+#[allow(clippy::too_many_arguments)]
+fn apply_host<W, F, V>(
+    plan: &HostUpdatePlan,
+    target: &str,
+    json: bool,
+    stdout: &mut W,
+    execute: &mut F,
+    verify: &mut V,
+    installed_pair_sha256: &mut Option<(String, Option<String>)>,
+    verified: &mut Vec<verify::HostVerification>,
+) -> Result<Option<String>, CliFailure>
+where
+    W: Write,
+    F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
+    V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
+{
+    let evidence = match execute(plan) {
+        Ok(evidence) => evidence,
+        Err(PlanExecutionError::TimedOut(error)) => {
+            render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
+            return Ok(Some(format!("{} timed out: {error}", plan.class)));
+        }
+        Err(PlanExecutionError::Failed(error)) => {
+            render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
+            return Ok(Some(format!("{} failed: {error}", plan.class)));
+        }
+    };
+    if let Err(error) = validate_evidence(plan, &evidence) {
+        render_host_result(
+            stdout,
+            json,
+            target,
+            plan,
+            false,
+            Some(&evidence),
+            Some(&error),
+        )?;
+        return Ok(Some(format!("{} evidence failed: {error}", plan.class)));
+    }
+    let observed_pair = (
+        evidence.after_pair.primary.sha256.clone(),
+        evidence
+            .after_pair
+            .companion
+            .as_ref()
+            .map(|companion| companion.sha256.clone()),
+    );
+    if let Some(expected_pair) = installed_pair_sha256.as_ref()
+        && expected_pair != &observed_pair
+    {
+        let detail = format!(
+            "installed binary pair hashes disagreed with the first successful host: expected {expected_pair:?}, observed {observed_pair:?}"
+        );
+        render_host_result(
+            stdout,
+            json,
+            target,
+            plan,
+            false,
+            Some(&evidence),
+            Some(&detail),
+        )?;
+        return Ok(Some(format!("{} evidence failed: {detail}", plan.class)));
+    }
+    installed_pair_sha256.get_or_insert(observed_pair);
+    render_host_result(stdout, json, target, plan, true, Some(&evidence), None)?;
+    let verification = verify(plan, evidence.daemon_pid);
+    render_verification(stdout, json, target, &verification)?;
+    if verification.verified() {
+        verified.push(verification);
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "{} failed post-rollout verification: {}",
+            plan.class,
+            verification.failures.join("; ")
+        )))
+    }
 }
 
 fn render_verification<W: Write>(

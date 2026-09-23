@@ -99,7 +99,7 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
             })
     }
 
-    fn api_json(&self, endpoint: &str) -> Result<Value, String> {
+    pub(super) fn api_json(&self, endpoint: &str) -> Result<Value, String> {
         let mut command = self.command()?;
         command.args(["api", endpoint]).stdin(Stdio::null());
         let output = run(&mut command, "GitHub release-authority query")?;
@@ -558,7 +558,7 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn release_repository() -> Result<String, String> {
+pub(super) fn release_repository() -> Result<String, String> {
     let url = env!("CARGO_PKG_REPOSITORY").trim_end_matches(['/', '\\']);
     let slug = url
         .strip_prefix("https://github.com/")

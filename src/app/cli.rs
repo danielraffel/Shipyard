@@ -413,6 +413,11 @@ pub(super) enum Command {
         /// an env token, or a command helper such as a GitHub App installation.
         #[arg(long = "rate-limit")]
         rate_limit: bool,
+        /// Report every configured host class's installed Shipyard version
+        /// against the latest published release, flagging hosts that lag
+        /// past the soak. Reads each host over SSH; changes nothing.
+        #[arg(long)]
+        fleet: bool,
     },
     /// Validate current HEAD on configured targets.
     Run {
@@ -1397,6 +1402,24 @@ pub(super) enum RunnerCommand {
         #[arg(long, conflicts_with = "host_classes")]
         all_hosts: bool,
         /// Execute the rollout. Without this flag, emit the exact host plan.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Backstop for releases that did not roll themselves out: compare the
+    /// latest published release with every configured host's installed
+    /// version and, once the release has soaked, run the verified
+    /// `fleet-update` rollout. Reports only unless `--apply` is supplied.
+    /// Exit 9 when anything is unreadable (nothing is rolled out), 3 when
+    /// hosts lag but the tag was attempted inside the retry window.
+    #[command(name = "fleet-reconcile")]
+    FleetReconcile {
+        /// Minutes a release must have been public before it is rolled out.
+        #[arg(long = "soak-minutes", default_value_t = 30)]
+        soak_minutes: u64,
+        /// Hours between attempts at the same tag.
+        #[arg(long = "retry-hours", default_value_t = 6)]
+        retry_hours: u64,
+        /// Run the rollout when one is due.
         #[arg(long)]
         apply: bool,
     },
