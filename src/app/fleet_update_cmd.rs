@@ -12,6 +12,7 @@ mod auth_support;
 mod command;
 mod evidence;
 mod release_authority;
+mod verify;
 
 #[cfg(all(test, unix))]
 use command::exact_asset_curl_shim;
@@ -177,7 +178,14 @@ pub(super) fn fleet_update_command<W: Write>(
         return Ok(ExitCode::SUCCESS);
     }
 
-    apply_plans(&plans, &target, json, stdout, execute_plan)
+    apply_plans(
+        &plans,
+        &target,
+        json,
+        stdout,
+        execute_plan,
+        verify::verify_host,
+    )
 }
 
 #[cfg(all(test, not(unix)))]
@@ -267,21 +275,31 @@ fn select_host_classes<'a>(
         .collect()
 }
 
-fn apply_plans<W, F>(
+/// Apply every plan in order, then independently verify each host.
+///
+/// Hosts are updated one at a time and the rollout stops at the first host
+/// whose update or verification fails, so one bad release cannot spread. Every
+/// outcome ends in a `fleet_summary` receipt that names the verified hosts, the
+/// failed host, and the hosts that were never attempted (and so still lag).
+fn apply_plans<W, F, V>(
     plans: &[HostUpdatePlan],
     target: &str,
     json: bool,
     stdout: &mut W,
     execute: F,
+    verify: V,
 ) -> Result<ExitCode, CliFailure>
 where
     W: Write,
     F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
+    V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
 {
     let mut execute = execute;
+    let mut verify = verify;
     let mut installed_pair_sha256: Option<(String, Option<String>)> = None;
-    for plan in plans {
-        match execute(plan) {
+    let mut verified: Vec<verify::HostVerification> = Vec::new();
+    for (index, plan) in plans.iter().enumerate() {
+        let failure = match execute(plan) {
             Ok(evidence) => {
                 if let Err(error) = validate_evidence(plan, &evidence) {
                     render_host_result(
@@ -293,68 +311,192 @@ where
                         Some(&evidence),
                         Some(&error),
                     )?;
-                    return Err(CliFailure::new(
-                        1,
-                        format!(
-                            "fleet update stopped after {} evidence failed: {error}",
-                            plan.class
-                        ),
-                    ));
-                }
-                let observed_pair = (
-                    evidence.after_pair.primary.sha256.clone(),
-                    evidence
-                        .after_pair
-                        .companion
-                        .as_ref()
-                        .map(|companion| companion.sha256.clone()),
-                );
-                if let Some(expected_pair) = &installed_pair_sha256
-                    && expected_pair != &observed_pair
-                {
-                    let detail = format!(
-                        "installed binary pair hashes disagreed with the first successful host: expected {expected_pair:?}, observed {observed_pair:?}"
+                    Some(format!("{} evidence failed: {error}", plan.class))
+                } else {
+                    let observed_pair = (
+                        evidence.after_pair.primary.sha256.clone(),
+                        evidence
+                            .after_pair
+                            .companion
+                            .as_ref()
+                            .map(|companion| companion.sha256.clone()),
                     );
-                    render_host_result(
-                        stdout,
-                        json,
-                        target,
-                        plan,
-                        false,
-                        Some(&evidence),
-                        Some(&detail),
-                    )?;
-                    return Err(CliFailure::new(
-                        1,
-                        format!(
-                            "fleet update stopped after {} evidence failed: {detail}",
-                            plan.class
-                        ),
-                    ));
+                    if let Some(expected_pair) = &installed_pair_sha256
+                        && expected_pair != &observed_pair
+                    {
+                        let detail = format!(
+                            "installed binary pair hashes disagreed with the first successful host: expected {expected_pair:?}, observed {observed_pair:?}"
+                        );
+                        render_host_result(
+                            stdout,
+                            json,
+                            target,
+                            plan,
+                            false,
+                            Some(&evidence),
+                            Some(&detail),
+                        )?;
+                        Some(format!("{} evidence failed: {detail}", plan.class))
+                    } else {
+                        installed_pair_sha256.get_or_insert(observed_pair);
+                        render_host_result(
+                            stdout,
+                            json,
+                            target,
+                            plan,
+                            true,
+                            Some(&evidence),
+                            None,
+                        )?;
+                        let verification = verify(plan, evidence.daemon_pid);
+                        render_verification(stdout, json, target, &verification)?;
+                        if verification.verified() {
+                            verified.push(verification);
+                            None
+                        } else {
+                            Some(format!(
+                                "{} failed post-rollout verification: {}",
+                                plan.class,
+                                verification.failures.join("; ")
+                            ))
+                        }
+                    }
                 }
-                installed_pair_sha256.get_or_insert(observed_pair);
-                render_host_result(stdout, json, target, plan, true, Some(&evidence), None)?;
             }
             Err(PlanExecutionError::TimedOut(error)) => {
                 render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
-                return Err(CliFailure::new(
-                    1,
-                    format!(
-                        "fleet update stopped after {} timed out: {error}",
-                        plan.class
-                    ),
-                ));
+                Some(format!("{} timed out: {error}", plan.class))
             }
             Err(PlanExecutionError::Failed(error)) => {
                 render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
-                return Err(CliFailure::new(
-                    1,
-                    format!("fleet update stopped after {} failed: {error}", plan.class),
-                ));
+                Some(format!("{} failed: {error}", plan.class))
             }
+        };
+        if let Some(reason) = failure {
+            let not_attempted = plans[index + 1..]
+                .iter()
+                .map(|plan| plan.class.clone())
+                .collect::<Vec<_>>();
+            render_fleet_summary(
+                stdout,
+                json,
+                target,
+                &verified,
+                Some((plan.class.as_str(), reason.as_str())),
+                &not_attempted,
+            )?;
+            let lagging = std::iter::once(plan.class.clone())
+                .chain(not_attempted)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(CliFailure::new(
+                1,
+                format!(
+                    "fleet update stopped after {reason}; hosts not verified at {target}: {lagging}"
+                ),
+            ));
         }
     }
+    render_fleet_summary(stdout, json, target, &verified, None, &[])?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn render_verification<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    target: &str,
+    verification: &verify::HostVerification,
+) -> Result<(), CliFailure> {
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("event".to_owned(), Value::from("host_verification"));
+        data.insert("target".to_owned(), Value::from(target));
+        let Value::Object(fields) = serde_json::to_value(verification)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?
+        else {
+            return Err(CliFailure::new(1, "verification receipt must be an object"));
+        };
+        data.extend(fields);
+        write_json_envelope(stdout, "runner.fleet-update", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        writeln!(
+            stdout,
+            "{}: verification {} (cli={}, daemon={}, pid={}, guards={}{})",
+            verification.host_class,
+            verification.verdict.to_uppercase(),
+            verification.cli_version.as_deref().unwrap_or("unread"),
+            verification.daemon_version.as_deref().unwrap_or("unread"),
+            verification
+                .daemon_pid
+                .map_or_else(|| "unread".to_owned(), |pid| pid.to_string()),
+            verification.guards,
+            if verification.failures.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", verification.failures.join("; "))
+            }
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn render_fleet_summary<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    target: &str,
+    verified: &[verify::HostVerification],
+    failed: Option<(&str, &str)>,
+    not_attempted: &[String],
+) -> Result<(), CliFailure> {
+    let verified_names = verified
+        .iter()
+        .map(|host| host.host_class.clone())
+        .collect::<Vec<_>>();
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("event".to_owned(), Value::from("fleet_summary"));
+        data.insert("target".to_owned(), Value::from(target));
+        data.insert(
+            "verdict".to_owned(),
+            Value::from(if failed.is_none() {
+                "verified"
+            } else {
+                "failed"
+            }),
+        );
+        data.insert("verified_hosts".to_owned(), Value::from(verified_names));
+        data.insert(
+            "failed_host".to_owned(),
+            failed.map_or(
+                Value::Null,
+                |(host, reason)| serde_json::json!({"host_class": host, "reason": reason}),
+            ),
+        );
+        data.insert(
+            "not_attempted_hosts".to_owned(),
+            Value::from(not_attempted.to_vec()),
+        );
+        write_json_envelope(stdout, "runner.fleet-update", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else if let Some((host, reason)) = failed {
+        writeln!(
+            stdout,
+            "fleet {target}: FAILED at {host} ({reason}); verified: [{}]; not attempted: [{}]",
+            verified_names.join(", "),
+            not_attempted.join(", ")
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        writeln!(
+            stdout,
+            "fleet {target}: every host verified: [{}]",
+            verified_names.join(", ")
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn normalize_exact_tag(raw: &str) -> Result<String, CliFailure> {

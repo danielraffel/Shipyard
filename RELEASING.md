@@ -151,6 +151,7 @@ The script runs the full pipeline on the local Mac:
 5. **Runs both binaries' `--version` from the mounted DMG locally.** If either fails, the script exits and does NOT upload. This is the whole point — the Mac running the script is the same Mac that will need to launch the binaries tomorrow.
 6. On launch success: uploads via `gh release upload --clobber`, updates `checksums.sha256`, verifies public asset visibility, and runs the `install.sh` E2E. The enclosing release workflow then publishes GitHub build-provenance attestations for the signed/notarized DMG; non-macOS release assets are attested by the release job before the draft is created.
 7. With `--rollback-tag`, verifies baseline install, pair upgrade, and rollback in an isolated temp install directory; rollback before v0.127.0 must remove the provider companion.
+8. **Rolls the published tag out to the fleet and verifies every host.** It runs the controller's `shipyard --json runner fleet-update --to vX.Y.Z --all-hosts --apply`. That governed rollout updates each configured host class one at a time and then re-reads each host in a fresh process: the installed `shipyard --version` must equal the tag; the daemon must answer `daemon status` as that version from the refreshed pid (named by its pid file and alive); and when the release ships `shipyard guards`, the rollout installs this release's `ghapp` guards and `guards status` must report every guard current. It stops at the first host that fails and ends with a `fleet_summary` receipt naming verified, failed, and not-attempted hosts. A failure here exits `6` and names every lagging host. **The release is not reverted**: it is already public and install-verified. Fix the host, then rerun `shipyard runner fleet-update --to vX.Y.Z --all-hosts --apply`, or let `shipyard runner fleet-reconcile` retry after its soak. `--no-fleet-rollout` skips this stage with a warning. `--ci-mode` skips it too, because CI has no fleet; the controller's reconcile agent picks those releases up.
 
 Running without `--upload` is the diagnostic mode (used to confirm the local signing path actually works on a given Mac). Script-helper tests under `scripts/test_*.py` ensure missing creds / bad flags / bash syntax errors all surface before the expensive build step.
 
@@ -189,6 +190,18 @@ now enforces the actual success criterion: `install.sh` downloads the
 DMG, mounts it, extracts both binaries, and both `--version` probes launch.
 If any step in that chain fails, the release fails regardless of what
 `codesign --verify` or `spctl --assess` said earlier.
+
+The same lesson applies one step further out. On 2026-09-23 every fleet host
+was still on v0.205.0 while v0.208.0 was published, because nothing ran the
+governed rollout after a release. **A release is done when the fleet
+verifies it, not when the DMG is public.** The local release script therefore
+ends with the verified fleet rollout above. For a release that reached GitHub
+any other way (CI signing, a manual upload, an opted-out run), the controller
+runs `shipyard runner fleet-reconcile` every 15 minutes. It compares the latest
+published release (after a 30-minute soak) with every host's installed version
+and runs the same verified rollout when any host lags. It makes at most one
+attempt per tag every 6 hours, and fails closed when it cannot read a version.
+`shipyard doctor` reports each host's version against the latest release.
 
 ## Preferred runner provider
 

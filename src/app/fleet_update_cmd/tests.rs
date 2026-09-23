@@ -1306,6 +1306,34 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
     );
 }
 
+fn apply_plans_for_test<F>(
+    plans: &[HostUpdatePlan],
+    target: &str,
+    json: bool,
+    output: &mut Vec<u8>,
+    execute: F,
+) -> Result<ExitCode, CliFailure>
+where
+    F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
+{
+    apply_plans(plans, target, json, output, execute, verified_ok)
+}
+
+fn verified_ok(plan: &HostUpdatePlan, pid: u32) -> verify::HostVerification {
+    let version = plan.target.trim_start_matches('v');
+    verify::judge(
+        plan,
+        pid,
+        &format!(
+            "SHIPYARD_VERIFY_CLI=shipyard {version}\n\
+             SHIPYARD_VERIFY_DAEMON={{\"command\":\"daemon:status\",\"running\":true,\"shipyard_version\":\"{version}\"}}\n\
+             SHIPYARD_VERIFY_DAEMON_PID={pid}\n\
+             SHIPYARD_VERIFY_DAEMON_PID_ALIVE=1\n\
+             SHIPYARD_VERIFY_GUARDS=unsupported\n"
+        ),
+    )
+}
+
 fn named_host(name: &str) -> HostClassConfig {
     let mut class = host(Some(name), Some("/Users/ci/.local/bin/shipyard"));
     name.clone_into(&mut class.class);
@@ -1490,7 +1518,7 @@ fn apply_stops_before_every_later_host_after_first_failure() {
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(&plans, "v0.137.0", true, &mut output, |plan| {
+    let error = apply_plans_for_test(&plans, "v0.137.0", true, &mut output, |plan| {
         attempted.push(plan.class.clone());
         if plan.class == "m3" {
             Err(PlanExecutionError::Failed("controlled failure".to_owned()))
@@ -1506,8 +1534,23 @@ fn apply_stops_before_every_later_host_after_first_failure() {
         .into_iter::<Value>()
         .collect::<Result<Vec<_>, _>>()
         .expect("typed receipts");
-    assert_eq!(receipts.len(), 2);
+    // m1: update receipt + verification; m3: failed update; then the summary.
+    assert_eq!(receipts.len(), 4);
     assert_eq!(receipts[0]["host_class"], "m1");
+    assert_eq!(receipts[1]["event"], "host_verification");
+    assert_eq!(receipts[1]["verdict"], "verified");
+    assert_eq!(receipts[3]["event"], "fleet_summary");
+    assert_eq!(receipts[3]["verified_hosts"], serde_json::json!(["m1"]));
+    assert_eq!(receipts[3]["failed_host"]["host_class"], "m3");
+    assert_eq!(
+        receipts[3]["not_attempted_hosts"],
+        serde_json::json!(["m5"])
+    );
+    assert!(
+        error
+            .message
+            .contains("hosts not verified at v0.137.0: m3, m5")
+    );
     assert_eq!(receipts[0]["target"], "v0.137.0");
     assert_eq!(receipts[0]["executable_sha256"], "a".repeat(64));
     assert_eq!(
@@ -1521,8 +1564,8 @@ fn apply_stops_before_every_later_host_after_first_failure() {
     assert!(receipts[0]["binary_pair_after"]["companion"].is_object());
     assert_eq!(receipts[0]["daemon_pid"], 42);
     assert_eq!(receipts[0]["configured_repos_preserved"], true);
-    assert_eq!(receipts[1]["host_class"], "m3");
-    assert_eq!(receipts[1]["ok"], false);
+    assert_eq!(receipts[2]["host_class"], "m3");
+    assert_eq!(receipts[2]["ok"], false);
     assert!(!rendered.contains("\"host_class\": \"m5\""));
 }
 
@@ -1534,7 +1577,7 @@ fn authority_receipt_mismatch_stops_before_the_next_host() {
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(&plans, "v0.137.0", true, &mut output, |plan| {
+    let error = apply_plans_for_test(&plans, "v0.137.0", true, &mut output, |plan| {
         attempted.push(plan.class.clone());
         let mut observed = evidence("0.137.0");
         if plan.class == "m3" {
@@ -1556,7 +1599,7 @@ fn cross_host_binary_pair_hash_drift_stops_rollout() {
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(&plans, "v0.137.0", true, &mut output, |plan| {
+    let error = apply_plans_for_test(&plans, "v0.137.0", true, &mut output, |plan| {
         attempted.push(plan.class.clone());
         let mut observed = evidence("0.137.0");
         if plan.class == "m3" {
@@ -1620,4 +1663,238 @@ fn paired_host_receipt_exposes_reconcilable_before_and_after_identities() {
         receipt["release_authority"]["platform_asset"]["attestation_statement_sha256"],
         "7".repeat(64)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Post-rollout verification
+// ---------------------------------------------------------------------------
+
+fn verify_transcript(
+    cli: &str,
+    daemon_version: &str,
+    pid: &str,
+    alive: &str,
+    guards: &str,
+) -> String {
+    format!(
+        "SHIPYARD_VERIFY_CLI={cli}\n\
+         SHIPYARD_VERIFY_DAEMON={{\"command\":\"daemon:status\",\"running\":true,\"shipyard_version\":\"{daemon_version}\"}}\n\
+         SHIPYARD_VERIFY_DAEMON_PID={pid}\n\
+         SHIPYARD_VERIFY_DAEMON_PID_ALIVE={alive}\n\
+         SHIPYARD_VERIFY_GUARDS_INSTALL={{\"command\":\"guards install\"}}\n\
+         SHIPYARD_VERIFY_GUARDS={guards}\n"
+    )
+}
+
+const GUARDS_CURRENT: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"current"},{"name":"queue-arm-guard","status":"current"}]}"#;
+const GUARDS_STALE: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"stale"},{"name":"queue-arm-guard","status":"missing"}]}"#;
+
+#[test]
+fn verification_accepts_only_the_target_binary_daemon_and_current_guards() {
+    let plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    let good = verify::judge(
+        &plan,
+        42,
+        &verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_CURRENT),
+    );
+    assert!(good.verified(), "{good:?}");
+    assert_eq!(good.guards, "current");
+    assert!(good.guards_installed);
+
+    let cases = [
+        (
+            verify_transcript("shipyard 0.136.0", "0.137.0", "42", "1", GUARDS_CURRENT),
+            "installed CLI reports",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.136.0", "42", "1", GUARDS_CURRENT),
+            "daemon answers as version",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "41", "1", GUARDS_CURRENT),
+            "not the refreshed pid 42",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "0", GUARDS_CURRENT),
+            "is not alive",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_STALE),
+            "queue-removal-guard=stale, queue-arm-guard=missing",
+        ),
+        (
+            "SHIPYARD_VERIFY_CLI=shipyard 0.137.0\n".to_owned(),
+            "daemon status could not be read",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_CURRENT)
+                .replace("\"running\":true", "\"running\":false"),
+            "daemon is not running",
+        ),
+    ];
+    for (transcript, expected) in cases {
+        let verdict = verify::judge(&plan, 42, &transcript);
+        assert!(!verdict.verified(), "{transcript}");
+        assert!(
+            verdict
+                .failures
+                .iter()
+                .any(|failure| failure.contains(expected)),
+            "{expected}: {:?}",
+            verdict.failures
+        );
+    }
+}
+
+#[test]
+fn a_release_without_guards_is_verified_without_them() {
+    let plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    let verdict = verify::judge(
+        &plan,
+        42,
+        &verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", "unsupported").replace(
+            "SHIPYARD_VERIFY_GUARDS_INSTALL={\"command\":\"guards install\"}\n",
+            "",
+        ),
+    );
+    assert!(verdict.verified(), "{verdict:?}");
+    assert_eq!(verdict.guards, "unsupported");
+    assert!(!verdict.guards_installed);
+}
+
+#[test]
+fn failed_verification_stops_the_rollout_and_names_lagging_hosts() {
+    let plans = ["m1", "m3", "m5"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut attempted = Vec::new();
+    let mut output = Vec::new();
+    let error = apply_plans(
+        &plans,
+        "v0.137.0",
+        true,
+        &mut output,
+        |plan| {
+            attempted.push(plan.class.clone());
+            Ok(evidence("0.137.0"))
+        },
+        |plan, pid| {
+            if plan.class == "m3" {
+                verify::judge(
+                    plan,
+                    pid,
+                    &verify_transcript(
+                        "shipyard 0.136.0",
+                        "0.137.0",
+                        &pid.to_string(),
+                        "1",
+                        "unsupported",
+                    ),
+                )
+            } else {
+                verified_ok(plan, pid)
+            }
+        },
+    )
+    .expect_err("a host that does not verify must fail the rollout");
+    assert_eq!(attempted, ["m1", "m3"]);
+    assert!(
+        error
+            .message
+            .contains("m3 failed post-rollout verification"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error
+            .message
+            .contains("hosts not verified at v0.137.0: m3, m5"),
+        "{}",
+        error.message
+    );
+    let rendered = String::from_utf8(output).expect("UTF-8");
+    let receipts = serde_json::Deserializer::from_str(&rendered)
+        .into_iter::<Value>()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("typed receipts");
+    let summary = receipts.last().expect("summary");
+    assert_eq!(summary["event"], "fleet_summary");
+    assert_eq!(summary["verdict"], "failed");
+    assert_eq!(summary["verified_hosts"], serde_json::json!(["m1"]));
+    assert_eq!(summary["failed_host"]["host_class"], "m3");
+    assert_eq!(summary["not_attempted_hosts"], serde_json::json!(["m5"]));
+    let m3 = receipts
+        .iter()
+        .find(|receipt| receipt["event"] == "host_verification" && receipt["host_class"] == "m3")
+        .expect("m3 verification receipt");
+    assert_eq!(m3["verdict"], "failed");
+}
+
+#[test]
+fn a_fully_verified_rollout_ends_with_a_verified_summary() {
+    let plans = ["m1", "m3"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    apply_plans_for_test(&plans, "v0.137.0", true, &mut output, |_| {
+        Ok(evidence("0.137.0"))
+    })
+    .expect("verified rollout");
+    let rendered = String::from_utf8(output).expect("UTF-8");
+    let summary = serde_json::Deserializer::from_str(&rendered)
+        .into_iter::<Value>()
+        .last()
+        .expect("summary")
+        .expect("json");
+    assert_eq!(summary["verdict"], "verified");
+    assert_eq!(summary["verified_hosts"], serde_json::json!(["m1", "m3"]));
+}
+
+/// Run the real verification script locally against a fake installed binary,
+/// so the shell the host executes (not just the judge) is covered.
+#[cfg(unix)]
+#[test]
+fn verification_script_installs_guards_and_reads_every_fact_on_the_host() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("temp");
+    let bin = temp.path().join("shipyard");
+    let log = temp.path().join("calls");
+    let state_dir = temp.path().join("state");
+    std::fs::create_dir_all(state_dir.join("daemon")).expect("daemon dir");
+    let live_pid = std::process::id();
+    std::fs::write(state_dir.join("daemon/daemon.pid"), format!("{live_pid}\n")).expect("pid");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{log}'\n\
+             case \"$*\" in\n\
+             \x20 --version) echo 'shipyard 0.137.0' ;;\n\
+             \x20 *'daemon status'*) printf '%s' '{{\"command\":\"daemon:status\",\"running\":true,\"shipyard_version\":\"0.137.0\"}}' ;;\n\
+             \x20 'guards --help') exit 0 ;;\n\
+             \x20 '--json guards install') printf '%s' '{{\"command\":\"guards install\"}}' ;;\n\
+             \x20 '--json guards status') printf '%s' '{GUARDS_CURRENT}' ;;\n\
+             \x20 *) exit 9 ;;\n\
+             esac\n",
+            log = log.display()
+        ),
+    )
+    .expect("fake binary");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut plan = host_update_plan(&named_host("studio"), "v0.137.0").expect("plan");
+    plan.ssh = None;
+    plan.binary = bin;
+    plan.state_dir = state_dir;
+
+    let verdict = verify::verify_host(&plan, live_pid);
+
+    assert!(verdict.verified(), "{verdict:?}");
+    assert_eq!(verdict.guards, "current");
+    assert!(verdict.guards_installed);
+    let calls = std::fs::read_to_string(log).expect("calls");
+    assert!(calls.contains("--json guards install"), "{calls}");
+    assert!(calls.contains("--json guards status"), "{calls}");
+    assert!(calls.contains("--json daemon status"), "{calls}");
 }

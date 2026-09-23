@@ -2110,6 +2110,10 @@ fn plan_execution_message(error: PlanExecutionError) -> String {
     }
 }
 
+pub(super) fn ssh_binary_path() -> PathBuf {
+    ssh_binary()
+}
+
 fn ssh_binary() -> PathBuf {
     [PathBuf::from("/usr/bin/ssh"), PathBuf::from("/bin/ssh")]
         .into_iter()

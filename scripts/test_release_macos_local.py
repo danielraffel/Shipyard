@@ -515,5 +515,113 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             self.assertTrue(any(line.endswith("  shipyard-macos-arm64.dmg") for line in lines))
 
 
+class FleetRolloutStageTests(unittest.TestCase):
+    def config(self, **overrides: object) -> release_macos_local.ReleaseConfig:
+        values: dict[str, object] = dict(
+            tag="v0.209.0",
+            repo="danielraffel/Shipyard",
+            artifact_prefix="shipyard",
+            dist_dir=Path("dist"),
+            upload=True,
+            ci_mode=False,
+            skip_build=True,
+            binary=None,
+            cargo_target=None,
+        )
+        values.update(overrides)
+        return release_macos_local.ReleaseConfig(**values)  # type: ignore[arg-type]
+
+    def fleet_runner(self, code: int, events: list[dict]) -> FakeRunner:
+        runner = FakeRunner(assets=complete_release_assets())
+        runner.fleet_calls = []  # type: ignore[attr-defined]
+
+        def run_status(args: list[str]) -> tuple[int, str, str]:
+            runner.fleet_calls.append(args)  # type: ignore[attr-defined]
+            stdout = "".join(json.dumps(event, indent=2) + "\n" for event in events)
+            return code, stdout, "" if code == 0 else "fleet update stopped"
+
+        runner.run_status = run_status  # type: ignore[method-assign]
+        return runner
+
+    def run_main(self, runner: FakeRunner, *argv: str) -> tuple[int | str | None, str, str]:
+        stdout, stderr = StringIO(), StringIO()
+        with (
+            mock.patch.object(release_macos_local, "CommandRunner", return_value=runner),
+            mock.patch.object(release_macos_local, "load_release_environment"),
+            mock.patch.object(release_macos_local, "resolve_environment_files", return_value=[]),
+            mock.patch.object(release_macos_local, "check_unattended_auth", return_value="api-key"),
+            mock.patch.object(release_macos_local, "package_signed_dmg", return_value=Path("x.dmg")),
+            mock.patch.object(release_macos_local, "upload_artifact_and_checksums"),
+            mock.patch.object(release_macos_local, "publish_if_ready", return_value="published"),
+            mock.patch("sys.stderr", stderr),
+            redirect_stdout(stdout),
+        ):
+            try:
+                code: int | str | None = release_macos_local.main(
+                    ["--tag", "v0.209.0", "--upload", *argv]
+                )
+            except SystemExit as error:
+                code = error.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_release_rolls_out_to_every_host_and_requires_a_verified_summary(self) -> None:
+        runner = self.fleet_runner(
+            0,
+            [
+                {"event": "host_verification", "host_class": "m1", "verdict": "verified"},
+                {"event": "fleet_summary", "verdict": "verified", "verified_hosts": ["m1", "m5", "studio"]},
+            ],
+        )
+        code, out, _ = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            runner.fleet_calls,  # type: ignore[attr-defined]
+            [["/opt/ctl/shipyard", "--json", "runner", "fleet-update", "--to", "v0.209.0", "--all-hosts", "--apply"]],
+        )
+        self.assertIn("fleet rollout verified at v0.209.0: m1, m5, studio", out)
+
+    def test_failed_fleet_fails_the_release_loudly_and_names_lagging_hosts(self) -> None:
+        runner = self.fleet_runner(
+            1,
+            [
+                {
+                    "event": "fleet_summary",
+                    "verdict": "failed",
+                    "verified_hosts": ["m1"],
+                    "failed_host": {"host_class": "m5", "reason": "m5 failed post-rollout verification: daemon answers as version"},
+                    "not_attempted_hosts": ["studio"],
+                },
+            ],
+        )
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("FLEET ROLLOUT FAILED for v0.209.0", err)
+        self.assertIn("release stays published", err)
+        self.assertIn("Hosts not verified: m5, studio", err)
+        # The published release is never reverted to draft by the fleet stage.
+        self.assertFalse(any("--draft=true" in command for command in runner.commands))
+
+    def test_zero_exit_without_a_verified_summary_is_still_a_failure(self) -> None:
+        runner = self.fleet_runner(0, [{"event": "host_result", "host_class": "m1", "ok": True}])
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("UNKNOWN (no fleet summary was produced)", err)
+
+    def test_opt_out_warns_and_skips_the_rollout(self) -> None:
+        runner = self.fleet_runner(0, [])
+        code, _, err = self.run_main(runner, "--no-fleet-rollout")
+        self.assertEqual(code, 0)
+        self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]
+        self.assertIn("WARNING: --no-fleet-rollout", err)
+        self.assertIn("not done until every host verifies", err)
+
+    def test_missing_controller_binary_fails_instead_of_skipping(self) -> None:
+        runner = self.fleet_runner(0, [])
+        with mock.patch.object(release_macos_local.shutil, "which", return_value=None):
+            code, _, err = self.run_main(runner)
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("no `shipyard` controller binary", err)
+
+
 if __name__ == "__main__":
     unittest.main()
