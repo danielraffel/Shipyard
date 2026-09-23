@@ -17,7 +17,19 @@ pub(super) fn lock_path(state_dir: &Path) -> PathBuf {
 /// Held for as long as the value lives.
 #[derive(Debug)]
 pub(super) struct ControllerLock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for ControllerLock {
+    /// Release explicitly rather than by closing. `flock` belongs to the open
+    /// file description, which a child forked by any thread in this process
+    /// shares until its `exec` closes the descriptor. Closing our copy then
+    /// leaves the lock held by that child for a moment, and the next
+    /// acquisition in this process reads a free controller as busy. Unlocking
+    /// releases the description itself, whoever else still holds a copy.
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 /// Take the controller lock without waiting. `Ok(None)` means another rollout
@@ -33,7 +45,7 @@ pub(super) fn try_acquire(state_dir: &Path) -> Result<Option<ControllerLock>, St
         .open(&path)
         .map_err(|error| format!("open fleet controller lock {}: {error}", path.display()))?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(ControllerLock { _file: file })),
+        Ok(()) => Ok(Some(ControllerLock { file })),
         Err(error)
             if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
                 || error.kind() == std::io::ErrorKind::WouldBlock =>
@@ -55,5 +67,20 @@ mod tests {
         assert!(try_acquire(temp.path()).expect("lock").is_none());
         drop(first);
         assert!(try_acquire(temp.path()).expect("lock").is_some());
+    }
+
+    /// A duplicate of the locked descriptor (what a forked child holds until
+    /// its exec) must not keep the controller locked after the holder drops.
+    #[test]
+    fn releasing_frees_the_lock_even_while_a_duplicate_descriptor_lives() {
+        let temp = tempfile::tempdir().expect("temp");
+        let held = try_acquire(temp.path()).expect("lock").expect("free");
+        let duplicate = held.file.try_clone().expect("dup");
+        drop(held);
+        assert!(
+            try_acquire(temp.path()).expect("lock").is_some(),
+            "a lingering duplicate descriptor kept the controller locked"
+        );
+        drop(duplicate);
     }
 }
