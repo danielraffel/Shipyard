@@ -49,6 +49,12 @@ shipyard guards status                       # missing/stale/current vs this bui
 shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
 
+# Keep the fleet on the latest release (controller only)
+shipyard runner fleet-update --to vX.Y.Z --all-hosts          # plan
+shipyard runner fleet-update --to vX.Y.Z --all-hosts --apply  # roll out + verify every host
+shipyard runner fleet-reconcile                # latest release vs every host; --apply rolls out lagging fleets after the soak
+shipyard doctor --fleet                        # each host's version vs the latest release
+
 # Monitor
 shipyard status                # dashboard: queue + targets + evidence
 shipyard queue-observe         # one read-only queue/PR snapshot; emit on change

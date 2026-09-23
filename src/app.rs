@@ -444,7 +444,10 @@ where
             release_chain,
             runners,
             rate_limit,
+            fleet,
         } => {
+            let fleet_section = fleet
+                .then(|| fleet_update_cmd::fleet_version_doctor_section(&runtime_paths, &cwd, 30));
             handle_doctor_command(
                 cli.json,
                 cli.mode.into(),
@@ -454,6 +457,7 @@ where
                 release_chain,
                 runners,
                 rate_limit,
+                fleet_section,
                 stdout,
             )?;
         }
@@ -820,6 +824,7 @@ fn handle_doctor_command<W: Write>(
     release_chain: bool,
     runners: bool,
     rate_limit: bool,
+    fleet_section: Option<std::collections::BTreeMap<String, crate::doctor::DoctorEntry>>,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
     doctor(
@@ -831,6 +836,7 @@ fn handle_doctor_command<W: Write>(
         release_chain,
         runners,
         rate_limit,
+        fleet_section,
         stdout,
     )
     .map_err(|error| CliFailure::new(1, error.to_string()))

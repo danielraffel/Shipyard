@@ -1070,6 +1070,32 @@ fn local_rollout_rejects_a_filename_the_installer_cannot_replace() {
     assert!(error.message.contains("must end in /shipyard"));
 }
 
+/// A controller-local probe that stalls before the update command runs is a
+/// before-mutation failure, so the host is not rolled back.
+#[cfg(unix)]
+#[test]
+fn a_stalled_local_pre_probe_is_classified_before_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let binary = temp.path().join("shipyard");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh
+sleep 60
+",
+    )
+    .expect("fixture");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    let plan = host_update_plan(&host(None, binary.to_str()), "v0.137.0").expect("plan");
+    assert!(matches!(
+        evidence::execute_plan_phased_with_timeout(&plan, Duration::from_millis(50)),
+        Err(evidence::PlanPhaseError::BeforeMutation(
+            PlanExecutionError::TimedOut(_)
+        ))
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn one_stalled_host_is_terminated_at_its_bound() {
@@ -1306,6 +1332,90 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
     );
 }
 
+/// Scripted host side effects for [`apply_plans`].
+struct TestOps<E, V, R> {
+    execute: E,
+    verify: V,
+    rollback: R,
+    /// What `installed_version` reports for every host.
+    installed: Option<String>,
+    rollbacks: Vec<(String, Option<String>)>,
+}
+
+impl<E, V, R> HostOps for TestOps<E, V, R>
+where
+    E: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, evidence::PlanPhaseError>,
+    V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
+    R: FnMut(&HostUpdatePlan, Option<&str>) -> rollback::RollbackOutcome,
+{
+    fn installed_version(&mut self, _plan: &HostUpdatePlan) -> Option<String> {
+        self.installed.clone()
+    }
+    fn execute(
+        &mut self,
+        plan: &HostUpdatePlan,
+    ) -> Result<HostUpdateEvidence, evidence::PlanPhaseError> {
+        (self.execute)(plan)
+    }
+    fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification {
+        (self.verify)(plan, daemon_pid)
+    }
+    fn rollback(
+        &mut self,
+        plan: &HostUpdatePlan,
+        previous: Option<&str>,
+    ) -> rollback::RollbackOutcome {
+        self.rollbacks
+            .push((plan.class.clone(), previous.map(ToOwned::to_owned)));
+        (self.rollback)(plan, previous)
+    }
+}
+
+fn rolled_back_ok(plan: &HostUpdatePlan, previous: Option<&str>) -> rollback::RollbackOutcome {
+    rollback::RollbackOutcome::RolledBack {
+        to: format!("v{}", previous.unwrap_or("0.136.0")),
+        verification: Box::new(verified_ok(plan, 1)),
+    }
+}
+
+fn apply_plans_for_test<F>(
+    plans: &[HostUpdatePlan],
+    target: &str,
+    json: bool,
+    output: &mut Vec<u8>,
+    execute: F,
+) -> Result<ExitCode, RolloutFailure>
+where
+    F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
+{
+    let mut execute = execute;
+    let mut ops = TestOps {
+        execute: move |plan: &HostUpdatePlan| {
+            execute(plan).map_err(evidence::PlanPhaseError::Command)
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    apply_plans(plans, &[], target, json, output, &mut ops)
+}
+
+fn verified_ok(plan: &HostUpdatePlan, pid: u32) -> verify::HostVerification {
+    let version = plan.target.trim_start_matches('v');
+    verify::judge(
+        plan,
+        pid,
+        &format!(
+            "SHIPYARD_VERIFY_CLI=shipyard {version}\n\
+             SHIPYARD_VERIFY_DAEMON={{\"command\":\"daemon:status\",\"running\":true,\"shipyard_version\":\"{version}\"}}\n\
+             SHIPYARD_VERIFY_DAEMON_PID={pid}\n\
+             SHIPYARD_VERIFY_DAEMON_PID_ALIVE=1\n\
+             SHIPYARD_VERIFY_GUARDS=unsupported\n"
+        ),
+    )
+}
+
 fn named_host(name: &str) -> HostClassConfig {
     let mut class = host(Some(name), Some("/Users/ci/.local/bin/shipyard"));
     name.clone_into(&mut class.class);
@@ -1490,7 +1600,7 @@ fn apply_stops_before_every_later_host_after_first_failure() {
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(&plans, "v0.137.0", true, &mut output, |plan| {
+    let error = apply_plans_for_test(&plans, "v0.137.0", true, &mut output, |plan| {
         attempted.push(plan.class.clone());
         if plan.class == "m3" {
             Err(PlanExecutionError::Failed("controlled failure".to_owned()))
@@ -1500,14 +1610,30 @@ fn apply_stops_before_every_later_host_after_first_failure() {
     })
     .expect_err("apply stops");
     assert_eq!(attempted, ["m1", "m3"]);
-    assert!(error.message.contains("stopped after m3"));
+    assert!(error.failure.message.contains("stopped after m3"));
     let rendered = String::from_utf8(output).expect("UTF-8");
     let receipts = serde_json::Deserializer::from_str(&rendered)
         .into_iter::<Value>()
         .collect::<Result<Vec<_>, _>>()
         .expect("typed receipts");
-    assert_eq!(receipts.len(), 2);
+    // m1: update receipt + verification; m3: failed update; then the summary.
+    assert_eq!(receipts.len(), 4);
     assert_eq!(receipts[0]["host_class"], "m1");
+    assert_eq!(receipts[1]["event"], "host_verification");
+    assert_eq!(receipts[1]["verdict"], "verified");
+    assert_eq!(receipts[3]["event"], "fleet_summary");
+    assert_eq!(receipts[3]["verified_hosts"], serde_json::json!(["m1"]));
+    assert_eq!(receipts[3]["failed_host"]["host_class"], "m3");
+    assert_eq!(
+        receipts[3]["not_attempted_hosts"],
+        serde_json::json!(["m5"])
+    );
+    assert!(
+        error
+            .failure
+            .message
+            .contains("hosts not verified at v0.137.0: m3, m5")
+    );
     assert_eq!(receipts[0]["target"], "v0.137.0");
     assert_eq!(receipts[0]["executable_sha256"], "a".repeat(64));
     assert_eq!(
@@ -1521,8 +1647,8 @@ fn apply_stops_before_every_later_host_after_first_failure() {
     assert!(receipts[0]["binary_pair_after"]["companion"].is_object());
     assert_eq!(receipts[0]["daemon_pid"], 42);
     assert_eq!(receipts[0]["configured_repos_preserved"], true);
-    assert_eq!(receipts[1]["host_class"], "m3");
-    assert_eq!(receipts[1]["ok"], false);
+    assert_eq!(receipts[2]["host_class"], "m3");
+    assert_eq!(receipts[2]["ok"], false);
     assert!(!rendered.contains("\"host_class\": \"m5\""));
 }
 
@@ -1534,7 +1660,7 @@ fn authority_receipt_mismatch_stops_before_the_next_host() {
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(&plans, "v0.137.0", true, &mut output, |plan| {
+    let error = apply_plans_for_test(&plans, "v0.137.0", true, &mut output, |plan| {
         attempted.push(plan.class.clone());
         let mut observed = evidence("0.137.0");
         if plan.class == "m3" {
@@ -1544,8 +1670,13 @@ fn authority_receipt_mismatch_stops_before_the_next_host() {
     })
     .expect_err("drift must stop rollout");
     assert_eq!(attempted, ["m1", "m3"]);
-    assert!(error.message.contains("stopped after m3 evidence failed"));
-    assert!(error.message.contains("frozen release authority"));
+    assert!(
+        error
+            .failure
+            .message
+            .contains("stopped after m3 evidence failed")
+    );
+    assert!(error.failure.message.contains("frozen release authority"));
 }
 
 #[test]
@@ -1556,7 +1687,7 @@ fn cross_host_binary_pair_hash_drift_stops_rollout() {
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(&plans, "v0.137.0", true, &mut output, |plan| {
+    let error = apply_plans_for_test(&plans, "v0.137.0", true, &mut output, |plan| {
         attempted.push(plan.class.clone());
         let mut observed = evidence("0.137.0");
         if plan.class == "m3" {
@@ -1575,7 +1706,7 @@ fn cross_host_binary_pair_hash_drift_stops_rollout() {
     })
     .expect_err("cross-host drift must stop rollout");
     assert_eq!(attempted, ["m1", "m3"]);
-    assert!(error.message.contains("hashes disagreed"));
+    assert!(error.failure.message.contains("hashes disagreed"));
 }
 
 #[test]
@@ -1620,4 +1751,768 @@ fn paired_host_receipt_exposes_reconcilable_before_and_after_identities() {
         receipt["release_authority"]["platform_asset"]["attestation_statement_sha256"],
         "7".repeat(64)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Post-rollout verification
+// ---------------------------------------------------------------------------
+
+fn verify_transcript(
+    cli: &str,
+    daemon_version: &str,
+    pid: &str,
+    alive: &str,
+    guards: &str,
+) -> String {
+    format!(
+        "SHIPYARD_VERIFY_CLI={cli}\n\
+         SHIPYARD_VERIFY_DAEMON={{\"command\":\"daemon:status\",\"running\":true,\"shipyard_version\":\"{daemon_version}\"}}\n\
+         SHIPYARD_VERIFY_DAEMON_PID={pid}\n\
+         SHIPYARD_VERIFY_DAEMON_PID_ALIVE={alive}\n\
+         SHIPYARD_VERIFY_GUARDS_BEFORE={GUARDS_BEFORE_STALE}\n\
+         SHIPYARD_VERIFY_GUARDS_INSTALL={INSTALL_OK}\n\
+         SHIPYARD_VERIFY_GUARDS_INSTALL_EXIT=0\n\
+         SHIPYARD_VERIFY_GUARDS={guards}\n"
+    )
+}
+
+const GUARDS_BEFORE_STALE: &str = r#"{"guards":[{"name":"queue-arm-guard","status":"stale","installed_sha256":"abc123"},{"name":"queue-removal-guard","status":"current"}]}"#;
+const INSTALL_OK: &str = r#"{"guards":[{"name":"queue-removal-guard","action":"unchanged"},{"name":"queue-arm-guard","action":"replaced"}]}"#;
+const INSTALL_REFUSED: &str = r#"{"guards":[{"name":"queue-removal-guard","action":"unchanged"},{"name":"queue-arm-guard","action":"refused","detail":"a symlink"}]}"#;
+const GUARDS_CURRENT: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"current"},{"name":"queue-arm-guard","status":"current"}]}"#;
+const GUARDS_STALE: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"stale"},{"name":"queue-arm-guard","status":"missing"}]}"#;
+
+#[test]
+fn verification_accepts_only_the_target_binary_daemon_and_current_guards() {
+    let plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    let good = verify::judge(
+        &plan,
+        42,
+        &verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_CURRENT),
+    );
+    assert!(good.verified(), "{good:?}");
+    assert_eq!(good.guards, "current");
+    assert!(good.guards_installed);
+    assert_eq!(
+        good.guards_replaced,
+        ["queue-arm-guard (replaced sha256 abc123)"]
+    );
+
+    let cases = [
+        (
+            verify_transcript("shipyard 0.136.0", "0.137.0", "42", "1", GUARDS_CURRENT),
+            "installed CLI reports",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.136.0", "42", "1", GUARDS_CURRENT),
+            "daemon answers as version",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "41", "1", GUARDS_CURRENT),
+            "not the refreshed pid 42",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "0", GUARDS_CURRENT),
+            "is not alive",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_STALE),
+            "queue-removal-guard=stale, queue-arm-guard=missing",
+        ),
+        (
+            "SHIPYARD_VERIFY_CLI=shipyard 0.137.0\n".to_owned(),
+            "daemon status could not be read",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_CURRENT)
+                .replace(INSTALL_OK, INSTALL_REFUSED)
+                .replace("INSTALL_EXIT=0", "INSTALL_EXIT=1"),
+            "ghapp guards install: exited 1: queue-arm-guard refused (a symlink)",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_CURRENT)
+                .replace(INSTALL_OK, INSTALL_REFUSED),
+            "ghapp guards install: queue-arm-guard refused",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_CURRENT)
+                .replace("INSTALL_EXIT=0", "INSTALL_EXIT=2"),
+            "ghapp guards install: exited 2",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_CURRENT)
+                .replace(INSTALL_OK, "not json"),
+            "ghapp guards install: its receipt was not readable",
+        ),
+        (
+            verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_CURRENT)
+                .replace("\"running\":true", "\"running\":false"),
+            "daemon is not running",
+        ),
+    ];
+    for (transcript, expected) in cases {
+        let verdict = verify::judge(&plan, 42, &transcript);
+        assert!(!verdict.verified(), "{transcript}");
+        assert!(
+            verdict
+                .failures
+                .iter()
+                .any(|failure| failure.contains(expected)),
+            "{expected}: {:?}",
+            verdict.failures
+        );
+    }
+}
+
+#[test]
+fn a_release_without_guards_is_verified_without_them() {
+    let plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    let verdict = verify::judge(
+        &plan,
+        42,
+        &verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", "unsupported").replace(
+            "SHIPYARD_VERIFY_GUARDS_INSTALL={\"command\":\"guards install\"}\n",
+            "",
+        ),
+    );
+    assert!(verdict.verified(), "{verdict:?}");
+    assert_eq!(verdict.guards, "unsupported");
+    assert!(!verdict.guards_installed);
+}
+
+fn failing_m3_verification(plan: &HostUpdatePlan, pid: u32) -> verify::HostVerification {
+    if plan.class == "m3" {
+        verify::judge(
+            plan,
+            pid,
+            &verify_transcript(
+                "shipyard 0.136.0",
+                "0.137.0",
+                &pid.to_string(),
+                "1",
+                "unsupported",
+            ),
+        )
+    } else {
+        verified_ok(plan, pid)
+    }
+}
+
+fn rollout_receipts(output: Vec<u8>) -> Vec<Value> {
+    let rendered = String::from_utf8(output).expect("UTF-8");
+    serde_json::Deserializer::from_str(&rendered)
+        .into_iter::<Value>()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("typed receipts")
+}
+
+#[test]
+fn failed_verification_rolls_the_host_back_and_stops_the_rollout() {
+    let plans = ["m1", "m3", "m5"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut attempted = Vec::new();
+    let mut output = Vec::new();
+    let mut ops = TestOps {
+        execute: |plan: &HostUpdatePlan| {
+            attempted.push(plan.class.clone());
+            Ok(evidence("0.137.0"))
+        },
+        verify: failing_m3_verification,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut output, &mut ops)
+        .expect_err("a host that does not verify must fail the rollout");
+    let rollbacks = ops.rollbacks.clone();
+    drop(ops);
+    assert_eq!(attempted, ["m1", "m3"]);
+    assert_eq!(
+        rollbacks,
+        [("m3".to_owned(), Some("0.136.0".to_owned()))],
+        "only the failing host is rolled back, to its pre-update version"
+    );
+    let message = &error.failure.message;
+    assert!(error.rollback_failed_host.is_none());
+    assert!(
+        message.contains("m3 failed post-rollout verification"),
+        "{message}"
+    );
+    assert!(
+        message.contains("rolled back to v0.136.0 (verified)"),
+        "{message}"
+    );
+    assert!(
+        message.contains("hosts not verified at v0.137.0: m3, m5"),
+        "{message}"
+    );
+    let receipts = rollout_receipts(output);
+    let rollback = receipts
+        .iter()
+        .find(|receipt| receipt["event"] == "host_rollback")
+        .expect("rollback receipt");
+    assert_eq!(rollback["host_class"], "m3");
+    assert_eq!(rollback["outcome"]["rollback"], "rolled_back");
+    assert_eq!(rollback["outcome"]["to"], "v0.136.0");
+    let summary = receipts.last().expect("summary");
+    assert_eq!(summary["event"], "fleet_summary");
+    assert_eq!(summary["verdict"], "failed");
+    assert_eq!(summary["verified_hosts"], serde_json::json!(["m1"]));
+    assert_eq!(summary["not_attempted_hosts"], serde_json::json!(["m5"]));
+}
+
+fn failed_rollback(_: &HostUpdatePlan, _: Option<&str>) -> rollback::RollbackOutcome {
+    rollback::RollbackOutcome::Failed {
+        to: Some("v0.136.0".to_owned()),
+        reason: "rollback did not verify: daemon is not running".to_owned(),
+    }
+}
+
+#[test]
+fn a_failed_rollback_is_reported_loudly_and_still_stops() {
+    let plans = ["m3", "m5"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut attempted = Vec::new();
+    let mut output = Vec::new();
+    let mut ops = TestOps {
+        execute: |plan: &HostUpdatePlan| {
+            attempted.push(plan.class.clone());
+            Ok(evidence("0.137.0"))
+        },
+        verify: failing_m3_verification,
+        rollback: failed_rollback,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut output, &mut ops)
+        .expect_err("failed rollback");
+    drop(ops);
+    assert_eq!(attempted, ["m3"], "no later host after a failed rollback");
+    assert_eq!(error.rollback_failed_host.as_deref(), Some("m3"));
+    assert_eq!(error.failure.code, EXIT_ROLLBACK_FAILED);
+    assert!(
+        error.failure.message.contains("ROLLBACK TO v0.136.0 FAILED: rollback did not verify: daemon is not running; the host needs an operator"),
+        "{}",
+        error.failure.message
+    );
+    let receipts = rollout_receipts(output);
+    assert!(
+        receipts
+            .iter()
+            .any(|receipt| receipt["event"] == "host_rollback"
+                && receipt["outcome"]["rollback"] == "failed")
+    );
+    let summary = receipts.last().expect("summary");
+    assert_eq!(summary["verdict"], "rollback_failed");
+    assert_eq!(summary["failed_host"]["needs_operator"], true);
+}
+
+#[test]
+fn a_committed_transaction_is_rolled_back_after_evidence_or_timeout_failures() {
+    let plans = vec![host_update_plan(&named_host("m3"), "v0.137.0").expect("plan")];
+    // Evidence the validator rejects: the transaction committed, then lied.
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            let mut observed = evidence("0.137.0");
+            observed.release_authority_identity = "f".repeat(64);
+            Ok(observed)
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect_err("evidence failure");
+    assert!(error.failure.message.contains("evidence failed"));
+    assert!(error.failure.message.contains("rolled back to v0.136.0"));
+    assert_eq!(
+        ops.rollbacks,
+        [("m3".to_owned(), Some("0.136.0".to_owned()))]
+    );
+
+    // A timeout: no evidence, but the pre-update probe names the version.
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            Err(evidence::PlanPhaseError::Command(
+                PlanExecutionError::TimedOut("deadline".to_owned()),
+            ))
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.135.2".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error =
+        apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops).expect_err("timeout");
+    assert!(error.failure.message.contains("m3 timed out"));
+    assert_eq!(
+        ops.rollbacks,
+        [("m3".to_owned(), Some("0.135.2".to_owned()))]
+    );
+
+    // A refusal before mutation is not rolled back.
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            Err(evidence::PlanPhaseError::Command(
+                PlanExecutionError::Failed("ssh: connection refused".to_owned()),
+            ))
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops).expect_err("failed");
+    assert!(ops.rollbacks.is_empty());
+}
+
+#[test]
+fn a_failure_before_mutation_is_never_rolled_back_and_a_post_commit_one_always_is() {
+    let plans = vec![host_update_plan(&named_host("studio"), "v0.137.0").expect("plan")];
+    // A controller-local probe timing out before the update command ran: the
+    // host is untouched, so nothing is rolled back, even with no known
+    // previous version (which would otherwise quarantine a healthy host).
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            Err(evidence::PlanPhaseError::BeforeMutation(
+                PlanExecutionError::TimedOut(
+                    "daemon status for host class studio exhausted the deadline".to_owned(),
+                ),
+            ))
+        },
+        verify: verified_ok,
+        rollback: failed_rollback,
+        installed: None,
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect_err("before-mutation failure");
+    assert!(
+        ops.rollbacks.is_empty(),
+        "an untouched host is never rolled back"
+    );
+    assert!(
+        error.rollback_failed_host.is_none(),
+        "a healthy host is never quarantined"
+    );
+    assert!(error.failure.message.contains("failed before any change"));
+
+    // The update committed but its evidence could not be collected: the host
+    // runs something unverified, so it is rolled back, never taken as current.
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            Err(evidence::PlanPhaseError::AfterCommit(
+                PlanExecutionError::Failed(
+                    "remote evidence missing SHIPYARD_FLEET_AFTER_STATUS".to_owned(),
+                ),
+            ))
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect_err("post-commit failure");
+    assert_eq!(
+        ops.rollbacks,
+        [("studio".to_owned(), Some("0.136.0".to_owned()))]
+    );
+    assert!(
+        error
+            .failure
+            .message
+            .contains("updated but its evidence could not be collected")
+    );
+    assert!(error.failure.message.contains("rolled back to v0.136.0"));
+}
+
+#[test]
+fn quarantined_hosts_are_excluded_from_every_rollout() {
+    let mut plans = ["m1", "m5", "studio"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut ledger = reconcile::AttemptLedger::default();
+    ledger.quarantined.insert(
+        "m5".to_owned(),
+        reconcile::Quarantine {
+            tag: "v0.136.0".to_owned(),
+            reason: "rollback failed".to_owned(),
+            since: chrono::Utc::now(),
+        },
+    );
+    let skipped = exclude_quarantined(&mut plans, &ledger);
+    assert_eq!(skipped, ["m5"]);
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.class.as_str())
+            .collect::<Vec<_>>(),
+        ["m1", "studio"]
+    );
+}
+
+#[test]
+fn a_fleet_update_rollback_failure_quarantines_and_alerts_like_reconcile() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut alerts = Vec::new();
+    let failure = RolloutFailure {
+        ineligible: false,
+        rollback_failed_host: Some("m5".to_owned()),
+        failure: CliFailure::new(EXIT_ROLLBACK_FAILED, "ROLLBACK TO v0.208.0 FAILED"),
+    };
+    let error = record_cli_rollback_failure(temp.path(), "0.209.0", failure, |title, body| {
+        alerts.push((title.to_owned(), body.to_owned()));
+        Ok(())
+    });
+    assert_eq!(error.code, EXIT_ROLLBACK_FAILED);
+    assert!(
+        error
+            .message
+            .contains("m5 is quarantined and an alert was raised")
+    );
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].0, reconcile::alert_title("v0.209.0"));
+    assert!(alerts[0].1.contains("--clear-host m5"));
+    let ledger = reconcile::read_ledger(temp.path()).expect("ledger");
+    assert_eq!(ledger.quarantined["m5"].tag, "v0.209.0");
+    assert!(ledger.tags["v0.209.0"].terminal.is_some());
+
+    // An ordinary failure records nothing.
+    let temp = tempfile::tempdir().expect("temp");
+    let failure = RolloutFailure::from(CliFailure::new(1, "m1 failed"));
+    let error = record_cli_rollback_failure(temp.path(), "v0.209.0", failure, |_, _| {
+        panic!("no alert for an ordinary failure")
+    });
+    assert_eq!(error.code, 1);
+    assert!(!reconcile::ledger_path(temp.path()).exists());
+}
+
+#[test]
+fn a_pair_hash_disagreement_rolls_the_disagreeing_host_back() {
+    let plans = ["m1", "m3"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut ops = TestOps {
+        execute: |plan: &HostUpdatePlan| {
+            let mut observed = evidence("0.137.0");
+            if plan.class == "m3" {
+                observed.after_pair.primary.sha256 = "d".repeat(64);
+                observed.executable_sha256 = "d".repeat(64);
+                observed.daemon_runtime.loaded_executable_sha256 = "d".repeat(64);
+                observed
+                    .auth_support_after
+                    .generation
+                    .as_mut()
+                    .expect("generation")
+                    .binary
+                    .sha256 = "d".repeat(64);
+            }
+            Ok(observed)
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect_err("pair drift");
+    assert!(error.failure.message.contains("hashes disagreed"));
+    assert_eq!(ops.rollbacks.len(), 1);
+    assert_eq!(ops.rollbacks[0].0, "m3");
+}
+
+#[test]
+fn lagging_only_skips_current_and_ahead_hosts_and_fails_closed_on_unknown() {
+    let plans = ["m1", "m3", "m5"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let versions = [
+        ("m1", Some("0.137.0")),
+        ("m3", Some("0.136.1")),
+        ("m5", Some("0.138.0")),
+    ];
+    let probe = |plan: &HostUpdatePlan| {
+        let version = versions
+            .iter()
+            .find(|(name, _)| *name == plan.class)
+            .and_then(|(_, version)| *version);
+        reconcile::HostVersion {
+            host_class: plan.class.clone(),
+            ssh: plan.ssh.clone(),
+            version: version.map(ToOwned::to_owned),
+            error: None,
+            lagging: None,
+            declares_host_classes: None,
+        }
+    };
+    let (lagging, current) =
+        partition_lagging(plans.clone(), "v0.137.0", probe).expect("partition");
+    assert_eq!(
+        lagging
+            .iter()
+            .map(|plan| plan.class.as_str())
+            .collect::<Vec<_>>(),
+        ["m3"]
+    );
+    assert_eq!(
+        current,
+        ["m1", "m5"],
+        "current and ahead hosts are never reinstalled"
+    );
+
+    let unreadable = |plan: &HostUpdatePlan| reconcile::HostVersion {
+        host_class: plan.class.clone(),
+        ssh: plan.ssh.clone(),
+        version: None,
+        error: Some("ssh: timed out".to_owned()),
+        lagging: None,
+        declares_host_classes: None,
+    };
+    let error = partition_lagging(plans, "v0.137.0", unreadable).expect_err("unknown");
+    assert!(
+        error
+            .message
+            .contains("cannot read the installed version on m1")
+    );
+
+    let mut output = Vec::new();
+    apply_plans(
+        &[],
+        &["m1".to_owned(), "m5".to_owned()],
+        "v0.137.0",
+        true,
+        &mut output,
+        &mut TestOps {
+            execute: |_: &HostUpdatePlan| -> Result<HostUpdateEvidence, evidence::PlanPhaseError> {
+                panic!("nothing lags")
+            },
+            verify: verified_ok,
+            rollback: rolled_back_ok,
+            installed: None,
+            rollbacks: Vec::new(),
+        },
+    )
+    .expect("nothing to do is success");
+    let summary = rollout_receipts(output).pop().expect("summary");
+    assert_eq!(summary["verdict"], "verified");
+    assert_eq!(
+        summary["already_current_hosts"],
+        serde_json::json!(["m1", "m5"])
+    );
+}
+
+// fleet-update refuses to run as a non-Unix controller before it reaches the
+// lock (see non_unix_tests), so the lock contract is Unix-only.
+#[cfg(unix)]
+#[test]
+fn fleet_update_apply_refuses_while_another_rollout_holds_the_lock() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Shipyard,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let held = controller_lock::try_acquire(&paths.state_dir)
+        .expect("lock")
+        .expect("free");
+    let args = FleetUpdateArgs {
+        to: "v0.209.0".to_owned(),
+        host_classes: Vec::new(),
+        all_hosts: true,
+        apply: true,
+        lagging_only: true,
+    };
+    let mut output = Vec::new();
+    let error = fleet_update_command(
+        &args,
+        RuntimeMode::Shipyard,
+        temp.path(),
+        &paths,
+        true,
+        &mut output,
+    )
+    .expect_err("held lock");
+    assert_eq!(error.code, EXIT_CONTROLLER_BUSY);
+    assert!(
+        error
+            .message
+            .contains("another fleet rollout holds the controller lock")
+    );
+    assert!(output.is_empty(), "nothing was planned or touched");
+    drop(held);
+}
+
+#[test]
+fn rollback_target_is_the_pre_update_version_when_a_governed_one_exists() {
+    let plan = host_update_plan(&named_host("m1"), "v0.140.0").expect("plan");
+    assert_eq!(
+        rollback::rollback_target(&plan, Some("0.138.2")).as_deref(),
+        Ok("v0.138.2")
+    );
+    assert_eq!(
+        rollback::rollback_target(&plan, Some("v0.138.2")).as_deref(),
+        Ok("v0.138.2")
+    );
+    assert!(
+        rollback::rollback_target(&plan, Some("0.140.0"))
+            .expect_err("same")
+            .contains("no earlier version")
+    );
+    assert!(
+        rollback::rollback_target(&plan, Some("0.120.0"))
+            .expect_err("old")
+            .contains("predates")
+    );
+    assert!(rollback::rollback_target(&plan, None).is_err());
+}
+
+// The local (controller) plan needs an absolute Unix shipyard_bin path.
+#[cfg(unix)]
+#[test]
+fn the_controller_host_is_always_updated_last() {
+    let mut local = named_host("studio");
+    local.ssh = None;
+    local.shipyard_bin = Some("/Users/ci/.local/bin/shipyard".to_owned());
+    let mut plans = vec![
+        host_update_plan(&local, "v0.137.0").expect("local plan"),
+        host_update_plan(&named_host("m1"), "v0.137.0").expect("plan"),
+        host_update_plan(&named_host("m5"), "v0.137.0").expect("plan"),
+        host_update_plan(&named_host("m7-new-rack"), "v0.137.0").expect("plan"),
+    ];
+    order_controller_last(&mut plans);
+    let order = plans
+        .iter()
+        .map(|plan| plan.class.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(order, ["m1", "m5", "m7-new-rack", "studio"]);
+}
+
+#[test]
+fn a_fully_verified_rollout_ends_with_a_verified_summary() {
+    let plans = ["m1", "m3"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    apply_plans_for_test(&plans, "v0.137.0", true, &mut output, |_| {
+        Ok(evidence("0.137.0"))
+    })
+    .expect("verified rollout");
+    let rendered = String::from_utf8(output).expect("UTF-8");
+    let summary = serde_json::Deserializer::from_str(&rendered)
+        .into_iter::<Value>()
+        .last()
+        .expect("summary")
+        .expect("json");
+    assert_eq!(summary["verdict"], "verified");
+    assert_eq!(summary["verified_hosts"], serde_json::json!(["m1", "m3"]));
+}
+
+/// Run the real verification script locally against a fake installed binary,
+/// so the shell the host executes (not just the judge) is covered.
+#[cfg(unix)]
+#[test]
+fn verification_script_installs_guards_and_reads_every_fact_on_the_host() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("temp");
+    let bin = temp.path().join("shipyard");
+    let log = temp.path().join("calls");
+    let state_dir = temp.path().join("state");
+    std::fs::create_dir_all(state_dir.join("daemon")).expect("daemon dir");
+    let live_pid = std::process::id();
+    std::fs::write(state_dir.join("daemon/daemon.pid"), format!("{live_pid}\n")).expect("pid");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{log}'\n\
+             case \"$*\" in\n\
+             \x20 --version) echo 'shipyard 0.137.0' ;;\n\
+             \x20 *'daemon status'*) printf '%s' '{{\"command\":\"daemon:status\",\"running\":true,\"shipyard_version\":\"0.137.0\"}}' ;;\n\
+             \x20 'guards --help') exit 0 ;;\n\
+             \x20 '--json guards install') printf '%s' '{INSTALL_OK}' ;;\n\
+             \x20 '--json guards status') if [ -f '{marker}' ]; then printf '%s' '{GUARDS_CURRENT}'; else : > '{marker}'; printf '%s' '{GUARDS_BEFORE_STALE}'; fi ;;\n\
+             \x20 *) exit 9 ;;\n\
+             esac\n",
+            log = log.display(),
+            marker = temp.path().join("status-read").display()
+        ),
+    )
+    .expect("fake binary");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut plan = host_update_plan(&named_host("studio"), "v0.137.0").expect("plan");
+    plan.ssh = None;
+    plan.binary = bin;
+    plan.state_dir = state_dir;
+
+    let verdict = verify::verify_host(&plan, live_pid);
+
+    assert!(verdict.verified(), "{verdict:?}");
+    assert_eq!(verdict.guards, "current");
+    assert!(verdict.guards_installed);
+    assert_eq!(
+        verdict.guards_replaced,
+        ["queue-arm-guard (replaced sha256 abc123)"]
+    );
+    let calls = std::fs::read_to_string(log).expect("calls");
+    assert!(calls.contains("--json guards install"), "{calls}");
+    assert!(calls.contains("--json guards status"), "{calls}");
+    assert!(calls.contains("--json daemon status"), "{calls}");
+}
+
+#[test]
+fn doctor_flags_a_host_only_once_it_lags_past_the_soak() {
+    let now = chrono::Utc::now();
+    let latest = reconcile::PublishedRelease {
+        tag: "v0.208.0".to_owned(),
+        published_at: now - chrono::Duration::minutes(45),
+    };
+    let row = |version: Option<&str>, lagging: Option<bool>| reconcile::HostVersion {
+        host_class: "m5".to_owned(),
+        ssh: Some("blackbook".to_owned()),
+        version: version.map(ToOwned::to_owned),
+        error: version.is_none().then(|| "ssh: timed out".to_owned()),
+        lagging,
+        declares_host_classes: None,
+    };
+    let lagging =
+        reconcile_cmd::fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 30);
+    assert!(!lagging.ok);
+    assert!(
+        lagging
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("lags v0.208.0 past the 30-minute soak")
+    );
+    let soaking =
+        reconcile_cmd::fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 60);
+    assert!(soaking.ok, "{soaking:?}");
+    let current = reconcile_cmd::fleet_version_row(
+        &row(Some("0.208.0"), Some(false)),
+        Some(&latest),
+        now,
+        30,
+    );
+    assert!(current.ok);
+    let unknown = reconcile_cmd::fleet_version_row(&row(None, None), Some(&latest), now, 30);
+    assert!(!unknown.ok);
+    assert!(
+        unknown
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("UNKNOWN: ssh: timed out")
+    );
+    let no_release = reconcile_cmd::fleet_version_row(&row(Some("0.205.0"), None), None, now, 30);
+    assert!(!no_release.ok);
 }

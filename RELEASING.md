@@ -151,6 +151,14 @@ The script runs the full pipeline on the local Mac:
 5. **Runs both binaries' `--version` from the mounted DMG locally.** If either fails, the script exits and does NOT upload. This is the whole point — the Mac running the script is the same Mac that will need to launch the binaries tomorrow.
 6. On launch success: uploads via `gh release upload --clobber`, updates `checksums.sha256`, verifies public asset visibility, and runs the `install.sh` E2E. The enclosing release workflow then publishes GitHub build-provenance attestations for the signed/notarized DMG; non-macOS release assets are attested by the release job before the draft is created.
 7. With `--rollback-tag`, verifies baseline install, pair upgrade, and rollback in an isolated temp install directory; rollback before v0.127.0 must remove the provider companion.
+8. **Rolls the published tag out to the fleet and verifies every host.** It runs the controller's `shipyard --json runner fleet-update --to vX.Y.Z --all-hosts --apply --lagging-only`, so hosts already on the tag are skipped rather than reinstalled. That governed rollout updates each configured host class one at a time, with the controller's own host last. It then re-reads each host in a fresh process:
+   - the installed `shipyard --version` must equal the tag;
+   - the daemon must answer `daemon status` as that version from the refreshed pid;
+   - when the release ships `shipyard guards`, its ghapp guards are installed (the install's own result is authoritative, and any replaced copy is named) and must be current.
+
+   A host whose update may have committed but did not verify (failed verification, rejected evidence, pair-hash drift, or a timeout) is rolled back automatically to the version it ran before, through the same governed path, and re-verified. If that rollback fails, the host is quarantined, an alert issue is opened, and the stage prints "FLEET ROLLBACK FAILED … needs an operator now". No rollout touches a quarantined host until `shipyard runner fleet-reconcile --clear-host <class>`. If another rollout holds the controller lock (exit 75), the stage warns and hands over instead of failing. The run stops at that host and ends with a `fleet_summary` naming verified, failed and not-attempted hosts. A failure exits `6` and names every lagging host. **The release is not reverted**: it is already public and install-verified. Fix the host, then rerun `shipyard runner fleet-update --to vX.Y.Z --host-class <class> --apply`, or let `shipyard runner fleet-reconcile` retry after its soak.
+
+   `--no-fleet-rollout` skips the stage with a warning. It is also skipped with a warning when `--ci-mode` is set (CI has no fleet), when the controller binary predates verified rollouts, or when the Mac declares no `[host_class.*]`. In all of those cases the controller's reconcile agent picks the release up.
 
 Running without `--upload` is the diagnostic mode (used to confirm the local signing path actually works on a given Mac). Script-helper tests under `scripts/test_*.py` ensure missing creds / bad flags / bash syntax errors all surface before the expensive build step.
 
@@ -189,6 +197,28 @@ now enforces the actual success criterion: `install.sh` downloads the
 DMG, mounts it, extracts both binaries, and both `--version` probes launch.
 If any step in that chain fails, the release fails regardless of what
 `codesign --verify` or `spctl --assess` said earlier.
+
+The same lesson applies one step further out. On 2026-09-23 every fleet host
+was still on v0.205.0 while v0.208.0 was published, because nothing ran the
+governed rollout after a release. **A release is done when the fleet
+verifies it, not when the DMG is public.** The local release script therefore
+ends with the verified fleet rollout above. For a release that reached GitHub
+any other way (CI signing, a manual upload, an opted-out run), the controller
+runs `shipyard runner fleet-reconcile` every 15 minutes. It compares the latest
+published release (after a 30-minute soak) with every host's installed version
+and runs the same verified rollout to the lagging host classes only. It never
+downgrades a host that is ahead; that raises an alert instead. It makes at most
+one attempt per tag every 6 hours. After three attempts, or at once for an
+ineligible release, it stops retrying and opens a GitHub issue. It fails closed
+when it cannot read a version.
+
+**Adding a machine** to the fleet means adding its `[host_class.<name>]` (and
+its tartci profile) to the controller's machine-global config. Exactly one Mac
+is the controller; `shipyard doctor --fleet` flags a remote host that also
+declares host classes. No host is
+named in code; the next release or reconcile tick rolls and verifies it like
+every other host.
+`shipyard doctor` reports each host's version against the latest release.
 
 ## Preferred runner provider
 

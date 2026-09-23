@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Fleet-reconcile backstop for the rollout controller (install with
+  scripts/install_fleet_reconcile.sh; never hand-load). Every 15 minutes it
+  compares the latest published Shipyard release with every configured host
+  class and, once the release has soaked, runs the verified fleet rollout.
+  It rolls a given tag out at most once per retry window and never acts on
+  an unreadable version.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.shipyard.fleet-reconcile</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@SHIPYARD@</string>
+        <string>--json</string>
+        <string>runner</string>
+        <string>fleet-reconcile</string>
+        <string>--soak-minutes</string>
+        <string>@SOAK_MINUTES@</string>
+        <string>--retry-hours</string>
+        <string>@RETRY_HOURS@</string>
+        <string>--apply</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@HOME@</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StartInterval</key>
+    <integer>@INTERVAL@</integer>
+    <key>StandardOutPath</key>
+    <string>@HOME@/Library/Logs/shipyard-fleet-reconcile.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Library/Logs/shipyard-fleet-reconcile.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:@HOME@/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,6 +27,12 @@ DEFAULT_LOCAL_ENV_FILES = (
 )
 PUBLIC_ASSET_VISIBILITY_TIMEOUT_SECS = 90
 PUBLIC_ASSET_VISIBILITY_POLL_SECS = 3
+# Distinct from every earlier failure: the release is public and installable,
+# but at least one fleet host did not verify at it.
+FLEET_ROLLOUT_FAILED_EXIT = 6
+# `shipyard runner fleet-update` exit codes the stage treats specially.
+FLEET_CONTROLLER_BUSY_EXIT = 75
+FLEET_ROLLBACK_FAILED_EXIT = 7
 
 
 @dataclass(frozen=True)
@@ -70,6 +77,13 @@ class CommandRunner:
                 detail = f"{detail}\n{result.stderr.strip()}"
             raise SystemExit(detail)
         return result.stdout.strip() if capture else ""
+
+    def run_status(self, args: list[str]) -> tuple[int, str, str]:
+        """Run a command whose failure the caller reports itself."""
+        result = subprocess.run(
+            args, cwd=ROOT, check=False, text=True, capture_output=True
+        )
+        return result.returncode, result.stdout, result.stderr
 
 
 def require_env() -> None:
@@ -523,6 +537,118 @@ def run_install_e2e(config: ReleaseConfig, runner: CommandRunner) -> str:
         return "\n".join(observed)
 
 
+def _json_documents(text: str) -> list[dict]:
+    decoder = json.JSONDecoder()
+    documents: list[dict] = []
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            break
+        if isinstance(value, dict):
+            documents.append(value)
+    return documents
+
+
+def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: str | None) -> None:
+    """Roll the just-published tag out to every configured host and verify it.
+
+    The release is not reverted on failure: it is public, verified installable,
+    and other consumers may already hold it. The failure is loud and names the
+    hosts that did not verify, and the fleet-reconcile backstop retries later.
+    """
+    if not shipyard:
+        print(
+            "FLEET ROLLOUT FAILED: no `shipyard` controller binary on PATH; "
+            "pass --fleet-shipyard or --no-fleet-rollout",
+            file=sys.stderr,
+        )
+        raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
+    # The controller binary is the one already installed, i.e. the previous
+    # release. A controller that predates verified rollouts (no fleet-reconcile)
+    # or a Mac with no [host_class] cannot run this stage; neither makes the
+    # release incomplete, so hand over to the backstop with a warning.
+    code, _, _ = runner.run_status([shipyard, "runner", "fleet-reconcile", "--help"])
+    if code != 0:
+        print(
+            f"WARNING: {shipyard} predates verified fleet rollouts; the fleet was NOT "
+            f"updated to {config.tag} here. Once the controller runs a release with "
+            "`runner fleet-reconcile`, its agent rolls the fleet after the soak.",
+            file=sys.stderr,
+        )
+        return
+    plan = [shipyard, "--json", "runner", "fleet-update", "--to", config.tag, "--all-hosts"]
+    code, _, stderr = runner.run_status(plan)
+    if code != 0 and "No [host_class." in stderr:
+        print(
+            "WARNING: this Mac declares no [host_class.*], so it is not the fleet "
+            f"controller; the fleet was NOT updated to {config.tag} here. The "
+            "controller's fleet-reconcile agent rolls it out after the soak.",
+            file=sys.stderr,
+        )
+        return
+    if code != 0:
+        print(
+            f"FLEET ROLLOUT FAILED for {config.tag}: the rollout plan was refused; "
+            "the release stays published.",
+            file=sys.stderr,
+        )
+        if stderr.strip():
+            print(stderr.strip(), file=sys.stderr)
+        raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
+    # Only hosts behind the tag: reinstalling a current host restarts its daemon
+    # and cannot be rolled back (there is no earlier version to restore).
+    command = [*plan, "--apply", "--lagging-only"]
+    print(f"fleet rollout: {' '.join(command)}")
+    code, stdout, stderr = runner.run_status(command)
+    if code == FLEET_CONTROLLER_BUSY_EXIT:
+        print(
+            f"WARNING: another fleet rollout holds the controller lock; {config.tag} was "
+            "not rolled out here. The running rollout or the fleet-reconcile agent "
+            "finishes the fleet.",
+            file=sys.stderr,
+        )
+        return
+    summaries = [
+        document
+        for document in _json_documents(stdout)
+        if document.get("event") == "fleet_summary"
+    ]
+    summary = summaries[-1] if summaries else None
+    if code == 0 and summary and summary.get("verdict") == "verified":
+        hosts = ", ".join(summary.get("verified_hosts") or [])
+        print(f"fleet rollout verified at {config.tag}: {hosts}")
+        return
+    failed = (summary or {}).get("failed_host") or {}
+    lagging = [
+        name
+        for name in [failed.get("host_class"), *((summary or {}).get("not_attempted_hosts") or [])]
+        if name
+    ]
+    if code == FLEET_ROLLBACK_FAILED_EXIT or (summary or {}).get("verdict") == "rollback_failed":
+        print(
+            f"FLEET ROLLBACK FAILED for {config.tag}: {failed.get('host_class', 'a host')} "
+            "was updated, failed, and could NOT be restored; it needs an operator now.",
+            file=sys.stderr,
+        )
+    print(
+        f"FLEET ROLLOUT FAILED for {config.tag} (exit {code}); the release stays "
+        "published. Hosts not verified: "
+        + (", ".join(lagging) if lagging else "UNKNOWN (no fleet summary was produced)"),
+        file=sys.stderr,
+    )
+    if failed.get("reason"):
+        print(f"  cause: {failed['reason']}", file=sys.stderr)
+    if stderr.strip():
+        print(stderr.strip(), file=sys.stderr)
+    raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", help="Release tag, for example v0.1.0")
@@ -555,6 +681,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "E2E verifies previous -> current -> previous inside an isolated "
             "install directory."
         ),
+    )
+    parser.add_argument(
+        "--no-fleet-rollout",
+        action="store_true",
+        help=(
+            "Skip the final governed fleet rollout + verification. The release "
+            "is then not done until the fleet verifies; fleet-reconcile catches up."
+        ),
+    )
+    parser.add_argument(
+        "--fleet-shipyard",
+        default=None,
+        help="Controller shipyard binary for the fleet rollout (default: shipyard on PATH)",
     )
     parser.add_argument("--dist-dir", type=Path, default=package_release.DEFAULT_DIST_DIR)
     parser.add_argument("--artifact-prefix", default=package_release.BIN_NAME)
@@ -601,6 +740,24 @@ def main(argv: list[str] | None = None) -> int:
     upload_artifact_and_checksums(config, dmg, runner)
     outcome = publish_if_ready(config, runner)
     print(f"release outcome: {outcome}")
+    if outcome in ("published", "already-public"):
+        if args.no_fleet_rollout:
+            print(
+                "WARNING: --no-fleet-rollout: the fleet was NOT updated to "
+                f"{config.tag}; the release is not done until every host verifies "
+                "(shipyard runner fleet-reconcile will catch up after the soak).",
+                file=sys.stderr,
+            )
+        elif config.ci_mode:
+            print(
+                "WARNING: --ci-mode has no fleet to roll out to; the controller's "
+                "shipyard runner fleet-reconcile will update the fleet after the soak.",
+                file=sys.stderr,
+            )
+        else:
+            run_fleet_rollout(
+                config, runner, args.fleet_shipyard or shutil.which("shipyard")
+            )
     return 0
 
 

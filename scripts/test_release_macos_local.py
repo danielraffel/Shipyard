@@ -515,5 +515,212 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             self.assertTrue(any(line.endswith("  shipyard-macos-arm64.dmg") for line in lines))
 
 
+class FleetRolloutStageTests(unittest.TestCase):
+    def config(self, **overrides: object) -> release_macos_local.ReleaseConfig:
+        values: dict[str, object] = dict(
+            tag="v0.209.0",
+            repo="danielraffel/Shipyard",
+            artifact_prefix="shipyard",
+            dist_dir=Path("dist"),
+            upload=True,
+            ci_mode=False,
+            skip_build=True,
+            binary=None,
+            cargo_target=None,
+        )
+        values.update(overrides)
+        return release_macos_local.ReleaseConfig(**values)  # type: ignore[arg-type]
+
+    def fleet_runner(
+        self,
+        code: int,
+        events: list[dict],
+        *,
+        capable: int = 0,
+        plan_code: int = 0,
+        plan_stderr: str = "",
+    ) -> FakeRunner:
+        runner = FakeRunner(assets=complete_release_assets())
+        runner.fleet_calls = []  # type: ignore[attr-defined]
+
+        runner.probe_calls = []  # type: ignore[attr-defined]
+
+        def run_status(args: list[str]) -> tuple[int, str, str]:
+            if args[1:] == ["runner", "fleet-reconcile", "--help"]:
+                runner.probe_calls.append(args)  # type: ignore[attr-defined]
+                return capable, "", ""
+            if "--apply" not in args:
+                runner.probe_calls.append(args)  # type: ignore[attr-defined]
+                return plan_code, "{}", plan_stderr
+            runner.fleet_calls.append(args)  # type: ignore[attr-defined]
+            stdout = "".join(json.dumps(event, indent=2) + "\n" for event in events)
+            return code, stdout, "" if code == 0 else "fleet update stopped"
+
+        runner.run_status = run_status  # type: ignore[method-assign]
+        return runner
+
+    def run_main(
+        self, runner: FakeRunner, *argv: str, ci_mode: bool = False
+    ) -> tuple[int | str | None, str, str]:
+        stdout, stderr = StringIO(), StringIO()
+        with (
+            mock.patch.object(release_macos_local, "CommandRunner", return_value=runner),
+            mock.patch.object(release_macos_local, "load_release_environment"),
+            mock.patch.object(release_macos_local, "resolve_environment_files", return_value=[]),
+            mock.patch.object(release_macos_local, "check_unattended_auth", return_value="api-key"),
+            mock.patch.object(release_macos_local, "package_signed_dmg", return_value=Path("x.dmg")),
+            mock.patch.object(release_macos_local, "upload_artifact_and_checksums"),
+            mock.patch.object(release_macos_local, "publish_if_ready", return_value="published"),
+            mock.patch("sys.stderr", stderr),
+            redirect_stdout(stdout),
+        ):
+            try:
+                code: int | str | None = release_macos_local.main(
+                    ["--tag", "v0.209.0", "--upload", *(["--ci-mode"] if ci_mode else []), *argv]
+                )
+            except SystemExit as error:
+                code = error.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_release_rolls_out_to_every_host_and_requires_a_verified_summary(self) -> None:
+        runner = self.fleet_runner(
+            0,
+            [
+                {"event": "host_verification", "host_class": "m1", "verdict": "verified"},
+                {"event": "fleet_summary", "verdict": "verified", "verified_hosts": ["m1", "m5", "studio"]},
+            ],
+        )
+        code, out, _ = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            runner.fleet_calls,  # type: ignore[attr-defined]
+            [["/opt/ctl/shipyard", "--json", "runner", "fleet-update", "--to", "v0.209.0", "--all-hosts", "--apply", "--lagging-only"]],
+        )
+        self.assertIn("fleet rollout verified at v0.209.0: m1, m5, studio", out)
+
+    def test_failed_fleet_fails_the_release_loudly_and_names_lagging_hosts(self) -> None:
+        runner = self.fleet_runner(
+            1,
+            [
+                {
+                    "event": "fleet_summary",
+                    "verdict": "failed",
+                    "verified_hosts": ["m1"],
+                    "failed_host": {"host_class": "m5", "reason": "m5 failed post-rollout verification: daemon answers as version"},
+                    "not_attempted_hosts": ["studio"],
+                },
+            ],
+        )
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("FLEET ROLLOUT FAILED for v0.209.0", err)
+        self.assertIn("release stays published", err)
+        self.assertIn("Hosts not verified: m5, studio", err)
+        # The published release is never reverted to draft by the fleet stage.
+        self.assertFalse(any("--draft=true" in command for command in runner.commands))
+
+    def test_zero_exit_without_a_verified_summary_is_still_a_failure(self) -> None:
+        runner = self.fleet_runner(0, [{"event": "host_result", "host_class": "m1", "ok": True}])
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("UNKNOWN (no fleet summary was produced)", err)
+
+    def test_opt_out_warns_and_skips_the_rollout(self) -> None:
+        runner = self.fleet_runner(0, [])
+        code, _, err = self.run_main(runner, "--no-fleet-rollout")
+        self.assertEqual(code, 0)
+        self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]
+        self.assertIn("WARNING: --no-fleet-rollout", err)
+        self.assertIn("not done until every host verifies", err)
+
+    def test_exit_zero_with_a_failed_summary_is_a_failure(self) -> None:
+        runner = self.fleet_runner(
+            0,
+            [
+                {
+                    "event": "fleet_summary",
+                    "verdict": "failed",
+                    "verified_hosts": [],
+                    "failed_host": {"host_class": "m1", "reason": "m1 failed"},
+                    "not_attempted_hosts": ["studio"],
+                }
+            ],
+        )
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("Hosts not verified: m1, studio", err)
+
+    def test_ci_mode_skips_the_rollout_with_a_warning(self) -> None:
+        runner = self.fleet_runner(0, [])
+        code, _, err = self.run_main(
+            runner, "--fleet-shipyard", "/opt/ctl/shipyard", ci_mode=True
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]
+        self.assertEqual(runner.probe_calls, [])  # type: ignore[attr-defined]
+        self.assertIn("WARNING: --ci-mode has no fleet", err)
+
+    def test_controller_without_verified_rollouts_falls_back_to_the_backstop(self) -> None:
+        runner = self.fleet_runner(0, [], capable=2)
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, 0)
+        self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]
+        self.assertIn("predates verified fleet rollouts", err)
+
+    def test_mac_without_host_classes_falls_back_to_the_backstop(self) -> None:
+        runner = self.fleet_runner(
+            0,
+            [],
+            plan_code=1,
+            plan_stderr="No [host_class.<name>] configured — fleet-update has no rollout targets.",
+        )
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, 0)
+        self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]
+        self.assertIn("declares no [host_class.*]", err)
+
+    def test_a_refused_plan_fails_the_stage(self) -> None:
+        runner = self.fleet_runner(
+            0, [], plan_code=1, plan_stderr="fleet release is ineligible: missing attestation"
+        )
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("rollout plan was refused", err)
+        self.assertIn("missing attestation", err)
+        self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]
+
+    def test_a_held_controller_lock_hands_over_instead_of_failing(self) -> None:
+        runner = self.fleet_runner(75, [])
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, 0)
+        self.assertIn("another fleet rollout holds the controller lock", err)
+        self.assertNotIn("UNKNOWN (no fleet summary", err)
+
+    def test_a_failed_rollback_is_called_out_as_needing_an_operator(self) -> None:
+        runner = self.fleet_runner(
+            7,
+            [
+                {
+                    "event": "fleet_summary",
+                    "verdict": "rollback_failed",
+                    "verified_hosts": [],
+                    "failed_host": {"host_class": "m5", "reason": "ROLLBACK TO v0.208.0 FAILED", "needs_operator": True},
+                    "not_attempted_hosts": ["studio"],
+                }
+            ],
+        )
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("FLEET ROLLBACK FAILED for v0.209.0: m5", err)
+        self.assertIn("needs an operator now", err)
+
+    def test_missing_controller_binary_fails_instead_of_skipping(self) -> None:
+        runner = self.fleet_runner(0, [])
+        with mock.patch.object(release_macos_local.shutil, "which", return_value=None):
+            code, _, err = self.run_main(runner)
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("no `shipyard` controller binary", err)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -258,11 +258,33 @@ fn runner_command_with_actions<W: Write>(
             host_classes,
             all_hosts,
             apply,
+            lagging_only,
         } => super::fleet_update_cmd::fleet_update_command(
             &super::fleet_update_cmd::FleetUpdateArgs {
                 to,
                 host_classes,
                 all_hosts,
+                apply,
+                lagging_only,
+            },
+            mode,
+            cwd,
+            runtime_paths,
+            json,
+            stdout,
+        ),
+        RunnerCommand::FleetReconcile {
+            soak_minutes,
+            retry_hours,
+            max_attempts,
+            clear_host,
+            apply,
+        } => super::fleet_update_cmd::fleet_reconcile_command(
+            &super::fleet_update_cmd::FleetReconcileArgs {
+                soak_minutes,
+                retry_hours,
+                max_attempts,
+                clear_host,
                 apply,
             },
             mode,

@@ -572,6 +572,86 @@ a reviewed ordered subset, or use explicit `--all-hosts`. Missing, unknown, and
 duplicate selection fails closed; apply stops before later hosts after the
 first failure.
 
+Every applied host is then **independently verified** in a fresh process:
+- the installed `shipyard --version` must equal the target;
+- `daemon status` must answer as that version from the refreshed pid (the daemon's pid file, alive);
+- when the release ships `shipyard guards`, the rollout runs `guards install`, whose exit status and per-guard actions are authoritative, and requires `guards status` current. A differing guard that is replaced is named in the receipt (`guards_replaced`), never overwritten silently.
+
+A host whose transaction may have committed is **rolled back automatically**
+when any of these happen:
+- it fails verification;
+- its evidence is rejected;
+- its binary pair disagrees with the first host;
+- it times out.
+
+The version it ran before, read by a separate probe before the update, is
+reinstalled through the same governed path and verified. The receipt says
+"rolled back to vX". If no governed earlier version exists, or the rollback
+does not verify, the receipt says "ROLLBACK ... FAILED; the host needs an
+operator" and the run exits 7 (`verdict: rollback_failed`). Either way no later
+host is attempted. `--lagging-only` reads each selected host first and skips
+hosts already at or ahead of the target. Reinstalling such a host cannot be
+rolled back and restarts its daemon. The release stage and reconcile always use
+it. The controller's own
+(`ssh`-less) host class is always updated last, and one controller lock spans
+apply, verify and rollback (a second rollout exits 75).
+
+A release is done when the fleet verifies it. `scripts/release-macos-local.sh`
+ends with that verified rollout (exit 6 naming lagging hosts; the published
+release is never reverted; `--no-fleet-rollout` opts out with a warning). The
+stage falls back to the backstop with a warning when the controller binary
+predates this (no `runner fleet-reconcile`), or when the Mac declares no
+`[host_class.*]`.
+
+For releases that reached GitHub another way, `shipyard runner fleet-reconcile`
+compares the latest published non-draft release (after `--soak-minutes`,
+default 30) with every host class's installed version. With `--apply` it rolls
+out to **only the lagging host classes**. It never downgrades: a host running
+a newer version than the latest release stops the whole tick with an alert
+(exit 4). Each attempt is recorded before it starts. A tag is retried at most
+once per `--retry-hours` (default 6, exit 3), and after `--max-attempts`
+(default 3) it becomes terminal (exit 5). An ineligible release is terminal
+immediately. A terminal tag opens or refreshes a GitHub issue titled
+`fleet-reconcile: <tag> could not reach the fleet` on the Shipyard repository
+and shows in `shipyard doctor --fleet`. Anything unreadable exits 9 and rolls
+nothing out. A tick that finds the controller lock held records nothing (exit
+75). Install its launchd agent on the controller only with
+`scripts/install_fleet_reconcile.sh`. That script is a dry run by default;
+`--install` first rehearses the reconcile under the agent's exact environment
+and refuses to load it on failure.
+
+A failed rollback, whether it happened in reconcile, the release stage or an
+operator's `fleet-update --apply`, is terminal for that tag immediately and
+alerts at once. The host is **quarantined** in the controller's ledger. Every
+fleet-update and reconcile skips it until `shipyard runner fleet-reconcile
+--clear-host <class>` is run after the host is fixed; that also makes its tag
+eligible again. Rollback follows only failures that may have changed the host:
+- a timeout of the update command;
+- evidence that could not be collected after the command exited 0 (the host runs an unverified build, which is never treated as current);
+- rejected evidence, pair-hash drift, or a failed verification.
+
+A failure before the update command started (including a controller-local
+probe timing out) touched nothing and is never rolled back. The "hosts ahead" alert
+is raised once per tag. An unreadable host no longer blocks the others: the
+reachable lagging hosts are rolled, the tick exits 9, and the host alerts once
+after 4 consecutive unreadable ticks. Alerts find their issue by exact-title
+search, not by scanning one page of open issues.
+
+**Exactly one controller.** Only one Mac may declare `[host_class.*]` and run
+fleet-update or fleet-reconcile. Two controllers would race each other's
+rollouts and rollbacks on the same hosts, and each only holds its own lock.
+Shipyard can check this only from the controller: every probe reads each remote
+host's machine-global config, and a remote host that also declares host classes
+is reported by fleet-reconcile and flagged by `shipyard doctor --fleet` as a
+second controller. Remove the host classes from any Mac that is not the
+controller.
+
+**Adding a machine is adding its `[host_class.<name>]`** (plus its tartci
+profile) to the controller's machine-global config. Nothing in Shipyard names a
+host. `fleet-update --all-hosts`, `fleet-reconcile` and `doctor --fleet`
+enumerate the configured classes, so the new machine is probed, rolled,
+verified and rolled back like the others from the next tick.
+
 For targets v0.134.0 and newer, the fleet transaction stages the exact
 release-matched CLI, helper, wrapper, and typed context in a private,
 content-addressed auth generation. Starting with v0.137.0, that generation

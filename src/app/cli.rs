@@ -413,6 +413,11 @@ pub(super) enum Command {
         /// an env token, or a command helper such as a GitHub App installation.
         #[arg(long = "rate-limit")]
         rate_limit: bool,
+        /// Report every configured host class's installed Shipyard version
+        /// against the latest published release, flagging hosts that lag
+        /// past the soak. Reads each host over SSH; changes nothing.
+        #[arg(long)]
+        fleet: bool,
     },
     /// Validate current HEAD on configured targets.
     Run {
@@ -1397,6 +1402,38 @@ pub(super) enum RunnerCommand {
         #[arg(long, conflicts_with = "host_classes")]
         all_hosts: bool,
         /// Execute the rollout. Without this flag, emit the exact host plan.
+        #[arg(long)]
+        apply: bool,
+        /// With --apply: read each selected host's installed version first and
+        /// skip hosts already at or ahead of the target (reported as already
+        /// current). An unreadable host fails before anything is touched.
+        #[arg(long = "lagging-only")]
+        lagging_only: bool,
+    },
+    /// Backstop for releases that did not roll themselves out: compare the
+    /// latest published release with every configured host's installed
+    /// version and, once the release has soaked, run the verified
+    /// `fleet-update` rollout. Reports only unless `--apply` is supplied.
+    /// Only lagging host classes are rolled; a host ahead of the release stops
+    /// the run with an alert (exit 4) and is never downgraded. Exit 9 when
+    /// anything is unreadable (nothing is rolled out), 3 while rate-limited,
+    /// 5 once the tag is terminal, 75 when another rollout holds the lock.
+    #[command(name = "fleet-reconcile")]
+    FleetReconcile {
+        /// Minutes a release must have been public before it is rolled out.
+        #[arg(long = "soak-minutes", default_value_t = 30)]
+        soak_minutes: u64,
+        /// Hours between attempts at the same tag.
+        #[arg(long = "retry-hours", default_value_t = 6)]
+        retry_hours: u64,
+        /// Attempts at one tag before it becomes terminal and raises an alert.
+        #[arg(long = "max-attempts", default_value_t = 3)]
+        max_attempts: u32,
+        /// Clear a host class quarantined after a failed rollback (fix the host
+        /// first). A tag made terminal by that failure becomes eligible again.
+        #[arg(long = "clear-host", value_name = "HOST_CLASS")]
+        clear_host: Option<String>,
+        /// Run the rollout when one is due.
         #[arg(long)]
         apply: bool,
     },
