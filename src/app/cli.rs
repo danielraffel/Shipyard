@@ -1404,6 +1404,11 @@ pub(super) enum RunnerCommand {
         /// Execute the rollout. Without this flag, emit the exact host plan.
         #[arg(long)]
         apply: bool,
+        /// With --apply: read each selected host's installed version first and
+        /// skip hosts already at or ahead of the target (reported as already
+        /// current). An unreadable host fails before anything is touched.
+        #[arg(long = "lagging-only")]
+        lagging_only: bool,
     },
     /// Backstop for releases that did not roll themselves out: compare the
     /// latest published release with every configured host's installed
@@ -1424,6 +1429,10 @@ pub(super) enum RunnerCommand {
         /// Attempts at one tag before it becomes terminal and raises an alert.
         #[arg(long = "max-attempts", default_value_t = 3)]
         max_attempts: u32,
+        /// Clear a host class quarantined after a failed rollback (fix the host
+        /// first). A tag made terminal by that failure becomes eligible again.
+        #[arg(long = "clear-host", value_name = "HOST_CLASS")]
+        clear_host: Option<String>,
         /// Run the rollout when one is due.
         #[arg(long)]
         apply: bool,

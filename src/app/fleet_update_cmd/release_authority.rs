@@ -112,17 +112,25 @@ impl<'a> GitHubReleaseAuthorityVerifier<'a> {
     /// duplicates.
     pub(super) fn upsert_issue(&self, title: &str, body: &str) -> Result<(), String> {
         let repository = release_repository()?;
-        let open = self.api_json(&format!(
-            "repos/{repository}/issues?state=open&per_page=100"
-        ))?;
-        let existing = open.as_array().and_then(|issues| {
-            issues.iter().find_map(|issue| {
-                (issue.get("title").and_then(Value::as_str) == Some(title)
-                    && issue.get("pull_request").is_none())
-                .then(|| issue.get("number").and_then(Value::as_u64))
-                .flatten()
-            })
-        });
+        // Search by the exact phrase rather than scanning one page of open
+        // issues, then require an exact title match among the hits.
+        let mut search = self.command()?;
+        search
+            .args([
+                "api".to_owned(),
+                "-X".to_owned(),
+                "GET".to_owned(),
+                "search/issues".to_owned(),
+                "-f".to_owned(),
+                format!("q={}", issue_search_query(&repository, title)),
+                "-f".to_owned(),
+                "per_page=100".to_owned(),
+            ])
+            .stdin(Stdio::null());
+        let output = run(&mut search, "fleet alert issue search")?;
+        let found: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("issue search returned invalid JSON: {error}"))?;
+        let existing = existing_alert_issue(&found, title)?;
         let mut command = self.command()?;
         match existing {
             Some(number) => command.args([
@@ -599,6 +607,33 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// GitHub search query for an open issue with exactly this title phrase.
+pub(super) fn issue_search_query(repository: &str, title: &str) -> String {
+    format!(
+        "repo:{repository} is:issue is:open in:title \"{}\"",
+        title.replace('"', "")
+    )
+}
+
+/// The open issue whose title is exactly `title`, from a search response.
+/// An incomplete search result is an error: a missed match would duplicate.
+pub(super) fn existing_alert_issue(found: &Value, title: &str) -> Result<Option<u64>, String> {
+    if found.get("incomplete_results").and_then(Value::as_bool) == Some(true) {
+        return Err("issue search returned incomplete results".to_owned());
+    }
+    let items = found
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "issue search response had no items".to_owned())?;
+    Ok(items.iter().find_map(|issue| {
+        (issue.get("title").and_then(Value::as_str) == Some(title)
+            && issue.get("pull_request").is_none()
+            && issue.get("state").and_then(Value::as_str) != Some("closed"))
+        .then(|| issue.get("number").and_then(Value::as_u64))
+        .flatten()
+    }))
+}
+
 pub(super) fn release_repository() -> Result<String, String> {
     let url = env!("CARGO_PKG_REPOSITORY").trim_end_matches(['/', '\\']);
     let slug = url
@@ -1036,6 +1071,30 @@ exit 0;
         assert_eq!(
             std::fs::read_dir(staging.path()).expect("listing").count(),
             0
+        );
+    }
+}
+
+#[cfg(test)]
+mod alert_issue_tests {
+    use super::*;
+
+    #[test]
+    fn alert_lookup_requires_an_exact_title_among_search_hits() {
+        let title = "fleet-reconcile: v0.209.0 could not reach the fleet";
+        let found = serde_json::json!({"incomplete_results": false, "items": [
+            {"number": 1, "title": "fleet-reconcile: v0.209.0 could not reach the fleet (old)", "state": "open"},
+            {"number": 2, "title": title, "state": "open", "pull_request": {}},
+            {"number": 3, "title": title, "state": "open"},
+        ]});
+        assert_eq!(existing_alert_issue(&found, title), Ok(Some(3)));
+        let none = serde_json::json!({"incomplete_results": false, "items": []});
+        assert_eq!(existing_alert_issue(&none, title), Ok(None));
+        let partial = serde_json::json!({"incomplete_results": true, "items": []});
+        assert!(existing_alert_issue(&partial, title).is_err());
+        assert_eq!(
+            issue_search_query("danielraffel/Shipyard", "a \"b\""),
+            "repo:danielraffel/Shipyard is:issue is:open in:title \"a b\""
         );
     }
 }

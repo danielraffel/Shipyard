@@ -66,7 +66,9 @@ echo "  log=$HOME/Library/Logs/shipyard-fleet-reconcile.log"
 # Rehearse exactly what launchd will run, under the plist's environment, but
 # without --apply: a reconcile that cannot read the release or a host would
 # fail every tick, so refuse to load it. 0 (current/soaking/due), 3 (rate
-# limited) and 5 (terminal, already alerted) are healthy; anything else is not.
+# limited) and 5 (terminal, already alerted) are healthy, and 75 (a rollout
+# holds the controller lock) is transient; anything else, including 4 (a host
+# ahead of the latest release), refuses to load.
 AGENT_PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 set +e
 REHEARSAL="$(cd "$HOME" && /usr/bin/env -i HOME="$HOME" PATH="$AGENT_PATH" \
@@ -76,6 +78,7 @@ REHEARSAL_EXIT=$?
 set -e
 case "$REHEARSAL_EXIT" in
   0|3|5) echo "  rehearsal=ok (exit $REHEARSAL_EXIT)" ;;
+  75) echo "  rehearsal=controller lock held by a running rollout (exit 75); the agent retries next tick" ;;
   *)
     echo "fleet-reconcile rehearsal under the agent environment exited $REHEARSAL_EXIT; not loading the agent:" >&2
     printf '%s\n' "$REHEARSAL" | tail -n 20 >&2

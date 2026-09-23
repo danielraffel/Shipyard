@@ -31,6 +31,7 @@ pub(in crate::app) struct FleetReconcileArgs {
     pub(in crate::app) soak_minutes: u64,
     pub(in crate::app) retry_hours: u64,
     pub(in crate::app) max_attempts: u32,
+    pub(in crate::app) clear_host: Option<String>,
     pub(in crate::app) apply: bool,
 }
 
@@ -73,6 +74,9 @@ impl ReconcileEnv for LiveEnv<'_> {
             host_classes: host_classes.to_vec(),
             all_hosts: false,
             apply: true,
+            // Re-checked at apply time: a host that caught up since the
+            // decision is skipped rather than reinstalled.
+            lagging_only: true,
         };
         // The caller already holds the controller lock.
         match run_fleet_update(
@@ -84,6 +88,12 @@ impl ReconcileEnv for LiveEnv<'_> {
             &mut self.rollout_output,
         ) {
             Ok(_) => RolloutOutcome::Verified,
+            Err(failure) if failure.rollback_failed_host.is_some() => {
+                RolloutOutcome::RollbackFailed {
+                    host_class: failure.rollback_failed_host.unwrap_or_default(),
+                    reason: failure.failure.message().to_owned(),
+                }
+            }
             Err(failure) if failure.ineligible => RolloutOutcome::Ineligible {
                 reason: failure.failure.message().to_owned(),
             },
@@ -114,6 +124,27 @@ pub(in crate::app) fn fleet_reconcile_command<W: Write>(
             "fleet-reconcile requires a Unix rollout controller",
         ));
     }
+    if let Some(host_class) = &args.clear_host {
+        let Some(_lock) = super::controller_lock::try_acquire(&runtime_paths.state_dir)
+            .map_err(|error| CliFailure::new(1, error))?
+        else {
+            return Err(CliFailure::new(
+                super::EXIT_CONTROLLER_BUSY,
+                "another fleet rollout holds the controller lock; retry --clear-host later",
+            ));
+        };
+        let cleared = reconcile::clear_host(&runtime_paths.state_dir, host_class)
+            .map_err(|error| CliFailure::new(1, error))?;
+        let message = match cleared {
+            Some(quarantine) => format!(
+                "cleared {host_class} (quarantined since {} after {}: {})",
+                quarantine.since, quarantine.tag, quarantine.reason
+            ),
+            None => format!("{host_class} was not quarantined"),
+        };
+        writeln!(stdout, "{message}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let config = LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let classes = parse_host_classes(&config.data).map_err(|error| CliFailure::new(2, error))?;
@@ -143,6 +174,18 @@ pub(in crate::app) fn fleet_reconcile_command<W: Write>(
 }
 
 fn failure_message(report: &ReconcileReport) -> String {
+    if let Some(RolloutOutcome::RollbackFailed { host_class, reason }) = &report.rollout {
+        return format!(
+            "{host_class} could not be rolled back and needs an operator ({reason}); it is \
+             quarantined until `shipyard runner fleet-reconcile --clear-host {host_class}`"
+        );
+    }
+    if report.exit_code == reconcile::EXIT_RECONCILE_UNKNOWN && !report.unreachable.is_empty() {
+        return format!(
+            "could not read {}; reachable hosts were reconciled, these were left out",
+            report.unreachable.join(", ")
+        );
+    }
     match (&report.decision, &report.rollout) {
         (_, Some(RolloutOutcome::Failed { reason })) if report.terminal.is_none() => format!(
             "fleet rollout attempt {} failed: {reason}",
@@ -227,6 +270,23 @@ fn render_reconcile<W: Write>(
         .map_err(io)?;
     }
     writeln!(stdout, "decision: {}", describe(&report.decision, apply)).map_err(io)?;
+    for class in &report.unreachable {
+        writeln!(stdout, "UNREACHABLE: {class} (left out of this tick)").map_err(io)?;
+    }
+    for class in &report.quarantined {
+        writeln!(
+            stdout,
+            "QUARANTINED: {class} (needs an operator; --clear-host {class} once fixed)"
+        )
+        .map_err(io)?;
+    }
+    for class in &report.other_controllers {
+        writeln!(
+            stdout,
+            "WARNING: {class} also declares [host_class.*]; the fleet must have exactly one controller"
+        )
+        .map_err(io)?;
+    }
     for alert in &report.alerts {
         writeln!(stdout, "ALERT: {alert}").map_err(io)?;
     }
@@ -278,6 +338,7 @@ fn describe(decision: &ReconcileDecision, apply: bool) -> String {
 /// Doctor section: each configured host's installed version against the
 /// latest published release, flagged when it lags past the soak, plus any tag
 /// fleet-reconcile has stopped retrying.
+#[allow(clippy::too_many_lines)] // One read-only report assembled in display order.
 pub(in crate::app) fn fleet_version_doctor_section(
     runtime_paths: &RuntimePaths,
     cwd: &Path,
@@ -323,6 +384,22 @@ pub(in crate::app) fn fleet_version_doctor_section(
             return rows;
         }
     };
+    if let Ok(ledger) = reconcile::read_ledger(&runtime_paths.state_dir) {
+        for (class, quarantine) in &ledger.quarantined {
+            rows.insert(
+                format!("quarantined:{class}"),
+                entry(
+                    false,
+                    Some(quarantine.tag.clone()),
+                    Some(format!(
+                        "rollback failed {}: {}; fix the host, then `shipyard runner fleet-reconcile --clear-host {class}`",
+                        quarantine.since, quarantine.reason
+                    )),
+                    Some("needs an operator".to_owned()),
+                ),
+            );
+        }
+    }
     for (tag, attempts) in terminal_tags(&runtime_paths.state_dir) {
         rows.insert(
             format!("reconcile:{tag}"),
@@ -359,6 +436,21 @@ pub(in crate::app) fn fleet_version_doctor_section(
         reconcile::classify_hosts(latest, &mut hosts);
     }
     for host in hosts {
+        if host.declares_host_classes == Some(true) {
+            rows.insert(
+                format!("controller:{}", host.host_class),
+                entry(
+                    false,
+                    None,
+                    Some(format!(
+                        "{} declares [host_class.*] in its own machine-global config; exactly one \
+                         Mac may be the fleet controller, or two reconcilers will race the same hosts",
+                        host.host_class
+                    )),
+                    Some("second controller".to_owned()),
+                ),
+            );
+        }
         let row = fleet_version_row(&host, latest.as_ref().ok(), now, soak_minutes);
         rows.insert(format!("host:{}", host.host_class), row);
     }

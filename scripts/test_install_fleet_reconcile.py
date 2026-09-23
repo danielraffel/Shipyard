@@ -101,7 +101,7 @@ class InstallFleetReconcileTests(unittest.TestCase):
         self.assertNotIn("SHIPYARD_LAUNCHCTL_BIN", env, "the rehearsal must not inherit the caller's env")
 
     def test_a_failing_rehearsal_refuses_to_load(self) -> None:
-        for code in ("9", "4", "75"):
+        for code in ("9", "4", "7"):
             with self.subTest(code=code):
                 self.rehearsal_exit.write_text(code, encoding="utf-8")
                 result = self.run_installer("--install")
@@ -110,11 +110,13 @@ class InstallFleetReconcileTests(unittest.TestCase):
                 self.assertFalse(self.plist_path().exists())
                 self.assertFalse(self.calls.exists())
 
-    def test_rate_limited_or_terminal_rehearsal_still_loads(self) -> None:
-        self.rehearsal_exit.write_text("3", encoding="utf-8")
-        result = self.run_installer("--install")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.plist_path().exists())
+    def test_rate_limited_terminal_or_busy_rehearsal_still_loads(self) -> None:
+        for code in ("3", "5", "75"):
+            with self.subTest(code=code):
+                self.rehearsal_exit.write_text(code, encoding="utf-8")
+                result = self.run_installer("--install")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.plist_path().exists())
 
     def test_dry_run_does_not_rehearse(self) -> None:
         self.run_installer()

@@ -577,12 +577,22 @@ Every applied host is then **independently verified** in a fresh process:
 - `daemon status` must answer as that version from the refreshed pid (the daemon's pid file, alive);
 - when the release ships `shipyard guards`, the rollout runs `guards install`, whose exit status and per-guard actions are authoritative, and requires `guards status` current. A differing guard that is replaced is named in the receipt (`guards_replaced`), never overwritten silently.
 
-A host that updates but does not verify is **rolled back automatically**: the
-version it ran before the update is reinstalled through the same governed path
-(release authority, staged install, daemon refresh) and verified, and the
-receipt says "rolled back to vX". If there is no governed earlier version, or
-the rollback does not verify, it says "ROLLBACK ... FAILED; the host needs an
-operator". Either way no later host is attempted. The controller's own
+A host whose transaction may have committed is **rolled back automatically**
+when any of these happen:
+- it fails verification;
+- its evidence is rejected;
+- its binary pair disagrees with the first host;
+- it times out.
+
+The version it ran before, read by a separate probe before the update, is
+reinstalled through the same governed path and verified. The receipt says
+"rolled back to vX". If no governed earlier version exists, or the rollback
+does not verify, the receipt says "ROLLBACK ... FAILED; the host needs an
+operator" and the run exits 7 (`verdict: rollback_failed`). Either way no later
+host is attempted. `--lagging-only` reads each selected host first and skips
+hosts already at or ahead of the target. Reinstalling such a host cannot be
+rolled back and restarts its daemon. The release stage and reconcile always use
+it. The controller's own
 (`ssh`-less) host class is always updated last, and one controller lock spans
 apply, verify and rollback (a second rollout exits 75).
 
@@ -609,6 +619,24 @@ nothing out. A tick that finds the controller lock held records nothing (exit
 `scripts/install_fleet_reconcile.sh`. That script is a dry run by default;
 `--install` first rehearses the reconcile under the agent's exact environment
 and refuses to load it on failure.
+
+A failed rollback during reconcile is terminal for that tag immediately and
+alerts at once. The host is **quarantined**: no automatic rollout touches it
+until `shipyard runner fleet-reconcile --clear-host <class>` is run after the
+host is fixed. That also makes its tag eligible again. The "hosts ahead" alert
+is raised once per tag. An unreadable host no longer blocks the others: the
+reachable lagging hosts are rolled, the tick exits 9, and the host alerts once
+after 4 consecutive unreadable ticks. Alerts find their issue by exact-title
+search, not by scanning one page of open issues.
+
+**Exactly one controller.** Only one Mac may declare `[host_class.*]` and run
+fleet-update or fleet-reconcile. Two controllers would race each other's
+rollouts and rollbacks on the same hosts, and each only holds its own lock.
+Shipyard can check this only from the controller: every probe reads each remote
+host's machine-global config, and a remote host that also declares host classes
+is reported by fleet-reconcile and flagged by `shipyard doctor --fleet` as a
+second controller. Remove the host classes from any Mac that is not the
+controller.
 
 **Adding a machine is adding its `[host_class.<name>]`** (plus its tartci
 profile) to the controller's machine-global config. Nothing in Shipyard names a

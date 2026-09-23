@@ -122,6 +122,9 @@ pub(super) struct FleetUpdateArgs {
     pub(super) host_classes: Vec<String>,
     pub(super) all_hosts: bool,
     pub(super) apply: bool,
+    /// Skip hosts already at (or ahead of) the target instead of reinstalling
+    /// them. A reinstall cannot be rolled back and restarts the daemon.
+    pub(super) lagging_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,6 +184,8 @@ pub(super) const EXIT_CONTROLLER_BUSY: u8 = 75;
 pub(super) struct RolloutFailure {
     /// True when the release was refused before any host was touched.
     pub(super) ineligible: bool,
+    /// The host that was mutated and could not be restored.
+    pub(super) rollback_failed_host: Option<String>,
     pub(super) failure: CliFailure,
 }
 
@@ -188,6 +193,7 @@ impl From<CliFailure> for RolloutFailure {
     fn from(failure: CliFailure) -> Self {
         Self {
             ineligible: false,
+            rollback_failed_host: None,
             failure,
         }
     }
@@ -223,6 +229,7 @@ pub(super) fn run_fleet_update<W: Write>(
         .verify(&target)
         .map_err(|error| RolloutFailure {
             ineligible: true,
+            rollback_failed_host: None,
             failure: CliFailure::new(1, format!("fleet release is ineligible: {error}")),
         })?;
     let mut plans = selected_classes
@@ -236,15 +243,100 @@ pub(super) fn run_fleet_update<W: Write>(
         return Ok(ExitCode::SUCCESS);
     }
 
-    Ok(apply_plans(
-        &plans,
-        &target,
-        json,
-        stdout,
-        execute_plan,
-        verify::verify_host,
-        |plan, evidence| rollback_host(&config, cwd, &classes, plan, evidence),
-    )?)
+    let mut skipped_current = Vec::new();
+    if args.lagging_only {
+        let (lagging, current) = partition_lagging(plans, &target, |plan| {
+            reconcile::probe_version_at(
+                &plan.class,
+                plan.ssh.as_deref(),
+                Some(&plan.binary.display().to_string()),
+                None,
+            )
+        })?;
+        plans = lagging;
+        skipped_current = current;
+    }
+
+    let mut ops = LiveOps {
+        config: &config,
+        cwd,
+        classes: &classes,
+    };
+    apply_plans(&plans, &skipped_current, &target, json, stdout, &mut ops)
+}
+
+/// Keep only the hosts behind `target`. A host at or ahead of it is skipped
+/// (never reinstalled, never downgraded); an unreadable host fails closed
+/// before any host is touched.
+fn partition_lagging<P>(
+    plans: Vec<HostUpdatePlan>,
+    target: &str,
+    mut probe: P,
+) -> Result<(Vec<HostUpdatePlan>, Vec<String>), CliFailure>
+where
+    P: FnMut(&HostUpdatePlan) -> reconcile::HostVersion,
+{
+    let target_version = reconcile::parse_version(target)
+        .ok_or_else(|| CliFailure::new(2, format!("target {target} is not vMAJOR.MINOR.PATCH")))?;
+    let mut lagging = Vec::new();
+    let mut current = Vec::new();
+    for plan in plans {
+        let probed = probe(&plan);
+        let installed = probed
+            .version
+            .as_deref()
+            .and_then(reconcile::parse_version)
+            .ok_or_else(|| {
+                CliFailure::new(
+                    reconcile::EXIT_RECONCILE_UNKNOWN,
+                    format!(
+                        "cannot read the installed version on {} ({}); refusing to decide which hosts lag",
+                        plan.class,
+                        probed.error.as_deref().unwrap_or("unparseable")
+                    ),
+                )
+            })?;
+        if installed < target_version {
+            lagging.push(plan);
+        } else {
+            current.push(plan.class.clone());
+        }
+    }
+    Ok((lagging, current))
+}
+
+struct LiveOps<'a> {
+    config: &'a LoadedConfig,
+    cwd: &'a Path,
+    classes: &'a [HostClassConfig],
+}
+
+impl HostOps for LiveOps<'_> {
+    fn installed_version(&mut self, plan: &HostUpdatePlan) -> Option<String> {
+        reconcile::probe_version_at(
+            &plan.class,
+            plan.ssh.as_deref(),
+            Some(&plan.binary.display().to_string()),
+            None,
+        )
+        .version
+    }
+
+    fn execute(&mut self, plan: &HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError> {
+        execute_plan(plan)
+    }
+
+    fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification {
+        verify::verify_host(plan, daemon_pid)
+    }
+
+    fn rollback(
+        &mut self,
+        plan: &HostUpdatePlan,
+        previous: Option<&str>,
+    ) -> rollback::RollbackOutcome {
+        rollback_host(self.config, self.cwd, self.classes, plan, previous)
+    }
 }
 
 #[cfg(all(test, not(unix)))]
@@ -266,6 +358,7 @@ mod non_unix_tests {
             host_classes: vec!["m1".to_owned()],
             all_hosts: false,
             apply: true,
+            lagging_only: false,
         };
         let mut output = Vec::new();
         let error = fleet_update_command(
@@ -334,30 +427,49 @@ fn select_host_classes<'a>(
         .collect()
 }
 
+/// The side effects of rolling one host, so the ordering and failure policy in
+/// [`apply_plans`] can be tested without GitHub or hosts.
+trait HostOps {
+    /// The version installed before this rollout touches the host, read
+    /// independently of the update transaction. `None` when unreadable.
+    fn installed_version(&mut self, plan: &HostUpdatePlan) -> Option<String>;
+    fn execute(&mut self, plan: &HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>;
+    fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification;
+    /// Restore `previous` (the pre-update version) on this host.
+    fn rollback(
+        &mut self,
+        plan: &HostUpdatePlan,
+        previous: Option<&str>,
+    ) -> rollback::RollbackOutcome;
+}
+
+/// Exit code when a host could not be rolled back and needs an operator.
+pub(super) const EXIT_ROLLBACK_FAILED: u8 = 7;
+
+/// Why one host stopped the rollout.
+struct HostFailure {
+    reason: String,
+    /// Set when the host was mutated, then could not be restored.
+    rollback_failed: bool,
+}
+
 /// Apply every plan in order, then independently verify each host.
 ///
 /// Hosts are updated one at a time and the rollout stops at the first host
-/// whose update or verification fails, so one bad release cannot spread. Every
-/// outcome ends in a `fleet_summary` receipt that names the verified hosts, the
-/// failed host, and the hosts that were never attempted (and so still lag).
-fn apply_plans<W, F, V, R>(
+/// whose update or verification fails, so one bad release cannot spread. A
+/// host whose transaction may already have committed (evidence rejected, pair
+/// hashes disagreeing, a timeout, or a failed verification) is rolled back to
+/// the version it ran before. Every outcome ends in a `fleet_summary` receipt
+/// naming verified hosts, the failed host, hosts never attempted (and so still
+/// lagging), and hosts skipped because they were already current.
+fn apply_plans<W: Write, O: HostOps>(
     plans: &[HostUpdatePlan],
+    skipped_current: &[String],
     target: &str,
     json: bool,
     stdout: &mut W,
-    execute: F,
-    verify: V,
-    rollback: R,
-) -> Result<ExitCode, CliFailure>
-where
-    W: Write,
-    F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
-    V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
-    R: FnMut(&HostUpdatePlan, &HostUpdateEvidence) -> rollback::RollbackOutcome,
-{
-    let mut execute = execute;
-    let mut verify = verify;
-    let mut rollback = rollback;
+    ops: &mut O,
+) -> Result<ExitCode, RolloutFailure> {
     let mut installed_pair_sha256: Option<(String, Option<String>)> = None;
     let mut verified: Vec<verify::HostVerification> = Vec::new();
     for (index, plan) in plans.iter().enumerate() {
@@ -366,13 +478,11 @@ where
             target,
             json,
             stdout,
-            &mut execute,
-            &mut verify,
-            &mut rollback,
+            ops,
             &mut installed_pair_sha256,
             &mut verified,
         )?;
-        if let Some(reason) = failure {
+        if let Some(failure) = failure {
             let not_attempted = plans[index + 1..]
                 .iter()
                 .map(|plan| plan.class.clone())
@@ -381,56 +491,106 @@ where
                 stdout,
                 json,
                 target,
-                &verified,
-                Some((plan.class.as_str(), reason.as_str())),
-                &not_attempted,
+                &FleetSummary {
+                    verified: &verified,
+                    failed: Some((plan.class.as_str(), failure.reason.as_str())),
+                    rollback_failed: failure.rollback_failed,
+                    not_attempted: &not_attempted,
+                    skipped_current,
+                },
             )?;
             let lagging = std::iter::once(plan.class.clone())
                 .chain(not_attempted)
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(CliFailure::new(
-                1,
-                format!(
-                    "fleet update stopped after {reason}; hosts not verified at {target}: {lagging}"
+            return Err(RolloutFailure {
+                ineligible: false,
+                rollback_failed_host: failure.rollback_failed.then(|| plan.class.clone()),
+                failure: CliFailure::new(
+                    if failure.rollback_failed {
+                        EXIT_ROLLBACK_FAILED
+                    } else {
+                        1
+                    },
+                    format!(
+                        "fleet update stopped after {}; hosts not verified at {target}: {lagging}",
+                        failure.reason
+                    ),
                 ),
-            ));
+            });
         }
     }
-    render_fleet_summary(stdout, json, target, &verified, None, &[])?;
+    render_fleet_summary(
+        stdout,
+        json,
+        target,
+        &FleetSummary {
+            verified: &verified,
+            failed: None,
+            rollback_failed: false,
+            not_attempted: &[],
+            skipped_current,
+        },
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// Update, validate and verify one host. `Ok(Some(reason))` stops the rollout.
-#[allow(clippy::too_many_arguments)]
-fn apply_host<W, F, V, R>(
+/// Roll back a host whose transaction may have committed, and turn the result
+/// into the failure that stops the rollout.
+fn roll_back_after<W: Write, O: HostOps>(
     plan: &HostUpdatePlan,
     target: &str,
     json: bool,
     stdout: &mut W,
-    execute: &mut F,
-    verify: &mut V,
-    rollback: &mut R,
+    ops: &mut O,
+    previous: Option<&str>,
+    cause: &str,
+) -> Result<Option<HostFailure>, CliFailure> {
+    let outcome = ops.rollback(plan, previous);
+    render_rollback(stdout, json, target, plan, &outcome)?;
+    Ok(Some(HostFailure {
+        reason: format!("{cause}; {}", outcome.summary()),
+        rollback_failed: !matches!(outcome, rollback::RollbackOutcome::RolledBack { .. }),
+    }))
+}
+
+/// Update, validate and verify one host. `Ok(Some(_))` stops the rollout.
+fn apply_host<W: Write, O: HostOps>(
+    plan: &HostUpdatePlan,
+    target: &str,
+    json: bool,
+    stdout: &mut W,
+    ops: &mut O,
     installed_pair_sha256: &mut Option<(String, Option<String>)>,
     verified: &mut Vec<verify::HostVerification>,
-) -> Result<Option<String>, CliFailure>
-where
-    W: Write,
-    F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
-    V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
-    R: FnMut(&HostUpdatePlan, &HostUpdateEvidence) -> rollback::RollbackOutcome,
-{
-    let evidence = match execute(plan) {
+) -> Result<Option<HostFailure>, CliFailure> {
+    // Read before mutating, so a rollback target exists even when the update
+    // never returns evidence (a timeout).
+    let before = ops.installed_version(plan);
+    let evidence = match ops.execute(plan) {
         Ok(evidence) => evidence,
         Err(PlanExecutionError::TimedOut(error)) => {
             render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
-            return Ok(Some(format!("{} timed out: {error}", plan.class)));
+            // The transaction may have committed before the deadline.
+            return roll_back_after(
+                plan,
+                target,
+                json,
+                stdout,
+                ops,
+                before.as_deref(),
+                &format!("{} timed out: {error}", plan.class),
+            );
         }
         Err(PlanExecutionError::Failed(error)) => {
             render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
-            return Ok(Some(format!("{} failed: {error}", plan.class)));
+            return Ok(Some(HostFailure {
+                reason: format!("{} failed: {error}", plan.class),
+                rollback_failed: false,
+            }));
         }
     };
+    let previous = before.or_else(|| Some(evidence.before_pair.primary.semantic_version.clone()));
     if let Err(error) = validate_evidence(plan, &evidence) {
         render_host_result(
             stdout,
@@ -441,7 +601,15 @@ where
             Some(&evidence),
             Some(&error),
         )?;
-        return Ok(Some(format!("{} evidence failed: {error}", plan.class)));
+        return roll_back_after(
+            plan,
+            target,
+            json,
+            stdout,
+            ops,
+            previous.as_deref(),
+            &format!("{} evidence failed: {error}", plan.class),
+        );
     }
     let observed_pair = (
         evidence.after_pair.primary.sha256.clone(),
@@ -466,25 +634,37 @@ where
             Some(&evidence),
             Some(&detail),
         )?;
-        return Ok(Some(format!("{} evidence failed: {detail}", plan.class)));
+        return roll_back_after(
+            plan,
+            target,
+            json,
+            stdout,
+            ops,
+            previous.as_deref(),
+            &format!("{} evidence failed: {detail}", plan.class),
+        );
     }
     installed_pair_sha256.get_or_insert(observed_pair);
     render_host_result(stdout, json, target, plan, true, Some(&evidence), None)?;
-    let verification = verify(plan, evidence.daemon_pid);
+    let verification = ops.verify(plan, evidence.daemon_pid);
     render_verification(stdout, json, target, &verification)?;
     if verification.verified() {
         verified.push(verification);
         return Ok(None);
     }
-    // The host was mutated and does not verify: restore what it ran before.
-    let outcome = rollback(plan, &evidence);
-    render_rollback(stdout, json, target, plan, &outcome)?;
-    Ok(Some(format!(
-        "{} failed post-rollout verification: {}; {}",
-        plan.class,
-        verification.failures.join("; "),
-        outcome.summary()
-    )))
+    roll_back_after(
+        plan,
+        target,
+        json,
+        stdout,
+        ops,
+        previous.as_deref(),
+        &format!(
+            "{} failed post-rollout verification: {}",
+            plan.class,
+            verification.failures.join("; ")
+        ),
+    )
 }
 
 fn render_rollback<W: Write>(
@@ -520,9 +700,9 @@ fn rollback_host(
     cwd: &Path,
     classes: &[HostClassConfig],
     plan: &HostUpdatePlan,
-    evidence: &HostUpdateEvidence,
+    previous: Option<&str>,
 ) -> rollback::RollbackOutcome {
-    let tag = match rollback::rollback_target(plan, evidence) {
+    let tag = match rollback::rollback_target(plan, previous) {
         Ok(tag) => tag,
         Err(reason) => return rollback::RollbackOutcome::Failed { to: None, reason },
     };
@@ -619,59 +799,76 @@ fn render_verification<W: Write>(
     Ok(())
 }
 
+struct FleetSummary<'a> {
+    verified: &'a [verify::HostVerification],
+    failed: Option<(&'a str, &'a str)>,
+    rollback_failed: bool,
+    not_attempted: &'a [String],
+    skipped_current: &'a [String],
+}
+
 fn render_fleet_summary<W: Write>(
     stdout: &mut W,
     json: bool,
     target: &str,
-    verified: &[verify::HostVerification],
-    failed: Option<(&str, &str)>,
-    not_attempted: &[String],
+    summary: &FleetSummary<'_>,
 ) -> Result<(), CliFailure> {
-    let verified_names = verified
+    let verified_names = summary
+        .verified
         .iter()
         .map(|host| host.host_class.clone())
         .collect::<Vec<_>>();
+    let io = |error: std::io::Error| CliFailure::new(1, error.to_string());
     if json {
         let mut data = BTreeMap::new();
         data.insert("event".to_owned(), Value::from("fleet_summary"));
         data.insert("target".to_owned(), Value::from(target));
         data.insert(
             "verdict".to_owned(),
-            Value::from(if failed.is_none() {
-                "verified"
-            } else {
-                "failed"
+            Value::from(match (summary.failed, summary.rollback_failed) {
+                (None, _) => "verified",
+                (Some(_), false) => "failed",
+                (Some(_), true) => "rollback_failed",
             }),
         );
         data.insert("verified_hosts".to_owned(), Value::from(verified_names));
         data.insert(
             "failed_host".to_owned(),
-            failed.map_or(
-                Value::Null,
-                |(host, reason)| serde_json::json!({"host_class": host, "reason": reason}),
-            ),
+            summary.failed.map_or(Value::Null, |(host, reason)| {
+                serde_json::json!({
+                    "host_class": host,
+                    "reason": reason,
+                    "needs_operator": summary.rollback_failed,
+                })
+            }),
         );
         data.insert(
             "not_attempted_hosts".to_owned(),
-            Value::from(not_attempted.to_vec()),
+            Value::from(summary.not_attempted.to_vec()),
+        );
+        data.insert(
+            "already_current_hosts".to_owned(),
+            Value::from(summary.skipped_current.to_vec()),
         );
         write_json_envelope(stdout, "runner.fleet-update", data)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    } else if let Some((host, reason)) = failed {
+    } else if let Some((host, reason)) = summary.failed {
         writeln!(
             stdout,
-            "fleet {target}: FAILED at {host} ({reason}); verified: [{}]; not attempted: [{}]",
+            "fleet {target}: FAILED at {host} ({reason}); verified: [{}]; not attempted: [{}]; already current: [{}]",
             verified_names.join(", "),
-            not_attempted.join(", ")
+            summary.not_attempted.join(", "),
+            summary.skipped_current.join(", ")
         )
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        .map_err(io)?;
     } else {
         writeln!(
             stdout,
-            "fleet {target}: every host verified: [{}]",
-            verified_names.join(", ")
+            "fleet {target}: every host verified: [{}]; already current: [{}]",
+            verified_names.join(", "),
+            summary.skipped_current.join(", ")
         )
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        .map_err(io)?;
     }
     Ok(())
 }

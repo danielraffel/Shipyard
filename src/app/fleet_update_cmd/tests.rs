@@ -1306,30 +1306,67 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
     );
 }
 
+/// Scripted host side effects for [`apply_plans`].
+struct TestOps<E, V, R> {
+    execute: E,
+    verify: V,
+    rollback: R,
+    /// What `installed_version` reports for every host.
+    installed: Option<String>,
+    rollbacks: Vec<(String, Option<String>)>,
+}
+
+impl<E, V, R> HostOps for TestOps<E, V, R>
+where
+    E: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
+    V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
+    R: FnMut(&HostUpdatePlan, Option<&str>) -> rollback::RollbackOutcome,
+{
+    fn installed_version(&mut self, _plan: &HostUpdatePlan) -> Option<String> {
+        self.installed.clone()
+    }
+    fn execute(&mut self, plan: &HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError> {
+        (self.execute)(plan)
+    }
+    fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification {
+        (self.verify)(plan, daemon_pid)
+    }
+    fn rollback(
+        &mut self,
+        plan: &HostUpdatePlan,
+        previous: Option<&str>,
+    ) -> rollback::RollbackOutcome {
+        self.rollbacks
+            .push((plan.class.clone(), previous.map(ToOwned::to_owned)));
+        (self.rollback)(plan, previous)
+    }
+}
+
+fn rolled_back_ok(plan: &HostUpdatePlan, previous: Option<&str>) -> rollback::RollbackOutcome {
+    rollback::RollbackOutcome::RolledBack {
+        to: format!("v{}", previous.unwrap_or("0.136.0")),
+        verification: Box::new(verified_ok(plan, 1)),
+    }
+}
+
 fn apply_plans_for_test<F>(
     plans: &[HostUpdatePlan],
     target: &str,
     json: bool,
     output: &mut Vec<u8>,
     execute: F,
-) -> Result<ExitCode, CliFailure>
+) -> Result<ExitCode, RolloutFailure>
 where
     F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
 {
-    apply_plans(
-        plans,
-        target,
-        json,
-        output,
+    let mut ops = TestOps {
         execute,
-        verified_ok,
-        |plan, _| {
-            panic!(
-                "rollback must not run for {}: nothing failed verification",
-                plan.class
-            )
-        },
-    )
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    apply_plans(plans, &[], target, json, output, &mut ops)
 }
 
 fn verified_ok(plan: &HostUpdatePlan, pid: u32) -> verify::HostVerification {
@@ -1541,7 +1578,7 @@ fn apply_stops_before_every_later_host_after_first_failure() {
     })
     .expect_err("apply stops");
     assert_eq!(attempted, ["m1", "m3"]);
-    assert!(error.message.contains("stopped after m3"));
+    assert!(error.failure.message.contains("stopped after m3"));
     let rendered = String::from_utf8(output).expect("UTF-8");
     let receipts = serde_json::Deserializer::from_str(&rendered)
         .into_iter::<Value>()
@@ -1561,6 +1598,7 @@ fn apply_stops_before_every_later_host_after_first_failure() {
     );
     assert!(
         error
+            .failure
             .message
             .contains("hosts not verified at v0.137.0: m3, m5")
     );
@@ -1600,8 +1638,13 @@ fn authority_receipt_mismatch_stops_before_the_next_host() {
     })
     .expect_err("drift must stop rollout");
     assert_eq!(attempted, ["m1", "m3"]);
-    assert!(error.message.contains("stopped after m3 evidence failed"));
-    assert!(error.message.contains("frozen release authority"));
+    assert!(
+        error
+            .failure
+            .message
+            .contains("stopped after m3 evidence failed")
+    );
+    assert!(error.failure.message.contains("frozen release authority"));
 }
 
 #[test]
@@ -1631,7 +1674,7 @@ fn cross_host_binary_pair_hash_drift_stops_rollout() {
     })
     .expect_err("cross-host drift must stop rollout");
     assert_eq!(attempted, ["m1", "m3"]);
-    assert!(error.message.contains("hashes disagreed"));
+    assert!(error.failure.message.contains("hashes disagreed"));
 }
 
 #[test]
@@ -1838,49 +1881,40 @@ fn failed_verification_rolls_the_host_back_and_stops_the_rollout() {
         .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
-    let mut rolled_back = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(
-        &plans,
-        "v0.137.0",
-        true,
-        &mut output,
-        |plan| {
+    let mut ops = TestOps {
+        execute: |plan: &HostUpdatePlan| {
             attempted.push(plan.class.clone());
             Ok(evidence("0.137.0"))
         },
-        failing_m3_verification,
-        |plan, evidence| {
-            rolled_back.push(plan.class.clone());
-            // The pre-update version is recorded by the update itself; the
-            // fixture evidence cannot carry a mixed pair, so it is named here.
-            rollback::RollbackOutcome::RolledBack {
-                to: "v0.136.0".to_owned(),
-                verification: Box::new(verified_ok(plan, evidence.daemon_pid)),
-            }
-        },
-    )
-    .expect_err("a host that does not verify must fail the rollout");
+        verify: failing_m3_verification,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut output, &mut ops)
+        .expect_err("a host that does not verify must fail the rollout");
+    let rollbacks = ops.rollbacks.clone();
+    drop(ops);
     assert_eq!(attempted, ["m1", "m3"]);
-    assert_eq!(rolled_back, ["m3"], "only the failing host is rolled back");
+    assert_eq!(
+        rollbacks,
+        [("m3".to_owned(), Some("0.136.0".to_owned()))],
+        "only the failing host is rolled back, to its pre-update version"
+    );
+    let message = &error.failure.message;
+    assert!(error.rollback_failed_host.is_none());
     assert!(
-        error
-            .message
-            .contains("m3 failed post-rollout verification"),
-        "{}",
-        error.message
+        message.contains("m3 failed post-rollout verification"),
+        "{message}"
     );
     assert!(
-        error.message.contains("rolled back to v0.136.0 (verified)"),
-        "{}",
-        error.message
+        message.contains("rolled back to v0.136.0 (verified)"),
+        "{message}"
     );
     assert!(
-        error
-            .message
-            .contains("hosts not verified at v0.137.0: m3, m5"),
-        "{}",
-        error.message
+        message.contains("hosts not verified at v0.137.0: m3, m5"),
+        "{message}"
     );
     let receipts = rollout_receipts(output);
     let rollback = receipts
@@ -1897,6 +1931,13 @@ fn failed_verification_rolls_the_host_back_and_stops_the_rollout() {
     assert_eq!(summary["not_attempted_hosts"], serde_json::json!(["m5"]));
 }
 
+fn failed_rollback(_: &HostUpdatePlan, _: Option<&str>) -> rollback::RollbackOutcome {
+    rollback::RollbackOutcome::Failed {
+        to: Some("v0.136.0".to_owned()),
+        reason: "rollback did not verify: daemon is not running".to_owned(),
+    }
+}
+
 #[test]
 fn a_failed_rollback_is_reported_loudly_and_still_stops() {
     let plans = ["m3", "m5"]
@@ -1905,27 +1946,26 @@ fn a_failed_rollback_is_reported_loudly_and_still_stops() {
         .collect::<Vec<_>>();
     let mut attempted = Vec::new();
     let mut output = Vec::new();
-    let error = apply_plans(
-        &plans,
-        "v0.137.0",
-        true,
-        &mut output,
-        |plan| {
+    let mut ops = TestOps {
+        execute: |plan: &HostUpdatePlan| {
             attempted.push(plan.class.clone());
             Ok(evidence("0.137.0"))
         },
-        failing_m3_verification,
-        |_, _| rollback::RollbackOutcome::Failed {
-            to: Some("v0.136.0".to_owned()),
-            reason: "rollback did not verify: daemon is not running".to_owned(),
-        },
-    )
-    .expect_err("failed rollback");
+        verify: failing_m3_verification,
+        rollback: failed_rollback,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut output, &mut ops)
+        .expect_err("failed rollback");
+    drop(ops);
     assert_eq!(attempted, ["m3"], "no later host after a failed rollback");
+    assert_eq!(error.rollback_failed_host.as_deref(), Some("m3"));
+    assert_eq!(error.failure.code, EXIT_ROLLBACK_FAILED);
     assert!(
-        error.message.contains("ROLLBACK TO v0.136.0 FAILED: rollback did not verify: daemon is not running; the host needs an operator"),
+        error.failure.message.contains("ROLLBACK TO v0.136.0 FAILED: rollback did not verify: daemon is not running; the host needs an operator"),
         "{}",
-        error.message
+        error.failure.message
     );
     let receipts = rollout_receipts(output);
     assert!(
@@ -1934,31 +1974,243 @@ fn a_failed_rollback_is_reported_loudly_and_still_stops() {
             .any(|receipt| receipt["event"] == "host_rollback"
                 && receipt["outcome"]["rollback"] == "failed")
     );
+    let summary = receipts.last().expect("summary");
+    assert_eq!(summary["verdict"], "rollback_failed");
+    assert_eq!(summary["failed_host"]["needs_operator"], true);
+}
+
+#[test]
+fn a_committed_transaction_is_rolled_back_after_evidence_or_timeout_failures() {
+    let plans = vec![host_update_plan(&named_host("m3"), "v0.137.0").expect("plan")];
+    // Evidence the validator rejects: the transaction committed, then lied.
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            let mut observed = evidence("0.137.0");
+            observed.release_authority_identity = "f".repeat(64);
+            Ok(observed)
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect_err("evidence failure");
+    assert!(error.failure.message.contains("evidence failed"));
+    assert!(error.failure.message.contains("rolled back to v0.136.0"));
+    assert_eq!(
+        ops.rollbacks,
+        [("m3".to_owned(), Some("0.136.0".to_owned()))]
+    );
+
+    // A timeout: no evidence, but the pre-update probe names the version.
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| Err(PlanExecutionError::TimedOut("deadline".to_owned())),
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.135.2".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error =
+        apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops).expect_err("timeout");
+    assert!(error.failure.message.contains("m3 timed out"));
+    assert_eq!(
+        ops.rollbacks,
+        [("m3".to_owned(), Some("0.135.2".to_owned()))]
+    );
+
+    // A refusal before mutation is not rolled back.
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            Err(PlanExecutionError::Failed(
+                "ssh: connection refused".to_owned(),
+            ))
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops).expect_err("failed");
+    assert!(ops.rollbacks.is_empty());
+}
+
+#[test]
+fn a_pair_hash_disagreement_rolls_the_disagreeing_host_back() {
+    let plans = ["m1", "m3"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut ops = TestOps {
+        execute: |plan: &HostUpdatePlan| {
+            let mut observed = evidence("0.137.0");
+            if plan.class == "m3" {
+                observed.after_pair.primary.sha256 = "d".repeat(64);
+                observed.executable_sha256 = "d".repeat(64);
+                observed.daemon_runtime.loaded_executable_sha256 = "d".repeat(64);
+                observed
+                    .auth_support_after
+                    .generation
+                    .as_mut()
+                    .expect("generation")
+                    .binary
+                    .sha256 = "d".repeat(64);
+            }
+            Ok(observed)
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect_err("pair drift");
+    assert!(error.failure.message.contains("hashes disagreed"));
+    assert_eq!(ops.rollbacks.len(), 1);
+    assert_eq!(ops.rollbacks[0].0, "m3");
+}
+
+#[test]
+fn lagging_only_skips_current_and_ahead_hosts_and_fails_closed_on_unknown() {
+    let plans = ["m1", "m3", "m5"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let versions = [
+        ("m1", Some("0.137.0")),
+        ("m3", Some("0.136.1")),
+        ("m5", Some("0.138.0")),
+    ];
+    let probe = |plan: &HostUpdatePlan| {
+        let version = versions
+            .iter()
+            .find(|(name, _)| *name == plan.class)
+            .and_then(|(_, version)| *version);
+        reconcile::HostVersion {
+            host_class: plan.class.clone(),
+            ssh: plan.ssh.clone(),
+            version: version.map(ToOwned::to_owned),
+            error: None,
+            lagging: None,
+            declares_host_classes: None,
+        }
+    };
+    let (lagging, current) =
+        partition_lagging(plans.clone(), "v0.137.0", probe).expect("partition");
+    assert_eq!(
+        lagging
+            .iter()
+            .map(|plan| plan.class.as_str())
+            .collect::<Vec<_>>(),
+        ["m3"]
+    );
+    assert_eq!(
+        current,
+        ["m1", "m5"],
+        "current and ahead hosts are never reinstalled"
+    );
+
+    let unreadable = |plan: &HostUpdatePlan| reconcile::HostVersion {
+        host_class: plan.class.clone(),
+        ssh: plan.ssh.clone(),
+        version: None,
+        error: Some("ssh: timed out".to_owned()),
+        lagging: None,
+        declares_host_classes: None,
+    };
+    let error = partition_lagging(plans, "v0.137.0", unreadable).expect_err("unknown");
+    assert!(
+        error
+            .message
+            .contains("cannot read the installed version on m1")
+    );
+
+    let mut output = Vec::new();
+    apply_plans(
+        &[],
+        &["m1".to_owned(), "m5".to_owned()],
+        "v0.137.0",
+        true,
+        &mut output,
+        &mut TestOps {
+            execute: |_: &HostUpdatePlan| -> Result<HostUpdateEvidence, PlanExecutionError> {
+                panic!("nothing lags")
+            },
+            verify: verified_ok,
+            rollback: rolled_back_ok,
+            installed: None,
+            rollbacks: Vec::new(),
+        },
+    )
+    .expect("nothing to do is success");
+    let summary = rollout_receipts(output).pop().expect("summary");
+    assert_eq!(summary["verdict"], "verified");
+    assert_eq!(
+        summary["already_current_hosts"],
+        serde_json::json!(["m1", "m5"])
+    );
+}
+
+#[test]
+fn fleet_update_apply_refuses_while_another_rollout_holds_the_lock() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Shipyard,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let held = controller_lock::try_acquire(&paths.state_dir)
+        .expect("lock")
+        .expect("free");
+    let args = FleetUpdateArgs {
+        to: "v0.209.0".to_owned(),
+        host_classes: Vec::new(),
+        all_hosts: true,
+        apply: true,
+        lagging_only: true,
+    };
+    let mut output = Vec::new();
+    let error = fleet_update_command(
+        &args,
+        RuntimeMode::Shipyard,
+        temp.path(),
+        &paths,
+        true,
+        &mut output,
+    )
+    .expect_err("held lock");
+    assert_eq!(error.code, EXIT_CONTROLLER_BUSY);
+    assert!(
+        error
+            .message
+            .contains("another fleet rollout holds the controller lock")
+    );
+    assert!(output.is_empty(), "nothing was planned or touched");
+    drop(held);
 }
 
 #[test]
 fn rollback_target_is_the_pre_update_version_when_a_governed_one_exists() {
     let plan = host_update_plan(&named_host("m1"), "v0.140.0").expect("plan");
-    let mut observed = evidence("0.140.0");
-    observed.before_pair.primary.semantic_version = "0.138.2".to_owned();
     assert_eq!(
-        rollback::rollback_target(&plan, &observed).as_deref(),
+        rollback::rollback_target(&plan, Some("0.138.2")).as_deref(),
         Ok("v0.138.2")
     );
-    observed.before_pair.primary.semantic_version = "0.140.0".to_owned();
+    assert_eq!(
+        rollback::rollback_target(&plan, Some("v0.138.2")).as_deref(),
+        Ok("v0.138.2")
+    );
     assert!(
-        rollback::rollback_target(&plan, &observed)
+        rollback::rollback_target(&plan, Some("0.140.0"))
             .expect_err("same")
             .contains("no earlier version")
     );
-    observed.before_pair.primary.semantic_version = "0.120.0".to_owned();
     assert!(
-        rollback::rollback_target(&plan, &observed)
+        rollback::rollback_target(&plan, Some("0.120.0"))
             .expect_err("old")
             .contains("predates")
     );
-    observed.before_pair.primary.semantic_version = String::new();
-    assert!(rollback::rollback_target(&plan, &observed).is_err());
+    assert!(rollback::rollback_target(&plan, None).is_err());
 }
 
 #[test]
@@ -2066,6 +2318,7 @@ fn doctor_flags_a_host_only_once_it_lags_past_the_soak() {
         version: version.map(ToOwned::to_owned),
         error: version.is_none().then(|| "ssh: timed out".to_owned()),
         lagging,
+        declares_host_classes: None,
     };
     let lagging =
         reconcile_cmd::fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 30);

@@ -11,7 +11,7 @@
 use serde::Serialize;
 
 use super::verify::HostVerification;
-use super::{HostUpdateEvidence, HostUpdatePlan, MIN_FLEET_UPDATE_TARGET, tag_at_least};
+use super::{HostUpdatePlan, MIN_FLEET_UPDATE_TARGET, tag_at_least};
 
 /// What a rollback attempt did.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -47,9 +47,10 @@ impl RollbackOutcome {
 /// possible.
 pub(super) fn rollback_target(
     plan: &HostUpdatePlan,
-    evidence: &HostUpdateEvidence,
+    previous: Option<&str>,
 ) -> Result<String, String> {
-    let previous = evidence.before_pair.primary.semantic_version.trim();
+    let previous = previous.unwrap_or_default().trim();
+    let previous = previous.strip_prefix('v').unwrap_or(previous);
     if previous.is_empty() {
         return Err("the version installed before the update was not recorded".to_owned());
     }

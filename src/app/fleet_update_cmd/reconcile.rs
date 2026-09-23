@@ -22,7 +22,7 @@
 //! - **One mutation at a time.** The controller lock spans the decision and the
 //!   rollout; a tick that finds it held records nothing and exits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -57,6 +57,11 @@ pub(super) struct HostVersion {
     pub(super) version: Option<String>,
     pub(super) error: Option<String>,
     pub(super) lagging: Option<bool>,
+    /// A remote host whose own machine-global config declares
+    /// `[host_class.*]`: a second fleet controller. `None` for the controller
+    /// itself or when unread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) declares_host_classes: Option<bool>,
 }
 
 /// Exit code when a host runs a newer version than the latest release.
@@ -117,6 +122,63 @@ pub(super) struct TagAttempts {
 pub(super) struct AttemptLedger {
     #[serde(default)]
     pub(super) tags: BTreeMap<String, TagAttempts>,
+    /// Never rolled automatically again until an operator clears it.
+    #[serde(default)]
+    pub(super) quarantined: BTreeMap<String, Quarantine>,
+    /// Tags whose "hosts ahead" alert was already raised.
+    #[serde(default)]
+    pub(super) ahead_alerted: BTreeSet<String>,
+    /// Consecutive ticks each host class could not be read.
+    #[serde(default)]
+    pub(super) unreachable_ticks: BTreeMap<String, u32>,
+    /// Host classes whose "unreachable" alert was already raised.
+    #[serde(default)]
+    pub(super) unreachable_alerted: BTreeSet<String>,
+}
+
+/// A host that was mutated, failed, and could not be restored.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Quarantine {
+    pub(super) tag: String,
+    pub(super) reason: String,
+    pub(super) since: DateTime<Utc>,
+}
+
+/// Consecutive unreadable ticks before a host raises an alert (about an hour
+/// at the 15-minute agent interval).
+pub(super) const UNREACHABLE_ALERT_TICKS: u32 = 4;
+
+/// Read, change and atomically rewrite the ledger.
+pub(super) fn update_ledger<F: FnOnce(&mut AttemptLedger)>(
+    state_dir: &Path,
+    change: F,
+) -> Result<(), String> {
+    let mut ledger = read_ledger(state_dir)?;
+    change(&mut ledger);
+    write_ledger(state_dir, &ledger)
+}
+
+/// Clear an operator-resolved quarantine. When the host's failed rollback is
+/// what made its tag terminal, that tag becomes eligible again too.
+pub(super) fn clear_host(state_dir: &Path, host_class: &str) -> Result<Option<Quarantine>, String> {
+    let mut cleared = None;
+    update_ledger(state_dir, |ledger| {
+        cleared = ledger.quarantined.remove(host_class);
+        if let Some(quarantine) = &cleared
+            && let Some(attempts) = ledger.tags.get_mut(&quarantine.tag)
+            && attempts
+                .terminal
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(&rollback_failed_prefix(host_class)))
+        {
+            *attempts = TagAttempts::default();
+        }
+    })?;
+    Ok(cleared)
+}
+
+fn rollback_failed_prefix(host_class: &str) -> String {
+    format!("rollback failed on {host_class}: ")
 }
 
 pub(super) fn ledger_path(state_dir: &Path) -> PathBuf {
@@ -235,23 +297,30 @@ pub(super) fn decide(
             reason: "no host classes are configured".to_owned(),
         };
     }
-    let unknown = hosts
+    // An unreadable host is left out of this tick, not treated as current:
+    // the reachable hosts are still reconciled, and the caller reports the
+    // unreadable ones (and alerts once they stay unreadable).
+    let reachable = hosts
         .iter()
-        .filter(|host| host.lagging.is_none())
-        .map(|host| {
-            format!(
-                "{} ({})",
-                host.host_class,
-                host.error.as_deref().unwrap_or("version unreadable")
-            )
-        })
+        .filter(|host| host.lagging.is_some())
         .collect::<Vec<_>>();
-    if !unknown.is_empty() {
+    if reachable.is_empty() {
         return ReconcileDecision::Unknown {
-            reason: format!("host version unreadable: {}", unknown.join(", ")),
+            reason: format!(
+                "no host version could be read: {}",
+                hosts
+                    .iter()
+                    .map(|host| format!(
+                        "{} ({})",
+                        host.host_class,
+                        host.error.as_deref().unwrap_or("version unreadable")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         };
     }
-    let ahead = hosts
+    let ahead = reachable
         .iter()
         .filter(|host| {
             host.version
@@ -270,9 +339,10 @@ pub(super) fn decide(
     if !ahead.is_empty() {
         return ReconcileDecision::Ahead { hosts: ahead };
     }
-    let lagging = hosts
+    let lagging = reachable
         .iter()
         .filter(|host| host.lagging == Some(true))
+        .filter(|host| !ledger.quarantined.contains_key(&host.host_class))
         .map(|host| host.host_class.clone())
         .collect::<Vec<_>>();
     if lagging.is_empty() {
@@ -320,6 +390,11 @@ pub(super) enum RolloutOutcome {
     Ineligible {
         reason: String,
     },
+    /// A host was mutated and could not be restored. It needs an operator.
+    RollbackFailed {
+        host_class: String,
+        reason: String,
+    },
 }
 
 /// The world the reconciler reads and acts on. Production talks to GitHub and
@@ -344,6 +419,13 @@ pub(super) struct ReconcileReport {
     pub(super) attempt: Option<u32>,
     pub(super) terminal: Option<String>,
     pub(super) alerts: Vec<String>,
+    /// Host classes whose version could not be read this tick.
+    pub(super) unreachable: Vec<String>,
+    /// Host classes that will not be rolled until an operator clears them.
+    pub(super) quarantined: Vec<String>,
+    /// Remote hosts whose own config declares `[host_class.*]`: there must be
+    /// exactly one fleet controller.
+    pub(super) other_controllers: Vec<String>,
     pub(super) exit_code: u8,
 }
 
@@ -366,6 +448,9 @@ pub(super) fn run_reconcile<E: ReconcileEnv>(
         attempt: None,
         terminal: None,
         alerts: Vec::new(),
+        unreachable: Vec::new(),
+        quarantined: Vec::new(),
+        other_controllers: Vec::new(),
         exit_code: super::EXIT_CONTROLLER_BUSY,
     };
     let _lock = match super::controller_lock::try_acquire(state_dir) {
@@ -394,49 +479,116 @@ pub(super) fn run_reconcile<E: ReconcileEnv>(
         ),
         Err(reason) => ReconcileDecision::Unknown { reason },
     };
+    let ledger = read_ledger(state_dir).unwrap_or_default();
+    report.unreachable = hosts
+        .iter()
+        .filter(|host| host.lagging.is_none())
+        .map(|host| host.host_class.clone())
+        .collect();
+    report.quarantined = ledger.quarantined.keys().cloned().collect();
+    report.other_controllers = hosts
+        .iter()
+        .filter(|host| host.declares_host_classes == Some(true))
+        .map(|host| host.host_class.clone())
+        .collect();
     report.hosts = hosts;
     report.decision = decision.clone();
-    report.exit_code = match &decision {
+    track_unreachable(env, &mut report, state_dir, latest.is_ok());
+    let tag = report
+        .latest_release
+        .as_ref()
+        .map_or_else(|| "?".to_owned(), |latest| latest.tag.clone());
+    let mut exit = match &decision {
         ReconcileDecision::UpToDate | ReconcileDecision::Soaking { .. } => 0,
         ReconcileDecision::Unknown { .. } => EXIT_RECONCILE_UNKNOWN,
         ReconcileDecision::RateLimited { .. } => EXIT_RECONCILE_RATE_LIMITED,
         ReconcileDecision::Terminal { .. } => EXIT_RECONCILE_TERMINAL,
         ReconcileDecision::ControllerBusy => super::EXIT_CONTROLLER_BUSY,
         ReconcileDecision::Ahead { hosts } => {
-            let tag = report
-                .latest_release
-                .as_ref()
-                .map_or("?", |latest| latest.tag.as_str())
-                .to_owned();
-            let body = format!(
-                "Hosts run a newer Shipyard than the latest published release {tag}: {}. \
-                 fleet-reconcile never downgrades, so it rolled nothing out. Check whether \
-                 {tag} is really the release the fleet should run.",
-                hosts.join(", ")
-            );
-            raise(
-                env,
-                &mut report,
-                &format!("fleet-reconcile: hosts ahead of {tag}"),
-                &body,
-            );
+            // Alert once per tag, not on every tick.
+            if !ledger.ahead_alerted.contains(&tag) {
+                let body = format!(
+                    "Hosts run a newer Shipyard than the latest published release {tag}: {}. \
+                     fleet-reconcile never downgrades, so it rolled nothing out. Check whether \
+                     {tag} is really the release the fleet should run.",
+                    hosts.join(", ")
+                );
+                raise(
+                    env,
+                    &mut report,
+                    &format!("fleet-reconcile: hosts ahead of {tag}"),
+                    &body,
+                );
+                let _ = update_ledger(state_dir, |ledger| {
+                    ledger.ahead_alerted.insert(tag.clone());
+                });
+            }
             EXIT_RECONCILE_AHEAD
         }
         ReconcileDecision::Rollout { .. } if !apply => 0,
         ReconcileDecision::Rollout { lagging } => {
-            let latest = latest.expect("a rollout decision requires a readable release");
-            rollout(
-                env,
-                &mut report,
-                state_dir,
-                policy,
-                &latest.tag,
-                lagging,
-                now,
-            )
+            rollout(env, &mut report, state_dir, policy, &tag, lagging, now)
         }
     };
+    // A tick that could not read every host is not a clean pass.
+    if exit == 0 && !report.unreachable.is_empty() {
+        exit = EXIT_RECONCILE_UNKNOWN;
+    }
+    report.exit_code = exit;
     report
+}
+
+/// Count consecutive unreadable ticks per host and alert once a host has been
+/// unreadable for [`UNREACHABLE_ALERT_TICKS`]. A host that answers again
+/// resets its count and may alert again later.
+fn track_unreachable<E: ReconcileEnv>(
+    env: &mut E,
+    report: &mut ReconcileReport,
+    state_dir: &Path,
+    release_read: bool,
+) {
+    if !release_read {
+        return;
+    }
+    let unreachable = report.unreachable.clone();
+    let reachable = report
+        .hosts
+        .iter()
+        .filter(|host| host.lagging.is_some())
+        .map(|host| host.host_class.clone())
+        .collect::<Vec<_>>();
+    let mut to_alert = Vec::new();
+    let _ = update_ledger(state_dir, |ledger| {
+        for class in &reachable {
+            ledger.unreachable_ticks.remove(class);
+            ledger.unreachable_alerted.remove(class);
+        }
+        for class in &unreachable {
+            let ticks = ledger.unreachable_ticks.entry(class.clone()).or_insert(0);
+            *ticks += 1;
+            if *ticks >= UNREACHABLE_ALERT_TICKS && ledger.unreachable_alerted.insert(class.clone())
+            {
+                to_alert.push((class.clone(), *ticks));
+            }
+        }
+    });
+    for (class, ticks) in to_alert {
+        let error = report
+            .hosts
+            .iter()
+            .find(|host| host.host_class == class)
+            .and_then(|host| host.error.clone())
+            .unwrap_or_default();
+        raise(
+            env,
+            report,
+            &format!("fleet-reconcile: {class} is unreachable"),
+            &format!(
+                "fleet-reconcile could not read {class}'s installed Shipyard for {ticks} \
+                 consecutive ticks ({error}). It is left out of every rollout until it answers."
+            ),
+        );
+    }
 }
 
 fn raise<E: ReconcileEnv>(env: &mut E, report: &mut ReconcileReport, title: &str, body: &str) {
@@ -471,6 +623,35 @@ fn rollout<E: ReconcileEnv>(
     report.rollout = Some(outcome.clone());
     let terminal = match &outcome {
         RolloutOutcome::Verified => return 0,
+        RolloutOutcome::RollbackFailed { host_class, reason } => {
+            // Terminal at once and alerted at once: retrying would reinstall
+            // onto a host nobody has looked at. The host stays out of every
+            // future rollout until an operator clears it.
+            let quarantine = Quarantine {
+                tag: tag.to_owned(),
+                reason: reason.clone(),
+                since: now,
+            };
+            let _ = update_ledger(state_dir, |ledger| {
+                ledger.quarantined.insert(host_class.clone(), quarantine);
+            });
+            report.quarantined.push(host_class.clone());
+            let terminal = format!("{}{reason}", rollback_failed_prefix(host_class));
+            if let Err(error) = mark_terminal(state_dir, tag, &terminal) {
+                report
+                    .alerts
+                    .push(format!("could not record terminal state: {error}"));
+            }
+            let body = format!(
+                "fleet-reconcile rolled {tag} out to {host_class}, the host failed, and restoring \
+                 its previous version ALSO failed: {reason}.\n\n{host_class} needs an operator. \
+                 It is quarantined: no automatic rollout will touch it until \
+                 `shipyard runner fleet-reconcile --clear-host {host_class}` is run after it is fixed."
+            );
+            raise(env, report, &alert_title(tag), &body);
+            report.terminal = Some(terminal);
+            return super::EXIT_ROLLBACK_FAILED;
+        }
         RolloutOutcome::Ineligible { reason } => format!("release is ineligible: {reason}"),
         RolloutOutcome::Failed { reason } if attempt >= policy.max_attempts => {
             format!("gave up after {attempt} attempts; last failure: {reason}")
@@ -493,25 +674,51 @@ fn rollout<E: ReconcileEnv>(
     EXIT_RECONCILE_TERMINAL
 }
 
-/// Read one host's installed `shipyard --version` without mutating anything.
+const PROBE_CONTROLLER_MARKER: &str = "SHIPYARD_PROBE_DECLARES_HOST_CLASSES=";
+
+/// Read one configured host's installed version. See [`probe_version_at`].
 pub(super) fn probe_host_version(class: &HostClassConfig) -> HostVersion {
+    probe_version_at(
+        &class.class,
+        class.ssh.as_deref(),
+        class.shipyard_bin.as_deref(),
+        class.shipyard_global_dir.as_deref(),
+    )
+}
+
+/// Read one host's installed `shipyard --version` without mutating anything.
+/// For a remote host with a known global dir, also report whether its own
+/// machine-global config declares host classes (a second fleet controller).
+pub(super) fn probe_version_at(
+    class: &str,
+    ssh: Option<&str>,
+    binary: Option<&str>,
+    global_dir: Option<&str>,
+) -> HostVersion {
     let mut result = HostVersion {
-        host_class: class.class.clone(),
-        ssh: class.ssh.clone(),
+        host_class: class.to_owned(),
+        ssh: ssh.map(ToOwned::to_owned),
         version: None,
         error: None,
         lagging: None,
+        declares_host_classes: None,
     };
-    let Some(binary) = class
-        .shipyard_bin
-        .as_deref()
-        .filter(|path| path.starts_with('/'))
-    else {
+    let Some(binary) = binary.filter(|path| path.starts_with('/')) else {
         result.error = Some("host_class has no absolute shipyard_bin".to_owned());
         return result;
     };
-    let script = format!("{} --version", shlex_quote(binary));
-    let mut command = if let Some(host) = &class.ssh {
+    let mut script = format!("{} --version", shlex_quote(binary));
+    if ssh.is_some()
+        && let Some(global_dir) = global_dir.filter(|path| path.starts_with('/'))
+    {
+        let config = shlex_quote(&format!("{global_dir}/config.toml"));
+        let marker = shlex_quote(PROBE_CONTROLLER_MARKER);
+        let probe = format!(
+            "\nif /usr/bin/grep -q '^\\[host_class\\.' {config} 2>/dev/null; then printf '%s1\\n' {marker}; else printf '%s0\\n' {marker}; fi"
+        );
+        script.push_str(&probe);
+    }
+    let mut command = if let Some(host) = ssh {
         let mut command = Command::new(super::evidence::ssh_binary_path());
         command.args([
             "-o",
@@ -532,7 +739,7 @@ pub(super) fn probe_host_version(class: &HostClassConfig) -> HostVersion {
             .env("PATH", unattended_tool_path());
         command
     };
-    let label = format!("version probe for host class {}", class.class);
+    let label = format!("version probe for host class {class}");
     match crate::process::run_output_until(
         &mut command,
         Instant::now() + HOST_PROBE_TIMEOUT,
@@ -546,6 +753,10 @@ pub(super) fn probe_host_version(class: &HostClassConfig) -> HostVersion {
             } else {
                 result.error = Some(format!("unparseable version output {line:?}"));
             }
+            result.declares_host_classes = text
+                .lines()
+                .find_map(|line| line.strip_prefix(PROBE_CONTROLLER_MARKER))
+                .map(|value| value.trim() == "1");
         }
         Ok(output) => {
             result.error = Some(format!(
@@ -609,6 +820,7 @@ mod tests {
                 .is_none()
                 .then(|| "ssh: connect timed out".to_owned()),
             lagging: None,
+            declares_host_classes: None,
         }
     }
 
@@ -688,12 +900,26 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_inputs_are_unknown_never_up_to_date() {
+    fn unreadable_inputs_are_never_read_as_current() {
         let now = Utc::now();
         let latest = release("v0.208.0", 120, now);
+        // One unreadable host is left out; the readable ones still decide.
         let decision = run(
             &latest,
-            vec![host("m1", Some("0.208.0")), host("m5", None)],
+            vec![host("m1", Some("0.205.0")), host("m5", None)],
+            &AttemptLedger::default(),
+            now,
+        );
+        assert_eq!(
+            decision,
+            ReconcileDecision::Rollout {
+                lagging: vec!["m1".to_owned()]
+            }
+        );
+        // Every host unreadable is unknown.
+        let decision = run(
+            &latest,
+            vec![host("m1", None), host("m5", None)],
             &AttemptLedger::default(),
             now,
         );
@@ -1030,5 +1256,143 @@ mod tests {
             env.rollouts,
             vec![("v0.208.0".to_owned(), vec!["m7-new-rack".to_owned()])]
         );
+    }
+
+    #[test]
+    fn a_failed_rollback_alerts_at_once_and_quarantines_the_host() {
+        let temp = tempfile::tempdir().expect("temp");
+        let start = Utc::now();
+        let mut env = FakeEnv::new(
+            start,
+            &[("m1", "0.205.0"), ("m5", "0.205.0")],
+            RolloutOutcome::RollbackFailed {
+                host_class: "m5".to_owned(),
+                reason: "ROLLBACK TO v0.205.0 FAILED: daemon is not running".to_owned(),
+            },
+        );
+        let report = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(report.exit_code, super::super::EXIT_ROLLBACK_FAILED);
+        assert_eq!(report.attempt, Some(1), "no waiting for the attempt cap");
+        assert_eq!(env.alerts.len(), 1, "alerted on the first failure");
+        assert!(env.alerts[0].1.contains("m5 needs an operator"));
+        assert!(env.alerts[0].1.contains("--clear-host m5"));
+        let ledger = read_ledger(temp.path()).expect("ledger");
+        assert!(ledger.quarantined.contains_key("m5"));
+        assert!(ledger.tags["v0.208.0"].terminal.is_some());
+
+        // A newer release must still never touch the quarantined host.
+        env.latest = Ok(release("v0.209.0", 120, start));
+        env.outcome = RolloutOutcome::Verified;
+        env.now = start + chrono::Duration::days(1);
+        let later = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(later.quarantined, ["m5"]);
+        assert_eq!(env.rollouts.last().expect("rollout").1, ["m1"]);
+        assert_eq!(env.alerts.len(), 1);
+
+        // Once an operator clears it, the host and its terminal tag return.
+        let cleared = clear_host(temp.path(), "m5")
+            .expect("clear")
+            .expect("was quarantined");
+        assert_eq!(cleared.tag, "v0.208.0");
+        let ledger = read_ledger(temp.path()).expect("ledger");
+        assert!(ledger.quarantined.is_empty());
+        assert!(ledger.tags["v0.208.0"].terminal.is_none());
+        env.hosts[0].1 = Some("0.209.0".to_owned());
+        env.now = start + chrono::Duration::days(2);
+        run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(env.rollouts.last().expect("rollout").1, ["m5"]);
+    }
+
+    #[test]
+    fn a_host_ahead_is_alerted_once_per_tag() {
+        let temp = tempfile::tempdir().expect("temp");
+        let start = Utc::now();
+        let mut env = FakeEnv::new(start, &[("m5", "0.210.0")], RolloutOutcome::Verified);
+        for tick in 0..4 {
+            env.now = start + chrono::Duration::minutes(15 * tick);
+            let report = run_reconcile(&mut env, temp.path(), policy(), true);
+            assert_eq!(report.exit_code, EXIT_RECONCILE_AHEAD);
+        }
+        assert_eq!(env.alerts.len(), 1, "one alert per tag, not one per tick");
+        env.latest = Ok(release("v0.209.0", 120, start));
+        run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(env.alerts.len(), 2, "a different latest tag alerts again");
+    }
+
+    #[test]
+    fn an_unreachable_host_does_not_block_the_others_and_alerts_after_a_streak() {
+        let temp = tempfile::tempdir().expect("temp");
+        let start = Utc::now();
+        let mut env = FakeEnv::new(
+            start,
+            &[("m1", "0.205.0"), ("m5", "0.205.0")],
+            RolloutOutcome::Verified,
+        );
+        env.hosts[1].1 = None;
+        let first = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(
+            env.rollouts,
+            vec![("v0.208.0".to_owned(), vec!["m1".to_owned()])]
+        );
+        assert_eq!(first.unreachable, ["m5"]);
+        assert_eq!(
+            first.exit_code, EXIT_RECONCILE_UNKNOWN,
+            "a partial tick is not clean"
+        );
+        env.hosts[0].1 = Some("0.208.0".to_owned());
+        for tick in 1..UNREACHABLE_ALERT_TICKS + 3 {
+            env.now = start + chrono::Duration::minutes(15 * i64::from(tick));
+            run_reconcile(&mut env, temp.path(), policy(), true);
+        }
+        let unreachable_alerts = env
+            .alerts
+            .iter()
+            .filter(|(title, _)| title == "fleet-reconcile: m5 is unreachable")
+            .count();
+        assert_eq!(
+            unreachable_alerts, 1,
+            "alert once after the streak, not every tick"
+        );
+        // Answering again resets the streak.
+        env.hosts[1].1 = Some("0.208.0".to_owned());
+        run_reconcile(&mut env, temp.path(), policy(), true);
+        assert!(
+            read_ledger(temp.path())
+                .expect("ledger")
+                .unreachable_ticks
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_second_controller_is_reported() {
+        struct Controllers(FakeEnv);
+        impl ReconcileEnv for Controllers {
+            fn now(&self) -> DateTime<Utc> {
+                self.0.now()
+            }
+            fn latest_release(&mut self) -> Result<PublishedRelease, String> {
+                self.0.latest_release()
+            }
+            fn probe_hosts(&mut self) -> Vec<HostVersion> {
+                let mut hosts = self.0.probe_hosts();
+                hosts[0].declares_host_classes = Some(true);
+                hosts
+            }
+            fn rollout(&mut self, tag: &str, host_classes: &[String]) -> RolloutOutcome {
+                self.0.rollout(tag, host_classes)
+            }
+            fn alert(&mut self, title: &str, body: &str) -> Result<(), String> {
+                self.0.alert(title, body)
+            }
+        }
+        let temp = tempfile::tempdir().expect("temp");
+        let mut env = Controllers(FakeEnv::new(
+            Utc::now(),
+            &[("m5", "0.208.0")],
+            RolloutOutcome::Verified,
+        ));
+        let report = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(report.other_controllers, ["m5"]);
     }
 }

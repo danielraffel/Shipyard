@@ -30,6 +30,9 @@ PUBLIC_ASSET_VISIBILITY_POLL_SECS = 3
 # Distinct from every earlier failure: the release is public and installable,
 # but at least one fleet host did not verify at it.
 FLEET_ROLLOUT_FAILED_EXIT = 6
+# `shipyard runner fleet-update` exit codes the stage treats specially.
+FLEET_CONTROLLER_BUSY_EXIT = 75
+FLEET_ROLLBACK_FAILED_EXIT = 7
 
 
 @dataclass(frozen=True)
@@ -598,9 +601,19 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
         if stderr.strip():
             print(stderr.strip(), file=sys.stderr)
         raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
-    command = [*plan, "--apply"]
+    # Only hosts behind the tag: reinstalling a current host restarts its daemon
+    # and cannot be rolled back (there is no earlier version to restore).
+    command = [*plan, "--apply", "--lagging-only"]
     print(f"fleet rollout: {' '.join(command)}")
     code, stdout, stderr = runner.run_status(command)
+    if code == FLEET_CONTROLLER_BUSY_EXIT:
+        print(
+            f"WARNING: another fleet rollout holds the controller lock; {config.tag} was "
+            "not rolled out here. The running rollout or the fleet-reconcile agent "
+            "finishes the fleet.",
+            file=sys.stderr,
+        )
+        return
     summaries = [
         document
         for document in _json_documents(stdout)
@@ -617,6 +630,12 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
         for name in [failed.get("host_class"), *((summary or {}).get("not_attempted_hosts") or [])]
         if name
     ]
+    if code == FLEET_ROLLBACK_FAILED_EXIT or (summary or {}).get("verdict") == "rollback_failed":
+        print(
+            f"FLEET ROLLBACK FAILED for {config.tag}: {failed.get('host_class', 'a host')} "
+            "was updated, failed, and could NOT be restored; it needs an operator now.",
+            file=sys.stderr,
+        )
     print(
         f"FLEET ROLLOUT FAILED for {config.tag} (exit {code}); the release stays "
         "published. Hosts not verified: "

@@ -594,7 +594,7 @@ class FleetRolloutStageTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             runner.fleet_calls,  # type: ignore[attr-defined]
-            [["/opt/ctl/shipyard", "--json", "runner", "fleet-update", "--to", "v0.209.0", "--all-hosts", "--apply"]],
+            [["/opt/ctl/shipyard", "--json", "runner", "fleet-update", "--to", "v0.209.0", "--all-hosts", "--apply", "--lagging-only"]],
         )
         self.assertIn("fleet rollout verified at v0.209.0: m1, m5, studio", out)
 
@@ -688,6 +688,31 @@ class FleetRolloutStageTests(unittest.TestCase):
         self.assertIn("rollout plan was refused", err)
         self.assertIn("missing attestation", err)
         self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]
+
+    def test_a_held_controller_lock_hands_over_instead_of_failing(self) -> None:
+        runner = self.fleet_runner(75, [])
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, 0)
+        self.assertIn("another fleet rollout holds the controller lock", err)
+        self.assertNotIn("UNKNOWN (no fleet summary", err)
+
+    def test_a_failed_rollback_is_called_out_as_needing_an_operator(self) -> None:
+        runner = self.fleet_runner(
+            7,
+            [
+                {
+                    "event": "fleet_summary",
+                    "verdict": "rollback_failed",
+                    "verified_hosts": [],
+                    "failed_host": {"host_class": "m5", "reason": "ROLLBACK TO v0.208.0 FAILED", "needs_operator": True},
+                    "not_attempted_hosts": ["studio"],
+                }
+            ],
+        )
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, release_macos_local.FLEET_ROLLOUT_FAILED_EXIT)
+        self.assertIn("FLEET ROLLBACK FAILED for v0.209.0: m5", err)
+        self.assertIn("needs an operator now", err)
 
     def test_missing_controller_binary_fails_instead_of_skipping(self) -> None:
         runner = self.fleet_runner(0, [])
