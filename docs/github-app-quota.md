@@ -238,6 +238,52 @@ Normal CLI calls must also carry repository provenance: use `--repo`, a
 checkout, `GH_REPO`, or an explicit `SHIPYARD_GHAPP_REPO`. Repo-less
 organization or GraphQL calls should set `SHIPYARD_GHAPP_REPO` to a repository
 owned by the intended installation; the wrapper otherwise fails closed.
+
+### Which installation a `ghapp` token is minted for
+
+A GitHub App has one installation per account or org, and an installation
+token can only see what that installation covers. `ghapp` mints its token for
+the installation that covers one bound repository, chosen in this order:
+
+1. a target the command names itself: `--repo OWNER/REPO`, a PR/issue URL,
+   `ghapp repo view OWNER/REPO`, or an `api` path `repos/OWNER/REPO/...`
+   (with or without a leading `/`). The path outranks the environment, because
+   only the target's own installation can reach it;
+2. `SHIPYARD_GHAPP_REPO` (canonical);
+3. `SHIPYARD_GH_APP_REPO`, an alias for the spelling the tartci fleet renders
+   into every lane environment;
+4. `GH_REPO`;
+5. the current checkout (`cwd:<path>`).
+
+If `SHIPYARD_GHAPP_REPO` and `SHIPYARD_GH_APP_REPO` are both set and name
+different repositories, `ghapp` refuses and names both. (`GH_REPO` is only
+a lower-precedence default and never conflicts.)
+
+An `api` call to `orgs/<org>/...` whose only binding is the current checkout,
+owned by a different account, is refused before any token is minted:
+
+```
+ghapp: this request targets org Generous-Corp, but the App token would be minted for danielraffel/tartci (from cwd:/Volumes/Workshop/Code/tartci), a different installation. Bind it: GH_REPO=Generous-Corp/<some-repo> ghapp ...
+```
+
+When native `gh api` fails with `Resource not accessible by integration`, or
+with HTTP 404 on a `repos/` or `orgs/` path, `ghapp` keeps gh's stderr and exit
+code and appends one line naming the installation and how it was bound:
+
+```
+ghapp: token was minted for installation covering danielraffel/tartci (bound via GH_REPO); the request targeted orgs/Generous-Corp/actions/runners?per_page=1. If the target belongs to another account/org, bind with GH_REPO=Generous-Corp/<repo>. This is an identity mismatch, not proof that a permission is missing.
+```
+
+Only when the token was minted for the target's own installation does a 403
+read as a missing permission:
+
+```
+ghapp: token was minted for installation covering Generous-Corp/pulp (bound via cwd:/Volumes/Workshop/Code/pulp), which is the target's own installation: the installation for Generous-Corp/pulp lacks this permission.
+```
+
+Do not ask anybody to change App permissions on the strength of a 403 that
+carries the identity-mismatch line; rebind and retry first. Non-`api`
+subcommands keep their existing behaviour and are not annotated.
 This wrapper is intentionally bound to `github.com`: repository-controlled
 remotes and URLs cannot redirect the App JWT to another host. A GHES or
 `*.ghe.com` deployment needs a separately reviewed wrapper and host-specific

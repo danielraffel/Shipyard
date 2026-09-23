@@ -833,6 +833,18 @@ Shipyard while the audited `shipyard-v1` CLI surface remains available to
 tartci. Remove the old fixed installation id. Missing repo provenance fails
 closed. The privileged wrapper is not a
 general native-`gh` drop-in, and unknown commands or flags fail before minting.
+`ghapp` mints its token for the installation covering one bound repository:
+the command's own target (`--repo`, PR URL, `api repos/OWNER/REPO/...`) first,
+then `SHIPYARD_GHAPP_REPO`, its tartci-fleet alias `SHIPYARD_GH_APP_REPO`
+(the two must agree when both are set), `GH_REPO`, and finally the current
+checkout. `api orgs/<org>/...` bound only by a checkout owned by another account
+is refused before minting. On `Resource not accessible by integration` (or a
+404 on a `repos/`/`orgs/` path) ghapp appends one line naming the installation
+and its binding source: "identity mismatch, not proof that a permission is
+missing" when the token belongs to another installation, "the installation for
+<repo> lacks this permission" only when it is the target's own. Never request a
+GitHub permission change from a mismatch line. See `docs/github-app-quota.md`.
+
 The one bounded asset-publication exception is `ghapp release upload`: require
 an explicit exact repository, tag, and existing non-symlink regular files. It
 does not admit `--clobber`, release creation/deletion, or tag retargeting.

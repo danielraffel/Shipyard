@@ -875,7 +875,29 @@ if [[ "$auth_hostname_command" == 1 ]]; then
     fi
 fi
 
-repo="${SHIPYARD_GHAPP_REPO:-${GH_REPO:-}}"
+# Installation binding. SHIPYARD_GHAPP_REPO is the canonical name;
+# SHIPYARD_GH_APP_REPO is the spelling the tartci fleet renders into every lane
+# and is honoured as an alias. Precedence: SHIPYARD_GHAPP_REPO,
+# SHIPYARD_GH_APP_REPO, GH_REPO, then the current checkout. repo_source records
+# where the binding came from so a refusal or a 403 can say so.
+if [[ -n "${SHIPYARD_GHAPP_REPO:-}" && -n "${SHIPYARD_GH_APP_REPO:-}" && \
+      "$(printf '%s' "$SHIPYARD_GHAPP_REPO" | /usr/bin/tr '[:upper:]' '[:lower:]')" != \
+      "$(printf '%s' "$SHIPYARD_GH_APP_REPO" | /usr/bin/tr '[:upper:]' '[:lower:]')" ]]; then
+    echo "ghapp: SHIPYARD_GHAPP_REPO=$SHIPYARD_GHAPP_REPO and SHIPYARD_GH_APP_REPO=$SHIPYARD_GH_APP_REPO disagree; refusing to guess which installation to mint a token for. Unset one." >&2
+    exit 1
+fi
+repo=""
+repo_source=""
+if [[ -n "${SHIPYARD_GHAPP_REPO:-}" ]]; then
+    repo="$SHIPYARD_GHAPP_REPO"
+    repo_source="SHIPYARD_GHAPP_REPO"
+elif [[ -n "${SHIPYARD_GH_APP_REPO:-}" ]]; then
+    repo="$SHIPYARD_GH_APP_REPO"
+    repo_source="SHIPYARD_GH_APP_REPO"
+elif [[ -n "${GH_REPO:-}" ]]; then
+    repo="$GH_REPO"
+    repo_source="GH_REPO"
+fi
 url_repo_routed=0
 if [[ "${1:-}" == "pr" || "${1:-}" == "issue" ]]; then
     if [[ "${2:-}" == -* ]]; then
@@ -903,6 +925,7 @@ if [[ "${1:-}" == "pr" || "${1:-}" == "issue" ]]; then
         esac
         if set_target_url_repo "$argument" "$1"; then
             url_repo_routed=1
+            repo_source="URL target $argument"
             break
         fi
     done
@@ -942,12 +965,14 @@ if [[ "${1:-}" == "repo" ]]; then
                 fi
                 if [[ "$argument" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]+$ ]]; then
                     repo="$argument"
+                    repo_source="repo $repo_subcommand argument"
                     break
                 fi
                 # The first real positional value is the repository target.
                 # A malformed slug must fail in the helper, not be skipped in
                 # favor of a later destination/argument.
                 repo="$argument"
+                repo_source="repo $repo_subcommand argument"
                 break
             done
             ;;
@@ -1009,8 +1034,19 @@ if [[ "${1:-}" == "api" ]]; then
             name="${name%%\?*}"
             name="${name%%\#*}"
             if [[ "$owner" != *'{'* && "$owner" != *'}'* && "$name" != *'{'* && "$name" != *'}'* ]]; then
+                # The path names the repository, so its installation is the only
+                # one whose token can reach it; it outranks any ambient binding.
                 repo="$owner/$name"
+                repo_source="api path repos/$owner/$name"
+                api_target_repo="$owner/$name"
             fi
+            ;;
+        orgs/*|/orgs/*)
+            path="${api_endpoint#/}"
+            path="${path#orgs/}"
+            api_target_org="${path%%/*}"
+            api_target_org="${api_target_org%%\?*}"
+            api_target_org="${api_target_org%%\#*}"
             ;;
     esac
 fi
@@ -1044,10 +1080,10 @@ for argument in "$@"; do
             ;;
     esac
     case "$argument" in
-        --repo|-R) repo_flag_pending=1; repo_selector_count=$((repo_selector_count + 1)) ;;
-        --repo=*) repo="${argument#--repo=}"; repo_selector_count=$((repo_selector_count + 1)) ;;
-        -R=*) repo="${argument#-R=}"; repo_selector_count=$((repo_selector_count + 1)) ;;
-        -R?*) repo="${argument#-R}"; repo_selector_count=$((repo_selector_count + 1)) ;;
+        --repo|-R) repo_flag_pending=1; repo_selector_count=$((repo_selector_count + 1)); repo_source="--repo flag" ;;
+        --repo=*) repo="${argument#--repo=}"; repo_selector_count=$((repo_selector_count + 1)); repo_source="--repo flag" ;;
+        -R=*) repo="${argument#-R=}"; repo_selector_count=$((repo_selector_count + 1)); repo_source="--repo flag" ;;
+        -R?*) repo="${argument#-R}"; repo_selector_count=$((repo_selector_count + 1)); repo_source="--repo flag" ;;
         *)
             if cli_option_takes_value "${1:-}" "${2:-}" "$argument"; then
                 cli_option_value=1
@@ -1235,9 +1271,23 @@ fi
 
 if [[ -z "$repo" ]]; then
     checkout_repo_target
+    repo_source="cwd:$PWD"
 fi
 
 normalize_repo_target "$repo"
+
+# An org-scoped request is served by whichever installation the token is minted
+# for. A binding inferred from the current checkout silently picks that
+# checkout's installation, and a 403 from the wrong installation reads like a
+# missing permission. Refuse before minting anything.
+if [[ -n "${api_target_org:-}" && "$repo_source" == cwd:* && -n "$repo" ]]; then
+    bound_owner="${repo%%/*}"
+    if [[ "$(printf '%s' "$bound_owner" | /usr/bin/tr '[:upper:]' '[:lower:]')" != \
+          "$(printf '%s' "$api_target_org" | /usr/bin/tr '[:upper:]' '[:lower:]')" ]]; then
+        echo "ghapp: this request targets org $api_target_org, but the App token would be minted for $repo (from ${repo_source}), a different installation. Bind it: GH_REPO=$api_target_org/<some-repo> ghapp ..." >&2
+        exit 1
+    fi
+fi
 
 if [[ -z "$repo" ]]; then
     echo "ghapp: exact repository provenance is required; use --repo OWNER/REPO" >&2
@@ -1492,4 +1542,58 @@ if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
     exit 0
 fi
 
-exec "$gh_binary" "$@"
+if [[ "${1:-}" != "api" ]]; then
+    exec "$gh_binary" "$@"
+fi
+
+# For `api`, keep native gh's stdout and exit code untouched but watch its
+# stderr, so an authorization refusal can say which installation the token was
+# minted for. A 403 from the wrong installation is an identity mismatch, not
+# evidence that the permission is missing.
+api_stderr_capture="$(/usr/bin/mktemp /tmp/shipyard-ghapp-api-stderr.XXXXXX)"
+set +e
+{ "$gh_binary" "$@" 2>&1 1>&3 3>&- | /usr/bin/tee "$api_stderr_capture" >&2; } 3>&1
+api_status="${PIPESTATUS[0]}"
+set -e
+if [[ "$api_status" != 0 ]]; then
+    api_target_path="${api_endpoint:-<unknown endpoint>}"
+    api_forbidden=0
+    api_not_found=0
+    if /usr/bin/grep -q "Resource not accessible by integration" "$api_stderr_capture"; then
+        api_forbidden=1
+    elif [[ -n "${api_target_repo:-}${api_target_org:-}" ]] && \
+         /usr/bin/grep -q "HTTP 404" "$api_stderr_capture"; then
+        api_not_found=1
+    fi
+    if [[ "$api_forbidden" == 1 || "$api_not_found" == 1 ]]; then
+        lower() { printf '%s' "$1" | /usr/bin/tr '[:upper:]' '[:lower:]'; }
+        api_target_owner=""
+        if [[ -n "${api_target_repo:-}" ]]; then
+            api_target_owner="${api_target_repo%%/*}"
+        elif [[ -n "${api_target_org:-}" ]]; then
+            api_target_owner="$api_target_org"
+        fi
+        api_target_bound=0
+        if [[ -n "${api_target_repo:-}" && "$(lower "$api_target_repo")" == "$(lower "$repo")" ]]; then
+            api_target_bound=1
+        elif [[ -n "${api_target_org:-}" && "$(lower "$api_target_org")" == "$(lower "${repo%%/*}")" ]]; then
+            api_target_bound=1
+        fi
+        if [[ "$api_target_bound" == 1 ]]; then
+            if [[ "$api_forbidden" == 1 ]]; then
+                echo "ghapp: token was minted for installation covering $repo (bound via $repo_source), which is the target's own installation: the installation for $repo lacks this permission." >&2
+            fi
+        else
+            if [[ -n "${api_target_repo:-}" ]]; then
+                api_bind_hint="$api_target_repo"
+            elif [[ -n "$api_target_owner" ]]; then
+                api_bind_hint="$api_target_owner/<repo>"
+            else
+                api_bind_hint="<target-owner>/<repo>"
+            fi
+            echo "ghapp: token was minted for installation covering $repo (bound via $repo_source); the request targeted $api_target_path. If the target belongs to another account/org, bind with GH_REPO=$api_bind_hint. This is an identity mismatch, not proof that a permission is missing." >&2
+        fi
+    fi
+fi
+/bin/rm -f -- "$api_stderr_capture"
+exit "$api_status"
