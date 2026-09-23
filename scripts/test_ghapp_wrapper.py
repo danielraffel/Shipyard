@@ -2358,7 +2358,9 @@ class GhappWrapperTests(unittest.TestCase):
         self.gh.write_text(
             "#!/bin/bash\n"
             "[ \"${GH_TOKEN:-}\" = ghs_private_fixture ] || exit 92\n"
-            f"/usr/sbin/lsof -a -p $$ -d 2 -Fn | sed -n 's/^n//p' > '{capture_log}'\n"
+            # Linux exposes the stderr target under /proc; macOS needs lsof.
+            f"if [ -e /proc/$$/fd/2 ]; then readlink /proc/$$/fd/2; "
+            f"else /usr/sbin/lsof -a -p $$ -d 2 -Fn | sed -n 's/^n//p'; fi > '{capture_log}'\n"
             f"trap 'echo term > \"{marker}\"; exit 143' TERM\n"
             "while :; do sleep 0.1; done\n",
             encoding="utf-8",
