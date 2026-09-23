@@ -151,6 +151,25 @@ pub(super) enum PlanExecutionError {
     Failed(String),
 }
 
+/// Where in a host attempt a failure happened, which decides whether the host
+/// may have been mutated.
+#[derive(Debug)]
+pub(super) enum PlanPhaseError {
+    /// Before the update command started: nothing on the host changed.
+    BeforeMutation(PlanExecutionError),
+    /// The update command itself failed or timed out.
+    Command(PlanExecutionError),
+    /// The update command exited 0 (the transaction committed) but its
+    /// evidence could not be collected: the host runs something unverified.
+    AfterCommit(PlanExecutionError),
+}
+
+pub(super) fn execute_plan_phased(
+    plan: &HostUpdatePlan,
+) -> Result<HostUpdateEvidence, PlanPhaseError> {
+    execute_plan_phased_with_timeout(plan, HOST_UPDATE_TIMEOUT)
+}
+
 pub(super) fn execute_plan(
     plan: &HostUpdatePlan,
 ) -> Result<HostUpdateEvidence, PlanExecutionError> {
@@ -161,16 +180,66 @@ pub(super) fn execute_plan_with_timeout(
     plan: &HostUpdatePlan,
     timeout: Duration,
 ) -> Result<HostUpdateEvidence, PlanExecutionError> {
+    execute_plan_phased_with_timeout(plan, timeout).map_err(|error| match error {
+        PlanPhaseError::BeforeMutation(error)
+        | PlanPhaseError::Command(error)
+        | PlanPhaseError::AfterCommit(error) => error,
+    })
+}
+
+pub(super) fn execute_plan_phased_with_timeout(
+    plan: &HostUpdatePlan,
+    timeout: Duration,
+) -> Result<HostUpdateEvidence, PlanPhaseError> {
     let deadline = Instant::now() + timeout;
-    let (before_status, before_pair, before_auth) = if plan.ssh.is_none() {
-        let status = run_local_daemon_status(plan, deadline)?;
-        let pair = collect_local_pair(plan, deadline, false)?;
-        validate_binary_pair(plan, &pair, None).map_err(PlanExecutionError::Failed)?;
-        let auth = collect_local_auth_support(plan, false)?;
-        (Some(status), Some(pair), Some(auth))
-    } else {
-        (None, None, None)
-    };
+    run_phases(
+        || {
+            if plan.ssh.is_none() {
+                let status = run_local_daemon_status(plan, deadline)?;
+                let pair = collect_local_pair(plan, deadline, false)?;
+                validate_binary_pair(plan, &pair, None).map_err(PlanExecutionError::Failed)?;
+                let auth = collect_local_auth_support(plan, false)?;
+                Ok((Some(status), Some(pair), Some(auth)))
+            } else {
+                Ok((None, None, None))
+            }
+        },
+        || run_update_command(plan, deadline),
+        |(before_status, before_pair, before_auth), stdout| {
+            if plan.ssh.is_some() {
+                parse_remote_evidence(plan, stdout)
+            } else {
+                collect_local_evidence(
+                    plan,
+                    &before_status.expect("local status was collected before update"),
+                    before_pair.expect("local pair was collected before update"),
+                    before_auth.expect("local auth support was collected before update"),
+                    stdout,
+                    deadline,
+                )
+            }
+        },
+    )
+}
+
+/// Run the three phases of one host attempt and classify a failure by the
+/// phase it happened in: before the update command (nothing changed), the
+/// command itself, or after the command exited 0 (the transaction committed).
+pub(super) fn run_phases<B, T>(
+    before: impl FnOnce() -> Result<B, PlanExecutionError>,
+    command: impl FnOnce() -> Result<Vec<u8>, PlanExecutionError>,
+    collect: impl FnOnce(B, &[u8]) -> Result<T, PlanExecutionError>,
+) -> Result<T, PlanPhaseError> {
+    let before = before().map_err(PlanPhaseError::BeforeMutation)?;
+    let stdout = command().map_err(PlanPhaseError::Command)?;
+    collect(before, &stdout).map_err(PlanPhaseError::AfterCommit)
+}
+
+/// Run the update command; a non-zero exit is a command failure.
+fn run_update_command(
+    plan: &HostUpdatePlan,
+    deadline: Instant,
+) -> Result<Vec<u8>, PlanExecutionError> {
     let mut command = if let Some(host) = &plan.ssh {
         let mut command = Command::new(ssh_binary());
         command.args([
@@ -203,18 +272,7 @@ pub(super) fn execute_plan_with_timeout(
             output.status.code().unwrap_or(-1)
         )));
     }
-    if plan.ssh.is_some() {
-        parse_remote_evidence(plan, &output.stdout)
-    } else {
-        collect_local_evidence(
-            plan,
-            &before_status.expect("local status was collected before update"),
-            before_pair.expect("local pair was collected before update"),
-            before_auth.expect("local auth support was collected before update"),
-            &output.stdout,
-            deadline,
-        )
-    }
+    Ok(output.stdout)
 }
 
 fn run_bounded_output(

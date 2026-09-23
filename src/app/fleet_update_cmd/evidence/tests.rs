@@ -762,6 +762,52 @@ fn local_evidence_probes_share_the_host_attempt_deadline() {
     );
 }
 
+/// Each phase's failure is classified by the phase, which decides whether the
+/// host may have changed: a failure after the command exited 0 is post-commit,
+/// never before-mutation.
+#[test]
+fn host_attempt_failures_are_classified_by_phase() {
+    let fail = |message: &str| PlanExecutionError::Failed(message.to_owned());
+    let mut ran = Vec::new();
+    let before = run_phases(
+        || Err::<(), _>(fail("status probe")),
+        || -> Result<Vec<u8>, PlanExecutionError> { panic!("command must not run") },
+        |(), _| -> Result<(), PlanExecutionError> { panic!("collect must not run") },
+    );
+    assert!(matches!(before, Err(PlanPhaseError::BeforeMutation(_))));
+
+    let command = run_phases(
+        || Ok(()),
+        || Err(PlanExecutionError::TimedOut("deadline".to_owned())),
+        |(), _| -> Result<(), PlanExecutionError> { panic!("collect must not run") },
+    );
+    assert!(matches!(
+        command,
+        Err(PlanPhaseError::Command(PlanExecutionError::TimedOut(_)))
+    ));
+
+    let after = run_phases(
+        || Ok(()),
+        || {
+            ran.push("command");
+            Ok(b"SHIPYARD_FLEET_AFTER_STATUS=".to_vec())
+        },
+        |(), stdout| -> Result<(), PlanExecutionError> {
+            assert!(!stdout.is_empty(), "collect sees the command output");
+            Err(fail("remote evidence missing markers"))
+        },
+    );
+    assert_eq!(
+        ran,
+        ["command"],
+        "control: the command ran before collection failed"
+    );
+    assert!(matches!(after, Err(PlanPhaseError::AfterCommit(_))));
+
+    let ok = run_phases(|| Ok(1), || Ok(Vec::new()), |before, _| Ok(before + 1));
+    assert_eq!(ok.expect("all phases pass"), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn remote_supervisor_kills_term_ignoring_descendants_after_leader_exits() {

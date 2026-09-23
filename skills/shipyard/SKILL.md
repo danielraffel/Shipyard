@@ -620,10 +620,18 @@ nothing out. A tick that finds the controller lock held records nothing (exit
 `--install` first rehearses the reconcile under the agent's exact environment
 and refuses to load it on failure.
 
-A failed rollback during reconcile is terminal for that tag immediately and
-alerts at once. The host is **quarantined**: no automatic rollout touches it
-until `shipyard runner fleet-reconcile --clear-host <class>` is run after the
-host is fixed. That also makes its tag eligible again. The "hosts ahead" alert
+A failed rollback, whether it happened in reconcile, the release stage or an
+operator's `fleet-update --apply`, is terminal for that tag immediately and
+alerts at once. The host is **quarantined** in the controller's ledger. Every
+fleet-update and reconcile skips it until `shipyard runner fleet-reconcile
+--clear-host <class>` is run after the host is fixed; that also makes its tag
+eligible again. Rollback follows only failures that may have changed the host:
+- a timeout of the update command;
+- evidence that could not be collected after the command exited 0 (the host runs an unverified build, which is never treated as current);
+- rejected evidence, pair-hash drift, or a failed verification.
+
+A failure before the update command started (including a controller-local
+probe timing out) touched nothing and is never rolled back. The "hosts ahead" alert
 is raised once per tag. An unreadable host no longer blocks the others: the
 reachable lagging hosts are rolled, the tick exits 9, and the host alerts once
 after 4 consecutive unreadable ticks. Alerts find their issue by exact-title

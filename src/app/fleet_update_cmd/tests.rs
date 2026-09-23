@@ -1070,6 +1070,32 @@ fn local_rollout_rejects_a_filename_the_installer_cannot_replace() {
     assert!(error.message.contains("must end in /shipyard"));
 }
 
+/// A controller-local probe that stalls before the update command runs is a
+/// before-mutation failure, so the host is not rolled back.
+#[cfg(unix)]
+#[test]
+fn a_stalled_local_pre_probe_is_classified_before_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let binary = temp.path().join("shipyard");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh
+sleep 60
+",
+    )
+    .expect("fixture");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    let plan = host_update_plan(&host(None, binary.to_str()), "v0.137.0").expect("plan");
+    assert!(matches!(
+        evidence::execute_plan_phased_with_timeout(&plan, Duration::from_millis(50)),
+        Err(evidence::PlanPhaseError::BeforeMutation(
+            PlanExecutionError::TimedOut(_)
+        ))
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn one_stalled_host_is_terminated_at_its_bound() {
@@ -1318,14 +1344,17 @@ struct TestOps<E, V, R> {
 
 impl<E, V, R> HostOps for TestOps<E, V, R>
 where
-    E: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
+    E: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, evidence::PlanPhaseError>,
     V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
     R: FnMut(&HostUpdatePlan, Option<&str>) -> rollback::RollbackOutcome,
 {
     fn installed_version(&mut self, _plan: &HostUpdatePlan) -> Option<String> {
         self.installed.clone()
     }
-    fn execute(&mut self, plan: &HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError> {
+    fn execute(
+        &mut self,
+        plan: &HostUpdatePlan,
+    ) -> Result<HostUpdateEvidence, evidence::PlanPhaseError> {
         (self.execute)(plan)
     }
     fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification {
@@ -1359,8 +1388,11 @@ fn apply_plans_for_test<F>(
 where
     F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
 {
+    let mut execute = execute;
     let mut ops = TestOps {
-        execute,
+        execute: move |plan: &HostUpdatePlan| {
+            execute(plan).map_err(evidence::PlanPhaseError::Command)
+        },
         verify: verified_ok,
         rollback: rolled_back_ok,
         installed: Some("0.136.0".to_owned()),
@@ -2005,7 +2037,11 @@ fn a_committed_transaction_is_rolled_back_after_evidence_or_timeout_failures() {
 
     // A timeout: no evidence, but the pre-update probe names the version.
     let mut ops = TestOps {
-        execute: |_: &HostUpdatePlan| Err(PlanExecutionError::TimedOut("deadline".to_owned())),
+        execute: |_: &HostUpdatePlan| {
+            Err(evidence::PlanPhaseError::Command(
+                PlanExecutionError::TimedOut("deadline".to_owned()),
+            ))
+        },
         verify: verified_ok,
         rollback: rolled_back_ok,
         installed: Some("0.135.2".to_owned()),
@@ -2022,8 +2058,8 @@ fn a_committed_transaction_is_rolled_back_after_evidence_or_timeout_failures() {
     // A refusal before mutation is not rolled back.
     let mut ops = TestOps {
         execute: |_: &HostUpdatePlan| {
-            Err(PlanExecutionError::Failed(
-                "ssh: connection refused".to_owned(),
+            Err(evidence::PlanPhaseError::Command(
+                PlanExecutionError::Failed("ssh: connection refused".to_owned()),
             ))
         },
         verify: verified_ok,
@@ -2033,6 +2069,129 @@ fn a_committed_transaction_is_rolled_back_after_evidence_or_timeout_failures() {
     };
     apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops).expect_err("failed");
     assert!(ops.rollbacks.is_empty());
+}
+
+#[test]
+fn a_failure_before_mutation_is_never_rolled_back_and_a_post_commit_one_always_is() {
+    let plans = vec![host_update_plan(&named_host("studio"), "v0.137.0").expect("plan")];
+    // A controller-local probe timing out before the update command ran: the
+    // host is untouched, so nothing is rolled back, even with no known
+    // previous version (which would otherwise quarantine a healthy host).
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            Err(evidence::PlanPhaseError::BeforeMutation(
+                PlanExecutionError::TimedOut(
+                    "daemon status for host class studio exhausted the deadline".to_owned(),
+                ),
+            ))
+        },
+        verify: verified_ok,
+        rollback: failed_rollback,
+        installed: None,
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect_err("before-mutation failure");
+    assert!(
+        ops.rollbacks.is_empty(),
+        "an untouched host is never rolled back"
+    );
+    assert!(
+        error.rollback_failed_host.is_none(),
+        "a healthy host is never quarantined"
+    );
+    assert!(error.failure.message.contains("failed before any change"));
+
+    // The update committed but its evidence could not be collected: the host
+    // runs something unverified, so it is rolled back, never taken as current.
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            Err(evidence::PlanPhaseError::AfterCommit(
+                PlanExecutionError::Failed(
+                    "remote evidence missing SHIPYARD_FLEET_AFTER_STATUS".to_owned(),
+                ),
+            ))
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect_err("post-commit failure");
+    assert_eq!(
+        ops.rollbacks,
+        [("studio".to_owned(), Some("0.136.0".to_owned()))]
+    );
+    assert!(
+        error
+            .failure
+            .message
+            .contains("updated but its evidence could not be collected")
+    );
+    assert!(error.failure.message.contains("rolled back to v0.136.0"));
+}
+
+#[test]
+fn quarantined_hosts_are_excluded_from_every_rollout() {
+    let mut plans = ["m1", "m5", "studio"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut ledger = reconcile::AttemptLedger::default();
+    ledger.quarantined.insert(
+        "m5".to_owned(),
+        reconcile::Quarantine {
+            tag: "v0.136.0".to_owned(),
+            reason: "rollback failed".to_owned(),
+            since: chrono::Utc::now(),
+        },
+    );
+    let skipped = exclude_quarantined(&mut plans, &ledger);
+    assert_eq!(skipped, ["m5"]);
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.class.as_str())
+            .collect::<Vec<_>>(),
+        ["m1", "studio"]
+    );
+}
+
+#[test]
+fn a_fleet_update_rollback_failure_quarantines_and_alerts_like_reconcile() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut alerts = Vec::new();
+    let failure = RolloutFailure {
+        ineligible: false,
+        rollback_failed_host: Some("m5".to_owned()),
+        failure: CliFailure::new(EXIT_ROLLBACK_FAILED, "ROLLBACK TO v0.208.0 FAILED"),
+    };
+    let error = record_cli_rollback_failure(temp.path(), "0.209.0", failure, |title, body| {
+        alerts.push((title.to_owned(), body.to_owned()));
+        Ok(())
+    });
+    assert_eq!(error.code, EXIT_ROLLBACK_FAILED);
+    assert!(
+        error
+            .message
+            .contains("m5 is quarantined and an alert was raised")
+    );
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].0, reconcile::alert_title("v0.209.0"));
+    assert!(alerts[0].1.contains("--clear-host m5"));
+    let ledger = reconcile::read_ledger(temp.path()).expect("ledger");
+    assert_eq!(ledger.quarantined["m5"].tag, "v0.209.0");
+    assert!(ledger.tags["v0.209.0"].terminal.is_some());
+
+    // An ordinary failure records nothing.
+    let temp = tempfile::tempdir().expect("temp");
+    let failure = RolloutFailure::from(CliFailure::new(1, "m1 failed"));
+    let error = record_cli_rollback_failure(temp.path(), "v0.209.0", failure, |_, _| {
+        panic!("no alert for an ordinary failure")
+    });
+    assert_eq!(error.code, 1);
+    assert!(!reconcile::ledger_path(temp.path()).exists());
 }
 
 #[test]
@@ -2133,7 +2292,7 @@ fn lagging_only_skips_current_and_ahead_hosts_and_fails_closed_on_unknown() {
         true,
         &mut output,
         &mut TestOps {
-            execute: |_: &HostUpdatePlan| -> Result<HostUpdateEvidence, PlanExecutionError> {
+            execute: |_: &HostUpdatePlan| -> Result<HostUpdateEvidence, evidence::PlanPhaseError> {
                 panic!("nothing lags")
             },
             verify: verified_ok,

@@ -177,6 +177,42 @@ pub(super) fn clear_host(state_dir: &Path, host_class: &str) -> Result<Option<Qu
     Ok(cleared)
 }
 
+/// Record a host that was mutated and could not be restored: quarantine it and
+/// make the tag terminal, under the caller's controller lock. Shared by
+/// fleet-reconcile and by `fleet-update --apply` (the release stage), so every
+/// path that can leave a broken host records it the same way. Returns the
+/// terminal reason and the alert body.
+pub(super) fn record_rollback_failure(
+    state_dir: &Path,
+    tag: &str,
+    host_class: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(String, String), String> {
+    let terminal = format!("{}{reason}", rollback_failed_prefix(host_class));
+    update_ledger(state_dir, |ledger| {
+        ledger.quarantined.insert(
+            host_class.to_owned(),
+            Quarantine {
+                tag: tag.to_owned(),
+                reason: reason.to_owned(),
+                since: now,
+            },
+        );
+        ledger.tags.entry(tag.to_owned()).or_default().terminal = Some(terminal.clone());
+    })?;
+    Ok((terminal, rollback_failure_body(tag, host_class, reason)))
+}
+
+pub(super) fn rollback_failure_body(tag: &str, host_class: &str, reason: &str) -> String {
+    format!(
+        "A fleet rollout of {tag} updated {host_class}, the host failed, and restoring its \
+         previous version ALSO failed: {reason}.\n\n{host_class} needs an operator. It is \
+         quarantined: no automatic rollout will touch it until \
+         `shipyard runner fleet-reconcile --clear-host {host_class}` is run after it is fixed."
+    )
+}
+
 fn rollback_failed_prefix(host_class: &str) -> String {
     format!("rollback failed on {host_class}: ")
 }
@@ -627,27 +663,20 @@ fn rollout<E: ReconcileEnv>(
             // Terminal at once and alerted at once: retrying would reinstall
             // onto a host nobody has looked at. The host stays out of every
             // future rollout until an operator clears it.
-            let quarantine = Quarantine {
-                tag: tag.to_owned(),
-                reason: reason.clone(),
-                since: now,
-            };
-            let _ = update_ledger(state_dir, |ledger| {
-                ledger.quarantined.insert(host_class.clone(), quarantine);
-            });
+            let (terminal, body) =
+                match record_rollback_failure(state_dir, tag, host_class, reason, now) {
+                    Ok(recorded) => recorded,
+                    Err(error) => {
+                        report
+                            .alerts
+                            .push(format!("could not record the quarantine: {error}"));
+                        (
+                            format!("{}{reason}", rollback_failed_prefix(host_class)),
+                            rollback_failure_body(tag, host_class, reason),
+                        )
+                    }
+                };
             report.quarantined.push(host_class.clone());
-            let terminal = format!("{}{reason}", rollback_failed_prefix(host_class));
-            if let Err(error) = mark_terminal(state_dir, tag, &terminal) {
-                report
-                    .alerts
-                    .push(format!("could not record terminal state: {error}"));
-            }
-            let body = format!(
-                "fleet-reconcile rolled {tag} out to {host_class}, the host failed, and restoring \
-                 its previous version ALSO failed: {reason}.\n\n{host_class} needs an operator. \
-                 It is quarantined: no automatic rollout will touch it until \
-                 `shipyard runner fleet-reconcile --clear-host {host_class}` is run after it is fixed."
-            );
             raise(env, report, &alert_title(tag), &body);
             report.terminal = Some(terminal);
             return super::EXIT_ROLLBACK_FAILED;

@@ -34,7 +34,9 @@ use evidence::{
     AuthSupportEvidence, BinaryEvidence, BinaryPairEvidence, DaemonRuntimeEvidence,
     GenerationEvidence, GenerationMemberEvidence, SourceIdentityBasis, SupportFileEvidence,
 };
-use evidence::{HostUpdateEvidence, PlanExecutionError, execute_plan, validate_evidence};
+use evidence::{
+    HostUpdateEvidence, PlanExecutionError, PlanPhaseError, execute_plan, validate_evidence,
+};
 use release_authority::{
     GitHubReleaseAuthorityVerifier, ReleaseAuthority, ReleaseAuthorityVerifier,
 };
@@ -172,8 +174,61 @@ pub(super) fn fleet_update_command<W: Write>(
             "another fleet rollout holds the controller lock; not starting a second one",
         ));
     };
-    run_fleet_update(args, mode, cwd, runtime_paths, json, stdout)
-        .map_err(|failure| failure.failure)
+    run_fleet_update(args, mode, cwd, runtime_paths, json, stdout).map_err(|failure| {
+        record_cli_rollback_failure(
+            &runtime_paths.state_dir,
+            &args.to,
+            failure,
+            |title, body| {
+                let config =
+                    LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+                        .map_err(|error| error.to_string())?;
+                GitHubReleaseAuthorityVerifier::new(&config, cwd).upsert_issue(title, body)
+            },
+        )
+    })
+}
+
+/// A host that `fleet-update --apply` (the release stage, an operator) could
+/// not restore is recorded exactly like reconcile records it: quarantined, its
+/// tag terminal, and an alert issue opened, all under the held lock.
+fn record_cli_rollback_failure<A>(
+    state_dir: &Path,
+    to: &str,
+    failure: RolloutFailure,
+    mut alert: A,
+) -> CliFailure
+where
+    A: FnMut(&str, &str) -> Result<(), String>,
+{
+    let Some(host_class) = failure.rollback_failed_host.as_deref() else {
+        return failure.failure;
+    };
+    let tag = normalize_exact_tag(to).unwrap_or_else(|_| to.to_owned());
+    let reason = failure.failure.message.clone();
+    let mut notes = Vec::new();
+    let body = match reconcile::record_rollback_failure(
+        state_dir,
+        &tag,
+        host_class,
+        &reason,
+        chrono::Utc::now(),
+    ) {
+        Ok((_, body)) => body,
+        Err(error) => {
+            notes.push(format!("QUARANTINE NOT RECORDED: {error}"));
+            reconcile::rollback_failure_body(&tag, host_class, &reason)
+        }
+    };
+    if let Err(error) = alert(&reconcile::alert_title(&tag), &body) {
+        notes.push(format!("ALERT NOT DELIVERED: {error}"));
+    }
+    let mut message = format!("{reason}; {host_class} is quarantined and an alert was raised");
+    for note in notes {
+        message.push_str("; ");
+        message.push_str(&note);
+    }
+    CliFailure::new(failure.failure.code, message)
 }
 
 /// Exit code when another rollout holds the controller lock.
@@ -237,6 +292,12 @@ pub(super) fn run_fleet_update<W: Write>(
         .map(|class| host_update_plan_with_authority(class, &target, &release_authority))
         .collect::<Result<Vec<_>, _>>()?;
     order_controller_last(&mut plans);
+    // A host that could not be restored after a failed rollout stays out of
+    // every rollout, whichever path starts it, until an operator clears it.
+    // An unreadable ledger fails closed before any host is touched.
+    let ledger = reconcile::read_ledger(&runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(reconcile::EXIT_RECONCILE_UNKNOWN, error))?;
+    let quarantined = exclude_quarantined(&mut plans, &ledger);
 
     if !args.apply {
         render_plan(stdout, json, &target, &plans, args.all_hosts)?;
@@ -262,7 +323,29 @@ pub(super) fn run_fleet_update<W: Write>(
         cwd,
         classes: &classes,
     };
-    apply_plans(&plans, &skipped_current, &target, json, stdout, &mut ops)
+    let result = apply_plans(&plans, &skipped_current, &target, json, stdout, &mut ops);
+    if !quarantined.is_empty() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "fleet-update: skipped quarantined host(s) {}; clear with `shipyard runner fleet-reconcile --clear-host <class>` once fixed",
+            quarantined.join(", ")
+        );
+    }
+    result
+}
+
+/// Drop quarantined host classes from `plans`, returning their names.
+fn exclude_quarantined(
+    plans: &mut Vec<HostUpdatePlan>,
+    ledger: &reconcile::AttemptLedger,
+) -> Vec<String> {
+    let quarantined = plans
+        .iter()
+        .filter(|plan| ledger.quarantined.contains_key(&plan.class))
+        .map(|plan| plan.class.clone())
+        .collect::<Vec<_>>();
+    plans.retain(|plan| !ledger.quarantined.contains_key(&plan.class));
+    quarantined
 }
 
 /// Keep only the hosts behind `target`. A host at or ahead of it is skipped
@@ -322,8 +405,8 @@ impl HostOps for LiveOps<'_> {
         .version
     }
 
-    fn execute(&mut self, plan: &HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError> {
-        execute_plan(plan)
+    fn execute(&mut self, plan: &HostUpdatePlan) -> Result<HostUpdateEvidence, PlanPhaseError> {
+        evidence::execute_plan_phased(plan)
     }
 
     fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification {
@@ -433,7 +516,7 @@ trait HostOps {
     /// The version installed before this rollout touches the host, read
     /// independently of the update transaction. `None` when unreadable.
     fn installed_version(&mut self, plan: &HostUpdatePlan) -> Option<String>;
-    fn execute(&mut self, plan: &HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>;
+    fn execute(&mut self, plan: &HostUpdatePlan) -> Result<HostUpdateEvidence, PlanPhaseError>;
     fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification;
     /// Restore `previous` (the pre-update version) on this host.
     fn rollback(
@@ -554,6 +637,71 @@ fn roll_back_after<W: Write, O: HostOps>(
     }))
 }
 
+/// Turn a failed host attempt into the failure that stops the rollout, rolling
+/// the host back only when the failure may have changed it.
+fn phase_failure<W: Write, O: HostOps>(
+    plan: &HostUpdatePlan,
+    target: &str,
+    json: bool,
+    stdout: &mut W,
+    ops: &mut O,
+    before: Option<&str>,
+    error: PlanPhaseError,
+) -> Result<Option<HostFailure>, CliFailure> {
+    match error {
+        // Nothing on the host changed: there is nothing to roll back, and a
+        // rollback of an untouched host could only make things worse.
+        PlanPhaseError::BeforeMutation(
+            PlanExecutionError::TimedOut(error) | PlanExecutionError::Failed(error),
+        ) => {
+            render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
+            Ok(Some(HostFailure {
+                reason: format!("{} failed before any change: {error}", plan.class),
+                rollback_failed: false,
+            }))
+        }
+        PlanPhaseError::Command(PlanExecutionError::TimedOut(error)) => {
+            render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
+            // The transaction may have committed before the deadline.
+            roll_back_after(
+                plan,
+                target,
+                json,
+                stdout,
+                ops,
+                before,
+                &format!("{} timed out: {error}", plan.class),
+            )
+        }
+        PlanPhaseError::Command(PlanExecutionError::Failed(error)) => {
+            render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
+            Ok(Some(HostFailure {
+                reason: format!("{} failed: {error}", plan.class),
+                rollback_failed: false,
+            }))
+        }
+        // The update committed but its evidence could not be read: the host
+        // runs something nobody verified, which is never "current".
+        PlanPhaseError::AfterCommit(
+            PlanExecutionError::TimedOut(error) | PlanExecutionError::Failed(error),
+        ) => {
+            render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
+            roll_back_after(
+                plan,
+                target,
+                json,
+                stdout,
+                ops,
+                before,
+                &format!(
+                    "{} updated but its evidence could not be collected: {error}",
+                    plan.class
+                ),
+            )
+        }
+    }
+}
+
 /// Update, validate and verify one host. `Ok(Some(_))` stops the rollout.
 fn apply_host<W: Write, O: HostOps>(
     plan: &HostUpdatePlan,
@@ -569,25 +717,8 @@ fn apply_host<W: Write, O: HostOps>(
     let before = ops.installed_version(plan);
     let evidence = match ops.execute(plan) {
         Ok(evidence) => evidence,
-        Err(PlanExecutionError::TimedOut(error)) => {
-            render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
-            // The transaction may have committed before the deadline.
-            return roll_back_after(
-                plan,
-                target,
-                json,
-                stdout,
-                ops,
-                before.as_deref(),
-                &format!("{} timed out: {error}", plan.class),
-            );
-        }
-        Err(PlanExecutionError::Failed(error)) => {
-            render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
-            return Ok(Some(HostFailure {
-                reason: format!("{} failed: {error}", plan.class),
-                rollback_failed: false,
-            }));
+        Err(error) => {
+            return phase_failure(plan, target, json, stdout, ops, before.as_deref(), error);
         }
     };
     let previous = before.or_else(|| Some(evidence.before_pair.primary.semantic_version.clone()));
