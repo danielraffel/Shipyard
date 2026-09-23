@@ -593,6 +593,17 @@ their `GHAPP_REAL_GH`/merge probe to the wrapper's selected native binary, and
 dispatch the PR-close guard for every command so its REST/GraphQL/issue aliases
 cannot bypass inspection.
 
+**`ghapp` identity: bind before you blame permissions.** The App token is
+minted for ONE installation, chosen from the command's own target (`--repo`,
+a PR URL, `api repos/OWNER/REPO/...`), else `SHIPYARD_GHAPP_REPO`, else its
+fleet alias `SHIPYARD_GH_APP_REPO`, else `GH_REPO`, else the current checkout.
+From `~/Code/tartci`, `ghapp api orgs/Generous-Corp/...` would use the
+danielraffel installation, so ghapp now refuses it before calling and says to
+run `GH_REPO=Generous-Corp/<repo> ghapp ...`. A 403 that ends with
+"This is an identity mismatch, not proof that a permission is missing" means
+rebind and retry; only "the installation for <repo> lacks this permission"
+means a permission is actually missing. Details: `docs/github-app-quota.md`.
+
 The bounded App-authenticated publication exception is
 `ghapp release upload <tag> <files>... --repo OWNER/REPO`. It accepts only an
 existing release, stable private snapshots of non-symlink regular files, and
