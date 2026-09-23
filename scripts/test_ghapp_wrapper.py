@@ -2257,6 +2257,135 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertIn("(bound via SHIPYARD_GH_APP_REPO)", result.stderr)
         self.assertIn("This is an identity mismatch", result.stderr)
 
+    def test_forbidden_without_a_concrete_target_gets_no_verdict(self) -> None:
+        self.environment["GH_REPO"] = "Generous-Corp/pulp"
+        native = "gh: Resource not accessible by integration (HTTP 403)"
+        self.fail_gh_with(native, 1)
+        for endpoint in (
+            ("graphql", "-f", "query=mutation{enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}){clientMutationId}}"),
+            ("rate_limit",),
+            ("repos/{owner}/{repo}/actions/runners",),
+        ):
+            with self.subTest(endpoint=endpoint[0]):
+                result = self.run_wrapper("api", *endpoint)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(native, result.stderr)
+                self.assertIn(
+                    "ghapp: token was minted for installation covering Generous-Corp/pulp "
+                    f"(bound via GH_REPO); the account that owns what {endpoint[0]} touches "
+                    "could not be determined from the request, so this refusal is neither "
+                    "attributed to an identity mismatch nor to a missing permission.",
+                    result.stderr,
+                )
+                self.assertNotIn("This is an identity mismatch", result.stderr)
+                self.assertNotIn("lacks this permission", result.stderr)
+
+    def test_forbidden_on_the_bound_org_says_permission_missing(self) -> None:
+        self.environment["GH_REPO"] = "generous-corp/pulp"
+        self.fail_gh_with("gh: Resource not accessible by integration (HTTP 403)", 1)
+
+        result = self.run_wrapper("api", "orgs/Generous-Corp/hooks")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "the installation for generous-corp/pulp lacks this permission.", result.stderr
+        )
+        self.assertNotIn("identity mismatch", result.stderr)
+
+    def test_closed_stderr_falls_back_to_plain_exec(self) -> None:
+        self.environment["GH_REPO"] = "danielraffel/tartci"
+        self.fail_gh_with("gh: Resource not accessible by integration (HTTP 403)", 1)
+
+        result = subprocess.run(
+            ["/bin/bash", "-c", '"$0" api orgs/Generous-Corp/actions/runners 2>&-', str(self.wrapper)],
+            cwd=self.root,
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("ghapp: token was minted", result.stdout + result.stderr)
+
+    def test_broken_stderr_pipe_keeps_the_native_exit_code(self) -> None:
+        self.environment["GH_REPO"] = "danielraffel/tartci"
+        self.fail_gh_with("gh: Resource not accessible by integration (HTTP 403)", 1)
+
+        result = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                '"$0" api orgs/Generous-Corp/actions/runners 2>&1 >/dev/null | : ; '
+                'echo "status=${PIPESTATUS[0]}"',
+                str(self.wrapper),
+            ],
+            cwd=self.root,
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertIn("status=1", result.stdout)
+        self.assertNotIn("status=141", result.stdout)
+
+    def test_api_stdin_reaches_native_gh(self) -> None:
+        body = self.root / "stdin-seen"
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "[ \"${GH_TOKEN:-}\" = ghs_private_fixture ] || exit 92\n"
+            f"cat > '{body}'\n",
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [str(self.wrapper), "api", "graphql", "--input", "-"],
+            cwd=self.root,
+            env={**self.environment, "GH_REPO": "Generous-Corp/pulp"},
+            input='{"query":"query{viewer{login}}"}',
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(body.read_text(), '{"query":"query{viewer{login}}"}')
+
+    def test_term_is_forwarded_to_native_gh_and_capture_is_removed(self) -> None:
+        marker = self.root / "gh-got-term"
+        capture_log = self.root / "gh-stderr-path"
+        self.gh.write_text(
+            "#!/bin/bash\n"
+            "[ \"${GH_TOKEN:-}\" = ghs_private_fixture ] || exit 92\n"
+            f"/usr/sbin/lsof -a -p $$ -d 2 -Fn | sed -n 's/^n//p' > '{capture_log}'\n"
+            f"trap 'echo term > \"{marker}\"; exit 143' TERM\n"
+            "while :; do sleep 0.1; done\n",
+            encoding="utf-8",
+        )
+        process = subprocess.Popen(
+            [str(self.wrapper), "api", "repos/Generous-Corp/pulp/hooks"],
+            cwd=self.root,
+            env=self.environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 20
+        while not capture_log.exists() or not capture_log.read_text().strip():
+            self.assertLess(time.monotonic(), deadline, "gh never started")
+            time.sleep(0.05)
+        capture = Path(capture_log.read_text().strip())
+        self.assertTrue(capture.name.startswith("shipyard-ghapp-api-stderr."), capture)
+        self.assertTrue(capture.exists())
+
+        process.terminate()
+        process.communicate(timeout=10)
+
+        self.assertEqual(process.returncode, 143)
+        self.assertEqual(marker.read_text().strip(), "term")
+        self.assertFalse(capture.exists(), "capture file must not outlive ghapp")
+
     def test_unrelated_api_failure_is_passed_through_unannotated(self) -> None:
         native = "gh: Bad credentials (HTTP 401)"
         self.fail_gh_with(native, 3)

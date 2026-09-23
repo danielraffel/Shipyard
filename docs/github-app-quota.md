@@ -281,9 +281,45 @@ read as a missing permission:
 ghapp: token was minted for installation covering Generous-Corp/pulp (bound via cwd:/Volumes/Workshop/Code/pulp), which is the target's own installation: the installation for Generous-Corp/pulp lacks this permission.
 ```
 
+When the request names no concrete target (`api graphql`, `api rate_limit`,
+a `repos/{owner}/{repo}/...` placeholder path), ghapp cannot tell which account
+the refusal concerns and gives no verdict either way:
+
+```
+ghapp: token was minted for installation covering Generous-Corp/pulp (bound via GH_REPO); the account that owns what graphql touches could not be determined from the request, so this refusal is neither attributed to an identity mismatch nor to a missing permission. If that account is not Generous-Corp, bind with GH_REPO=<that-owner>/<repo> and retry.
+```
+
 Do not ask anybody to change App permissions on the strength of a 403 that
 carries the identity-mismatch line; rebind and retry first. Non-`api`
 subcommands keep their existing behaviour and are not annotated.
+
+To annotate, `ghapp api` runs native gh as a child instead of replacing
+itself: gh's stdin, stdout and exit code pass through unchanged, its stderr is
+replayed after it exits, and `INT`/`TERM`/`HUP` sent to ghapp are forwarded to
+gh. `SIGKILL` cannot be forwarded: `kill -9` of ghapp leaves gh running to
+completion and leaves its `/tmp/shipyard-ghapp-api-stderr.*` capture behind.
+When ghapp starts with stderr closed it falls back to a plain `exec` of gh
+with no annotation, and a reader that goes away never turns gh's exit code
+into `SIGPIPE`.
+
+### Operator note: the alias activates dormant fleet calls
+
+Honouring `SHIPYARD_GH_APP_REPO` changes what already-deployed tartci lanes do
+once hosts receive a ghapp generation containing it:
+
+- tartci's `providers/tart-macos/runner.sh` `reclaim_runner_name` and
+  `sweep_lane_ghost_runners` list and `DELETE` runner registrations under an
+  org runner root (`orgs/Generous-Corp/actions/runners`) through `ghapp`, with
+  only `SHIPYARD_GH_APP_REPO` set. Today
+  those calls fail with "exact repository provenance is required" (or bind to
+  the lane's checkout) and the failure is swallowed, so they have silently done
+  nothing. On org-scoped lanes (on m3: the forge lane, runner group 11, and the
+  vellum lane, runner group 8) they will start to run and may delete offline
+  or stale runner registrations.
+- `SHIPYARD_GH_APP_REPO` now outranks `GH_REPO`. A process that sets both to
+  different repositories now binds to the alias.
+
+Review those lanes' ghost-runner sweep before rolling the generation out.
 This wrapper is intentionally bound to `github.com`: repository-controlled
 remotes and URLs cannot redirect the App JWT to another host. A GHES or
 `*.ghe.com` deployment needs a separately reviewed wrapper and host-specific
