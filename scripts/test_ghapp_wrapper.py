@@ -1989,6 +1989,36 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertTrue(self.helper_log.exists())
         self.assertFalse(self.gh_log.exists())
 
+    def test_queue_arm_guard_uses_app_token_before_native_gh(self) -> None:
+        guards = self.root / "guards"
+        guard = guards / "queue-arm-guard"
+        guard.write_text(
+            "#!/bin/sh\n"
+            "[ \"${GH_TOKEN:-}\" = ghs_private_fixture ] || exit 0\n"
+            "[ \"${GHAPP_REAL_GH:-}\" = \"$GH_EXPECTED\" ] || exit 0\n"
+            "exit 76\n",
+            encoding="utf-8",
+        )
+        guard.chmod(0o755)
+
+        result = self.run_wrapper(
+            "api", "repos/Generous-Corp/pulp/hooks"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_absent_queue_arm_guard_is_optional(self) -> None:
+        self.assertFalse((self.root / "guards" / "queue-arm-guard").exists())
+
+        result = self.run_wrapper(
+            "api", "repos/Generous-Corp/pulp/hooks"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.gh_log.exists())
+
     def test_missing_pr_close_guard_fails_before_native_gh(self) -> None:
         (self.root / "guards/pr-close-guard").unlink()
 

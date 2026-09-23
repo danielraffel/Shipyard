@@ -11,6 +11,7 @@ It is read-only. It never merges, enqueues, dispatches or cancels.
 shipyard landing                                   # the origin remote, its default base
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                            # machine-readable
+shipyard landing --pr 123                          # one pull request's queue state
 ```
 
 Exit `0` when the mechanism was fully determined, `9` when any headline field
@@ -112,6 +113,43 @@ required contexts and a large backlog.
 
 `--run-sample` and `--max-job-reads` bound the fallback sweep used when the
 check-run route does not cover every context.
+
+## One pull request: `shipyard landing --pr <n>`
+
+With `--pr`, `landing` skips the repository model and classifies one pull
+request's merge-queue state from a single GraphQL read. Every line of output
+names the response field it came from, and the report always opens with:
+
+> REST pulls/<n>.auto_merge is null for every queued PR (GitHub consumes
+> auto-merge on enqueue) — never read it as 'unarmed'.
+
+| class | meaning | next action |
+|---|---|---|
+| `queued` | `isInMergeQueue` is true (position from `mergeQueueEntry`) | nothing; do not re-arm |
+| `armed_not_queued` | `autoMergeRequest` set, not yet admitted | nothing; the queue admits it when checks pass |
+| `never_armed` | open, not armed, no removal in the timeline window | `shipyard ship --pr <n>` |
+| `ejected` | last `RemovedFromMergeQueueEvent` was not `merged`, not queued, not armed | new head since, or `invalid_merge_commit`: `shipyard ship --pr <n>`; same head after `failed_checks`/`merge_conflict`: push a fix first; same head after any other reason (`manual`, ...): confirm with whoever dequeued it |
+| `merged` / `closed` | PR state | nothing |
+| `unknown` | the read failed or was malformed, or the timeline window is truncated and shows no removal and no new head; exit `9` | do not act |
+
+History is read in **timeline order**, not by commit date and not from
+`RemovedFromMergeQueueEvent.beforeCommit` (unreliable): a new head is a
+`PullRequestCommit` or `HeadRefForcePushedEvent` after the last removal.
+`requeues_without_new_head` counts `AddedToMergeQueueEvent`s that directly
+follow a `failed_checks`/`merge_conflict` removal with no new head between.
+Under `ALLGREEN` grouping each such re-add fails every batch-mate with it. A
+`merged` removal (emitted right after `MergedEvent`) is never an ejection.
+
+The query reads `timelineItems(last: 100)`. When `pageInfo.hasPreviousPage`
+is true the report says `TRUNCATED` and the counts are lower bounds. Actor
+identity is not consulted: every queue mutation is attributed to the same App
+actor whether Shipyard or an agent issued it.
+
+Operator overrides for the guard are in `docs/ghapp-guards.md`. The same
+classifier guards the `ghapp` wrapper: `ghapp_queue_arm_guard.py`
+refuses to arm or enqueue a PR in any class whose next action above is not
+"land it". Its Python twin and this Rust classifier assert against the same
+real-response corpus in `tests/fixtures/github/`.
 
 ## Relationship to `shipyard landability`
 

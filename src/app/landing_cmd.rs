@@ -22,7 +22,7 @@ use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
 use crate::landability::gate;
 use crate::landing::gather::{DEFAULT_MAX_JOB_READS, DEFAULT_RUN_SAMPLE, GatherOptions};
-use crate::landing::{EXIT_LANDING_UNKNOWN, gather, render};
+use crate::landing::{EXIT_LANDING_UNKNOWN, gather, pr_state, render};
 
 /// What the caller asked for, as parsed from the command line.
 pub(super) struct LandingArgs {
@@ -34,6 +34,8 @@ pub(super) struct LandingArgs {
     pub run_sample: Option<usize>,
     /// Upper bound on per-run job reads.
     pub max_job_reads: Option<usize>,
+    /// Classify one pull request's queue state instead of the repo model.
+    pub pr: Option<u64>,
     /// Emit the machine-readable form.
     pub json: bool,
 }
@@ -50,6 +52,7 @@ pub(super) fn landing_command<W: Write>(
         base: base_arg,
         run_sample,
         max_job_reads,
+        pr,
         json,
     } = args;
     let config = LoadedConfig::load_from_cwd(mode, cwd)
@@ -69,6 +72,25 @@ pub(super) fn landing_command<W: Write>(
         .unwrap_or_else(|| gate::resolve_base(&config));
 
     let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
+    if let Some(pr) = pr {
+        let report = pr_state::gather(&actions, &repo, pr);
+        if json {
+            pr_state::write_json(stdout, &report)
+        } else {
+            pr_state::write_human(stdout, &report)
+        }
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if report.is_unknown() {
+            return Err(CliFailure::new(
+                EXIT_LANDING_UNKNOWN,
+                format!(
+                    "PR #{pr}'s merge-queue state could not be determined; do not act on it as \
+                     if it were unarmed"
+                ),
+            ));
+        }
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
     let report = gather::gather(
         &actions,
         &GatherOptions {

@@ -449,10 +449,16 @@ fn enqueue_uses_the_method_the_queue_declares() {
     assert_eq!(guidance.action, "enqueue");
     assert_eq!(
         guidance.command.as_deref(),
-        Some("gh pr merge <number> --auto --merge"),
-        "a queue configured for MERGE must never be given --squash"
+        Some("shipyard ship --pr <number>"),
+        "a live queue is entered through Shipyard's guarded exact-head path"
     );
     assert!(guidance.rationale.contains("MERGE"));
+    assert!(
+        guidance.rationale.contains("--merge"),
+        "a queue configured for MERGE must never be described with --squash"
+    );
+    assert!(guidance.rationale.contains("shipyard landing --pr"));
+    assert!(!guidance.rationale.contains("--auto"));
 }
 
 #[test]
@@ -472,8 +478,10 @@ fn a_squash_queue_gets_squash_not_merge() {
     let guidance = enqueue_guidance(&finding);
     assert_eq!(
         guidance.command.as_deref(),
-        Some("gh pr merge <number> --auto --squash")
+        Some("shipyard ship --pr <number>")
     );
+    assert!(guidance.rationale.contains("SQUASH"));
+    assert!(guidance.rationale.contains("--squash"));
 }
 
 #[test]

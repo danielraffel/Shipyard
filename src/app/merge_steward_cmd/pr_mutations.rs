@@ -401,7 +401,7 @@ fn enqueue_unstacked_pull_request(
     } else {
         "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}"
     };
-    let result = context.actions.run_gh(&[
+    let result = context.actions.run_gh_internal_queue_mutation(&[
         "api".to_owned(),
         "graphql".to_owned(),
         "-f".to_owned(),

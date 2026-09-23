@@ -603,14 +603,21 @@ pub fn enqueue_guidance(queue: &QueueFinding) -> EnqueueGuidance {
             let enforcing = config.enforcing();
             EnqueueGuidance {
                 action: if enforcing { "enqueue" } else { "merge" }.to_owned(),
-                command: Some(format!("gh pr merge <number> --auto {flag}")),
+                command: Some(if enforcing {
+                    "shipyard ship --pr <number>".to_owned()
+                } else {
+                    format!("gh pr merge <number> {flag}")
+                }),
                 rationale: if enforcing {
                     format!(
-                        "A merge queue is live on this branch and uses {method}. Enabling \
-                         auto-merge adds the pull request to the queue; the queue builds and \
-                         merges batches of up to {} entries. Do not merge directly, and do not \
-                         pass a method other than {flag}: the queue's method is the one the \
-                         repository's downstream automation was built around.",
+                        "A merge queue is live on this branch and uses {method}. Land through \
+                         Shipyard, which enqueues the exact validated head and refuses to \
+                         re-admit a head the queue already ejected. The queue builds and merges \
+                         batches of up to {} entries. Do not merge directly, and do not arm \
+                         auto-merge by hand: a queued PR reports auto_merge=null (GitHub consumes \
+                         it on enqueue), so check `shipyard landing --pr <number>` first. The \
+                         queue's method is {flag}, the one the repository's downstream \
+                         automation was built around.",
                         config
                             .max_entries_to_merge
                             .map_or_else(|| "?".to_owned(), |value| value.to_string())

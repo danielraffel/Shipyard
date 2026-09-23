@@ -158,6 +158,7 @@ pub(super) fn reconcile_enrollment_snapshot(
             )
     });
     let mut truncated = false;
+    let mut pending = Vec::new();
     for (index, previous_entry) in candidates.into_iter().enumerate() {
         if index >= MAX_ENROLLMENT_LOOKUPS_PER_TICK {
             if previous_entry.auto_merge_cleared {
@@ -193,18 +194,41 @@ pub(super) fn reconcile_enrollment_snapshot(
             if pull_base != base {
                 continue;
             }
-            retained.push(EnrollmentSnapshotEntry {
-                pr: previous_entry.pr,
-                head_sha: previous_entry.head_sha,
-                enqueued_at: previous_entry.enqueued_at,
-                head_observed_at: previous_entry.head_observed_at,
-                auto_merge_cleared: pull.get("auto_merge").is_none_or(Value::is_null),
-                last_checked_at: Some(Utc::now().to_rfc3339()),
-            });
-            if pull.get("auto_merge").is_none_or(Value::is_null) {
-                cleared.push(previous_entry.pr);
-            }
+            // REST `auto_merge` is null for every queued PR (GitHub consumes
+            // the request on enqueue). This entry left the queue snapshot, so a
+            // null here normally means the authority really was cleared, except
+            // when the PR was ejected and re-enqueued between the snapshot and
+            // this read. Such entries get one batched membership re-check below;
+            // an entry already recorded as cleared is not re-queried.
+            let rest_null = pull.get("auto_merge").is_none_or(Value::is_null);
+            let recheck = rest_null && !previous_entry.auto_merge_cleared;
+            pending.push((
+                EnrollmentSnapshotEntry {
+                    pr: previous_entry.pr,
+                    head_sha: previous_entry.head_sha,
+                    enqueued_at: previous_entry.enqueued_at,
+                    head_observed_at: previous_entry.head_observed_at,
+                    auto_merge_cleared: rest_null,
+                    last_checked_at: Some(Utc::now().to_rfc3339()),
+                },
+                recheck,
+            ));
         }
+    }
+    let recheck = pending
+        .iter()
+        .filter(|(_, recheck)| *recheck)
+        .map(|(entry, _)| entry.pr)
+        .collect::<Vec<_>>();
+    let in_queue = prs_in_merge_queue(actions, repo, &recheck)?;
+    for (mut entry, _) in pending {
+        if in_queue.contains(&entry.pr) {
+            entry.auto_merge_cleared = false;
+        }
+        if entry.auto_merge_cleared {
+            cleared.push(entry.pr);
+        }
+        retained.push(entry);
     }
     let snapshot = EnrollmentSnapshot {
         entries: entries
@@ -238,6 +262,56 @@ pub(super) fn reconcile_enrollment_snapshot(
         .map_err(|error| format!("persist fleet snapshot failed: {error}"))?;
     cleared.sort_unstable();
     Ok((cleared, truncated))
+}
+
+/// Which of `prs` GitHub reports in its merge queue right now, in one
+/// aliased GraphQL read.
+///
+/// Membership is `isInMergeQueue`; `auto_merge` cannot answer it. An
+/// unreadable answer is an error, never "not queued". No PRs, no call.
+fn prs_in_merge_queue(
+    actions: &GitHubActions,
+    repo: &str,
+    prs: &[u64],
+) -> Result<BTreeSet<u64>, String> {
+    if prs.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("repo `{repo}` is not OWNER/REPO"))?;
+    let fields = prs
+        .iter()
+        .map(|pr| format!("pr{pr}:pullRequest(number:{pr}){{isInMergeQueue}}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!(
+                "query=query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{fields}}}}}"
+            ),
+            "-f".to_owned(),
+            format!("owner={owner}"),
+            "-f".to_owned(),
+            format!("name={name}"),
+        ])
+        .map_err(|error| format!("re-check prior queue PR membership failed: {error}"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("could not parse PR membership JSON: {error}"))?;
+    let mut queued = BTreeSet::new();
+    for pr in prs {
+        let in_queue = value
+            .pointer(&format!("/data/repository/pr{pr}/isInMergeQueue"))
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("PR #{pr} membership response missing isInMergeQueue"))?;
+        if in_queue {
+            queued.insert(*pr);
+        }
+    }
+    Ok(queued)
 }
 
 pub(super) fn classify_observation_error(reason: &str) -> ObservationReason {

@@ -33,6 +33,7 @@ pub mod fleet_escalation_cmd;
 mod fleet_status_cmd;
 mod fleet_update_cmd;
 mod governance_cmd;
+mod guards_cmd;
 mod init_cmd;
 mod landability_cmd;
 mod landing_cmd;
@@ -325,6 +326,9 @@ where
         Command::Pin { command } => {
             return pin_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
+        Command::Guards { command } => {
+            return guards_cmd::guards_command(command, cli.json, stdout);
+        }
         Command::Dependency { command } => {
             return dependency_command(command, &cwd, &runtime_paths, cli.json, stdout);
         }
@@ -416,6 +420,7 @@ where
             base,
             run_sample,
             max_job_reads,
+            pr,
         } => {
             return landing_cmd::landing_command(
                 cli.mode.into(),
@@ -425,6 +430,7 @@ where
                     base,
                     run_sample,
                     max_job_reads,
+                    pr,
                     json: cli.json,
                 },
                 stdout,
@@ -641,6 +647,7 @@ fn handle_operational_variant<W: Write>(
         | Command::ExecutionWorker { .. }
         | Command::ParallelProofCanaryWorker { .. }
         | Command::Pin { .. }
+        | Command::Guards { .. }
         | Command::Dependency { .. }
         | Command::Config { .. }
         | Command::Ci { .. }

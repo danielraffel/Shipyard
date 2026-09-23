@@ -16,6 +16,14 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+/// Environment marker set on Shipyard's own queue-mutating `gh` commands.
+///
+/// `gh` may resolve to the `ghapp` wrapper, whose queue-removal and queue-arm
+/// guards refuse ad-hoc arm/enqueue/dequeue requests. Shipyard's own calls are
+/// exact-head, audited, and already admitted by its own policy, so they carry
+/// this marker rather than being re-judged by a second classifier.
+pub const INTERNAL_QUEUE_MUTATION_ENV: &str = "SHIPYARD_INTERNAL_QUEUE_MUTATION";
+
 /// Number of entries requested per merge-queue `entries` page.
 ///
 /// GitHub caps a connection page at 100 nodes.

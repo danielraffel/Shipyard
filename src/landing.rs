@@ -51,6 +51,7 @@ use crate::fleet_service::Boundary;
 pub mod backlog;
 pub mod gather;
 pub mod placement;
+pub mod pr_state;
 pub mod queue;
 pub mod render;
 

@@ -114,6 +114,13 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: PinCommand,
     },
+    /// Install or audit the `ghapp` wrapper's queue guards
+    /// (`queue-removal-guard`, `queue-arm-guard`) from this build's copies.
+    Guards {
+        /// Guards subcommand.
+        #[command(subcommand)]
+        command: GuardsCommand,
+    },
     /// Qualify and pin immutable upstream dependencies.
     Dependency {
         /// Dependency family.
@@ -384,6 +391,12 @@ pub(super) enum Command {
         /// Defaults to 15. Zero skips placement entirely.
         #[arg(long = "max-job-reads", value_name = "COUNT")]
         max_job_reads: Option<usize>,
+        /// Instead of the repository model, classify one pull request's
+        /// merge-queue state (queued, armed, ejected, never armed, merged)
+        /// from GraphQL queue membership and timeline history, with the
+        /// field each fact came from. One API call. Exit 9 when UNKNOWN.
+        #[arg(long, value_name = "NUMBER")]
+        pr: Option<u64>,
     },
     Doctor {
         /// Exact OWNER/REPO used to resolve configured auth token placeholders.
@@ -1624,6 +1637,27 @@ pub(super) enum DaemonCommand {
         /// Repo(s) to reconcile. Defaults to the configured repositories.
         #[arg(long = "repo")]
         repos: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum GuardsCommand {
+    /// Report whether each managed guard is installed and identical to this
+    /// build's copy. Exit 1 when any is missing, stale, or not executable.
+    Status {
+        /// Guards directory. Defaults to `$SHIPYARD_GHAPP_GUARDS_DIR` or
+        /// `~/.config/shipyard/guards`, where `ghapp` looks.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Install this build's guards atomically. Never overwrites a symlink.
+    Install {
+        /// Guards directory. Defaults to where `ghapp` looks.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+        /// Report what would change without writing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 

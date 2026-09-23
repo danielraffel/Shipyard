@@ -1,0 +1,15 @@
+{
+  "number": 8669,
+  "state": "open",
+  "auto_merge": null,
+  "mergeable_state": "unstable",
+  "merged": false,
+  "head": {
+    "sha": "2e7e733bc526b87a80fec9b25f4ce44d21a62398",
+    "ref": "fix/workflow-lint-parallelism-guarded-20260920"
+  },
+  "base": {
+    "ref": "main"
+  },
+  "_note": "Trimmed projection of the real response: title/body/links removed; auto_merge is the field under test."
+}
