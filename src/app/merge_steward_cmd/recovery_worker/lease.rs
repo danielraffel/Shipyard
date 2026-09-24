@@ -17,7 +17,7 @@ const RECOVERY_LEASE_POLL_MILLIS: u64 = 10;
 /// Exclusive ordering proof shared by request/witness publication and clear.
 #[derive(Debug)]
 pub(in crate::app::merge_steward_cmd) struct RecoveryEnqueueLease {
-    _file: File,
+    _file: crate::file_lock::LockedFile,
     store_root: PathBuf,
 }
 
@@ -167,7 +167,7 @@ pub(in crate::app::merge_steward_cmd) fn acquire_recovery_enqueue_lease(
 pub(super) fn acquire_recovery_enqueue_read_lease(
     store_root: &Path,
     deadline: Instant,
-) -> Result<File, CliFailure> {
+) -> Result<crate::file_lock::LockedFile, CliFailure> {
     let path = store_root.join("enqueue-witness.lock");
     let file = OpenOptions::new().read(true).open(&path).map_err(|error| {
         CliFailure::new(
@@ -181,7 +181,11 @@ pub(super) fn acquire_recovery_enqueue_read_lease(
     wait_for_lease(file, deadline, false)
 }
 
-fn wait_for_lease(file: File, deadline: Instant, exclusive: bool) -> Result<File, CliFailure> {
+fn wait_for_lease(
+    file: File,
+    deadline: Instant,
+    exclusive: bool,
+) -> Result<crate::file_lock::LockedFile, CliFailure> {
     loop {
         let result = if exclusive {
             FileExt::try_lock_exclusive(&file)
@@ -189,7 +193,7 @@ fn wait_for_lease(file: File, deadline: Instant, exclusive: bool) -> Result<File
             FileExt::try_lock_shared(&file)
         };
         match result {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(crate::file_lock::LockedFile::new(file)),
             Err(error) if is_file_lock_contended(&error) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {

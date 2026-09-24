@@ -63,6 +63,8 @@ pub mod execution_supervisor;
 pub(crate) mod execution_termination;
 /// Local and remote executor support modules.
 pub mod executor;
+/// Locked files that release their `flock` explicitly on drop.
+pub mod file_lock;
 /// Fail-closed check that a host has converged to the declared fleet epoch.
 pub mod fleet_epoch;
 /// Decide when a fleet verdict should leave the host and reach a human.

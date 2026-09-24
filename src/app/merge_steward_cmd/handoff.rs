@@ -668,6 +668,7 @@ fn resolve_origin_machine(runtime_paths: &RuntimePaths) -> Result<String, CliFai
         .map_err(|error| CliFailure::new(1, format!("open machine identity lock: {error}")))?;
     lock.lock_exclusive()
         .map_err(|error| CliFailure::new(1, format!("lock machine identity: {error}")))?;
+    let _lock = crate::file_lock::LockedFile::new(lock);
 
     let identity_path = runtime_paths.state_dir.join("machine-identity.json");
     match fs::read(&identity_path) {
@@ -1033,7 +1034,10 @@ fn ensure_private_directory(directory: &Path) -> Result<(), CliFailure> {
     Ok(())
 }
 
-fn acquire_handoff_lock(directory: &Path, head: &str) -> Result<fs::File, CliFailure> {
+fn acquire_handoff_lock(
+    directory: &Path,
+    head: &str,
+) -> Result<crate::file_lock::LockedFile, CliFailure> {
     let lock_path = directory.join(format!("{}.lock", head.to_ascii_lowercase()));
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&lock_path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -1056,7 +1060,7 @@ fn acquire_handoff_lock(directory: &Path, head: &str) -> Result<fs::File, CliFai
             format!("another handoff transition owns this exact PR head: {error}"),
         )
     })?;
-    Ok(file)
+    Ok(crate::file_lock::LockedFile::new(file))
 }
 
 fn load_handoff(path: &Path) -> Result<Option<DurableStewardHandoff>, CliFailure> {
@@ -1321,7 +1325,7 @@ fn persist_agent_route_with_transfer(
     save_private_json(path, &stored, "agent route")
 }
 
-fn acquire_agent_route_lock(path: &Path) -> Result<fs::File, CliFailure> {
+fn acquire_agent_route_lock(path: &Path) -> Result<crate::file_lock::LockedFile, CliFailure> {
     let parent = path
         .parent()
         .ok_or_else(|| CliFailure::new(1, "agent route path has no parent"))?;
@@ -1344,7 +1348,7 @@ fn acquire_agent_route_lock(path: &Path) -> Result<fs::File, CliFailure> {
     }
     file.lock_exclusive()
         .map_err(|error| CliFailure::new(1, format!("lock agent route: {error}")))?;
-    Ok(file)
+    Ok(crate::file_lock::LockedFile::new(file))
 }
 
 fn same_immutable_agent_contract(

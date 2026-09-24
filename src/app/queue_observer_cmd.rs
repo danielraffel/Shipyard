@@ -190,7 +190,7 @@ fn observer_actions(
     }
 }
 
-fn acquire_observer_lock(state_path: &Path) -> Result<fs::File, CliFailure> {
+fn acquire_observer_lock(state_path: &Path) -> Result<crate::file_lock::LockedFile, CliFailure> {
     let lock_path = observer_lock_path(state_path);
     let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -216,7 +216,7 @@ fn acquire_observer_lock(state_path: &Path) -> Result<fs::File, CliFailure> {
             format!("queue observer already active for this state path: {error}"),
         )
     })?;
-    Ok(lock)
+    Ok(crate::file_lock::LockedFile::new(lock))
 }
 
 fn observer_lock_path(state_path: &Path) -> PathBuf {
