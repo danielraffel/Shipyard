@@ -121,7 +121,9 @@ project will automatically recover or merge every PR.
   `github-hosted` (or any provider via `--to`). `--rerun-failed`
   dispatches fresh replacements for terminal failed/cancelled runs without
   re-arming the originals; `--all-stuck` is the
-  repo-wide variant. It complements the watchdog for explicitly supported
+  repo-wide variant. `--superseded-merge-group` instead reaps merge_group
+  runs whose `gh-readonly-queue/*` ref GitHub already deleted (audit-only
+  unless `--apply`). It complements the watchdog for explicitly supported
   recovery cases.
 - **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
   operator reason and terminates an active local or SSH validation process tree

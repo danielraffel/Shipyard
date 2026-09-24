@@ -1,0 +1,58 @@
+{
+  "_provenance": "Generous-Corp/pulp runs recorded 2026-09-24. Run 35942471884 is restated as it was while in flight (01:20-01:45Z, superseded when its batch re-formed); 35942990001 is the live successor batch; the pull_request and Release CLI rows are controls.",
+  "total_count": 4,
+  "workflow_runs": [
+    {
+      "id": 35942471884,
+      "name": "Build and Test",
+      "head_branch": "gh-readonly-queue/main/pr-8726-a49be6e6c8da2c3924e6f53cabd8e5c8bf786946",
+      "head_sha": "3b5b81db018ae4a256feb942e0d806e0cb627fcc",
+      "event": "merge_group",
+      "status": "in_progress",
+      "conclusion": null,
+      "created_at": "2026-09-24T01:20:23Z",
+      "run_started_at": "2026-09-24T01:20:23Z",
+      "path": ".github/workflows/build.yml",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35942471884"
+    },
+    {
+      "id": 35942990001,
+      "name": "Build and Test",
+      "head_branch": "gh-readonly-queue/main/pr-8726-0e3c1f6d2b4a5968778695a4b3c2d1e0f9a8b7c6",
+      "head_sha": "4c6c92ec129fbd40d6c1a1e0b3f2a5d6c7e8f901",
+      "event": "merge_group",
+      "status": "in_progress",
+      "conclusion": null,
+      "created_at": "2026-09-24T01:45:02Z",
+      "run_started_at": "2026-09-24T01:45:02Z",
+      "path": ".github/workflows/build.yml",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35942990001"
+    },
+    {
+      "id": 35942000777,
+      "name": "Build and Test",
+      "head_branch": "feature/unrelated",
+      "head_sha": "5d7da3fd23a0ce51e2d2b2f1c4a3b6c7d8e9f012",
+      "event": "pull_request",
+      "status": "in_progress",
+      "conclusion": null,
+      "created_at": "2026-09-24T01:10:00Z",
+      "run_started_at": "2026-09-24T01:10:00Z",
+      "path": ".github/workflows/build.yml",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35942000777"
+    },
+    {
+      "id": 35942000888,
+      "name": "Release CLI",
+      "head_branch": "gh-readonly-queue/main/pr-8700-1111111111111111111111111111111111111111",
+      "head_sha": "6e8eb4fe34b1df62f3e3c3a2d5b4c7d8e9f01234",
+      "event": "merge_group",
+      "status": "in_progress",
+      "conclusion": null,
+      "created_at": "2026-09-24T01:00:00Z",
+      "run_started_at": "2026-09-24T01:00:00Z",
+      "path": ".github/workflows/release-cli.yml",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35942000888"
+    }
+  ]
+}

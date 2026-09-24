@@ -1,0 +1,19 @@
+{
+  "_provenance": "Generous-Corp/pulp queued merge_group run recorded 2026-09-24: queued since 2026-08-19 with zero jobs (GitHub's ghost shape).",
+  "total_count": 1,
+  "workflow_runs": [
+    {
+      "id": 32218602754,
+      "name": "Build and Test",
+      "head_branch": "gh-readonly-queue/main/pr-7677-647fd209c059c55ad1b7893282b8b1105f4524a6",
+      "head_sha": "9df5c0fbd91f5b2058be3ea3d1b1acb750d30845",
+      "event": "merge_group",
+      "status": "queued",
+      "conclusion": null,
+      "created_at": "2026-08-19T05:13:09Z",
+      "run_started_at": "2026-08-19T05:13:09Z",
+      "path": ".github/workflows/build.yml",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/32218602754"
+    }
+  ]
+}
