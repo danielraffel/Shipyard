@@ -112,7 +112,7 @@ fn materialize(
     let checkout = checkout_from_receipt(source_repo, checkout_parent, receipt)?;
     let materialize_guard = acquire_fence(&checkout.lock_path)?;
     ensure_materialized(&checkout)?;
-    fs2::FileExt::unlock(&materialize_guard)
+    fs2::FileExt::unlock(&*materialize_guard)
         .map_err(|error| format!("release integration materialization fence: {error}"))?;
     Ok(checkout)
 }
@@ -206,7 +206,9 @@ fn checkout_from_receipt(
 /// Hold the exact checkout's execution fence and prove its content before a
 /// command can start. The returned file must remain alive through execution,
 /// post-execution verification, and cleanup.
-pub(crate) fn prepare_for_execution(checkout: &IntegrationCheckout) -> Result<fs::File, String> {
+pub(crate) fn prepare_for_execution(
+    checkout: &IntegrationCheckout,
+) -> Result<crate::file_lock::LockedFile, String> {
     ensure_real_directory(
         checkout
             .path
@@ -242,7 +244,7 @@ fn cleanup_state_exists(checkout: &IntegrationCheckout) -> Result<bool, String> 
     Ok(false)
 }
 
-fn acquire_fence(path: &Path) -> Result<fs::File, String> {
+fn acquire_fence(path: &Path) -> Result<crate::file_lock::LockedFile, String> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -252,7 +254,7 @@ fn acquire_fence(path: &Path) -> Result<fs::File, String> {
         .map_err(|error| format!("open integration execution fence: {error}"))?;
     lock.try_lock_exclusive()
         .map_err(|error| format!("integration checkout is already owned: {error}"))?;
-    Ok(lock)
+    Ok(crate::file_lock::LockedFile::new(lock))
 }
 
 /// Recheck exact content while the caller still holds the execution fence.

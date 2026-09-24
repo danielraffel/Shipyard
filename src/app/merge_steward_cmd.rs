@@ -541,7 +541,7 @@ fn try_acquire_admission_observation_lock(
     repo: &str,
     base: &str,
     labels: &[String],
-) -> Result<Option<fs::File>, String> {
+) -> Result<Option<crate::file_lock::LockedFile>, String> {
     let directory = state_dir.join("runner-admission-observation");
     crate::writer_domain_lease::ensure_protected_dir_all(&directory)
         .map_err(|error| format!("could not create admission observation state: {error}"))?;
@@ -558,7 +558,7 @@ fn try_acquire_admission_observation_lock(
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
     drop(writer_domain);
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(crate::file_lock::LockedFile::new(file))),
         Err(error) if lock_is_contended(&error) => Ok(None),
         Err(error) => Err(format!(
             "could not lock admission observation state: {error}"
@@ -1216,7 +1216,9 @@ fn persist_final_ledger(
     }
 }
 
-fn try_acquire_ledger_lock(path: &Path) -> Result<Option<fs::File>, CliFailure> {
+fn try_acquire_ledger_lock(
+    path: &Path,
+) -> Result<Option<crate::file_lock::LockedFile>, CliFailure> {
     let lock_path = path.with_extension("json.lock");
     let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -1251,7 +1253,7 @@ fn try_acquire_ledger_lock(path: &Path) -> Result<Option<fs::File>, CliFailure> 
         })?;
     drop(writer_domain);
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(crate::file_lock::LockedFile::new(file))),
         Err(error) if lock_is_contended(&error) => Ok(None),
         Err(error) => Err(CliFailure::new(
             1,
@@ -1263,7 +1265,7 @@ fn try_acquire_ledger_lock(path: &Path) -> Result<Option<fs::File>, CliFailure> 
     }
 }
 
-fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
+fn acquire_ledger_lock(path: &Path) -> Result<crate::file_lock::LockedFile, CliFailure> {
     try_acquire_ledger_lock(path)?.ok_or_else(|| {
         CliFailure::new(
             1,

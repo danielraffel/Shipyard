@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -189,7 +189,7 @@ fn pin_log_directory<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
-fn acquire_cleanup_lock(state_dir: &Path) -> Result<File, CliFailure> {
+fn acquire_cleanup_lock(state_dir: &Path) -> Result<crate::file_lock::LockedFile, CliFailure> {
     let lock_path = state_dir.join("cleanup.lock");
     let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -204,7 +204,7 @@ fn acquire_cleanup_lock(state_dir: &Path) -> Result<File, CliFailure> {
     drop(writer_domain);
     lock.lock_exclusive()
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    Ok(lock)
+    Ok(crate::file_lock::LockedFile::new(lock))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

@@ -1870,7 +1870,7 @@ pub fn extract_verified_archive(
     extract_verified_archive_locked(path, manifest, authority, destination, space_policy)
 }
 
-fn acquire_extraction_lock(parent: &Path) -> Result<File, Error> {
+fn acquire_extraction_lock(parent: &Path) -> Result<crate::file_lock::LockedFile, Error> {
     let extraction_lock_path = parent.join(".shipyard-artifact-extract.lease");
     reject_symlink(&extraction_lock_path)?;
     let extraction_lock = OpenOptions::new()
@@ -1887,7 +1887,7 @@ fn acquire_extraction_lock(parent: &Path) -> Result<File, Error> {
             Error::Io(error)
         }
     })?;
-    Ok(extraction_lock)
+    Ok(crate::file_lock::LockedFile::new(extraction_lock))
 }
 
 fn extract_verified_archive_locked(
