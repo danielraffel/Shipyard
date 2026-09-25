@@ -439,8 +439,10 @@ def attributor_command(start: pathlib.Path | None = None) -> tuple[list[str], pa
 
 def failed_jobs(owner: str, name: str, run_id: int) -> list[dict[str, Any]]:
     """Every failing job of ``run_id`` with the names of its failing steps."""
+    # Not --paginate: `gh api --paginate` concatenates one JSON object per page,
+    # which is not a JSON document. One large page instead.
     response = run_real_gh(
-        ["api", f"repos/{owner}/{name}/actions/runs/{run_id}/jobs", "--paginate"]
+        ["api", f"repos/{owner}/{name}/actions/runs/{run_id}/jobs?per_page=100"]
     )
     jobs = response.get("jobs") if isinstance(response, dict) else None
     if not isinstance(jobs, list):
@@ -468,9 +470,15 @@ def failed_jobs(owner: str, name: str, run_id: int) -> list[dict[str, Any]]:
 
 
 def _contains_head(owner: str, name: str, head: str, run_head: str) -> bool:
+    """Whether ``run_head``'s history contains ``head``.
+
+    ``compare/base...head`` reports status relative to the BASE, so a batch head
+    built on top of this pull request's head is ``ahead`` of it. ``behind`` and
+    ``diverged`` both mean the batch did not contain this head.
+    """
     response = run_real_gh(["api", f"repos/{owner}/{name}/compare/{head}...{run_head}"])
     status = response.get("status") if isinstance(response, dict) else None
-    return status in ("behind", "identical")
+    return status in ("ahead", "identical")
 
 
 def resolve_ejecting_batch(
@@ -503,15 +511,8 @@ def resolve_ejecting_batch(
     ]
     candidates.sort(key=lambda run: run["created_at"], reverse=True)
     named = f"pr-{number}-"
-    probes = 0
-    for run in candidates:
-        branch = run.get("head_branch") if isinstance(run.get("head_branch"), str) else ""
-        if named not in branch:
-            if probes >= MERGE_GROUP_ANCESTRY_PROBES:
-                break
-            probes += 1
-            if not _contains_head(owner, name, head, run["head_sha"]):
-                continue
+
+    def _selected(run: dict[str, Any]) -> dict[str, Any]:
         run_id = run.get("id")
         if not isinstance(run_id, int):
             raise GuardError("a failed merge_group run carries no id")
@@ -523,6 +524,19 @@ def resolve_ejecting_batch(
             "created_at": run["created_at"],
             "failures": failed_jobs(owner, name, run_id),
         }
+
+    def _branch(run: dict[str, Any]) -> str:
+        branch = run.get("head_branch")
+        return branch if isinstance(branch, str) else ""
+
+    for run in candidates:
+        if named in _branch(run):
+            return _selected(run)
+    # A batch's read-only queue branch names one entry, so a pull request that
+    # was not the namesake needs commit ancestry. Bounded: each probe is a call.
+    for run in candidates[:MERGE_GROUP_ANCESTRY_PROBES]:
+        if _contains_head(owner, name, head, run["head_sha"]):
+            return _selected(run)
     raise GuardError(
         f"no failed merge_group run before {at} contains head {head[:12]}; the ejecting batch "
         "cannot be identified"

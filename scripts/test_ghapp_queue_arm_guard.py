@@ -684,7 +684,12 @@ class BatchAttributionTests(unittest.TestCase):
         self.assertIn("must be a non-empty list of strings", message)
 
     def test_an_ancestry_probe_finds_a_batch_this_pr_did_not_name(self) -> None:
-        """A batch is named after one entry, so a mid-batch member needs ancestry."""
+        """A batch is named after one entry, so a mid-batch member needs ancestry.
+
+        `compare/base...head` reports relative to the BASE, so a batch head built
+        on this PR's head is `ahead` of it. Verified live on the incident:
+        compare/e147f2d0...9b4c3892 is `ahead`, and the reverse is `behind`.
+        """
         listing = copy.deepcopy(fixture("merge_group_failed_runs_listing.json"))
         for run in listing["workflow_runs"]:
             run["head_branch"] = run["head_branch"].replace("pr-8811-", "pr-9999-")
@@ -693,12 +698,58 @@ class BatchAttributionTests(unittest.TestCase):
             [
                 fixture(self.INCIDENT),
                 listing,
-                {"status": "behind"},
+                {"status": "ahead"},
                 fixture("merge_group_run_real_infra_and_build.json")["jobs"],
             ]
         )
         self.assertEqual(code, 0, message)
         self.assertIn("compare/e147f2d09972babcc9977e82a46470e17f9de538...", calls[2][1])
+        self.assertIn("...9b4c3892f326382317340e020e7947c0890d5539", calls[2][1])
+
+    def test_a_batch_that_does_not_contain_this_head_is_not_the_ejecting_batch(self) -> None:
+        """`behind` and `diverged` both mean the batch never contained this head."""
+        listing = copy.deepcopy(fixture("merge_group_failed_runs_listing.json"))
+        for run in listing["workflow_runs"]:
+            run["head_branch"] = run["head_branch"].replace("pr-8811-", "pr-9999-")
+        for status in ("behind", "diverged"):
+            with self.subTest(status=status):
+                self.declare(self.certifies())
+                code, message, _ = self.run_guard(
+                    [fixture(self.INCIDENT), listing, *[{"status": status}] * 3]
+                )
+                self.assertEqual(code, 1)
+                self.assertIn("cannot be identified", message)
+
+    def test_the_named_batch_wins_before_any_ancestry_probe_is_spent(self) -> None:
+        """A probe budget must not be able to hide a named match further down."""
+        listing = copy.deepcopy(fixture("merge_group_failed_runs_listing.json"))
+        runs = listing["workflow_runs"]
+        named = next(run for run in runs if "pr-8811-" in run["head_branch"])
+        others = [run for run in runs if run is not named]
+        # Push the named run behind more decoys than the probe budget allows.
+        for index, run in enumerate(others):
+            run["created_at"] = "2026-09-25T04:1%d:00Z" % min(index, 2)
+        listing["workflow_runs"] = others + [named]
+        self.assertGreater(len(others), guard.MERGE_GROUP_ANCESTRY_PROBES)  # control
+        self.declare(self.certifies())
+        code, message, calls = self.run_guard(
+            [
+                fixture(self.INCIDENT),
+                listing,
+                fixture("merge_group_run_real_infra_and_build.json")["jobs"],
+            ]
+        )
+        self.assertEqual(code, 0, message)
+        # No compare call was needed at all.
+        self.assertTrue(all("compare" not in "".join(call) for call in calls), calls)
+
+    def test_jobs_are_read_without_gh_paginate(self) -> None:
+        """`gh api --paginate` concatenates one object per page, which is not JSON."""
+        self.declare(self.certifies())
+        _, _, calls = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        jobs_call = calls[2]
+        self.assertNotIn("--paginate", jobs_call)
+        self.assertIn("per_page=100", jobs_call[1])
 
     def test_certification_never_names_the_override(self) -> None:
         for verdict in (self.certifies(), {"run_id": self.RUN_ID, "implicates_head": None}):
