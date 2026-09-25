@@ -116,6 +116,16 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
 
 
 class QueueArmGuardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Run from a directory with no `.shipyard/config.toml` above it, so these
+        # cases never pick up a batch attributor from the checkout they run in
+        # and their exact gh-call lists stay meaningful.
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        previous = pathlib.Path.cwd()
+        os.chdir(directory)
+        self.addCleanup(os.chdir, previous)
+
     def run_guard(
         self, args: list[str], responses: list[Any] | None = None, **env: str
     ) -> tuple[int, str, list[list[str]]]:
