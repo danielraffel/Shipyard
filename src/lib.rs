@@ -238,6 +238,8 @@ pub mod tree_drift;
 pub mod tunnel;
 /// Fail-closed policy primitives for contributor-controlled review requests.
 pub mod untrusted;
+/// Test-tier and receipt-decision annotations published by CI jobs.
+pub mod validation_signals;
 /// Terminal-verdict consumption over durable ship-state records.
 pub mod verdicts;
 /// Pure truth evaluators for `shipyard wait`.

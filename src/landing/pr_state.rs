@@ -15,6 +15,7 @@ use crate::pr_queue_state::{
     PR_QUEUE_STATE_QUERY, PrQueueReport, PrQueueState, REST_AUTO_MERGE_PREFACE,
     explain_pr_queue_state, same_head_requeue_allowed, same_head_requeue_cascades,
 };
+use crate::validation_signals::{self, PrValidationSignals};
 
 /// Machine-readable envelope for one PR's queue state.
 #[derive(Clone, Debug, Serialize)]
@@ -31,6 +32,11 @@ pub struct PrStateReport {
     pub classification: PrQueueReport,
     /// What an agent should do next, derived from the classification.
     pub next_action: String,
+    /// How much the head's required checks tested, and the receipt decisions
+    /// of the pull request's merge group(s), read from the
+    /// `shipyard-test-tier` / `shipyard-receipt-decision` annotation contract
+    /// (see [`crate::validation_signals`]).
+    pub validation: PrValidationSignals,
 }
 
 impl PrStateReport {
@@ -51,6 +57,11 @@ pub fn gather(actions: &GitHubActions, repo: &str, pr: u64) -> PrStateReport {
         })),
     };
     let next_action = next_action(&classification.state, pr);
+    let validation = validation_signals::gather_pr(
+        &|args: &[String]| actions.run_gh(args).map_err(|error| error.to_string()),
+        repo,
+        pr,
+    );
     PrStateReport {
         schema_version: super::SCHEMA_VERSION,
         preface: REST_AUTO_MERGE_PREFACE.to_owned(),
@@ -58,6 +69,7 @@ pub fn gather(actions: &GitHubActions, repo: &str, pr: u64) -> PrStateReport {
         pr,
         classification,
         next_action,
+        validation,
     }
 }
 
@@ -162,6 +174,8 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io:
     )?;
     writeln!(stdout, "  {}", report.next_action)?;
     writeln!(stdout)?;
+    write_validation(stdout, &report.validation)?;
+    writeln!(stdout)?;
     writeln!(stdout, "HISTORY")?;
     match &classification.last_ejection {
         Some(ejection) => writeln!(
@@ -192,6 +206,55 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io:
     for fact in &classification.facts {
         writeln!(stdout, "  {:<26} {}", fact.name, fact.value)?;
         writeln!(stdout, "  {:<26} <- {}", "", fact.source)?;
+    }
+    Ok(())
+}
+
+/// Write the VALIDATION block: what the head's green means, and whether the
+/// merge group(s) ran tests.
+pub fn write_validation<W: Write>(
+    stdout: &mut W,
+    validation: &PrValidationSignals,
+) -> std::io::Result<()> {
+    writeln!(stdout, "VALIDATION")?;
+    writeln!(stdout, "  {}", validation.headline())?;
+    for check in &validation.test_tier {
+        writeln!(
+            stdout,
+            "    {}: {}{}",
+            check.check,
+            check.reading.render(),
+            check
+                .check_run_id
+                .map_or_else(String::new, |id| format!("  [check run {id}]"))
+        )?;
+    }
+    for group in &validation.merge_groups {
+        writeln!(
+            stdout,
+            "  merge group {} ({}): {}",
+            group.sha.get(..12).unwrap_or(&group.sha),
+            match group.source {
+                validation_signals::MergeGroupSource::MergeQueueEntry => "queue entry",
+                validation_signals::MergeGroupSource::MergeCommit => "merge commit",
+            },
+            group.headline()
+        )?;
+        for decision in &group.receipt_decisions {
+            writeln!(stdout, "    {}", decision.render())?;
+        }
+        for check in &group.test_tier {
+            writeln!(stdout, "    {}: {}", check.check, check.reading.render())?;
+        }
+        if group.truncated {
+            writeln!(
+                stdout,
+                "    (read bound reached or a read failed; the lists above may be incomplete)"
+            )?;
+        }
+    }
+    for warning in &validation.warnings {
+        writeln!(stdout, "  warning: {warning}")?;
     }
     Ok(())
 }
@@ -280,6 +343,118 @@ mod tests {
         let report = gather(&actions, "Generous-Corp/pulp", 1);
         assert!(report.is_unknown());
         assert!(report.next_action.starts_with("UNKNOWN"));
+    }
+
+    /// A `gh` that answers the queue-state query from a fixture, the
+    /// validation query and REST reads from inline bodies, and 404s the rest.
+    #[cfg(unix)]
+    fn routing_gh(temp: &tempfile::TempDir) -> GitHubActions {
+        let write = |name: &str, body: &serde_json::Value| {
+            let path = temp.path().join(name);
+            std::fs::write(&path, body.to_string()).expect("fixture");
+            path
+        };
+        let tier = r#"{"schema":"shipyard-test-tier/v1","tier":"fast","selector":"pr-fast","full_suite_runs_in":"merge_group"}"#;
+        let decision = r#"{"schema":"shipyard-receipt-decision/v1","target":"macos","verdict":"refuse","reason":"the receipt ran a narrowed tier","source_run_id":null,"selected":null,"passed":null,"skipped":null,"inventory_count":null}"#;
+        let validation = write(
+            "validation.json",
+            &serde_json::json!({"data": {"repository": {"pullRequest": {
+                "headRefOid": "abc123abc123abc1",
+                "mergeCommit": {"oid": "def456def456def4"},
+                "mergeQueueEntry": null,
+                "commits": {"nodes": [{"commit": {"oid": "abc123abc123abc1", "statusCheckRollup": {"contexts": {
+                    "pageInfo": {"hasNextPage": false},
+                    "nodes": [{"__typename": "CheckRun", "databaseId": 77, "name": "macos",
+                               "status": "COMPLETED", "conclusion": "SUCCESS", "isRequired": true}]}}}}]}
+            }}}}),
+        );
+        let tier_annotations = write(
+            "tier.json",
+            &serde_json::json!([{"title": "shipyard-test-tier", "message": tier}]),
+        );
+        let runs = write(
+            "runs.json",
+            &serde_json::json!({"workflow_runs": [{"id": 5, "check_suite_id": 50}]}),
+        );
+        let check_runs = write(
+            "check_runs.json",
+            &serde_json::json!({"total_count": 1, "check_runs": [
+                {"id": 88, "name": "receipt-gate", "check_suite": {"id": 50}, "output": {"annotations_count": 1}}]}),
+        );
+        let decision_annotations = write(
+            "decision.json",
+            &serde_json::json!([{"title": "shipyard-receipt-decision", "message": decision}]),
+        );
+        let path = temp.path().join("gh");
+        crate::test_support::write_executable_script(
+            &path,
+            &format!(
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> '{calls}'\ncase \"$*\" in\n\
+                 *isRequired*) cat '{validation}' ;;\n\
+                 *graphql*) cat '{FIXTURES}/pr_merged.json' ;;\n\
+                 *check-runs/77/annotations*) cat '{tier}' ;;\n\
+                 *actions/runs*) cat '{runs}' ;;\n\
+                 *commits/def456def456def4/check-runs*) cat '{check_runs}' ;;\n\
+                 *check-runs/88/annotations*) cat '{decision}' ;;\n\
+                 *) echo 'HTTP 404' >&2; exit 1 ;;\nesac\n",
+                calls = temp.path().join("calls").display(),
+                validation = validation.display(),
+                tier = tier_annotations.display(),
+                runs = runs.display(),
+                check_runs = check_runs.display(),
+                decision = decision_annotations.display(),
+            ),
+        );
+        actions_for(temp, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_report_separates_fast_tier_green_from_full_validation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = routing_gh(&temp);
+        let report = gather(&actions, "Generous-Corp/pulp", 42);
+        let mut out = Vec::new();
+        write_human(&mut out, &report).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(
+                "PR head abc123abc123 GREEN on the fast tier, NOT full validation: validated on \
+                 the fast tier (pr-fast) by macos; the full suite runs in merge_group, not on \
+                 this head"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "merge group def456def456 (merge commit): full suite ran in this merge group"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "    macos: validated in full: receipt refused because the receipt ran a \
+                 narrowed tier"
+            ),
+            "{text}"
+        );
+        let mut json_out = Vec::new();
+        write_json(&mut json_out, &report).expect("json");
+        let value: Value = serde_json::from_slice(&json_out).expect("json");
+        assert_eq!(value["validation"]["test_tier_verdict"]["tier"], "fast");
+        assert_eq!(
+            value["validation"]["test_tier"][0]["reading"]["selector"],
+            "pr-fast"
+        );
+        assert_eq!(
+            value["validation"]["merge_groups"][0]["receipt_decisions"][0]["verdict"],
+            "refuse"
+        );
+        assert_eq!(
+            value["validation"]["merge_groups"][0]["source"],
+            "merge_commit"
+        );
+        assert_eq!(value["validation"]["api_calls"], 5);
     }
 
     #[test]
