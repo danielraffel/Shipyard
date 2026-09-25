@@ -925,6 +925,7 @@ fn handle_ship_variant<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let arm_auto_merge = command.arm_auto_merge().unwrap_or(true);
     let Command::Ship {
         pr,
         base,
@@ -940,7 +941,7 @@ fn handle_ship_variant<W: Write>(
         skip_targets,
         adopt_head,
         foreground,
-        no_arm,
+        no_arm: _,
     } = command
     else {
         unreachable!("ship variant required")
@@ -970,7 +971,7 @@ fn handle_ship_variant<W: Write>(
             steward_handoff: None,
             invocation: ship_cmd::ShipInvocation::Direct,
             foreground,
-            arm_auto_merge: !no_arm,
+            arm_auto_merge,
         },
         mode,
         cwd,
@@ -988,6 +989,7 @@ fn handle_pr_variant<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let arm_auto_merge = command.arm_auto_merge().unwrap_or(true);
     let Command::Pr {
         base,
         apply_bumps,
@@ -1007,7 +1009,7 @@ fn handle_pr_variant<W: Write>(
         workstream_id,
         context_url,
         no_steward_handoff,
-        no_arm,
+        no_arm: _,
     } = command
     else {
         unreachable!("pr variant required")
@@ -1038,7 +1040,7 @@ fn handle_pr_variant<W: Write>(
                 StewardHandoffPreference::ProjectDefault
             },
             python_command: None,
-            arm_auto_merge: !no_arm,
+            arm_auto_merge,
         },
         &config,
         cwd,

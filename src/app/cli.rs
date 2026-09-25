@@ -2437,6 +2437,24 @@ pub(super) enum MergeResult {
     Failure,
 }
 
+impl Command {
+    /// Whether this command should arm GitHub-native auto-merge.
+    ///
+    /// The inversion of `--no-arm` lives here, once, because both `ship` and
+    /// `pr` feed it into `ShipCommandArgs::arm_auto_merge`. Two open-coded
+    /// `!no_arm` expressions would each be a silent place for arming to
+    /// default off, with nothing downstream to notice.
+    ///
+    /// `None` for commands that never open or adopt a pull request.
+    #[must_use]
+    pub(crate) const fn arm_auto_merge(&self) -> Option<bool> {
+        match self {
+            Self::Ship { no_arm, .. } | Self::Pr { no_arm, .. } => Some(!*no_arm),
+            _ => None,
+        }
+    }
+}
+
 impl MergeMethod {
     pub(super) fn gh_flag(self) -> &'static str {
         match self {
@@ -2908,5 +2926,50 @@ mod tests {
         assert_eq!(source_run_id, 33_439_971_439);
         assert_eq!(min_age_minutes, 45);
         assert!(!apply);
+    }
+
+    /// Arming must be the DEFAULT on every route into `ship`, and `--no-arm`
+    /// must be the only thing that turns it off. This asserts the RESOLVED
+    /// value that reaches `ShipCommandArgs`, not merely that clap saw the
+    /// flag: a regression here is silent, and pull requests simply stop being
+    /// armed and sit unqueued again.
+    #[test]
+    fn arming_is_on_by_default_and_only_no_arm_disables_it() {
+        for (argv, expected) in [
+            (vec!["shipyard", "pr"], Some(true)),
+            (vec!["shipyard", "pr", "--no-arm"], Some(false)),
+            (vec!["shipyard", "ship"], Some(true)),
+            (vec!["shipyard", "ship", "--no-arm"], Some(false)),
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("parses");
+            assert_eq!(cli.command.arm_auto_merge(), expected, "{argv:?}");
+        }
+    }
+
+    /// A command that never opens or adopts a pull request has no opinion, so
+    /// the resolver must not claim one.
+    #[test]
+    fn a_command_that_owns_no_pull_request_resolves_no_arm_opinion() {
+        let cli = Cli::try_parse_from(["shipyard", "status"]).expect("parses");
+        assert_eq!(cli.command.arm_auto_merge(), None);
+    }
+
+    /// The steward backstop is opt-in: its absence is the default and
+    /// `--arm-unqueued` is what turns it on.
+    #[test]
+    fn the_steward_backstop_is_opt_in() {
+        for (argv, expected) in [
+            (vec!["shipyard", "runner", "steward"], false),
+            (vec!["shipyard", "runner", "steward", "--arm-unqueued"], true),
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("parses");
+            let Command::Runner { command } = cli.command else {
+                panic!("expected runner command for {argv:?}");
+            };
+            let RunnerCommand::Steward { arm_unqueued, .. } = command else {
+                panic!("expected steward subcommand for {argv:?}");
+            };
+            assert_eq!(arm_unqueued, expected, "{argv:?}");
+        }
     }
 }
