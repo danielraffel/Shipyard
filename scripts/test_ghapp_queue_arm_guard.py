@@ -543,7 +543,10 @@ class BatchAttributionTests(unittest.TestCase):
         self.declare(self.certifies())
         code, message, calls = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
         self.assertEqual(code, 0, message)
-        self.assertEqual(message, "")
+        # A certified allow lifts a protective refusal, so it is audited.
+        self.assertIn("queue-arm-guard: note:", message)
+        self.assertIn("batch attributor certified", message)
+        self.assertIn("Install ccache (macOS)", message)
         # The resolver picked the ejecting run, not the newer failed batch.
         self.assertIn(f"repos/Generous-Corp/pulp/actions/runs/{self.RUN_ID}/jobs", calls[2][1])
         argv = (self.root / "argv").read_text(encoding="utf-8")
@@ -750,6 +753,25 @@ class BatchAttributionTests(unittest.TestCase):
         jobs_call = calls[2]
         self.assertNotIn("--paginate", jobs_call)
         self.assertIn("per_page=100", jobs_call[1])
+
+    def test_a_repo_relative_program_is_resolved_against_the_repo_root(self) -> None:
+        """subprocess does not search `cwd=` for the executable."""
+        runner = self.root / "bin" / "attribute.sh"
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        runner.write_text(
+            "#!/bin/sh\nprintf '%s' '" + json.dumps(self.certifies()) + "'\n", encoding="utf-8"
+        )
+        runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+        (self.root / ".shipyard").mkdir(parents=True, exist_ok=True)
+        (self.root / ".shipyard" / "config.toml").write_text(
+            '[queue.attribution]\ncommand = ["bin/attribute.sh"]\n', encoding="utf-8"
+        )
+        # Run from a subdirectory so the parent cwd is not the repo root.
+        nested = self.root / "deep" / "deeper"
+        nested.mkdir(parents=True, exist_ok=True)
+        os.chdir(nested)
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 0, message)
 
     def test_certification_never_names_the_override(self) -> None:
         for verdict in (self.certifies(), {"run_id": self.RUN_ID, "implicates_head": None}):

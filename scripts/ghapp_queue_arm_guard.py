@@ -563,7 +563,20 @@ def read_attributor_verdict(
     ``implicates_head``, nor an ``other_pull_request`` verdict that names this
     same pull request.
     """
-    argv = [*command, "--repo", repo, "--pr", str(number), "--run-id", str(batch["run_id"])]
+    program = command[0]
+    # `cwd=` is applied to the child, but Python does not search it for the
+    # executable, so a repo-relative program has to be resolved here.
+    if not pathlib.PurePath(program).is_absolute() and (
+        "/" in program or "\\" in program
+    ):
+        program = str(root / program)
+    argv = [
+        program,
+        *command[1:],
+        "--repo", repo,
+        "--pr", str(number),
+        "--run-id", str(batch["run_id"]),
+    ]
     try:
         completed = subprocess.run(
             argv,
@@ -885,6 +898,9 @@ def main(args: list[str]) -> int:
         verdicts.append(decide(target, attribution))
     refusals = [message for allowed, message in verdicts if not allowed]
     if not refusals:
+        for allowed, message in verdicts:
+            if allowed and "batch attributor certified" in message:
+                print(f"queue-arm-guard: note: {message}", file=sys.stderr)
         return 0
     message = " | ".join(refusals)
     if override:
