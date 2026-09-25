@@ -50,6 +50,54 @@ truthful on release PRs.
 
 Shipyard coordinates validation across local, SSH, and cloud targets.
 
+## `shipyard pr` arms auto-merge; you no longer do it by hand
+
+`ship` arms GitHub-native auto-merge (merge method **MERGE**) as soon as it
+knows the pull request, from the one chokepoint every route into `ship` shares —
+so `shipyard pr`, a bare `shipyard ship`, and `shipyard ship --pr <n>` all arm.
+Do **not** follow a ship with a hand-rolled `enablePullRequestAutoMerge`
+mutation; check the result instead.
+
+Why it exists: Shipyard's own admission path enqueues a head only *after* it has
+validated it, which happens only while a Shipyard process is alive. When a ship
+lost its merge phase, the pull request was left green, unqueued and unarmed,
+with nothing on GitHub's side left to move it — measured at 6 of 12 open pull
+requests on one repository. Native auto-merge is server-owned, so it survives
+the process that armed it.
+
+What the transcript line means:
+
+| line | meaning |
+|------|---------|
+| `▸ Auto-merge armed on #N` | GitHub will enqueue it when its required checks pass |
+| `▸ Auto-merge left as it is on #N: …` | nothing to do (already armed, already queued, draft, ejected on this head, not yet green) — **not** a failure |
+| `⚠︎ Auto-merge not armed on #N: …` | the arm did not happen and the ship continued; re-check with `shipyard landing --pr <n>` |
+
+In `--json` mode that line goes to **stderr**, because stdout carries one
+envelope.
+
+`--no-arm` opts out for one invocation; the `shipyard:no-auto-merge` label opts a
+pull request out permanently. Neither is something to reach for by default.
+
+Two things not to conclude from it:
+
+- **A refusal is usually the `ghapp` queue-arm guard agreeing there is nothing to
+  arm.** These requests deliberately do not carry Shipyard's internal queue
+  marker, so the guard judges them. Report it and move on; never retry it, and
+  never set `GHAPP_ALLOW_QUEUE_REARM`.
+- **Armed is not merged.** GitHub still waits for the repository's required
+  checks and refuses drafts itself. But note the converse: once armed, GitHub
+  may merge as soon as the *required* set is green, which can be before
+  Shipyard's broader target set finishes if the required set is narrower.
+
+The periodic counterpart for pull requests that slipped through anyway — opened
+by another route, or ejected and left unarmed — is
+`shipyard runner steward --arm-unqueued` (audit-only without `--apply`), with
+`scripts/install_arm_unqueued.sh` to run it on a timer. It acts only on pull
+requests the steward itself declines to own, so it cannot contend with the
+enqueue path. See the shipyard skill's
+[merge-steward reference](../shipyard/references/merge-steward.md).
+
 ## Quick reference
 
 | Task | Command |
