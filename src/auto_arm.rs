@@ -296,6 +296,39 @@ pub fn arm_mutation_args(node_id: &str) -> Vec<String> {
     ]
 }
 
+/// Whether a mutation response proves a pull request came back armed.
+///
+/// GitHub answers a *rejected* GraphQL mutation with HTTP 200 plus an `errors`
+/// array, so a successful exit status proves nothing. Both conditions are
+/// load-bearing and neither implies the other: a partial success carries the
+/// mutation payload *and* an `errors` array, and a hard rejection carries a
+/// null payload with no payload key at all.
+#[must_use]
+pub fn arm_response_accepted(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|value| {
+        value.get("errors").is_none()
+            && value
+                .pointer("/data/enablePullRequestAutoMerge/pullRequest")
+                .is_some_and(|pull_request| !pull_request.is_null())
+    })
+}
+
+/// The first GraphQL error message in a response, for reporting.
+#[must_use]
+pub fn first_graphql_error(raw: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("errors")?
+                .as_array()?
+                .first()?
+                .get("message")?
+                .as_str()
+                .map(str::to_owned)
+        })
+}
+
 /// Whether a failed arm attempt was the `ghapp` arm guard declining it.
 ///
 /// The guard refuses exactly the states this module also refuses, so its

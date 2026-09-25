@@ -1,6 +1,7 @@
 use super::{
-    ArmSkip, ArmVerdict, NATIVE_AUTO_MERGE_MUTATION, arm_mutation_args, decide_from_queue_state,
-    is_arm_guard_refusal, merge_state_is_arm_ready, preselect_backstop_candidate,
+    ArmSkip, ArmVerdict, NATIVE_AUTO_MERGE_MUTATION, arm_mutation_args, arm_response_accepted,
+    decide_from_queue_state, first_graphql_error, is_arm_guard_refusal, merge_state_is_arm_ready,
+    preselect_backstop_candidate,
 };
 use crate::merge_steward::StewardPullRequest;
 use crate::pr_queue_state::PrQueueState;
@@ -54,6 +55,54 @@ fn arm_mutation_args_bind_the_node_id_as_a_variable() {
         args.iter()
             .all(|arg| !arg.starts_with("query=") || !arg.contains("PR_kwDOABCD"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Reading the mutation response
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_response_carrying_the_armed_pull_request_is_accepted() {
+    assert!(arm_response_accepted(
+        r#"{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7}}}}"#
+    ));
+}
+
+/// GitHub answers a PARTIAL failure with HTTP 200, the mutation payload, AND an
+/// `errors` array. Without the errors check this reads as a clean success, so
+/// this case is the only one that makes that check load-bearing.
+#[test]
+fn a_partial_success_carrying_both_a_payload_and_errors_is_not_accepted() {
+    assert!(!arm_response_accepted(
+        r#"{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7}}},
+            "errors":[{"message":"Something went wrong while executing your query"}]}"#
+    ));
+}
+
+#[test]
+fn a_null_payload_is_not_accepted() {
+    assert!(!arm_response_accepted(
+        r#"{"data":{"enablePullRequestAutoMerge":null}}"#
+    ));
+}
+
+#[test]
+fn a_response_without_the_mutation_payload_is_not_accepted() {
+    assert!(!arm_response_accepted(r#"{"data":{}}"#));
+    assert!(!arm_response_accepted("not json"));
+}
+
+#[test]
+fn the_first_graphql_error_is_reported_for_a_rejection() {
+    assert_eq!(
+        first_graphql_error(
+            r#"{"errors":[{"message":"Pull request is in clean status"},
+                          {"message":"second"}]}"#
+        )
+        .as_deref(),
+        Some("Pull request is in clean status")
+    );
+    assert_eq!(first_graphql_error(r#"{"data":{}}"#), None);
 }
 
 // ---------------------------------------------------------------------------

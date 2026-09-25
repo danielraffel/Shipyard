@@ -42,8 +42,8 @@ use serde::Serialize;
 
 use super::{GitHubActions, ObservedPr, PrReport, RepoObservation, StewardDecision};
 use crate::auto_arm::{
-    ArmSkip, ArmVerdict, arm_mutation_args, decide_from_queue_state, is_arm_guard_refusal,
-    preselect_backstop_candidate,
+    ArmSkip, ArmVerdict, arm_mutation_args, arm_response_accepted, decide_from_queue_state,
+    first_graphql_error, is_arm_guard_refusal, preselect_backstop_candidate,
 };
 use crate::pr_queue_state::{PR_QUEUE_STATE_QUERY, explain_pr_queue_state};
 
@@ -309,29 +309,6 @@ fn read_queue_state(
         ])
         .map_err(|error| error.to_string())?;
     serde_json::from_str(&raw).map_err(|error| format!("malformed GraphQL JSON: {error}"))
-}
-
-fn arm_response_accepted(raw: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|value| {
-        value.get("errors").is_none()
-            && value
-                .pointer("/data/enablePullRequestAutoMerge/pullRequest")
-                .is_some_and(|pull_request| !pull_request.is_null())
-    })
-}
-
-fn first_graphql_error(raw: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("errors")?
-                .as_array()?
-                .first()?
-                .get("message")?
-                .as_str()
-                .map(str::to_owned)
-        })
 }
 
 #[cfg(test)]

@@ -30,7 +30,8 @@
 use serde_json::Value;
 
 use crate::auto_arm::{
-    ArmVerdict, arm_mutation_args, decide_from_queue_state, is_arm_guard_refusal,
+    ArmVerdict, arm_mutation_args, arm_response_accepted, decide_from_queue_state,
+    first_graphql_error, is_arm_guard_refusal,
 };
 use crate::pr_queue_state::{PR_QUEUE_STATE_QUERY, explain_pr_queue_state};
 
@@ -160,31 +161,6 @@ fn read_queue_state(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<Value, Str
         format!("number={pr}"),
     ])?;
     serde_json::from_str(&raw).map_err(|error| format!("malformed GraphQL JSON: {error}"))
-}
-
-/// Whether the mutation response proves a pull request came back armed.
-///
-/// A `200` carrying a GraphQL `errors` array is a failure; only the presence of
-/// the mutation's own payload counts.
-fn arm_response_accepted(raw: &str) -> bool {
-    serde_json::from_str::<Value>(raw).is_ok_and(|value| {
-        value.get("errors").is_none()
-            && value
-                .pointer("/data/enablePullRequestAutoMerge/pullRequest")
-                .is_some_and(|pull_request| !pull_request.is_null())
-    })
-}
-
-fn first_graphql_error(raw: &str) -> Option<String> {
-    serde_json::from_str::<Value>(raw).ok().and_then(|value| {
-        value
-            .get("errors")?
-            .as_array()?
-            .first()?
-            .get("message")?
-            .as_str()
-            .map(str::to_owned)
-    })
 }
 
 /// Collapse a multi-line `gh` diagnostic so one arm result stays one line.
