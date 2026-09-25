@@ -789,6 +789,33 @@ class BatchAttributionTests(unittest.TestCase):
         code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
         self.assertEqual(code, 0, message)
 
+    def test_no_fixture_reaches_an_attributor_when_none_is_declared(self) -> None:
+        """The compatibility contract: opting out costs nothing and changes nothing.
+
+        Installing this guard must not alter behaviour for a repository with no
+        `[queue.attribution]`, because the guards directory is shared by every
+        Shipyard binary on the host.
+        """
+        asked = []
+        with mock.patch.object(
+            guard, "resolve_ejecting_batch", side_effect=AssertionError("resolved a batch")
+        ), mock.patch.object(guard, "attributor_command", wraps=guard.attributor_command) as spy:
+            for path in sorted(FIXTURES.glob("pr_*.json")):
+                body = json.loads(path.read_text(encoding="utf-8"))
+                classified = guard.classify_pr_queue_state(body)
+                verdict = guard.attribute_ejecting_batch(classified, "Generous-Corp/pulp")
+                self.assertIsNone(verdict, path.name)
+                # An uncertified/None verdict must leave the decision untouched.
+                self.assertEqual(
+                    guard.decide(classified), guard.decide(classified, verdict), path.name
+                )
+                asked.append(path.name)
+            # Control: the corpus really was walked, and same-head failed_checks
+            # cases (the only ones that could consult an attributor) were in it.
+            self.assertGreaterEqual(len(asked), 10)
+            self.assertIn(self.INCIDENT, asked)
+            self.assertGreaterEqual(spy.call_count, 1)
+
     def test_certification_never_names_the_override(self) -> None:
         for verdict in (self.certifies(), {"run_id": self.RUN_ID, "implicates_head": None}):
             with self.subTest(verdict=verdict):
