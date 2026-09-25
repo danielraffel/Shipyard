@@ -844,6 +844,7 @@ tartci runtime export --repo Generous-Corp/pulp |
   shipyard metrics import tartci --json
 shipyard metrics summary --project pulp --json
 shipyard metrics scorecard --project pulp --since 30d --json
+shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
 shipyard metrics watch --project pulp --since 14d --json
 shipyard metrics advise --project pulp --json
 shipyard metrics compare --project pulp --baseline github-hosted --candidate macstudio --json

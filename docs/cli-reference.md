@@ -77,6 +77,7 @@ shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics summary --project pulp --json
 shipyard metrics scorecard --project pulp --since 30d --json
+shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
 shipyard metrics slowest --project pulp --limit 20
 shipyard metrics watch --project pulp --since 14d --json
 shipyard metrics advise --project pulp --profile normal --json

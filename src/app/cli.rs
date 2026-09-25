@@ -894,6 +894,74 @@ pub(crate) enum MetricsCommand {
     Advise(MetricsAdviseArgs),
     /// Emit one compact stewardship scorecard with explicit telemetry gaps.
     Scorecard(MetricsWatchArgs),
+    /// Read-only: required-gate minutes per merged PR, merge-queue batch
+    /// fullness, and merge-group receipt reuse, read live from GitHub.
+    ///
+    /// Definitions:
+    ///
+    /// gate minutes = wall minutes (`completed_at - started_at`) of every job
+    /// named exactly --gate-job in runs of --workflow whose event is one of
+    /// --event and whose run was created in the window. Every attempt counts,
+    /// including failed and cancelled ones: waste is a cost. Runs from events
+    /// other than `merge_group` are reported as PR-head runs.
+    ///
+    /// gate minutes per merged PR = total gate minutes / pull requests merged
+    /// into --base in the window (GitHub search).
+    ///
+    /// batch fullness = pull requests per merge-queue push to --base (one
+    /// `merge_queue_merge` repository activity), counted by walking the pushed
+    /// head's first-parent chain back to the pre-push commit, against the
+    /// ruleset's `max_entries_to_merge`. Reported as mean and distribution.
+    ///
+    /// receipt reuse rate = merge-group runs in which a
+    /// `shipyard-receipt-decision/v1` annotation reported verdict `reuse` for
+    /// --receipt-target, divided by all merge-group runs of --workflow. A run
+    /// that published no decision counts as not reused and is named as a gap.
+    ///
+    /// Every list is paginated completely; a read whose length disagrees with
+    /// the API's `total_count` fails instead of reporting a smaller number.
+    /// Defaults for every flag may be set in `[metrics.gate_cost]` of
+    /// `.shipyard/config.toml` (keys: `repo`, `workflow`, `gate_job`,
+    /// `base_branch`, `events`, `receipt_job`, `receipt_target`). Run it from inside a checkout of
+    /// the repository so GitHub credentials resolve for it.
+    #[command(name = "gate-cost", verbatim_doc_comment)]
+    GateCost(Box<MetricsGateCostArgs>),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsGateCostArgs {
+    /// Owner/repo slug.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Workflow file name or id hosting the gate job, for example `build.yml`.
+    #[arg(long)]
+    pub(crate) workflow: Option<String>,
+    /// Exact name of the required gate job, for example `macos`.
+    #[arg(long = "gate-job")]
+    pub(crate) gate_job: Option<String>,
+    /// Protected branch the merge queue merges into. Defaults to `main`.
+    #[arg(long)]
+    pub(crate) base: Option<String>,
+    /// Workflow-run event counted as a gate run. Repeatable. Defaults to
+    /// `pull_request` and `merge_group`.
+    #[arg(long = "event")]
+    pub(crate) events: Vec<String>,
+    /// Only read receipt decisions from jobs with this exact name. Default:
+    /// every job of the merge-group run that ran.
+    #[arg(long = "receipt-job")]
+    pub(crate) receipt_job: Option<String>,
+    /// Target a reuse decision must name. Defaults to the gate job name.
+    #[arg(long = "receipt-target")]
+    pub(crate) receipt_target: Option<String>,
+    /// Window length ending at --to (or now), for example `48h` or `7d`.
+    #[arg(long, default_value = "48h", conflicts_with = "from")]
+    pub(crate) since: String,
+    /// Window start, RFC 3339. Overrides --since.
+    #[arg(long)]
+    pub(crate) from: Option<String>,
+    /// Window end, RFC 3339 (exclusive). Defaults to now.
+    #[arg(long)]
+    pub(crate) to: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2550,6 +2618,52 @@ mod tests {
         };
         assert_eq!(args.project, "pulp");
         assert_eq!(args.since, "30d");
+    }
+
+    #[test]
+    fn metrics_gate_cost_parses_repeatable_events_and_window() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "metrics",
+            "gate-cost",
+            "--repo",
+            "o/r",
+            "--workflow",
+            "build.yml",
+            "--gate-job",
+            "macos",
+            "--event",
+            "pull_request",
+            "--event",
+            "merge_group",
+            "--from",
+            "2026-09-24T00:00:00Z",
+        ])
+        .expect("metrics gate-cost");
+        let Command::Metrics { command } = cli.command else {
+            panic!("expected metrics command");
+        };
+        let super::MetricsCommand::GateCost(args) = *command else {
+            panic!("expected metrics gate-cost command");
+        };
+        assert_eq!(args.repo.as_deref(), Some("o/r"));
+        assert_eq!(args.gate_job.as_deref(), Some("macos"));
+        assert_eq!(args.events, ["pull_request", "merge_group"]);
+        assert_eq!(args.from.as_deref(), Some("2026-09-24T00:00:00Z"));
+        assert_eq!(args.since, "48h");
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "metrics",
+                "gate-cost",
+                "--since",
+                "2d",
+                "--from",
+                "2026-09-24T00:00:00Z",
+            ])
+            .is_err(),
+            "--since and --from conflict"
+        );
     }
 
     #[test]
