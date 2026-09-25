@@ -258,8 +258,7 @@ pub(super) fn ship_command<W: Write>(
             &repo,
             pr_context.number,
         );
-        writeln!(stdout, "{}", outcome.line)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        report_arm_outcome(&outcome, json_mode, stdout)?;
     }
     let steward_handoff = apply_requested_steward_handoff(
         args.steward_handoff.as_ref(),
@@ -918,6 +917,24 @@ fn create_current_branch_pr(
 }
 
 mod auto_arm;
+
+/// Put one arm result where the caller's output mode can carry it.
+///
+/// In JSON mode stdout carries exactly one envelope, so a plain line there
+/// corrupts the output for every consumer that parses this command. The result
+/// is still worth saying, so it goes to stderr instead of being dropped.
+fn report_arm_outcome<W: Write>(
+    outcome: &auto_arm::ArmOutcome,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    if json_mode {
+        let _ = crate::writer_domain_lease::write_stderr(format_args!("{}", outcome.line));
+        return Ok(());
+    }
+    writeln!(stdout, "{}", outcome.line).map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
 mod post_validation;
 use post_validation::{ShipRenderState, post_run_merge_state};
 

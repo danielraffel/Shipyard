@@ -279,3 +279,37 @@ fn a_repo_without_owner_and_name_arms_nothing() {
     assert!(outcome.line.contains("could not be read"));
     assert!(!gh.called("enablePullRequestAutoMerge"));
 }
+
+// ---------------------------------------------------------------------------
+// Where the result is written
+// ---------------------------------------------------------------------------
+
+/// `--json` puts exactly one envelope on stdout. A plain arm line there would
+/// corrupt it for every consumer that parses this command's output.
+#[test]
+fn json_mode_keeps_the_arm_line_off_stdout() {
+    let outcome = ArmOutcome {
+        armed: true,
+        line: "▸ Auto-merge armed on #7".to_owned(),
+    };
+    let mut stdout = Vec::new();
+    super::super::report_arm_outcome(&outcome, true, &mut stdout).expect("reported");
+    assert!(
+        stdout.is_empty(),
+        "stdout must stay envelope-only: {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn human_mode_writes_the_arm_line_to_stdout() {
+    let outcome = ArmOutcome {
+        armed: false,
+        line: "▸ Auto-merge left as it is on #7: it is a draft".to_owned(),
+    };
+    let mut stdout = Vec::new();
+    super::super::report_arm_outcome(&outcome, false, &mut stdout).expect("reported");
+    let text = String::from_utf8(stdout).expect("utf8");
+    assert!(text.contains("Auto-merge left as it is on #7"), "{text}");
+    assert!(text.ends_with('\n'), "{text:?}");
+}
