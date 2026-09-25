@@ -25,6 +25,20 @@ wrong in at least one way that mattered (see "The trap" below).
 | `pr_real_truncated_same_head_ejected.json` | 8638 | **Real timeline, truncated; state fields set to what GitHub showed between those events.** 8638's full timeline (23 items, paginated read 2026-09-22T23:19:27Z) cut right after item 16, `RemovedFromMergeQueueEvent(failed_checks)` at 2026-09-22T10:26:42Z; live, the next event was a same-head `AddedToMergeQueueEvent` at 10:32:31Z. `isInMergeQueue=false`, `mergeQueueEntry=null`, `autoMergeRequest=null`, `headRefOid` = the last commit before the cut. Provenance is in the file's `_provenance` object. |
 | `pr_synthetic_truncated_window.json` | 900001 | **SYNTHETIC.** Hand-built: `hasPreviousPage: true` and no removal or new head in the window, which must classify `unknown`. |
 | `pr_merged.json` | 8721 | `MergedEvent` then `RemovedFromMergeQueueEvent(reason: merged)`. The removal is **not** an ejection. |
+| `pr_real_8811_same_head_ejected.json` | 8811 | **Real timeline, cut at the ejection.** Live capture cut right after `RemovedFromMergeQueueEvent(failed_checks)` at 2026-09-25T04:12:51Z, so it reproduces the state the guard saw: ejected, head `e147f2d0`, no new head since. The live PR has since advanced to `5a1cf562`, so this state is only reachable by cutting. `isInMergeQueue=false`, `mergeQueueEntry=null`, `autoMergeRequest=null`. The batch that ejected it is `merge_group` run 36093055057, below. |
+
+### Merge-queue batch runs
+
+Read by the queue-arm guard's batch resolver (`repos/.../actions/runs?event=merge_group&status=failure`,
+then `.../runs/<id>/jobs`). Only `id`/`name`/`conclusion` and each step's
+`number`/`name`/`conclusion` are retained; provenance is in each file's
+`_provenance` object.
+
+| file | run | what it pins |
+|---|---|---|
+| `merge_group_failed_runs_listing.json` | 20 runs | The listing the resolver scans, newest first. Contains the two runs below plus 36090859921 (#8807), whose `Linux (x64) [github-hosted]` job also failed at `Build` for the same pre-existing cause: a `(job, step)` pair is not a fingerprint. |
+| `merge_group_run_real_infra_and_build.json` | 36093055057 | The batch that ejected #8811. Batch of one: head commit `9b4c3892` has parents `2c2e767d` (main) and `e147f2d0` (the PR head). `macos` failed at `Install ccache (macOS)`; `Linux (x64) [github-hosted]` failed at `Build`, on CMake test discovery for `pulp-test-group-canvas`, which is registered at the batch base in `test/cmake/script_canvas_render_tests.cmake:240` and untouched by the PR. **Neither failure is a ctest failure**, which is why absence of test-failure evidence cannot certify a head. |
+| `merge_group_run_real_test_failure.json` | 36103973610 | A batch whose failure **is** a test failure: `Linux (x64) [github-hosted]` at `Test (non-Windows)` and `Surface ctest failures (non-Windows)`. Negative control for the certification rules. |
 | `rest_pull_queued.json` | 8669 | `GET repos/Generous-Corp/pulp/pulls/8669` while the PR was queued, trimmed to the fields that matter. `auto_merge` is `null`. |
 | `ruleset_merge_queue.json` | - | `GET repos/Generous-Corp/pulp/rulesets/19431100` (`MERGE`, `ALLGREEN`, merge 5, build 3). |
 | `classic_protection.json` | - | `GET repos/Generous-Corp/pulp/branches/main/protection`. It has no field that can express a merge queue. |
