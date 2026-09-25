@@ -1,5 +1,7 @@
 use super::*;
+#[cfg(unix)]
 use crate::config::{LoadedConfig, LocalOverlaySource};
+#[cfg(unix)]
 use std::path::PathBuf;
 
 const FIXTURES: &str = concat!(
@@ -149,6 +151,7 @@ fn run_reap(
     (result, envelope)
 }
 
+#[cfg(unix)]
 fn row_for(envelope: &Value, run_id: u64) -> Option<Value> {
     envelope
         .pointer("/data/runs")
@@ -159,6 +162,7 @@ fn row_for(envelope: &Value, run_id: u64) -> Option<Value> {
         .cloned()
 }
 
+#[cfg(unix)]
 fn status_of(envelope: &Value, run_id: u64) -> Option<String> {
     row_for(envelope, run_id)?
         .get("status")
