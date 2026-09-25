@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02131"></a>
+## [0.213.1] - 2026-09-25
+
+- fix/release ci keychain ignores host secrets ([#613](https://github.com/danielraffel/Shipyard/pull/613))
+
 <a id="v02130"></a>
 ## [0.213.0] - 2026-09-24
 
@@ -1564,6 +1569,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.213.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.213.1
 [0.213.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.213.0
 [0.212.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.212.0
 [0.211.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.211.0
