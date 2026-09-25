@@ -2642,6 +2642,19 @@ or same-head-ejected PR. When it refuses, do what the refusal says (push a fix,
 or confirm a manual dequeue with whoever made it); do not look for a way around
 it. Operator overrides are documented for humans in `docs/ghapp-guards.md`.
 
+**A green head is not necessarily a fully tested head.** `shipyard landing
+--pr <n>` and `shipyard wait pr <n> --state green` print a `VALIDATION` block
+read from the `shipyard-test-tier` annotation on the head's required check
+runs: "GREEN on the fast tier, NOT full validation" (the full suite runs in
+the merge group), "GREEN and fully tested", or "test tier unknown" when no
+required check published one. Never read `unknown` as `full`. For a queued or
+merged PR the same block reports the merge group's `shipyard-receipt-decision`
+annotations ("reused receipt from run N: X selected / Y passed" versus
+"validated in full: receipt refused because ..."), which answers "did this
+merge actually run tests?" in one command. `queue-observe` shows the same
+decisions per queue entry. Contract and emission recipe:
+[`docs/validation-signals.md`](../../docs/validation-signals.md).
+
 ### Reading the verdict
 
 | verdict | meaning | what to do |

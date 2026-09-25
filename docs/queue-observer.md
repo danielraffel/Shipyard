@@ -32,7 +32,12 @@ Each live tick issues one GraphQL `query` containing:
   `governance.required_status_checks` from Shipyard configuration;
 - up to 100 server merge-queue entries in order, with PR heads, admission
   timestamps, speculative merge-group SHAs, and the merge-group commit's
-  latest required-check contexts.
+  latest required-check contexts, plus up to 20 annotations per merge-group
+  check run, from which each entry's `receipt_decisions[]` and `test_tier[]`
+  are parsed (the `shipyard-receipt-decision` / `shipyard-test-tier` contract in
+  [`validation-signals.md`](validation-signals.md)). Both lists are omitted
+  from state when empty, so a repository that does not emit the contract keeps
+  its state hash across the upgrade.
 
 Bounded GraphQL connections set `truncated=true` rather than silently claiming
 completeness. Ruleset-required contexts that are not present in Shipyard config

@@ -3500,6 +3500,17 @@ they are siblings rather than one inside the other.
 | `backlog.rs` | open pull requests counted by `mergeStateStatus` |
 | `gather.rs` | the reads; nothing here mutates |
 | `render.rs` | human and `--json` forms |
+| `pr_state.rs` | `--pr <n>`: queue class plus the `VALIDATION` block (test tier of the head's required checks, merge-group receipt decisions) from `crate::validation_signals` |
+
+`src/validation_signals.rs` owns the `shipyard-test-tier` /
+`shipyard-receipt-decision` annotation contract (`docs/validation-signals.md`)
+for `landing --pr`, `wait pr --state green`, and `queue-observe`. Its rules are
+fail-honest: no tier annotation is `unknown` (never `full`), unknown tier or
+verdict values are shown verbatim, malformed or wrong-schema messages are
+reported as unparseable rather than dropped, and the weakest reported tier is
+the head's headline. Merge-group reads are restricted to check runs of
+`merge_group` workflow runs, because a merged commit also carries the base
+branch's push runs.
 
 ### The endpoint that lies by omission
 

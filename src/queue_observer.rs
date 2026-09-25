@@ -75,6 +75,15 @@ pub struct QueueEntrySnapshot {
     pub enqueued_at: String,
     /// Latest check/status observations on the speculative merge-group SHA.
     pub checks: Vec<CheckSnapshot>,
+    /// Receipt-reuse decisions the merge group's check runs published as
+    /// `shipyard-receipt-decision` annotations. Omitted when empty so a
+    /// repository that does not emit the contract keeps its state hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipt_decisions: Vec<crate::validation_signals::ReceiptDecision>,
+    /// Test tiers the merge group's check runs published as
+    /// `shipyard-test-tier` annotations. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_tier: Vec<crate::validation_signals::CheckTier>,
 }
 
 /// Local mutation-authority facts. They are observed only; this module exposes
@@ -691,6 +700,16 @@ pub fn render_markdown(transition: &Transition) -> String {
             for check in &entry.checks {
                 lines.push(format!("  - merge-group {}", render_check(check)));
             }
+            for decision in &entry.receipt_decisions {
+                lines.push(format!("  - receipt decision: {}", decision.render()));
+            }
+            for tier in &entry.test_tier {
+                lines.push(format!(
+                    "  - test tier: {}: {}",
+                    tier.check,
+                    tier.reading.render()
+                ));
+            }
         }
     }
     for pr in &snapshot.pull_requests {
@@ -885,10 +904,10 @@ fn parse_queue_entry(
     let pr = node
         .get("pullRequest")
         .ok_or_else(|| "queue entry missing pull request".to_owned())?;
-    let checks = parse_latest_checks(
-        node.pointer("/headCommit/statusCheckRollup/contexts"),
-        required,
-    )?;
+    let contexts = node.pointer("/headCommit/statusCheckRollup/contexts");
+    let checks = parse_latest_checks(contexts, required)?;
+    let (receipt_decisions, test_tier) =
+        crate::validation_signals::signals_from_graphql_contexts(contexts);
     Ok(QueueEntrySnapshot {
         pr: required_u64(pr, "number", "queue pull request")?,
         position: required_u64(node, "position", "queue entry")?,
@@ -900,6 +919,8 @@ fn parse_queue_entry(
             .map(str::to_owned),
         enqueued_at: required_string(node, "enqueuedAt", "queue entry")?,
         checks,
+        receipt_decisions,
+        test_tier,
     })
 }
 
@@ -1303,6 +1324,67 @@ mod tests {
             "pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}},
             "mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}
         })
+    }
+
+    #[test]
+    fn queue_entry_reports_receipt_decisions_and_keeps_hash_when_absent() {
+        let entry = |annotations: Value| {
+            let mut repository = fixture_repo("abc");
+            repository["mergeQueue"]["entries"]["nodes"] = serde_json::json!([{
+                "position":1,
+                "enqueuedAt":"2026-08-08T00:00:00Z",
+                "headCommit":{
+                    "oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "statusCheckRollup":{"contexts":{"nodes":[{
+                        "__typename":"CheckRun","databaseId":9,"name":"receipt-gate",
+                        "status":"COMPLETED","conclusion":"SUCCESS",
+                        "checkSuite":{"createdAt":"2026-08-08T00:00:01Z","app":{"databaseId":1}},
+                        "annotations":annotations
+                    }],"pageInfo":{"hasNextPage":false}}}
+                },
+                "pullRequest":{
+                    "number":7,
+                    "url":"https://github.test/o/r/pull/7",
+                    "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            }]);
+            parse_snapshot(
+                &serde_json::json!({"data":{"repository":repository}}),
+                "o/r",
+                "main",
+                &[],
+                OwnershipSnapshot::default(),
+            )
+            .expect("snapshot")
+        };
+        let decided = entry(serde_json::json!({"nodes":[
+            {"title":"","message":"noise"},
+            {"title":"shipyard-receipt-decision","message":"{\"schema\":\"shipyard-receipt-decision/v1\",\"target\":\"macos\",\"verdict\":\"reuse\",\"reason\":\"unchanged\",\"source_run_id\":\"123\",\"selected\":40,\"passed\":40,\"skipped\":2,\"inventory_count\":90}"}
+        ]}));
+        assert_eq!(decided.queue[0].receipt_decisions.len(), 1);
+        let transition = observe(None, decided)
+            .expect("observe")
+            .transition
+            .expect("emit");
+        let markdown = render_markdown(&transition);
+        assert!(
+            markdown.contains(
+                "  - receipt decision: macos: reused receipt from run 123: 40 selected / 40 \
+                 passed (2 skipped)"
+            ),
+            "{markdown}"
+        );
+        // A repository that emits no contract annotations serializes exactly
+        // as before the fields existed, so upgrading does not fake a transition.
+        let plain = entry(serde_json::json!({"nodes":[{"title":"","message":"noise"}]}));
+        let serialized = serde_json::to_value(&plain.queue[0]).expect("json");
+        assert!(
+            serialized.get("receipt_decisions").is_none(),
+            "{serialized}"
+        );
+        assert!(serialized.get("test_tier").is_none(), "{serialized}");
+        let restored: QueueEntrySnapshot = serde_json::from_value(serialized).expect("restore");
+        assert_eq!(restored, plain.queue[0]);
     }
 
     #[test]

@@ -42,7 +42,8 @@ shipyard dependency pulp verify           # fresh, cache-bypassing CI verificati
 shipyard landing                             # merge queue, strict, enqueue, check placement, backlog
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                      # machine-readable; exit 9 when any headline field is UNKNOWN
-shipyard landing --pr 123                    # one PR: queued / armed_not_queued / ejected / never_armed / merged, with sources
+shipyard landing --pr 123                    # one PR: queued / armed_not_queued / ejected / never_armed / merged, with sources;
+                                             #   plus VALIDATION: head test tier (fast / full / unknown) and merge-group receipt decisions
 
 # ghapp queue guards (queue-removal-guard, queue-arm-guard)
 shipyard guards status                       # missing/stale/current vs this build's copies; exit 1 unless all current

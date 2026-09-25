@@ -145,6 +145,21 @@ is true the report says `TRUNCATED` and the counts are lower bounds. Actor
 identity is not consulted: every queue mutation is attributed to the same App
 actor whether Shipyard or an agent issued it.
 
+### What the head's green means, and whether the merge group ran tests
+
+The report also carries a `VALIDATION` block (JSON: `validation`). It reads the
+`shipyard-test-tier` annotation on each **required** check run of the head
+(`isRequired(pullRequestNumber:)`, newest run per name) and says whether the
+head is green on a narrowed tier ("NOT full validation; the full suite runs in
+merge_group"), fully tested, or of **unknown** tier (no annotation: never read
+as full). For the PR's merge group, the live queue entry's head or, once
+merged, its merge commit, it lists every `shipyard-receipt-decision` annotation
+published by that SHA's `merge_group` workflow runs: "reused receipt from run
+N: X selected / Y passed (Z skipped)" or "validated in full: receipt refused
+because ...". A malformed annotation is shown as unparseable; an unreadable
+endpoint as unknown. Neither changes the exit code. Contract, emission recipe
+and API cost: [`validation-signals.md`](validation-signals.md).
+
 Operator overrides for the guard are in `docs/ghapp-guards.md`. The same
 classifier guards the `ghapp` wrapper: `ghapp_queue_arm_guard.py`
 refuses to arm or enqueue a PR in any class whose next action above is not

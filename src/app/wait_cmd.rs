@@ -62,6 +62,7 @@ pub(super) fn wait_command<W: Write>(
             repo,
             snapshot_file,
         } => wait_pr(
+            mode,
             daemon_socket,
             cwd,
             json,
@@ -165,6 +166,7 @@ fn wait_release<W: Write>(
 
 #[allow(clippy::too_many_arguments)]
 fn wait_pr<W: Write>(
+    mode: RuntimeMode,
     socket_path: &Path,
     cwd: &Path,
     json: bool,
@@ -215,7 +217,16 @@ fn wait_pr<W: Write>(
                     return Ok(ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
                 }
             }
-            render_wait_outcome(
+            // A green PR head is not necessarily a fully tested one: read the
+            // test tier its required checks published, so the success line
+            // cannot be mistaken for full validation. Snapshot-file waits are
+            // offline replays and stay offline.
+            let validation = (outcome.matched
+                && !terminal_wrong
+                && matches!(state, WaitPrState::Green)
+                && snapshot_file.is_none())
+            .then(|| pr_validation_signals(mode, cwd, &repo, pr_number, &outcome));
+            render_wait_outcome_with(
                 stdout,
                 json,
                 "wait:pr",
@@ -226,8 +237,18 @@ fn wait_pr<W: Write>(
                     "head_sha": outcome.observed.get("head_sha").cloned().unwrap_or(Value::Null),
                 }),
                 &outcome,
+                validation.as_ref().map(|signals| {
+                    (
+                        "validation",
+                        serde_json::to_value(signals).unwrap_or(Value::Null),
+                    )
+                }),
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            if let (Some(signals), false) = (&validation, json) {
+                crate::landing::pr_state::write_validation(stdout, signals)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            }
             if terminal_wrong {
                 return Ok(ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
             }
@@ -717,6 +738,45 @@ fn wait_failure(error: &(dyn std::error::Error + 'static)) -> CliFailure {
     CliFailure::new(1, error.to_string())
 }
 
+/// Read the test tier (and any merge-group receipt decisions) for a PR whose
+/// head just matched green. Never fails the wait: an unreadable read is
+/// reported inside the signals as unknown.
+fn pr_validation_signals(
+    mode: RuntimeMode,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+    outcome: &WaitOutcome,
+) -> crate::validation_signals::PrValidationSignals {
+    let mut signals = match LoadedConfig::load_from_cwd(mode, cwd) {
+        Ok(config) => {
+            let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
+            crate::validation_signals::gather_pr(
+                &|args: &[String]| actions.run_gh(args).map_err(|error| error.to_string()),
+                repo,
+                pr,
+            )
+        }
+        Err(error) => crate::validation_signals::gather_pr(
+            &|_: &[String]| Err(format!("config unreadable: {error}")),
+            repo,
+            pr,
+        ),
+    };
+    let observed = outcome.observed.get("head_sha").and_then(Value::as_str);
+    if let (Some(observed), Some(read)) = (observed, signals.head_sha.as_deref())
+        && observed != read
+    {
+        {
+            signals.warnings.push(format!(
+                "the head moved from {observed} to {read} between the green match and the tier \
+                 read; the tier describes {read}"
+            ));
+        }
+    }
+    signals
+}
+
 fn render_wait_outcome<W: Write>(
     stdout: &mut W,
     json: bool,
@@ -724,8 +784,22 @@ fn render_wait_outcome<W: Write>(
     condition: Value,
     outcome: &WaitOutcome,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    render_wait_outcome_with(stdout, json, command, condition, outcome, None)
+}
+
+fn render_wait_outcome_with<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    command: &str,
+    condition: Value,
+    outcome: &WaitOutcome,
+    extra: Option<(&str, Value)>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if json {
         let mut data = BTreeMap::new();
+        if let Some((key, value)) = extra {
+            data.insert(key.to_owned(), value);
+        }
         data.insert("matched".to_owned(), Value::Bool(outcome.matched));
         data.insert("condition".to_owned(), condition);
         data.insert(
@@ -1101,6 +1175,7 @@ artifacts = [
         let mut out = Vec::new();
 
         let code = wait_pr(
+            RuntimeMode::Isolated,
             &temp.path().join("missing.sock"),
             temp.path(),
             false,
@@ -1144,6 +1219,7 @@ artifacts = [
         let mut out = Vec::new();
 
         let code = wait_pr(
+            RuntimeMode::Isolated,
             &temp.path().join("missing.sock"),
             temp.path(),
             true,
@@ -1189,6 +1265,7 @@ artifacts = [
         let mut out = Vec::new();
 
         let code = wait_pr(
+            RuntimeMode::Isolated,
             &temp.path().join("missing.sock"),
             temp.path(),
             false,
