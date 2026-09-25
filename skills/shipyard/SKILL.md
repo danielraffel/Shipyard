@@ -2578,6 +2578,15 @@ at the same step for an unrelated-to-either-PR cause already on the base. Only a
 verdict that positively names infrastructure or another PR counts, and
 `merge_conflict` is never attributable because a conflict is a property of the
 head against its base.
+
+**"Un-implicated by the ejecting batch" is weaker than "will pass next time".**
+In the same incident `#8811`'s head was broken anyway, by the same defect class
+in its own file (a grouped member spec whose only case compiles on macOS, so
+Linux and Windows discovery matched nothing). The build aborted on the base's
+failure before reaching it, so that defect appears nowhere in the ejecting run
+and the PR needed a real fix three hours later. When judging a batch failure,
+ask whether the build even got to the parts the diff touches before concluding
+the head is clean.
 without re-judging. When the guard refuses, follow its stated path; the
 operator override is documented for humans in `docs/ghapp-guards.md`, not for
 agents. `shipyard landing --pr <n>` prints the same classification with the

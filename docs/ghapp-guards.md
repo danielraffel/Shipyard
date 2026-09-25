@@ -143,8 +143,20 @@ pre-existing cause, so `(job, step)` does corroborate across batches, but
 `(macos, Install ccache (macOS))` corroborates nowhere that day, and a rule
 requiring every failing job to be corroborated refuses this incident anyway.
 
-Which of a repository's steps can be influenced by repository content is
-knowledge the repository has and Shipyard does not. So Shipyard asks.
+The same incident also shows that "un-implicated by the ejecting batch" is
+strictly weaker than "will pass next time". `#8811`'s visible batch failure was
+not its own, but its head was broken anyway, by the same class of defect: a
+grouped member spec whose only case compiles on macOS, so discovery matched
+nothing on Linux and Windows. The build aborted on the base's `group-canvas`
+failure before reaching it, so that defect appears nowhere in the ejecting run,
+and the pull request needed a real fix three hours later. A same-head
+re-enqueue at 04:13 would have been justified by every piece of evidence that
+batch contained, and would still have failed and taken its batch-mates with it.
+
+So certification is deliberately narrow and repository-owned. Only the
+repository can reason about whether a failed build even reached the parts a diff
+touches, and which of its steps repository content can influence at all.
+Shipyard asks rather than guessing.
 
 ## Overrides and bypasses
 
