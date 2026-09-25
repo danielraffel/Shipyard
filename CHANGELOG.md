@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02110"></a>
+## [0.211.0] - 2026-09-24
+
+- fix/steward lock release 20260924 ([#611](https://github.com/danielraffel/Shipyard/pull/611))
+
 <a id="v02100"></a>
 ## [0.210.0] - 2026-09-23
 
@@ -1549,6 +1554,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.211.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.211.0
 [0.210.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.210.0
 [0.209.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.209.1
 [0.209.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.209.0

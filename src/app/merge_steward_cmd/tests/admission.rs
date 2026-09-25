@@ -393,3 +393,32 @@ fn cross_process_contender_defers_and_owner_death_forces_fresh_observation() {
             .contains("could not open")
     );
 }
+
+/// The #609 shape, deterministically: a child forked while a steward holds its
+/// ledger or observation lock keeps a duplicate of the locked descriptor until
+/// its exec. Releasing must not depend on that duplicate closing first.
+#[test]
+fn steward_locks_release_while_a_forked_duplicate_descriptor_lives() {
+    let temp = tempfile::tempdir().expect("temp");
+    let ledger = temp.path().join("merge-steward.json");
+    let held = acquire_ledger_lock(&ledger).expect("ledger lock");
+    let duplicate = held.try_clone().expect("duplicate descriptor");
+    drop(held);
+    acquire_ledger_lock(&ledger).expect("the ledger lock must be free after release");
+    drop(duplicate);
+
+    let labels = vec!["pulp-build-vm".to_owned()];
+    let observation =
+        try_acquire_admission_observation_lock(temp.path(), "Owner/Repo", "main", &labels)
+            .expect("observation lock")
+            .expect("free");
+    let duplicate = observation.try_clone().expect("duplicate descriptor");
+    drop(observation);
+    assert!(
+        try_acquire_admission_observation_lock(temp.path(), "Owner/Repo", "main", &labels)
+            .expect("observation lock")
+            .is_some(),
+        "the observation lock must be free after release"
+    );
+    drop(duplicate);
+}

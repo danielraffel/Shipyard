@@ -238,7 +238,9 @@ fn read_uncertain_from_paths(ordered_paths: &[PathBuf]) -> Result<Vec<serde_json
     Ok(started.into_values().collect())
 }
 
-fn locked_audit_paths(audit_path: &Path) -> Result<Option<(File, Vec<PathBuf>)>, String> {
+fn locked_audit_paths(
+    audit_path: &Path,
+) -> Result<Option<(crate::file_lock::LockedFile, Vec<PathBuf>)>, String> {
     let Some(audit_dir) = audit_path.parent() else {
         return Ok(None);
     };
@@ -260,6 +262,7 @@ fn locked_audit_paths(audit_path: &Path) -> Result<Option<(File, Vec<PathBuf>)>,
     audit_lock
         .lock_exclusive()
         .map_err(|error| format!("failed to lock merge-queue mutation audit: {error}"))?;
+    let audit_lock = crate::file_lock::LockedFile::new(audit_lock);
     Ok(ordered_audit_paths(audit_path)?.map(|paths| (audit_lock, paths)))
 }
 
@@ -1033,6 +1036,8 @@ fn append_audit(
         .open(lock_path)?;
     drop(writer_domain);
     lock.lock_exclusive()?;
+    // Released explicitly on every path, including the early returns below.
+    let lock = crate::file_lock::LockedFile::new(lock);
     let unresolved = ordered_audit_paths(path)
         .map_err(io::Error::other)?
         .map_or_else(|| Ok(Vec::new()), |paths| read_uncertain_from_paths(&paths))

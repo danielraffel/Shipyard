@@ -1358,6 +1358,25 @@ drops it makes a false terminal impossible to debug later.
 Details: `docs/runner-watchdog.md` and
 `planning/2026-09-04-fleet-service-assertions.md`.
 
+## flock locks: release with `unlock`, never by closing
+
+`flock` belongs to the open file description, not the descriptor. A child
+forked by *any* thread in the process (Shipyard spawns `gh`, `git` and `ssh`
+constantly, and tests spawn fake ones) shares that description until its
+`exec` closes the close-on-exec descriptor. So a lock released only by closing
+its own descriptor stays held for a moment by that child, and the next
+acquisition in the same process reads a free lock as contended ("already
+running", "busy"). That was Shipyard#609's intermittent Linux failure, and
+#607's controller-lock flake.
+
+Wrap every lock whose release matters in `crate::file_lock::LockedFile`
+(explicit `unlock` on drop), or give the owning type a `Drop` that calls
+`FileExt::unlock`. The exception is a lock deliberately handed to a child
+through the inherited description (the recovery worker's `GlobalModelLease`),
+which must not be unlocked while that child runs. A regression test for a lock
+holds `file.try_clone()` (what a forked child holds) across the release and
+requires the lock to be free.
+
 ## cfg-gated tests: gate the helpers identically
 
 A `#[cfg(unix)]` test module must gate its **helpers** with the same cfg, not

@@ -197,6 +197,15 @@ impl KnownHostsAuthority {
     }
 }
 
+#[cfg(unix)]
+impl Drop for KnownHostsAuthority {
+    /// Release the shared lock explicitly; a close alone would leave it held
+    /// by any concurrently forked child still sharing the file description.
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 #[cfg(not(unix))]
 struct KnownHostsAuthority;
 
