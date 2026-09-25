@@ -49,13 +49,17 @@ class InstallArmUnqueuedTests(unittest.TestCase):
         self.launchctl = executable(
             self.root / "launchctl", f'printf "%s\\n" "$*" >> "{self.calls}"\n'
         )
+        self.plutil = executable(self.root / "plutil", "exit 0\n")
         self.env = {
             "HOME": str(self.home),
             "PATH": "/usr/bin:/bin",
             "SHIPYARD_LAUNCHCTL_BIN": str(self.launchctl),
-            # The real plutil: the point of these tests is that the rendered
-            # plist is valid, so a stub that always succeeds would prove nothing.
-            "SHIPYARD_PLUTIL_BIN": "/usr/bin/plutil",
+            # A stub: plutil is macOS-only and these tests run on Linux in CI.
+            # Validity is still genuinely proven, by a stricter parser — the
+            # assertions below load the rendered plist with plistlib, which
+            # rejects the malformed XML that plutil -lint accepted (a double
+            # hyphen inside the template's XML comment).
+            "SHIPYARD_PLUTIL_BIN": str(self.plutil),
         }
 
     def tearDown(self) -> None:

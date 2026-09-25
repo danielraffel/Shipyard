@@ -239,6 +239,39 @@ The gate never dispatches, cancels, or retries in response. See
 `skills/shipyard/SKILL.md` for the classifier and `src/landability/` for the
 implementation.
 
+## Arming auto-merge is outside the state machine
+
+Once `resolve_pr_context` has a pull-request number — for `shipyard pr`, a bare
+`shipyard ship`, and `shipyard ship --pr <n>` alike — `ship` arms GitHub-native
+auto-merge on it. This deliberately sits **outside** every state in this
+document:
+
+* It writes no `ShipState` and reads none. It happens before any durable ship
+  state exists on the create path, and it is skipped entirely by `--no-arm`.
+* It cannot fail a ship. Every outcome, including a refusal, is one reported
+  line; the ship proceeds to submission either way.
+* It is idempotent, so a resumed or re-run ship re-issues nothing: an
+  already-armed or already-queued pull request is left alone.
+
+The reason it exists is a gap this state machine cannot close by itself. T5
+(merge on PASS) is the only thing that enqueues a validated head, so a ship that
+never reaches T5 — orphaned, abandoned, or killed before its merge phase —
+leaves a pull request that is green, unqueued, and unarmed, with nothing on
+GitHub's side left to move it. A `ShipState` can be well-formed and terminal in
+every respect while that is true, which makes it the same shape of failure as
+exit 7 above: outside the machine, therefore invisible to it.
+
+Native auto-merge is server-owned, so arming it early survives the process
+dying. It grants GitHub no authority the repository's branch protection does not
+already hold: GitHub re-checks required checks itself and refuses drafts itself.
+Note the converse, which *is* a behaviour change — once armed, GitHub may merge
+as soon as the **required** contexts are green, which can precede the completion
+of a broader Shipyard target set.
+
+Policy and refusals live in `src/auto_arm.rs`; the ship-side transport is
+`src/app/ship_cmd/auto_arm.rs`; the periodic counterpart for pull requests that
+slipped through anyway is `shipyard runner steward --arm-unqueued`.
+
 ## Entry points and which states they read/write
 
 | CLI command                 | Reads                                               | Writes                                                  |
