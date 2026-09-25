@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use crate::auto_arm::{
     ArmVerdict, arm_mutation_args, arm_response_accepted, decide_from_queue_state,
-    first_graphql_error, is_arm_guard_refusal,
+    first_graphql_error, is_arm_guard_refusal, is_auto_merge_disabled_refusal,
 };
 use crate::pr_queue_state::{PR_QUEUE_STATE_QUERY, explain_pr_queue_state};
 
@@ -87,6 +87,10 @@ pub(super) fn arm_native_auto_merge(run_gh: RunGh<'_>, repo: &str, pr: u64) -> A
                 "⚠︎ Auto-merge not armed on #{pr}: GitHub accepted the request but returned no \
                  armed pull request ({}). Check with `shipyard landing --pr {pr}`.",
                 first_graphql_error(&raw).unwrap_or_else(|| "no errors reported".to_owned())
+            )),
+            Err(detail) if is_auto_merge_disabled_refusal(&detail) => skipped(format!(
+                "▸ Auto-merge left as it is on #{pr}: this repository does not allow native \
+                 auto-merge, so there is nothing to arm."
             )),
             Err(detail) if is_arm_guard_refusal(&detail) => skipped(format!(
                 "▸ Auto-merge left as it is on #{pr}: the queue-arm guard declined it, which is \

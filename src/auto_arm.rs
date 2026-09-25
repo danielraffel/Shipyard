@@ -329,6 +329,25 @@ pub fn first_graphql_error(raw: &str) -> Option<String> {
         })
 }
 
+/// Whether a failed arm attempt was GitHub saying the repository does not allow
+/// auto-merge at all.
+///
+/// This is a repository setting, not a fault on the pull request, and no amount
+/// of retrying changes it. Reporting it as a warning on every single ship would
+/// train a reader to ignore the warning that matters, so it is reported as an
+/// ordinary "nothing to do".
+#[must_use]
+pub fn is_auto_merge_disabled_refusal(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    // GitHub has used several wordings here; match on the shared substance
+    // rather than on one exact sentence.
+    (lowered.contains("auto-merge") || lowered.contains("auto merge"))
+        && (lowered.contains("not allowed")
+            || lowered.contains("not enabled")
+            || lowered.contains("is disabled")
+            || lowered.contains("enabled in repository settings"))
+}
+
 /// Whether a failed arm attempt was the `ghapp` arm guard declining it.
 ///
 /// The guard refuses exactly the states this module also refuses, so its

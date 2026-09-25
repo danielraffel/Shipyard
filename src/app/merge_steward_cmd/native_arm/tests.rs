@@ -1,9 +1,19 @@
+// Everything that drives a fake `gh` is unix-only, because the stand-in is a
+// shell script. Under `-D warnings` an ungated helper that only unix tests call
+// is a dead-code error on Windows, so the gating has to match the tests exactly.
+#[cfg(unix)]
 use std::collections::BTreeMap;
 
-use super::{apply_native_arm_backstop, steward_declines_ownership};
+#[cfg(unix)]
+use super::apply_native_arm_backstop;
+use super::steward_declines_ownership;
+#[cfg(unix)]
 use crate::app::merge_steward_cmd::{ObservedPr, PrReport, RepoObservation, parse_pr};
+#[cfg(unix)]
 use crate::cloud::GitHubActions;
-use crate::merge_steward::{CapacityPreemptionPolicy, RequiredCheck, StewardDecision};
+use crate::merge_steward::StewardDecision;
+#[cfg(unix)]
+use crate::merge_steward::{CapacityPreemptionPolicy, RequiredCheck};
 
 /// A `gh` stand-in: one shell script that answers the queue-state read and the
 /// arm mutation by matching on its own argv, and appends every call to a log.
@@ -49,6 +59,7 @@ esac"#
     )
 }
 
+#[cfg(unix)]
 fn pr_row(overrides: &serde_json::Value) -> ObservedPr {
     let mut row = serde_json::json!({
         "id": "PR_node42",
@@ -70,6 +81,7 @@ fn pr_row(overrides: &serde_json::Value) -> ObservedPr {
     parse_pr(&row, &BTreeMap::new()).expect("PR row")
 }
 
+#[cfg(unix)]
 fn observation(pr: ObservedPr, allow_auto_merge: bool) -> RepoObservation {
     RepoObservation {
         repo: "owner/repo".to_owned(),
@@ -89,6 +101,7 @@ fn observation(pr: ObservedPr, allow_auto_merge: bool) -> RepoObservation {
     }
 }
 
+#[cfg(unix)]
 fn report(decision: StewardDecision) -> Vec<PrReport> {
     vec![PrReport {
         number: 42,

@@ -313,3 +313,25 @@ fn human_mode_writes_the_arm_line_to_stdout() {
     assert!(text.contains("Auto-merge left as it is on #7"), "{text}");
     assert!(text.ends_with('\n'), "{text:?}");
 }
+
+/// A repository with auto-merge switched off must read as "nothing to do", not
+/// as a warning on every ship.
+#[test]
+fn a_repository_without_auto_merge_reads_as_nothing_to_do() {
+    let gh = FakeGh::new(vec![
+        ("pr view", Ok(pr_view("PR_node", false))),
+        ("isInMergeQueue", Ok(never_armed_state())),
+        (
+            "enablePullRequestAutoMerge",
+            Err("GraphQL: Auto merge is not allowed for this repository".to_owned()),
+        ),
+    ]);
+    let outcome = run(&gh);
+    assert!(!outcome.armed);
+    assert!(
+        outcome.line.starts_with('▸'),
+        "must not be a warning: {}",
+        outcome.line
+    );
+    assert!(outcome.line.contains("does not allow native auto-merge"));
+}

@@ -1,7 +1,7 @@
 use super::{
     ArmSkip, ArmVerdict, NATIVE_AUTO_MERGE_MUTATION, arm_mutation_args, arm_response_accepted,
-    decide_from_queue_state, first_graphql_error, is_arm_guard_refusal, merge_state_is_arm_ready,
-    preselect_backstop_candidate,
+    decide_from_queue_state, first_graphql_error, is_arm_guard_refusal,
+    is_auto_merge_disabled_refusal, merge_state_is_arm_ready, preselect_backstop_candidate,
 };
 use crate::merge_steward::StewardPullRequest;
 use crate::pr_queue_state::PrQueueState;
@@ -491,6 +491,47 @@ fn skip_reasons_explain_themselves_without_naming_an_override() {
         assert!(
             !text.contains("GHAPP_ALLOW_QUEUE_REARM"),
             "{skip:?} names the operator override"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// "this repository does not allow auto-merge" is a setting, not a fault
+// ---------------------------------------------------------------------------
+
+/// Observed live: `danielraffel/Shipyard` itself has `allow_auto_merge=false`.
+/// Reporting that as a warning on every single ship would teach a reader to
+/// ignore the warning that matters, so it must read as an ordinary no-op.
+#[test]
+fn githubs_auto_merge_disabled_wordings_are_recognised() {
+    for message in [
+        "GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)",
+        "Can't enable auto-merge for this pull request. Please ensure auto-merge is \
+         enabled in repository settings.",
+        "AUTO-MERGE IS NOT ENABLED FOR THIS REPOSITORY",
+        "auto merge is disabled",
+    ] {
+        assert!(
+            is_auto_merge_disabled_refusal(message),
+            "not recognised: {message}"
+        );
+    }
+}
+
+#[test]
+fn an_unrelated_failure_is_not_read_as_auto_merge_being_disabled() {
+    for message in [
+        "HTTP 502: Bad Gateway",
+        "GraphQL: Resource not accessible by integration",
+        // A guard refusal names the queue, not the repository setting: these two
+        // recognisers must not both claim the same message.
+        "queue-arm-guard: refusing: PR #7 is already in the merge queue",
+        // "not allowed" alone is not enough; it must be about auto-merge.
+        "Pushing to this branch is not allowed",
+    ] {
+        assert!(
+            !is_auto_merge_disabled_refusal(message),
+            "wrongly recognised: {message}"
         );
     }
 }
