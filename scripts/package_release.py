@@ -454,7 +454,12 @@ def prepared_signing_keychain():
             "SHIPYARD_SIGNING_P12_PASSWORD so Shipyard can prepare a disposable, "
             "noninteractive keychain before codesign"
         )
-    if not p12:
+    # A CI job that prepared its own keychain signs with the identity it
+    # imported there. A P12 that also reached the environment (a self-hosted
+    # runner's local release secrets) must not replace that keychain: its
+    # certificate is not the one SHIPYARD_SIGNING_IDENTITY names, so codesign
+    # would report "no identity found".
+    if not p12 or prepared:
         with signing_keychain_first():
             yield
         return

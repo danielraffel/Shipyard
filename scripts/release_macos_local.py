@@ -118,9 +118,21 @@ def load_release_environment(env_files: list[Path]) -> None:
     )
 
 
+def ci_prepared_signing_keychain() -> bool:
+    return (
+        os.environ.get("CI") == "true"
+        and os.environ.get("SHIPYARD_SIGNING_KEYCHAIN_READY") == "1"
+    )
+
+
 def resolve_environment_files(requested: list[Path]) -> list[Path]:
     if requested:
         return requested
+    # A CI job carries its own credentials. The host's local release secrets
+    # (present on a self-hosted runner that is also a developer machine) would
+    # only fill the gaps with a different certificate.
+    if ci_prepared_signing_keychain():
+        return []
     if all(path.is_file() for path in DEFAULT_LOCAL_ENV_FILES):
         return list(DEFAULT_LOCAL_ENV_FILES)
     return []

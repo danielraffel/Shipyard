@@ -176,6 +176,19 @@ class ReleaseMacosLocalTests(unittest.TestCase):
 
         self.assertEqual(resolved, list(files))
 
+    def test_ci_prepared_keychain_skips_host_local_environment_files(self) -> None:
+        files = (Path("/tmp/keychain.env"), Path("/tmp/notary.env"))
+        with mock.patch.object(release_macos_local, "DEFAULT_LOCAL_ENV_FILES", files), \
+                mock.patch.object(Path, "is_file", return_value=True), \
+                mock.patch.dict(
+                    os.environ,
+                    {"CI": "true", "SHIPYARD_SIGNING_KEYCHAIN_READY": "1"},
+                    clear=True,
+                ):
+            resolved = release_macos_local.resolve_environment_files([])
+
+        self.assertEqual(resolved, [])
+
     def test_explicit_environment_files_override_m5_defaults(self) -> None:
         requested = [Path("/tmp/custom.env")]
         self.assertEqual(
