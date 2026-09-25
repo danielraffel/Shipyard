@@ -798,5 +798,79 @@ class BatchAttributionTests(unittest.TestCase):
                     self.assertNotIn(name, message)
 
 
+    def test_installed_guard_certifies_through_a_real_subprocess(self) -> None:
+        """The whole chain as ghapp runs it: installed names, real gh, real attributor."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            guards = root / "guards"
+            guards.mkdir()
+            shutil.copy(SCRIPT, guards / "queue-arm-guard")
+            shutil.copy(
+                SCRIPT.with_name("ghapp_queue_removal_guard.py"), guards / "queue-removal-guard"
+            )
+            # A repo checkout that declares an attributor.
+            repo = root / "repo"
+            (repo / ".shipyard").mkdir(parents=True)
+            attributor = repo / "attribute.py"
+            attributor.write_text(
+                "import json, sys\n"
+                "args = dict(zip(sys.argv[1::2], sys.argv[2::2]))\n"
+                "print(json.dumps({'run_id': int(args['--run-id']),\n"
+                "                  'implicates_head': False,\n"
+                "                  'verdict': 'infrastructure',\n"
+                "                  'evidence': 'macos failed before any content built',\n"
+                "                  'saw': args['--repo'] + '#' + args['--pr']}))\n",
+                encoding="utf-8",
+            )
+            (repo / ".shipyard" / "config.toml").write_text(
+                f'[queue.attribution]\ncommand = ["{sys.executable}", "attribute.py"]\n',
+                encoding="utf-8",
+            )
+            # A gh that answers the three reads in order: PR, run listing, jobs.
+            answers = guards / "answers"
+            answers.mkdir()
+            for index, name in enumerate(
+                (
+                    self.INCIDENT,
+                    "merge_group_failed_runs_listing.json",
+                    "merge_group_run_real_infra_and_build.json",
+                )
+            ):
+                body = fixture(name)
+                if name.startswith("merge_group_run_"):
+                    body = body["jobs"]
+                (answers / f"{index}.json").write_text(json.dumps(body), encoding="utf-8")
+            fake_gh = guards / "gh"
+            fake_gh.write_text(
+                "#!/bin/sh\n"
+                f"n=$(cat '{guards / 'n'}' 2>/dev/null || echo 0)\n"
+                f"printf '%s\\n' \"$*\" >> '{guards / 'calls'}'\n"
+                f"echo $((n+1)) > '{guards / 'n'}'\n"
+                f"cat '{answers}'/$n.json\n",
+                encoding="utf-8",
+            )
+            for executable in (fake_gh, guards / "queue-arm-guard"):
+                executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+            result = subprocess.run(
+                [sys.executable, str(guards / "queue-arm-guard"), "pr", "merge", "8811", "--auto"],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "GHAPP_REAL_GH": str(fake_gh),
+                    "GH_REPO": "Generous-Corp/pulp",
+                },
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("batch attributor certified", result.stderr)
+            self.assertIn("Install ccache (macOS)", result.stderr)
+            calls = (guards / "calls").read_text(encoding="utf-8")
+            self.assertIn("number=8811", calls)
+            self.assertIn("event=merge_group&status=failure", calls)
+            self.assertIn(f"runs/{self.RUN_ID}/jobs", calls)
+
+
 if __name__ == "__main__":
     unittest.main()
