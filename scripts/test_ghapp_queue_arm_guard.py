@@ -754,8 +754,14 @@ class BatchAttributionTests(unittest.TestCase):
         self.assertNotIn("--paginate", jobs_call)
         self.assertIn("per_page=100", jobs_call[1])
 
-    def test_a_repo_relative_program_is_resolved_against_the_repo_root(self) -> None:
-        """subprocess does not search `cwd=` for the executable."""
+    def test_a_repo_relative_program_runs_from_the_repo_root(self) -> None:
+        """A repo-relative `command` is supported, run with cwd at the repo root.
+
+        Characterization, not a guard: POSIX resolves this natively because
+        CPython chdirs to `cwd` before `execv`, so no code in the guard
+        implements it and breaking the guard cannot make this test fail. It is
+        here to pin the supported shape of `command`.
+        """
         runner = self.root / "bin" / "attribute.sh"
         runner.parent.mkdir(parents=True, exist_ok=True)
         runner.write_text(

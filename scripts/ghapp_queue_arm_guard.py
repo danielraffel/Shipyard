@@ -563,20 +563,7 @@ def read_attributor_verdict(
     ``implicates_head``, nor an ``other_pull_request`` verdict that names this
     same pull request.
     """
-    program = command[0]
-    # `cwd=` is applied to the child, but Python does not search it for the
-    # executable, so a repo-relative program has to be resolved here.
-    if not pathlib.PurePath(program).is_absolute() and (
-        "/" in program or "\\" in program
-    ):
-        program = str(root / program)
-    argv = [
-        program,
-        *command[1:],
-        "--repo", repo,
-        "--pr", str(number),
-        "--run-id", str(batch["run_id"]),
-    ]
+    argv = [*command, "--repo", repo, "--pr", str(number), "--run-id", str(batch["run_id"])]
     try:
         completed = subprocess.run(
             argv,
