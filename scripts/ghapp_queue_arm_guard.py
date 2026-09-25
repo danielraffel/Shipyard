@@ -582,7 +582,10 @@ def read_attributor_verdict(
     if completed.returncode != 0:
         return {
             "certified": False,
-            "detail": f"{evidence} The attributor exited {completed.returncode}, so it did not rule.",
+            "detail": (
+                f"{evidence} The attributor exited {completed.returncode}, "
+                "so it did not rule."
+            ),
         }
     try:
         verdict = json.loads(completed.stdout)
