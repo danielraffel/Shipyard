@@ -250,7 +250,11 @@ pub(super) fn ship_command<W: Write>(
     if args.arm_auto_merge && !repo.is_empty() {
         let arm_actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
         let outcome = auto_arm::arm_native_auto_merge(
-            &|gh_args: &[String]| arm_actions.run_gh(gh_args).map_err(|error| error.to_string()),
+            &|gh_args: &[String]| {
+                arm_actions
+                    .run_gh(gh_args)
+                    .map_err(|error| error.to_string())
+            },
             &repo,
             pr_context.number,
         );

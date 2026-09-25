@@ -265,7 +265,10 @@ fn a_pr_whose_required_checks_are_failing_is_filtered_before_any_github_read() {
     let log = temp.path().join("calls.log");
     let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
     // BLOCKED is GitHub's own verdict for a failing/missing required check.
-    let observation = observation(pr_row(&serde_json::json!({"mergeStateStatus": "BLOCKED"})), true);
+    let observation = observation(
+        pr_row(&serde_json::json!({"mergeStateStatus": "BLOCKED"})),
+        true,
+    );
     let (status, _) = apply_native_arm_backstop(
         &actions,
         &observation,
@@ -407,7 +410,10 @@ esac"#,
         "shipyard:no-auto-merge",
         true,
     );
-    assert!(!unhealthy, "a guard refusal must not fail the pass: {status:?}");
+    assert!(
+        !unhealthy,
+        "a guard refusal must not fail the pass: {status:?}"
+    );
     assert_eq!(status.results[0].outcome, "skipped");
     assert!(status.results[0].error.is_none(), "{status:?}");
     // Exactly one attempt: no retry, and no override.

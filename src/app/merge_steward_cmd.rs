@@ -1186,7 +1186,7 @@ fn append_unmatched_recovery_errors(
             prs: Vec::new(),
             cancellations,
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, &repo),
-        native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
+            native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
             errors,
         });
     }
@@ -1217,7 +1217,7 @@ fn persist_final_ledger(
             prs: Vec::new(),
             cancellations: Vec::new(),
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, "steward"),
-        native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
+            native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
             errors: vec![message],
         });
     }
@@ -1290,8 +1290,8 @@ mod cancellation_revalidation;
 mod cancellation_terminalization;
 mod capacity_cancellation;
 mod ledger;
-mod observation;
 mod native_arm;
+mod observation;
 mod pr_mutations;
 mod queue_priority_recovery;
 mod render;

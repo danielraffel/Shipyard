@@ -86,8 +86,7 @@ pub(super) fn arm_native_auto_merge(run_gh: RunGh<'_>, repo: &str, pr: u64) -> A
             Ok(raw) => skipped(format!(
                 "⚠︎ Auto-merge not armed on #{pr}: GitHub accepted the request but returned no \
                  armed pull request ({}). Check with `shipyard landing --pr {pr}`.",
-                first_graphql_error(&raw)
-                    .unwrap_or_else(|| "no errors reported".to_owned())
+                first_graphql_error(&raw).unwrap_or_else(|| "no errors reported".to_owned())
             )),
             Err(detail) if is_arm_guard_refusal(&detail) => skipped(format!(
                 "▸ Auto-merge left as it is on #{pr}: the queue-arm guard declined it, which is \

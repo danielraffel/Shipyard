@@ -2960,7 +2960,10 @@ mod tests {
     fn the_steward_backstop_is_opt_in() {
         for (argv, expected) in [
             (vec!["shipyard", "runner", "steward"], false),
-            (vec!["shipyard", "runner", "steward", "--arm-unqueued"], true),
+            (
+                vec!["shipyard", "runner", "steward", "--arm-unqueued"],
+                true,
+            ),
         ] {
             let cli = Cli::try_parse_from(argv.clone()).expect("parses");
             let Command::Runner { command } = cli.command else {

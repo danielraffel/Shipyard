@@ -29,10 +29,7 @@ impl FakeGh {
     }
 
     fn called(&self, needle: &str) -> bool {
-        self.calls
-            .borrow()
-            .iter()
-            .any(|call| call.contains(needle))
+        self.calls.borrow().iter().any(|call| call.contains(needle))
     }
 
     fn call_count(&self) -> usize {

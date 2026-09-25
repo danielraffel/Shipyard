@@ -48,12 +48,27 @@ use crate::auto_arm::{
 use crate::pr_queue_state::{PR_QUEUE_STATE_QUERY, explain_pr_queue_state};
 
 /// What the backstop did for this repository on this pass.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct NativeArmRepoStatus {
     /// Why the pass acted, or why it did nothing.
     pub(super) policy: String,
     /// One entry per pull request the pass considered a candidate.
     pub(super) results: Vec<NativeArmResult>,
+}
+
+impl Default for NativeArmRepoStatus {
+    /// The state for a repository the pass never reached, said as such.
+    ///
+    /// An empty policy string would read as "nothing to report", which is the
+    /// one thing it must not mean: a repository whose settings could not be
+    /// read was not evaluated, and that is not the same as having no
+    /// candidates.
+    fn default() -> Self {
+        Self {
+            policy: "not evaluated: the repository was not readable on this pass".to_owned(),
+            results: Vec::new(),
+        }
+    }
 }
 
 /// One considered pull request.
@@ -219,12 +234,7 @@ fn consider_candidate(
 }
 
 /// Issue the arm mutation for one confirmed candidate.
-fn arm(
-    actions: &GitHubActions,
-    number: u64,
-    head_sha: String,
-    node_id: &str,
-) -> NativeArmResult {
+fn arm(actions: &GitHubActions, number: u64, head_sha: String, node_id: &str) -> NativeArmResult {
     if node_id.is_empty() {
         return NativeArmResult {
             number,

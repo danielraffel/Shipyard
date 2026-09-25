@@ -275,10 +275,7 @@ fn an_unknown_state_is_never_armed() {
         false,
     );
     assert!(!verdict.arms());
-    assert!(matches!(
-        verdict,
-        ArmVerdict::Skip(ArmSkip::Unknown { .. })
-    ));
+    assert!(matches!(verdict, ArmVerdict::Skip(ArmSkip::Unknown { .. })));
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +303,10 @@ fn the_opt_out_label_excludes_a_pr_case_insensitively() {
     let mut pr = open_pr();
     pr.labels = vec!["Shipyard:No-Auto-Merge".to_owned()];
     let verdict = preselect_backstop_candidate(&pr, true, "shipyard:no-auto-merge");
-    assert!(matches!(verdict, ArmVerdict::Skip(ArmSkip::OptedOut { .. })));
+    assert!(matches!(
+        verdict,
+        ArmVerdict::Skip(ArmSkip::OptedOut { .. })
+    ));
 }
 
 #[test]
