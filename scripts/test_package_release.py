@@ -552,6 +552,24 @@ class PackageReleaseTests(unittest.TestCase):
                 pass
         prepared.assert_called_once_with()
 
+    def test_ci_prepared_keychain_wins_over_a_p12_in_the_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SHIPYARD_SIGNING_KEYCHAIN": "/tmp/ci.keychain-db",
+                "SHIPYARD_SIGNING_KEYCHAIN_READY": "1",
+                "CI": "true",
+                "SHIPYARD_SIGNING_P12": "/tmp/host-local.p12",
+                "SHIPYARD_SIGNING_P12_PASSWORD": "host-secret",
+            },
+            clear=True,
+        ), mock.patch.object(package_release, "signing_keychain_first") as prepared, \
+                mock.patch.object(package_release, "create_disposable_signing_keychain") as disposable:
+            with package_release.prepared_signing_keychain():
+                self.assertEqual(os.environ["SHIPYARD_SIGNING_KEYCHAIN"], "/tmp/ci.keychain-db")
+        prepared.assert_called_once_with()
+        disposable.assert_not_called()
+
     def test_local_ready_marker_cannot_bypass_disposable_keychain(self) -> None:
         with mock.patch.dict(
             os.environ,
