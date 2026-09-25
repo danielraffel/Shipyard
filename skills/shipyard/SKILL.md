@@ -2734,6 +2734,19 @@ Local and SSH targets retain Shipyard `sy-*` job IDs, and their terminal
 evidence is authoritative. Never fuzzy-match a local target such as `mac` to a
 hosted check and replace a local failure with that check's green conclusion.
 
+### Superseded merge_group runs → `rescue --superseded-merge-group`
+
+A `merge_group` run whose `gh-readonly-queue/*` ref GitHub deleted (the batch
+re-formed) keeps running and holds a runner. `shipyard rescue
+--superseded-merge-group` lists in-flight merge_group runs, then reads the
+queue refs with `git ls-remote` (HEAD must be present as a control), and marks a
+run for cancellation only when its ref is confirmed absent and it still has
+active jobs. Audit-only unless `--apply`; uncertainty (ls-remote failure, jobs
+read failure) always keeps the run; zero-job ghosts and cancel 409s are
+skipped, never force-cancelled; `--apply` honours the merge-queue hold. Do not
+substitute "is the PR still queued?" for the ref test: it reads live for a
+superseded batch. The implementation is `src/app/rescue_cmd/superseded.rs`.
+
 ### Flaky-required-leg wedge → rescue hand-off (`auto_rescue`)
 
 When Shipyard validated every target green but `gh pr merge` is *rejected*

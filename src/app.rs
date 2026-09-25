@@ -628,7 +628,9 @@ fn handle_operational_variant<W: Write>(
         command @ Command::Cloud { .. } => {
             handle_cloud_variant(command, mode, cwd, &runtime_paths.state_dir, json, stdout)
         }
-        command @ Command::Rescue(_) => handle_rescue_variant(command, mode, cwd, json, stdout),
+        command @ Command::Rescue(_) => {
+            handle_rescue_variant(command, mode, cwd, &runtime_paths.state_dir, json, stdout)
+        }
         command @ Command::AutoMerge { .. } => {
             handle_auto_merge_variant(command, mode, runtime_paths, cwd, json, stdout)
         }
@@ -691,6 +693,7 @@ fn handle_rescue_variant<W: Write>(
     command: Command,
     mode: RuntimeMode,
     cwd: &Path,
+    state_root: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -699,7 +702,7 @@ fn handle_rescue_variant<W: Write>(
     };
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    rescue_command(&args, &config, cwd, json, stdout)
+    rescue_command(&args, &config, cwd, state_root, json, stdout)
 }
 
 fn handle_setup_command<W: Write>(

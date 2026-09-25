@@ -222,6 +222,7 @@ writer custody before mutation.
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider github-hosted]` (dry-run; add `--apply`) |
 | Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (preflights + dispatches a replacement before cancelling the old run; add `--dry-run` to preview, `--rerun-failed` for completed cancelled/failed/timed-out runs; omit `--to` to re-resolve a failed leg local-first, or pass `--to <provider>` to force) |
 | Rescue every stuck run repo-wide | `shipyard rescue --all-stuck` |
+| Reap superseded ("zombie") merge_group runs still holding a runner | `shipyard rescue --superseded-merge-group` (audit-only; add `--apply` to cancel) |
 | Same-PR ship refused by a killed worker (`SamePrShipRunning`) | v0.68.0+ auto-reaps the stale `running` queue job after ~180s — just retry `shipyard pr`. See the `shipyard` skill's "Legacy Queue Recovery: killed-worker stale-running reaping". Don't run two `shipyard pr`s for one PR concurrently. |
 | PR stuck in-flight forever (never auto-merges after a host reboot / daemon crash) | `shipyard ship-state list` or `shipyard status` flags it `ORPHANED? [<evidence>]` — cross-referencing the queue: `queue_stale` (dead worker heartbeat) / `queue_terminal` (worker ended without finalizing) surface in ~3m; `queue_absent` / `time_fallback` are time-gated (default 45m, `[ship_state] orphan_stale_minutes`). A live or pending worker is never flagged. Re-run `shipyard ship <pr>` to re-validate (this clears any `abandoned` marker), or `shipyard ship-state discard <pr>` if truly dead. Detection is report-only; the daemon can optionally abandon a `queue_stale` orphan (so auto-merge stops waiting) via `[ship_state] auto_resume = true` (default off, fail-closed, never re-dispatches, re-reads the queue live under the per-PR lock so a concurrent re-ship is spared). Records are reconciled against the PR itself before being reported: one whose PR already MERGED or CLOSED prints `RESOLVED [merged|closed]` (no verdict is owed — it blocks nothing, just discard it) rather than `ORPHANED?`, so the flagged list is only PRs that really are waiting on Shipyard. An unreadable PR state fails closed and stays flagged. See the `shipyard` skill's "Orphaned ship-state reporting". |
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
@@ -1149,6 +1150,39 @@ destructive ops on the runner host itself.
 `cloud handoff run --apply`). Both `cloud handoff list-stuck` and
 `cloud handoff run` remain available for cases where you need to operate
 on a specific run ID outside the PR-scoped flow.
+
+### Reaping superseded merge_group runs (`rescue --superseded-merge-group`)
+
+When GitHub re-forms a merge-queue batch it deletes the old
+`gh-readonly-queue/<base>/pr-<n>-<sha>` ref, but a `merge_group` run already
+started on it keeps running and holds a self-hosted runner until it finishes.
+Its result can never be used.
+
+```bash
+shipyard rescue --superseded-merge-group          # audit: prints every decision + evidence
+shipyard rescue --superseded-merge-group --apply  # cancel the proven zombies
+```
+
+The detector is the ref, not the queue: a run is superseded only when its head
+branch is absent from a *successful* `git ls-remote <remote> HEAD
+'refs/heads/gh-readonly-queue/*'`. "Is the PR still in the queue?" is the
+wrong test: a superseded batch's PR usually is, in the newer batch. Run it from
+inside the target checkout (so `origin` is the repo) or pass `--repo`.
+
+Fail-closed rules:
+- Runs are listed first, refs second. GitHub creates the ref before the run, so
+  a new batch cannot be misread as superseded.
+- The listing must include `HEAD` as a control. A failed or HEAD-less listing
+  keeps every run and exits 1.
+- A run with zero active jobs is the ghost shape GitHub refuses to cancel (409 on
+  cancel and force-cancel) and holds no runner: `skipped-ghost`, never
+  escalated. A 409 at cancel time is recorded the same way.
+- Only `merge_group` runs on `gh-readonly-queue/*` that pass the bulk-cancel
+  policy are considered; release workflows are always protected. It never
+  redispatches.
+- `--apply` refuses while `shipyard merge-queue hold` is set.
+
+Row statuses: `would-cancel`, `cancelled`, `keep`, `skipped-ghost`, `failed`.
 
 ### Preventing wedges: `runner watch --kill-hung-workers`
 

@@ -14,6 +14,8 @@ use crate::config::LoadedConfig;
 use crate::output::write_json_envelope;
 use crate::workflow_cancellation::is_bulk_run_cancellation_safe;
 
+mod superseded;
+
 /// Cap on the number of paginated `gh api` calls per rescue invocation.
 /// Each page is 100 items, so the worst case is 500 queued + 500 completed
 /// runs scanned. In practice we expect early termination on the first
@@ -63,10 +65,27 @@ pub(super) fn rescue_command<W: Write>(
     args: &RescueArgs,
     config: &LoadedConfig,
     cwd: &Path,
+    state_root: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let actions = GitHubActions::from_loaded_config(cwd, config);
+    if args.superseded_merge_group {
+        let repo_slug = resolve_repo_slug(args.repo.clone(), cwd)?;
+        let remote = superseded::queue_ref_remote(cwd, &repo_slug);
+        return superseded::reap_superseded_merge_groups(
+            &superseded::ReapRequest {
+                repo: &repo_slug,
+                apply: args.apply,
+                state_root,
+            },
+            &actions,
+            || superseded::ls_remote_queue_refs(cwd, &remote),
+            &remote,
+            json,
+            stdout,
+        );
+    }
     rescue_with_actions(args, config, cwd, &actions, json, stdout, Utc::now())
 }
 
@@ -736,6 +755,8 @@ cache_ttl_seconds = 300
             dry_run: true,
             threshold: "30m".to_owned(),
             repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
         };
         let run = queued_run(99, "feat/x", "2026-05-13T10:00:00Z", "queued", None);
         let candidate = Candidate {
@@ -760,6 +781,8 @@ cache_ttl_seconds = 300
             dry_run: false,
             threshold: "30m".to_owned(),
             repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
         };
         let summary = render_human_summary(&args, "owner/repo", Some("feat/x"), &[]);
         assert!(summary.contains("No stuck queued runs"));
@@ -794,6 +817,8 @@ cache_ttl_seconds = 300
             dry_run: true,
             threshold: "30m".to_owned(),
             repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
         };
         let actions = GitHubActions::new(temp.path());
         let outcome =
@@ -842,6 +867,8 @@ cache_ttl_seconds = 300
             dry_run: true,
             threshold: "30m".to_owned(),
             repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
         };
         let outcome = process_candidate(
             &candidate,
@@ -878,6 +905,8 @@ cache_ttl_seconds = 300
             dry_run: false,
             threshold: "30m".to_owned(),
             repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
         };
 
         let outcome =
@@ -921,6 +950,8 @@ cache_ttl_seconds = 300
             dry_run: false,
             threshold: "30m".to_owned(),
             repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
         };
 
         let outcome =
@@ -965,6 +996,8 @@ cache_ttl_seconds = 300
             dry_run: false,
             threshold: "30m".to_owned(),
             repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
         };
 
         let outcome =
@@ -1044,6 +1077,8 @@ cache_ttl_seconds = 300
             dry_run: true,
             threshold: "30m".to_owned(),
             repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
         };
         let actions = GitHubActions::new(temp.path());
         let outcome =
@@ -1070,6 +1105,8 @@ cache_ttl_seconds = 300
             dry_run: true,
             threshold: "30m".to_owned(),
             repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
         };
         let actions = GitHubActions::new(temp.path());
         let outcome =

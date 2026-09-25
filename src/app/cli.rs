@@ -609,7 +609,9 @@ pub(super) enum Command {
         command: CloudCommand,
     },
     /// One-shot rescue for wedged-runner recovery: cancel + redispatch every
-    /// stuck workflow run on a PR (or the whole repo) to a different provider.
+    /// stuck workflow run on a PR (or the whole repo) to a different provider,
+    /// or (`--superseded-merge-group`) reap `merge_group` runs whose queue ref
+    /// GitHub has already deleted.
     Rescue(RescueArgs),
     /// Update the locally-installed Shipyard CLI from a published GitHub Release.
     Update(UpdateArgs),
@@ -2162,9 +2164,12 @@ pub(super) struct CloudRetargetArgs {
 }
 
 #[derive(Clone, Debug, clap::Args)]
+// Clap models each independent rescue mode and flag as a bool.
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct RescueArgs {
-    /// PR number whose stuck runs should be rescued. Required unless `--all-stuck`.
-    #[arg(required_unless_present = "all_stuck")]
+    /// PR number whose stuck runs should be rescued. Required unless
+    /// `--all-stuck` or `--superseded-merge-group`.
+    #[arg(required_unless_present_any = ["all_stuck", "superseded_merge_group"])]
     pub(super) pr: Option<u64>,
     /// Rescue every stuck queued run in the repo regardless of PR.
     #[arg(long = "all-stuck", action = ArgAction::SetTrue, conflicts_with = "pr")]
@@ -2189,6 +2194,25 @@ pub(super) struct RescueArgs {
     /// Owner/repo slug. Defaults to the current git repo.
     #[arg(long)]
     pub(super) repo: Option<String>,
+    /// Reap superseded ("zombie") `merge_group` runs instead of rescuing a PR:
+    /// an in-flight `merge_group` run whose `gh-readonly-queue/*` ref is absent
+    /// from a successful `git ls-remote` validates a deleted batch and can only
+    /// hold a runner. Audit-only unless `--apply`; never redispatches.
+    #[arg(
+        long = "superseded-merge-group",
+        action = ArgAction::SetTrue,
+        conflicts_with_all = ["pr", "all_stuck", "provider", "rerun_failed"]
+    )]
+    pub(super) superseded_merge_group: bool,
+    /// Cancel the superseded `merge_group` runs the audit proves. Only valid with
+    /// `--superseded-merge-group`, whose default is audit-only.
+    #[arg(
+        long = "apply",
+        action = ArgAction::SetTrue,
+        requires = "superseded_merge_group",
+        conflicts_with = "dry_run"
+    )]
+    pub(super) apply: bool,
 }
 
 #[derive(Clone, Debug, clap::Args)]
