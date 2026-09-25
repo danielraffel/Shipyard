@@ -109,6 +109,10 @@ Certification requires **all** of:
 Everything else refuses, and the refusal now carries the batch's failing jobs
 and steps so the attribution can be made in one step instead of hunted for.
 
+A certified allow is not silent. The guard exits 0 and prints
+`queue-arm-guard: note: ...` to stderr naming the batch, the certification and
+the evidence, because lifting a protective refusal should leave a trace.
+
 **`merge_conflict` is never attributable.** A conflict is a property of the head
 against its base, so it implicates the head whatever the batch's checks did.
 
