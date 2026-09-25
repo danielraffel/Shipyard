@@ -528,6 +528,13 @@ pub(super) enum Command {
         /// SHA drift (Shipyard #346).
         #[arg(long = "adopt-head")]
         adopt_head: bool,
+        /// Do not arm GitHub-native auto-merge on the pull request. By default
+        /// Shipyard arms it (merge method MERGE) as soon as the pull request is
+        /// known, so a green pull request cannot sit unqueued because nothing
+        /// armed it. Arming is server-owned and survives this process; it does
+        /// not merge anything a required check has not passed.
+        #[arg(long = "no-arm")]
+        no_arm: bool,
         /// Execute in this terminal for debugging instead of daemon ownership.
         #[arg(long)]
         foreground: bool,
@@ -601,6 +608,13 @@ pub(super) enum Command {
         /// Disable a project-configured automatic steward handoff.
         #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
         no_steward_handoff: bool,
+        /// Do not arm GitHub-native auto-merge on the pull request. By default
+        /// Shipyard arms it (merge method MERGE) as soon as the pull request is
+        /// known, so a green pull request cannot sit unqueued because nothing
+        /// armed it. Arming is server-owned and survives this process; it does
+        /// not merge anything a required check has not passed.
+        #[arg(long = "no-arm")]
+        no_arm: bool,
     },
     /// Cloud runner operations.
     Cloud {
@@ -1569,6 +1583,14 @@ pub(super) enum RunnerCommand {
         /// Maximum preemptions of one workflow on one immutable PR head.
         #[arg(long = "max-preemptions-per-head", default_value_t = 1)]
         max_preemptions_per_head: u32,
+        /// Also arm GitHub-native auto-merge on green, unqueued, unarmed pull
+        /// requests the steward itself declines to own (no management label, or
+        /// no current-head handoff receipt), so one cannot sit unqueued because
+        /// nothing armed it. Audit-only without `--apply`. Drafts, failing
+        /// required checks, conflicts, and heads the queue ejected are never
+        /// armed, and the queue-arm guard's refusals are honoured.
+        #[arg(long = "arm-unqueued")]
+        arm_unqueued: bool,
         /// Perform the planned mutations. Without this flag, only audit.
         #[arg(long)]
         apply: bool,

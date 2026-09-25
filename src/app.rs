@@ -940,6 +940,7 @@ fn handle_ship_variant<W: Write>(
         skip_targets,
         adopt_head,
         foreground,
+        no_arm,
     } = command
     else {
         unreachable!("ship variant required")
@@ -969,6 +970,7 @@ fn handle_ship_variant<W: Write>(
             steward_handoff: None,
             invocation: ship_cmd::ShipInvocation::Direct,
             foreground,
+            arm_auto_merge: !no_arm,
         },
         mode,
         cwd,
@@ -1005,6 +1007,7 @@ fn handle_pr_variant<W: Write>(
         workstream_id,
         context_url,
         no_steward_handoff,
+        no_arm,
     } = command
     else {
         unreachable!("pr variant required")
@@ -1035,6 +1038,7 @@ fn handle_pr_variant<W: Write>(
                 StewardHandoffPreference::ProjectDefault
             },
             python_command: None,
+            arm_auto_merge: !no_arm,
         },
         &config,
         cwd,

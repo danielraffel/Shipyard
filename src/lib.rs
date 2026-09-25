@@ -16,6 +16,9 @@
 pub mod app;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.
 pub mod artifact_transport;
+/// Decide whether GitHub-native auto-merge may be armed on one pull request,
+/// so a green pull request cannot sit unqueued because nothing armed it.
+pub mod auto_arm;
 /// Classify a "Shipyard validated green but GitHub refused the merge" wedge and
 /// decide whether a red required check is a flaky leg the operator can recover.
 pub mod auto_rescue;
