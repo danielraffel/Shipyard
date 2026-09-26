@@ -32,6 +32,7 @@ as `shipyard landing --pr <n>` (see `docs/landing-model.md`).
 | removed for `invalid_merge_commit`, same head | allow (GitHub failed to build the merge commit; nothing against the head, and the one reason Shipyard's own admission re-arms after) |
 | already queued | refuse: nothing to do; REST `auto_merge` is `null` for every queued PR |
 | auto-merge armed, not yet queued | refuse: the queue will pick it up |
+| removed for `failed_checks`, same head, batch attributor certifies the head | allow (the repository ruled the ejecting batch's failure not this head's; see [Batch attribution](#batch-attribution)) |
 | removed for `failed_checks` / `merge_conflict`, same head | refuse: under ALLGREEN a same-head re-enqueue fails its batch-mates; push a fix first |
 | removed for any other reason (`manual`, ...), same head | refuse: confirm with whoever dequeued it |
 | merged / closed | refuse |
@@ -39,6 +40,124 @@ as `shipyard landing --pr <n>` (see `docs/landing-model.md`).
 
 A GraphQL body read from stdin (`--input -`, `query=@-`) cannot be inspected
 and is refused as ambiguous.
+
+## Batch attribution
+
+A pull request ejected for `failed_checks` is refused a same-head re-enqueue
+because under ALLGREEN a head that failed its batch will fail the next one too,
+taking innocent batch-mates with it. That reasoning assumes the head is what
+failed. Sometimes it is not: the batch failed on infrastructure, or on a
+breakage already present on the base, or on a different entry in the batch.
+
+The guard does not decide that for itself. It asks the repository, and only a
+positive certification turns the refusal into an allow.
+
+### Declaring an attributor
+
+```toml
+# .shipyard/config.toml
+[queue.attribution]
+command = ["python3", "tools/scripts/queue_batch_attribute.py"]
+```
+
+`command` must be an argv list; a shell string is rejected rather than quoted,
+so the repository's config never becomes a shell-injection surface for a command
+that runs on an operator's machine. The config is found by searching upward from
+the working directory `ghapp` was invoked in, and it is used only when that
+checkout is the pull request's own repository.
+
+**With no `[queue.attribution]` declared the guard makes no extra API reads and
+behaves exactly as it did before.** Nothing changes for a repository that does
+not opt in.
+
+### What the guard asks
+
+When, and only when, a target is a same-head ejection for `failed_checks`, the
+guard resolves the ejecting `merge_group` run (the most recent failed
+`merge_group` run created no later than the removal, whose batch contains this
+head, proven by the read-only queue branch naming `pr-<n>-` or by commit
+ancestry), collects each failing job and the names of its failing steps, and
+runs:
+
+```
+<command...> --repo <owner/name> --pr <number> --run-id <id>
+```
+
+### What certifies, and what does not
+
+The attributor must print one JSON object on stdout:
+
+```json
+{
+  "run_id": 36093055057,
+  "implicates_head": false,
+  "verdict": "infrastructure",
+  "evidence": "macos failed at `Install ccache (macOS)`, before any repository content built"
+}
+```
+
+Certification requires **all** of:
+
+| requirement | why |
+|---|---|
+| exit status 0 | a crashed attributor has not ruled |
+| stdout is a JSON object | an unparsable verdict is not a verdict |
+| `run_id` equals the run the guard resolved | a ruling about another run does not apply here |
+| `implicates_head` is exactly `false` | `null`, missing, or a string is not a ruling |
+| `verdict` is `infrastructure` or `other_pull_request` | it must name *why*, not what it failed to find |
+| for `other_pull_request`, `implicated_pr` is an integer other than this PR | blaming this PR is not blaming another one |
+
+Everything else refuses, and the refusal now carries the batch's failing jobs
+and steps so the attribution can be made in one step instead of hunted for.
+
+A certified allow is not silent. The guard exits 0 and prints
+`queue-arm-guard: note: ...` to stderr naming the batch, the certification and
+the evidence, because lifting a protective refusal should leave a trace.
+
+**`merge_conflict` is never attributable.** A conflict is a property of the head
+against its base, so it implicates the head whatever the batch's checks did.
+
+### Why the guard does not rule for itself
+
+It is tempting to let Shipyard decide this generically: resolve the ejecting
+run, and if nothing in it looks like a test failure, call the head innocent.
+That rule is unsound, and the incident that motivated this feature is the
+counter-example.
+
+`Generous-Corp/pulp#8811` was ejected for `failed_checks` at
+2026-09-25T04:12:51Z by `merge_group` run 36093055057. Two jobs failed: `macos`
+at `Install ccache (macOS)`, and `Linux (x64) [github-hosted]` at `Build`.
+Neither is a test failure, and the repository's own tooling reported exactly
+that: "no ctest failure block (failure is not a test failure)".
+
+But **a compile error is the most common way a head breaks a batch, and it
+produces no test-failure evidence at all.** A rule that reads "no test failure"
+as "innocent head" allows a re-enqueue of a head that cannot possibly pass:
+the precise wrong-allow this guard exists to prevent, and one whose cost is
+ejecting innocent batch-mates.
+
+A step-name signature is no better. In that same batch the `Build` failure was
+CMake test discovery for `pulp-test-group-canvas`, registered at the batch's
+base commit and untouched by the pull request. The neighbouring batch for
+`#8807` (run 36090859921) failed the same job at the same step for the same
+pre-existing cause, so `(job, step)` does corroborate across batches, but
+`(macos, Install ccache (macOS))` corroborates nowhere that day, and a rule
+requiring every failing job to be corroborated refuses this incident anyway.
+
+The same incident also shows that "un-implicated by the ejecting batch" is
+strictly weaker than "will pass next time". `#8811`'s visible batch failure was
+not its own, but its head was broken anyway, by the same class of defect: a
+grouped member spec whose only case compiles on macOS, so discovery matched
+nothing on Linux and Windows. The build aborted on the base's `group-canvas`
+failure before reaching it, so that defect appears nowhere in the ejecting run,
+and the pull request needed a real fix three hours later. A same-head
+re-enqueue at 04:13 would have been justified by every piece of evidence that
+batch contained, and would still have failed and taken its batch-mates with it.
+
+So certification is deliberately narrow and repository-owned. Only the
+repository can reason about whether a failed build even reached the parts a diff
+touches, and which of its steps repository content can influence at all.
+Shipyard asks rather than guessing.
 
 ### Shipyard's own arming path is deliberately judged by this guard
 
@@ -113,11 +232,13 @@ build). Binaries from before the arm guard do not set
 judged like anyone else's. In practice their admission logic already skips
 queued and armed PRs, so what changes for them is:
 
-- a same-head re-enqueue after `failed_checks` or `merge_conflict` is refused.
-  This is the intended refusal. It includes the older merge steward's
-  queue-priority recovery, which re-enqueued the same head after a
-  `failed_checks` it attributed to infrastructure; that recovery resumes once
-  the host runs a marked binary.
+- a same-head re-enqueue after `failed_checks` or `merge_conflict` is refused
+  unless the repository declares a batch attributor that certifies the head
+  (see [Batch attribution](#batch-attribution)). This is the intended refusal.
+  It includes the older merge steward's queue-priority recovery, which
+  re-enqueued the same head after a `failed_checks` it attributed to
+  infrastructure; that recovery resumes once the host runs a marked binary, or
+  once the repository's attributor can certify such a batch.
 - a same-head re-enqueue after a `manual` (or other non-`invalid_merge_commit`)
   removal is refused, asking for confirmation from whoever dequeued it.
 - an enqueue whose live state the guard cannot read is refused (fail closed);

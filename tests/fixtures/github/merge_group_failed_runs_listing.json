@@ -1,0 +1,210 @@
+{
+  "total_count": 1099,
+  "workflow_runs": [
+    {
+      "id": 36103973610,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8800-626681729a31f89dc6bfbd87b71f603858bbb5d0",
+      "head_sha": "2de71059ea8d90f4c1dd98045aa3104a625d5d15",
+      "created_at": "2026-09-25T06:41:05Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36103973610"
+    },
+    {
+      "id": 36093055057,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8811-2c2e767d89ca6d1cddfb7509f2c6eb17ace9e5d2",
+      "head_sha": "9b4c3892f326382317340e020e7947c0890d5539",
+      "created_at": "2026-09-25T04:06:08Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36093055057"
+    },
+    {
+      "id": 36090859921,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8807-bb7e5335281771bf7122f2e385e13835770be93d",
+      "head_sha": "2c2e767d89ca6d1cddfb7509f2c6eb17ace9e5d2",
+      "created_at": "2026-09-25T03:33:45Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36090859921"
+    },
+    {
+      "id": 36062449140,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8803-954faec7a8126596e4dd541bc008451d1a10ea7e",
+      "head_sha": "3d9d28b0c860a487d0e710790b1a1d1fd258b705",
+      "created_at": "2026-09-24T21:35:29Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36062449140"
+    },
+    {
+      "id": 36061707783,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8806-ffdae1deb8e9c2957516e8511bc4ea29b7407657",
+      "head_sha": "954faec7a8126596e4dd541bc008451d1a10ea7e",
+      "created_at": "2026-09-24T21:28:33Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36061707783"
+    },
+    {
+      "id": 36060078018,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8805-59c017fc9ad09e9f28f006880470e3da326028b0",
+      "head_sha": "ffdae1deb8e9c2957516e8511bc4ea29b7407657",
+      "created_at": "2026-09-24T21:13:34Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36060078018"
+    },
+    {
+      "id": 36059335632,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8805-70be34be4c2d6f44cedaede17deae12df04d3079",
+      "head_sha": "ee8efa0f92ee38c5180db0624e1edd6891cc1bd1",
+      "created_at": "2026-09-24T21:06:43Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36059335632"
+    },
+    {
+      "id": 36055833245,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8802-59c017fc9ad09e9f28f006880470e3da326028b0",
+      "head_sha": "70be34be4c2d6f44cedaede17deae12df04d3079",
+      "created_at": "2026-09-24T20:34:55Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36055833245"
+    },
+    {
+      "id": 36052438785,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8796-7df092f7d20322a3b8ca05b1530cc805633e97bf",
+      "head_sha": "59c017fc9ad09e9f28f006880470e3da326028b0",
+      "created_at": "2026-09-24T20:04:47Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36052438785"
+    },
+    {
+      "id": 36026740383,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8761-82f817e1df00df62640960a007216d2274c6c217",
+      "head_sha": "be488a5650acc348bd72905233ab8ca9b5ef4d0e",
+      "created_at": "2026-09-24T16:21:03Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36026740383"
+    },
+    {
+      "id": 36022340612,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8767-32023b19cba1e2532aeb95d5adb9c110c6de6cf0",
+      "head_sha": "82f817e1df00df62640960a007216d2274c6c217",
+      "created_at": "2026-09-24T15:44:06Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36022340612"
+    },
+    {
+      "id": 36022280195,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8793-f68ca5db9e2421a2269acbb4aecc1214400002ee",
+      "head_sha": "32023b19cba1e2532aeb95d5adb9c110c6de6cf0",
+      "created_at": "2026-09-24T15:43:36Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36022280195"
+    },
+    {
+      "id": 35973715485,
+      "name": "WebCLAP Cloudflare",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8773-b756422ff4306e158491cebbf6f96ad3d741528c",
+      "head_sha": "720ec4a631d31614fbb0f37ebc9eab02fde34845",
+      "created_at": "2026-09-24T08:10:39Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35973715485"
+    },
+    {
+      "id": 35958969875,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8739-4686a360f6efa8ab83700030b02c8d92fad0fd58",
+      "head_sha": "058ffb028d08904ac3e9bc8bdf6df7d2f00ec149",
+      "created_at": "2026-09-24T05:13:09Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35958969875"
+    },
+    {
+      "id": 35946846933,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8741-80813b14102240eb52f06e2a06444b519e708163",
+      "head_sha": "68993e80d104d936d9eb28c713d87c80eca4e640",
+      "created_at": "2026-09-24T02:20:45Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35946846933"
+    },
+    {
+      "id": 35944328801,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8750-14b71003a38e9d6652cdfa0b3d05ea22789b218c",
+      "head_sha": "80813b14102240eb52f06e2a06444b519e708163",
+      "created_at": "2026-09-24T01:45:34Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35944328801"
+    },
+    {
+      "id": 35944327058,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8726-3d9026b8750626493e6f0de6ba87399818b646cf",
+      "head_sha": "14b71003a38e9d6652cdfa0b3d05ea22789b218c",
+      "created_at": "2026-09-24T01:45:32Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35944327058"
+    },
+    {
+      "id": 35940039903,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8751-eb9880dff1f057661cee1ed784bc1b7b3201c6d6",
+      "head_sha": "05799238a9a6675ebedc3561e29e566858a5da40",
+      "created_at": "2026-09-24T00:47:53Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35940039903"
+    },
+    {
+      "id": 35932604210,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8603-272d383fb2d7bfb57fa6a95ac91e2ecfcbe3c446",
+      "head_sha": "19da689009bb6876be5e80aca380e022e3d31013",
+      "created_at": "2026-09-23T23:14:40Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35932604210"
+    },
+    {
+      "id": 35924701709,
+      "name": "Build and Test",
+      "event": "merge_group",
+      "conclusion": "failure",
+      "head_branch": "gh-readonly-queue/main/pr-8734-8ffef4870a3d7135d680fbe89cfa5c584486130f",
+      "head_sha": "a9ad9fbc751dbd931b47a751700d5bd01f3a12ec",
+      "created_at": "2026-09-23T21:48:40Z",
+      "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/35924701709"
+    }
+  ],
+  "_provenance": {
+    "source": "repos/Generous-Corp/pulp/actions/runs?event=merge_group&status=failure&per_page=20",
+    "captured": "2026-09-25",
+    "note": "The listing the batch resolver scans, newest first. Contains both fixtures above and run 36090859921 (pulp#8807), whose `Linux (x64) [github-hosted]` job also failed at `Build` for the same pre-existing pulp-test-group-canvas cause: a (job, step) signature is not a fingerprint."
+  }
+}
