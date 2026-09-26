@@ -104,6 +104,7 @@ esac
         coalesce: true,
         preempt_capacity: true,
         max_preemptions_per_head: 1,
+        arm_unqueued: false,
         apply: true,
         ledger: None,
     };
@@ -2121,6 +2122,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         coalesce: true,
         preempt_capacity: true,
         max_preemptions_per_head: 1,
+        arm_unqueued: false,
         apply: false,
         ledger: None,
     };
@@ -2230,6 +2232,7 @@ fi
         coalesce: true,
         preempt_capacity: true,
         max_preemptions_per_head: 1,
+        arm_unqueued: false,
         apply: true,
         ledger: None,
     };
@@ -2288,6 +2291,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         coalesce: true,
         preempt_capacity: true,
         max_preemptions_per_head: 1,
+        arm_unqueued: false,
         apply: false,
         ledger: None,
     };
@@ -2329,6 +2333,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         coalesce: false,
         preempt_capacity: false,
         max_preemptions_per_head: 1,
+        arm_unqueued: false,
         apply: false,
         ledger: None,
     };

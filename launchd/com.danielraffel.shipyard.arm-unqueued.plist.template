@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Auto-merge arming backstop (install with scripts/install_arm_unqueued.sh;
+  never hand-load). Every 15 minutes it runs the merge steward's arming pass
+  over the configured repositories and arms GitHub-native auto-merge on green,
+  unqueued, unarmed pull requests the steward itself declines to own.
+
+  Why it exists: Shipyard's own admission path enqueues a head only after it
+  has validated it, which happens only while a Shipyard process is alive. A
+  pull request whose ship lost its merge phase is then green, unqueued and
+  unarmed, with nothing left on GitHub's side to move it. Native auto-merge is
+  server-owned, so arming it survives every local process.
+
+  It arms; it never merges. GitHub re-checks required checks itself and refuses
+  drafts itself, so an armed pull request still waits for its own gates. Drafts,
+  failing required checks, conflicts, already-armed or already-queued pull
+  requests, and heads the queue ejected with no new head since are all refused,
+  and the ghapp queue-arm guard's refusals are honoured rather than overridden.
+
+  The coalescing and capacity-preemption passes are switched off below on
+  purpose: this agent's job is arming only. Run cancellation and capacity
+  preemption belong to a deliberate `runner steward` invocation by an operator,
+  not to an unattended arming tick.
+
+  NOTE for editors: an XML comment may not contain a double hyphen, so flag
+  names are spelled out in prose here rather than quoted literally.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.shipyard.arm-unqueued</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@SHIPYARD@</string>
+        <string>--json</string>
+        <string>runner</string>
+        <string>steward</string>
+        <string>--base</string>
+        <string>@BASE@</string>
+        <string>--arm-unqueued</string>
+        <string>--no-coalesce</string>
+        <string>--no-preempt-capacity</string>
+        <string>--apply</string>
+@REPO_ARGS@
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@HOME@</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StartInterval</key>
+    <integer>@INTERVAL@</integer>
+    <key>StandardOutPath</key>
+    <string>@HOME@/Library/Logs/shipyard-arm-unqueued.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Library/Logs/shipyard-arm-unqueued.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:@HOME@/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

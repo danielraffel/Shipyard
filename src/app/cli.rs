@@ -528,6 +528,13 @@ pub(super) enum Command {
         /// SHA drift (Shipyard #346).
         #[arg(long = "adopt-head")]
         adopt_head: bool,
+        /// Do not arm GitHub-native auto-merge on the pull request. By default
+        /// Shipyard arms it (merge method MERGE) as soon as the pull request is
+        /// known, so a green pull request cannot sit unqueued because nothing
+        /// armed it. Arming is server-owned and survives this process; it does
+        /// not merge anything a required check has not passed.
+        #[arg(long = "no-arm")]
+        no_arm: bool,
         /// Execute in this terminal for debugging instead of daemon ownership.
         #[arg(long)]
         foreground: bool,
@@ -601,6 +608,13 @@ pub(super) enum Command {
         /// Disable a project-configured automatic steward handoff.
         #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
         no_steward_handoff: bool,
+        /// Do not arm GitHub-native auto-merge on the pull request. By default
+        /// Shipyard arms it (merge method MERGE) as soon as the pull request is
+        /// known, so a green pull request cannot sit unqueued because nothing
+        /// armed it. Arming is server-owned and survives this process; it does
+        /// not merge anything a required check has not passed.
+        #[arg(long = "no-arm")]
+        no_arm: bool,
     },
     /// Cloud runner operations.
     Cloud {
@@ -894,6 +908,74 @@ pub(crate) enum MetricsCommand {
     Advise(MetricsAdviseArgs),
     /// Emit one compact stewardship scorecard with explicit telemetry gaps.
     Scorecard(MetricsWatchArgs),
+    /// Read-only: required-gate minutes per merged PR, merge-queue batch
+    /// fullness, and merge-group receipt reuse, read live from GitHub.
+    ///
+    /// Definitions:
+    ///
+    /// gate minutes = wall minutes (`completed_at - started_at`) of every job
+    /// named exactly --gate-job in runs of --workflow whose event is one of
+    /// --event and whose run was created in the window. Every attempt counts,
+    /// including failed and cancelled ones: waste is a cost. Runs from events
+    /// other than `merge_group` are reported as PR-head runs.
+    ///
+    /// gate minutes per merged PR = total gate minutes / pull requests merged
+    /// into --base in the window (GitHub search).
+    ///
+    /// batch fullness = pull requests per merge-queue push to --base (one
+    /// `merge_queue_merge` repository activity), counted by walking the pushed
+    /// head's first-parent chain back to the pre-push commit, against the
+    /// ruleset's `max_entries_to_merge`. Reported as mean and distribution.
+    ///
+    /// receipt reuse rate = merge-group runs in which a
+    /// `shipyard-receipt-decision/v1` annotation reported verdict `reuse` for
+    /// --receipt-target, divided by all merge-group runs of --workflow. A run
+    /// that published no decision counts as not reused and is named as a gap.
+    ///
+    /// Every list is paginated completely; a read whose length disagrees with
+    /// the API's `total_count` fails instead of reporting a smaller number.
+    /// Defaults for every flag may be set in `[metrics.gate_cost]` of
+    /// `.shipyard/config.toml` (keys: `repo`, `workflow`, `gate_job`,
+    /// `base_branch`, `events`, `receipt_job`, `receipt_target`). Run it from inside a checkout of
+    /// the repository so GitHub credentials resolve for it.
+    #[command(name = "gate-cost", verbatim_doc_comment)]
+    GateCost(Box<MetricsGateCostArgs>),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsGateCostArgs {
+    /// Owner/repo slug.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Workflow file name or id hosting the gate job, for example `build.yml`.
+    #[arg(long)]
+    pub(crate) workflow: Option<String>,
+    /// Exact name of the required gate job, for example `macos`.
+    #[arg(long = "gate-job")]
+    pub(crate) gate_job: Option<String>,
+    /// Protected branch the merge queue merges into. Defaults to `main`.
+    #[arg(long)]
+    pub(crate) base: Option<String>,
+    /// Workflow-run event counted as a gate run. Repeatable. Defaults to
+    /// `pull_request` and `merge_group`.
+    #[arg(long = "event")]
+    pub(crate) events: Vec<String>,
+    /// Only read receipt decisions from jobs with this exact name. Default:
+    /// every job of the merge-group run that ran.
+    #[arg(long = "receipt-job")]
+    pub(crate) receipt_job: Option<String>,
+    /// Target a reuse decision must name. Defaults to the gate job name.
+    #[arg(long = "receipt-target")]
+    pub(crate) receipt_target: Option<String>,
+    /// Window length ending at --to (or now), for example `48h` or `7d`.
+    #[arg(long, default_value = "48h", conflicts_with = "from")]
+    pub(crate) since: String,
+    /// Window start, RFC 3339. Overrides --since.
+    #[arg(long)]
+    pub(crate) from: Option<String>,
+    /// Window end, RFC 3339 (exclusive). Defaults to now.
+    #[arg(long)]
+    pub(crate) to: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1569,6 +1651,14 @@ pub(super) enum RunnerCommand {
         /// Maximum preemptions of one workflow on one immutable PR head.
         #[arg(long = "max-preemptions-per-head", default_value_t = 1)]
         max_preemptions_per_head: u32,
+        /// Also arm GitHub-native auto-merge on green, unqueued, unarmed pull
+        /// requests the steward itself declines to own (no management label, or
+        /// no current-head handoff receipt), so one cannot sit unqueued because
+        /// nothing armed it. Audit-only without `--apply`. Drafts, failing
+        /// required checks, conflicts, and heads the queue ejected are never
+        /// armed, and the queue-arm guard's refusals are honoured.
+        #[arg(long = "arm-unqueued")]
+        arm_unqueued: bool,
         /// Perform the planned mutations. Without this flag, only audit.
         #[arg(long)]
         apply: bool,
@@ -2415,6 +2505,24 @@ pub(super) enum MergeResult {
     Failure,
 }
 
+impl Command {
+    /// Whether this command should arm GitHub-native auto-merge.
+    ///
+    /// The inversion of `--no-arm` lives here, once, because both `ship` and
+    /// `pr` feed it into `ShipCommandArgs::arm_auto_merge`. Two open-coded
+    /// `!no_arm` expressions would each be a silent place for arming to
+    /// default off, with nothing downstream to notice.
+    ///
+    /// `None` for commands that never open or adopt a pull request.
+    #[must_use]
+    pub(crate) const fn arm_auto_merge(&self) -> Option<bool> {
+        match self {
+            Self::Ship { no_arm, .. } | Self::Pr { no_arm, .. } => Some(!*no_arm),
+            _ => None,
+        }
+    }
+}
+
 impl MergeMethod {
     pub(super) fn gh_flag(self) -> &'static str {
         match self {
@@ -2550,6 +2658,52 @@ mod tests {
         };
         assert_eq!(args.project, "pulp");
         assert_eq!(args.since, "30d");
+    }
+
+    #[test]
+    fn metrics_gate_cost_parses_repeatable_events_and_window() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "metrics",
+            "gate-cost",
+            "--repo",
+            "o/r",
+            "--workflow",
+            "build.yml",
+            "--gate-job",
+            "macos",
+            "--event",
+            "pull_request",
+            "--event",
+            "merge_group",
+            "--from",
+            "2026-09-24T00:00:00Z",
+        ])
+        .expect("metrics gate-cost");
+        let Command::Metrics { command } = cli.command else {
+            panic!("expected metrics command");
+        };
+        let super::MetricsCommand::GateCost(args) = *command else {
+            panic!("expected metrics gate-cost command");
+        };
+        assert_eq!(args.repo.as_deref(), Some("o/r"));
+        assert_eq!(args.gate_job.as_deref(), Some("macos"));
+        assert_eq!(args.events, ["pull_request", "merge_group"]);
+        assert_eq!(args.from.as_deref(), Some("2026-09-24T00:00:00Z"));
+        assert_eq!(args.since, "48h");
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "metrics",
+                "gate-cost",
+                "--since",
+                "2d",
+                "--from",
+                "2026-09-24T00:00:00Z",
+            ])
+            .is_err(),
+            "--since and --from conflict"
+        );
     }
 
     #[test]
@@ -2886,5 +3040,53 @@ mod tests {
         assert_eq!(source_run_id, 33_439_971_439);
         assert_eq!(min_age_minutes, 45);
         assert!(!apply);
+    }
+
+    /// Arming must be the DEFAULT on every route into `ship`, and `--no-arm`
+    /// must be the only thing that turns it off. This asserts the RESOLVED
+    /// value that reaches `ShipCommandArgs`, not merely that clap saw the
+    /// flag: a regression here is silent, and pull requests simply stop being
+    /// armed and sit unqueued again.
+    #[test]
+    fn arming_is_on_by_default_and_only_no_arm_disables_it() {
+        for (argv, expected) in [
+            (vec!["shipyard", "pr"], Some(true)),
+            (vec!["shipyard", "pr", "--no-arm"], Some(false)),
+            (vec!["shipyard", "ship"], Some(true)),
+            (vec!["shipyard", "ship", "--no-arm"], Some(false)),
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("parses");
+            assert_eq!(cli.command.arm_auto_merge(), expected, "{argv:?}");
+        }
+    }
+
+    /// A command that never opens or adopts a pull request has no opinion, so
+    /// the resolver must not claim one.
+    #[test]
+    fn a_command_that_owns_no_pull_request_resolves_no_arm_opinion() {
+        let cli = Cli::try_parse_from(["shipyard", "status"]).expect("parses");
+        assert_eq!(cli.command.arm_auto_merge(), None);
+    }
+
+    /// The steward backstop is opt-in: its absence is the default and
+    /// `--arm-unqueued` is what turns it on.
+    #[test]
+    fn the_steward_backstop_is_opt_in() {
+        for (argv, expected) in [
+            (vec!["shipyard", "runner", "steward"], false),
+            (
+                vec!["shipyard", "runner", "steward", "--arm-unqueued"],
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("parses");
+            let Command::Runner { command } = cli.command else {
+                panic!("expected runner command for {argv:?}");
+            };
+            let RunnerCommand::Steward { arm_unqueued, .. } = command else {
+                panic!("expected steward subcommand for {argv:?}");
+            };
+            assert_eq!(arm_unqueued, expected, "{argv:?}");
+        }
     }
 }

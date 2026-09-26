@@ -50,6 +50,54 @@ truthful on release PRs.
 
 Shipyard coordinates validation across local, SSH, and cloud targets.
 
+## `shipyard pr` arms auto-merge; you no longer do it by hand
+
+`ship` arms GitHub-native auto-merge (merge method **MERGE**) as soon as it
+knows the pull request, from the one chokepoint every route into `ship` shares —
+so `shipyard pr`, a bare `shipyard ship`, and `shipyard ship --pr <n>` all arm.
+Do **not** follow a ship with a hand-rolled `enablePullRequestAutoMerge`
+mutation; check the result instead.
+
+Why it exists: Shipyard's own admission path enqueues a head only *after* it has
+validated it, which happens only while a Shipyard process is alive. When a ship
+lost its merge phase, the pull request was left green, unqueued and unarmed,
+with nothing on GitHub's side left to move it — measured at 6 of 12 open pull
+requests on one repository. Native auto-merge is server-owned, so it survives
+the process that armed it.
+
+What the transcript line means:
+
+| line | meaning |
+|------|---------|
+| `▸ Auto-merge armed on #N` | GitHub will enqueue it when its required checks pass |
+| `▸ Auto-merge left as it is on #N: …` | nothing to do (already armed, already queued, draft, ejected on this head, not yet green) — **not** a failure |
+| `⚠︎ Auto-merge not armed on #N: …` | the arm did not happen and the ship continued; re-check with `shipyard landing --pr <n>` |
+
+In `--json` mode that line goes to **stderr**, because stdout carries one
+envelope.
+
+`--no-arm` opts out for one invocation; the `shipyard:no-auto-merge` label opts a
+pull request out permanently. Neither is something to reach for by default.
+
+Two things not to conclude from it:
+
+- **A refusal is usually the `ghapp` queue-arm guard agreeing there is nothing to
+  arm.** These requests deliberately do not carry Shipyard's internal queue
+  marker, so the guard judges them. Report it and move on; never retry it, and
+  never set `GHAPP_ALLOW_QUEUE_REARM`.
+- **Armed is not merged.** GitHub still waits for the repository's required
+  checks and refuses drafts itself. But note the converse: once armed, GitHub
+  may merge as soon as the *required* set is green, which can be before
+  Shipyard's broader target set finishes if the required set is narrower.
+
+The periodic counterpart for pull requests that slipped through anyway — opened
+by another route, or ejected and left unarmed — is
+`shipyard runner steward --arm-unqueued` (audit-only without `--apply`), with
+`scripts/install_arm_unqueued.sh` to run it on a timer. It acts only on pull
+requests the steward itself declines to own, so it cannot contend with the
+enqueue path. See the shipyard skill's
+[merge-steward reference](../shipyard/references/merge-steward.md).
+
 ## Quick reference
 
 | Task | Command |
@@ -204,6 +252,7 @@ writer custody before mutation.
 | Import tartci VM timing into runner metrics | `tartci runtime export --repo <owner/repo> | shipyard metrics import tartci --json` |
 | Summarize runner timing history | `shipyard metrics summary --project <name> --json` |
 | Show one bounded stewardship scorecard | `shipyard metrics scorecard --project <name> --since 30d --json` |
+| Gate-minutes per merged PR, batch fullness, receipt reuse (live, read-only) | `shipyard metrics gate-cost --repo <owner/repo> --workflow <file> --gate-job <job> --since 48h --json` |
 | Ask for agent-readable runner health findings | `shipyard metrics watch --project <name> --since 14d --json` |
 | Compare local vs GitHub runner timing | `shipyard metrics compare --project <name> --baseline github-hosted --candidate macstudio --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
@@ -528,6 +577,18 @@ view; it reports telemetry that Shipyard does not collect as `unavailable`
 rather than inventing a value. Treat insufficient-sample findings as "keep
 collecting", not as proof of a regression. Escalate only when the finding
 includes enough samples and a material delta for that repo/lane.
+
+`shipyard metrics gate-cost` is the merge-throughput view and reads GitHub
+live, not the metrics store. Its headline is required-gate wall minutes (PR-head
+and merge-group runs of one workflow/job, every attempt, failures included)
+divided by PRs merged into the base branch. It also reports merge-queue batch
+fullness against the ruleset's `max_entries_to_merge` and the share of
+merge-group runs whose `shipyard-receipt-decision/v1` said `reuse`. Run it from
+inside a checkout of the repo (credentials resolve by cwd); a 48h window of a
+busy repo is several hundred API reads and takes minutes. A short page is an
+error, never a smaller number. A merge-group run with no decision counts as not
+reused and appears under `telemetry_gaps`, as does queue-depth history, which
+GitHub does not record.
 
 When debugging GitHub imports, remember that Shipyard invokes `gh api` with
 absolute `/repos/...` paths and forces `-X GET` when query parameters are passed

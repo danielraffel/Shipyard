@@ -16,6 +16,9 @@
 pub mod app;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.
 pub mod artifact_transport;
+/// Decide whether GitHub-native auto-merge may be armed on one pull request,
+/// so a green pull request cannot sit unqueued because nothing armed it.
+pub mod auto_arm;
 /// Classify a "Shipyard validated green but GitHub refused the merge" wedge and
 /// decide whether a red required check is a flaky leg the operator can recover.
 pub mod auto_rescue;
@@ -93,6 +96,8 @@ pub mod fleet_slot;
 pub mod fleet_supervision;
 /// Typed supervisor assertions: can the thing that boots VMs see the work?
 pub mod fleet_supervisor;
+/// Read-only gate-minutes-per-merged-PR, batch fullness and receipt reuse.
+pub mod gate_cost;
 /// Repo-local gate script resolution for `shipyard pr`.
 pub mod gate_scripts;
 /// Shared GitHub CLI command boundary and auth resolution.

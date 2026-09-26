@@ -77,6 +77,7 @@ shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics summary --project pulp --json
 shipyard metrics scorecard --project pulp --since 30d --json
+shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
 shipyard metrics slowest --project pulp --limit 20
 shipyard metrics watch --project pulp --since 14d --json
 shipyard metrics advise --project pulp --profile normal --json
@@ -128,9 +129,13 @@ shipyard runner steward --apply                     # exact-head, green-gated mu
 shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
 shipyard runner steward --recover-hosted-setup-eviction-priority --apply
 shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable authority blocker
+shipyard runner steward --arm-unqueued              # audit green, unqueued, UNARMED PRs
+shipyard runner steward --arm-unqueued --apply      # arm native auto-merge on them
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers
+shipyard pr --no-arm                                # do NOT arm native auto-merge on the PR
+shipyard ship --pr 123 --no-arm                     # same, adopting an existing PR
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
 shipyard runner recovery-worker --drain --apply     # process one bounded pending snapshot (maximum 32)

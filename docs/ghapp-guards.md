@@ -158,6 +158,22 @@ repository can reason about whether a failed build even reached the parts a diff
 touches, and which of its steps repository content can influence at all.
 Shipyard asks rather than guessing.
 
+### Shipyard's own arming path is deliberately judged by this guard
+
+`shipyard pr` / `ship` / `ship --pr` arm native auto-merge once the pull request
+is known, and `runner steward --arm-unqueued` does the same periodically for
+pull requests the steward declines to own. Both issue
+`enablePullRequestAutoMerge` through the ordinary `gh` path **without**
+`SHIPYARD_INTERNAL_QUEUE_MUTATION`, so this guard judges them.
+
+That is on purpose. The internal marker exists for requests bound to a head
+Shipyard has *validated*; an arm-on-open request is not, so the guard's live
+read is the only thing standing between it and re-arming a queued or ejected
+head. Every state the guard refuses, Shipyard's own policy
+(`src/auto_arm.rs`) refuses too, so in practice the guard agrees — and when it
+refuses, Shipyard reports the refusal and carries on rather than failing the
+ship. Shipyard never sets `GHAPP_ALLOW_QUEUE_REARM`.
+
 ## Overrides and bypasses
 
 | variable | who sets it | effect |

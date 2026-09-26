@@ -186,6 +186,12 @@ pub(super) fn metrics_command<W: Write>(
                 )
             })?;
         }
+        MetricsCommand::GateCost(_) => {
+            return Err(CliFailure::new(
+                2,
+                "metrics gate-cost is dispatched before the metrics store opens",
+            ));
+        }
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
