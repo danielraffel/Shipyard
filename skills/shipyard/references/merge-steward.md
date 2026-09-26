@@ -70,6 +70,64 @@ the final force-cancel boundary re-reads blocker, opt-out, management label,
 exact-head handoff status, PR number, and base; a late authority loss leaves the
 pending record and a durable rejected-revalidation audit without another POST.
 
+## Arming backstop (`--arm-unqueued`)
+
+The steward enqueues only pull requests explicitly handed to it. Everything else
+depends on somebody's `shipyard ship` reaching its merge phase — and when that
+does not happen (the session died, the daemon dropped the job, the pull request
+was opened by another route) the pull request is green, unqueued and unarmed,
+with nothing left on GitHub's side to move it. Measured on one repository, 6 of
+12 open pull requests were in exactly that state.
+
+`--arm-unqueued` adds a pass that arms **GitHub-native auto-merge** on those.
+It is audit-only without `--apply`, like everything else here.
+
+```bash
+shipyard runner steward --repo OWNER/REPO --arm-unqueued           # report
+shipyard runner steward --repo OWNER/REPO --arm-unqueued --apply   # arm
+```
+
+It acts **only** on pull requests whose decision is `unmanaged` or
+`handoff_missing` — the complement of what the enqueue path touches — so the two
+can never contend for one pull request. That split is also why the weaker
+mutation is appropriate: `enqueuePullRequest` asserts "this exact head is
+admissible now", which is why it demands an ownership receipt, whereas
+`enablePullRequestAutoMerge` asserts only "merge this when GitHub says it is
+ready". GitHub re-checks required checks itself and refuses drafts itself, so
+arming grants no authority the repository's branch protection does not hold.
+
+Refused, never armed: a draft, a failing required check or outstanding review
+(`mergeStateStatus` `BLOCKED`), a conflict (`DIRTY`), an already-armed or
+already-queued pull request, a head the queue ejected with no new head since,
+the opt-out label, a repository with native auto-merge disabled, and any state
+that could not be read. `BEHIND` *is* armed: being out of date is exactly what a
+queue absorbs, and refusing it would exclude most of a backlog under up-to-date
+protection.
+
+Candidates are selected from facts the pass already fetched, so selection costs
+no extra request; only a candidate costs one, because a backlog row carries no
+timeline and so cannot tell a never-armed pull request from an ejected one.
+
+The `ghapp` queue-arm guard judges each arm request (Shipyard does not claim its
+internal marker here — see `docs/ghapp-guards.md`). A guard refusal is agreement
+that there is nothing to arm: it is reported, never retried, and
+`GHAPP_ALLOW_QUEUE_REARM` is never set.
+
+Per-repository results appear under `native_auto_merge_backstop` in the JSON
+report. A repository whose settings could not be read reports
+`not evaluated`, which is deliberately not the same as having no candidates.
+
+To run it periodically, install the launchd agent (plan-by-default):
+
+```bash
+scripts/install_arm_unqueued.sh --repo OWNER/REPO            # print the plan
+scripts/install_arm_unqueued.sh --repo OWNER/REPO --install  # load it
+```
+
+It rehearses the pass in audit mode under the agent's own environment and
+refuses to load if that fails, and it refuses a Shipyard without the flag (which
+would otherwise run the steward's much broader `--apply` pass).
+
 Semantic blockers (`required_failed` or a conflicting/dirty `needs_update`)
 produce a failed `shipyard/steward-recovery` status and the
 `shipyard:needs-agent` label. This pair is deduplicated on the immutable head;

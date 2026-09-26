@@ -2560,6 +2560,29 @@ agents. `shipyard landing --pr <n>` prints the same classification with the
 source field of every fact. Actor identity is never consulted: every queue
 mutation is attributed to the same App actor.
 
+Shipyard arms native auto-merge itself, and is judged by that guard. `ship`
+arms `enablePullRequestAutoMerge` (merge method **MERGE**, never squash: a
+squash subject folds the `chore: bump versions` marker commit in and trips
+release automation) from `resolve_pr_context`, the one chokepoint every route
+into `ship` passes through — so `shipyard pr`, a bare `ship`, and
+`ship --pr <n>` all arm, and no later route can quietly skip it. `--no-arm`
+opts out. This matters because Shipyard's own admission path enqueues only
+after it has validated a head, which happens only while a Shipyard process is
+alive; native auto-merge is server-owned, so a pull request whose ship lost its
+merge phase still lands instead of sitting green, unqueued and unarmed. Arming
+never fails the ship: a refusal is normally the guard agreeing there is nothing
+to arm.
+
+Unlike Shipyard's validated enqueue, these requests deliberately do **not**
+carry `SHIPYARD_INTERNAL_QUEUE_MUTATION`, so the arm guard judges them — an
+arm-on-open request is not bound to a validated head, so its live read is the
+only thing between it and re-arming a queued or ejected head. `src/auto_arm.rs`
+refuses every state the guard refuses (a unit test asserts that agreement), and
+`GHAPP_ALLOW_QUEUE_REARM` is never set by Shipyard. The periodic counterpart is
+`shipyard runner steward --arm-unqueued`, which arms only pull requests the
+steward declines to own; see
+[references/merge-steward.md](references/merge-steward.md).
+
 Both queue guards are optional to `ghapp` (absent means skipped), so an
 un-installed or stale copy silently leaves the protection off. `shipyard guards
 install` places this build's exact copies (atomic rename; never overwrites a

@@ -95,7 +95,29 @@ pub(super) fn apply_repo_plan(
         ledger,
         mutation_control,
     );
+    // The backstop acts only on pull requests the steward declines to own, so
+    // it can never contend with the enqueue path above. See `native_arm`.
+    let (native_arm_status, native_arm_failed) = if args.arm_unqueued {
+        super::native_arm::apply_native_arm_backstop(
+            actions,
+            observation,
+            &reports,
+            &args.opt_out_label,
+            args.apply,
+        )
+    } else {
+        (
+            super::native_arm::NativeArmRepoStatus {
+                policy: "disabled: pass --arm-unqueued to arm green, unqueued, unarmed pull \
+                         requests the steward declines to own"
+                    .to_owned(),
+                results: Vec::new(),
+            },
+            false,
+        )
+    };
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
+        || native_arm_failed
         || pr_mutation_failed
         || recovery_witness_error.is_some()
         || terminal_handoff_reconcile_error.is_some()
@@ -200,6 +222,7 @@ pub(super) fn apply_repo_plan(
                 .collect(),
             prs: reports,
             cancellations,
+            native_auto_merge_backstop: native_arm_status,
             stale_pr_run_wedge: super::stale_pr_wedge::repo_status(
                 Some(observation),
                 wedge_candidates,

@@ -91,6 +91,10 @@ pub(super) struct ShipCommandArgs {
     /// `ship --pr` recovery that lacks the submitting session's context.
     pub(super) invocation: ShipInvocation,
     pub(super) foreground: bool,
+    /// Arm GitHub-native auto-merge once the pull request is known, so a green
+    /// pull request cannot sit unqueued because nothing armed it. `--no-arm`
+    /// clears it.
+    pub(super) arm_auto_merge: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,6 +242,23 @@ pub(super) fn ship_command<W: Write>(
             &sha,
             &pr_context,
         )?;
+    }
+    // Arm native auto-merge from the one chokepoint every route into `ship`
+    // passes through, so `shipyard pr`, a bare `ship`, and `ship --pr` all get
+    // it. Never fatal: a refusal is usually the arm guard agreeing there is
+    // nothing to arm. See `auto_arm`'s module docs.
+    if args.arm_auto_merge && !repo.is_empty() {
+        let arm_actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+        let outcome = auto_arm::arm_native_auto_merge(
+            &|gh_args: &[String]| {
+                arm_actions
+                    .run_gh(gh_args)
+                    .map_err(|error| error.to_string())
+            },
+            &repo,
+            pr_context.number,
+        );
+        report_arm_outcome(&outcome, json_mode, stdout)?;
     }
     let steward_handoff = apply_requested_steward_handoff(
         args.steward_handoff.as_ref(),
@@ -893,6 +914,25 @@ fn create_current_branch_pr(
         &compose_pr_body_with_policy(cwd, Some(lane_policy)),
     )
     .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+mod auto_arm;
+
+/// Put one arm result where the caller's output mode can carry it.
+///
+/// In JSON mode stdout carries exactly one envelope, so a plain line there
+/// corrupts the output for every consumer that parses this command. The result
+/// is still worth saying, so it goes to stderr instead of being dropped.
+fn report_arm_outcome<W: Write>(
+    outcome: &auto_arm::ArmOutcome,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    if json_mode {
+        let _ = crate::writer_domain_lease::write_stderr(format_args!("{}", outcome.line));
+        return Ok(());
+    }
+    writeln!(stdout, "{}", outcome.line).map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 mod post_validation;

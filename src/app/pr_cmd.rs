@@ -44,6 +44,9 @@ pub(super) struct PrCommandArgs {
     pub(super) context_url: Option<String>,
     pub(super) steward_handoff_preference: StewardHandoffPreference,
     pub(super) python_command: Option<PathBuf>,
+    /// Arm GitHub-native auto-merge on the pull request once `ship` knows it.
+    /// Cleared by `--no-arm`.
+    pub(super) arm_auto_merge: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -300,6 +303,7 @@ pub(super) fn pr_command<W: Write>(
             steward_handoff,
             invocation: ShipInvocation::PrCommand,
             foreground: false,
+            arm_auto_merge: args.arm_auto_merge,
         },
         config,
         cwd,
@@ -749,6 +753,7 @@ mod tests {
             context_url: None,
             steward_handoff_preference: StewardHandoffPreference::ProjectDefault,
             python_command: None,
+            arm_auto_merge: false,
         }
     }
 
