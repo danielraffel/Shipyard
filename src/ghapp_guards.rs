@@ -1,6 +1,7 @@
 //! Install and audit the `ghapp` wrapper's optional queue guards.
 //!
-//! `scripts/ghapp` runs `queue-removal-guard` and `queue-arm-guard` from
+//! `scripts/ghapp` runs `queue-removal-guard`, `queue-arm-guard` and
+//! `branch-refresh-guard` from
 //! `$SHIPYARD_GHAPP_GUARDS_DIR` (default `~/.config/shipyard/guards`) when they
 //! are present and executable. Nothing else puts them there, so a host keeps
 //! whatever copy somebody placed by hand, possibly months stale. This module
@@ -13,8 +14,8 @@
 //! release-matched member of the authenticated `ghapp` generation and is
 //! published by `shipyard fleet update`.
 //!
-//! The arm guard loads its request parser from the removal guard sitting next
-//! to it, so the two are installed together.
+//! The arm and branch-refresh guards load their request parser from the
+//! removal guard sitting next to them, so all three are installed together.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -38,8 +39,9 @@ pub struct ManagedGuard {
 }
 
 /// Every guard `shipyard guards install` manages, in install order: the arm
-/// guard imports the removal guard's request parser, so the parser lands first.
-pub const MANAGED_GUARDS: [ManagedGuard; 2] = [
+/// and branch-refresh guards import the removal guard's request parser, so the
+/// parser lands first.
+pub const MANAGED_GUARDS: [ManagedGuard; 3] = [
     ManagedGuard {
         name: "queue-removal-guard",
         source_path: "scripts/ghapp_queue_removal_guard.py",
@@ -49,6 +51,11 @@ pub const MANAGED_GUARDS: [ManagedGuard; 2] = [
         name: "queue-arm-guard",
         source_path: "scripts/ghapp_queue_arm_guard.py",
         contents: include_bytes!("../scripts/ghapp_queue_arm_guard.py"),
+    },
+    ManagedGuard {
+        name: "branch-refresh-guard",
+        source_path: "scripts/ghapp_branch_refresh_guard.py",
+        contents: include_bytes!("../scripts/ghapp_branch_refresh_guard.py"),
     },
 ];
 

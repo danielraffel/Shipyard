@@ -2703,6 +2703,15 @@ or same-head-ejected PR. When it refuses, do what the refusal says (push a fix,
 or confirm a manual dequeue with whoever made it); do not look for a way around
 it. Operator overrides are documented for humans in `docs/ghapp-guards.md`.
 
+**Do not refresh a PR the merge queue will validate anyway.** A `BEHIND` PR on a
+merge-queue base does not need `update-branch` or a merged-in `origin/main`: the
+queue builds the merge result itself, and the refresh push cancels the required
+gate running on the old head. Refresh only to resolve a real conflict
+(`mergeable: CONFLICTING`) or to clear a failing required check. A repository
+can enforce this with `[merge] refresh_branch = "only-if-conflicting"`, which
+makes the `ghapp` branch-refresh guard refuse pointless `update-branch` calls
+(default `"always"` changes nothing).
+
 **A green head is not necessarily a fully tested head.** `shipyard landing
 --pr <n>` and `shipyard wait pr <n> --state green` print a `VALIDATION` block
 read from the `shipyard-test-tier` annotation on the head's required check
