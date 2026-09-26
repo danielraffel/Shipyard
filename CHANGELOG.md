@@ -3,6 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02150"></a>
+## [0.215.0] - 2026-09-25
+
+- feat/refresh branch policy ([#617](https://github.com/danielraffel/Shipyard/pull/617))
+- feat/queue rearm unimplicated batch ([#614](https://github.com/danielraffel/Shipyard/pull/614))
+- feat/auto arm and attributed rearm ([#615](https://github.com/danielraffel/Shipyard/pull/615))
+
 <a id="v02140"></a>
 ## [0.214.0] - 2026-09-25
 
@@ -1574,6 +1581,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.215.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.215.0
 [0.214.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.214.0
 [0.213.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.213.1
 [0.213.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.213.0
