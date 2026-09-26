@@ -1,0 +1,51 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "number": 8811,
+        "state": "OPEN",
+        "headRefOid": "e147f2d09972babcc9977e82a46470e17f9de538",
+        "baseRefName": "main",
+        "isInMergeQueue": false,
+        "mergeQueueEntry": null,
+        "autoMergeRequest": null,
+        "repository": {
+          "nameWithOwner": "Generous-Corp/pulp"
+        },
+        "timelineItems": {
+          "pageInfo": {
+            "hasPreviousPage": false
+          },
+          "nodes": [
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "e147f2d09972babcc9977e82a46470e17f9de538"
+              }
+            },
+            {
+              "__typename": "AutoMergeEnabledEvent",
+              "createdAt": "2026-09-25T03:47:25Z"
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-25T04:05:50Z"
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-25T04:12:51Z",
+              "reason": "failed_checks"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "_provenance": {
+    "source_pr": "Generous-Corp/pulp#8811",
+    "captured": "2026-09-25",
+    "cut_event_created_at": "2026-09-25T04:12:51Z",
+    "note": "Live capture cut at the RemovedFromMergeQueueEvent so it reproduces the state the guard saw at 2026-09-25T04:12:51Z: ejected for failed_checks with head e147f2d09972babcc9977e82a46470e17f9de538 and no new head since. The live PR has since advanced to 5a1cf5627c2d2d4c72a2de4f98cffb9bdbcb7a2b, so the same-head state is only reachable by cutting. mergeQueueEntry/autoMergeRequest are cleared because GitHub consumes both on ejection.",
+    "ejecting_merge_group_run": 36093055057
+  }
+}

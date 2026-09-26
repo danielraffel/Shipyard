@@ -116,6 +116,16 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
 
 
 class QueueArmGuardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Run from a directory with no `.shipyard/config.toml` above it, so these
+        # cases never pick up a batch attributor from the checkout they run in
+        # and their exact gh-call lists stay meaningful.
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        previous = pathlib.Path.cwd()
+        os.chdir(directory)
+        self.addCleanup(os.chdir, previous)
+
     def run_guard(
         self, args: list[str], responses: list[Any] | None = None, **env: str
     ) -> tuple[int, str, list[list[str]]]:
@@ -438,6 +448,455 @@ class InstalledLayoutEndToEnd(unittest.TestCase):
             )
             # ...and never blocks an unrelated one.
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class BatchAttributionTests(unittest.TestCase):
+    """A same-head re-enqueue after `failed_checks` needs a positive certification.
+
+    Grounded in Generous-Corp/pulp#8811, ejected 2026-09-25T04:12:51Z by
+    merge_group run 36093055057. Fixtures for the pull request, the run
+    listing, the ejecting run and a test-failing run are live captures.
+    """
+
+    INCIDENT = "pr_real_8811_same_head_ejected.json"
+    RUN_ID = 36093055057
+
+    def setUp(self) -> None:
+        self.root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        cwd = pathlib.Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, cwd)
+
+    def declare(self, verdict: Any, *, exit_code: int = 0, command: Any = None) -> None:
+        """Write a `.shipyard/config.toml` declaring a stub attributor."""
+        (self.root / ".shipyard").mkdir(parents=True, exist_ok=True)
+        script = self.root / "attribute.py"
+        body = verdict if isinstance(verdict, str) else json.dumps(verdict)
+        script.write_text(
+            "import sys, pathlib\n"
+            f"pathlib.Path({str(self.root / 'argv')!r}).write_text(' '.join(sys.argv[1:]))\n"
+            f"sys.stdout.write({body!r})\n"
+            f"raise SystemExit({exit_code})\n",
+            encoding="utf-8",
+        )
+        declared = command if command is not None else [sys.executable, str(script)]
+        rendered = declared if isinstance(declared, str) else json.dumps(declared)
+        (self.root / ".shipyard" / "config.toml").write_text(
+            f"[queue.attribution]\ncommand = {rendered}\n", encoding="utf-8"
+        )
+
+    def certifies(self, **overrides: Any) -> dict[str, Any]:
+        verdict = {
+            "run_id": self.RUN_ID,
+            "implicates_head": False,
+            "verdict": "infrastructure",
+            "evidence": "macos failed at Install ccache (macOS) before any content built",
+        }
+        verdict.update(overrides)
+        return verdict
+
+    def run_guard(
+        self,
+        responses: list[Any],
+        pr: int = 8811,
+        repo: str = "Generous-Corp/pulp",
+        **env: str,
+    ) -> tuple[int, str, list[list[str]]]:
+        calls: list[list[str]] = []
+        queue = list(responses)
+
+        def fake_gh(arguments: list[str]) -> Any:
+            calls.append(arguments)
+            if not queue:
+                raise AssertionError(f"unexpected gh call {arguments}")
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        stderr = io.StringIO()
+        base_env = {"GH_REPO": repo, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        base_env.update(env)
+        with (
+            mock.patch.dict(os.environ, base_env, clear=True),
+            mock.patch.object(guard, "run_real_gh", side_effect=fake_gh),
+            mock.patch.object(guard.PARSER, "current_repo_identity", return_value=tuple(repo.split("/"))),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = guard.main(["pr", "merge", str(pr), "--auto"])
+        return code, stderr.getvalue(), calls
+
+    def batch_reads(self, run: str = "merge_group_run_real_infra_and_build.json") -> list[Any]:
+        """The two live reads the resolver makes: the run listing, then jobs."""
+        return [fixture("merge_group_failed_runs_listing.json"), fixture(run)["jobs"]]
+
+    # -- the incident ------------------------------------------------------
+
+    def test_incident_fixture_is_the_state_the_guard_saw(self) -> None:
+        response = fixture(self.INCIDENT)
+        provenance = response["_provenance"]
+        self.assertEqual(provenance["source_pr"], "Generous-Corp/pulp#8811")
+        self.assertEqual(provenance["cut_event_created_at"], "2026-09-25T04:12:51Z")
+        self.assertEqual(provenance["ejecting_merge_group_run"], self.RUN_ID)
+        got = guard.classify_pr_queue_state(response)
+        self.assertEqual(got["class"], "ejected")
+        self.assertEqual(got["reason"], "failed_checks")
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertEqual(got["head"], "e147f2d09972babcc9977e82a46470e17f9de538")
+        # Control: with no attribution at all this is the refusal that shipped.
+        allowed, message = guard.decide(got)
+        self.assertFalse(allowed)
+        self.assertIn("Push a fix first", message)
+
+    def test_certified_infrastructure_allows_the_same_head_re_enqueue(self) -> None:
+        self.declare(self.certifies())
+        code, message, calls = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 0, message)
+        # A certified allow lifts a protective refusal, so it is audited.
+        self.assertIn("queue-arm-guard: note:", message)
+        self.assertIn("batch attributor certified", message)
+        self.assertIn("Install ccache (macOS)", message)
+        # The resolver picked the ejecting run, not the newer failed batch.
+        self.assertIn(f"repos/Generous-Corp/pulp/actions/runs/{self.RUN_ID}/jobs", calls[2][1])
+        argv = (self.root / "argv").read_text(encoding="utf-8")
+        self.assertIn("--pr 8811", argv)
+        self.assertIn(f"--run-id {self.RUN_ID}", argv)
+        self.assertIn("--repo Generous-Corp/pulp", argv)
+
+    def test_resolver_skips_runs_created_after_the_ejection(self) -> None:
+        """36103973610 is newer but ran at 06:41, after the 04:12:51 removal."""
+        listing = fixture("merge_group_failed_runs_listing.json")
+        ids = [run["id"] for run in listing["workflow_runs"]]
+        self.assertIn(36103973610, ids)  # control: the later run is in the listing
+        self.assertIn(self.RUN_ID, ids)
+        self.declare(self.certifies())
+        _, _, calls = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertNotIn("36103973610", "".join(calls[2]))
+
+    # -- what must still refuse -------------------------------------------
+
+    def test_absence_of_a_test_failure_does_not_certify(self) -> None:
+        """The exact signal Pulp's attributor emitted for this batch.
+
+        `no ctest failure block (failure is not a test failure)` is true of a
+        compile error too, which is the most common way a head breaks a batch.
+        """
+        self.declare({"run_id": self.RUN_ID, "verdict": "no_test_failure", "implicates_head": None})
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 1)
+        self.assertIn("did not certify this head", message)
+        self.assertIn("Push a fix first", message)
+        # The refusal now carries the batch evidence instead of nothing.
+        self.assertIn("Install ccache (macOS)", message)
+        self.assertIn(str(self.RUN_ID), message)
+
+    def test_a_batch_that_failed_a_test_still_refuses(self) -> None:
+        """Live capture of run 36103973610: a real ctest failure in the batch."""
+        run = fixture("merge_group_run_real_test_failure.json")
+        steps = [
+            step["name"]
+            for job in run["jobs"]["jobs"]
+            if job["conclusion"] == "failure"
+            for step in job["steps"]
+            if step["conclusion"] == "failure"
+        ]
+        self.assertIn("Test (non-Windows)", steps)  # control: it really is a test failure
+        self.declare({"run_id": self.RUN_ID, "implicates_head": True, "verdict": "this_pull_request"})
+        code, message, _ = self.run_guard(
+            [fixture(self.INCIDENT), *self.batch_reads("merge_group_run_real_test_failure.json")]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("Test (non-Windows)", message)
+        self.assertIn("Push a fix first", message)
+
+    def test_merge_conflict_never_consults_an_attributor(self) -> None:
+        self.declare(self.certifies())
+        response = copy.deepcopy(fixture(self.INCIDENT))
+        for node in response["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]:
+            if node["__typename"] == "RemovedFromMergeQueueEvent":
+                node["reason"] = "merge_conflict"
+        code, message, calls = self.run_guard([response])
+        self.assertEqual(code, 1)
+        self.assertIn("ejected for merge_conflict", message)
+        self.assertEqual(len(calls), 1)  # only the PR read; no batch reads at all
+        self.assertFalse((self.root / "argv").exists())
+
+    def test_no_declared_attributor_reads_nothing_extra(self) -> None:
+        code, message, calls = self.run_guard([fixture(self.INCIDENT)])
+        self.assertEqual(code, 1)
+        self.assertIn("Push a fix first", message)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_verdict_about_another_run_does_not_apply(self) -> None:
+        self.declare(self.certifies(run_id=1))
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 1)
+        self.assertIn("ruled on run 1", message)
+
+    def test_blaming_another_pull_request_allows_but_blaming_this_one_refuses(self) -> None:
+        self.declare(self.certifies(verdict="other_pull_request", implicated_pr=8807))
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 0, message)
+        self.declare(self.certifies(verdict="other_pull_request", implicated_pr=8811))
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 1)
+        self.assertIn("named 8811", message)
+        self.declare(self.certifies(verdict="other_pull_request"))
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 1)
+        self.assertIn("named None", message)
+
+    def test_a_broken_attributor_refuses(self) -> None:
+        for label, verdict, kwargs in (
+            ("non-zero exit", self.certifies(), {"exit_code": 3}),
+            ("not JSON", "not json at all", {}),
+            ("not an object", "[1, 2]", {}),
+        ):
+            with self.subTest(label=label):
+                self.declare(verdict, **kwargs)
+                code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+                self.assertEqual(code, 1)
+                self.assertIn("Push a fix first", message)
+
+    def test_an_unresolvable_ejecting_batch_refuses(self) -> None:
+        self.declare(self.certifies())
+        empty = {"total_count": 0, "workflow_runs": []}
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), empty])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot be identified", message)
+        self.declare(self.certifies())
+        code, message, _ = self.run_guard(
+            [fixture(self.INCIDENT), guard.GuardError("HTTP 502 listing runs")]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 502", message)
+
+    def test_a_run_with_no_failing_job_is_not_evidence(self) -> None:
+        self.declare(self.certifies())
+        jobs = copy.deepcopy(fixture("merge_group_run_real_infra_and_build.json")["jobs"])
+        for job in jobs["jobs"]:
+            job["conclusion"] = "success"
+        code, message, _ = self.run_guard(
+            [fixture(self.INCIDENT), fixture("merge_group_failed_runs_listing.json"), jobs]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("no failing job", message)
+
+    def test_an_attributor_from_another_repository_cannot_rule(self) -> None:
+        self.declare(self.certifies())
+        code, message, calls = self.run_guard([fixture(self.INCIDENT)], repo="someone/else")
+        self.assertEqual(code, 1)
+        self.assertIn("belongs to someone/else", message)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_shell_string_command_is_rejected(self) -> None:
+        self.declare(self.certifies(), command='"python3 attribute.py"')
+        code, message, _ = self.run_guard([fixture(self.INCIDENT)])
+        self.assertEqual(code, 1)
+        self.assertIn("must be a non-empty list of strings", message)
+
+    def test_an_ancestry_probe_finds_a_batch_this_pr_did_not_name(self) -> None:
+        """A batch is named after one entry, so a mid-batch member needs ancestry.
+
+        `compare/base...head` reports relative to the BASE, so a batch head built
+        on this PR's head is `ahead` of it. Verified live on the incident:
+        compare/e147f2d0...9b4c3892 is `ahead`, and the reverse is `behind`.
+        """
+        listing = copy.deepcopy(fixture("merge_group_failed_runs_listing.json"))
+        for run in listing["workflow_runs"]:
+            run["head_branch"] = run["head_branch"].replace("pr-8811-", "pr-9999-")
+        self.declare(self.certifies())
+        code, message, calls = self.run_guard(
+            [
+                fixture(self.INCIDENT),
+                listing,
+                {"status": "ahead"},
+                fixture("merge_group_run_real_infra_and_build.json")["jobs"],
+            ]
+        )
+        self.assertEqual(code, 0, message)
+        self.assertIn("compare/e147f2d09972babcc9977e82a46470e17f9de538...", calls[2][1])
+        self.assertIn("...9b4c3892f326382317340e020e7947c0890d5539", calls[2][1])
+
+    def test_a_batch_that_does_not_contain_this_head_is_not_the_ejecting_batch(self) -> None:
+        """`behind` and `diverged` both mean the batch never contained this head."""
+        listing = copy.deepcopy(fixture("merge_group_failed_runs_listing.json"))
+        for run in listing["workflow_runs"]:
+            run["head_branch"] = run["head_branch"].replace("pr-8811-", "pr-9999-")
+        for status in ("behind", "diverged"):
+            with self.subTest(status=status):
+                self.declare(self.certifies())
+                code, message, _ = self.run_guard(
+                    [fixture(self.INCIDENT), listing, *[{"status": status}] * 3]
+                )
+                self.assertEqual(code, 1)
+                self.assertIn("cannot be identified", message)
+
+    def test_the_named_batch_wins_before_any_ancestry_probe_is_spent(self) -> None:
+        """A probe budget must not be able to hide a named match further down."""
+        listing = copy.deepcopy(fixture("merge_group_failed_runs_listing.json"))
+        runs = listing["workflow_runs"]
+        named = next(run for run in runs if "pr-8811-" in run["head_branch"])
+        others = [run for run in runs if run is not named]
+        # Push the named run behind more decoys than the probe budget allows.
+        for index, run in enumerate(others):
+            run["created_at"] = "2026-09-25T04:1%d:00Z" % min(index, 2)
+        listing["workflow_runs"] = others + [named]
+        self.assertGreater(len(others), guard.MERGE_GROUP_ANCESTRY_PROBES)  # control
+        self.declare(self.certifies())
+        code, message, calls = self.run_guard(
+            [
+                fixture(self.INCIDENT),
+                listing,
+                fixture("merge_group_run_real_infra_and_build.json")["jobs"],
+            ]
+        )
+        self.assertEqual(code, 0, message)
+        # No compare call was needed at all.
+        self.assertTrue(all("compare" not in "".join(call) for call in calls), calls)
+
+    def test_jobs_are_read_without_gh_paginate(self) -> None:
+        """`gh api --paginate` concatenates one object per page, which is not JSON."""
+        self.declare(self.certifies())
+        _, _, calls = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        jobs_call = calls[2]
+        self.assertNotIn("--paginate", jobs_call)
+        self.assertIn("per_page=100", jobs_call[1])
+
+    def test_a_repo_relative_program_runs_from_the_repo_root(self) -> None:
+        """A repo-relative `command` is supported, run with cwd at the repo root.
+
+        Characterization, not a guard: POSIX resolves this natively because
+        CPython chdirs to `cwd` before `execv`, so no code in the guard
+        implements it and breaking the guard cannot make this test fail. It is
+        here to pin the supported shape of `command`.
+        """
+        runner = self.root / "bin" / "attribute.sh"
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        runner.write_text(
+            "#!/bin/sh\nprintf '%s' '" + json.dumps(self.certifies()) + "'\n", encoding="utf-8"
+        )
+        runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+        (self.root / ".shipyard").mkdir(parents=True, exist_ok=True)
+        (self.root / ".shipyard" / "config.toml").write_text(
+            '[queue.attribution]\ncommand = ["bin/attribute.sh"]\n', encoding="utf-8"
+        )
+        # Run from a subdirectory so the parent cwd is not the repo root.
+        nested = self.root / "deep" / "deeper"
+        nested.mkdir(parents=True, exist_ok=True)
+        os.chdir(nested)
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 0, message)
+
+    def test_no_fixture_reaches_an_attributor_when_none_is_declared(self) -> None:
+        """The compatibility contract: opting out costs nothing and changes nothing.
+
+        Installing this guard must not alter behaviour for a repository with no
+        `[queue.attribution]`, because the guards directory is shared by every
+        Shipyard binary on the host.
+        """
+        asked = []
+        with mock.patch.object(
+            guard, "resolve_ejecting_batch", side_effect=AssertionError("resolved a batch")
+        ), mock.patch.object(guard, "attributor_command", wraps=guard.attributor_command) as spy:
+            for path in sorted(FIXTURES.glob("pr_*.json")):
+                body = json.loads(path.read_text(encoding="utf-8"))
+                classified = guard.classify_pr_queue_state(body)
+                verdict = guard.attribute_ejecting_batch(classified, "Generous-Corp/pulp")
+                self.assertIsNone(verdict, path.name)
+                # An uncertified/None verdict must leave the decision untouched.
+                self.assertEqual(
+                    guard.decide(classified), guard.decide(classified, verdict), path.name
+                )
+                asked.append(path.name)
+            # Control: the corpus really was walked, and same-head failed_checks
+            # cases (the only ones that could consult an attributor) were in it.
+            self.assertGreaterEqual(len(asked), 10)
+            self.assertIn(self.INCIDENT, asked)
+            self.assertGreaterEqual(spy.call_count, 1)
+
+    def test_certification_never_names_the_override(self) -> None:
+        for verdict in (self.certifies(), {"run_id": self.RUN_ID, "implicates_head": None}):
+            with self.subTest(verdict=verdict):
+                self.declare(verdict)
+                _, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+                for name in ("GHAPP_ALLOW_QUEUE_REARM", "SHIPYARD_INTERNAL_QUEUE_MUTATION"):
+                    self.assertNotIn(name, message)
+
+
+    def test_installed_guard_certifies_through_a_real_subprocess(self) -> None:
+        """The whole chain as ghapp runs it: installed names, real gh, real attributor."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            guards = root / "guards"
+            guards.mkdir()
+            shutil.copy(SCRIPT, guards / "queue-arm-guard")
+            shutil.copy(
+                SCRIPT.with_name("ghapp_queue_removal_guard.py"), guards / "queue-removal-guard"
+            )
+            # A repo checkout that declares an attributor.
+            repo = root / "repo"
+            (repo / ".shipyard").mkdir(parents=True)
+            attributor = repo / "attribute.py"
+            attributor.write_text(
+                "import json, sys\n"
+                "args = dict(zip(sys.argv[1::2], sys.argv[2::2]))\n"
+                "print(json.dumps({'run_id': int(args['--run-id']),\n"
+                "                  'implicates_head': False,\n"
+                "                  'verdict': 'infrastructure',\n"
+                "                  'evidence': 'macos failed before any content built',\n"
+                "                  'saw': args['--repo'] + '#' + args['--pr']}))\n",
+                encoding="utf-8",
+            )
+            (repo / ".shipyard" / "config.toml").write_text(
+                f'[queue.attribution]\ncommand = ["{sys.executable}", "attribute.py"]\n',
+                encoding="utf-8",
+            )
+            # A gh that answers the three reads in order: PR, run listing, jobs.
+            answers = guards / "answers"
+            answers.mkdir()
+            for index, name in enumerate(
+                (
+                    self.INCIDENT,
+                    "merge_group_failed_runs_listing.json",
+                    "merge_group_run_real_infra_and_build.json",
+                )
+            ):
+                body = fixture(name)
+                if name.startswith("merge_group_run_"):
+                    body = body["jobs"]
+                (answers / f"{index}.json").write_text(json.dumps(body), encoding="utf-8")
+            fake_gh = guards / "gh"
+            fake_gh.write_text(
+                "#!/bin/sh\n"
+                f"n=$(cat '{guards / 'n'}' 2>/dev/null || echo 0)\n"
+                f"printf '%s\\n' \"$*\" >> '{guards / 'calls'}'\n"
+                f"echo $((n+1)) > '{guards / 'n'}'\n"
+                f"cat '{answers}'/$n.json\n",
+                encoding="utf-8",
+            )
+            for executable in (fake_gh, guards / "queue-arm-guard"):
+                executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+            result = subprocess.run(
+                [sys.executable, str(guards / "queue-arm-guard"), "pr", "merge", "8811", "--auto"],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "GHAPP_REAL_GH": str(fake_gh),
+                    "GH_REPO": "Generous-Corp/pulp",
+                },
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("batch attributor certified", result.stderr)
+            self.assertIn("Install ccache (macOS)", result.stderr)
+            calls = (guards / "calls").read_text(encoding="utf-8")
+            self.assertIn("number=8811", calls)
+            self.assertIn("event=merge_group&status=failure", calls)
+            self.assertIn(f"runs/{self.RUN_ID}/jobs", calls)
 
 
 if __name__ == "__main__":

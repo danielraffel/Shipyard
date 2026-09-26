@@ -2554,6 +2554,40 @@ or removed from the queue with no new commit or force-push since. A same-head
 removal for `failed_checks`/`merge_conflict` is the ALLGREEN cascade (push a
 fix first); any other reason except `invalid_merge_commit` is refused with
 "confirm with whoever dequeued it". Shipyard's own enqueue is recognised
+
+A same-head `failed_checks` refusal can be lifted, but only by the repository,
+never by inference. If the repo declares `[queue.attribution] command = [...]`
+(argv list; a shell string is rejected) in `.shipyard/config.toml`, the guard
+resolves the ejecting `merge_group` run, collects its failing jobs and steps,
+and runs that command with `--repo/--pr/--run-id`. Certifying requires exit 0, a
+JSON object, a `run_id` equal to the run the guard resolved, `implicates_head`
+exactly `false`, and `verdict` of `infrastructure` or `other_pull_request` with
+an `implicated_pr` other than this PR. With nothing declared the guard makes zero
+extra API reads, which is why installing it on a fleet host changes nothing for
+repos that have not opted in.
+
+**The gotcha that shaped this: "the batch failure was not a test failure" is NOT
+evidence that the head is innocent, and an attributor that only reports that
+cannot certify.** A compile error is the most common way a head breaks a batch
+and produces no ctest/JUnit block at all, so reading absent test-failure evidence
+as innocence allows re-enqueuing a head that cannot pass. `pulp#8811`'s ejecting
+batch (run 36093055057) failed `macos` at `Install ccache (macOS)` and
+`Linux (x64)` at `Build`; Pulp's attributor said "no ctest failure block", which
+is true and says nothing about attribution. A `(job, failing step)` signature is
+not a fingerprint either: the neighbouring batch for `#8807` failed the same job
+at the same step for an unrelated-to-either-PR cause already on the base. Only a
+verdict that positively names infrastructure or another PR counts, and
+`merge_conflict` is never attributable because a conflict is a property of the
+head against its base.
+
+**"Un-implicated by the ejecting batch" is weaker than "will pass next time".**
+In the same incident `#8811`'s head was broken anyway, by the same defect class
+in its own file (a grouped member spec whose only case compiles on macOS, so
+Linux and Windows discovery matched nothing). The build aborted on the base's
+failure before reaching it, so that defect appears nowhere in the ejecting run
+and the PR needed a real fix three hours later. When judging a batch failure,
+ask whether the build even got to the parts the diff touches before concluding
+the head is clean.
 without re-judging. When the guard refuses, follow its stated path; the
 operator override is documented for humans in `docs/ghapp-guards.md`, not for
 agents. `shipyard landing --pr <n>` prints the same classification with the

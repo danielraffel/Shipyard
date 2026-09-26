@@ -1,0 +1,609 @@
+{
+  "run": {
+    "id": 36103973610,
+    "name": "Build and Test",
+    "event": "merge_group",
+    "status": "completed",
+    "conclusion": "failure",
+    "head_branch": "gh-readonly-queue/main/pr-8800-626681729a31f89dc6bfbd87b71f603858bbb5d0",
+    "head_sha": "2de71059ea8d90f4c1dd98045aa3104a625d5d15",
+    "created_at": "2026-09-25T06:41:05Z",
+    "run_attempt": 1,
+    "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36103973610"
+  },
+  "jobs": {
+    "total_count": 14,
+    "jobs": [
+      {
+        "id": 107972322113,
+        "name": "resolve-provider",
+        "conclusion": "success",
+        "steps": [
+          {
+            "number": 1,
+            "name": "Set up job",
+            "conclusion": "success"
+          },
+          {
+            "number": 2,
+            "name": "Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 3,
+            "name": "Run set -euo pipefail",
+            "conclusion": "success"
+          },
+          {
+            "number": 6,
+            "name": "Post Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 7,
+            "name": "Complete job",
+            "conclusion": "success"
+          }
+        ]
+      },
+      {
+        "id": 107972322272,
+        "name": "classify",
+        "conclusion": "success",
+        "steps": [
+          {
+            "number": 1,
+            "name": "Set up job",
+            "conclusion": "success"
+          },
+          {
+            "number": 2,
+            "name": "Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 3,
+            "name": "Run set -euo pipefail",
+            "conclusion": "success"
+          },
+          {
+            "number": 6,
+            "name": "Post Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 7,
+            "name": "Complete job",
+            "conclusion": "success"
+          }
+        ]
+      },
+      {
+        "id": 107972323338,
+        "name": "Pulp repository-isolation local proof",
+        "conclusion": "skipped",
+        "steps": []
+      },
+      {
+        "id": 107972381587,
+        "name": "protected-receipt-reuse",
+        "conclusion": "success",
+        "steps": [
+          {
+            "number": 1,
+            "name": "Set up job",
+            "conclusion": "success"
+          },
+          {
+            "number": 2,
+            "name": "Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 3,
+            "name": "Run set -u",
+            "conclusion": "success"
+          },
+          {
+            "number": 6,
+            "name": "Post Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 7,
+            "name": "Complete job",
+            "conclusion": "success"
+          }
+        ]
+      },
+      {
+        "id": 107972382601,
+        "name": "Windows MSVC release-path gate",
+        "conclusion": "skipped",
+        "steps": []
+      },
+      {
+        "id": 107972382726,
+        "name": "Windows BLE compile-gate (advisory)",
+        "conclusion": "skipped",
+        "steps": []
+      },
+      {
+        "id": 107972382789,
+        "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true') && 'macos' || 'macos-pr-unused'",
+        "conclusion": "skipped",
+        "steps": []
+      },
+      {
+        "id": 107972382812,
+        "name": "Windows MIDI Services SDK compile-gate (advisory)",
+        "conclusion": "skipped",
+        "steps": []
+      },
+      {
+        "id": 107972382959,
+        "name": "a2t-protected-event",
+        "conclusion": "skipped",
+        "steps": []
+      },
+      {
+        "id": 107972439849,
+        "name": "macos",
+        "conclusion": "success",
+        "steps": [
+          {
+            "number": 1,
+            "name": "Set up job",
+            "conclusion": "success"
+          },
+          {
+            "number": 2,
+            "name": "Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 3,
+            "name": "Fetch protected capability base",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 4,
+            "name": "Hydrate bounded GPU provenance commits",
+            "conclusion": "success"
+          },
+          {
+            "number": 5,
+            "name": "Set up Namespace macOS cache",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 6,
+            "name": "Install Linux dependencies",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 7,
+            "name": "Namespace cache (brew + ccache + Pulp FetchContent)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 8,
+            "name": "brew update (macOS)",
+            "conclusion": "success"
+          },
+          {
+            "number": 9,
+            "name": "Install ccache (macOS)",
+            "conclusion": "success"
+          },
+          {
+            "number": 10,
+            "name": "Install ccache (Windows)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 11,
+            "name": "Restore FetchContent sources (GitHub-hosted)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 12,
+            "name": "Restore ccache (GitHub-hosted)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 13,
+            "name": "Bootstrap repository dependencies",
+            "conclusion": "success"
+          },
+          {
+            "number": 14,
+            "name": "Install pinned Chrome for browser-source fidelity (macOS ARM64)",
+            "conclusion": "success"
+          },
+          {
+            "number": 15,
+            "name": "Save FetchContent sources (main push, GitHub-hosted Linux/Windows)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 16,
+            "name": "Fetch prebuilt Skia (macOS)",
+            "conclusion": "success"
+          },
+          {
+            "number": 17,
+            "name": "Intel canary \u2014 lint + x86_64 GPU-off compile",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 18,
+            "name": "Ccache effective config (proof of override)",
+            "conclusion": "success"
+          },
+          {
+            "number": 19,
+            "name": "Install materialized runtime Node test dependencies (Linux)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 20,
+            "name": "Configure",
+            "conclusion": "success"
+          },
+          {
+            "number": 21,
+            "name": "Install visual-analysis Python dependencies",
+            "conclusion": "success"
+          },
+          {
+            "number": 22,
+            "name": "Build",
+            "conclusion": "success"
+          },
+          {
+            "number": 23,
+            "name": "Ccache stats",
+            "conclusion": "success"
+          },
+          {
+            "number": 24,
+            "name": "Save ccache (main push, GitHub-hosted Linux/Windows)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 25,
+            "name": "Test fast deterministic tier (pull request head)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 26,
+            "name": "Test (non-Windows)",
+            "conclusion": "success"
+          },
+          {
+            "number": 27,
+            "name": "Observe ctest non-runs (non-Windows)",
+            "conclusion": "success"
+          },
+          {
+            "number": 28,
+            "name": "Observe GPU adapter contract (self-hosted macOS)",
+            "conclusion": "success"
+          },
+          {
+            "number": 29,
+            "name": "Test installed SDK capability contract (affected changes)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 30,
+            "name": "Test A2T structural receipt issuer",
+            "conclusion": "success"
+          },
+          {
+            "number": 31,
+            "name": "Verify A2T structural receipt",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 32,
+            "name": "Publish A2T structural verification",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 33,
+            "name": "Surface ctest failures (non-Windows)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 34,
+            "name": "Upload ctest logs and JUnit report",
+            "conclusion": "success"
+          },
+          {
+            "number": 35,
+            "name": "Test (Windows \u2014 UTF-8 code page wrapped)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 36,
+            "name": "Issue exact protected-validation receipt",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 37,
+            "name": "Publish exact protected-validation receipt",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 38,
+            "name": "Upload plugin bundles (macOS)",
+            "conclusion": "success"
+          },
+          {
+            "number": 39,
+            "name": "Upload plugin bundles (Windows)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 40,
+            "name": "Upload plugin bundles (Linux)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 80,
+            "name": "Post Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 81,
+            "name": "Complete job",
+            "conclusion": "success"
+          }
+        ]
+      },
+      {
+        "id": 107972439979,
+        "name": "Linux (x64) [github-hosted]",
+        "conclusion": "failure",
+        "steps": [
+          {
+            "number": 1,
+            "name": "Set up job",
+            "conclusion": "success"
+          },
+          {
+            "number": 2,
+            "name": "Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 3,
+            "name": "Fetch protected capability base",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 4,
+            "name": "Hydrate bounded GPU provenance commits",
+            "conclusion": "success"
+          },
+          {
+            "number": 5,
+            "name": "Set up Namespace macOS cache",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 6,
+            "name": "Install Linux dependencies",
+            "conclusion": "success"
+          },
+          {
+            "number": 7,
+            "name": "Namespace cache (brew + ccache + Pulp FetchContent)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 8,
+            "name": "brew update (macOS)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 9,
+            "name": "Install ccache (macOS)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 10,
+            "name": "Install ccache (Windows)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 11,
+            "name": "Restore FetchContent sources (GitHub-hosted)",
+            "conclusion": "success"
+          },
+          {
+            "number": 12,
+            "name": "Restore ccache (GitHub-hosted)",
+            "conclusion": "success"
+          },
+          {
+            "number": 13,
+            "name": "Bootstrap repository dependencies",
+            "conclusion": "success"
+          },
+          {
+            "number": 14,
+            "name": "Install pinned Chrome for browser-source fidelity (macOS ARM64)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 15,
+            "name": "Save FetchContent sources (main push, GitHub-hosted Linux/Windows)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 16,
+            "name": "Fetch prebuilt Skia (macOS)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 17,
+            "name": "Intel canary \u2014 lint + x86_64 GPU-off compile",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 18,
+            "name": "Ccache effective config (proof of override)",
+            "conclusion": "success"
+          },
+          {
+            "number": 19,
+            "name": "Install materialized runtime Node test dependencies (Linux)",
+            "conclusion": "success"
+          },
+          {
+            "number": 20,
+            "name": "Configure",
+            "conclusion": "success"
+          },
+          {
+            "number": 21,
+            "name": "Install visual-analysis Python dependencies",
+            "conclusion": "success"
+          },
+          {
+            "number": 22,
+            "name": "Build",
+            "conclusion": "success"
+          },
+          {
+            "number": 23,
+            "name": "Ccache stats",
+            "conclusion": "success"
+          },
+          {
+            "number": 24,
+            "name": "Save ccache (main push, GitHub-hosted Linux/Windows)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 25,
+            "name": "Test fast deterministic tier (pull request head)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 26,
+            "name": "Test (non-Windows)",
+            "conclusion": "failure"
+          },
+          {
+            "number": 27,
+            "name": "Observe ctest non-runs (non-Windows)",
+            "conclusion": "success"
+          },
+          {
+            "number": 28,
+            "name": "Observe GPU adapter contract (self-hosted macOS)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 29,
+            "name": "Test installed SDK capability contract (affected changes)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 30,
+            "name": "Test A2T structural receipt issuer",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 31,
+            "name": "Verify A2T structural receipt",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 32,
+            "name": "Publish A2T structural verification",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 33,
+            "name": "Surface ctest failures (non-Windows)",
+            "conclusion": "failure"
+          },
+          {
+            "number": 34,
+            "name": "Upload ctest logs and JUnit report",
+            "conclusion": "success"
+          },
+          {
+            "number": 35,
+            "name": "Test (Windows \u2014 UTF-8 code page wrapped)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 36,
+            "name": "Issue exact protected-validation receipt",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 37,
+            "name": "Publish exact protected-validation receipt",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 38,
+            "name": "Upload plugin bundles (macOS)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 39,
+            "name": "Upload plugin bundles (Windows)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 40,
+            "name": "Upload plugin bundles (Linux)",
+            "conclusion": "skipped"
+          },
+          {
+            "number": 80,
+            "name": "Post Run actions/checkout@v5",
+            "conclusion": "success"
+          },
+          {
+            "number": 81,
+            "name": "Complete job",
+            "conclusion": "success"
+          }
+        ]
+      },
+      {
+        "id": 107972440882,
+        "name": "github.event_name == 'merge_group' && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true' || needs.protected-receipt-reuse.outputs.macos_reused == 'true') && 'macos' || 'macos-merge-unused'",
+        "conclusion": "skipped",
+        "steps": []
+      },
+      {
+        "id": 107989625822,
+        "name": "linux",
+        "conclusion": "skipped",
+        "steps": []
+      },
+      {
+        "id": 107989625864,
+        "name": "windows",
+        "conclusion": "skipped",
+        "steps": []
+      }
+    ]
+  },
+  "_provenance": {
+    "source": "Generous-Corp/pulp actions run 36103973610 (+/jobs)",
+    "captured": "2026-09-25",
+    "note": "A failed merge_group batch whose failure IS a test failure: `Linux (x64) [github-hosted]` failed at `Test (non-Windows)` and `Surface ctest failures (non-Windows)`. Negative control: the guard must keep refusing a same-head re-enqueue for this batch.",
+    "steps_fields_only": "Only id/name/conclusion and per-step number/name/conclusion are retained."
+  }
+}
