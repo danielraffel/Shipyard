@@ -321,6 +321,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_parser_consumer_installs_after_the_removal_guard() {
+        let names = MANAGED_GUARDS.map(|guard| guard.name);
+        assert_eq!(names[0], "queue-removal-guard");
+        for consumer in ["queue-arm-guard", "branch-refresh-guard"] {
+            assert!(names[1..].contains(&consumer), "{consumer} is not managed");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_places_missing_and_replaces_stale_guards_then_reports_current() {
