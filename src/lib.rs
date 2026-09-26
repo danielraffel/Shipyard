@@ -93,6 +93,8 @@ pub mod fleet_slot;
 pub mod fleet_supervision;
 /// Typed supervisor assertions: can the thing that boots VMs see the work?
 pub mod fleet_supervisor;
+/// Read-only gate-minutes-per-merged-PR, batch fullness and receipt reuse.
+pub mod gate_cost;
 /// Repo-local gate script resolution for `shipyard pr`.
 pub mod gate_scripts;
 /// Shared GitHub CLI command boundary and auth resolution.

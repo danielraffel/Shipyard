@@ -204,6 +204,7 @@ writer custody before mutation.
 | Import tartci VM timing into runner metrics | `tartci runtime export --repo <owner/repo> | shipyard metrics import tartci --json` |
 | Summarize runner timing history | `shipyard metrics summary --project <name> --json` |
 | Show one bounded stewardship scorecard | `shipyard metrics scorecard --project <name> --since 30d --json` |
+| Gate-minutes per merged PR, batch fullness, receipt reuse (live, read-only) | `shipyard metrics gate-cost --repo <owner/repo> --workflow <file> --gate-job <job> --since 48h --json` |
 | Ask for agent-readable runner health findings | `shipyard metrics watch --project <name> --since 14d --json` |
 | Compare local vs GitHub runner timing | `shipyard metrics compare --project <name> --baseline github-hosted --candidate macstudio --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
@@ -528,6 +529,18 @@ view; it reports telemetry that Shipyard does not collect as `unavailable`
 rather than inventing a value. Treat insufficient-sample findings as "keep
 collecting", not as proof of a regression. Escalate only when the finding
 includes enough samples and a material delta for that repo/lane.
+
+`shipyard metrics gate-cost` is the merge-throughput view and reads GitHub
+live, not the metrics store. Its headline is required-gate wall minutes (PR-head
+and merge-group runs of one workflow/job, every attempt, failures included)
+divided by PRs merged into the base branch. It also reports merge-queue batch
+fullness against the ruleset's `max_entries_to_merge` and the share of
+merge-group runs whose `shipyard-receipt-decision/v1` said `reuse`. Run it from
+inside a checkout of the repo (credentials resolve by cwd); a 48h window of a
+busy repo is several hundred API reads and takes minutes. A short page is an
+error, never a smaller number. A merge-group run with no decision counts as not
+reused and appears under `telemetry_gaps`, as does queue-depth history, which
+GitHub does not record.
 
 When debugging GitHub imports, remember that Shipyard invokes `gh api` with
 absolute `/repos/...` paths and forces `-X GET` when query parameters are passed

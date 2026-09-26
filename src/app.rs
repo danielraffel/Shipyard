@@ -41,6 +41,7 @@ mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
 mod metrics_cmd;
+mod metrics_gate_cost_cmd;
 mod parallel_proof_canary_cmd;
 mod paths_cmd;
 mod pin_cmd;
@@ -94,6 +95,7 @@ use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
 use self::merge_queue_control_cmd::merge_queue_control_command;
 use self::metrics_cmd::metrics_command;
+use self::metrics_gate_cost_cmd::gate_cost_command;
 use self::parallel_proof_canary_cmd::parallel_proof_canary_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
@@ -349,7 +351,13 @@ where
             return ci_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Metrics { command } => {
-            return metrics_command(*command, &runtime_paths.state_dir, cli.json, stdout);
+            // gate-cost reads GitHub live and never touches the metrics store.
+            return match *command {
+                self::cli::MetricsCommand::GateCost(args) => {
+                    gate_cost_command(*args, cli.mode.into(), &cwd, cli.json, stdout)
+                }
+                command => metrics_command(command, &runtime_paths.state_dir, cli.json, stdout),
+            };
         }
         Command::Auth { command } => {
             return auth_command(
