@@ -114,8 +114,8 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: PinCommand,
     },
-    /// Install or audit the `ghapp` wrapper's queue guards
-    /// (`queue-removal-guard`, `queue-arm-guard`) from this build's copies.
+    /// Install or audit the `ghapp` wrapper's guards (`queue-removal-guard`,
+    /// `queue-arm-guard`, `branch-refresh-guard`) from this build's copies.
     Guards {
         /// Guards subcommand.
         #[command(subcommand)]

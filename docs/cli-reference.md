@@ -45,7 +45,7 @@ shipyard --json landing                      # machine-readable; exit 9 when any
 shipyard landing --pr 123                    # one PR: queued / armed_not_queued / ejected / never_armed / merged, with sources;
                                              #   plus VALIDATION: head test tier (fast / full / unknown) and merge-group receipt decisions
 
-# ghapp queue guards (queue-removal-guard, queue-arm-guard)
+# ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard)
 shipyard guards status                       # missing/stale/current vs this build's copies; exit 1 unless all current
 shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all

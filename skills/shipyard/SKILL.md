@@ -2617,10 +2617,35 @@ refuses every state the guard refuses (a unit test asserts that agreement), and
 steward declines to own; see
 [references/merge-steward.md](references/merge-steward.md).
 
-Both queue guards are optional to `ghapp` (absent means skipped), so an
+Branch refreshes are the third guarded mutation, and the only one whose
+guard is off by default. `scripts/ghapp_branch_refresh_guard.py` (installed as
+`branch-refresh-guard`) intercepts `pr update-branch`, REST
+`repos/<o>/<r>/pulls/<n>/update-branch`, and GraphQL `updatePullRequestBranch`.
+It reads `[merge] refresh_branch` from `.shipyard/config.toml` **on the PR's
+base branch** (a PR branch cannot relax it for itself):
+
+- `"always"` (default; also what an absent key, file, or unrecognized value
+  means) allows every refresh, exactly as before.
+- `"only-if-conflicting"` refuses a refresh only when all three are proven:
+  the base has a merge queue, the PR is `MERGEABLE`, and no required check on
+  its head is failing. A conflicting PR, a red required check (the queue would
+  reject it; a fresh merge ref also clears a failure at a step the current
+  workflow no longer runs), a base without a queue (strict protection may need
+  the up-to-date head), or anything the guard cannot read is allowed.
+
+Why: on a repository whose workflow concurrency is keyed on the PR ref with
+`cancel-in-progress`, every refresh push cancels the required gate already
+running on the old head and restarts it, while the merge queue re-validates
+the merged result anyway. Pulp measured 663 of 1175 cancelled gate-minutes in
+48h on runs cancelled by a merge-main/rebase push. When the guard refuses,
+leave the head alone and land it with `shipyard ship --pr <n>`. The same rule
+applies to a local `git merge origin/main` + `git push`, which no guard sees:
+under a merge queue, merge the base into a PR only to resolve a real conflict.
+
+All three guards are optional to `ghapp` (absent means skipped), so an
 un-installed or stale copy silently leaves the protection off. `shipyard guards
 install` places this build's exact copies (atomic rename; never overwrites a
-symlink), `shipyard guards status` exits 1 when either is missing or differs by
+symlink), `shipyard guards status` exits 1 when any is missing or differs by
 content hash, `shipyard doctor` reports them under "ghapp guards" on any host
 with a guards directory or `~/.local/bin/ghapp`, and `shipyard update` refreshes
 them with the newly verified binary when the guards directory exists. The

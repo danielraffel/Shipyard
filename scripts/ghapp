@@ -1542,6 +1542,14 @@ fi
 if [[ -x "$guards/queue-arm-guard" ]]; then
     PATH="$trusted_path" "$guards/queue-arm-guard" "$@" || exit 1
 fi
+# Optional as well. It refuses `pr update-branch` / the REST and GraphQL
+# branch-refresh equivalents only when the base branch's `[merge]
+# refresh_branch` policy is "only-if-conflicting" and the refresh is provably
+# pointless (merge queue present, PR mergeable, no required check failing).
+# The default policy, "always", allows every refresh.
+if [[ -x "$guards/branch-refresh-guard" ]]; then
+    PATH="$trusted_path" "$guards/branch-refresh-guard" "$@" || exit 1
+fi
 
 if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
       -n "${release_upload_stage_dir:-}" ]]; then

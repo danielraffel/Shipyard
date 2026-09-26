@@ -15,6 +15,7 @@ present, or not executable, is skipped.
 |---|---|---|
 | `queue-removal-guard` | `scripts/ghapp_queue_removal_guard.py` | `pr merge --disable-auto`, `dequeuePullRequest`, `disablePullRequestAutoMerge` |
 | `queue-arm-guard` | `scripts/ghapp_queue_arm_guard.py` | `pr merge --auto`, a plain `pr merge` whose base has a merge queue, `enablePullRequestAutoMerge`, `enqueuePullRequest`, when the PR's live state makes arming harmful (below) |
+| `branch-refresh-guard` | `scripts/ghapp_branch_refresh_guard.py` | `pr update-branch`, REST `pulls/<n>/update-branch`, `updatePullRequestBranch`, only when the base's `[merge] refresh_branch` policy is `"only-if-conflicting"` and the refresh is provably pointless (below) |
 
 `pr-close-guard` is a mandatory member of the authenticated `ghapp` generation
 and is managed by `shipyard fleet update`, not by this page.
@@ -174,6 +175,32 @@ head. Every state the guard refuses, Shipyard's own policy
 refuses, Shipyard reports the refusal and carries on rather than failing the
 ship. Shipyard never sets `GHAPP_ALLOW_QUEUE_REARM`.
 
+### Branch-refresh guard decisions
+
+The policy is `[merge] refresh_branch` in `.shipyard/config.toml`, read from the
+pull request's **base branch** through the App token, so a PR branch cannot
+relax it for itself:
+
+```toml
+[merge]
+refresh_branch = "only-if-conflicting"   # default: "always"
+```
+
+| policy / live state | decision |
+|---|---|
+| `"always"`, key or file absent, or an unrecognized value (reported) | allow: Shipyard's historical behaviour |
+| `"only-if-conflicting"`, base has no merge queue | allow: strict protection may need the up-to-date head to merge |
+| PR conflicts (`mergeable: CONFLICTING` or `mergeStateStatus: DIRTY`) | allow: resolving it needs a new head |
+| a required check on the head is failing (`FAILURE`, `TIMED_OUT`, `CANCELLED`, `ACTION_REQUIRED`, `STARTUP_FAILURE`, `STALE`; status `ERROR`/`FAILURE`) | allow: the queue would reject the PR, and a fresh merge ref can clear a failure at a step the current workflow no longer runs |
+| `mergeable` still `UNKNOWN` after two re-reads, required checks truncated past 100, PR not open, or anything unreadable | allow (with a note): the guard never refuses blind |
+| base has a merge queue, PR `MERGEABLE`, no required check failing (pending is not failing) | **refuse**: the queue validates the merge result itself, and the refresh push would cancel and restart the required gate |
+
+There is deliberately no `"never"`: a refresh that resolves a conflict is
+needed for correctness, and no policy value can refuse one. The guard sees only
+App-authenticated refreshes; a local `git merge origin/main && git push` does
+not pass through `ghapp`, so agent guidance (the `ci` and `shipyard` skills)
+carries the same rule.
+
 ## Overrides and bypasses
 
 | variable | who sets it | effect |
@@ -181,6 +208,7 @@ ship. Shipyard never sets `GHAPP_ALLOW_QUEUE_REARM`.
 | `SHIPYARD_INTERNAL_QUEUE_MUTATION=1` | Shipyard itself, on its own exact-head, audited queue commands (enqueue arm, classic merge, merge-steward enqueue, disable/dequeue revocation) | both queue guards step aside; Shipyard's admission rules already made the decision |
 | `GHAPP_ALLOW_QUEUE_REARM=1` | an operator, deliberately, for one command | the arm guard allows a refused arm and prints a `WARNING` naming what it overrode |
 | `GHAPP_ALLOW_QUEUE_REMOVAL=1` | an operator, deliberately | the removal guard allows a dequeue/disable and prints a `WARNING` |
+| `GHAPP_ALLOW_BRANCH_REFRESH=1` | an operator, deliberately, for one command | the branch-refresh guard allows a refused refresh and prints a `WARNING` |
 
 Setting `SHIPYARD_INTERNAL_QUEUE_MUTATION` by hand claims Shipyard's authority
 for a command Shipyard did not audit. Do not.
@@ -188,7 +216,7 @@ for a command Shipyard did not audit. Do not.
 ## Installing, and fleet-wide ordering
 
 ```sh
-shipyard guards status    # exit 1 unless both guards are installed and match this build
+shipyard guards status    # exit 1 unless every managed guard is installed and matches this build
 shipyard guards install   # atomic; never overwrites a symlink
 ```
 
