@@ -143,6 +143,9 @@ shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --works
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers
 shipyard pr --no-arm                                # do NOT arm native auto-merge on the PR
+                                                    # `shipyard pr` first prints a fold suggestion (advisory) when open PRs from the
+                                                    #   same whence session, opened in the last 6 h, share a directory family
+                                                    #   (first two path components; pr.fold.noise_paths excluded) with this branch
 shipyard ship --pr 123 --no-arm                     # same, adopting an existing PR
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt

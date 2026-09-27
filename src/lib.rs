@@ -183,6 +183,8 @@ pub mod pin;
 pub mod platform;
 /// Pull request shell boundary used by `ship`.
 pub mod pr;
+/// Same-session sibling pull requests that could ship as one.
+pub mod pr_fold;
 /// Classify one pull request's merge-queue state from GraphQL timeline facts.
 pub mod pr_queue_state;
 /// Pull request title/body composition.

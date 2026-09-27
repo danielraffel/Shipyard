@@ -13,6 +13,7 @@ use crate::config::LoadedConfig;
 use crate::gate_scripts::{SKILL_SYNC, VERSION_BUMP, VERSIONING_CONFIG, resolve};
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::paths::RuntimePaths;
+use crate::pr_fold;
 
 // A CLI argument bag: one bool per user-facing flag is the shape the
 // command line already has, and grouping them into sub-structs would
@@ -265,6 +266,7 @@ pub(super) fn pr_command<W: Write>(
         .map_or_else(|| PathBuf::from("python3"), Path::to_path_buf);
 
     warn_missing_release_bot_token(stdout, cwd, config);
+    print_fold_suggestions(stdout, cwd, config, &args.base);
     run_skill_sync(stdout, &python, &gates, &repo_root, &args.base)?;
     let bumped_files = run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
     if !bumped_files.is_empty() {
@@ -689,6 +691,83 @@ fn warn_missing_release_bot_token<W: Write>(stdout: &mut W, cwd: &Path, config: 
             "▸ Heads-up: RELEASE_BOT_TOKEN secret is missing on this repo.\n         Auto-release will tag but the binary release workflow won't fire.\n         See `shipyard doctor` for the one-time setup steps."
         );
     }
+}
+
+/// Name open pull requests from this agent session that could ship with this
+/// one. Advisory: any failure prints one line and the command continues.
+fn print_fold_suggestions<W: Write>(stdout: &mut W, cwd: &Path, config: &LoadedConfig, base: &str) {
+    let Some(session) = pr_fold::current_session(|name| std::env::var(name).ok()) else {
+        return;
+    };
+    let lines = match fold_suggestions(cwd, config, base, &session) {
+        Ok(suggestions) => pr_fold::render(&suggestions),
+        Err(error) => vec![format!("▸ Fold check skipped: {error}")],
+    };
+    for line in lines {
+        let _ = writeln!(stdout, "{line}");
+    }
+}
+
+fn fold_suggestions(
+    cwd: &Path,
+    config: &LoadedConfig,
+    base: &str,
+    session: &str,
+) -> Result<Vec<pr_fold::FoldSuggestion>, String> {
+    let repo = detect_repo_from_remote(cwd, None).ok_or("no GitHub origin remote")?;
+    let branch = git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let noise: Vec<String> = config
+        .get(pr_fold::NOISE_CONFIG_KEY)
+        .and_then(toml::Value::as_array)
+        .map_or_else(
+            || {
+                pr_fold::DEFAULT_NOISE_PATHS
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect()
+            },
+            |items| {
+                items
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            },
+        );
+    let diff = git_output(
+        cwd,
+        &["diff", "--name-only", &format!("origin/{base}...HEAD")],
+    )?;
+    let here = pr_fold::families(diff.lines(), &noise);
+    if here.is_empty() {
+        return Ok(Vec::new());
+    }
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+    let read = |path: String| -> Result<Value, String> {
+        let raw = actions
+            .run_gh(&["api".to_owned(), path])
+            .map_err(|error| error.to_string())?;
+        serde_json::from_str(&raw).map_err(|error| error.to_string())
+    };
+    let open = pr_fold::parse_open_prs(&read(format!(
+        "repos/{repo}/pulls?state=open&base={base}&per_page=100"
+    ))?);
+    let candidates = pr_fold::session_candidates(&open, session, &branch, chrono::Utc::now());
+    let mut with_families = Vec::new();
+    for pr in candidates {
+        let files = read(format!(
+            "repos/{repo}/pulls/{}/files?per_page=100",
+            pr.number
+        ))?;
+        let names: Vec<&str> = files
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|file| file.get("filename").and_then(Value::as_str))
+            .collect();
+        with_families.push((pr, pr_fold::families(names, &noise)));
+    }
+    Ok(pr_fold::suggestions(&here, &with_families))
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {

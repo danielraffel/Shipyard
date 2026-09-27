@@ -608,10 +608,12 @@ fn unsettled_runs_and_jobs_are_read_live_every_time() {
 
     gather_with(responses.clone(), &ReadCache::open(dir.path(), now));
     let (_, paths) = gather_with(responses, &ReadCache::open(dir.path(), now));
-    let live: Vec<&String> = paths
+    // Reads run on several workers, so their order is not part of the contract.
+    let mut live: Vec<&String> = paths
         .iter()
         .filter(|path| path.ends_with("/jobs"))
         .collect();
+    live.sort();
     assert_eq!(
         live,
         [

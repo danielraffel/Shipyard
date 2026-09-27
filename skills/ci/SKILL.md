@@ -55,6 +55,18 @@ truthful on release PRs.
 
 Shipyard coordinates validation across local, SSH, and cloud targets.
 
+## `shipyard pr` suggests folding same-session siblings
+
+Before the skill-sync and version gates, `shipyard pr` reads the current agent
+session (`WHENCE_SESSION_ID`, else `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`,
+`CODEX_ROLLOUT_ID` — the variables `whence` stamps from) and lists open pull
+requests whose `whence` block carries the same `prov.session`, opened in the
+last 6 h, that share a directory family (first two path components, minus
+gate-forced paths in `pr.fold.noise_paths`) with this branch. It is advisory
+and prints one "Fold check skipped" line on any read failure. Each separate PR
+pays its own PR-head and merge-group gate run; over one measured week, 85 of
+177 session-stamped Pulp PRs had such a sibling open.
+
 ## `shipyard pr` arms auto-merge; you no longer do it by hand
 
 `ship` arms GitHub-native auto-merge (merge method **MERGE**) as soon as it
