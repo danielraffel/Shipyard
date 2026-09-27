@@ -70,7 +70,7 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
                 self.assertEqual("allow" if allowed else "refuse", want["guard"])
                 checked += 1
         # Control: the whole corpus, real and labelled-synthetic, was visited.
-        self.assertEqual(checked, 10)
+        self.assertEqual(checked, 11)
 
     def test_real_truncated_same_head_ejection_is_ejected_and_refused(self) -> None:
         response = fixture("pr_real_truncated_same_head_ejected.json")
@@ -106,13 +106,137 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         got = guard.classify_pr_queue_state(response)
         self.assertEqual(got["class"], "ejected")
         self.assertFalse(got["new_head_since_removal"])
+        # A force-push that names no commit is not evidence of a new head.
         pr["timelineItems"]["nodes"].append({"__typename": "HeadRefForcePushedEvent"})
+        self.assertFalse(guard.classify_pr_queue_state(response)["new_head_since_removal"])
+        # One that put the current head on the branch is.
+        pr["headRefOid"] = PUSHED_HEAD
+        pr["timelineItems"]["nodes"].append(
+            {"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": PUSHED_HEAD}}
+        )
         self.assertTrue(guard.classify_pr_queue_state(response)["new_head_since_removal"])
 
     def test_unreadable_is_unknown(self) -> None:
         for value in ({}, {"errors": [{"message": "x"}]}, {"data": {"node": {"state": "OPEN"}}}):
             with self.subTest(value=value):
                 self.assertEqual(guard.classify_pr_queue_state(value)["class"], "unknown")
+
+
+PUSHED_HEAD = "1" * 40
+BACKDATED_FIXTURE = "pr_real_8912_backdated_fix_after_ejection.json"
+# The head the queue removed from 8912: beforeCommit's second parent.
+REMOVED_8912 = "f4b97cb8e4458072e2ff10429c2361ec3b446b5e"
+# The back-dated fix pushed after the ejection.
+FIX_8912 = "c246e05b54069e800a8d1e5f8f4c9d5e841818d7"
+
+
+def _removal_index(nodes: list[dict[str, Any]]) -> int:
+    return max(i for i, n in enumerate(nodes) if n["__typename"] == "RemovedFromMergeQueueEvent")
+
+
+class NewHeadIsDecidedBySha(unittest.TestCase):
+    """Twin of the Rust ``pr_queue_state`` new-head tests."""
+
+    def setUp(self) -> None:
+        self.response = fixture(BACKDATED_FIXTURE)
+        self.pr = self.response["data"]["repository"]["pullRequest"]
+        self.nodes = self.pr["timelineItems"]["nodes"]
+
+    def classify(self) -> dict[str, Any]:
+        return guard.classify_pr_queue_state(self.response)
+
+    def test_backdated_fix_pushed_after_the_ejection_is_a_new_head(self) -> None:
+        self.assertEqual(self.response["_provenance"]["source_pr"], "Generous-Corp/pulp#8912")
+        # Control: GitHub sorts the back-dated fix BEFORE the removal, so
+        # timeline position alone would say "no new head".
+        fix = next(i for i, n in enumerate(self.nodes) if n.get("commit", {}).get("oid") == FIX_8912)
+        self.assertLess(fix, _removal_index(self.nodes))
+        got = self.classify()
+        self.assertEqual(got["class"], "ejected")
+        self.assertIs(got["new_head_since_removal"], True)
+        self.assertEqual(got["last_ejection"]["removed_head"], REMOVED_8912)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "removed_head_sha")
+        allowed, message = guard.decide(got)
+        self.assertTrue(allowed, message)
+        self.assertIn("new head since", message)
+
+    def test_the_head_the_queue_removed_is_still_the_same_head(self) -> None:
+        self.pr["headRefOid"] = REMOVED_8912
+        got = self.classify()
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertFalse(guard.decide(got)[0])
+        # Equal SHAs are the same head whatever the timeline says.
+        self.nodes.append(
+            {"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": REMOVED_8912}}
+        )
+        self.assertIs(self.classify()["new_head_since_removal"], False)
+
+    def test_force_push_to_an_older_sha_is_a_new_head(self) -> None:
+        older = "0a" * 20
+        self.pr["headRefOid"] = older
+        self.nodes.append({"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": older}})
+        got = self.classify()
+        self.assertEqual(got["last_ejection"]["removed_head"], REMOVED_8912)
+        self.assertIs(got["new_head_since_removal"], True)
+
+    def test_missing_before_commit_falls_back_to_pushes_and_fails_closed(self) -> None:
+        del self.nodes[_removal_index(self.nodes)]["beforeCommit"]
+        got = self.classify()
+        self.assertIsNone(got["last_ejection"]["removed_head"])
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertFalse(guard.decide(got)[0])
+        # A later push of some other commit is still not the current head.
+        self.nodes.append({"__typename": "PullRequestCommit", "commit": {"oid": PUSHED_HEAD}})
+        self.assertIs(self.classify()["new_head_since_removal"], False)
+        # A later push of the current head is.
+        self.pr["headRefOid"] = PUSHED_HEAD
+        got = self.classify()
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "push_after_removal")
+        self.assertIs(got["new_head_since_removal"], True)
+
+    def test_a_merge_group_parent_this_pr_never_had_is_not_trusted(self) -> None:
+        index = _removal_index(self.nodes)
+        self.nodes[index]["beforeCommit"]["parents"]["nodes"][1]["oid"] = PUSHED_HEAD
+        got = self.classify()
+        self.assertIsNone(got["last_ejection"]["removed_head"])
+        self.assertIs(got["new_head_since_removal"], False)
+
+    def test_requeue_count_compares_removed_heads_not_timeline_position(self) -> None:
+        a, b = REMOVED_8912, FIX_8912
+
+        def removal(head: str) -> dict[str, Any]:
+            return {
+                "__typename": "RemovedFromMergeQueueEvent",
+                "reason": "failed_checks",
+                "createdAt": "2026-09-27T05:52:04Z",
+                "beforeCommit": {
+                    "oid": "ffff",
+                    "parents": {"nodes": [{"oid": "base"}, {"oid": head}]},
+                },
+            }
+
+        def build(second: str) -> dict[str, Any]:
+            return {"data": {"repository": {"pullRequest": {
+                "number": 1, "state": "OPEN", "headRefOid": b,
+                "isInMergeQueue": False, "mergeQueueEntry": None, "autoMergeRequest": None,
+                "timelineItems": {"pageInfo": {"hasPreviousPage": False}, "nodes": [
+                    {"__typename": "PullRequestCommit", "commit": {"oid": a}},
+                    {"__typename": "AddedToMergeQueueEvent", "createdAt": "t0"},
+                    {"__typename": "PullRequestCommit", "commit": {"oid": b}},
+                    removal(a),
+                    {"__typename": "AddedToMergeQueueEvent", "createdAt": "t1"},
+                    removal(second),
+                ]},
+            }}}}
+
+        self.assertEqual(guard.classify_pr_queue_state(build(b))["requeues_without_new_head"], 0)
+        # Control: the second removal naming A again is a same-head re-enqueue.
+        self.assertEqual(guard.classify_pr_queue_state(build(a))["requeues_without_new_head"], 1)
+
+    def test_query_selects_the_removed_head_and_force_push_target(self) -> None:
+        self.assertIn("beforeCommit{oid parents(first:3){nodes{oid}}}", guard.PR_BY_NUMBER_QUERY)
+        self.assertIn("HeadRefForcePushedEvent{createdAt afterCommit{oid}}", guard.PR_BY_NUMBER_QUERY)
 
 
 class QueueArmGuardTests(unittest.TestCase):
@@ -253,6 +377,7 @@ class QueueArmGuardTests(unittest.TestCase):
         pr = response["data"]["repository"]["pullRequest"]
         pr["isInMergeQueue"] = False
         pr["mergeQueueEntry"] = None
+        pr["headRefOid"] = "f" * 40
         pr["timelineItems"]["nodes"][-1] = {
             "__typename": "PullRequestCommit",
             "commit": {"oid": "f" * 40},

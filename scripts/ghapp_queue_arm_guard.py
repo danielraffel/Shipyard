@@ -84,9 +84,9 @@ _TIMELINE = (
     "timelineItems(last:100,itemTypes:[PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,"
     "ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,AUTO_MERGE_ENABLED_EVENT,"
     "AUTO_MERGE_DISABLED_EVENT,MERGED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename "
-    "... on PullRequestCommit{commit{oid}} ... on HeadRefForcePushedEvent{createdAt} "
+    "... on PullRequestCommit{commit{oid}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} "
     "... on AddedToMergeQueueEvent{createdAt} "
-    "... on RemovedFromMergeQueueEvent{createdAt reason} "
+    "... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid parents(first:3){nodes{oid}}}} "
     "... on AutoMergeEnabledEvent{createdAt} ... on AutoMergeDisabledEvent{createdAt} "
     "... on MergedEvent{createdAt}}}"
 )
@@ -160,6 +160,98 @@ def _pull_request(response: Any) -> dict[str, Any] | None:
     return None
 
 
+def _typename(node: Any) -> str:
+    return node.get("__typename", "") if isinstance(node, dict) else ""
+
+
+def _oid(value: Any) -> str | None:
+    oid = value.get("oid") if isinstance(value, dict) else None
+    return oid if isinstance(oid, str) and oid else None
+
+
+def _pushed_oid(node: Any) -> str | None:
+    """The commit a new-head timeline item put on the branch."""
+    typename = _typename(node)
+    if typename == "PullRequestCommit":
+        return _oid(node.get("commit"))
+    if typename == "HeadRefForcePushedEvent":
+        return _oid(node.get("afterCommit"))
+    return None
+
+
+def _removed_head(node: dict[str, Any], known: list[str]) -> str | None:
+    """The head a ``RemovedFromMergeQueueEvent`` removed.
+
+    ``beforeCommit`` is the merge-group commit the queue built; its second
+    parent is the removed head. Accepted only when it is one of ``known``
+    (commits this pull request is seen to have had); ``beforeCommit`` itself is
+    accepted when it already is one of them.
+    """
+    before = node.get("beforeCommit")
+    if not isinstance(before, dict):
+        return None
+    lowered = {oid.lower() for oid in known}
+    oid = _oid(before)
+    if oid and oid.lower() in lowered:
+        return oid
+    parents = before.get("parents")
+    parent_nodes = parents.get("nodes") if isinstance(parents, dict) else None
+    if not isinstance(parent_nodes, list):
+        return None
+    oids = [_oid(parent) for parent in parent_nodes]
+    if len(oids) == 2 and oids[1] and oids[1].lower() in lowered:
+        return oids[1]
+    return None
+
+
+def _same_head_re_add(
+    nodes: list[Any],
+    removed_heads: list[str | None],
+    removal: int,
+    add: int,
+    queued_head: str | None,
+) -> bool | None:
+    """Whether the first re-add after a hazard removal re-added the removed head.
+
+    Decided by SHA against the next removal's head, or against ``queued_head``
+    (``headRefOid`` while still queued) when no removal follows. ``None`` when
+    the SHAs cannot say; the caller falls back to timeline order.
+    """
+    removed = removed_heads[removal]
+    if removed is None:
+        return None
+    re_added: str | None = queued_head
+    for index in range(add + 1, len(nodes)):
+        if _typename(nodes[index]) == "RemovedFromMergeQueueEvent":
+            re_added = removed_heads[index]
+            break
+    if re_added is None:
+        return None
+    return re_added.lower() == removed.lower()
+
+
+def _new_head_since(
+    nodes: list[Any], index: int, removed: str | None, head: str | None
+) -> tuple[bool, str]:
+    """Whether ``head`` differs from the head removed at ``index``, and on what basis.
+
+    By SHA when the removal names its head. Otherwise a force-push or commit
+    after the removal (timeline order) whose oid is ``head``. With neither, no
+    new head is assumed, so a re-arm is refused. Commit dates are never
+    consulted: GitHub sorts a back-dated commit before a removal it was pushed
+    after.
+    """
+    if head is None:
+        return False, "no_evidence"
+    if removed is not None:
+        return removed.lower() != head.lower(), "removed_head_sha"
+    for node in nodes[index + 1 :]:
+        oid = _pushed_oid(node)
+        if oid and oid.lower() == head.lower():
+            return True, "push_after_removal"
+    return False, "no_evidence"
+
+
 def classify_pr_queue_state(response: Any) -> dict[str, Any]:
     """Classify a GraphQL pull-request response. Unreadable input is ``unknown``."""
     errors = response.get("errors") if isinstance(response, dict) else None
@@ -185,43 +277,66 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
     has_previous = page_info.get("hasPreviousPage") if isinstance(page_info, dict) else None
     timeline_complete = (not has_previous) if isinstance(has_previous, bool) else None
 
+    head = pr.get("headRefOid")
+    head = head if isinstance(head, str) and head else None
+    # Every commit this pull request is seen to have had: a removed head read
+    # off a merge-group commit is trusted only when it is one of these.
+    known_heads = [oid for oid in (_pushed_oid(node) for node in nodes) if oid]
+    if head:
+        known_heads.append(head)
+    removed_heads = [
+        _removed_head(node, known_heads) if _typename(node) == "RemovedFromMergeQueueEvent" else None
+        for node in nodes
+    ]
+
     requeues = 0
-    hazard_pending = False
+    # The hazard removal awaiting its first re-add, and whether a push has
+    # followed it in timeline order (the fallback when SHAs cannot decide).
+    hazard_pending: tuple[int, bool] | None = None
     last_removal: tuple[int, str, str | None] | None = None
     last_new_head: int | None = None
     for index, node in enumerate(nodes):
-        typename = node.get("__typename", "") if isinstance(node, dict) else ""
+        typename = _typename(node)
         if typename in ("PullRequestCommit", "HeadRefForcePushedEvent"):
-            hazard_pending = False
+            if hazard_pending is not None:
+                hazard_pending = (hazard_pending[0], True)
             last_new_head = index
         elif typename == "RemovedFromMergeQueueEvent":
             reason = node.get("reason") if isinstance(node.get("reason"), str) else "UNKNOWN"
-            hazard_pending = reason.lower() in RETRY_HAZARD_REASONS
+            hazard_pending = (index, False) if reason.lower() in RETRY_HAZARD_REASONS else None
             at = node.get("createdAt") if isinstance(node.get("createdAt"), str) else None
             last_removal = (index, reason, at)
         elif typename == "AddedToMergeQueueEvent":
-            if hazard_pending:
-                requeues += 1
-            hazard_pending = False
+            if hazard_pending is not None:
+                removal, pushed = hazard_pending
+                same = _same_head_re_add(
+                    nodes, removed_heads, removal, index, head if in_queue else None
+                )
+                if (not pushed) if same is None else same:
+                    requeues += 1
+            hazard_pending = None
 
     last_ejection = None
     if last_removal is not None and last_removal[1].lower() != "merged":
         index, reason, at = last_removal
+        removed = removed_heads[index]
+        new_head_since, basis = _new_head_since(nodes, index, removed, head)
         last_ejection = {
             "reason": reason,
             "at": at,
-            "new_head_since": last_new_head is not None and last_new_head > index,
+            "new_head_since": new_head_since,
+            "removed_head": removed,
+            "new_head_basis": basis,
         }
 
     entry = pr.get("mergeQueueEntry") if isinstance(pr.get("mergeQueueEntry"), dict) else None
     auto_merge = (
         pr.get("autoMergeRequest") if isinstance(pr.get("autoMergeRequest"), dict) else None
     )
-    head = pr.get("headRefOid")
     repository = pr.get("repository")
     result: dict[str, Any] = {
         "pr": pr.get("number"),
-        "head": head if isinstance(head, str) and head else None,
+        "head": head,
         "repo": repository.get("nameWithOwner") if isinstance(repository, dict) else None,
         "requeues_without_new_head": requeues,
         "last_ejection": last_ejection,

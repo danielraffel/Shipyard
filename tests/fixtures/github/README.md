@@ -25,6 +25,7 @@ wrong in at least one way that mattered (see "The trap" below).
 | `pr_real_truncated_same_head_ejected.json` | 8638 | **Real timeline, truncated; state fields set to what GitHub showed between those events.** 8638's full timeline (23 items, paginated read 2026-09-22T23:19:27Z) cut right after item 16, `RemovedFromMergeQueueEvent(failed_checks)` at 2026-09-22T10:26:42Z; live, the next event was a same-head `AddedToMergeQueueEvent` at 10:32:31Z. `isInMergeQueue=false`, `mergeQueueEntry=null`, `autoMergeRequest=null`, `headRefOid` = the last commit before the cut. Provenance is in the file's `_provenance` object. |
 | `pr_synthetic_truncated_window.json` | 900001 | **SYNTHETIC.** Hand-built: `hasPreviousPage: true` and no removal or new head in the window, which must classify `unknown`. |
 | `pr_merged.json` | 8721 | `MergedEvent` then `RemovedFromMergeQueueEvent(reason: merged)`. The removal is **not** an ejection. |
+| `pr_real_8912_backdated_fix_after_ejection.json` | 8912 | **Real timeline, cut at the ejection; `headRefOid` set to the head that followed it.** Captured 2026-09-27T06:00:01Z with the current query (removals carry `beforeCommit{oid parents}`), cut right after `RemovedFromMergeQueueEvent(failed_checks)` at 05:52:04Z. The removal's `beforeCommit` `3dba2caa` is the merge-group commit; its second parent `f4b97cb8` is the head the queue removed. The fix `c246e05b` was committed at 05:49:11Z and pushed at ~05:52:08Z, so GitHub sorts its `PullRequestCommit` **before** the removal. `headRefOid=c246e05b`, `autoMergeRequest=null` (re-armed only at 05:54:30Z). Pins "new head since = yes" against a timeline that says otherwise. |
 | `pr_real_8811_same_head_ejected.json` | 8811 | **Real timeline, cut at the ejection.** Live capture cut right after `RemovedFromMergeQueueEvent(failed_checks)` at 2026-09-25T04:12:51Z, so it reproduces the state the guard saw: ejected, head `e147f2d0`, no new head since. The live PR has since advanced to `5a1cf562`, so this state is only reachable by cutting. `isInMergeQueue=false`, `mergeQueueEntry=null`, `autoMergeRequest=null`. The batch that ejected it is `merge_group` run 36093055057, below. |
 
 ### Merge-queue batch runs
@@ -56,7 +57,9 @@ A disagreement between them fails one of the two test suites.
 The `pr_*.json` files are shaped by this GraphQL query (variables
 `owner`, `name`, `number`). Re-running it against PR 8721 on the capture date
 reproduced `pr_merged.json` byte-for-byte apart from `pageInfo`, which the
-capture did not request:
+capture did not request. Captures from 2026-09-27 on use
+`src/pr_queue_state.rs`'s `PR_QUEUE_STATE_QUERY`, which additionally selects
+`beforeCommit{oid parents(first:3){nodes{oid}}}` on `RemovedFromMergeQueueEvent`:
 
 ```graphql
 query($owner:String!,$name:String!,$number:Int!){
@@ -92,10 +95,16 @@ PR, and emits no `AutoMergeDisabledEvent` when it does. A reader that treats
 - Every queue mutation is attributed to the same App actor
   (`shipyard-local`), whether Shipyard or an agent driving `ghapp` issued it.
   Actor identity cannot distinguish them.
-- `RemovedFromMergeQueueEvent.beforeCommit` is unreliable for "was a new head
-  pushed after the ejection"; the classifier instead looks for a
-  `PullRequestCommit` or `HeadRefForcePushedEvent` item **after** the removal in
-  timeline order.
+- `RemovedFromMergeQueueEvent.beforeCommit` is the **merge-group commit** the
+  queue built, not the pull request's head; its second parent is the head the
+  queue removed (verified on 8638, 8688, 8702, 8722, 8811 and 8912). A
+  `merge_conflict` removal has `beforeCommit: null`: no merge group was built.
+- `PullRequestCommit` timeline items are ordered by the commit's own date, not
+  its push time. "Was a new head pushed after this ejection" is therefore
+  answered by comparing `headRefOid` with the removed head, and only when the
+  removal names none by a `PullRequestCommit` / `HeadRefForcePushedEvent`
+  **after** the removal whose oid is `headRefOid`. Captures made before the
+  query selected `beforeCommit` exercise that fallback.
 - `timelineItems(last: 100)` is a window, not the whole history. When
   `pageInfo.hasPreviousPage` is `true` the counts derived from it are lower
   bounds; the classifier reports that rather than hiding it.

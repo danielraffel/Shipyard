@@ -230,6 +230,14 @@ on a base with a merge queue:
 | queue state unreadable | refuse (fail closed) | allow (fail open) | refresh, or read it with `shipyard landing --pr <n>` |
 | merged / closed | refuse | allow (not open) | nothing to do |
 
+"Same head" and "new head since" compare SHAs: the current `headRefOid` against
+the head the queue removed (the second parent of the removal's `beforeCommit`
+merge-group commit). Commit dates and timeline position are not consulted,
+because GitHub sorts a fix committed before an ejection but pushed after it
+*before* the removal. A removal that names no head (`merge_conflict`) falls back
+to a push of the current head after it; with none, both guards treat the head
+as unchanged.
+
 The two unreadable rows are asymmetric on purpose: arming blind can fail
 innocent batch-mates, while a blind refresh costs at most one gate run. Every
 row has a path that at least one guard allows without an override. Each guard's
