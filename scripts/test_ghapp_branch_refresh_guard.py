@@ -21,6 +21,21 @@ guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
 ONLY = guard.POLICY_ONLY_IF_CONFLICTING
+FIXTURES = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "github"
+
+
+def fixture(name: str) -> dict[str, Any]:
+    """A real ``shipyard landing``-shaped response from the shared corpus."""
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+# Real captures (see tests/fixtures/github/README.md):
+# Generous-Corp/pulp#8811, ejected for failed_checks at its current head.
+SAME_HEAD_EJECTED = "pr_real_8811_same_head_ejected.json"
+# Generous-Corp/pulp#8722, removed (manual) and given a new head since.
+EJECTED_NEW_HEAD = "pr_ejected_new_head.json"
+# Generous-Corp/pulp#8672, never armed and never queued.
+NEVER_ARMED = "pr_never_armed.json"
 
 
 def check_run(name: str, conclusion: str | None, required: bool = True) -> dict[str, Any]:
@@ -168,6 +183,91 @@ class Decisions(unittest.TestCase):
         self.assertTrue(decide(missing_queue))
 
 
+class QueueEjection(unittest.TestCase):
+    """The refusal ``decide`` makes, weighed against queue-arm-guard's demand.
+
+    Every case starts from the state ``decide`` refuses (mergeable, green, base
+    with a merge queue), which is also exactly how an ejected PR looks: its
+    failure happened in the merge_group run, not on the head.
+    """
+
+    def classify(self, name: str) -> dict[str, Any]:
+        return guard.ARM_GUARD.classify_pr_queue_state(fixture(name))
+
+    def test_arm_guard_is_loaded_for_its_reader(self) -> None:
+        self.assertIsNotNone(guard.ARM_GUARD)
+        self.assertTrue(guard.ARM_GUARD_PRESENT)
+
+    def test_ejected_at_current_head_is_refreshable(self) -> None:
+        classification = self.classify(SAME_HEAD_EJECTED)
+        # Control: queue-arm-guard really does refuse this head as it is.
+        self.assertFalse(guard.ARM_GUARD.decide(classification)[0])
+        lifted = guard.ejection_decision(classification)
+        self.assertIsNotNone(lifted)
+        allowed, reason = lifted
+        self.assertTrue(allowed)
+        self.assertIn("failed_checks", reason)
+        self.assertIn("queue-arm-guard", reason)
+        self.assertIn("shipyard ship --pr 8811", reason)
+
+    def test_same_head_removal_for_any_refused_reason_is_refreshable(self) -> None:
+        for reason in ("failed_checks", "merge_conflict", "manual", "UNKNOWN"):
+            with self.subTest(reason=reason):
+                classification = {
+                    "class": "ejected", "pr": 7, "reason": reason, "at": "t",
+                    "new_head_since_removal": False,
+                }
+                self.assertIsNotNone(guard.ejection_decision(classification))
+
+    def test_invalid_merge_commit_keeps_the_refusal(self) -> None:
+        # queue-arm-guard re-enqueues this same head itself; no new head needed.
+        classification = {
+            "class": "ejected", "pr": 7, "reason": "invalid_merge_commit", "at": "t",
+            "new_head_since_removal": False,
+        }
+        self.assertTrue(guard.ARM_GUARD.decide(classification)[0])
+        self.assertIsNone(guard.ejection_decision(classification))
+
+    def test_ejected_then_new_head_follows_normal_policy(self) -> None:
+        classification = self.classify(EJECTED_NEW_HEAD)
+        self.assertEqual(classification["class"], "ejected")
+        self.assertTrue(classification["new_head_since_removal"])
+        self.assertIsNone(guard.ejection_decision(classification))
+
+    def test_never_queued_keeps_the_refusal(self) -> None:
+        classification = self.classify(NEVER_ARMED)
+        self.assertEqual(classification["class"], "never_armed")
+        self.assertIsNone(guard.ejection_decision(classification))
+
+    def test_queued_and_armed_keep_the_refusal(self) -> None:
+        for klass in ("queued", "armed_not_queued", "merged", "closed"):
+            with self.subTest(klass=klass):
+                self.assertIsNone(guard.ejection_decision({"class": klass, "pr": 7}))
+
+    def test_each_guard_names_the_others_sanctioned_path(self) -> None:
+        # queue-arm-guard's same-head refusals point at the refresh this guard allows.
+        for reason in ("failed_checks", "manual"):
+            with self.subTest(reason=reason):
+                allowed, message = guard.ARM_GUARD.decide(
+                    {"class": "ejected", "pr": 7, "reason": reason, "at": "t",
+                     "new_head_since_removal": False}
+                )
+                self.assertFalse(allowed)
+                self.assertIn("gh pr update-branch 7", message)
+                self.assertIn("branch-refresh-guard", message)
+        # ...and this guard's refusal points at the queue-arm-guard exception.
+        allowed, reason = guard.decide(ONLY, guard.refresh_facts(pr_response()))
+        self.assertFalse(allowed)
+        self.assertIn("queue-arm-guard", reason)
+        self.assertIn("shipyard landing --pr 8885", reason)
+
+    def test_unreadable_timeline_is_allowed(self) -> None:
+        self.assertTrue(guard.ejection_decision(None)[0])
+        unreadable = guard.ARM_GUARD.classify_pr_queue_state({"errors": [{"message": "boom"}]})
+        self.assertEqual(unreadable["class"], "unknown")
+        self.assertTrue(guard.ejection_decision(unreadable)[0])
+
+
 class RequestDetection(unittest.TestCase):
     def test_pr_update_branch_forms(self) -> None:
         self.assertEqual(
@@ -224,6 +324,8 @@ class EndToEnd(unittest.TestCase):
         *,
         config: str | None,
         state: dict[str, Any] | None = None,
+        queue_state: dict[str, Any] | None = None,
+        queue_readable: bool = True,
         env: dict[str, str] | None = None,
     ) -> tuple[int, str, list[list[str]]]:
         calls: list[list[str]] = []
@@ -235,6 +337,11 @@ class EndToEnd(unittest.TestCase):
                 if config is None:
                     return 1, "", 'gh: Not Found (HTTP 404)\n'
                 return 0, config, ""
+            if arguments[:2] == ["api", "graphql"] and "timelineItems" in joined:
+                if not queue_readable:
+                    return 1, "", "gh: HTTP 502\n"
+                queue = queue_state if queue_state is not None else fixture(NEVER_ARMED)
+                return 0, json.dumps(queue), ""
             if arguments[:2] == ["api", "graphql"]:
                 return 0, json.dumps(state if state is not None else pr_response()), ""
             if arguments[:1] == ["api"] and arguments[-1].startswith("repos/"):
@@ -263,6 +370,46 @@ class EndToEnd(unittest.TestCase):
             any("contents/.shipyard/config.toml?ref=main" in " ".join(call) for call in calls),
             "the policy must be read from the PR's base branch",
         )
+
+    def test_never_queued_mergeable_green_is_still_refused(self) -> None:
+        green = pr_response(contexts=[check_run("macos", "SUCCESS")], merge_state="CLEAN")
+        code, stderr, calls = self.run_main(self.ARGS, config=self.ENABLED, state=green)
+        self.assertEqual(code, 1, stderr)
+        self.assertIn("queue-arm-guard", stderr, "the refusal must name the sanctioned exception")
+        self.assertTrue(
+            any("timelineItems" in " ".join(call) for call in calls),
+            "the queue state must actually be read before refusing",
+        )
+
+    def test_ejected_at_current_head_is_allowed_with_a_reason(self) -> None:
+        green = pr_response(contexts=[check_run("macos", "SUCCESS")], merge_state="CLEAN")
+        code, stderr, _ = self.run_main(
+            self.ARGS, config=self.ENABLED, state=green, queue_state=fixture(SAME_HEAD_EJECTED)
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("allowing", stderr)
+        self.assertIn("failed_checks", stderr)
+
+    def test_ejected_then_new_head_is_refused_under_normal_policy(self) -> None:
+        code, stderr, _ = self.run_main(
+            self.ARGS, config=self.ENABLED, queue_state=fixture(EJECTED_NEW_HEAD)
+        )
+        self.assertEqual(code, 1, stderr)
+
+    def test_unreadable_queue_state_is_allowed(self) -> None:
+        code, stderr, _ = self.run_main(self.ARGS, config=self.ENABLED, queue_readable=False)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("not refusing blind", stderr)
+
+    def test_without_an_arm_guard_nothing_needs_unblocking(self) -> None:
+        with mock.patch.object(guard, "ARM_GUARD", None), mock.patch.object(
+            guard, "ARM_GUARD_PRESENT", False
+        ):
+            code, _, calls = self.run_main(
+                self.ARGS, config=self.ENABLED, queue_state=fixture(SAME_HEAD_EJECTED)
+            )
+        self.assertEqual(code, 1)
+        self.assertFalse(any("timelineItems" in " ".join(call) for call in calls))
 
     def test_absent_config_allows_without_reading_pr_state(self) -> None:
         code, stderr, calls = self.run_main(self.ARGS, config=None)
@@ -304,6 +451,9 @@ class InstalledLayout(unittest.TestCase):
             guards = pathlib.Path(temp)
             removal = SCRIPT.with_name("ghapp_queue_removal_guard.py")
             (guards / "queue-removal-guard").write_bytes(removal.read_bytes())
+            (guards / "queue-arm-guard").write_bytes(
+                SCRIPT.with_name("ghapp_queue_arm_guard.py").read_bytes()
+            )
             (guards / "branch-refresh-guard").write_bytes(SCRIPT.read_bytes())
             spec = importlib.util.spec_from_loader(
                 "installed_refresh_guard",
@@ -315,6 +465,7 @@ class InstalledLayout(unittest.TestCase):
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             self.assertIsNotNone(module.PARSER)
+            self.assertIsNotNone(module.ARM_GUARD, "the installed arm guard must be found")
             self.assertEqual(
                 module.refresh_request(["api", "-X", "PUT", "repos/o/r/pulls/3/update-branch"]),
                 [("o", "r", 3)],

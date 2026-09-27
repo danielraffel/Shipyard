@@ -193,13 +193,49 @@ refresh_branch = "only-if-conflicting"   # default: "always"
 | PR conflicts (`mergeable: CONFLICTING` or `mergeStateStatus: DIRTY`) | allow: resolving it needs a new head |
 | a required check on the head is failing (`FAILURE`, `TIMED_OUT`, `CANCELLED`, `ACTION_REQUIRED`, `STARTUP_FAILURE`, `STALE`; status `ERROR`/`FAILURE`) | allow: the queue would reject the PR, and a fresh merge ref can clear a failure at a step the current workflow no longer runs |
 | `mergeable` still `UNKNOWN` after two re-reads, required checks truncated past 100, PR not open, or anything unreadable | allow (with a note): the guard never refuses blind |
-| base has a merge queue, PR `MERGEABLE`, no required check failing (pending is not failing) | **refuse**: the queue validates the merge result itself, and the refresh push would cancel and restart the required gate |
+| removed from the merge queue at its **current** head for a reason `queue-arm-guard` refuses to re-enqueue (`failed_checks`, `merge_conflict`, `manual`, ...) | allow (with a note): the arm guard demands a new head, and a refresh is one |
+| the queue state (timeline) cannot be read or classified, or `queue-arm-guard` is installed but will not load | allow (with a note): not refusing blind |
+| base has a merge queue, PR `MERGEABLE`, no required check failing (pending is not failing), and not removed from the queue at its current head | **refuse**: the queue validates the merge result itself, and the refresh push would cancel and restart the required gate |
+
+The queue-state row is read only when the guard is about to refuse, with
+`queue-arm-guard`'s own query and classifier (the Python twin of
+`shipyard landing --pr <n>`), loaded from the arm guard installed next to it. An
+ejected pull request's head checks are usually green, because the failure
+happened in its `merge_group` run, so without that row an infrastructure
+ejection would be refused by both guards at once. When no arm guard is
+installed nothing refuses a same-head re-arm, so the row is skipped.
 
 There is deliberately no `"never"`: a refresh that resolves a conflict is
 needed for correctness, and no policy value can refuse one. The guard sees only
 App-authenticated refreshes; a local `git merge origin/main && git push` does
 not pass through `ghapp`, so agent guidance (the `ci` and `shipyard` skills)
 carries the same rule.
+
+### How the two guards interact
+
+A guard that refuses must leave a path another guard allows, or the pull request
+is stuck until an operator override. Under `refresh_branch = "only-if-conflicting"`
+on a base with a merge queue:
+
+| live state | `queue-arm-guard` (re-arm this head) | `branch-refresh-guard` (new head via refresh) | way forward |
+|---|---|---|---|
+| never armed, not queued, mergeable, green | allow | refuse | arm it (`shipyard ship --pr <n>`) |
+| queued, or armed and not yet queued | refuse (nothing to do) | refuse | wait for the queue |
+| removed for `invalid_merge_commit`, same head | allow | refuse | re-arm as is |
+| removed for `failed_checks` / `merge_conflict`, same head | refuse (unless the repository's attributor certifies the batch) | allow | push a fix, or refresh if the batch failed on infrastructure; then `shipyard ship --pr <n>` |
+| removed for `manual` (or any other reason), same head | refuse: confirm with whoever dequeued it | allow | confirm, then fix or refresh, then `shipyard ship --pr <n>` |
+| removed, new head since | allow | normal policy (refuse when mergeable and green) | re-arm |
+| conflicting (`CONFLICTING` / `DIRTY`) | as its queue state says | allow | refresh or resolve locally |
+| a required check on the head failing | as its queue state says | allow | refresh or fix |
+| queue state unreadable | refuse (fail closed) | allow (fail open) | refresh, or read it with `shipyard landing --pr <n>` |
+| merged / closed | refuse | allow (not open) | nothing to do |
+
+The two unreadable rows are asymmetric on purpose: arming blind can fail
+innocent batch-mates, while a blind refresh costs at most one gate run. Every
+row has a path that at least one guard allows without an override. Each guard's
+refusal names the other's allowed path: the arm guard's same-head refusal points
+at `gh pr update-branch <n>`, and the refresh guard's refusal says a same-head
+queue removal is refreshable.
 
 ## Overrides and bypasses
 

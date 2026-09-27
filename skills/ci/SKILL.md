@@ -2712,7 +2712,9 @@ it. Operator overrides are documented for humans in `docs/ghapp-guards.md`.
 merge-queue base does not need `update-branch` or a merged-in `origin/main`: the
 queue builds the merge result itself, and the refresh push cancels the required
 gate running on the old head. Refresh only to resolve a real conflict
-(`mergeable: CONFLICTING`) or to clear a failing required check. A repository
+(`mergeable: CONFLICTING`), to clear a failing required check, or to give a new
+head to a PR the queue removed at its current head (the queue-arm guard refuses
+that same head; the branch-refresh guard allows exactly this refresh). A repository
 can enforce this with `[merge] refresh_branch = "only-if-conflicting"`, which
 makes the `ghapp` branch-refresh guard refuse pointless `update-branch` calls
 (default `"always"` changes nothing).
