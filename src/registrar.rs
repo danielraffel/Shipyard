@@ -1544,6 +1544,26 @@ mod tests {
         assert!(registrar.all().is_empty());
     }
 
+    #[test]
+    fn only_an_http_404_reads_as_a_missing_repository() {
+        use crate::repo_slug::SlugProbe;
+
+        assert_eq!(
+            super::slug_probe_from_failure(
+                "token helper exited with status 1: shipyard-github-app-token: GitHub API returned HTTP 404"
+            ),
+            SlugProbe::NotFound
+        );
+        assert_eq!(
+            super::slug_probe_from_failure("gh: Not Found (HTTP 404)"),
+            SlugProbe::NotFound
+        );
+        assert!(matches!(
+            super::slug_probe_from_failure("gh CLI not found on PATH"),
+            SlugProbe::Unreadable(_)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn create_http_401_is_auth_degraded() {
