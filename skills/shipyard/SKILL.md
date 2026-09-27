@@ -1668,6 +1668,16 @@ fixtures cannot become protected writes accidentally. Do not relax the writer
 domain predicate to accommodate fixtures, and do not replace an explicitly
 configured trusted validation `TMPDIR`.
 
+`src/pr_fold.rs` owns the same-session fold suggestion `shipyard pr` prints
+before its gates: the current session comes from the variables `whence` stamps
+from (`WHENCE_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`,
+`CODEX_ROLLOUT_ID`; a blank value is skipped), a sibling's session from the
+`prov.session` of its `<!-- whence {...} -->` body block, and relatedness from
+shared first-two-component directory families with `pr.fold.noise_paths`
+removed (default `.claude-plugin`, `.agents/skills`, `skills`, `planning`,
+because the version and skill gates force every change to touch them). It is
+advisory; a read failure prints one "Fold check skipped" line.
+
 When local validation is required, normal `shipyard run`, `shipyard ship`, and
 `shipyard pr` submissions persist their resolved request and exact
 checkout/configuration provenance, ensure the matching-version daemon is live,
