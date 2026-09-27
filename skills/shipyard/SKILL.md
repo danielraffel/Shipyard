@@ -2631,7 +2631,15 @@ base branch** (a PR branch cannot relax it for itself):
   its head is failing. A conflicting PR, a red required check (the queue would
   reject it; a fresh merge ref also clears a failure at a step the current
   workflow no longer runs), a base without a queue (strict protection may need
-  the up-to-date head), or anything the guard cannot read is allowed.
+  the up-to-date head), or anything the guard cannot read is allowed. So is a
+  PR the merge queue removed at its current head (`failed_checks`,
+  `merge_conflict`, `manual`): its head checks are usually green because the
+  failure was in the `merge_group` run, yet `queue-arm-guard` refuses to
+  re-enqueue that head and demands a new one. The refresh guard reads the queue
+  state with the arm guard's own classifier and allows exactly that refresh, so
+  an infrastructure ejection is recovered with `gh pr update-branch <n>` then
+  `shipyard ship --pr <n>`. The full two-guard matrix is in
+  `docs/ghapp-guards.md`.
 
 Why: on a repository whose workflow concurrency is keyed on the PR ref with
 `cancel-in-progress`, every refresh push cancels the required gate already

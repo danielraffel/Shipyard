@@ -28,6 +28,16 @@ branch cannot relax it for itself):
   Anything the guard cannot read is allowed, never refused: skipping a refresh
   that correctness needs is worse than a wasted gate run.
 
+  One more state is refreshed: a pull request the merge queue removed at its
+  current head. Its head checks are usually green (the failure happened in the
+  ``merge_group`` run), yet ``queue-arm-guard`` refuses to re-enqueue that same
+  head and asks for a new one. Refusing the refresh too would leave an
+  infrastructure ejection with no guarded way forward, so before refusing, this
+  guard reads the pull request's queue state with the arm guard's own query and
+  classifier (the Python twin of ``shipyard landing``) and allows the refresh
+  exactly when the arm guard would refuse a same-head re-arm. A timeline it
+  cannot read is allowed, like every other unreadable state.
+
 An unrecognized policy value is reported and treated as ``"always"``.
 """
 
@@ -111,6 +121,40 @@ def _load_request_parser() -> ModuleType | None:
 
 
 PARSER = _load_request_parser()
+
+
+def _load_arm_guard() -> tuple[ModuleType | None, bool]:
+    """Load ``queue-arm-guard`` for its queue-state reader and classifier.
+
+    Returns ``(module, present)``. ``present`` is true when an arm guard file
+    sits next to this one, whether or not it loaded; a present-but-unloadable
+    arm guard is reported by the caller and never read as "nothing to unblock".
+    """
+    here = pathlib.Path(__file__).resolve().parent
+    present = False
+    for name in ("ghapp_queue_arm_guard.py", "queue-arm-guard"):
+        candidate = here / name
+        if not candidate.is_file():
+            continue
+        present = True
+        loader = importlib.machinery.SourceFileLoader("_ghapp_refresh_arm_guard", str(candidate))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        try:
+            loader.exec_module(module)
+        except Exception:  # noqa: BLE001 - any failure means "arm guard unavailable"
+            continue
+        if all(
+            hasattr(module, attribute)
+            for attribute in ("PR_BY_NUMBER_QUERY", "classify_pr_queue_state", "decide")
+        ):
+            return module, True
+    return None, present
+
+
+ARM_GUARD, ARM_GUARD_PRESENT = _load_arm_guard()
 
 
 # ---------------------------------------------------------------------------
@@ -288,13 +332,71 @@ def decide(policy: str, facts: dict[str, Any]) -> tuple[bool, str]:
             "would reject"
         )
     where = " and is already in the merge queue" if facts.get("in_merge_queue") else ""
+    number = facts.get("pr", "<n>")
     return False, (
         f"{label} is mergeable{where}, and `{facts.get('base')}` lands through a merge queue "
         "that validates the merge result itself. Refreshing the branch buys nothing, pushes a "
         "new head, and cancels and restarts the required gate. Leave the head as it is and "
-        f"land it with `shipyard ship --pr {facts.get('pr', '<n>')}`; refresh only if it "
-        "conflicts or a required check fails"
+        f"land it with `shipyard ship --pr {number}`; refresh only if it conflicts, a required "
+        "check fails, or the merge queue removed it at this head (queue-arm-guard then demands "
+        f"a new head, and this guard allows the refresh; `shipyard landing --pr {number}` shows "
+        "which)"
     )
+
+
+def ejection_decision(classification: dict[str, Any] | None) -> tuple[bool, str] | None:
+    """Whether the PR's queue state lifts a refusal from ``decide``.
+
+    ``classification`` is ``queue-arm-guard``'s classification of the PR, or
+    ``None`` when it could not be read. Returns ``(True, reason)`` when the
+    refresh must be allowed, or ``None`` when the refusal stands.
+
+    Allowed: the PR's last queue event is a removal at its current head that
+    the arm guard refuses to re-enqueue (``failed_checks``, ``merge_conflict``,
+    ``manual``, ...). That refusal says "push a new head"; a refresh is one.
+    Also allowed: anything unreadable, so this guard never completes a deadlock
+    blind. Everything else (never queued, queued, armed, removed and already
+    given a new head, removed for ``invalid_merge_commit``) keeps the refusal:
+    the arm guard lets those through without a new head.
+    """
+    if classification is None:
+        return True, "the pull request's merge-queue state could not be read; not refusing blind"
+    klass = classification.get("class")
+    label = f"PR #{classification.get('pr', '?')}"
+    if klass == "unknown":
+        return True, (
+            f"{label}'s merge-queue state could not be determined "
+            f"({classification.get('detail', 'unknown')}); not refusing blind"
+        )
+    if klass != "ejected" or classification.get("new_head_since_removal"):
+        return None
+    if ARM_GUARD is not None:
+        arm_allowed, _ = ARM_GUARD.decide(classification)
+        if arm_allowed:
+            return None
+    reason = classification.get("reason") or "unknown"
+    at = classification.get("at") or "an unknown time"
+    return True, (
+        f"{label} was removed from the merge queue ({reason}) at {at} and its head has not "
+        "changed since; queue-arm-guard refuses to re-enqueue that same head, so a new head is "
+        f"the only way back into the queue. After the refresh, land it with "
+        f"`shipyard ship --pr {classification.get('pr', '<n>')}`"
+    )
+
+
+def read_queue_classification(owner: str, name: str, number: int) -> dict[str, Any] | None:
+    """The arm guard's classification of the PR, or ``None`` when unreadable."""
+    if ARM_GUARD is None:
+        return None
+    arguments = [
+        "api", "graphql", "-f", f"query={ARM_GUARD.PR_BY_NUMBER_QUERY}",
+        "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={number}",
+    ]
+    try:
+        response = run_real_gh(arguments)
+    except GuardError:
+        return None
+    return ARM_GUARD.classify_pr_queue_state(response)
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +632,13 @@ def main(args: list[str]) -> int:
             _note(f"{error}; allowing the refresh of PR #{number}")
             continue
         allowed, reason = decide(policy, facts)
+        if not allowed and (ARM_GUARD is not None or ARM_GUARD_PRESENT):
+            # Only when an arm guard is installed can a same-head removal be
+            # stuck: without one, nothing refuses re-arming the head as it is.
+            lifted = ejection_decision(read_queue_classification(owner, name, number))
+            if lifted is not None:
+                _note(f"allowing: {lifted[1]}")
+                continue
         if not allowed:
             refusals.append(reason)
     if not refusals:

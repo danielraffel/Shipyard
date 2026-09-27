@@ -318,12 +318,17 @@ def decide(
         note = f" {attribution['detail']}" if attribution and attribution.get("detail") else ""
         return False, (
             f"{label} was ejected for {reason} at {at}; re-enqueuing the same head under "
-            f"ALLGREEN fails its batch-mates. Push a fix first, then {land}.{note}"
+            f"ALLGREEN fails its batch-mates. Push a fix first, then {land}. If the batch "
+            f"failed on infrastructure rather than this head, give it a new head with "
+            f"`gh pr update-branch {number}` (branch-refresh-guard allows that for a head the "
+            f"queue removed) and then {land}.{note}"
         )
     if klass == "ejected":
         return False, (
             f"{label} was removed from the queue ({reason}) at {at} and the head has not "
-            f"changed; confirm with whoever dequeued it before re-enqueuing with {land}."
+            f"changed; confirm with whoever dequeued it, then give it a new head (a fix, or "
+            f"`gh pr update-branch {number}`, which branch-refresh-guard allows for a head the "
+            f"queue removed) and land it with {land}."
         )
     if klass in ("merged", "closed"):
         return False, f"{label} is {klass}; there is nothing to arm"
