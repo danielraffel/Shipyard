@@ -1677,6 +1677,13 @@ shared first-two-component directory families with `pr.fold.noise_paths`
 removed (default `.claude-plugin`, `.agents/skills`, `skills`, `planning`,
 because the version and skill gates force every change to touch them). It is
 advisory; a read failure prints one "Fold check skipped" line.
+`src/app/pr_cmd/fold.rs` owns `shipyard pr --fold <branch>`: it runs before
+trailers and gates, requires a clean tracked tree, resolves a local branch or
+fetches `origin/<branch>`, and cherry-picks (`-x`) the non-merge commits of
+`origin/<base>..<branch>` that `git cherry HEAD <branch> origin/<base>` marks
+`+` (so a repeated fold is a no-op), skipping `chore: bump versions` /
+`chore(versions): bump` subjects. Any failure aborts the pick and resets to the
+starting commit.
 
 When local validation is required, normal `shipyard run`, `shipyard ship`, and
 `shipyard pr` submissions persist their resolved request and exact

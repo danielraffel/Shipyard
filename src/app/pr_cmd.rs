@@ -15,6 +15,8 @@ use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::paths::RuntimePaths;
 use crate::pr_fold;
 
+mod fold;
+
 // A CLI argument bag: one bool per user-facing flag is the shape the
 // command line already has, and grouping them into sub-structs would
 // only move the flags further from the flags they mirror.
@@ -48,6 +50,8 @@ pub(super) struct PrCommandArgs {
     /// Arm GitHub-native auto-merge on the pull request once `ship` knows it.
     /// Cleared by `--no-arm`.
     pub(super) arm_auto_merge: bool,
+    /// Sibling branches whose own commits are carried onto this branch first.
+    pub(super) fold: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -244,6 +248,24 @@ pub(super) fn pr_command<W: Write>(
             2,
             "--no-steward-handoff conflicts with --workstream-id/--context-url.",
         ));
+    }
+
+    if !args.fold.is_empty() {
+        let folded = fold::fold_branches(cwd, &args.base, &args.fold)
+            .map_err(|error| CliFailure::new(2, format!("--fold: {error}")))?;
+        for branch in folded {
+            writeln!(
+                stdout,
+                "▸ Folded {}: {} commit(s) picked, {} already here, {} version bump(s) left behind",
+                branch.branch, branch.picked, branch.skipped_present, branch.skipped_bumps
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+        writeln!(
+            stdout,
+            "▸ Close the folded branches' pull requests once this one merges; their commits ride here."
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
 
     let trailers = shortcut_trailers(&args);
@@ -833,6 +855,7 @@ mod tests {
             steward_handoff_preference: StewardHandoffPreference::ProjectDefault,
             python_command: None,
             arm_auto_merge: false,
+            fold: Vec::new(),
         }
     }
 

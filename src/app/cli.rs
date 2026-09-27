@@ -636,6 +636,11 @@ pub(super) enum Command {
         /// not merge anything a required check has not passed.
         #[arg(long = "no-arm")]
         no_arm: bool,
+        /// Before anything else, cherry-pick this sibling branch's own commits
+        /// (over origin/<base>; merges, version bumps and patches already here
+        /// are skipped) onto the current branch. Repeatable; all-or-nothing.
+        #[arg(long = "fold", value_name = "BRANCH")]
+        fold: Vec<String>,
     },
     /// Cloud runner operations.
     Cloud {

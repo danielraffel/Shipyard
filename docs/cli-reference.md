@@ -146,6 +146,9 @@ shipyard pr --no-arm                                # do NOT arm native auto-mer
                                                     # `shipyard pr` first prints a fold suggestion (advisory) when open PRs from the
                                                     #   same whence session, opened in the last 6 h, share a directory family
                                                     #   (first two path components; pr.fold.noise_paths excluded) with this branch
+shipyard pr --fold feat/a --fold feat/b             # first cherry-pick each branch's own commits over origin/<base> onto this branch
+                                                    #   (merges, version bumps and patches already here skipped); clean tree required;
+                                                    #   a conflict resets the branch to where it started
 shipyard ship --pr 123 --no-arm                     # same, adopting an existing PR
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
