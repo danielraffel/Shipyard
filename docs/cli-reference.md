@@ -421,7 +421,8 @@ repeatable `--label`; without them the queue and starvation proxies read
 
 `gate-cost` leads with count-based proxies, then minutes as context: gate runs
 per merged PR (PR-head, merge-group, wasted attempts), starvation (gate jobs
-cancelled before any runner was assigned), placement (jobs whose exact label
+cancelled before any runner was assigned, with the share withdrawn by a push
+to the same PR broken out), placement (jobs whose exact label
 set no registered runner advertises and no job in the window was served on,
 with a placement-correct share per job class), queue wait per job ahead,
 merge-queue attempts per merged PR with ejections by cause (`gate_failed`,

@@ -185,9 +185,10 @@ fn render_proxies(out: &mut String, proxies: &GateProxies) {
     let starvation = &proxies.starvation;
     let _ = writeln!(
         out,
-        "  starvation: {} of {} gate attempts cancelled before a runner was assigned ({}; {})",
+        "  starvation: {} of {} gate attempts cancelled before a runner was assigned, {} of them withdrawn by a push ({}; {})",
         starvation.cancelled_before_runner,
         starvation.gate_attempts,
+        starvation.superseded_by_push,
         opt(starvation.share),
         sample_note(&starvation.evidence),
     );

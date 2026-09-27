@@ -99,6 +99,9 @@ pub struct Starvation {
     pub gate_attempts: usize,
     /// Of those, cancelled with no runner ever assigned.
     pub cancelled_before_runner: usize,
+    /// Of `cancelled_before_runner`, jobs whose run was superseded by a push
+    /// to the same PR: withdrawn by the author, not starved by capacity.
+    pub superseded_by_push: usize,
     /// `cancelled_before_runner / gate_attempts`.
     pub share: Option<f64>,
     /// Sample: gate attempts.
@@ -336,14 +339,16 @@ fn placement(observation: &GateCostObservation) -> Placement {
     }
 }
 
-fn push_cancellations(observation: &GateCostObservation) -> PushCancellations {
+/// PR-head runs whose gate was cancelled after a newer commit on the same
+/// branch started a run.
+fn superseded_runs(observation: &GateCostObservation) -> (usize, BTreeSet<u64>) {
     let pr_runs: Vec<(&u64, &RunMeta)> = observation
         .run_meta
         .iter()
         .filter(|(_, meta)| meta.event != MERGE_GROUP_EVENT)
         .collect();
     let mut cancelled = 0;
-    let mut superseded = 0;
+    let mut superseded = BTreeSet::new();
     for (run_id, meta) in &pr_runs {
         let Some(cancel_time) = observation
             .gate_jobs
@@ -367,16 +372,26 @@ fn push_cancellations(observation: &GateCostObservation) -> PushCancellations {
                     .is_some_and(|time| time > created && time <= cancel_time)
         });
         if newer_push {
-            superseded += 1;
+            superseded.insert(**run_id);
         }
     }
+    (cancelled, superseded)
+}
+
+fn push_cancellations(observation: &GateCostObservation) -> PushCancellations {
+    let pr_runs = observation
+        .run_meta
+        .values()
+        .filter(|meta| meta.event != MERGE_GROUP_EVENT)
+        .count();
+    let (cancelled, superseded) = superseded_runs(observation);
     PushCancellations {
         cancelled_pr_head_runs: cancelled,
-        superseded_by_push: superseded,
-        share_of_pr_head_runs: share(superseded, pr_runs.len()),
+        superseded_by_push: superseded.len(),
+        share_of_pr_head_runs: share(superseded.len(), pr_runs),
         by_push_type: None,
         evidence: evidence(
-            pr_runs.len(),
+            pr_runs,
             10,
             "n>=10 PR-head runs; a cancellation counts only when a newer run on the same \
              branch at another commit was created before it completed",
@@ -472,6 +487,11 @@ pub fn compute(observation: &GateCostObservation, merged_prs: Option<u64>) -> Ga
     }
     let mg_attempts = ran_jobs.iter().filter(|job| is_mg(job)).count();
     let starved_count = ran_jobs.iter().filter(|job| starved(job)).count();
+    let (_, superseded) = superseded_runs(observation);
+    let starved_by_push = ran_jobs
+        .iter()
+        .filter(|job| starved(job) && superseded.contains(&job.run_id))
+        .count();
 
     GateProxies {
         basis: "count-based, load-independent",
@@ -492,6 +512,7 @@ pub fn compute(observation: &GateCostObservation, merged_prs: Option<u64>) -> Ga
         starvation: Starvation {
             gate_attempts: ran_jobs.len(),
             cancelled_before_runner: starved_count,
+            superseded_by_push: starved_by_push,
             share: share(starved_count, ran_jobs.len()),
             evidence: evidence(
                 ran_jobs.len(),

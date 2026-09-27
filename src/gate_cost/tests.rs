@@ -351,6 +351,10 @@ fn count_based_proxies_are_reported_exactly() {
 
     assert_eq!(proxies.starvation.gate_attempts, 7);
     assert_eq!(proxies.starvation.cancelled_before_runner, 1);
+    assert_eq!(
+        proxies.starvation.superseded_by_push, 0,
+        "run 202 is a merge group"
+    );
     assert_eq!(proxies.starvation.share, Some(0.143));
     assert!(!proxies.starvation.evidence.sufficient);
 
@@ -471,4 +475,24 @@ fn activity_period_covers_the_window_start() {
     assert_eq!(activity_period(now, at("2026-09-25T12:00:00Z")), "day");
     assert_eq!(activity_period(now, at("2026-09-24T00:00:00Z")), "week");
     assert_eq!(activity_period(now, at("2026-09-01T00:00:00Z")), "month");
+}
+
+#[test]
+fn a_queued_gate_withdrawn_by_a_push_is_separated_from_capacity_starvation() {
+    let mut responses = proxy_fixture();
+    responses.insert(
+        "repos/o/r/actions/runs/104/jobs".to_owned(),
+        jobs_page(&[unassigned(
+            job_at(11, "macos", 1, "cancelled", "2026-09-24T09:05:00Z", 25),
+            &["self-hosted", "macos"],
+        )]),
+    );
+    let report = run_fixture(responses).expect("fixture gathers");
+    let starvation = &report.proxies.starvation;
+    assert_eq!(starvation.cancelled_before_runner, 2, "jobs 8 and 11");
+    assert_eq!(
+        starvation.superseded_by_push, 1,
+        "job 11's run was superseded"
+    );
+    assert_eq!(report.proxies.push_cancellations.superseded_by_push, 1);
 }
