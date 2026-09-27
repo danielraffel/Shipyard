@@ -590,8 +590,13 @@ divided by PRs merged into the base branch. It also reports merge-queue batch
 fullness against the ruleset's `max_entries_to_merge` and the share of
 merge-group runs whose `shipyard-receipt-decision/v1` said `reuse`. Run it from
 inside a checkout of the repo (credentials resolve by cwd); a 48h window of a
-busy repo is several hundred API reads and takes minutes. A short page is an
-error, never a smaller number. A merge-group run with no decision counts as not
+busy repo is several hundred API reads, and a cold 66h Pulp window took 810 s.
+Settled answers (jobs of a completed run attempt, annotations of a completed
+check run, commit parents) are cached under the state dir, so a repeat run
+reads only what is still in flight; the last line (`reads:`, JSON `reads`)
+says how many requests went to GitHub and how many the cache served. Use
+`--no-cache` to force every read live. A short page is an error, never a
+smaller number. A merge-group run with no decision counts as not
 reused and appears under `telemetry_gaps`, as does queue-depth history, which
 GitHub does not record.
 

@@ -15,6 +15,7 @@ use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 use crate::registrar::{Registrar, SUBSCRIBED_EVENTS};
+use crate::repo_slug;
 use crate::webhook_reconcile::{
     CONSECUTIVE_FAILED_DELIVERY_ALARM, DesiredWebhook, Finding, FindingCode, HostIdentity,
     ReconcileReport, Severity, reconcile,
@@ -50,6 +51,13 @@ pub(super) fn ensure_execution_daemon(
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let requested = normalize_repos(repos);
+        if configured_repositories_with_missing(configured.clone(), &requested).is_none() {
+            return Ok(0);
+        }
+        // Only a repository the daemon does not watch costs a resolution: a
+        // checkout whose remote still names a renamed repository must not
+        // restart the daemon on every submission.
+        let requested = resolve_watch_list(mode, &runtime_paths.state_dir, requested);
         let Some(configured) = configured_repositories_with_missing(configured, &requested) else {
             return Ok(0);
         };
@@ -61,7 +69,31 @@ pub(super) fn ensure_execution_daemon(
         }
         return spawn_execution_daemon(mode, runtime_paths, configured);
     }
-    spawn_execution_daemon(mode, runtime_paths, normalize_repos(repos))
+    let repos = resolve_watch_list(mode, &runtime_paths.state_dir, normalize_repos(repos));
+    spawn_execution_daemon(mode, runtime_paths, repos)
+}
+
+/// Replace every watched slug GitHub now reports under another name with that
+/// name, and say so on stderr (the daemon log, for a detached daemon). A slug
+/// that cannot be resolved is kept: an offline probe must never drop a
+/// repository from the watch list.
+fn resolve_watch_list(mode: RuntimeMode, state_dir: &Path, repos: Vec<String>) -> Vec<String> {
+    if repos.is_empty() {
+        return repos;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let registrar = Registrar::new_with_context(mode, state_dir, &cwd);
+    let (resolved, renames) = repo_slug::canonicalize(repos, |repo| {
+        let mut anonymous = repo_slug::anonymous_probe;
+        let mut authenticated = |slug: &str| registrar.probe_repo_name(slug);
+        repo_slug::resolve(repo, &mut [&mut anonymous, &mut authenticated])
+    });
+    for (from, to) in &renames {
+        let _ = crate::writer_domain_lease::write_stderr(format_args!(
+            "shipyard daemon: {from} now resolves to {to} on GitHub; watching {to}"
+        ));
+    }
+    resolved
 }
 
 fn configured_repositories_with_missing(
@@ -355,7 +387,11 @@ fn daemon_start<W: Write>(
     repos: &[String],
     no_detach: bool,
 ) -> Result<ExitCode, CliFailure> {
-    let resolved_repos = resolve_repos(&runtime_paths.state_dir, repos);
+    let resolved_repos = resolve_watch_list(
+        mode,
+        &runtime_paths.state_dir,
+        resolve_repos(&runtime_paths.state_dir, repos),
+    );
     if no_detach {
         return daemon_run_with_repos(mode, runtime_paths, resolved_repos);
     }
@@ -394,6 +430,7 @@ fn daemon_refresh<W: Write>(
         runtime_paths,
         repos,
         None,
+        |repos| resolve_watch_list(mode, &runtime_paths.state_dir, repos),
         spawn_detached,
     ) {
         Ok(outcome) => {
@@ -497,16 +534,19 @@ struct DaemonRefreshError {
     error: String,
 }
 
-fn execute_daemon_refresh<F>(
+#[allow(clippy::too_many_arguments)]
+fn execute_daemon_refresh<R, F>(
     mode: RuntimeMode,
     global_dir_override: Option<PathBuf>,
     state_dir_override: Option<PathBuf>,
     runtime_paths: &RuntimePaths,
     explicit_repos: &[String],
     binary_override: Option<PathBuf>,
+    resolve_watch: R,
     spawn: F,
 ) -> Result<DaemonRefreshOutcome, DaemonRefreshError>
 where
+    R: FnOnce(Vec<String>) -> Vec<String>,
     F: FnOnce(&SpawnRequest) -> Result<u32, DaemonSpawnFailedError>,
 {
     let prior_status = read_daemon_status(&runtime_paths.state_dir);
@@ -524,11 +564,14 @@ where
             error: "prior daemon did not stop; refusing to report a refreshed daemon".to_owned(),
         });
     }
-    let repos = if explicit_repos.is_empty() {
+    // A refresh re-resolves the watch set rather than copying the prior
+    // daemon's slugs verbatim, so a repository renamed while the daemon ran
+    // is watched under its new name from here on.
+    let repos = resolve_watch(if explicit_repos.is_empty() {
         prior_repos
     } else {
         resolve_repos(&runtime_paths.state_dir, explicit_repos)
-    };
+    });
     let binary = binary_override
         .map_or_else(std::env::current_exe, Ok)
         .map_err(|error| DaemonRefreshError {
@@ -1072,6 +1115,7 @@ mod tests {
             &runtime_paths(temp.path()),
             &[],
             None,
+            |repos| repos,
             |request: &SpawnRequest| {
                 assert_eq!(request.repos, vec!["owner/a", "owner/z"]);
                 Ok(4321)
@@ -1104,6 +1148,7 @@ mod tests {
                 "owner/b".to_owned(),
             ],
             None,
+            |repos| repos,
             |request: &SpawnRequest| {
                 assert_eq!(request.repos, vec!["owner/a", "owner/b"]);
                 Ok(1234)
@@ -1113,6 +1158,47 @@ mod tests {
 
         assert!(outcome.stopped_prior);
         assert_eq!(outcome.repos, vec!["owner/a", "owner/b"]);
+        worker.join().expect("join");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_rewatches_a_renamed_repository_under_its_new_name() {
+        let _process_fixture = crate::test_support::lock_process_tree_for_test();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let worker = spawn_test_daemon(
+            temp.path(),
+            vec!["danielraffel/pulp".to_owned(), "owner/other".to_owned()],
+        );
+        wait_for_daemon(temp.path());
+
+        let outcome = execute_daemon_refresh(
+            RuntimeMode::Isolated,
+            None,
+            Some(temp.path().to_path_buf()),
+            &runtime_paths(temp.path()),
+            &[],
+            None,
+            |repos| {
+                crate::repo_slug::canonicalize(repos, |repo| {
+                    if repo == "danielraffel/pulp" {
+                        crate::repo_slug::SlugResolution::Renamed {
+                            to: "Generous-Corp/pulp".to_owned(),
+                        }
+                    } else {
+                        crate::repo_slug::SlugResolution::Canonical
+                    }
+                })
+                .0
+            },
+            |request: &SpawnRequest| {
+                assert_eq!(request.repos, vec!["generous-corp/pulp", "owner/other"]);
+                Ok(77)
+            },
+        )
+        .expect("refresh outcome");
+
+        assert_eq!(outcome.repos, vec!["generous-corp/pulp", "owner/other"]);
         worker.join().expect("join");
     }
 
@@ -1128,6 +1214,7 @@ mod tests {
             &runtime_paths(temp.path()),
             &[],
             Some(installed_binary.clone()),
+            |repos| repos,
             |request: &SpawnRequest| {
                 assert!(request.repos.is_empty());
                 assert_eq!(request.binary, installed_binary);
@@ -1151,6 +1238,7 @@ mod tests {
             &runtime_paths(temp.path()),
             &["owner/repo".to_owned()],
             None,
+            |repos| repos,
             |_request: &SpawnRequest| Err(super::DaemonSpawnFailedError("boom".to_owned())),
         )
         .expect_err("spawn failure");

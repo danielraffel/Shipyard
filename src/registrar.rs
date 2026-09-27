@@ -18,6 +18,7 @@ use wait_timeout::ChildExt;
 use crate::daemon_ipc::rate_limit_is_anonymous;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
+use crate::repo_slug::{SlugProbe, full_name};
 use crate::webhook_reconcile::{DeliveryOutcome, ObservationFailure, ObservedWebhook};
 
 /// GitHub webhook events Shipyard subscribes to.
@@ -442,6 +443,33 @@ impl Registrar {
             .configured_gh_client(&repo)
             .map_err(|error| observation_failure_from(&error))?;
         self.observe_with_client(&repo, desired_url, &client, None)
+    }
+
+    /// Ask GitHub, through the configured credential, which name `repo`
+    /// has now. A credential minted per repository fails for a renamed
+    /// repository's old name, and that failure is read as `NotFound`, not as
+    /// an unreadable probe: it is the symptom being diagnosed.
+    #[must_use]
+    pub fn probe_repo_name(&self, repo: &str) -> SlugProbe {
+        let repo = canonical_repo(repo);
+        let client = match self.configured_gh_client(&repo) {
+            Ok(client) => client,
+            Err(error) => return slug_probe_from_failure(&error.to_string()),
+        };
+        match run_gh(
+            &client,
+            &self.cwd,
+            None,
+            &["api", &format!("repos/{repo}")],
+            None,
+        ) {
+            Ok(output) if output.status == 0 => full_name(&output.stdout).map_or_else(
+                || SlugProbe::Unreadable("repository read carried no full_name".to_owned()),
+                SlugProbe::Found,
+            ),
+            Ok(output) => slug_probe_from_failure(&output.combined_output()),
+            Err(error) => slug_probe_from_failure(&error.to_string()),
+        }
     }
 
     /// Observe with an explicit `gh` binary.
@@ -1014,6 +1042,16 @@ fn classify_gh_failure(action: &'static str, output: String) -> RegistrarError {
     }
 }
 
+/// Only an HTTP 404 from GitHub means "not found": a missing `gh` binary
+/// also says "not found", and it is an unreadable probe, not an answer.
+fn slug_probe_from_failure(output: &str) -> SlugProbe {
+    if output.to_ascii_lowercase().contains("http 404") {
+        SlugProbe::NotFound
+    } else {
+        SlugProbe::Unreadable(output.trim().to_owned())
+    }
+}
+
 fn mentions_not_found(output: &str) -> bool {
     let lowered = output.to_ascii_lowercase();
     lowered.contains("http 404")
@@ -1504,6 +1542,26 @@ mod tests {
         assert!(error.is_missing_webhook_scope());
         assert!(error.to_string().contains(WEBHOOK_SCOPE_COMMAND));
         assert!(registrar.all().is_empty());
+    }
+
+    #[test]
+    fn only_an_http_404_reads_as_a_missing_repository() {
+        use crate::repo_slug::SlugProbe;
+
+        assert_eq!(
+            super::slug_probe_from_failure(
+                "token helper exited with status 1: shipyard-github-app-token: GitHub API returned HTTP 404"
+            ),
+            SlugProbe::NotFound
+        );
+        assert_eq!(
+            super::slug_probe_from_failure("gh: Not Found (HTTP 404)"),
+            SlugProbe::NotFound
+        );
+        assert!(matches!(
+            super::slug_probe_from_failure("gh CLI not found on PATH"),
+            SlugProbe::Unreadable(_)
+        ));
     }
 
     #[cfg(unix)]

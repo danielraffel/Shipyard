@@ -351,11 +351,17 @@ where
             return ci_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Metrics { command } => {
-            // gate-cost reads GitHub live and never touches the metrics store.
+            // gate-cost reads GitHub live and never touches the metrics store;
+            // it keeps only its own cache of settled GitHub answers.
             return match *command {
-                self::cli::MetricsCommand::GateCost(args) => {
-                    gate_cost_command(*args, cli.mode.into(), &cwd, cli.json, stdout)
-                }
+                self::cli::MetricsCommand::GateCost(args) => gate_cost_command(
+                    *args,
+                    cli.mode.into(),
+                    &cwd,
+                    &runtime_paths.state_dir,
+                    cli.json,
+                    stdout,
+                ),
                 command => metrics_command(command, &runtime_paths.state_dir, cli.json, stdout),
             };
         }

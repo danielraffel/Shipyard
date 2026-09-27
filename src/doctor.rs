@@ -171,11 +171,15 @@ fn collect_report_with_github_auth(
     {
         core.insert("daemon-version".to_owned(), entry);
     }
+    if let Some(entry) = check_daemon_watched_repos(mode, state_dir) {
+        core.insert("daemon-repos".to_owned(), entry);
+    }
     let ready = ["git", "ssh", "rich-bundle"]
         .iter()
         .all(|name| core.get(*name).is_some_and(|entry| entry.ok))
         && core.get("macos-gatekeeper").is_none_or(|entry| entry.ok)
-        && core.get("daemon-version").is_none_or(|entry| entry.ok);
+        && core.get("daemon-version").is_none_or(|entry| entry.ok)
+        && core.get("daemon-repos").is_none_or(|entry| entry.ok);
     checks.insert("Core".to_owned(), core);
 
     let mut cloud = BTreeMap::new();
@@ -1059,6 +1063,63 @@ fn check_daemon_version_drift_with(
     ))
 }
 
+fn check_daemon_watched_repos(mode: RuntimeMode, state_dir: &Path) -> Option<DoctorEntry> {
+    let status = crate::daemon_ipc::read_daemon_status(state_dir)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let registrar = crate::registrar::Registrar::new_with_context(mode, state_dir, &cwd);
+    daemon_watched_repos_entry(&status, |repo| {
+        let mut anonymous = crate::repo_slug::anonymous_probe;
+        let mut authenticated = |slug: &str| registrar.probe_repo_name(slug);
+        crate::repo_slug::resolve(repo, &mut [&mut anonymous, &mut authenticated])
+    })
+}
+
+/// Flag every repository the running daemon watches under a name GitHub no
+/// longer answers to. Such a daemon keeps polling through redirects while its
+/// webhook registration fails on every attempt, so nothing else surfaces it.
+fn daemon_watched_repos_entry(
+    status: &serde_json::Value,
+    mut resolve_one: impl FnMut(&str) -> crate::repo_slug::SlugResolution,
+) -> Option<DoctorEntry> {
+    use crate::repo_slug::SlugResolution;
+
+    let repos: Vec<String> = status
+        .get("configured_repos")
+        .or_else(|| status.get("registered_repos"))
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    if repos.is_empty() {
+        return None;
+    }
+    let mut problems = Vec::new();
+    let mut unresolved = Vec::new();
+    for repo in &repos {
+        match resolve_one(repo) {
+            SlugResolution::Canonical => {}
+            SlugResolution::Renamed { to } => problems.push(format!(
+                "{repo} is now {to} on GitHub; run `shipyard daemon refresh` so the daemon watches {to}"
+            )),
+            SlugResolution::NotFound => problems.push(format!(
+                "{repo} returns 404 to both an anonymous read and the configured credential"
+            )),
+            SlugResolution::Unknown { reason } => unresolved.push(format!("{repo}: {reason}")),
+        }
+    }
+    let mut detail = problems.clone();
+    if !unresolved.is_empty() {
+        detail.push(format!("could not resolve {}", unresolved.join("; ")));
+    }
+    Some(DoctorEntry {
+        ok: problems.is_empty(),
+        version: Some(format!("daemon watches {} repo(s)", repos.len())),
+        detail: (!detail.is_empty()).then(|| detail.join("\n")),
+        error: None,
+    })
+}
+
 fn daemon_version_entry(relation: DaemonVersionRelation) -> DoctorEntry {
     match relation {
         DaemonVersionRelation::Match { daemon_version, .. } => DoctorEntry {
@@ -1897,6 +1958,57 @@ mod tests {
             Some("danielraffel/Shipyard".to_owned())
         );
         assert_eq!(parse_github_repo_slug("file:///tmp/repo"), None);
+    }
+
+    #[test]
+    fn a_daemon_watching_a_renamed_or_missing_repository_is_flagged() {
+        use crate::repo_slug::SlugResolution;
+
+        let status = serde_json::json!({
+            "configured_repos": ["danielraffel/pulp", "generous-corp/pulp", "owner/gone", "owner/offline"],
+        });
+        let entry = super::daemon_watched_repos_entry(&status, |repo| match repo {
+            "danielraffel/pulp" => SlugResolution::Renamed {
+                to: "Generous-Corp/pulp".to_owned(),
+            },
+            "owner/gone" => SlugResolution::NotFound,
+            "owner/offline" => SlugResolution::Unknown {
+                reason: "timed out".to_owned(),
+            },
+            _ => SlugResolution::Canonical,
+        })
+        .expect("entry");
+        assert!(!entry.ok);
+        let detail = entry.detail.expect("detail");
+        assert!(
+            detail.contains("danielraffel/pulp is now Generous-Corp/pulp"),
+            "{detail}"
+        );
+        assert!(detail.contains("owner/gone returns 404"), "{detail}");
+        assert!(
+            detail.contains("could not resolve owner/offline"),
+            "{detail}"
+        );
+
+        // An unreadable probe alone is reported but does not fail the check.
+        let offline = serde_json::json!({"configured_repos": ["owner/offline"]});
+        let entry = super::daemon_watched_repos_entry(&offline, |_| SlugResolution::Unknown {
+            reason: "timed out".to_owned(),
+        })
+        .expect("entry");
+        assert!(entry.ok);
+
+        let healthy = serde_json::json!({"configured_repos": ["generous-corp/pulp"]});
+        let entry = super::daemon_watched_repos_entry(&healthy, |_| SlugResolution::Canonical)
+            .expect("entry");
+        assert!(entry.ok);
+        assert_eq!(entry.detail, None);
+        assert!(
+            super::daemon_watched_repos_entry(&serde_json::json!({}), |_| {
+                SlugResolution::Canonical
+            })
+            .is_none()
+        );
     }
 
     #[test]

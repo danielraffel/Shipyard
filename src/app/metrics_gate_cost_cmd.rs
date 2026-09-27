@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::io::Write;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
@@ -9,7 +9,7 @@ use crate::app::cli::MetricsGateCostArgs;
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
-use crate::gate_cost::{self, GateCostQuery, GateCostReport, GateProxies};
+use crate::gate_cost::{self, GateCostQuery, GateCostReport, GateProxies, ReadCache};
 use crate::identity::RuntimeMode;
 use crate::output::write_pretty_json;
 
@@ -21,20 +21,27 @@ pub(super) fn gate_cost_command<W: Write>(
     args: MetricsGateCostArgs,
     mode: RuntimeMode,
     cwd: &Path,
+    state_dir: &Path,
     json_output: bool,
     stdout: &mut W,
 ) -> Result<std::process::ExitCode, CliFailure> {
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(2, format!("config error: {error}")))?;
     let now = Utc::now();
+    let no_cache = args.no_cache;
     let query = resolve_query(args, &config, now)?;
+    let cache = if no_cache {
+        ReadCache::disabled()
+    } else {
+        ReadCache::open(&cache_dir(state_dir, &query.repo), SystemTime::now())
+    };
     let actions = GitHubActions::from_loaded_config(cwd, &config);
     let reader = |gh_args: &[String]| {
         actions
             .run_gh_with_timeout(gh_args, GITHUB_READ_TIMEOUT)
             .map_err(|error| error.to_string())
     };
-    let observation = gate_cost::gather(&reader, &query, now)
+    let observation = gate_cost::gather_cached(&reader, &query, now, &cache)
         .map_err(|error| CliFailure::new(1, format!("gate-cost read failed: {error}")))?;
     let report = gate_cost::compute(&observation);
     if json_output {
@@ -45,6 +52,14 @@ pub(super) fn gate_cost_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// One cache directory per repository, under Shipyard's state directory.
+fn cache_dir(state_dir: &Path, repo: &str) -> PathBuf {
+    state_dir
+        .join("metrics")
+        .join("gate-cost-cache")
+        .join(repo.replace('/', "__").to_ascii_lowercase())
 }
 
 fn config_str(config: &LoadedConfig, key: &str) -> Option<String> {
@@ -315,6 +330,11 @@ fn render(report: &GateCostReport) -> String {
     for gap in &report.telemetry_gaps {
         let _ = writeln!(out, "gap {}: {}", gap.signal, gap.reason);
     }
+    let _ = writeln!(
+        out,
+        "reads: {} sent to GitHub, {} served from the settled-answer cache",
+        report.reads.github, report.reads.cached,
+    );
     out
 }
 
@@ -353,6 +373,7 @@ mod tests {
             run_meta: BTreeMap::new(),
             placement_jobs: Vec::new(),
             runner_census: Err("not read".to_owned()),
+            reads: gate_cost::ReadStats::default(),
         });
         let text = render(&report);
         let starts: Vec<&str> = text
@@ -389,6 +410,7 @@ mod tests {
             "receipt reuse",
             "queue depth now",
             "gap queue_depth_history",
+            "reads",
         ] {
             assert!(
                 starts.contains(&prefix),

@@ -429,7 +429,12 @@ merge-queue attempts per merged PR with ejections by cause (`gate_failed`,
 `starved`, `cancelled_after_start`), push cancellations (PR-head gate runs
 cancelled after a newer commit on the same branch started a run), receipt
 reuse, and batch fullness. Each block carries `evidence.sample` and
-`evidence.min_sample`; below the minimum, draw no verdict.
+`evidence.min_sample`; below the minimum, draw no verdict. Answers that can no
+longer change (jobs of a completed run attempt, annotations of a completed
+check run, commit parents) are cached under the state directory and reused by
+later runs; in-flight runs are always read live. `reads` reports the requests
+sent to GitHub and the answers served from the cache; `--no-cache` reads
+everything live.
 
 `shipyard status` is intentionally limited to queue/target state and does not
 probe GitHub quota. Use `shipyard doctor --rate-limit` when you need to confirm

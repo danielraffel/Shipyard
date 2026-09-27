@@ -869,7 +869,8 @@ collection gap, never a verdict. Pass `--basis wall-time` only when the
 question really is duration. `gate-cost` likewise leads with count-based
 proxies (runs per merged PR, starvation, unserved labels, wait per job ahead,
 merge-queue attempts and ejections by cause, push cancellations) and keeps
-minutes as context. Definitions and floors: `docs/cli-reference.md`
+minutes as context. It caches settled GitHub answers between runs and reports
+its own cost on the `reads:` line; `--no-cache` reads everything live. Definitions and floors: `docs/cli-reference.md`
 ("Proxy-first verdicts").
 
 When fixing GitHub importer bugs, keep Actions list endpoints absolute
@@ -1744,6 +1745,16 @@ existing daemon can refresh credentials independently of the submitting shell;
 running daemon from another Shipyard version must be refreshed before a new
 job is persisted. Adding a new repository to a same-version daemon refreshes
 its registration set while exact live workers remain independently owned.
+
+A renamed or transferred repository keeps answering ordinary API reads at its
+old slug (a 301), but the GitHub App installation lookup for the old name is a
+plain 404, so a daemon watching the old slug fails webhook registration on
+every retry while everything else looks healthy. Daemon start and `daemon
+refresh` resolve each watched slug (anonymous read, then the configured
+credential) and watch the name GitHub reports, logging the rename to the daemon
+log; an unresolvable slug is kept. `shipyard doctor` reports `daemon-repos`
+not ok for a watched repo that was renamed or returns 404 to both probes; the
+fix is `shipyard daemon refresh`.
 
 ## Legacy Queue Recovery: killed-worker stale-running reaping
 
