@@ -1,5 +1,8 @@
 #![allow(missing_docs)]
 
+pub mod proxy;
+mod proxy_store;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +48,11 @@ pub struct MetricRecordInput {
     pub completed_at: Option<DateTime<Utc>>,
     /// Authoritative cache reuse observation for this step, when supplied.
     pub cache_hit: Option<bool>,
+    /// Whether a runner was ever assigned to the job; `None` when unknown.
+    /// Starvation (cancelled before any runner) is measured from this.
+    pub runner_assigned: Option<bool>,
+    /// Runner labels the job requested, when known.
+    pub labels: Option<Vec<String>>,
 }
 
 /// One grouped timing summary row.
@@ -92,6 +100,12 @@ pub struct MetricsFinding {
     pub sample_count: usize,
     pub suggested_poll_interval_secs: u64,
     pub recommended_actions: Vec<String>,
+    /// Basis of this finding's verdict: `proxy` (load-independent counts) or
+    /// `wall_time` (load-dependent durations).
+    pub basis: &'static str,
+    /// Full before/after comparison, when the finding came from one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<proxy::Comparison>,
 }
 
 /// Compact, bounded stewardship scorecard. Fields that the metrics store does
@@ -121,6 +135,13 @@ pub struct StewardshipScorecard {
     pub cache_hit_rate: Option<f64>,
     pub submit_to_receipt: ScorecardCoverage,
     pub model_token_use: ScorecardCoverage,
+    /// Basis of `comparison.verdict`.
+    pub basis: &'static str,
+    /// Load-independent proxies over this window (project-wide).
+    pub proxies: Vec<proxy::ProxyValue>,
+    /// This window against the equal-length window before it. Duration
+    /// fields above are wall-clock and load-dependent; they are context.
+    pub comparison: proxy::Comparison,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -226,6 +247,8 @@ impl MetricsStore {
             );
             ",
         )?;
+        add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
+        add_column_if_missing(&conn, "jobs", "labels_json", "TEXT")?;
         Ok(())
     }
 
@@ -344,6 +367,8 @@ impl MetricsStore {
                 exit_code: input.exit_code,
                 failure_class: input.failure_class.clone(),
                 external_id: nonempty(input.external_id.clone()),
+                runner_assigned: input.runner_assigned,
+                labels_json: labels_json(input),
             },
         )?;
         let started_at_text = started_at.to_rfc3339();
@@ -435,6 +460,8 @@ impl MetricsStore {
                 exit_code: value_i64(value, "exit_code"),
                 failure_class: value_str(value, "failure_class").map(str::to_owned),
                 external_id,
+                runner_assigned: value.get("runner_assigned").and_then(Value::as_bool),
+                labels_json: value.get("labels").map(Value::to_string),
             },
         )?;
         import_phases(&conn, job_id, value)?;
@@ -477,15 +504,43 @@ impl MetricsStore {
         Ok(rows)
     }
 
-    /// Agent-oriented watch findings for material regressions.
+    /// Agent-oriented watch findings for material regressions. The verdict
+    /// uses `basis`: load-independent proxies by default, or wall-clock p90.
     pub fn watch(
         &self,
         project: &str,
         since_days: i64,
+        basis: proxy::Basis,
     ) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         let rows = load_summary_inputs(&conn, Some(project))?;
-        Ok(watch_findings(rows, since_days))
+        let wall = watch_findings(rows, since_days);
+        if basis == proxy::Basis::WallTime {
+            return Ok(wall);
+        }
+        let samples = proxy_store::load_samples(&conn, Some(project))?;
+        Ok(proxy_store::watch_findings(
+            &samples,
+            since_days,
+            Utc::now(),
+        ))
+    }
+
+    /// Every lane's earlier-half vs later-half comparison over `since_days`.
+    pub fn trend(
+        &self,
+        project: Option<&str>,
+        since_days: i64,
+        basis: proxy::Basis,
+    ) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let samples = proxy_store::load_samples(&conn, project)?;
+        Ok(proxy_store::trend_findings(
+            &samples,
+            since_days,
+            Utc::now(),
+            basis,
+        ))
     }
 
     /// Recommend the fastest healthy lane for each target.
@@ -494,23 +549,45 @@ impl MetricsStore {
         Ok(advise_findings(&summaries))
     }
 
-    /// Compare before/after windows split at `split_days_ago`.
+    /// Compare before/after windows split at `split_days_ago`. The verdict
+    /// uses `basis`: load-independent proxies by default, or wall-clock p50.
     pub fn compare(
         &self,
         project: &str,
         split_days_ago: i64,
+        basis: proxy::Basis,
     ) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let rows = load_summary_inputs(&conn, Some(project))?;
-        Ok(compare_findings(rows, split_days_ago))
+        if basis == proxy::Basis::WallTime {
+            let rows = load_summary_inputs(&conn, Some(project))?;
+            return Ok(compare_findings(rows, split_days_ago));
+        }
+        let samples = proxy_store::load_samples(&conn, Some(project))?;
+        Ok(proxy_store::compare_findings(
+            &samples,
+            split_days_ago,
+            Utc::now(),
+        ))
     }
 
     /// Return one compact historical scorecard without producing per-lane
-    /// findings or pretending absent telemetry was measured.
+    /// findings or pretending absent telemetry was measured. The comparison
+    /// verdict uses load-independent proxies.
     pub fn stewardship_scorecard(
         &self,
         project: &str,
         since_days: i64,
+    ) -> Result<StewardshipScorecard, Box<dyn std::error::Error>> {
+        self.stewardship_scorecard_with_basis(project, since_days, proxy::Basis::Proxy)
+    }
+
+    /// [`Self::stewardship_scorecard`] with an explicit verdict basis.
+    #[allow(clippy::too_many_lines)]
+    pub fn stewardship_scorecard_with_basis(
+        &self,
+        project: &str,
+        since_days: i64,
+        basis: proxy::Basis,
     ) -> Result<StewardshipScorecard, Box<dyn std::error::Error>> {
         validate_scorecard_scope(project, since_days)?;
         let conn = self.connect()?;
@@ -578,6 +655,14 @@ impl MetricsStore {
         };
         let cache = load_scorecard_cache_samples(&conn, project, &cutoff)?;
         let cache_hits = cache.iter().filter(|hit| **hit).count();
+        let now = Utc::now();
+        let (proxies, comparison) = proxy_store::scorecard_window(
+            &proxy_store::load_samples(&conn, Some(project))?,
+            now,
+            window,
+            basis,
+        )
+        .ok_or("scorecard day window is outside the timestamp range")?;
         let job_samples = samples.len();
         Ok(StewardshipScorecard {
             project: project.to_owned(),
@@ -610,6 +695,9 @@ impl MetricsStore {
                 status: "unavailable".to_owned(),
                 reason: "job metrics do not store model call or token counters".to_owned(),
             },
+            basis: basis.as_str(),
+            proxies,
+            comparison,
         })
     }
 }
@@ -747,6 +835,8 @@ struct JobInsert {
     exit_code: Option<i64>,
     failure_class: Option<String>,
     external_id: Option<String>,
+    runner_assigned: Option<bool>,
+    labels_json: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -805,8 +895,9 @@ fn insert_job(conn: &Connection, job: &JobInsert) -> Result<i64, rusqlite::Error
         "INSERT OR IGNORE INTO jobs (
           run_id, machine_id, job, target, platform, backend, provider,
           queued_at, started_at, completed_at, queue_ms, boot_ms, setup_ms,
-          run_ms, total_ms, status, exit_code, failure_class, external_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+          run_ms, total_ms, status, exit_code, failure_class, external_id,
+          runner_assigned, labels_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             job.run_id,
             job.machine_id,
@@ -826,7 +917,9 @@ fn insert_job(conn: &Connection, job: &JobInsert) -> Result<i64, rusqlite::Error
             job.status,
             job.exit_code,
             job.failure_class,
-            job.external_id
+            job.external_id,
+            job.runner_assigned,
+            job.labels_json
         ],
     )?;
     if conn.changes() == 0
@@ -904,7 +997,9 @@ fn refresh_existing_job(
                 queue_ms = COALESCE(?6, queue_ms), status = ?7, exit_code = COALESCE(?8, exit_code),
                 failure_class = COALESCE(?9, failure_class), machine_id = ?10,
                 target = COALESCE(?11, target), platform = COALESCE(?12, platform),
-                backend = COALESCE(?13, backend), provider = COALESCE(?14, provider)
+                backend = COALESCE(?13, backend), provider = COALESCE(?14, provider),
+                runner_assigned = COALESCE(?15, runner_assigned),
+                labels_json = COALESCE(?16, labels_json)
           WHERE id = ?1",
         params![
             job_id,
@@ -921,6 +1016,8 @@ fn refresh_existing_job(
             input.platform,
             input.backend,
             input.provider,
+            input.runner_assigned,
+            labels_json(input),
         ],
     )?;
     conn.execute(
@@ -970,6 +1067,30 @@ fn refresh_existing_job(
             &input.status,
             input.cache_hit,
         )?;
+    }
+    Ok(())
+}
+
+fn labels_json(input: &MetricRecordInput) -> Option<String> {
+    input
+        .labels
+        .as_ref()
+        .and_then(|labels| serde_json::to_string(labels).ok())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    kind: &str,
+) -> Result<(), rusqlite::Error> {
+    let present: bool = conn.query_row(
+        &format!("SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?1"),
+        params![column],
+        |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
     }
     Ok(())
 }
@@ -1180,6 +1301,8 @@ fn watch_findings(rows: Vec<SummaryInput>, since_days: i64) -> Vec<MetricsFindin
                 sample_count: previous.len() + current.len(),
                 suggested_poll_interval_secs: 600,
                 recommended_actions: vec!["Keep collecting runner timing samples.".to_owned()],
+                basis: proxy::Basis::WallTime.as_str(),
+                comparison: None,
             });
             continue;
         }
@@ -1200,6 +1323,8 @@ fn watch_findings(rows: Vec<SummaryInput>, since_days: i64) -> Vec<MetricsFindin
                     "Compare recent cache/golden/image labels against the previous window."
                         .to_owned(),
                 ],
+                basis: proxy::Basis::WallTime.as_str(),
+                comparison: None,
             });
         }
     }
@@ -1231,6 +1356,8 @@ fn advise_findings(summaries: &[MetricsSummaryRow]) -> Vec<MetricsFinding> {
                 recommended_actions: vec![
                     "Keep collecting metrics before changing profiles.".to_owned(),
                 ],
+                basis: proxy::Basis::WallTime.as_str(),
+                comparison: None,
             });
             continue;
         };
@@ -1251,6 +1378,8 @@ fn advise_findings(summaries: &[MetricsSummaryRow]) -> Vec<MetricsFinding> {
                 "Keep the profile unchanged unless capacity or fidelity requirements disagree."
                     .to_owned(),
             ],
+            basis: proxy::Basis::WallTime.as_str(),
+            comparison: None,
         });
     }
     findings
@@ -1304,6 +1433,8 @@ fn compare_findings(rows: Vec<SummaryInput>, split_days_ago: i64) -> Vec<Metrics
             recommended_actions: vec![
                 "Inspect profile, cache, and runner image changes near the split.".to_owned(),
             ],
+            basis: proxy::Basis::WallTime.as_str(),
+            comparison: None,
         });
     }
     findings
@@ -1455,6 +1586,12 @@ pub fn github_job_to_record(
         started_at,
         queued_at,
         completed_at,
+        runner_assigned: Some(
+            job.runner_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty()),
+        ),
+        labels: job.labels.clone(),
         ..MetricRecordInput::default()
     }
 }
@@ -1534,6 +1671,8 @@ mod tests {
                 exit_code: None,
                 failure_class: None,
                 external_id: None,
+                runner_assigned: None,
+                labels_json: None,
             },
         )
         .expect("insert job");

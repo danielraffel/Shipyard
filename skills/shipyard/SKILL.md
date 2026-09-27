@@ -858,6 +858,20 @@ a collection gap, not a regression. Prefer filing issues or changing profiles
 only when `watch`, `advise`, or `compare` reports enough samples and a material
 delta relative to that repo's baseline.
 
+Judge CI changes by the proxies, not by wall time. `compare`, `watch`,
+`trend`, and `scorecard` verdicts default to load-independent proxies
+(failure share, cancelled share, starvation share, attempts per PR, queue wait
+per job ahead, cache hit rate); p50/p90 duration is printed only as `context
+(load-dependent)` because it mostly tracks host load (1am vs peak). A
+`load_dependent_slowdown` watch finding means wall time rose while no proxy
+regressed: treat it as load, not a regression. `insufficient_sample` is a
+collection gap, never a verdict. Pass `--basis wall-time` only when the
+question really is duration. `gate-cost` likewise leads with count-based
+proxies (runs per merged PR, starvation, unserved labels, wait per job ahead,
+merge-queue attempts and ejections by cause, push cancellations) and keeps
+minutes as context. Definitions and floors: `docs/cli-reference.md`
+("Proxy-first verdicts").
+
 When fixing GitHub importer bugs, keep Actions list endpoints absolute
 (`/repos/<owner>/<repo>/...`) and force `gh api -X GET` whenever `-f` supplies
 query parameters. `gh api -f` defaults to POST, which can turn a valid list
