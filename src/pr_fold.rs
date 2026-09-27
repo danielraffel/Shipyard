@@ -181,10 +181,11 @@ pub fn render(suggestions: &[FoldSuggestion]) -> Vec<String> {
             suggestion.shared.join(", ")
         ));
     }
-    lines.push(
-        "  One PR per family saves a PR-head and a merge-group gate run each: cherry-pick their commits here and close them once this merges."
-            .to_owned(),
-    );
+    let branches: Vec<&str> = suggestions.iter().map(|s| s.branch.as_str()).collect();
+    lines.push(format!(
+        "  One PR per family saves a PR-head and a merge-group gate run each. To fold: shipyard pr --fold {}",
+        branches.join(" --fold ")
+    ));
     lines.push(
         "  Keep separate: an urgent fix, an unfinished branch, or one that may need reverting alone."
             .to_owned(),

@@ -1044,6 +1044,7 @@ fn handle_pr_variant<W: Write>(
         context_url,
         no_steward_handoff,
         no_arm: _,
+        fold,
     } = command
     else {
         unreachable!("pr variant required")
@@ -1075,6 +1076,7 @@ fn handle_pr_variant<W: Write>(
             },
             python_command: None,
             arm_auto_merge,
+            fold,
         },
         &config,
         cwd,

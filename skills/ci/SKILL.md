@@ -67,6 +67,14 @@ and prints one "Fold check skipped" line on any read failure. Each separate PR
 pays its own PR-head and merge-group gate run; over one measured week, 85 of
 177 session-stamped Pulp PRs had such a sibling open.
 
+`shipyard pr --fold <branch>` (repeatable) acts on the suggestion: before any
+gate, it cherry-picks each branch's own commits over `origin/<base>` onto the
+current branch, skipping merges, `chore: bump versions` commits (this PR
+computes its own bump) and patches already present. It needs a clean tracked
+tree and is all-or-nothing: a conflict aborts and resets the branch to its
+starting commit. Close the folded PRs once the combined one merges. Do not fold
+an urgent fix, an unfinished branch, or one that may need reverting alone.
+
 ## `shipyard pr` arms auto-merge; you no longer do it by hand
 
 `ship` arms GitHub-native auto-merge (merge method **MERGE**) as soon as it
