@@ -12,9 +12,10 @@ use crate::app::cli::{
     MetricsRecordArgs,
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
+use crate::metrics::proxy::{Basis, ProxyValue, WALL_CONTEXT_LABEL};
 use crate::metrics::{
     GitHubRunJob, MetricRecordInput, MetricsFinding, MetricsJobRow, MetricsStore,
-    MetricsSummaryRow, github_job_to_record, parse_duration_ms,
+    MetricsSummaryRow, StewardshipScorecard, github_job_to_record, parse_duration_ms,
 };
 use crate::output::write_pretty_json;
 
@@ -37,6 +38,14 @@ struct MetricsImportOutput {
 struct MetricsRowsOutput<T> {
     database: String,
     rows: Vec<T>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricsTrendOutput {
+    database: String,
+    basis: &'static str,
+    rows: Vec<MetricsJobRow>,
+    trend: Vec<MetricsFinding>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,11 +103,22 @@ pub(super) fn metrics_command<W: Write>(
                 })?;
             }
         },
-        MetricsCommand::List(args) | MetricsCommand::Trend(args) => {
+        MetricsCommand::List(args) => {
             let rows = store
                 .list(args.project.as_deref(), args.limit)
                 .map_err(|error| CliFailure::new(1, format!("metrics list failed: {error}")))?;
             write_rows(stdout, json_output, store.path(), rows)?;
+        }
+        MetricsCommand::Trend(args) => {
+            let since_days = parse_days(&args.since)?;
+            let basis = Basis::from(args.basis);
+            let rows = store
+                .list(args.project.as_deref(), args.limit)
+                .map_err(|error| CliFailure::new(1, format!("metrics trend failed: {error}")))?;
+            let trend = store
+                .trend(args.project.as_deref(), since_days, basis)
+                .map_err(|error| CliFailure::new(1, format!("metrics trend failed: {error}")))?;
+            write_trend(stdout, json_output, store.path(), basis, rows, trend)?;
         }
         MetricsCommand::Summary(args) => {
             let rows = store
@@ -122,7 +142,7 @@ pub(super) fn metrics_command<W: Write>(
                 .transpose()?
                 .unwrap_or(args.split_days_ago);
             let findings = store
-                .compare(&args.project, split_days_ago)
+                .compare(&args.project, split_days_ago, args.basis.into())
                 .map_err(|error| CliFailure::new(1, format!("metrics compare failed: {error}")))?;
             write_findings(
                 stdout,
@@ -136,7 +156,7 @@ pub(super) fn metrics_command<W: Write>(
         MetricsCommand::Watch(args) => {
             let since_days = parse_days(&args.since)?;
             let findings = store
-                .watch(&args.project, since_days)
+                .watch(&args.project, since_days, args.basis.into())
                 .map_err(|error| CliFailure::new(1, format!("metrics watch failed: {error}")))?;
             write_findings(
                 stdout,
@@ -163,12 +183,13 @@ pub(super) fn metrics_command<W: Write>(
         MetricsCommand::Scorecard(args) => {
             let since_days = parse_days(&args.since)?;
             let scorecard = store
-                .stewardship_scorecard(&args.project, since_days)
+                .stewardship_scorecard_with_basis(&args.project, since_days, args.basis.into())
                 .map_err(|error| {
                     CliFailure::new(1, format!("metrics scorecard failed: {error}"))
                 })?;
             write_output(stdout, json_output, &scorecard, || {
-                format!(
+                let mut text = scorecard_proxy_lines(&scorecard);
+                let coverage = format!(
                     "{}: {} jobs, {:.2} worker-minutes, {} PRs over {}d; worker-minutes coverage={} ({}); PR coverage={} ({}); submit-to-receipt={} ({}); model-tokens={} ({})",
                     scorecard.project,
                     scorecard.job_samples,
@@ -183,7 +204,9 @@ pub(super) fn metrics_command<W: Write>(
                     scorecard.submit_to_receipt.reason,
                     scorecard.model_token_use.status,
                     scorecard.model_token_use.reason,
-                )
+                );
+                text.push_str(&coverage);
+                text
             })?;
         }
         MetricsCommand::GateCost(_) => {
@@ -232,8 +255,10 @@ fn record_input(args: MetricsRecordArgs) -> Result<MetricRecordInput, CliFailure
         exit_code: args.exit_code,
         failure_class: args.failure_class,
         external_id: args.external_id,
-        queued_at: None,
+        queued_at: parse_rfc3339(args.queued_at.as_deref())?,
         cache_hit: None,
+        runner_assigned: args.runner_assigned,
+        labels: (!args.labels.is_empty()).then_some(args.labels),
         started_at: parse_rfc3339(args.started_at.as_deref())?,
         completed_at: parse_rfc3339(args.completed_at.as_deref())?,
     })
@@ -509,6 +534,13 @@ fn write_findings<W: Write>(
         writeln!(stdout, "No material findings.").map_err(io_error)?;
         return Ok(());
     }
+    if let Some(basis) = findings
+        .iter()
+        .find(|finding| finding.comparison.is_some())
+        .map(|finding| finding.basis)
+    {
+        writeln!(stdout, "basis: {basis}; wall time is {WALL_CONTEXT_LABEL}").map_err(io_error)?;
+    }
     for finding in findings {
         writeln!(
             stdout,
@@ -518,6 +550,71 @@ fn write_findings<W: Write>(
         .map_err(io_error)?;
     }
     Ok(())
+}
+
+fn proxy_value_text(value: &ProxyValue) -> String {
+    let measured = value
+        .value
+        .map_or_else(|| "n/a".to_owned(), |number| format!("{number:.3}"));
+    let marker = if value.sufficient {
+        ""
+    } else {
+        ", insufficient sample"
+    };
+    format!("{}={measured} (n={}{marker})", value.name, value.sample)
+}
+
+fn scorecard_proxy_lines(scorecard: &StewardshipScorecard) -> String {
+    let proxies: Vec<String> = scorecard.proxies.iter().map(proxy_value_text).collect();
+    format!(
+        "{} over {}d vs the previous {}d: {}\n  proxies: {}\n  {WALL_CONTEXT_LABEL}: duration p50 {} ms, p90 {} ms; queue p50 {} ms, p90 {} ms\n",
+        scorecard.project,
+        scorecard.since_days,
+        scorecard.since_days,
+        scorecard.comparison.summary(),
+        proxies.join(", "),
+        opt_ms(scorecard.duration_p50_ms),
+        opt_ms(scorecard.duration_p90_ms),
+        opt_ms(scorecard.queue_p50_ms),
+        opt_ms(scorecard.queue_p90_ms),
+    )
+}
+
+fn opt_ms(value: Option<i64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| value.to_string())
+}
+
+fn write_trend<W: Write>(
+    stdout: &mut W,
+    json_output: bool,
+    db_path: &Path,
+    basis: Basis,
+    rows: Vec<MetricsJobRow>,
+    trend: Vec<MetricsFinding>,
+) -> Result<(), CliFailure> {
+    if json_output {
+        return write_output(
+            stdout,
+            true,
+            &MetricsTrendOutput {
+                database: db_path.display().to_string(),
+                basis: basis.as_str(),
+                rows,
+                trend,
+            },
+            String::new,
+        );
+    }
+    writeln!(
+        stdout,
+        "trend verdicts (basis {}; wall time is {WALL_CONTEXT_LABEL}):",
+        basis.as_str()
+    )
+    .map_err(io_error)?;
+    for item in &trend {
+        writeln!(stdout, "  {}\t{}", item.lane, item.message).map_err(io_error)?;
+    }
+    write_rows(stdout, false, db_path, rows)
 }
 
 fn write_output<W: Write, T: Serialize, F: FnOnce() -> String>(
@@ -596,6 +693,54 @@ mod tests {
     }
 
     #[test]
+    fn json_outputs_keep_their_existing_keys_and_add_proxy_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |command: MetricsCommand| {
+            let mut output = Vec::new();
+            metrics_command(command, temp.path(), true, &mut output).expect("command");
+            serde_json::from_slice::<Value>(&output).expect("json")
+        };
+        let scorecard = run(MetricsCommand::Scorecard(
+            crate::app::cli::MetricsWatchArgs {
+                project: "shipyard".to_owned(),
+                since: "14d".to_owned(),
+                basis: crate::app::cli::MetricsBasis::Proxy,
+            },
+        ));
+        for key in [
+            "project",
+            "job_samples",
+            "worker_minutes",
+            "duration_p50_ms",
+            "duration_p90_ms",
+            "queue_p50_ms",
+            "cache_hit_rate",
+            "submit_to_receipt",
+            "model_token_use",
+            "basis",
+            "proxies",
+            "comparison",
+        ] {
+            assert!(scorecard.get(key).is_some(), "scorecard lost {key}");
+        }
+        assert_eq!(scorecard["basis"], "proxy");
+        assert_eq!(scorecard["comparison"]["verdict"], "insufficient_sample");
+        assert_eq!(
+            scorecard["comparison"]["context"]["label"],
+            "context (load-dependent)"
+        );
+        let trend = run(MetricsCommand::Trend(crate::app::cli::MetricsTrendArgs {
+            project: Some("shipyard".to_owned()),
+            limit: 5,
+            since: "14d".to_owned(),
+            basis: crate::app::cli::MetricsBasis::WallTime,
+        }));
+        assert!(trend["rows"].is_array());
+        assert!(trend["trend"].is_array());
+        assert_eq!(trend["basis"], "wall_time");
+    }
+
+    #[test]
     fn scorecard_human_output_surfaces_coverage_gaps() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut output = Vec::new();
@@ -603,6 +748,7 @@ mod tests {
             MetricsCommand::Scorecard(crate::app::cli::MetricsWatchArgs {
                 project: "shipyard".to_owned(),
                 since: "14d".to_owned(),
+                basis: crate::app::cli::MetricsBasis::Proxy,
             }),
             temp.path(),
             false,
@@ -610,6 +756,13 @@ mod tests {
         )
         .expect("scorecard command");
         let output = String::from_utf8(output).expect("UTF-8 output");
+
+        let first = output.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("insufficient_sample (basis proxy"),
+            "proxy verdict must lead: {output}"
+        );
+        assert!(output.contains("context (load-dependent): duration p50"));
 
         assert!(output.contains("PR coverage=unavailable"));
         assert!(output.contains("worker-minutes coverage=unavailable"));

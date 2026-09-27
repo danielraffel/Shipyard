@@ -82,6 +82,8 @@ shipyard metrics slowest --project pulp --limit 20
 shipyard metrics watch --project pulp --since 14d --json
 shipyard metrics advise --project pulp --profile normal --json
 shipyard metrics compare --project pulp --lane windows-arm64 --before 7d --after 7d --json
+shipyard metrics compare --project pulp --basis wall-time --json   # duration verdict (load-dependent)
+shipyard metrics trend --project pulp --since 14d --json
 
 # Manage
 shipyard bump <id> high        # reprioritize a pending job
@@ -387,6 +389,46 @@ use as `unavailable` until those values have durable source telemetry; it never
 infers them from job duration. Human output is available by default; `--json`
 returns structured rows, findings, or the scorecard for plugins, MCP tools, and
 monitoring agents.
+
+### Proxy-first verdicts
+
+Wall-clock duration mostly measures how busy the shared hosts were: the same
+change timed at 1am and at peak can differ by more than any real effect. So
+`compare`, `watch`, `trend`, and `scorecard` judge "better or worse" by
+load-independent proxies by default, and show p50/p90 duration only as
+`context (load-dependent)`. `--basis wall-time` restores the duration verdict.
+Every comparison reports both `proxy_verdict` and `wall_time_verdict`; the
+headline `verdict` follows `--basis`. Verdicts are `improved`, `regressed`,
+`mixed`, `unchanged`, or `insufficient_sample`.
+
+Store proxies (per job class; wall-time lanes also split by backend and host,
+but a job starved before any runner has no host):
+
+| Proxy | Definition | Floor |
+|---|---|---|
+| `failure_share` | failed / (success + failed) jobs | n>=10 per window; >2 pooled SE and 5 points |
+| `cancelled_share` | cancelled / completed jobs | same |
+| `starvation_share` | cancelled with no runner ever assigned / jobs with known assignment | same; rows without `runner_assigned` are excluded |
+| `attempts_per_pr` | jobs / distinct pull requests | n>=5 PRs; 15% and 0.25 attempts |
+| `queue_wait_per_job_ahead_ms` | median of wait / (1 + same-lane jobs queued earlier and still waiting) | n>=10 queued jobs; 25% and 1s |
+| `cache_hit_rate` | jobs whose every reported step hit / jobs reporting | n>=10; >2 pooled SE and 5 points |
+
+Recording rows that feed the proxies: `shipyard metrics import github` stores
+the queue time and whether a runner was assigned automatically. `shipyard
+metrics record` accepts `--queued-at`, `--runner-assigned true|false`, and a
+repeatable `--label`; without them the queue and starvation proxies read
+`insufficient_sample` rather than a guessed value.
+
+`gate-cost` leads with count-based proxies, then minutes as context: gate runs
+per merged PR (PR-head, merge-group, wasted attempts), starvation (gate jobs
+cancelled before any runner was assigned), placement (jobs whose exact label
+set no registered runner advertises and no job in the window was served on,
+with a placement-correct share per job class), queue wait per job ahead,
+merge-queue attempts per merged PR with ejections by cause (`gate_failed`,
+`starved`, `cancelled_after_start`), push cancellations (PR-head gate runs
+cancelled after a newer commit on the same branch started a run), receipt
+reuse, and batch fullness. Each block carries `evidence.sample` and
+`evidence.min_sample`; below the minimum, draw no verdict.
 
 `shipyard status` is intentionally limited to queue/target state and does not
 probe GitHub quota. Use `shipyard doctor --rate-limit` when you need to confirm

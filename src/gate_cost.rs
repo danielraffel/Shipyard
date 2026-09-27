@@ -26,6 +26,12 @@
 //! - **receipt reuse rate**: merge-group runs of `workflow` in which a
 //!   `shipyard-receipt-decision/v1` annotation reported verdict `reuse` for the
 //!   receipt target, divided by all merge-group runs of `workflow`.
+//!
+//! Gate minutes mostly track host load, so the report leads with the
+//! count-based proxies in [`proxy`]: gate runs per merged PR, starvation,
+//! placement against runner labels, queue wait per job ahead, merge-queue
+//! attempts and ejections, and push cancellations. Minutes stay in the report
+//! as load-dependent context.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,6 +40,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::validation_signals::{self, GhReader, ReceiptDecision};
+
+pub mod proxy;
+pub use proxy::{GateProxies, PlacementSample, RunMeta, RunnerCensus};
 
 /// A [`GhReader`] that may be shared across the bounded read workers.
 pub type SyncGhReader<'a> = dyn Fn(&[String]) -> Result<String, String> + Sync + 'a;
@@ -119,6 +128,12 @@ pub struct GateJobSample {
     pub started_at: Option<DateTime<Utc>>,
     /// Completion time.
     pub completed_at: Option<DateTime<Utc>>,
+    /// Job creation (queue) time.
+    pub created_at: Option<DateTime<Utc>>,
+    /// Runner that picked the job up; `None` when no runner ever did.
+    pub runner_name: Option<String>,
+    /// Labels the job requested.
+    pub labels: Vec<String>,
 }
 
 /// One merge-queue push to the base branch.
@@ -173,6 +188,12 @@ pub struct GateCostObservation {
     pub current_queue_depth: Result<u64, String>,
     /// Problems reading the ruleset, kept for the gap list.
     pub ruleset_error: Option<String>,
+    /// Run metadata per gate-workflow run id.
+    pub run_meta: BTreeMap<u64, RunMeta>,
+    /// Every job of every name in the gate-workflow runs read.
+    pub placement_jobs: Vec<PlacementSample>,
+    /// Registered runners' label sets.
+    pub runner_census: Result<RunnerCensus, String>,
 }
 
 /// Duration statistics for one class of gate runs.
@@ -293,6 +314,9 @@ pub struct GateCostReport {
     pub current_queue_depth: Option<u64>,
     /// Signals not measured, or measured only partly.
     pub telemetry_gaps: Vec<TelemetryGap>,
+    /// Count-based, load-independent proxies. Lead with these; the minutes
+    /// above are load-dependent context.
+    pub proxies: GateProxies,
 }
 
 fn round2(value: f64) -> f64 {
@@ -534,6 +558,19 @@ pub fn compute(observation: &GateCostObservation) -> GateCostReport {
             None
         }
     };
+    let proxies = proxy::compute(observation, merged_prs);
+    if let Some(reason) = &proxies.placement.census_reason {
+        gaps.push(TelemetryGap {
+            signal: "runner_census".to_owned(),
+            reason: reason.clone(),
+        });
+    }
+    gaps.push(TelemetryGap {
+        signal: "push_type".to_owned(),
+        reason: "push cancellations are not split by push type: that needs the pull \
+                 request timeline per run"
+            .to_owned(),
+    });
     gaps.push(TelemetryGap {
         signal: "queue_depth_history".to_owned(),
         reason: "GitHub exposes only the live merge-queue depth; depth at each batch \
@@ -572,6 +609,7 @@ pub fn compute(observation: &GateCostObservation) -> GateCostReport {
         reuse,
         current_queue_depth,
         telemetry_gaps: gaps,
+        proxies,
     }
 }
 
@@ -843,6 +881,7 @@ fn read_queue_depth(gh: &GhReader<'_>, query: &GateCostQuery) -> Result<u64, Str
 
 /// Read one window from GitHub. Fails only when the gate runs themselves
 /// cannot be read completely; every other signal degrades to a gap.
+#[allow(clippy::too_many_lines)]
 pub fn gather(
     gh: &SyncGhReader<'_>,
     query: &GateCostQuery,
@@ -856,6 +895,8 @@ pub fn gather(
     let mut runs_by_event: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut gate_jobs = Vec::new();
     let mut reuse = BTreeMap::new();
+    let mut run_meta = BTreeMap::new();
+    let mut placement_jobs = Vec::new();
     for event in &query.events {
         let pages = read_pages(
             gh,
@@ -886,6 +927,19 @@ pub fn gather(
             .iter()
             .filter_map(|run| run.get("id").and_then(Value::as_u64))
             .collect();
+        for run in &runs {
+            if let Some(id) = run.get("id").and_then(Value::as_u64) {
+                run_meta.insert(
+                    id,
+                    RunMeta {
+                        event: event.clone(),
+                        head_branch: text(run, "head_branch"),
+                        head_sha: text(run, "head_sha"),
+                        created_at: timestamp(run, "created_at"),
+                    },
+                );
+            }
+        }
         entry.extend(run_ids.iter().copied());
         let per_run = parallel_map(&run_ids, |run_id| {
             let job_pages = read_pages(
@@ -900,6 +954,14 @@ pub fn gather(
         for result in per_run {
             let (run_id, jobs, outcome) = result?;
             for job in &jobs {
+                let runner_name = text(job, "runner_name").filter(|name| !name.trim().is_empty());
+                let labels = job_labels(job);
+                placement_jobs.push(PlacementSample {
+                    name: text(job, "name").unwrap_or_default(),
+                    labels: labels.clone(),
+                    runner_assigned: runner_name.is_some(),
+                    conclusion: text(job, "conclusion"),
+                });
                 if text(job, "name").as_deref() != Some(query.gate_job.as_str()) {
                     continue;
                 }
@@ -911,6 +973,9 @@ pub fn gather(
                     conclusion: text(job, "conclusion"),
                     started_at: timestamp(job, "started_at"),
                     completed_at: timestamp(job, "completed_at"),
+                    created_at: timestamp(job, "created_at"),
+                    runner_name,
+                    labels,
                 });
             }
             if let Some(outcome) = outcome {
@@ -935,7 +1000,69 @@ pub fn gather(
         reuse,
         current_queue_depth: read_queue_depth(gh, query),
         ruleset_error,
+        run_meta,
+        placement_jobs,
+        runner_census: read_runner_census(gh, &query.repo),
     })
+}
+
+fn job_labels(job: &Value) -> Vec<String> {
+    job.get("labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn runner_label_sets(pages: &[Value]) -> Vec<BTreeSet<String>> {
+    pages
+        .iter()
+        .filter_map(|page| page.get("runners").and_then(Value::as_array))
+        .flatten()
+        .map(|runner| {
+            runner
+                .get("labels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|label| label.get("name").and_then(Value::as_str))
+                .map(str::to_lowercase)
+                .collect()
+        })
+        .collect()
+}
+
+/// Registered runners' labels, repository and organisation scope. Offline
+/// runners count: they still advertise their labels. Ephemeral runners that
+/// are not registered right now are invisible here, which is why placement
+/// also treats a label set as served when any job in the window got a runner.
+fn read_runner_census(gh: &GhReader<'_>, repo: &str) -> Result<RunnerCensus, String> {
+    let mut census = RunnerCensus::default();
+    let mut read_any = false;
+    let mut scopes = vec![(format!("repos/{repo}/actions/runners"), "repository")];
+    if let Some((owner, _)) = repo.split_once('/') {
+        scopes.push((format!("orgs/{owner}/actions/runners"), "organisation"));
+    }
+    let mut errors = Vec::new();
+    for (path, scope) in scopes {
+        match read_pages(gh, &path, &["per_page=100".to_owned()]) {
+            Ok(pages) => {
+                read_any = true;
+                census.label_sets.extend(runner_label_sets(&pages));
+            }
+            Err(error) => {
+                census.unread_scopes.push(scope.to_owned());
+                errors.push(format!("{scope} runners: {error}"));
+            }
+        }
+    }
+    if read_any {
+        Ok(census)
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// Parse a window length such as `48h`, `2d`, or `90m`.

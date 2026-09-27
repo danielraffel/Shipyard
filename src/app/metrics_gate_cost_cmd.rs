@@ -9,7 +9,7 @@ use crate::app::cli::MetricsGateCostArgs;
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
-use crate::gate_cost::{self, GateCostQuery, GateCostReport};
+use crate::gate_cost::{self, GateCostQuery, GateCostReport, GateProxies};
 use crate::identity::RuntimeMode;
 use crate::output::write_pretty_json;
 
@@ -160,10 +160,95 @@ fn opt(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_owned(), |value| format!("{value:.2}"))
 }
 
+fn sample_note(evidence: &gate_cost::proxy::Evidence) -> String {
+    if evidence.sufficient {
+        format!("n={}", evidence.sample)
+    } else {
+        format!(
+            "n={}, insufficient sample (needs {})",
+            evidence.sample, evidence.min_sample
+        )
+    }
+}
+
+fn render_proxies(out: &mut String, proxies: &GateProxies) {
+    let _ = writeln!(out, "proxies ({}):", proxies.basis);
+    let runs = &proxies.runs_per_merged_pr;
+    let _ = writeln!(
+        out,
+        "  gate runs per merged PR: {} PR-head, {} merge-group, {} wasted attempts ({} merged PRs)",
+        opt(runs.pr_head_per_merged_pr),
+        opt(runs.merge_group_per_merged_pr),
+        opt(runs.wasted_per_merged_pr),
+        sample_note(&runs.evidence),
+    );
+    let starvation = &proxies.starvation;
+    let _ = writeln!(
+        out,
+        "  starvation: {} of {} gate attempts cancelled before a runner was assigned ({}; {})",
+        starvation.cancelled_before_runner,
+        starvation.gate_attempts,
+        opt(starvation.share),
+        sample_note(&starvation.evidence),
+    );
+    let placement = &proxies.placement;
+    let unserved: Vec<String> = placement
+        .unserved_label_sets
+        .iter()
+        .map(|labels| format!("[{}]", labels.join(",")))
+        .collect();
+    let _ = writeln!(
+        out,
+        "  placement: {} of {} jobs on label sets nothing serves {}; placement-correct {} (census {}; {})",
+        placement.unserved_label_jobs,
+        placement.jobs,
+        unserved.join(" "),
+        opt(placement.placement_correct_share),
+        placement.census,
+        sample_note(&placement.evidence),
+    );
+    let wait = &proxies.queue_wait_per_job_ahead;
+    let _ = writeln!(
+        out,
+        "  queue wait per job ahead: median {}s (raw median wait {}s is load-dependent; {})",
+        opt(wait.median_seconds),
+        opt(wait.raw_median_wait_seconds),
+        sample_note(&wait.evidence),
+    );
+    let queue = &proxies.merge_queue;
+    let causes: Vec<String> = queue
+        .ejections_by_cause
+        .iter()
+        .map(|(cause, count)| format!("{cause}={count}"))
+        .collect();
+    let _ = writeln!(
+        out,
+        "  merge queue: {} attempts per merged PR; {} ejection(s) [{}] ({})",
+        opt(queue.attempts_per_merged_pr),
+        queue.ejections,
+        causes.join(" "),
+        sample_note(&queue.evidence),
+    );
+    let pushes = &proxies.push_cancellations;
+    let _ = writeln!(
+        out,
+        "  push cancellations: {} of {} cancelled PR-head runs superseded by a push ({} of PR-head runs; {})",
+        pushes.superseded_by_push,
+        pushes.cancelled_pr_head_runs,
+        opt(pushes.share_of_pr_head_runs),
+        sample_note(&pushes.evidence),
+    );
+}
+
 fn render(report: &GateCostReport) -> String {
     let mut out = format!(
         "{} {} job `{}` into {}, {} .. {}\n",
         report.repo, report.workflow, report.gate_job, report.base_branch, report.from, report.to
+    );
+    render_proxies(&mut out, &report.proxies);
+    let _ = writeln!(
+        out,
+        "context (load-dependent): gate minutes track host load; judge changes by the proxies above"
     );
     let _ = writeln!(
         out,
@@ -264,6 +349,9 @@ mod tests {
             reuse: BTreeMap::new(),
             current_queue_depth: Ok(0),
             ruleset_error: None,
+            run_meta: BTreeMap::new(),
+            placement_jobs: Vec::new(),
+            runner_census: Err("not read".to_owned()),
         });
         let text = render(&report);
         let starts: Vec<&str> = text
@@ -276,7 +364,22 @@ mod tests {
                 .unwrap_or("")
                 .starts_with("o/r build.yml")
         );
+        let proxy_line = text
+            .lines()
+            .position(|line| line.starts_with("proxies ("))
+            .expect("proxy block");
+        let minutes_line = text
+            .lines()
+            .position(|line| line.starts_with("gate-minutes per merged PR"))
+            .expect("minutes line");
+        assert!(proxy_line < minutes_line, "proxies must lead: {text}");
         for prefix in [
+            "  starvation",
+            "  placement",
+            "  queue wait per job ahead",
+            "  merge queue",
+            "  push cancellations",
+            "context (load-dependent)",
             "gate-minutes per merged PR",
             "  gate runs per merged PR",
             "  PR head",

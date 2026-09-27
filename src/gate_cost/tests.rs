@@ -25,18 +25,40 @@ fn query() -> GateCostQuery {
     }
 }
 
-/// A job whose wall time is exactly `minutes` minutes.
+/// A job whose wall time is exactly `minutes` minutes, queued two minutes
+/// before it started on runner `r1`.
 fn job(id: u64, name: &str, attempt: u64, conclusion: &str, minutes: i64) -> Value {
-    let start = at("2026-09-24T10:00:00Z");
+    job_at(
+        id,
+        name,
+        attempt,
+        conclusion,
+        "2026-09-24T10:00:00Z",
+        minutes,
+    )
+}
+
+fn job_at(id: u64, name: &str, attempt: u64, conclusion: &str, start: &str, minutes: i64) -> Value {
+    let start = at(start);
     json!({
         "id": id,
         "name": name,
         "run_attempt": attempt,
         "status": "completed",
         "conclusion": conclusion,
+        "created_at": (start - chrono::Duration::minutes(2)).to_rfc3339(),
         "started_at": start.to_rfc3339(),
         "completed_at": (start + chrono::Duration::minutes(minutes)).to_rfc3339(),
+        "runner_name": "r1",
+        "labels": ["self-hosted", "macos"],
     })
+}
+
+/// A job no runner ever picked up.
+fn unassigned(mut job: Value, labels: &[&str]) -> Value {
+    job["runner_name"] = Value::Null;
+    job["labels"] = json!(labels);
+    job
 }
 
 fn decision(target: &str, verdict: &str) -> Value {
@@ -229,7 +251,162 @@ fn synthetic_fixture_is_reported_exactly() {
         .iter()
         .map(|gap| gap.signal.as_str())
         .collect();
-    assert_eq!(gap_signals, ["batch_fullness", "queue_depth_history"]);
+    assert_eq!(
+        gap_signals,
+        [
+            "batch_fullness",
+            "runner_census",
+            "push_type",
+            "queue_depth_history"
+        ]
+    );
+}
+
+fn run(id: u64, branch: &str, sha: &str, created: &str) -> Value {
+    json!({"id": id, "head_branch": branch, "head_sha": sha, "created_at": created})
+}
+
+/// The base fixture plus: run 104 on branch `c` whose gate was cancelled at
+/// 09:30 after run 105 (same branch, new commit) was created at 09:20; a
+/// merge-group gate (run 202) cancelled before any runner took it; a
+/// `gpu-test` job requesting labels no runner advertises; and a repository
+/// runner census whose organisation scope is unreadable.
+fn proxy_fixture() -> BTreeMap<String, Value> {
+    let mut responses = fixture();
+    let mut put = |key: &str, value: Value| {
+        responses.insert(key.to_owned(), value);
+    };
+    put(
+        "runs:pull_request",
+        json!([{"total_count": 5, "workflow_runs": [
+            run(101, "a", "a1", "2026-09-24T09:50:00Z"),
+            run(102, "b", "b1", "2026-09-24T09:50:00Z"),
+            run(103, "a", "a2", "2026-09-24T09:55:00Z"),
+            run(104, "c", "c1", "2026-09-24T09:00:00Z"),
+            run(105, "c", "c2", "2026-09-24T09:20:00Z"),
+        ]}]),
+    );
+    put(
+        "repos/o/r/actions/runs/101/jobs",
+        jobs_page(&[
+            job(1, "macos", 1, "success", 20),
+            job(2, "linux", 1, "success", 40),
+            unassigned(
+                job(10, "gpu-test", 1, "cancelled", 0),
+                &["self-hosted", "gpu"],
+            ),
+        ]),
+    );
+    put(
+        "repos/o/r/actions/runs/104/jobs",
+        jobs_page(&[job_at(
+            11,
+            "macos",
+            1,
+            "cancelled",
+            "2026-09-24T09:05:00Z",
+            25,
+        )]),
+    );
+    put(
+        "repos/o/r/actions/runs/105/jobs",
+        jobs_page(&[job(12, "macos", 1, "success", 20)]),
+    );
+    put(
+        "repos/o/r/actions/runs/202/jobs",
+        jobs_page(&[
+            unassigned(
+                job(8, "macos", 1, "cancelled", 5),
+                &["self-hosted", "macos"],
+            ),
+            job(9, "protected-receipt-reuse", 1, "success", 1),
+        ]),
+    );
+    put(
+        "repos/o/r/actions/runners",
+        json!([{"total_count": 1, "runners": [
+            {"name": "r1", "status": "offline", "labels": [{"name": "self-hosted"}, {"name": "macOS"}]}
+        ]}]),
+    );
+    responses
+}
+
+#[test]
+#[allow(clippy::float_cmp)] // exact reporting is the property under test
+fn count_based_proxies_are_reported_exactly() {
+    let report = run_fixture(proxy_fixture()).expect("fixture gathers");
+    let proxies = &report.proxies;
+    assert_eq!(proxies.basis, "count-based, load-independent");
+
+    let runs = &proxies.runs_per_merged_pr;
+    assert_eq!((runs.pr_head_runs, runs.merge_group_runs), (5, 2));
+    assert_eq!(
+        runs.wasted_attempts, 3,
+        "102 failure, 104 and 202 cancelled"
+    );
+    assert_eq!(runs.pr_head_per_merged_pr, Some(1.67));
+    assert_eq!(runs.merge_group_per_merged_pr, Some(0.67));
+    assert_eq!(runs.wasted_per_merged_pr, Some(1.0));
+    assert!(!runs.evidence.sufficient, "3 merged PRs is under the floor");
+
+    assert_eq!(proxies.starvation.gate_attempts, 7);
+    assert_eq!(proxies.starvation.cancelled_before_runner, 1);
+    assert_eq!(proxies.starvation.share, Some(0.143));
+    assert!(!proxies.starvation.evidence.sufficient);
+
+    let placement = &proxies.placement;
+    assert_eq!(placement.census, "partial");
+    assert_eq!(placement.jobs, 11);
+    assert_eq!(placement.unserved_label_jobs, 1);
+    assert_eq!(
+        placement.unserved_label_sets,
+        vec![vec!["gpu".to_owned(), "self-hosted".to_owned()]]
+    );
+    assert_eq!(placement.placement_correct_share, Some(0.9));
+    assert_eq!(placement.by_job_class["gpu-test"].unserved, 1);
+    assert_eq!(placement.by_job_class["macos"].waiting_or_starved, 1);
+    assert_eq!(
+        placement.by_job_class["macos"].placement_correct_share,
+        Some(1.0)
+    );
+
+    let queue = &proxies.merge_queue;
+    assert_eq!(queue.attempts, 2);
+    assert_eq!(queue.attempts_per_merged_pr, Some(0.67));
+    assert_eq!(queue.ejections, 1);
+    assert_eq!(queue.ejections_by_cause.get("starved"), Some(&1));
+
+    let pushes = &proxies.push_cancellations;
+    assert_eq!(pushes.cancelled_pr_head_runs, 1);
+    assert_eq!(pushes.superseded_by_push, 1);
+    assert_eq!(pushes.share_of_pr_head_runs, Some(0.2));
+    assert_eq!(pushes.by_push_type, None);
+
+    let wait = &proxies.queue_wait_per_job_ahead;
+    assert_eq!(
+        wait.evidence.sample, 6,
+        "the starved job never waited to a start"
+    );
+    assert_eq!(wait.raw_median_wait_seconds, Some(120.0));
+}
+
+#[test]
+fn a_cancellation_without_a_newer_push_is_not_counted_as_superseded() {
+    let mut responses = proxy_fixture();
+    responses.insert(
+        "runs:pull_request".to_owned(),
+        json!([{"total_count": 5, "workflow_runs": [
+            run(101, "a", "a1", "2026-09-24T09:50:00Z"),
+            run(102, "b", "b1", "2026-09-24T09:50:00Z"),
+            run(103, "a", "a2", "2026-09-24T09:55:00Z"),
+            run(104, "c", "c1", "2026-09-24T09:00:00Z"),
+            // Same commit: a re-run, not a push.
+            run(105, "c", "c1", "2026-09-24T09:20:00Z"),
+        ]}]),
+    );
+    let report = run_fixture(responses).expect("fixture gathers");
+    assert_eq!(report.proxies.push_cancellations.cancelled_pr_head_runs, 1);
+    assert_eq!(report.proxies.push_cancellations.superseded_by_push, 0);
 }
 
 #[test]

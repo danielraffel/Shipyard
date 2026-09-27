@@ -143,6 +143,7 @@ fn record_command_metric(
         external_id: Some(format!("shipyard-command:{}", record.id)),
         started_at: Some(record.started_at),
         completed_at: Some(record.completed_at),
+        runner_assigned: Some(true),
         ..MetricRecordInput::default()
     })?;
     Ok(())
