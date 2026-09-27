@@ -1072,6 +1072,11 @@ pub(crate) struct MetricsGateCostArgs {
     /// Window end, RFC 3339 (exclusive). Defaults to now.
     #[arg(long)]
     pub(crate) to: Option<String>,
+    /// Read every answer live instead of reusing settled answers (completed
+    /// run attempts, completed check runs, commit parents) cached by earlier
+    /// runs.
+    #[arg(long)]
+    pub(crate) no_cache: bool,
 }
 
 #[derive(Debug, Subcommand)]

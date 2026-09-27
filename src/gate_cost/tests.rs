@@ -496,3 +496,211 @@ fn a_queued_gate_withdrawn_by_a_push_is_separated_from_capacity_starvation() {
     );
     assert_eq!(report.proxies.push_cancellations.superseded_by_push, 1);
 }
+
+/// The fixture with every run listed as a completed first attempt, so its
+/// jobs are settled answers the cache may keep.
+fn settled_fixture() -> BTreeMap<String, Value> {
+    let mut responses = fixture();
+    for (event, ids) in [
+        ("pull_request", &[101_u64, 102, 103][..]),
+        ("merge_group", &[201, 202][..]),
+    ] {
+        responses.insert(
+            format!("runs:{event}"),
+            json!([{
+                "total_count": ids.len(),
+                "workflow_runs": ids
+                    .iter()
+                    .map(|id| json!({"id": id, "run_attempt": 1, "status": "completed"}))
+                    .collect::<Vec<_>>(),
+            }]),
+        );
+    }
+    responses
+}
+
+fn gather_with(
+    responses: BTreeMap<String, Value>,
+    cache: &ReadCache,
+) -> (GateCostReport, Vec<String>) {
+    let seen = std::sync::Mutex::new(Vec::new());
+    let inner = reader(responses);
+    let gh = |args: &[String]| {
+        if let Some(path) = args
+            .iter()
+            .find(|arg| arg.starts_with("repos/") || arg.starts_with("orgs/"))
+        {
+            seen.lock().expect("seen").push(path.clone());
+        }
+        inner(args)
+    };
+    let observation =
+        gather_cached(&gh, &query(), at("2026-09-26T01:00:00Z"), cache).expect("gathers");
+    (compute(&observation), seen.into_inner().expect("seen"))
+}
+
+fn settled_reads(paths: &[String]) -> usize {
+    paths
+        .iter()
+        .filter(|path| {
+            path.ends_with("/jobs")
+                || path.ends_with("/annotations")
+                || path.contains("/git/commits/")
+        })
+        .count()
+}
+
+#[test]
+fn a_second_run_serves_settled_answers_from_the_cache() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let now = std::time::SystemTime::now();
+
+    let cold = ReadCache::open(dir.path(), now);
+    let (first, first_paths) = gather_with(settled_fixture(), &cold);
+    // Control: the first run really read every settled answer from GitHub.
+    // 5 run job lists, 2 receipt-job annotation lists, 5 commits.
+    assert_eq!(settled_reads(&first_paths), 12);
+    assert_eq!(first.reads.cached, 0);
+
+    let warm = ReadCache::open(dir.path(), now);
+    let (second, second_paths) = gather_with(settled_fixture(), &warm);
+    assert_eq!(settled_reads(&second_paths), 0, "{second_paths:?}");
+    assert_eq!(second.reads.cached, 12);
+    assert_eq!(
+        second.reads.github + 12,
+        first.reads.github,
+        "only the settled reads moved to the cache"
+    );
+
+    let strip = |report: &GateCostReport| {
+        let mut report = report.clone();
+        report.reads = ReadStats::default();
+        report
+    };
+    assert_eq!(
+        strip(&first),
+        strip(&second),
+        "cached answers change nothing"
+    );
+}
+
+#[test]
+fn unsettled_runs_and_jobs_are_read_live_every_time() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let now = std::time::SystemTime::now();
+    let mut responses = settled_fixture();
+    // Run 101 is still in progress; run 102 is listed completed but one of
+    // its jobs is not, so neither answer may be kept.
+    responses.insert(
+        "runs:pull_request".to_owned(),
+        json!([{"total_count": 3, "workflow_runs": [
+            {"id": 101, "run_attempt": 1, "status": "in_progress"},
+            {"id": 102, "run_attempt": 1, "status": "completed"},
+            {"id": 103, "run_attempt": 1, "status": "completed"},
+        ]}]),
+    );
+    let mut in_flight = job(4, "macos", 2, "success", 30);
+    in_flight["status"] = json!("in_progress");
+    responses.insert(
+        "repos/o/r/actions/runs/102/jobs".to_owned(),
+        jobs_page(&[job(3, "macos", 1, "failure", 10), in_flight]),
+    );
+
+    gather_with(responses.clone(), &ReadCache::open(dir.path(), now));
+    let (_, paths) = gather_with(responses, &ReadCache::open(dir.path(), now));
+    let live: Vec<&String> = paths
+        .iter()
+        .filter(|path| path.ends_with("/jobs"))
+        .collect();
+    assert_eq!(
+        live,
+        [
+            "repos/o/r/actions/runs/101/jobs",
+            "repos/o/r/actions/runs/102/jobs"
+        ]
+    );
+}
+
+#[test]
+fn a_rerun_attempt_is_not_answered_from_the_earlier_attempt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let now = std::time::SystemTime::now();
+    gather_with(settled_fixture(), &ReadCache::open(dir.path(), now));
+
+    let mut rerun = settled_fixture();
+    rerun.insert(
+        "runs:pull_request".to_owned(),
+        json!([{"total_count": 3, "workflow_runs": [
+            {"id": 101, "run_attempt": 2, "status": "completed"},
+            {"id": 102, "run_attempt": 1, "status": "completed"},
+            {"id": 103, "run_attempt": 1, "status": "completed"},
+        ]}]),
+    );
+    rerun.insert(
+        "repos/o/r/actions/runs/101/jobs".to_owned(),
+        jobs_page(&[
+            job(1, "macos", 1, "success", 20),
+            job(2, "linux", 1, "success", 40),
+            job(12, "macos", 2, "success", 20),
+        ]),
+    );
+    let (report, _) = gather_with(rerun, &ReadCache::open(dir.path(), now));
+    assert_eq!(report.pr_head.jobs, 5, "attempt 2's job is counted");
+}
+
+#[test]
+fn reuse_stops_at_the_job_that_published_the_decision() {
+    let mut responses = fixture();
+    // Every job that ran is read when no receipt job is named. Job 20 comes
+    // after the decider and has no annotations to read: reaching it would
+    // make the run unreadable.
+    responses.insert(
+        "repos/o/r/actions/runs/202/jobs".to_owned(),
+        jobs_page(&[
+            job(8, "macos", 1, "cancelled", 5),
+            job(9, "protected-receipt-reuse", 1, "success", 1),
+            job(20, "linux", 1, "success", 1),
+        ]),
+    );
+    responses.insert("repos/o/r/check-runs/8/annotations".to_owned(), json!([[]]));
+    responses.insert("repos/o/r/check-runs/6/annotations".to_owned(), json!([[]]));
+    let gh = reader(responses);
+    let mut unnamed = query();
+    unnamed.receipt_job = None;
+    let observation = gather(&gh, &unnamed, at("2026-09-26T01:00:00Z")).expect("gathers");
+    let report = compute(&observation);
+    assert_eq!(report.reuse.refused, 1);
+    assert_eq!(report.reuse.unreadable, 0);
+}
+
+#[test]
+fn a_cache_entry_under_another_key_is_a_miss() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = ReadCache::open(dir.path(), std::time::SystemTime::now());
+    cache.put("commit-parents:o/r:a1", &json!([{"sha": "b0"}]));
+    assert_eq!(
+        cache.get("commit-parents:o/r:a1"),
+        Some(json!([{"sha": "b0"}]))
+    );
+    assert_eq!(cache.get("commit-parents:o/r:a2"), None);
+    // Tamper with the stored key: the digest still matches, the key does not.
+    let entry = std::fs::read_dir(dir.path())
+        .expect("dir")
+        .flatten()
+        .next()
+        .expect("one entry")
+        .path();
+    std::fs::write(&entry, json!({"key": "other", "value": 1}).to_string()).expect("write");
+    assert_eq!(cache.get("commit-parents:o/r:a1"), None);
+    assert_eq!(cache.stats().cached, 1, "only the real hit counts");
+}
+
+#[test]
+fn entries_older_than_the_age_limit_are_pruned_on_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let now = std::time::SystemTime::now();
+    ReadCache::open(dir.path(), now).put("k", &json!(1));
+    assert_eq!(ReadCache::open(dir.path(), now).get("k"), Some(json!(1)));
+    let later = now + cache::MAX_ENTRY_AGE + std::time::Duration::from_secs(60);
+    assert_eq!(ReadCache::open(dir.path(), later).get("k"), None);
+}

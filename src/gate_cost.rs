@@ -41,7 +41,9 @@ use serde_json::Value;
 
 use crate::validation_signals::{self, GhReader, ReceiptDecision};
 
+pub mod cache;
 pub mod proxy;
+pub use cache::{ReadCache, ReadStats};
 pub use proxy::{GateProxies, PlacementSample, RunMeta, RunnerCensus};
 
 /// A [`GhReader`] that may be shared across the bounded read workers.
@@ -194,6 +196,8 @@ pub struct GateCostObservation {
     pub placement_jobs: Vec<PlacementSample>,
     /// Registered runners' label sets.
     pub runner_census: Result<RunnerCensus, String>,
+    /// How many reads went to GitHub and how many the disk cache answered.
+    pub reads: ReadStats,
 }
 
 /// Duration statistics for one class of gate runs.
@@ -317,6 +321,8 @@ pub struct GateCostReport {
     /// Count-based, load-independent proxies. Lead with these; the minutes
     /// above are load-dependent context.
     pub proxies: GateProxies,
+    /// Requests this report cost: sent to GitHub, and served from the cache.
+    pub reads: ReadStats,
 }
 
 fn round2(value: f64) -> f64 {
@@ -610,6 +616,7 @@ pub fn compute(observation: &GateCostObservation) -> GateCostReport {
         current_queue_depth,
         telemetry_gaps: gaps,
         proxies,
+        reads: observation.reads,
     }
 }
 
@@ -712,6 +719,7 @@ fn read_ruleset(gh: &GhReader<'_>, query: &GateCostQuery) -> Result<QueueRule, S
 
 fn read_batches(
     gh: &SyncGhReader<'_>,
+    cache: &ReadCache,
     query: &GateCostQuery,
     now: DateTime<Utc>,
     max_entries: Option<u64>,
@@ -750,12 +758,13 @@ fn read_batches(
     Ok(parallel_map(&pushes, |(time, before, after)| BatchSample {
         after: after.clone(),
         timestamp: *time,
-        entries: walk_first_parent(gh, &query.repo, after, before, walk_cap),
+        entries: walk_first_parent(gh, cache, &query.repo, after, before, walk_cap),
     }))
 }
 
 fn walk_first_parent(
     gh: &GhReader<'_>,
+    cache: &ReadCache,
     repo: &str,
     after: &str,
     before: &str,
@@ -766,13 +775,22 @@ fn walk_first_parent(
         if sha == before {
             return Some(steps);
         }
-        let commit = read_json(
-            gh,
-            &strings(&["api", &format!("repos/{repo}/git/commits/{sha}")]),
-        )
-        .ok()?;
-        commit
-            .get("parents")?
+        // A commit's parents are fixed by its hash, so this answer never goes
+        // stale.
+        let key = format!("commit-parents:{repo}:{sha}");
+        let parents = if let Some(parents) = cache.get(&key) {
+            parents
+        } else {
+            let commit = read_json(
+                gh,
+                &strings(&["api", &format!("repos/{repo}/git/commits/{sha}")]),
+            )
+            .ok()?;
+            let parents = commit.get("parents")?.clone();
+            cache.put(&key, &parents);
+            parents
+        };
+        parents
             .as_array()?
             .first()?
             .get("sha")?
@@ -782,8 +800,37 @@ fn walk_first_parent(
     None
 }
 
-fn read_reuse(gh: &GhReader<'_>, query: &GateCostQuery, jobs: &[Value]) -> ReuseOutcome {
-    let mut decided = false;
+/// Every annotation page of one check run. A completed check run's
+/// annotations are final, so only those answers are cached.
+fn read_annotation_pages(
+    gh: &GhReader<'_>,
+    cache: &ReadCache,
+    repo: &str,
+    job: &Value,
+    id: u64,
+) -> Result<Vec<Value>, String> {
+    let completed = text(job, "status").as_deref() == Some("completed");
+    let key = format!("check-run-annotations:{repo}:{id}");
+    if completed && let Some(Value::Array(pages)) = cache.get(&key) {
+        return Ok(pages);
+    }
+    let pages = read_pages(
+        gh,
+        &format!("repos/{repo}/check-runs/{id}/annotations"),
+        &["per_page=100".to_owned()],
+    )?;
+    if completed {
+        cache.put(&key, &Value::Array(pages.clone()));
+    }
+    Ok(pages)
+}
+
+fn read_reuse(
+    gh: &GhReader<'_>,
+    cache: &ReadCache,
+    query: &GateCostQuery,
+    jobs: &[Value],
+) -> ReuseOutcome {
     for job in jobs {
         let wanted = query.receipt_job.as_deref().map_or_else(
             || text(job, "conclusion").is_some_and(|c| c != "skipped"),
@@ -792,17 +839,14 @@ fn read_reuse(gh: &GhReader<'_>, query: &GateCostQuery, jobs: &[Value]) -> Reuse
         let Some(id) = job.get("id").and_then(Value::as_u64).filter(|_| wanted) else {
             continue;
         };
-        let Ok(pages) = read_pages(
-            gh,
-            &format!("repos/{}/check-runs/{id}/annotations", query.repo),
-            &["per_page=100".to_owned()],
-        ) else {
+        let Ok(pages) = read_annotation_pages(gh, cache, &query.repo, job, id) else {
             return ReuseOutcome::Unreadable;
         };
         let annotations: Vec<_> = pages
             .iter()
             .flat_map(validation_signals::parse_annotations)
             .collect();
+        let mut decided = false;
         for decision in validation_signals::receipt_decisions_from_annotations(&annotations, None) {
             if let ReceiptDecision::Parsed {
                 target, verdict, ..
@@ -815,12 +859,14 @@ fn read_reuse(gh: &GhReader<'_>, query: &GateCostQuery, jobs: &[Value]) -> Reuse
                 decided = true;
             }
         }
+        // One job publishes a run's decision for a target. Once it is found
+        // the remaining jobs cannot change the outcome, and each would cost a
+        // read.
+        if decided {
+            return ReuseOutcome::Refused;
+        }
     }
-    if decided {
-        ReuseOutcome::Refused
-    } else {
-        ReuseOutcome::NoDecision
-    }
+    ReuseOutcome::NoDecision
 }
 
 fn read_merged_prs(gh: &GhReader<'_>, query: &GateCostQuery) -> Result<u64, String> {
@@ -879,14 +925,68 @@ fn read_queue_depth(gh: &GhReader<'_>, query: &GateCostQuery) -> Result<u64, Str
         .ok_or_else(|| format!("no merge queue on `{}`", query.base_branch))
 }
 
-/// Read one window from GitHub. Fails only when the gate runs themselves
-/// cannot be read completely; every other signal degrades to a gap.
-#[allow(clippy::too_many_lines)]
+/// Read one window from GitHub without a disk cache.
 pub fn gather(
     gh: &SyncGhReader<'_>,
     query: &GateCostQuery,
     now: DateTime<Utc>,
 ) -> Result<GateCostObservation, String> {
+    gather_cached(gh, query, now, &ReadCache::disabled())
+}
+
+/// The jobs of one run. Cached only when the run attempt listed is completed
+/// and every job in the answer is too: a re-run bumps the attempt, so an
+/// attempt that finished can gain no further jobs.
+fn read_run_jobs(
+    gh: &GhReader<'_>,
+    cache: &ReadCache,
+    repo: &str,
+    run: &RunRef,
+) -> Result<Vec<Value>, String> {
+    let key = run
+        .attempt
+        .filter(|_| run.completed)
+        .map(|attempt| format!("run-jobs:{repo}:{}:attempt-{attempt}", run.id));
+    if let Some(Value::Array(jobs)) = key.as_deref().and_then(|key| cache.get(key)) {
+        return Ok(jobs);
+    }
+    let job_pages = read_pages(
+        gh,
+        &format!("repos/{repo}/actions/runs/{}/jobs", run.id),
+        &["filter=all".to_owned(), "per_page=100".to_owned()],
+    )?;
+    let jobs = collect_counted(&job_pages, "jobs", &format!("jobs of run {}", run.id))?;
+    let settled = jobs
+        .iter()
+        .all(|job| text(job, "status").as_deref() == Some("completed"));
+    if let Some(key) = key.filter(|_| settled) {
+        cache.put(&key, &Value::Array(jobs.clone()));
+    }
+    Ok(jobs)
+}
+
+/// The identity of one listed run that decides whether its jobs may be cached.
+struct RunRef {
+    id: u64,
+    attempt: Option<u64>,
+    completed: bool,
+}
+
+/// Read one window from GitHub, serving settled answers from `cache`. Fails
+/// only when the gate runs themselves cannot be read completely; every other
+/// signal degrades to a gap.
+#[allow(clippy::too_many_lines)]
+pub fn gather_cached(
+    gh: &SyncGhReader<'_>,
+    query: &GateCostQuery,
+    now: DateTime<Utc>,
+    cache: &ReadCache,
+) -> Result<GateCostObservation, String> {
+    let counted = |args: &[String]| {
+        cache.note_github_read();
+        gh(args)
+    };
+    let gh: &SyncGhReader<'_> = &counted;
     let created = format!(
         "created={}..{}",
         query.from.format("%Y-%m-%dT%H:%M:%SZ"),
@@ -923,9 +1023,15 @@ pub fn gather(
         }
         let runs = collect_counted(&pages, "workflow_runs", &format!("`{event}` runs"))?;
         let entry = runs_by_event.entry(event.clone()).or_default();
-        let run_ids: Vec<u64> = runs
+        let run_refs: Vec<RunRef> = runs
             .iter()
-            .filter_map(|run| run.get("id").and_then(Value::as_u64))
+            .filter_map(|run| {
+                Some(RunRef {
+                    id: run.get("id").and_then(Value::as_u64)?,
+                    attempt: run.get("run_attempt").and_then(Value::as_u64),
+                    completed: text(run, "status").as_deref() == Some("completed"),
+                })
+            })
             .collect();
         for run in &runs {
             if let Some(id) = run.get("id").and_then(Value::as_u64) {
@@ -940,16 +1046,11 @@ pub fn gather(
                 );
             }
         }
-        entry.extend(run_ids.iter().copied());
-        let per_run = parallel_map(&run_ids, |run_id| {
-            let job_pages = read_pages(
-                gh,
-                &format!("repos/{}/actions/runs/{run_id}/jobs", query.repo),
-                &["filter=all".to_owned(), "per_page=100".to_owned()],
-            )?;
-            let jobs = collect_counted(&job_pages, "jobs", &format!("jobs of run {run_id}"))?;
-            let outcome = (event == MERGE_GROUP_EVENT).then(|| read_reuse(gh, query, &jobs));
-            Ok::<_, String>((*run_id, jobs, outcome))
+        entry.extend(run_refs.iter().map(|run| run.id));
+        let per_run = parallel_map(&run_refs, |run| {
+            let jobs = read_run_jobs(gh, cache, &query.repo, run)?;
+            let outcome = (event == MERGE_GROUP_EVENT).then(|| read_reuse(gh, cache, query, &jobs));
+            Ok::<_, String>((run.id, jobs, outcome))
         });
         for result in per_run {
             let (run_id, jobs, outcome) = result?;
@@ -988,21 +1089,26 @@ pub fn gather(
             Ok((merge, build, method)) => (merge, build, method, None),
             Err(error) => (None, None, None, Some(error)),
         };
+    let merged_prs = read_merged_prs(gh, query);
+    let batches = read_batches(gh, cache, query, now, max_entries_to_merge);
+    let current_queue_depth = read_queue_depth(gh, query);
+    let runner_census = read_runner_census(gh, &query.repo);
     Ok(GateCostObservation {
         query: query.clone(),
         runs_by_event,
         gate_jobs,
-        merged_prs: read_merged_prs(gh, query),
-        batches: read_batches(gh, query, now, max_entries_to_merge),
+        merged_prs,
+        batches,
         max_entries_to_merge,
         max_entries_to_build,
         merge_method,
         reuse,
-        current_queue_depth: read_queue_depth(gh, query),
+        current_queue_depth,
         ruleset_error,
         run_meta,
         placement_jobs,
-        runner_census: read_runner_census(gh, &query.repo),
+        runner_census,
+        reads: cache.stats(),
     })
 }
 

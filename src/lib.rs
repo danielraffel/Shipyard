@@ -209,6 +209,8 @@ mod record_identity;
 pub mod recovery_worker;
 /// GitHub webhook registration through the user's existing `gh` auth.
 pub mod registrar;
+/// Canonical identity of a watched repository after a rename or transfer.
+pub mod repo_slug;
 /// Shared parsing for classic and ruleset required-check policies.
 pub mod required_check_policy;
 /// Cloud→local macOS reroute decision logic (#316 Part C).
