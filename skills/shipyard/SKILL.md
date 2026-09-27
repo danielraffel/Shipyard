@@ -3633,6 +3633,19 @@ the head's headline. Merge-group reads are restricted to check runs of
 `merge_group` workflow runs, because a merged commit also carries the base
 branch's push runs.
 
+`src/base_health.rs` reads a repository's `base-poison-signal/v1` annotation
+(title `base-poison-signal`) from the newest completed `success`/`failure` run
+of the detector workflow (`base_health.workflow`, default
+`main-health-detector.yml`); cancelled runs are skipped, and an older run is
+never consulted once the newest evidence run published nothing. Jump advice
+needs `status == "poisoned"`, a `candidate_fix_pr`, and a signal under two
+hours old. `landing` renders it; `shipyard base-health --act` applies
+`base_health.auto_jump` (`off` default and reads nothing; `dry-run` appends one
+`would_jump` line per (repo, base run, PR) episode to
+`<state>/base-health/jump-decisions.jsonl`; `on` dequeues and re-enqueues the
+exact head with `jump: true`, and a `failed` attempt may retry). An unknown
+config value is an error, never a silent `off`.
+
 ### The endpoint that lies by omission
 
 `GET /repos/{o}/{r}/branches/{b}/protection` has **no merge-queue field at

@@ -13,6 +13,7 @@ use clap::Parser;
 
 mod auth_cmd;
 mod auto_merge_cmd;
+mod base_health_cmd;
 mod branch_cmd;
 mod capacity_cmd;
 pub(crate) mod changed_surface_cmd;
@@ -429,6 +430,24 @@ where
                 stdout,
             );
         }
+        Command::BaseHealth {
+            repo,
+            workflow,
+            act,
+        } => {
+            return base_health_cmd::base_health_command(
+                base_health_cmd::BaseHealthArgs {
+                    repo,
+                    workflow,
+                    act,
+                    json: cli.json,
+                },
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                stdout,
+            );
+        }
         Command::Landing {
             repo,
             base,
@@ -695,6 +714,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Quarantine { .. }
         | Command::Landability { .. }
         | Command::Landing { .. }
+        | Command::BaseHealth { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }
         | Command::MergeQueue { .. }

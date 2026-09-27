@@ -2701,6 +2701,19 @@ the queue absorbs.
 An unreadable surface reports `UNKNOWN`, never `absent`. Treat an `UNKNOWN`
 queue as "determine this before doing bulk work", not as "there is no queue".
 
+**A red base overrides "wait for the queue".** `shipyard landing` also reads
+the repository's own `base-poison-signal/v1` annotation (Pulp publishes it from
+`main-health-detector.yml`). When it says `poisoned` and names a fix pull
+request, the ACTION block leads with `MAIN RED: <test>, FIX PR #n, JUMP IT`
+and the exact dequeue + `enqueuePullRequest(jump: true)` commands: every batch
+re-formed on a red base inherits the failure, so ejected pull requests are
+innocent and should be re-armed, not re-pushed. `shipyard base-health` prints
+the same thing alone. Advice needs a fresh signal (under 2 h) and a named fix;
+`suspected` is never advice. `base_health.auto_jump` (`off` by default) turns
+`shipyard base-health --act` into a recorder (`dry-run`) or an actor (`on`);
+switching it to `on` is an owner decision, taken only after dry-run records
+show it picks the right pull request.
+
 **Before arming or enqueuing ONE pull request: `shipyard landing --pr <n>`.**
 REST `pulls/<n>.auto_merge` is `null` for every queued PR — GitHub consumes
 auto-merge on enqueue — so never read that `null` as "unarmed". The command
