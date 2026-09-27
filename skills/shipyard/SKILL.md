@@ -1393,6 +1393,17 @@ which must not be unlocked while that child runs. A regression test for a lock
 holds `file.try_clone()` (what a forked child holds) across the release and
 requires the lock to be free.
 
+## Tests that spawn a daemon look-alike must reap it on every exit path
+
+A test that spawns an `sh … daemon run` stub (so `process_looks_like_shipyard_daemon`
+recognises it) must use `daemon_runtime`'s `DaemonStub` fixture, not a bare
+`Command::spawn`. A `std::process::Child` is not killed on drop, so any
+assertion that fails before the test's own cleanup leaves the stub looping
+under init forever; seven accumulated on one CI host before this was caught.
+`DaemonStub` leads its own process group and kills it on drop (panics), and
+the stub exits once the test process is gone (a harness timeout skips drop).
+Check a host with `ps -Ao pid,ppid,command | grep shipyard-daemon-run`.
+
 ## cfg-gated tests: gate the helpers identically
 
 A `#[cfg(unix)]` test module must gate its **helpers** with the same cfg, not
