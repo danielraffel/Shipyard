@@ -45,6 +45,12 @@ shipyard --json landing                      # machine-readable; exit 9 when any
 shipyard landing --pr 123                    # one PR: queued / armed_not_queued / ejected / never_armed / merged, with sources;
                                              #   plus VALIDATION: head test tier (fast / full / unknown) and merge-group receipt decisions
 
+# Is the base red? (reads the repo's own base-poison-signal/v1 annotation)
+shipyard base-health                         # status; for `poisoned` + a named fix PR: "main red: <test>, fix PR #n, jump it" and the commands
+shipyard base-health --workflow FILE         # detector workflow (default base_health.workflow, else main-health-detector.yml)
+shipyard base-health --act                   # apply base_health.auto_jump: off (default; reads nothing) | dry-run (records "would jump PR #n"
+                                             #   once per episode in <state>/base-health/jump-decisions.jsonl) | on (dequeue + enqueue jump:true)
+
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard)
 shipyard guards status                       # missing/stale/current vs this build's copies; exit 1 unless all current
 shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically

@@ -398,6 +398,27 @@ pub(super) enum Command {
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },
+    /// Read the repository's base-poison signal and, for a poisoned base with
+    /// a named fix pull request, print the commands that jump it to the front
+    /// of the merge queue.
+    ///
+    /// Read-only unless `--act` is given. `--act` follows
+    /// `base_health.auto_jump` (`off` by default; `dry-run` records "would jump
+    /// PR #n" once per episode; `on` dequeues and re-enqueues the fix with
+    /// `jump: true`). With `off`, `--act` returns before reading GitHub.
+    #[command(name = "base-health")]
+    BaseHealth {
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Detector workflow publishing the signal. Defaults to
+        /// `base_health.workflow`, else `main-health-detector.yml`.
+        #[arg(long, value_name = "FILE")]
+        workflow: Option<String>,
+        /// Apply `base_health.auto_jump` to the advice.
+        #[arg(long)]
+        act: bool,
+    },
     Doctor {
         /// Exact OWNER/REPO used to resolve configured auth token placeholders.
         #[arg(long, value_name = "OWNER/REPO")]

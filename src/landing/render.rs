@@ -8,6 +8,7 @@
 
 use std::io::Write;
 
+use crate::base_health::BaseHealthFinding;
 use crate::landing::placement::Placement;
 use crate::landing::{LandingReport, SurfaceOutcome, Verdict};
 
@@ -29,6 +30,16 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &LandingReport) -> std::io:
     writeln!(stdout)?;
 
     writeln!(stdout, "ACTION")?;
+    if let Some(jump) = &report.base_jump {
+        writeln!(stdout, "  {}", jump.message.to_uppercase())?;
+        for command in &jump.commands {
+            writeln!(stdout, "    {command}")?;
+        }
+        writeln!(
+            stdout,
+            "  Every batch re-formed on a red base inherits the failure; jump the fix first."
+        )?;
+    }
     writeln!(stdout, "  {}", report.enqueue.action.to_uppercase())?;
     if let Some(command) = &report.enqueue.command {
         writeln!(stdout, "  {command}")?;
@@ -188,6 +199,25 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &LandingReport) -> std::io:
         writeln!(stdout, "  drafts     {}", optional(report.backlog.drafts))?;
     }
     writeln!(stdout, "  {}", report.backlog.interpretation)?;
+    writeln!(stdout)?;
+
+    writeln!(stdout, "BASE HEALTH")?;
+    match &report.base_health {
+        BaseHealthFinding::Signal(observation) => {
+            writeln!(
+                stdout,
+                "  {}  detector run {} at {}",
+                observation.signal.status.to_uppercase(),
+                observation.run_id,
+                observation.observed_at.to_rfc3339()
+            )?;
+            if !observation.signal.tests.is_empty() {
+                writeln!(stdout, "  tests  {}", observation.signal.tests.join(", "))?;
+            }
+        }
+        BaseHealthFinding::NoSignal { detail } => writeln!(stdout, "  no signal ({detail})")?,
+        BaseHealthFinding::Unreadable { detail } => writeln!(stdout, "  UNKNOWN ({detail})")?,
+    }
     writeln!(stdout)?;
 
     writeln!(stdout, "SURFACES CONSULTED")?;
