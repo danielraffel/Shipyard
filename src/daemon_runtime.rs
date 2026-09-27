@@ -2683,6 +2683,120 @@ mod tests {
         worker.join().expect("join");
     }
 
+    /// A daemon-shaped `sh` stub that cannot outlive its test.
+    ///
+    /// It leads its own process group, which drop kills even when the test
+    /// panics; and it exits by itself within about a second of the test process
+    /// disappearing, which covers a harness timeout that kills the test binary
+    /// without running drop. Without both, a failed run leaves a `daemon run`
+    /// look-alike looping forever under init.
+    #[cfg(unix)]
+    struct DaemonStub {
+        child: std::process::Child,
+    }
+
+    #[cfg(unix)]
+    impl DaemonStub {
+        /// `on_term` is the TERM trap body; without an `exit` the stub
+        /// survives TERM like a stubborn daemon.
+        fn spawn(script: &Path, pid_path: &Path, on_term: &str) -> Self {
+            Self::spawn_owned_by(script, pid_path, on_term, std::process::id())
+        }
+
+        fn spawn_owned_by(script: &Path, pid_path: &Path, on_term: &str, owner: u32) -> Self {
+            use std::os::unix::process::CommandExt;
+
+            std::fs::write(
+                script,
+                format!(
+                    "#!/bin/sh\npid_file=\"$1\"\nowner=\"$4\"\necho $$ > \"$pid_file\"\ntrap '{on_term}' TERM\nwhile kill -0 \"$owner\" 2>/dev/null; do sleep 1; done\n"
+                ),
+            )
+            .expect("script");
+            let child = Command::new("sh")
+                .arg(script)
+                .arg(pid_path)
+                .arg("daemon")
+                .arg("run")
+                .arg(owner.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("daemon-shaped child");
+            Self { child }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DaemonStub {
+        fn drop(&mut self) {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", self.child.id())])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while pid_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        !pid_alive(pid)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_stub_does_not_survive_a_panicking_test() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("daemon.pid");
+        let script = temp.path().join("shipyard-daemon-run-stubborn.sh");
+        let (sender, receiver) = mpsc::channel();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let stub = DaemonStub::spawn(&script, &pid_path, "rm -f \"$pid_file\"");
+            sender.send(stub.child.id()).expect("send pid");
+            panic!("a failing test body");
+        }));
+        assert!(outcome.is_err());
+        let pid = receiver.recv().expect("stub pid");
+        // Control: the stub really started as a daemon look-alike.
+        assert!(pid > 0);
+        assert!(
+            wait_for_exit(pid, Duration::from_secs(3)),
+            "stub {pid} outlived the panicking test"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_stub_exits_when_its_owner_is_gone_without_drop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("daemon.pid");
+        let script = temp.path().join("shipyard-daemon-run-stubborn.sh");
+        let mut owner = Command::new("sleep").arg("1").spawn().expect("owner");
+        let stub =
+            DaemonStub::spawn_owned_by(&script, &pid_path, "rm -f \"$pid_file\"", owner.id());
+        let pid = stub.child.id();
+        // Stand in for a harness timeout: drop never runs.
+        std::mem::forget(stub);
+        assert!(
+            pid_alive(pid),
+            "control: the stub is running while its owner lives"
+        );
+        owner.wait().expect("owner exits");
+        assert!(
+            wait_for_exit(pid, Duration::from_secs(5)),
+            "stub {pid} kept looping after its owner exited"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn stop_running_terminates_pid_when_ipc_is_unavailable() {
@@ -2690,23 +2804,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let daemon_dir = temp.path().join("daemon");
         std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
-        let script = temp.path().join("shipyard-daemon-run.sh");
         let pid_path = daemon_dir.join("daemon.pid");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\npid_file=\"$1\"\necho $$ > \"$pid_file\"\ntrap 'rm -f \"$pid_file\"; exit 0' TERM\nwhile true; do sleep 1; done\n",
-        )
-        .expect("script");
-        let mut child = Command::new("sh")
-            .arg(&script)
-            .arg(&pid_path)
-            .arg("daemon")
-            .arg("run")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("daemon-shaped child");
+        let mut stub = DaemonStub::spawn(
+            &temp.path().join("shipyard-daemon-run.sh"),
+            &pid_path,
+            "rm -f \"$pid_file\"; exit 0",
+        );
+        let child = &mut stub.child;
         let deadline = Instant::now() + Duration::from_secs(1);
         while !pid_path.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -2743,23 +2847,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let daemon_dir = temp.path().join("daemon");
         std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
-        let script = temp.path().join("shipyard-daemon-run-stubborn.sh");
         let pid_path = daemon_dir.join("daemon.pid");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\npid_file=\"$1\"\necho $$ > \"$pid_file\"\ntrap 'rm -f \"$pid_file\"' TERM\nwhile true; do sleep 1; done\n",
-        )
-        .expect("script");
-        let mut child = Command::new("sh")
-            .arg(&script)
-            .arg(&pid_path)
-            .arg("daemon")
-            .arg("run")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("daemon-shaped child");
+        let mut stub = DaemonStub::spawn(
+            &temp.path().join("shipyard-daemon-run-stubborn.sh"),
+            &pid_path,
+            "rm -f \"$pid_file\"",
+        );
+        let child = &mut stub.child;
         let deadline = Instant::now() + Duration::from_secs(1);
         while !pid_path.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
