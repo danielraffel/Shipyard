@@ -898,15 +898,83 @@ pub(crate) enum MetricsCommand {
     Summary(MetricsProjectArgs),
     /// Show slowest successful jobs.
     Slowest(MetricsListArgs),
-    /// Compare before/after timing windows.
+    /// Compare before/after windows per job class.
+    ///
+    /// Verdicts use load-independent proxies by default. Wall-clock duration
+    /// mostly tracks how busy the shared hosts were (1am vs peak), so p50/p90
+    /// are shown only as "context (load-dependent)"; pass `--basis wall-time`
+    /// for the duration-based verdict. Proxies, each with a minimum sample and
+    /// a detection floor (below it the verdict is `insufficient_sample`):
+    ///
+    /// `failure_share` = failed / (success + failed) jobs.
+    /// `cancelled_share` = cancelled / completed jobs.
+    /// `starvation_share` = jobs cancelled before any runner was assigned /
+    /// jobs with known runner assignment.
+    /// `attempts_per_pr` = jobs / distinct pull requests.
+    /// `queue_wait_per_job_ahead_ms` = median of wait / (1 + jobs of the same
+    /// lane queued earlier and still waiting).
+    /// `cache_hit_rate` = jobs whose every reported step hit / jobs reporting.
+    #[command(verbatim_doc_comment)]
     Compare(MetricsCompareArgs),
-    /// Show simple trend rows.
-    Trend(MetricsListArgs),
-    /// Emit agent-oriented drift findings.
+    /// Show recent rows plus each job class's earlier-half vs later-half
+    /// verdict over --since.
+    ///
+    /// Verdicts use load-independent proxies by default. Wall-clock duration
+    /// mostly tracks how busy the shared hosts were (1am vs peak), so p50/p90
+    /// are shown only as "context (load-dependent)"; pass `--basis wall-time`
+    /// for the duration-based verdict. Proxies, each with a minimum sample and
+    /// a detection floor (below it the verdict is `insufficient_sample`):
+    ///
+    /// `failure_share` = failed / (success + failed) jobs.
+    /// `cancelled_share` = cancelled / completed jobs.
+    /// `starvation_share` = jobs cancelled before any runner was assigned /
+    /// jobs with known runner assignment.
+    /// `attempts_per_pr` = jobs / distinct pull requests.
+    /// `queue_wait_per_job_ahead_ms` = median of wait / (1 + jobs of the same
+    /// lane queued earlier and still waiting).
+    /// `cache_hit_rate` = jobs whose every reported step hit / jobs reporting.
+    #[command(verbatim_doc_comment)]
+    Trend(MetricsTrendArgs),
+    /// Emit agent-oriented drift findings: the --since window against the
+    /// equal window before it.
+    ///
+    /// Verdicts use load-independent proxies by default. Wall-clock duration
+    /// mostly tracks how busy the shared hosts were (1am vs peak), so p50/p90
+    /// are shown only as "context (load-dependent)"; pass `--basis wall-time`
+    /// for the duration-based verdict. Proxies, each with a minimum sample and
+    /// a detection floor (below it the verdict is `insufficient_sample`):
+    ///
+    /// `failure_share` = failed / (success + failed) jobs.
+    /// `cancelled_share` = cancelled / completed jobs.
+    /// `starvation_share` = jobs cancelled before any runner was assigned /
+    /// jobs with known runner assignment.
+    /// `attempts_per_pr` = jobs / distinct pull requests.
+    /// `queue_wait_per_job_ahead_ms` = median of wait / (1 + jobs of the same
+    /// lane queued earlier and still waiting).
+    /// `cache_hit_rate` = jobs whose every reported step hit / jobs reporting.
+    #[command(verbatim_doc_comment)]
     Watch(MetricsWatchArgs),
     /// Emit agent-oriented placement advice.
     Advise(MetricsAdviseArgs),
-    /// Emit one compact stewardship scorecard with explicit telemetry gaps.
+    /// Emit one compact stewardship scorecard with explicit telemetry gaps,
+    /// led by load-independent proxies and a verdict against the previous
+    /// equal window.
+    ///
+    /// Verdicts use load-independent proxies by default. Wall-clock duration
+    /// mostly tracks how busy the shared hosts were (1am vs peak), so p50/p90
+    /// are shown only as "context (load-dependent)"; pass `--basis wall-time`
+    /// for the duration-based verdict. Proxies, each with a minimum sample and
+    /// a detection floor (below it the verdict is `insufficient_sample`):
+    ///
+    /// `failure_share` = failed / (success + failed) jobs.
+    /// `cancelled_share` = cancelled / completed jobs.
+    /// `starvation_share` = jobs cancelled before any runner was assigned /
+    /// jobs with known runner assignment.
+    /// `attempts_per_pr` = jobs / distinct pull requests.
+    /// `queue_wait_per_job_ahead_ms` = median of wait / (1 + jobs of the same
+    /// lane queued earlier and still waiting).
+    /// `cache_hit_rate` = jobs whose every reported step hit / jobs reporting.
+    #[command(verbatim_doc_comment)]
     Scorecard(MetricsWatchArgs),
     /// Read-only: required-gate minutes per merged PR, merge-queue batch
     /// fullness, and merge-group receipt reuse, read live from GitHub.
@@ -931,6 +999,34 @@ pub(crate) enum MetricsCommand {
     /// `shipyard-receipt-decision/v1` annotation reported verdict `reuse` for
     /// --receipt-target, divided by all merge-group runs of --workflow. A run
     /// that published no decision counts as not reused and is named as a gap.
+    ///
+    /// Output leads with count-based proxies, because gate minutes mostly
+    /// track host load (1am vs peak) and cannot tell a better change from a
+    /// quieter hour. Minutes stay as "context (load-dependent)". Each proxy
+    /// reports its sample and minimum sample; below it, draw no verdict.
+    ///
+    /// gate runs per merged PR = PR-head runs, merge-group runs, and wasted
+    /// (ran, not successful) gate attempts, each / merged PRs (min 5 PRs).
+    ///
+    /// starvation = gate attempts cancelled with no runner ever assigned /
+    /// gate attempts that ran (min 10).
+    ///
+    /// placement = jobs of any name in the gate-workflow runs that no runner
+    /// picked up and whose exact label set nothing serves, plus the
+    /// placement-correct share per job class. A label set is served when a
+    /// registered repository or organisation runner (online or offline)
+    /// advertises it, or any job with that set got a runner in the window.
+    ///
+    /// queue wait per job ahead = median of (`started_at` - `created_at`) /
+    /// (1 + gate jobs queued earlier and still waiting), in place of raw wait.
+    ///
+    /// merge queue = merge-group gate attempts per merged PR, and ejections
+    /// (runs whose final gate attempt did not succeed) by cause: `gate_failed`,
+    /// `starved`, `cancelled_after_start`.
+    ///
+    /// push cancellations = PR-head runs whose gate was cancelled while a
+    /// newer run on the same branch at another commit had been created. Push
+    /// type is not split (named as a gap).
     ///
     /// Every list is paginated completely; a read whose length disagrees with
     /// the API's `total_count` fails instead of reporting a smaller number.
@@ -1054,6 +1150,17 @@ pub(crate) struct MetricsRecordArgs {
     /// External dedupe key, for example github:run/job/attempt.
     #[arg(long = "external-id")]
     pub(crate) external_id: Option<String>,
+    /// RFC3339 time the provider queued the job. Enables the
+    /// queue-wait-per-job-ahead proxy for this row.
+    #[arg(long = "queued-at")]
+    pub(crate) queued_at: Option<String>,
+    /// Whether a runner was ever assigned (`true`/`false`). A cancelled job
+    /// with `false` counts toward the starvation proxy; omit when unknown.
+    #[arg(long = "runner-assigned", action = ArgAction::Set)]
+    pub(crate) runner_assigned: Option<bool>,
+    /// Runner label the job requested. Repeatable.
+    #[arg(long = "label")]
+    pub(crate) labels: Vec<String>,
     /// RFC3339 start timestamp.
     #[arg(long = "started-at")]
     pub(crate) started_at: Option<String>,
@@ -1122,6 +1229,43 @@ pub(crate) struct MetricsCompareArgs {
     /// Split point in days ago. Older rows are before; newer rows are after.
     #[arg(long = "split-days-ago", default_value_t = 7)]
     pub(crate) split_days_ago: i64,
+    /// Verdict basis: load-independent `proxy` (default) or `wall-time`.
+    #[arg(long, value_enum, default_value_t = MetricsBasis::Proxy)]
+    pub(crate) basis: MetricsBasis,
+}
+
+/// What a metrics verdict is based on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum MetricsBasis {
+    /// Load-independent proxy counts and ratios.
+    Proxy,
+    /// Wall-clock p50/p90 durations (load-dependent).
+    WallTime,
+}
+
+impl From<MetricsBasis> for crate::metrics::proxy::Basis {
+    fn from(value: MetricsBasis) -> Self {
+        match value {
+            MetricsBasis::Proxy => Self::Proxy,
+            MetricsBasis::WallTime => Self::WallTime,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsTrendArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+    /// Maximum rows.
+    #[arg(long, default_value_t = 20)]
+    pub(crate) limit: usize,
+    /// Window split in half for the verdict, for example `14d`.
+    #[arg(long = "since", default_value = "14d")]
+    pub(crate) since: String,
+    /// Verdict basis: load-independent `proxy` (default) or `wall-time`.
+    #[arg(long, value_enum, default_value_t = MetricsBasis::Proxy)]
+    pub(crate) basis: MetricsBasis,
 }
 
 #[derive(Debug, Args)]
@@ -1132,6 +1276,9 @@ pub(crate) struct MetricsWatchArgs {
     /// Recent window, for example `14d`.
     #[arg(long = "since", default_value = "14d")]
     pub(crate) since: String,
+    /// Verdict basis: load-independent `proxy` (default) or `wall-time`.
+    #[arg(long, value_enum, default_value_t = MetricsBasis::Proxy)]
+    pub(crate) basis: MetricsBasis,
 }
 
 #[derive(Debug, Args)]
@@ -2635,6 +2782,75 @@ mod tests {
                 && (timeout - 42.0).abs() < f64::EPSILON
                 && (poll_interval - 0.25).abs() < f64::EPSILON
         ));
+    }
+
+    #[test]
+    fn metrics_verdicts_default_to_proxy_basis_with_wall_time_opt_out() {
+        for sub in ["compare", "watch", "scorecard", "trend"] {
+            let cli = Cli::try_parse_from(["shipyard", "metrics", sub, "--project", "pulp"])
+                .unwrap_or_else(|error| panic!("{sub}: {error}"));
+            let Command::Metrics { command } = cli.command else {
+                panic!("expected metrics command");
+            };
+            let basis = match *command {
+                super::MetricsCommand::Compare(args) => args.basis,
+                super::MetricsCommand::Watch(args) | super::MetricsCommand::Scorecard(args) => {
+                    args.basis
+                }
+                super::MetricsCommand::Trend(args) => args.basis,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(basis, super::MetricsBasis::Proxy, "{sub}");
+            let cli = Cli::try_parse_from([
+                "shipyard",
+                "metrics",
+                sub,
+                "--project",
+                "pulp",
+                "--basis",
+                "wall-time",
+            ])
+            .unwrap_or_else(|error| panic!("{sub}: {error}"));
+            let Command::Metrics { command } = cli.command else {
+                panic!("expected metrics command");
+            };
+            let basis = match *command {
+                super::MetricsCommand::Compare(args) => args.basis,
+                super::MetricsCommand::Watch(args) | super::MetricsCommand::Scorecard(args) => {
+                    args.basis
+                }
+                super::MetricsCommand::Trend(args) => args.basis,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(basis, super::MetricsBasis::WallTime, "{sub}");
+        }
+        let record = Cli::try_parse_from([
+            "shipyard",
+            "metrics",
+            "record",
+            "--project",
+            "pulp",
+            "--job",
+            "macos",
+            "--duration",
+            "1s",
+            "--queued-at",
+            "2026-09-01T00:00:00Z",
+            "--runner-assigned",
+            "false",
+            "--label",
+            "self-hosted",
+        ])
+        .expect("record proxy fields");
+        let Command::Metrics { command } = record.command else {
+            panic!("expected metrics command");
+        };
+        let super::MetricsCommand::Record(args) = *command else {
+            panic!("expected record");
+        };
+        assert_eq!(args.runner_assigned, Some(false));
+        assert_eq!(args.labels, ["self-hosted"]);
+        assert!(args.queued_at.is_some());
     }
 
     #[test]

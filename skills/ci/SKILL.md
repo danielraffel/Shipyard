@@ -35,6 +35,11 @@ that remedy belongs to a different fault that merely shares the 403 status code.
 
 ## Metrics authority
 
+Metrics verdicts (`shipyard metrics compare|watch|trend|scorecard`) default to
+load-independent proxies; wall-clock p50/p90 is load-dependent context. Do not
+call a CI change faster or slower from wall time alone; `--basis wall-time`
+exists for the duration question only.
+
 GitHub job `created_at` is the provider-authoritative queue timestamp. Metrics
 imports may persist queue latency only when both `created_at` and `started_at`
 parse successfully; never infer submit-to-receipt, cache reuse, or model-token
