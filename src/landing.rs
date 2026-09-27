@@ -160,6 +160,10 @@ pub struct LandingReport {
     pub required_checks: placement::PlacementFinding,
     /// Open pull requests grouped by mergeability.
     pub backlog: backlog::BacklogFinding,
+    /// The repository's own verdict on whether the base branch is red.
+    pub base_health: crate::base_health::BaseHealthFinding,
+    /// Present when the base is poisoned and a fix pull request is named.
+    pub base_jump: Option<crate::base_health::JumpAdvice>,
     /// Every surface consulted, in the order it was consulted.
     pub surfaces: Vec<SurfaceRead>,
     /// Instrument problems worth printing alongside the findings.

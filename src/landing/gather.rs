@@ -43,6 +43,8 @@ pub struct GatherOptions<'a> {
     pub run_sample: usize,
     /// Upper bound on per-run job reads.
     pub max_job_reads: usize,
+    /// Workflow that publishes the `base-poison-signal/v1` annotation.
+    pub base_health_workflow: &'a str,
 }
 
 /// Read every surface and assemble the report.
@@ -121,6 +123,21 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         ));
     }
 
+    // A few reads that name a red base and the pull request that fixes it:
+    // the one situation in which "wait for the queue" is the wrong advice.
+    let base_health = {
+        let reader = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+        let calls = std::cell::Cell::new(0u32);
+        let counted = |args: &[String]| {
+            calls.set(calls.get() + 1);
+            reader(args)
+        };
+        let finding = crate::base_health::read_latest(&counted, repo, options.base_health_workflow);
+        api_calls += calls.get();
+        finding
+    };
+    let base_jump = crate::base_health::jump_advice(repo, &base_health, chrono::Utc::now());
+
     LandingReport {
         schema_version: SCHEMA_VERSION,
         repo: repo.to_owned(),
@@ -134,6 +151,8 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
             notes: placement_notes,
         },
         backlog: backlog_finding,
+        base_health,
+        base_jump,
         surfaces,
         warnings,
         api_calls,

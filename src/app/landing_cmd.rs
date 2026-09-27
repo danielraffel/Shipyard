@@ -98,6 +98,9 @@ pub(super) fn landing_command<W: Write>(
             base: &base,
             run_sample: run_sample.unwrap_or(DEFAULT_RUN_SAMPLE).clamp(1, 100),
             max_job_reads: max_job_reads.unwrap_or(DEFAULT_MAX_JOB_READS).clamp(0, 50),
+            base_health_workflow: config
+                .get_str(crate::base_health::WORKFLOW_CONFIG_KEY)
+                .unwrap_or(crate::base_health::DEFAULT_WORKFLOW),
         },
     );
 
