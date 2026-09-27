@@ -910,8 +910,14 @@ fn create_current_branch_pr(
         gh_command,
         branch,
         base,
-        &compose_pr_title(cwd, branch),
-        &compose_pr_body_with_policy(cwd, Some(lane_policy)),
+        &compose_pr_title(cwd, branch, base),
+        &compose_pr_body_with_policy(
+            cwd,
+            branch,
+            base,
+            Some(lane_policy),
+            config.get_str(crate::pr_text::ATTRIBUTION_CONFIG_KEY),
+        ),
     )
     .map_err(|error| CliFailure::new(1, error.to_string()))
 }

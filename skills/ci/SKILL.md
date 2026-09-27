@@ -75,6 +75,18 @@ tree and is all-or-nothing: a conflict aborts and resets the branch to its
 starting commit. Close the folded PRs once the combined one merges. Do not fold
 an urgent fix, an unfinished branch, or one that may need reverting alone.
 
+## `shipyard pr` titles and describes the whole branch
+
+The PR title and body come from the non-merge commits in `origin/<base>..HEAD`,
+oldest first, skipping version-bump and changelog commits. The title is the
+first commit's subject unless a later commit's conventional type ranks higher
+(`feat` over `fix` over the rest). A single commit's body (or its subject)
+becomes the body; several commits become one `### <subject>` section each. The
+body is never empty. Set `pr.body.attribution` (for example the Claude Code
+"Generated with" line) and it closes every composed body once, so the body no
+longer needs patching after `shipyard pr`. Before this, 32 of 47 Pulp PRs it
+opened were edited afterwards, 30 of them to add that line.
+
 ## `shipyard pr` arms auto-merge; you no longer do it by hand
 
 `ship` arms GitHub-native auto-merge (merge method **MERGE**) as soon as it

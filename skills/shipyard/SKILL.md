@@ -1393,6 +1393,16 @@ which must not be unlocked while that child runs. A regression test for a lock
 holds `file.try_clone()` (what a forked child holds) across the release and
 requires the lock to be free.
 
+## PR title and body composition (`src/pr_text.rs`)
+
+`create_current_branch_pr` composes from `git log --reverse --no-merges
+origin/<base>..HEAD`, minus mechanical subjects. The old tip-only walk opened a
+branch of subject-only commits with an EMPTY body and its last subject as the
+title, and a branch that had merged its base at the tip as "Merge
+remote-tracking branch …". When the base ref is unreachable the tip walk is the
+fallback, and it skips `Merge ` subjects. `pr.body.attribution` appends a
+closing line once (not if a commit body already carries it).
+
 ## Tests that spawn a daemon look-alike must reap it on every exit path
 
 A test that spawns an `sh … daemon run` stub (so `process_looks_like_shipyard_daemon`
