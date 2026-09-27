@@ -2564,7 +2564,12 @@ The opposite mistake is guarded too. `scripts/ghapp_queue_arm_guard.py`
 a PR that is already queued (REST `auto_merge` is `null` for every queued PR:
 GitHub consumes it on enqueue), already armed, merged/closed, unreadable
 (including a truncated timeline window that shows no removal and no new head),
-or removed from the queue with no new commit or force-push since. A same-head
+or removed from the queue with no new head since. "New head" is decided by SHA
+(`headRefOid` against the removed head, the second parent of the removal's
+`beforeCommit` merge-group commit), never by commit date or timeline position:
+GitHub sorts a fix committed before an ejection but pushed after it *before* the
+removal. Only a removal that names no head falls back to a push of the current
+head after it, and without one refuses. A same-head
 removal for `failed_checks`/`merge_conflict` is the ALLGREEN cascade (push a
 fix first); any other reason except `invalid_merge_commit` is refused with
 "confirm with whoever dequeued it". Shipyard's own enqueue is recognised

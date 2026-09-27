@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::cloud::GitHubActions;
 use crate::pr_queue_state::{
-    PR_QUEUE_STATE_QUERY, PrQueueReport, PrQueueState, REST_AUTO_MERGE_PREFACE,
+    NewHeadBasis, PR_QUEUE_STATE_QUERY, PrQueueReport, PrQueueState, REST_AUTO_MERGE_PREFACE,
     explain_pr_queue_state, same_head_requeue_allowed, same_head_requeue_cascades,
 };
 use crate::validation_signals::{self, PrValidationSignals};
@@ -178,13 +178,29 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io:
     writeln!(stdout)?;
     writeln!(stdout, "HISTORY")?;
     match &classification.last_ejection {
-        Some(ejection) => writeln!(
-            stdout,
-            "  last ejection            {} at {} (new head since: {})",
-            ejection.reason,
-            ejection.at.as_deref().unwrap_or("UNKNOWN"),
-            if ejection.new_head_since { "yes" } else { "no" }
-        )?,
+        Some(ejection) => {
+            writeln!(
+                stdout,
+                "  last ejection            {} at {} (new head since: {})",
+                ejection.reason,
+                ejection.at.as_deref().unwrap_or("UNKNOWN"),
+                if ejection.new_head_since { "yes" } else { "no" }
+            )?;
+            writeln!(
+                stdout,
+                "  removed head             {} (current head {}; {})",
+                ejection
+                    .removed_head
+                    .as_deref()
+                    .unwrap_or("not named by the removal"),
+                classification.head_oid.as_deref().unwrap_or("UNKNOWN"),
+                match ejection.new_head_basis {
+                    NewHeadBasis::RemovedHeadSha => "compared by SHA",
+                    NewHeadBasis::PushAfterRemoval => "a push of the current head follows it",
+                    NewHeadBasis::NoEvidence => "no evidence of a new head",
+                }
+            )?;
+        }
         None => writeln!(stdout, "  last ejection            none visible")?,
     }
     writeln!(

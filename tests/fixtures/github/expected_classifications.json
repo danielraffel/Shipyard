@@ -87,5 +87,16 @@
     "last_ejection_reason": "failed_checks",
     "last_ejection_new_head_since": false,
     "guard": "refuse"
+  },
+  "pr_real_8912_backdated_fix_after_ejection.json": {
+    "real_truncated": true,
+    "pr": 8912,
+    "class": "ejected",
+    "reason": "failed_checks",
+    "new_head_since_removal": true,
+    "requeues_without_new_head": 0,
+    "last_ejection_reason": "failed_checks",
+    "last_ejection_new_head_since": true,
+    "guard": "allow"
   }
 }

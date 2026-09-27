@@ -1,0 +1,75 @@
+{
+  "_provenance": {
+    "source_pr": "Generous-Corp/pulp#8912",
+    "captured": "2026-09-27T06:00:01Z",
+    "cut_event_created_at": "2026-09-27T05:52:04Z",
+    "note": "Live capture (PR_QUEUE_STATE_QUERY, which selects RemovedFromMergeQueueEvent.beforeCommit with its parents) cut right after the RemovedFromMergeQueueEvent(failed_checks) at 2026-09-27T05:52:04Z, with headRefOid set to c246e05b54069e800a8d1e5f8f4c9d5e841818d7: the head from its push at ~05:52:08Z until the next push at 05:54:18Z. c246e05b was committed at 05:49:11Z, before the ejection, so GitHub sorts its PullRequestCommit item BEFORE the removal even though it was pushed after it. beforeCommit 3dba2caa is the merge-group commit; its second parent f4b97cb8 is the head the queue removed. autoMergeRequest is null because GitHub consumes it on enqueue and it was re-enabled only at 05:54:30Z. The live PR has since advanced past c246e05b, so this state is only reachable by cutting.",
+    "removed_head": "f4b97cb8e4458072e2ff10429c2361ec3b446b5e"
+  },
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "number": 8912,
+        "state": "OPEN",
+        "headRefOid": "c246e05b54069e800a8d1e5f8f4c9d5e841818d7",
+        "isInMergeQueue": false,
+        "mergeQueueEntry": null,
+        "autoMergeRequest": null,
+        "timelineItems": {
+          "pageInfo": {
+            "hasPreviousPage": false
+          },
+          "nodes": [
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "f4b97cb8e4458072e2ff10429c2361ec3b446b5e"
+              }
+            },
+            {
+              "__typename": "AutoMergeEnabledEvent",
+              "createdAt": "2026-09-27T02:15:00Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-27T03:08:05Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "c246e05b54069e800a8d1e5f8f4c9d5e841818d7"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-27T05:52:04Z",
+              "reason": "failed_checks",
+              "actor": {
+                "login": "github-merge-queue"
+              },
+              "beforeCommit": {
+                "oid": "3dba2caa0f804678499185798939bee86c1a5087",
+                "parents": {
+                  "nodes": [
+                    {
+                      "oid": "d5be85fda6fb974387d67bb3d8ec3b6e7e77f110"
+                    },
+                    {
+                      "oid": "f4b97cb8e4458072e2ff10429c2361ec3b446b5e"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
