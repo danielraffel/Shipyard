@@ -495,8 +495,9 @@ set_target_url_repo() {
     return 1
 }
 
-# This is the complete privileged command grammar reviewed against fleet native
-# gh 2.93.0 and 2.96.0. Extend it with a routing regression and security review.
+# This is the complete privileged command grammar, every row checked against
+# the native help of the fleet's gh 2.94.0, 2.100.0 and 2.101.0. Extend it with
+# a routing regression and security review.
 GHAPP_COMMAND_GRAMMAR_VERSION="shipyard-v1"
 GHAPP_COMMAND_GRAMMAR='surface|api|*
 surface|auth|status
@@ -506,6 +507,7 @@ surface|issue|view
 surface|pr|checks
 surface|pr|close
 surface|pr|create
+surface|pr|diff
 surface|pr|list
 surface|pr|merge
 surface|pr|ready
@@ -517,6 +519,7 @@ surface|release|upload
 surface|release|view
 surface|repo|view
 surface|run|cancel
+surface|run|download
 surface|run|list
 surface|run|rerun
 surface|run|view
@@ -542,6 +545,8 @@ value|pr|checks|-i --interval -q --jq --json -t --template
 boolean|pr|close|-d --delete-branch
 value|pr|close|-c --comment
 boolean|pr|create|-d --draft --dry-run -e --editor -f --fill --fill-first --fill-verbose --no-maintainer-edit -w --web
+boolean|pr|diff|--name-only --patch -w --web
+value|pr|diff|--color -e --exclude
 value|pr|create|-a --assignee -B --base -b --body -F --body-file -H --head -l --label -m --milestone -p --project --recover -r --reviewer -T --template -t --title
 boolean|pr|list|-d --draft -w --web
 value|pr|list|--app -a --assignee -A --author -B --base -H --head -q --jq --json -l --label -L --limit -S --search -s --state -t --template
@@ -560,6 +565,7 @@ value|release|view|-q --jq --json -t --template
 boolean|repo|view|-w --web
 value|repo|view|-b --branch -q --jq --json -t --template
 boolean|run|cancel|--force
+value|run|download|-D --dir -n --name -p --pattern
 boolean|run|list|-a --all
 value|run|list|-b --branch -c --commit --created -e --event -q --jq --json -L --limit -s --status -t --template -u --user -w --workflow
 boolean|run|rerun|-d --debug --failed
@@ -738,8 +744,71 @@ case "${1:-}" in
         ;;
 esac
 
+# Native gh withholds a response that contains terminal escape sequences unless
+# `--allow-escape-sequences` is passed, and older gh builds do not know that
+# flag at all. The wrapper owns the choice instead: it accepts the flag, drops
+# it here, and later neutralizes escape sequences in the output it prints.
+ghapp_neutralize_escapes=0
+if [[ "${1:-}" == "api" || ( "${1:-}" == "pr" && "${2:-}" == "diff" ) ]]; then
+    ghapp_filtered_arguments=()
+    for argument in "$@"; do
+        if [[ "$argument" == "--allow-escape-sequences" ]]; then
+            ghapp_neutralize_escapes=1
+        else
+            ghapp_filtered_arguments+=("$argument")
+        fi
+    done
+    set -- ${ghapp_filtered_arguments[@]+"${ghapp_filtered_arguments[@]}"}
+fi
+
+# `pr edit` stays outside the grammar; say exactly what to run instead.
+pr_edit_equivalent() {
+    local number="" edit_repo="" title="" body="" body_file="" base="" unsupported=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -R|--repo) edit_repo="${2:-}"; shift 2 || shift ;;
+            --repo=*) edit_repo="${1#--repo=}"; shift ;;
+            -t|--title) title="${2:-}"; shift 2 || shift ;;
+            --title=*) title="${1#--title=}"; shift ;;
+            -b|--body) body="${2:-}"; shift 2 || shift ;;
+            --body=*) body="${1#--body=}"; shift ;;
+            -F|--body-file) body_file="${2:-}"; shift 2 || shift ;;
+            --body-file=*) body_file="${1#--body-file=}"; shift ;;
+            -B|--base) base="${2:-}"; shift 2 || shift ;;
+            --base=*) base="${1#--base=}"; shift ;;
+            -*) unsupported="$unsupported $1"; shift ;;
+            *) [[ -z "$number" ]] && number="$1"; shift ;;
+        esac
+    done
+    if [[ "$number" =~ /pull/([1-9][0-9]*)/?$ ]]; then
+        number="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "$edit_repo" ]]; then
+        local origin
+        origin="$(git config --get remote.origin.url 2>/dev/null || true)"
+        if [[ "$origin" =~ github\.com[:/]([^/]+)/([^/]+)$ ]]; then
+            edit_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]%.git}"
+        fi
+    fi
+    local command
+    command="ghapp api -X PATCH repos/${edit_repo:-OWNER/REPO}/pulls/${number:-NUMBER}"
+    [[ -n "$title" ]] && command="$command -f title=$(printf '%q' "$title")"
+    [[ -n "$body" ]] && command="$command -f body=$(printf '%q' "$body")"
+    [[ -n "$body_file" ]] && command="$command -F body=@$(printf '%q' "$body_file")"
+    [[ -n "$base" ]] && command="$command -f base=$(printf '%q' "$base")"
+    echo "ghapp: pr edit is outside privileged grammar $GHAPP_COMMAND_GRAMMAR_VERSION; run the REST equivalent:" >&2
+    echo "  $command" >&2
+    if [[ -n "$unsupported" ]]; then
+        echo "ghapp: not translated:$unsupported (see the pulls and issues REST endpoints)" >&2
+    fi
+}
+
 command_name="${1:-}"
 subcommand_name="$(grammar_subcommand "$command_name" "${2:-}")"
+if [[ "$command_name" == "pr" && "${2:-}" == "edit" ]]; then
+    pr_edit_equivalent "${@:3}"
+    exit 1
+fi
 if ! grammar_has surface "$command_name" "$subcommand_name"; then
     echo "ghapp: command is outside privileged grammar $GHAPP_COMMAND_GRAMMAR_VERSION" >&2
     exit 1
@@ -1558,12 +1627,69 @@ if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
     exit 0
 fi
 
-if [[ "${1:-}" != "api" ]]; then
-    exec "$gh_binary" "$@"
+# Output that can carry terminal escape sequences is printed with them
+# neutralized: job logs (`run view --log`, `api …/actions/jobs/N/logs`), diffs,
+# and any `api` call that asked for them. Binary endpoints (run log archives,
+# artifact zips) are never rewritten.
+ghapp_sanitize=0
+case "${1:-} ${2:-}" in
+    "run view")
+        for argument in "${@:3}"; do
+            case "$argument" in
+                --log|--log-failed) ghapp_sanitize=1 ;;
+            esac
+        done
+        ;;
+    "pr diff") ghapp_sanitize=1 ;;
+esac
+if [[ "${1:-}" == "api" ]]; then
+    ghapp_log_path="${api_endpoint:-}"
+    ghapp_log_path="${ghapp_log_path#/}"
+    ghapp_log_path="${ghapp_log_path%%\?*}"
+    if [[ "$ghapp_log_path" =~ ^repos/[^/]+/[^/]+/actions/jobs/[0-9]+/logs$ || \
+          "$ghapp_neutralize_escapes" == 1 ]]; then
+        ghapp_sanitize=1
+    fi
+fi
+if [[ "$ghapp_sanitize" == 1 && ( "${1:-}" == "api" || "${1:-} ${2:-}" == "pr diff" ) ]]; then
+    ghapp_help_words=("$1")
+    [[ "$1" == "pr" ]] && ghapp_help_words+=("diff")
+    if "$gh_binary" "${ghapp_help_words[@]}" --help 2>/dev/null | \
+        /usr/bin/grep -q -- '--allow-escape-sequences'; then
+        if [[ "$1" == "api" ]]; then
+            set -- api --allow-escape-sequences "${@:2}"
+        else
+            set -- pr diff --allow-escape-sequences "${@:3}"
+        fi
+    fi
 fi
 
-if [[ "$ghapp_stderr_open" == 0 ]]; then
-    exec "$gh_binary" "$@"
+ghapp_neutralize_file() {
+    "$python_binary" -I -c '
+import re, sys
+data = open(sys.argv[1], "rb").read()
+data = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", data)
+data = re.sub(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", b"", data)
+data = re.sub(rb"\x1b[ -/]+[0-~]", b"", data)
+data = re.sub(rb"\x1b[@-Z\\-_]", b"", data)
+data = re.sub(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", b"", data)
+sys.stdout.buffer.write(data)
+' "$1"
+}
+
+if [[ "${1:-}" != "api" || "$ghapp_stderr_open" == 0 ]]; then
+    if [[ "$ghapp_sanitize" != 1 ]]; then
+        exec "$gh_binary" "$@"
+    fi
+    ghapp_stdout_capture="$(/usr/bin/mktemp /tmp/shipyard-ghapp-stdout.XXXXXX)"
+    trap '/bin/rm -f -- "$ghapp_stdout_capture"' EXIT
+    set +e
+    "$gh_binary" "$@" >"$ghapp_stdout_capture"
+    ghapp_status=$?
+    set -e
+    trap '' PIPE
+    ghapp_neutralize_file "$ghapp_stdout_capture" || true
+    exit "$ghapp_status"
 fi
 
 # For `api`, keep native gh's stdout, stdin and exit code untouched but capture
@@ -1576,9 +1702,16 @@ fi
 # file is removed on exit. SIGKILL cannot be caught: killing ghapp with -9
 # leaves gh running until it finishes and leaves the capture file behind.
 api_stderr_capture="$(/usr/bin/mktemp /tmp/shipyard-ghapp-api-stderr.XXXXXX)"
+api_stdout_capture=""
+if [[ "$ghapp_sanitize" == 1 ]]; then
+    api_stdout_capture="$(/usr/bin/mktemp /tmp/shipyard-ghapp-stdout.XXXXXX)"
+fi
 api_child=""
 api_cleanup() {
     /bin/rm -f -- "$api_stderr_capture"
+    if [[ -n "$api_stdout_capture" ]]; then
+        /bin/rm -f -- "$api_stdout_capture"
+    fi
 }
 api_forward() {
     if [[ -n "$api_child" ]]; then
@@ -1592,7 +1725,11 @@ trap 'api_forward HUP' HUP
 set +e
 # Explicit stdin: an asynchronous command otherwise reads /dev/null, which
 # would silently empty `--input -` bodies.
-"$gh_binary" "$@" 0<&0 2>"$api_stderr_capture" &
+if [[ -n "$api_stdout_capture" ]]; then
+    "$gh_binary" "$@" 0<&0 >"$api_stdout_capture" 2>"$api_stderr_capture" &
+else
+    "$gh_binary" "$@" 0<&0 2>"$api_stderr_capture" &
+fi
 api_child=$!
 while :; do
     wait "$api_child"
@@ -1607,6 +1744,9 @@ done
 set -e
 # A reader that went away must not turn gh's own exit code into SIGPIPE.
 trap '' PIPE
+if [[ -n "$api_stdout_capture" ]]; then
+    ghapp_neutralize_file "$api_stdout_capture" || true
+fi
 /bin/cat -- "$api_stderr_capture" >&2 2>/dev/null || true
 if [[ "$api_status" != 0 ]]; then
     api_target_path="${api_endpoint:-<unknown endpoint>}"
