@@ -87,6 +87,12 @@ body is never empty. Set `pr.body.attribution` (for example the Claude Code
 longer needs patching after `shipyard pr`. Before this, 32 of 47 Pulp PRs it
 opened were edited afterwards, 30 of them to add that line.
 
+To add a note to a PR body (a proxy reading, a follow-up), use
+`shipyard pr --body-append "<text>"` or `shipyard ship --pr <n> --body-append
+@notes.md` instead of hand-patching with `ghapp api -X PATCH`. The text lands
+once, after the attribution line and before the `<!-- whence` block; the same
+text again is a no-op.
+
 ## `shipyard pr` arms auto-merge; you no longer do it by hand
 
 `ship` arms GitHub-native auto-merge (merge method **MERGE**) as soon as it
