@@ -575,7 +575,18 @@ when the native `--help` lists it, and neutralizes escape sequences in job logs
 `api` call that asked for them. Binary endpoints (`runs/N/logs` archives) are
 never rewritten. `pr diff` and `run download` are read-only and allowed; `pr
 edit` stays outside the grammar and prints its exact `ghapp api -X PATCH …`
-equivalent.
+equivalent. The native-help probe must read the whole help text before
+matching: `gh … --help | grep -q` under `pipefail` fails whenever grep exits
+first and gh dies of SIGPIPE (exit 141), which silently skipped the flag and
+left `api …/logs` refused after release.
+
+`shipyard update` never installs the ghapp wrapper: `~/.local/bin/ghapp` runs
+the generation named by `~/.local/bin/ghapp.shipyard-generation`, and only
+`shipyard runner fleet-update` publishes a generation and moves that selector.
+`src/auth_generation.rs` reads the selected generation's bundled Shipyard
+version; `shipyard update` (outside a fleet rollout) and `shipyard doctor`
+(`ghapp-generation`, advisory) warn when it differs from the CLI and print the
+exact `shipyard runner fleet-update --to vX --all-hosts --apply` to run.
 Also configure explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir`
 on every remote `[host_class.<name>]`. Review `shipyard runner fleet-update
 --to vX.Y.Z --host-class <class>` and then use the same command with `--apply`;

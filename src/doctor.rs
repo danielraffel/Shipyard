@@ -171,6 +171,9 @@ fn collect_report_with_github_auth(
     {
         core.insert("daemon-version".to_owned(), entry);
     }
+    if let Some(entry) = check_ghapp_generation() {
+        core.insert("ghapp-generation".to_owned(), entry);
+    }
     if let Some(entry) = check_daemon_watched_repos(mode, state_dir) {
         core.insert("daemon-repos".to_owned(), entry);
     }
@@ -1061,6 +1064,43 @@ fn check_daemon_version_drift_with(
     Some(daemon_version_entry(
         crate::daemon_version::compare_daemon_version(status, cli_version)?,
     ))
+}
+
+fn check_ghapp_generation() -> Option<DoctorEntry> {
+    let generation = crate::auth_generation::selected_generation(&crate::paths::home_dir())?;
+    let version = crate::auth_generation::generation_version(&generation);
+    Some(ghapp_generation_entry(
+        env!("CARGO_PKG_VERSION"),
+        version.as_deref(),
+    ))
+}
+
+/// Report the live ghapp wrapper generation against this CLI. Advisory: it
+/// does not affect readiness, because an older wrapper still works; it only
+/// lacks the wrapper fixes released since.
+fn ghapp_generation_entry(cli_version: &str, generation_version: Option<&str>) -> DoctorEntry {
+    let Some(generation_version) = generation_version else {
+        return DoctorEntry {
+            ok: false,
+            version: None,
+            detail: Some(
+                "the selected ghapp generation's Shipyard binary did not report a version"
+                    .to_owned(),
+            ),
+            error: None,
+        };
+    };
+    match crate::auth_generation::lag_warning(cli_version, generation_version) {
+        None => DoctorEntry::ok(format!("ghapp wrapper from Shipyard {generation_version}")),
+        Some(warning) => DoctorEntry {
+            ok: false,
+            version: Some(format!(
+                "ghapp wrapper: {generation_version}   cli: {cli_version}"
+            )),
+            detail: Some(warning),
+            error: None,
+        },
+    }
 }
 
 fn check_daemon_watched_repos(mode: RuntimeMode, state_dir: &Path) -> Option<DoctorEntry> {
@@ -1958,6 +1998,19 @@ mod tests {
             Some("danielraffel/Shipyard".to_owned())
         );
         assert_eq!(parse_github_repo_slug("file:///tmp/repo"), None);
+    }
+
+    #[test]
+    fn a_ghapp_wrapper_from_another_release_is_flagged_with_the_install_command() {
+        let entry = super::ghapp_generation_entry("0.224.0", Some("0.217.0"));
+        assert!(!entry.ok);
+        let detail = entry.detail.expect("detail");
+        assert!(
+            detail.contains("shipyard runner fleet-update --to v0.224.0 --all-hosts --apply"),
+            "{detail}"
+        );
+        assert!(super::ghapp_generation_entry("0.224.0", Some("0.224.0")).ok);
+        assert!(!super::ghapp_generation_entry("0.224.0", None).ok);
     }
 
     #[test]
