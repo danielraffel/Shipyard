@@ -1754,6 +1754,7 @@ fn terminate_daemon_pid(pid: u32, timeout: Duration) -> bool {
 
 /// How long a daemon sent `SIGKILL` may take to finish exiting before stop reports
 /// failure.
+#[cfg(unix)]
 const DAEMON_KILL_SETTLE: Duration = Duration::from_secs(10);
 
 #[cfg(not(unix))]
