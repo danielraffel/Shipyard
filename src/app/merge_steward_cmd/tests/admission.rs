@@ -181,30 +181,39 @@ fn typed_admission_output_matches_tartci_flat_contract() {
     assert!(error.len() <= 4 * 1024 + 14 && error.ends_with("...[truncated]"));
 }
 
+/// A fake GitHub whose single managed pull request's head is chosen by
+/// `head_script` on every `pr list` read.
+fn moving_head_actions(temp: &tempfile::TempDir, head_script: &str) -> GitHubActions {
+    fake_gh(
+        temp,
+        &format!(
+            r#"
+case "$*" in
+  "api repos/owner/repo") printf '%s' '{{"full_name":"owner/repo","allow_auto_merge":true}}' ;;
+  *"rules/branches/main --paginate --slurp"*) printf '%s' '[[]]' ;;
+  *"branches/main/protection/required_status_checks"*) printf '%s' '{{"contexts":[],"checks":[]}}' ;;
+  "api graphql "*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  "pr list "*)
+    {head_script}
+    printf '%s' '[{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"HEAD","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"shipyard:managed"}}],"statusCheckRollup":[{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-30T00:00:00Z"}}]}}]' | sed "s/HEAD/$head/" ;;
+  *"actions/runs?status=in_progress"*)
+    printf '%s' '{{"workflow_runs":[{{"id":9001,"workflow_id":77,"run_attempt":1,"name":"Build and Test","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head_branch":"feature","status":"in_progress","event":"pull_request","pull_requests":[{{"number":42}}],"created_at":"2026-08-30T00:00:00Z"}}]}}' ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *"actions/runs/9001/jobs"*)
+    printf '%s' '{{"jobs":[{{"name":"macOS","status":"queued","conclusion":null,"labels":["self-hosted","macOS","ARM64"],"runner_name":null}}]}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#
+        ),
+    )
+    .with_repo_override("owner/repo")
+}
+
 #[test]
 fn final_authority_fence_detects_head_advance_with_old_claimable_work() {
     let temp = tempfile::tempdir().expect("temp");
-    let actions = fake_gh(
-        &temp,
-        r#"
-case "$*" in
-  "api repos/owner/repo") printf '%s' '{"full_name":"owner/repo","allow_auto_merge":true}' ;;
-  *"rules/branches/main --paginate --slurp"*) printf '%s' '[[]]' ;;
-  *"branches/main/protection/required_status_checks"*) printf '%s' '{"contexts":[],"checks":[]}' ;;
-  "api graphql "*) printf '%s' '{"data":{"repository":{"mergeQueue":null}}}' ;;
-  "pr list "*)
-    test -e .pr-authority-seen && head=cccccccccccccccccccccccccccccccccccccccc || { : > .pr-authority-seen; head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; }
-    printf '%s' '[{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"HEAD","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{"name":"shipyard:managed"}],"statusCheckRollup":[{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-30T00:00:00Z"}]}]' | sed "s/HEAD/$head/" ;;
-  *"actions/runs?status=in_progress"*)
-    printf '%s' '{"workflow_runs":[{"id":9001,"workflow_id":77,"run_attempt":1,"name":"Build and Test","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head_branch":"feature","status":"in_progress","event":"pull_request","pull_requests":[{"number":42}],"created_at":"2026-08-30T00:00:00Z"}]}' ;;
-  *"actions/runs?status="*) printf '%s' '{"workflow_runs":[]}' ;;
-  *"actions/runs/9001/jobs"*)
-    printf '%s' '{"jobs":[{"name":"macOS","status":"queued","conclusion":null,"labels":["self-hosted","macOS","ARM64"],"runner_name":null}]}' ;;
-  *) echo "unexpected: $*" >&2; exit 2 ;;
-esac
-"#,
-    )
-    .with_repo_override("owner/repo");
+    // The observation saw head b; the fence's fresh read sees c.
+    let actions = moving_head_actions(&temp, "head=cccccccccccccccccccccccccccccccccccccccc");
     let mut observation = admission_observation();
     observation.runs[0].status = "in_progress".to_owned();
     let labels = ["arm64", "macos", "self-hosted"].map(str::to_owned);
@@ -213,9 +222,66 @@ esac
     assert!(cancellable.is_empty(), "running workflow must not cancel");
     assert_eq!(blocking, vec![9001]);
 
+    let error = fence_admission_authority(&actions, &observation)
+        .expect_err("the fence alone must reject head drift");
+    assert_eq!(error, ADMISSION_AUTHORITY_CHANGED);
+}
+
+#[test]
+fn a_plan_made_under_moved_authority_is_remade_from_fresh_reads() {
+    let temp = tempfile::tempdir().expect("temp");
+    // One push lands during the first inspection; the authority then holds.
+    let actions = moving_head_actions(
+        &temp,
+        "test -e .pr-authority-seen && head=cccccccccccccccccccccccccccccccccccccccc || { : > .pr-authority-seen; head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; }",
+    );
+    let labels = ["arm64", "macos", "self-hosted"].map(str::to_owned);
+    let (observation, _, _) = observe_admission_candidates(&actions, "owner/repo", "main", &labels)
+        .expect("the second attempt observes a still authority");
+    assert_eq!(
+        observation.prs[0].fact.head_sha,
+        "c".repeat(40),
+        "the plan is made on the head that held, not the one that moved"
+    );
+}
+
+#[test]
+fn an_authority_that_never_holds_is_still_an_error() {
+    let temp = tempfile::tempdir().expect("temp");
+    // Every read sees a new head.
+    let actions = moving_head_actions(
+        &temp,
+        "n=$(cat .reads 2>/dev/null || echo 0); n=$((n+1)); echo $n > .reads; head=$(printf '%040d' $n)",
+    );
+    let labels = ["arm64", "macos", "self-hosted"].map(str::to_owned);
     let error = observe_admission_candidates(&actions, "owner/repo", "main", &labels)
-        .expect_err("fenced observation must reject head drift");
-    assert!(error.contains("authority changed"), "{error}");
+        .expect_err("a moving authority never yields a plan");
+    assert!(error.starts_with(ADMISSION_AUTHORITY_CHANGED), "{error}");
+    assert!(error.contains("3 consecutive attempts"), "{error}");
+}
+
+#[test]
+fn only_the_authority_change_is_retried() {
+    let mut calls = 0;
+    let error = with_stable_admission_authority(|| -> Result<(), String> {
+        calls += 1;
+        Err("open PR list failed".to_owned())
+    })
+    .expect_err("other errors return");
+    assert_eq!(error, "open PR list failed");
+    assert_eq!(calls, 1);
+
+    let mut calls = 0;
+    let value = with_stable_admission_authority(|| {
+        calls += 1;
+        if calls < 3 {
+            Err(ADMISSION_AUTHORITY_CHANGED.to_owned())
+        } else {
+            Ok(calls)
+        }
+    })
+    .expect("third attempt holds");
+    assert_eq!(value, 3);
 }
 
 /// The subprocess lock holder exits with one of two codes so that giving up on the parent's

@@ -638,16 +638,52 @@ fn admission_pr_authority(prs: &[ObservedPr]) -> (BTreeMap<u64, String>, BTreeSe
     (current_heads, excluded)
 }
 
+/// Error text when the repository's admission authority moved while its runs
+/// were being inspected.
+const ADMISSION_AUTHORITY_CHANGED: &str =
+    "admission authority changed during active-run inspection";
+
+/// Attempts at a consistent admission plan before the authority change is
+/// reported as an error.
+const ADMISSION_AUTHORITY_ATTEMPTS: usize = 3;
+
+/// Run `plan` until it completes under an admission authority that held still.
+///
+/// The authority is every open pull request's head and managed state plus the
+/// merge queue's group heads, so an unrelated push or queue movement anywhere
+/// in the repository during the seconds an inspection takes invalidates it.
+/// On a busy repository that is routine: every observed failure on the fleet
+/// coincided with a pull-request push or merge-group run in the preceding
+/// minutes. A plan made under an authority that moved is discarded and made
+/// again from fresh reads; only a fence that never holds is an error. Any
+/// other error returns at once.
+fn with_stable_admission_authority<T>(
+    mut plan: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut last = String::new();
+    for _ in 0..ADMISSION_AUTHORITY_ATTEMPTS {
+        match plan() {
+            Err(error) if error == ADMISSION_AUTHORITY_CHANGED => last = error,
+            outcome => return outcome,
+        }
+    }
+    Err(format!(
+        "{last} ({ADMISSION_AUTHORITY_ATTEMPTS} consecutive attempts)"
+    ))
+}
+
 fn observe_admission_candidates(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
     labels: &[String],
 ) -> Result<(RepoObservation, Vec<RunCancellation>, Vec<u64>), String> {
-    let observation = observe_repo(actions, repo, base, false)?;
-    let (candidates, blocking_only) = admission_candidates(actions, &observation, labels)?;
-    fence_admission_authority(actions, &observation)?;
-    Ok((observation, candidates, blocking_only))
+    with_stable_admission_authority(|| {
+        let observation = observe_repo(actions, repo, base, false)?;
+        let (candidates, blocking_only) = admission_candidates(actions, &observation, labels)?;
+        fence_admission_authority(actions, &observation)?;
+        Ok((observation, candidates, blocking_only))
+    })
 }
 
 fn refreshed_admission_authority(
@@ -669,7 +705,7 @@ fn fence_admission_authority(
     if admission_pr_authority(&observation.prs) != admission_pr_authority(&final_prs)
         || observation.merge_group_heads != final_merge_group_heads
     {
-        return Err("admission authority changed during active-run inspection".to_owned());
+        return Err(ADMISSION_AUTHORITY_CHANGED.to_owned());
     }
     Ok(())
 }
@@ -679,14 +715,16 @@ fn revalidate_active_admission_candidates(
     observation: &RepoObservation,
     labels: &[String],
 ) -> Result<(Vec<RunCancellation>, Vec<u64>), String> {
-    let mut refreshed = observation.clone();
-    let (prs, heads) = refreshed_admission_authority(actions, observation)?;
-    refreshed.prs = prs;
-    refreshed.merge_group_heads = heads;
-    refreshed.runs = active_runs(actions, &observation.repo)?;
-    let candidates = admission_candidates(actions, &refreshed, labels)?;
-    fence_admission_authority(actions, &refreshed)?;
-    Ok(candidates)
+    with_stable_admission_authority(|| {
+        let mut refreshed = observation.clone();
+        let (prs, heads) = refreshed_admission_authority(actions, observation)?;
+        refreshed.prs = prs;
+        refreshed.merge_group_heads = heads;
+        refreshed.runs = active_runs(actions, &observation.repo)?;
+        let candidates = admission_candidates(actions, &refreshed, labels)?;
+        fence_admission_authority(actions, &refreshed)?;
+        Ok(candidates)
+    })
 }
 
 fn pending_admission_cancellations(
