@@ -564,6 +564,18 @@ paths named `shipyard` and `ghapp`. Machine-global command auth must be exactly
 wrapper + `token --app-id VALUE --private-key ABS --repo {repo_slug}`. Direct
 `ghapp` resolves only that shape through its sibling Shipyard after grammar and
 repo validation; the wrapper pins API, cache, and resolved repo arguments.
+The `ghapp` grammar (`GHAPP_COMMAND_GRAMMAR`, pinned by the digest in
+`scripts/fixtures/ghapp-native-help-digests.tsv`) is checked row by row against
+native `--help` of every fleet gh version; re-run that check on each host before
+changing either. Native gh 2.100+ withholds a response containing terminal
+escape sequences unless `--allow-escape-sequences` is passed, and 2.94 has no
+such flag, so the wrapper owns it: it accepts and drops the flag, adds it only
+when the native `--help` lists it, and neutralizes escape sequences in job logs
+(`api …/actions/jobs/N/logs`, `run view --log/--log-failed`), `pr diff`, and any
+`api` call that asked for them. Binary endpoints (`runs/N/logs` archives) are
+never rewritten. `pr diff` and `run download` are read-only and allowed; `pr
+edit` stays outside the grammar and prints its exact `ghapp api -X PATCH …`
+equivalent.
 Also configure explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir`
 on every remote `[host_class.<name>]`. Review `shipyard runner fleet-update
 --to vX.Y.Z --host-class <class>` and then use the same command with `--apply`;
