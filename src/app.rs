@@ -976,10 +976,15 @@ fn handle_ship_variant<W: Write>(
         adopt_head,
         foreground,
         no_arm: _,
+        body_append,
     } = command
     else {
         unreachable!("ship variant required")
     };
+    let body_append = body_append
+        .map(|argument| crate::pr_text::resolve_body_append(&argument, cwd))
+        .transpose()
+        .map_err(|error| CliFailure::new(2, error))?;
     handle_ship_command(
         ShipCommandArgs {
             pr,
@@ -1006,6 +1011,7 @@ fn handle_ship_variant<W: Write>(
             invocation: ship_cmd::ShipInvocation::Direct,
             foreground,
             arm_auto_merge,
+            body_append,
         },
         mode,
         cwd,
@@ -1045,10 +1051,16 @@ fn handle_pr_variant<W: Write>(
         no_steward_handoff,
         no_arm: _,
         fold,
+        body_append,
     } = command
     else {
         unreachable!("pr variant required")
     };
+    // Read an `@file` before any side effect, so a bad path fails first.
+    let body_append = body_append
+        .map(|argument| crate::pr_text::resolve_body_append(&argument, cwd))
+        .transpose()
+        .map_err(|error| CliFailure::new(2, error))?;
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     pr_command(
@@ -1077,6 +1089,7 @@ fn handle_pr_variant<W: Write>(
             python_command: None,
             arm_auto_merge,
             fold,
+            body_append,
         },
         &config,
         cwd,

@@ -559,6 +559,11 @@ pub(super) enum Command {
         /// Execute in this terminal for debugging instead of daemon ownership.
         #[arg(long)]
         foreground: bool,
+        /// Add this text to the pull request body once, after the
+        /// attribution line and before the provenance block. `@path` reads
+        /// the text from a file. Re-running with the same text changes nothing.
+        #[arg(long = "body-append", value_name = "TEXT|@FILE")]
+        body_append: Option<String>,
     },
     /// One-shot push-a-PR: skill-sync, version-bump, then ship.
     Pr {
@@ -641,6 +646,11 @@ pub(super) enum Command {
         /// are skipped) onto the current branch. Repeatable; all-or-nothing.
         #[arg(long = "fold", value_name = "BRANCH")]
         fold: Vec<String>,
+        /// Add this text to the pull request body once, after the
+        /// attribution line and before the provenance block. `@path` reads
+        /// the text from a file. Re-running with the same text changes nothing.
+        #[arg(long = "body-append", value_name = "TEXT|@FILE")]
+        body_append: Option<String>,
     },
     /// Cloud runner operations.
     Cloud {
@@ -3134,6 +3144,23 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["shipyard", "dependency", "pulp"]).is_err());
+    }
+
+    #[test]
+    fn body_append_is_accepted_by_pr_and_ship() {
+        let pr = Cli::try_parse_from(["shipyard", "pr", "--body-append", "Proxy: 3 of 9"])
+            .expect("pr parses");
+        assert!(matches!(
+            pr.command,
+            Command::Pr { body_append: Some(ref text), .. } if text == "Proxy: 3 of 9"
+        ));
+        let ship =
+            Cli::try_parse_from(["shipyard", "ship", "--pr", "5", "--body-append", "@note.md"])
+                .expect("ship parses");
+        assert!(matches!(
+            ship.command,
+            Command::Ship { body_append: Some(ref text), .. } if text == "@note.md"
+        ));
     }
 
     #[test]

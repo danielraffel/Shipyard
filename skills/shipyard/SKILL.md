@@ -1414,6 +1414,10 @@ title, and a branch that had merged its base at the tip as "Merge
 remote-tracking branch …". When the base ref is unreachable the tip walk is the
 fallback, and it skips `Merge ` subjects. `pr.body.attribution` appends a
 closing line once (not if a commit body already carries it).
+`--body-append` (on `pr` and `ship`) reads the live body after the provenance
+hook and writes it back once with the text inserted before `<!-- whence `,
+through `pr_text::apply_body_append`; an `@file` is read at dispatch, before
+any side effect, and a failed append is a warning, not a failed ship.
 
 ## Tests that spawn a daemon look-alike must reap it on every exit path
 
