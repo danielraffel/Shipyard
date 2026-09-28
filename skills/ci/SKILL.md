@@ -283,6 +283,7 @@ writer custody before mutation.
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
 | **Self-update: apply latest stable** | `shipyard update` (governed machine-global auth; downloads the tag-matched installer completely before execution) |
 | **Self-update and refresh daemon after verification** | `shipyard update --to vX.Y.Z --refresh-daemon` |
+| **Install a released ghapp wrapper fix** | `shipyard update` does NOT install the ghapp wrapper; only `shipyard runner fleet-update --to vX.Y.Z --all-hosts [--apply]` publishes a new auth generation. `shipyard update` and `shipyard doctor` (`ghapp-generation`) warn with that exact command when the live generation lags the CLI |
 | **Self-update: pin / rollback to a specific tag** | `shipyard update --to v0.53.0` |
 | **Self-update hits "rate limit exceeded"** | v0.68.0+ auto-uses `gh`/`GITHUB_TOKEN` auth; if still rate-limited (60/hr unauth, no `gh` login), run `gh auth login` or export `GITHUB_TOKEN` and retry. Not a missing-`.dmg` error. |
 | **Stuck-runner: kill specific worker (with recovery)** | `shipyard runner kill --pid <pid> --reason "..." [--retrigger]` |

@@ -1654,8 +1654,11 @@ fi
 if [[ "$ghapp_sanitize" == 1 && ( "${1:-}" == "api" || "${1:-} ${2:-}" == "pr diff" ) ]]; then
     ghapp_help_words=("$1")
     [[ "$1" == "pr" ]] && ghapp_help_words+=("diff")
-    if "$gh_binary" "${ghapp_help_words[@]}" --help 2>/dev/null | \
-        /usr/bin/grep -q -- '--allow-escape-sequences'; then
+    # Read the whole help text before matching. Piping it into `grep -q`
+    # under `pipefail` fails whenever grep exits first: native gh then dies of
+    # SIGPIPE and the pipeline reports that, not the match.
+    ghapp_native_help="$("$gh_binary" "${ghapp_help_words[@]}" --help 2>/dev/null || true)"
+    if [[ "$ghapp_native_help" == *--allow-escape-sequences* ]]; then
         if [[ "$1" == "api" ]]; then
             set -- api --allow-escape-sequences "${@:2}"
         else

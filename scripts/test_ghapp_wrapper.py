@@ -605,7 +605,13 @@ class GhappWrapperTests(unittest.TestCase):
         self.gh.write_text(
             "#!/bin/sh\n"
             "[ \"${GH_TOKEN:-}\" = ghs_private_fixture ] || exit 92\n"
-            "case \" $* \" in *\" --help \"*) printf '%s\\n' '" + help_text + "'; exit 0 ;; esac\n"
+            # Like native gh, the help keeps writing after the matching line,
+            # far past a pipe buffer: a reader that stops at the first match
+            # makes this writer die of SIGPIPE.
+            "case \" $* \" in *\" --help \"*) printf '%s\\n' '" + help_text + "';"
+            " i=0; while [ $i -lt 6000 ]; do"
+            " echo \"      --filler-$i   padding padding padding padding padding\";"
+            " i=$((i+1)); done; exit 0 ;; esac\n"
             "printf '%s\\n' \"$*\" > \"$GH_LOG\"\n"
             "printf '\\033[36;1mline\\033[0m\\n\\033]0;title\\007ok\\tx\\033(B\\n'\n"
             f"exit {status}\n",

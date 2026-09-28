@@ -29,6 +29,7 @@ const DEFAULT_RELEASES_API_BASE: &str =
 const UPDATE_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// CLI dispatch entry.
+#[allow(clippy::too_many_lines)] // one linear install transaction; each step is a named helper
 pub(super) fn update_command<W: Write>(
     args: &UpdateArgs,
     mode: RuntimeMode,
@@ -127,6 +128,7 @@ pub(super) fn update_command<W: Write>(
     verify_installed_version(&installed_binary, &target)?;
 
     refresh_guards_after_update(&installed_binary, json, stdout)?;
+    warn_if_ghapp_generation_lags(args.unattended_fleet, &target, json, stdout)?;
 
     if args.refresh_daemon {
         let pid = refresh_daemon_with_installed_binary(mode, runtime_paths, &installed_binary)
@@ -224,7 +226,11 @@ fn refresh_guards_after_update<W: Write>(
             match refresh_guards_with_installed_binary(installed_binary, &guards_dir) {
                 Ok(()) => (
                     "guards_refreshed",
-                    format!("ghapp guards refreshed in {}.", guards_dir.display()),
+                    format!(
+                        "ghapp queue guards refreshed in {}. The ghapp wrapper itself is not \
+                         installed by `shipyard update`.",
+                        guards_dir.display()
+                    ),
                 ),
                 Err(error) => (
                     "guards_refresh_failed",
@@ -242,6 +248,41 @@ fn refresh_guards_after_update<W: Write>(
         );
         render(stdout, json, data, || message.clone())?;
     }
+    Ok(())
+}
+
+/// Say loudly when the live ghapp wrapper generation is from another release.
+///
+/// A fleet rollout runs this update inside the transaction that then publishes
+/// the matching generation, so only a standalone update warns.
+fn warn_if_ghapp_generation_lags<W: Write>(
+    unattended_fleet: bool,
+    target: &str,
+    json: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    if unattended_fleet {
+        return Ok(());
+    }
+    let Some(generation) = crate::auth_generation::selected_generation(&crate::paths::home_dir())
+    else {
+        return Ok(());
+    };
+    let Some(version) = crate::auth_generation::generation_version(&generation) else {
+        return Ok(());
+    };
+    let Some(warning) = crate::auth_generation::lag_warning(target, &version) else {
+        return Ok(());
+    };
+    let mut data = BTreeMap::new();
+    data.insert("event".to_owned(), Value::from("ghapp_generation_lags"));
+    data.insert("ghapp_generation_version".to_owned(), Value::from(version));
+    data.insert(
+        "install_command".to_owned(),
+        Value::from(crate::auth_generation::fleet_update_command(target)),
+    );
+    render(stdout, json, data, || warning.clone())?;
+    let _ = crate::writer_domain_lease::write_stderr(format_args!("{warning}"));
     Ok(())
 }
 
