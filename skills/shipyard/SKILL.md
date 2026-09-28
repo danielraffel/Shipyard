@@ -2411,6 +2411,11 @@ steward status/label writes only; normal observation remains on configured auth.
 
 Read [references/merge-steward.md](references/merge-steward.md) before operating
 the steward, changing its policy, or recovering a pending cancellation.
+Runner admission's `admission authority changed during active-run inspection`
+is usually unrelated repository activity (a push or merge-group run elsewhere)
+landing mid-inspection; the plan is remade from fresh reads up to three times
+before it is reported. See "Runner admission" in that reference before touching
+the fence.
 
 ### Pulp disposable Linux health lease
 
