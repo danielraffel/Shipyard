@@ -1744,10 +1744,18 @@ fn terminate_daemon_pid(pid: u32, timeout: Duration) -> bool {
     }
     if pid_alive(pid) {
         let _ = signal_pid(pid, "-KILL");
-        let _ = wait_until_pid_stops(pid, Duration::from_secs(1));
+        // SIGKILL cannot be ignored, but on a loaded host the kernel can take
+        // well over a second to finish tearing the process down, and until
+        // then it is not yet a zombie. The poll returns as soon as it is gone.
+        let _ = wait_until_pid_stops(pid, DAEMON_KILL_SETTLE);
     }
     !pid_alive(pid)
 }
+
+/// How long a daemon sent `SIGKILL` may take to finish exiting before stop reports
+/// failure.
+#[cfg(unix)]
+const DAEMON_KILL_SETTLE: Duration = Duration::from_secs(10);
 
 #[cfg(not(unix))]
 fn terminate_daemon_pid(_pid: u32, _timeout: Duration) -> bool {
@@ -2854,16 +2862,25 @@ mod tests {
             "rm -f \"$pid_file\"",
         );
         let child = &mut stub.child;
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !pid_path.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(pid_path.exists(), "pid file was not written");
+        // Every wait below polls a condition. The deadlines are generous
+        // because a loaded CI host can take seconds to start a shell or to
+        // finish tearing a killed one down; a healthy run passes in well
+        // under a second either way.
+        assert!(
+            wait_until(Duration::from_secs(15), || pid_path.exists()),
+            "pid file was not written"
+        );
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                process_looks_like_shipyard_daemon(child.id())
+            }),
+            "daemon identity was not observable"
+        );
 
         assert!(stop_running(temp.path()));
 
         let status = child
-            .wait_timeout(Duration::from_secs(2))
+            .wait_timeout(Duration::from_secs(15))
             .expect("wait")
             .or_else(|| {
                 let _ = child.kill();
@@ -2873,6 +2890,19 @@ mod tests {
         assert!(!status.success(), "stubborn daemon should require SIGKILL");
         assert!(!pid_alive(child.id()));
         assert!(!pid_path.exists());
+    }
+
+    /// Poll `condition` until it holds or `deadline` elapses.
+    #[cfg(unix)]
+    fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + deadline;
+        while Instant::now() < until {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        condition()
     }
 
     #[cfg(unix)]

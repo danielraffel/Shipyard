@@ -1440,6 +1440,11 @@ under init forever; seven accumulated on one CI host before this was caught.
 `DaemonStub` leads its own process group and kills it on drop (panics), and
 the stub exits once the test process is gone (a harness timeout skips drop).
 Check a host with `ps -Ao pid,ppid,command | grep shipyard-daemon-run`.
+Every wait in those tests polls a condition with a generous deadline (15 s):
+a loaded CI host can take seconds to start the stub shell or to finish tearing
+a killed one down. `terminate_daemon_pid` likewise polls up to
+`DAEMON_KILL_SETTLE` (10 s) after `SIGKILL` before reporting failure, because a
+killed process is not a zombie until the kernel finishes its exit.
 
 ## cfg-gated tests: gate the helpers identically
 
