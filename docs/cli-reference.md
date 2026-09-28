@@ -145,6 +145,8 @@ shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-
 shipyard pr --no-arm                                # do NOT arm native auto-merge on the PR
                                                     # title/body come from origin/<base>..HEAD non-merge commits (never empty);
                                                     #   [pr.body] attribution = "..." closes every composed body once
+shipyard pr --body-append "Proxy: ..."              # add text to the PR body once, after the attribution line and before the
+shipyard ship --pr 123 --body-append @notes.md      #   whence block; @path reads a file; repeating the same text changes nothing
                                                     # `shipyard pr` first prints a fold suggestion (advisory) when open PRs from the
                                                     #   same whence session, opened in the last 6 h, share a directory family
                                                     #   (first two path components; pr.fold.noise_paths excluded) with this branch
