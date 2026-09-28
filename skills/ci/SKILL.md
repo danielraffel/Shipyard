@@ -21,6 +21,15 @@ host whose tailnet name changed kept a registration under the old name; every
 delivery failed to connect, and because nothing was subscribed to the feed its
 failure produced no symptom at all.
 
+The repo list it prints is the same kind of claim. `--repo` on `daemon
+start` / `run` / `refresh` sets only what the daemon ADVERTISES from its status
+endpoint; it is not the set of repositories the daemon acts on. Status therefore
+says `advertises=` rather than `repos=`, and start/refresh say "advertising N
+repo(s)" rather than "registering" — a slug that resolves to nothing can sit in
+that line indefinitely without costing any capacity. Do not infer from it that a
+host is or is not doing work for a repo; read the runner path
+(`shipyard runner fleet-status`) for that.
+
 Before calling a daemon healthy, compare the two sides:
 
 ```sh
