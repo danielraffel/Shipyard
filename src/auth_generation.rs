@@ -96,6 +96,7 @@ pub fn lag_warning(cli_version: &str, generation_version: &str) -> Option<String
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     const ID: &str = "75f602aa0abfc8e8cccca632702bfadf1e1cb1dcd64883ac46c083299b686c28";
 
     #[cfg(unix)]
