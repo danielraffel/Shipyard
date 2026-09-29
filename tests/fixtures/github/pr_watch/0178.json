@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/108815320312/logs"
+ ],
+ "response": "2026-09-28T06:58:10.4121420Z The following tests FAILED:\n2026-09-28T06:58:10.4121710Z \t21292 - pulp-browser-capture-node-integration (Failed)    browser-capture node parser-import\n2026-09-28T06:58:10.5129980Z Errors while running CTest\n2026-09-28T06:58:11.9419330Z ##[error]Process completed with exit code 8.\n"
+}

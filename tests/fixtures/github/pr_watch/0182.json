@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/108850901233/logs"
+ ],
+ "response": "2026-09-28T11:58:40.7405360Z The following tests FAILED:\n2026-09-28T11:58:40.7405620Z \t21277 - cmake-forge-catalog-install (Failed)              cmake host sdk\n2026-09-28T11:58:40.7405960Z \t21338 - pulp-gpu-host-mapped-pointer-probe (Failed)\n2026-09-28T11:58:40.7406360Z \t21339 - pulp-gpu-host-mapped-pointer-oracle-negative-control (Failed)\n2026-09-28T11:58:40.7406790Z \t21340 - pulp-gpu-host-mapped-pointer-feature-gate-negative-control (Failed)\n2026-09-28T11:58:40.7407250Z \t21341 - pulp-gpu-host-mapped-pointer-write-buffer-counter-negative-control (Failed)\n2026-09-28T11:58:40.7407740Z \t21342 - pulp-gpu-host-mapped-pointer-copy-buffer-counter-negative-control (Failed)\n2026-09-28T11:58:40.7408220Z \t21343 - pulp-gpu-host-mapped-pointer-map-async-counter-negative-control (Failed)\n2026-09-28T11:58:40.8614310Z Errors while running CTest\n2026-09-28T11:58:43.0220720Z ##[error]Process completed with exit code 8.\n"
+}

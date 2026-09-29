@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/108627902349/logs"
+ ],
+ "response": "2026-09-27T13:29:19.5362518Z ##[error]Process completed with exit code 1.\n"
+}

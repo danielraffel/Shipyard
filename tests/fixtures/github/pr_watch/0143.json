@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/compare/main...5c8579ab1bfa724acedea12c7c9e9541fb475eba",
+  "--jq",
+  "{status: .status, merge_base: .merge_base_commit.sha}"
+ ],
+ "response": "{\"merge_base\":\"ed878f2a5cce38111f29df53b39b639aa72c84af\",\"status\":\"diverged\"}\n"
+}

@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/108826931857/logs"
+ ],
+ "response": "2026-09-28T07:59:04.7791280Z The following tests FAILED:\n2026-09-28T07:59:04.7791600Z \t21127 - cmake-ios-auv3-control-shipping (Failed)          auv3 cmake control ios\n2026-09-28T07:59:04.9032050Z Errors while running CTest\n2026-09-28T07:59:06.9801510Z ##[error]Process completed with exit code 8.\n"
+}

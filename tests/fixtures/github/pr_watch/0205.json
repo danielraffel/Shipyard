@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/109270042911/logs"
+ ],
+ "response": "2026-09-29T05:38:22.6744390Z The following tests FAILED:\n2026-09-29T05:38:22.6744560Z \t21428 - cmake-forge-catalog-install (Failed)              cmake host sdk\n2026-09-29T05:38:22.6744740Z Errors while running CTest\n2026-09-29T05:38:45.3272350Z ##[error]cmake-forge-catalog-install failed on this pull request head; it is a test this diff reaches, and it would fail the merge group too\n2026-09-29T05:38:45.3371990Z ##[error]Process completed with exit code 1.\n2026-09-29T05:38:46.3312820Z ##[error]Process completed with exit code 2.\n"
+}
