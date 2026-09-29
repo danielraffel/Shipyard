@@ -648,7 +648,12 @@ is held, by a running Sandbox canary or another install, refuses before any
 change with exit 75 and `SHIPYARD_FLEET_HOST_BUSY` on stderr; the rollout stops
 there as **deferred** (verdict `deferred`, exit 75), nothing is rolled back,
 and reconcile withdraws the attempt it recorded so the next tick retries
-without waiting out `--retry-hours`. Install its launchd agent on the controller only with
+without waiting out `--retry-hours`. When the controller's own install guard
+is held (a Sandbox canary on the controller), the tick defers before recording
+anything. The attempt ledger (`fleet-reconcile/attempts.json`) is production
+persistence in the protected state tree: a tick that changes nothing does not
+rewrite it, and every real write holds the shared sandbox writer-domain lease,
+so it waits for (and then defers to, exit 75) an exclusive Sandbox audit. Install its launchd agent on the controller only with
 `scripts/install_fleet_reconcile.sh`. That script is a dry run by default;
 `--install` first rehearses the reconcile under the agent's exact environment
 and refuses to load it on failure.
