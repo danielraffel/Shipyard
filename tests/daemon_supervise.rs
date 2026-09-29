@@ -66,10 +66,6 @@ fn supervise_forwards_sigterm_to_the_daemon_and_exits_with_its_code() {
         supervisor.id().to_string(),
         "the supervisor stays resident as the daemon's parent"
     );
-    assert!(
-        temp.path().join("state/daemon/daemon.log").is_file(),
-        "the daemon writes the same log a direct spawn does"
-    );
 
     let status = Command::new("kill")
         .args(["-TERM", &supervisor.id().to_string()])
@@ -114,5 +110,79 @@ fn supervise_contract_is_printed_for_the_installer() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "shipyard-daemon-supervise-v1"
+    );
+}
+
+#[test]
+fn in_place_step_prepares_the_daemon_and_execs_it_under_the_same_pid() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = temp.path().join("state");
+    let report = temp.path().join("report");
+    let script = temp.path().join("fake-daemon");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n{{ echo \"pid=$$\"; echo \"tmpdir=$TMPDIR\"; printf 'arg=%s\\n' \"$@\"; }} > \"{report}\"\necho from-daemon-stdout\n",
+            report = report.display()
+        ),
+    )
+    .expect("script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let mut child = Command::new(binary())
+        .arg("--mode")
+        .arg("shipyard")
+        .arg("--global-dir")
+        .arg(temp.path().join("global"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["daemon", "supervise", "--in-place", "--exec"])
+        .arg(&script)
+        .args(["--repo", "o/b", "--repo", "o/a"])
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn in-place step");
+    let status = child.wait().expect("wait");
+    assert!(
+        status.success(),
+        "the exec'd daemon's exit status is the step's"
+    );
+
+    let report = fs::read_to_string(&report).expect("fake daemon ran");
+    assert!(
+        report.contains(&format!("pid={}\n", child.id())),
+        "exec keeps the pid, so the launcher's privacy responsibility carries over: {report}"
+    );
+    assert!(
+        report.contains(&format!("tmpdir={}\n", state.join("daemon/tmp").display())),
+        "the release's own spawn code set the private TMPDIR: {report}"
+    );
+    let arguments: Vec<&str> = report
+        .lines()
+        .filter_map(|line| line.strip_prefix("arg="))
+        .collect();
+    let global = temp.path().join("global");
+    assert_eq!(
+        arguments,
+        [
+            "--mode",
+            "shipyard",
+            "--global-dir",
+            &global.to_string_lossy(),
+            "--state-dir",
+            &state.to_string_lossy(),
+            "daemon",
+            "run",
+            "--repo",
+            "o/a",
+            "--repo",
+            "o/b",
+        ],
+        "the daemon argv is exactly a direct spawn's, which fleet-update evidence compares"
+    );
+    let log = fs::read_to_string(state.join("daemon/daemon.log")).expect("daemon log");
+    assert!(
+        log.contains("from-daemon-stdout"),
+        "stdout goes to daemon.log"
     );
 }

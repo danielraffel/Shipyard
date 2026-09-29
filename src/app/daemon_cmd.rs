@@ -190,6 +190,7 @@ pub(super) fn daemon_command<W: Write>(
             exec,
             repos,
             contract,
+            in_place,
         } => daemon_supervise(
             mode,
             global_dir_override,
@@ -198,6 +199,7 @@ pub(super) fn daemon_command<W: Write>(
             exec,
             repos,
             contract,
+            in_place,
             stdout,
         ),
         DaemonCommand::LauncherProbe { paths, result } => daemon_launcher_probe(&paths, &result),
@@ -214,6 +216,7 @@ fn daemon_supervise<W: Write>(
     exec: Option<PathBuf>,
     repos: Vec<String>,
     contract: bool,
+    in_place: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     if contract {
@@ -230,6 +233,10 @@ fn daemon_supervise<W: Write>(
         state_dir: runtime_paths.state_dir.clone(),
         repos,
     };
+    if in_place {
+        let error = crate::daemon_launcher::exec_daemon_in_place(&request);
+        return Err(CliFailure::new(1, error.to_string()));
+    }
     let code = crate::daemon_launcher::supervise(&request)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
@@ -245,6 +252,7 @@ fn daemon_supervise<W: Write>(
     _exec: Option<PathBuf>,
     _repos: Vec<String>,
     _contract: bool,
+    _in_place: bool,
     _stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     Err(CliFailure::new(

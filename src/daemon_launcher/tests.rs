@@ -421,12 +421,14 @@ fn supervise_passes_signals_through_to_the_daemon_child() {
     let state = temp.path().join("state");
     let pid_file = temp.path().join("child.pid");
     let marker = temp.path().join("terminated");
+    let args_file = temp.path().join("args");
     let script = temp.path().join("fake-daemon");
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\ntrap 'echo term > \"{marker}\"; exit 7' TERM\necho $$ > \"{pid}\"\nwhile :; do sleep 0.05; done\n",
+            "#!/bin/sh\ntrap 'echo term > \"{marker}\"; exit 7' TERM\nprintf '%s\\n' \"$@\" > \"{args}\"\necho $$ > \"{pid}\"\nwhile :; do sleep 0.05; done\n",
             marker = marker.display(),
+            args = args_file.display(),
             pid = pid_file.display()
         ),
     )
@@ -438,8 +440,9 @@ fn supervise_passes_signals_through_to_the_daemon_child() {
         global_dir_override: Some(temp.path().join("global")),
         state_dir_override: Some(state.clone()),
         state_dir: state,
-        repos: Vec::new(),
+        repos: vec!["o/r".to_owned()],
     };
+    let expected_arguments = strings(&in_place_arguments(&request));
 
     let (sender, receiver) = std::sync::mpsc::channel();
     thread::spawn(move || {
@@ -472,6 +475,15 @@ fn supervise_passes_signals_through_to_the_daemon_child() {
     };
     let code = outcome.expect("supervise");
     assert_eq!(code, 7, "the daemon's exit code is the supervisor's");
+    // The resident launcher hands the start to the release binary's in-place
+    // step, so spawn invariants come from the release, not the launcher copy.
+    let recorded: Vec<String> = fs::read_to_string(&args_file)
+        .expect("arguments")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(recorded, expected_arguments);
+    assert!(recorded.contains(&"--in-place".to_owned()));
     assert_eq!(
         fs::read_to_string(&marker).expect("trap ran").trim(),
         "term"

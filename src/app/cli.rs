@@ -1976,6 +1976,10 @@ pub(super) enum DaemonCommand {
         /// Print the supervise argument contract and exit.
         #[arg(long)]
         contract: bool,
+        /// Prepare the daemon with this binary's spawn code and replace this
+        /// process with `daemon run`. Used by the resident launcher.
+        #[arg(long = "in-place")]
+        in_place: bool,
     },
     /// Read each path and record the outcome. Run from launchd by
     /// `daemon launcher install`; not for interactive use.

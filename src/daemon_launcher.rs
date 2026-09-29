@@ -14,8 +14,11 @@
 //! one stable path, started by a per-user launchd agent, and it stays resident
 //! as the parent of the daemon (`shipyard daemon supervise`). The daemon and
 //! everything it spawns are therefore attributed to the launcher path, whose
-//! consent survives every update. `exec` would not work: the responsible
-//! process is a pid, and after `exec` that pid's path is the new binary.
+//! consent survives every update. The launcher itself must not `exec` the
+//! release: the responsible process is a pid, and after `exec` that pid's path
+//! is the new binary. Its child does exec: the release binary prepares the
+//! daemon with its own spawn code and replaces itself with `daemon run`, so the
+//! launcher copy freezes only a minimal hand-off, never the spawn invariants.
 //!
 //! The launcher is opt-in per host. `shipyard daemon launcher install` copies
 //! the binary, runs one consent probe from launchd so the one-time prompt
@@ -358,16 +361,69 @@ pub fn start_via_launchd_with(
     launchctl.kickstart(&launcher.label)
 }
 
+/// Arguments for the in-place step: `request.binary`, run by the resident
+/// launcher, prepares the daemon with *its own* (current release) spawn code
+/// and then replaces itself with `daemon run`. Only this minimal hand-off is
+/// frozen in the launcher copy; log rotation, PATH, TMPDIR, and the stdio
+/// fence always come from the release being started.
+#[must_use]
+pub fn in_place_arguments(request: &SpawnRequest) -> Vec<OsString> {
+    let mut arguments: Vec<OsString> = vec!["--mode".into(), request.mode.as_str().into()];
+    if let Some(global_dir) = &request.global_dir_override {
+        arguments.push("--global-dir".into());
+        arguments.push(global_dir.into());
+    }
+    if let Some(state_dir) = &request.state_dir_override {
+        arguments.push("--state-dir".into());
+        arguments.push(state_dir.into());
+    }
+    arguments.extend([
+        "daemon".into(),
+        "supervise".into(),
+        "--in-place".into(),
+        "--exec".into(),
+    ]);
+    arguments.push(request.binary.clone().into());
+    for repo in crate::daemon_runtime::normalize_repos(request.repos.clone()) {
+        arguments.push("--repo".into());
+        arguments.push(repo.into());
+    }
+    arguments
+}
+
+/// Replace this process with the daemon for `request`: the in-place step.
+/// The pid, and therefore the privacy responsibility inherited from the
+/// resident launcher, carries over to `daemon run`. Returns only on failure.
+#[must_use]
+pub fn exec_daemon_in_place(request: &SpawnRequest) -> DaemonSpawnFailedError {
+    use std::os::unix::process::CommandExt;
+
+    let (daemon_dir, temp_dir) = match prepare_daemon_dirs(&request.state_dir) {
+        Ok(dirs) => dirs,
+        Err(error) => return error,
+    };
+    match prepare_daemon_child(request, &daemon_dir, &temp_dir) {
+        Ok(mut command) => {
+            DaemonSpawnFailedError(format!("failed to exec daemon: {}", command.exec()))
+        }
+        Err(error) => error,
+    }
+}
+
 /// Run the daemon for `request` as a child and wait for it. This is the
 /// launchd agent's program: staying resident keeps this stable executable
-/// the daemon's responsible process. SIGTERM, SIGINT, and SIGHUP are
-/// forwarded to the daemon as SIGTERM. Returns the exit code to use.
+/// the daemon's responsible process. The child is `request.binary` in its
+/// in-place step (see [`in_place_arguments`]). SIGTERM, SIGINT, and SIGHUP
+/// are forwarded to the daemon as SIGTERM. Returns the exit code to use.
 pub fn supervise(request: &SpawnRequest) -> Result<i32, DaemonSpawnFailedError> {
     use nix::sys::signal::{SigSet, Signal, kill};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
 
-    let (daemon_dir, temp_dir) = prepare_daemon_dirs(&request.state_dir)?;
-    let mut command = prepare_daemon_child(request, &daemon_dir, &temp_dir)?;
+    let mut command = Command::new(&request.binary);
+    command
+        .args(in_place_arguments(request))
+        .env("PATH", crate::paths::unattended_tool_path())
+        .stdin(Stdio::null());
     command.process_group(0);
     // std passes the parent's signal mask to the child, so spawn before
     // blocking anything: a daemon born with SIGTERM blocked could never be

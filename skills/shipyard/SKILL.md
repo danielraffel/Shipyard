@@ -3434,8 +3434,11 @@ macOS, opt-in per host). Facts it rests on, all measured with
 So the launcher is a copy of the signed binary at
 `~/.local/libexec/shipyard/shipyard-daemon-launcher`, run by a per-state-root
 LaunchAgent as `daemon supervise --exec <binary>`, staying the daemon's parent.
-The daemon itself still runs the generation binary with the same argv as a
-direct spawn, so fleet-update launch evidence is unchanged. `install` runs one
+The launcher only spawns `<release> daemon supervise --in-place`, which runs
+the release's own daemon preparation and then `exec`s `daemon run` under the
+same pid. So the daemon runs the generation binary with the direct-spawn argv
+(fleet-update launch evidence is unchanged), and spawn invariants are never
+frozen in the launcher copy, which only an operator reinstall replaces. `install` runs one
 consent probe from launchd (the one-time prompt appears while an operator is
 there) and only then writes `<state>/daemon/launcher.json`; `spawn_detached`
 uses launchd only when that record's SHA-256 still matches the launcher file,
