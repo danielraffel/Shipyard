@@ -99,6 +99,21 @@ bounded to one retry per head and off unless the repository opts in: the worst
 a wrong allowance costs is the one batch the retry joins, and the second
 ejection is refused with the ordinary "push a fix first".
 
+### Relationship to a declared attributor
+
+The guard asks the repository's [batch attributor](#batch-attribution) first.
+When it certifies, that allow stands and the environment reader is not
+consulted. When it does not certify, including a verdict of
+`implicates_head: true`, the environment reader still runs. That is deliberate:
+Pulp's attributor reads chain ancestry (the batch's parent passed, so this head
+is the culprit), which compares outcomes rather than causes. A parent that
+passed on a host that could reach PyPI says nothing about a batch that died on
+a host that could not, and `--certify` returns `implicates_head: true` for both
+`pulp#8678`'s pip-relay ejection and `pulp#8911`'s cargo-DNS ejection. The
+environment verdict rests on the failing step's own output instead, which a
+content-level implication (the head owns a failing ctest case) cannot share:
+such a step failed on a test, not on a network signature at its failure.
+
 An allowed re-enqueue is not silent: the guard prints
 `queue-arm-guard: note: ...` with the verdict and each step's matching log line.
 A refused one appends `Environment re-enqueue refused: <reason>` to the
