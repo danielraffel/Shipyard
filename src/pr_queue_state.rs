@@ -155,6 +155,10 @@ pub struct Ejection {
     pub new_head_basis: NewHeadBasis,
     /// Timeline index of the removal item.
     pub timeline_index: usize,
+    /// `beforeCommit.oid`: the merge-group commit the queue built and ran the
+    /// required checks on, when the removal names one (`merge_conflict`
+    /// removals do not).
+    pub merge_group_commit: Option<String>,
 }
 
 /// How "a new head since the ejection" was decided.
@@ -183,6 +187,15 @@ pub struct PrQueueReport {
     pub last_ejection: Option<Ejection>,
     /// Re-adds of an unchanged head after a failing removal.
     pub requeues_without_new_head: u32,
+    /// `failed_checks` / `merge_conflict` removals of the *current* head over
+    /// the visible timeline: the removals a same-head re-enqueue would repeat.
+    /// A `manual` or `invalid_merge_commit` removal says nothing against the
+    /// head and is not counted. A removal that names its head counts when that head is
+    /// `headRefOid`; one that names none counts when it follows the first
+    /// timeline item that pushed `headRefOid` (or when no such item is
+    /// visible), so an unattributable removal is charged to the current head
+    /// rather than assumed away.
+    pub ejections_of_current_head: u32,
     /// `Some(true)` when the timeline window reached the start of history,
     /// `Some(false)` when older items were cut off, `None` when unmeasured.
     pub timeline_complete: Option<bool>,
@@ -221,6 +234,7 @@ fn unknown(detail: impl Into<String>, facts: Vec<QueueFact>) -> PrQueueReport {
         },
         last_ejection: None,
         requeues_without_new_head: 0,
+        ejections_of_current_head: 0,
         timeline_complete: None,
         facts,
     }
@@ -478,8 +492,22 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                 reason,
                 at,
                 timeline_index: index,
+                merge_group_commit: nodes[index]
+                    .pointer("/beforeCommit/oid")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
             }
         });
+    let ejections_of_current_head =
+        count_ejections_of_head(nodes, &removed_heads, head_oid.as_deref());
+    fact(
+        &mut facts,
+        "ejections_of_current_head",
+        Value::from(ejections_of_current_head),
+        "timelineItems.nodes[] (failed_checks/merge_conflict RemovedFromMergeQueueEvent whose \
+         removed head is headRefOid; a removal naming no head counts once it follows the first \
+         push of headRefOid)",
+    );
     if let Some(ejection) = &last_ejection {
         fact(
             &mut facts,
@@ -559,6 +587,7 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                 },
                 last_ejection,
                 requeues_without_new_head: requeues,
+                ejections_of_current_head,
                 timeline_complete,
                 facts,
             };
@@ -570,9 +599,43 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
         state,
         last_ejection,
         requeues_without_new_head: requeues,
+        ejections_of_current_head,
         timeline_complete,
         facts,
     }
+}
+
+/// `failed_checks` / `merge_conflict` removals of `head`; see
+/// [`PrQueueReport::ejections_of_current_head`].
+fn count_ejections_of_head(
+    nodes: &[Value],
+    removed_heads: &[Option<String>],
+    head: Option<&str>,
+) -> u32 {
+    let Some(head) = head else {
+        return 0;
+    };
+    let first_push = nodes
+        .iter()
+        .position(|node| pushed_oid(node).is_some_and(|oid| oid.eq_ignore_ascii_case(head)));
+    let mut count = 0_u32;
+    for (index, node) in nodes.iter().enumerate() {
+        if node.get("__typename").and_then(Value::as_str) != Some("RemovedFromMergeQueueEvent") {
+            continue;
+        }
+        let reason = node.get("reason").and_then(Value::as_str).unwrap_or("");
+        if !same_head_requeue_cascades(reason) {
+            continue;
+        }
+        let charged = match removed_heads.get(index).and_then(Option::as_deref) {
+            Some(removed) => removed.eq_ignore_ascii_case(head),
+            None => first_push.is_none_or(|first| index > first),
+        };
+        if charged {
+            count += 1;
+        }
+    }
+    count
 }
 
 impl PrQueueState {
@@ -730,6 +793,23 @@ mod tests {
                     "{name}"
                 );
             }
+            if let Some(count) = want.get("ejections_of_current_head") {
+                assert_eq!(
+                    Some(u64::from(report.ejections_of_current_head)),
+                    count.as_u64(),
+                    "{name}"
+                );
+            }
+            if let Some(commit) = want.get("merge_group_commit") {
+                assert_eq!(
+                    report
+                        .last_ejection
+                        .as_ref()
+                        .and_then(|ejection| ejection.merge_group_commit.as_deref()),
+                    commit.as_str(),
+                    "{name}"
+                );
+            }
             match &report.state {
                 PrQueueState::Queued {
                     entry_state,
@@ -760,7 +840,7 @@ mod tests {
         }
         // Control: the loop must actually have visited the whole corpus,
         // including the real ejected captures and the labelled synthetic ones.
-        assert_eq!(checked, 11);
+        assert_eq!(checked, 15);
     }
 
     #[test]

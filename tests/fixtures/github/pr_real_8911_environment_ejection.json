@@ -1,0 +1,62 @@
+{
+  "_provenance": {
+    "source_pr": "Generous-Corp/pulp#8911",
+    "captured": "2026-09-29 with PR_QUEUE_STATE_QUERY",
+    "cut_after_timeline_index": 2,
+    "cut_event_created_at": "2026-09-27T11:39:01Z",
+    "note": "Cut right after the failed_checks removal of head 7e72e98a: merge group a8efc64d failed its required macos Build step because cargo could not resolve index.crates.io. Live, a new head 7fa56d26 was pushed 2 minutes later."
+  },
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "number": 8911,
+        "state": "OPEN",
+        "headRefOid": "7e72e98ab839fb0e3e14651204830ac51f758bd9",
+        "isInMergeQueue": false,
+        "mergeQueueEntry": null,
+        "autoMergeRequest": null,
+        "timelineItems": {
+          "pageInfo": {
+            "hasPreviousPage": false
+          },
+          "nodes": [
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "7e72e98ab839fb0e3e14651204830ac51f758bd9"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-27T11:14:06Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-27T11:39:01Z",
+              "reason": "failed_checks",
+              "actor": {
+                "login": "github-merge-queue"
+              },
+              "beforeCommit": {
+                "oid": "a8efc64d8240e5584f082b02330869ce2e25733b",
+                "parents": {
+                  "nodes": [
+                    {
+                      "oid": "78c0e24ffd6c6405bc730e20c2948a277347cbb8"
+                    },
+                    {
+                      "oid": "7e72e98ab839fb0e3e14651204830ac51f758bd9"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

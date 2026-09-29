@@ -1,0 +1,425 @@
+{
+ "_provenance": {
+  "source": "GET repos/Generous-Corp/pulp/actions/jobs/109284816079 and .../logs, captured 2026-09-29",
+  "job_id": 109284816079,
+  "job_name": "macos",
+  "runner_name": "m5studio-pulp-gate-01-42746-29",
+  "run_id": 36531070257,
+  "log_lines_kept": [
+   [
+    887,
+    1010
+   ],
+   [
+    15463,
+    15605
+   ],
+   [
+    57740,
+    57831
+   ]
+  ],
+  "log_lines_total": 57946,
+  "ejected": "Generous-Corp/pulp#8933 at 2026-09-29T06:56:30Z (merge-group commit 72515ddd)",
+  "what": "PR-culprit: ctest pulp-gpu-host-mapped-pointer-probe failed, exit 8. Lines 887-1010 are an earlier, passing step whose SCRIPT ECHO quotes \"Tunnel connection failed: 403 Forbidden\"; its output does not."
+ },
+ "job": {
+  "id": 109284816079,
+  "name": "macos",
+  "steps": [
+   {
+    "number": 1,
+    "name": "Set up job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:30:52Z",
+    "completed_at": "2026-09-29T06:30:54Z"
+   },
+   {
+    "number": 2,
+    "name": "Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:30:54Z",
+    "completed_at": "2026-09-29T06:31:10Z"
+   },
+   {
+    "number": 3,
+    "name": "Fetch protected capability base",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:31:10Z",
+    "completed_at": "2026-09-29T06:31:10Z"
+   },
+   {
+    "number": 4,
+    "name": "Hydrate bounded GPU provenance commits",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:31:10Z",
+    "completed_at": "2026-09-29T06:31:31Z"
+   },
+   {
+    "number": 5,
+    "name": "Set up Namespace macOS cache",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:31:31Z",
+    "completed_at": "2026-09-29T06:31:31Z"
+   },
+   {
+    "number": 6,
+    "name": "Install Linux dependencies",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:31:31Z",
+    "completed_at": "2026-09-29T06:31:31Z"
+   },
+   {
+    "number": 7,
+    "name": "Namespace cache (brew + ccache + Pulp FetchContent)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:31:31Z",
+    "completed_at": "2026-09-29T06:31:31Z"
+   },
+   {
+    "number": 8,
+    "name": "brew update (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:31:31Z",
+    "completed_at": "2026-09-29T06:31:40Z"
+   },
+   {
+    "number": 9,
+    "name": "Install ccache (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:31:40Z",
+    "completed_at": "2026-09-29T06:32:03Z"
+   },
+   {
+    "number": 10,
+    "name": "Install ccache (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:32:03Z",
+    "completed_at": "2026-09-29T06:32:03Z"
+   },
+   {
+    "number": 11,
+    "name": "Restore FetchContent sources (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:32:03Z",
+    "completed_at": "2026-09-29T06:32:03Z"
+   },
+   {
+    "number": 12,
+    "name": "Restore ccache (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:32:03Z",
+    "completed_at": "2026-09-29T06:32:03Z"
+   },
+   {
+    "number": 13,
+    "name": "Bootstrap repository dependencies",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:32:03Z",
+    "completed_at": "2026-09-29T06:32:22Z"
+   },
+   {
+    "number": 14,
+    "name": "Install pinned Chrome for browser-source fidelity (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:32:22Z",
+    "completed_at": "2026-09-29T06:32:28Z"
+   },
+   {
+    "number": 15,
+    "name": "Save FetchContent sources (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:32:28Z",
+    "completed_at": "2026-09-29T06:32:28Z"
+   },
+   {
+    "number": 16,
+    "name": "Fetch prebuilt Skia (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:32:28Z",
+    "completed_at": "2026-09-29T06:32:28Z"
+   },
+   {
+    "number": 17,
+    "name": "Intel canary — lint + x86_64 GPU-off compile",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:32:28Z",
+    "completed_at": "2026-09-29T06:32:28Z"
+   },
+   {
+    "number": 18,
+    "name": "Ccache effective config (proof of override)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:32:28Z",
+    "completed_at": "2026-09-29T06:32:28Z"
+   },
+   {
+    "number": 19,
+    "name": "Install materialized runtime Node test dependencies (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:32:28Z",
+    "completed_at": "2026-09-29T06:32:28Z"
+   },
+   {
+    "number": 20,
+    "name": "Configure",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:32:28Z",
+    "completed_at": "2026-09-29T06:33:21Z"
+   },
+   {
+    "number": 21,
+    "name": "Install visual-analysis Python dependencies",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:33:21Z",
+    "completed_at": "2026-09-29T06:33:27Z"
+   },
+   {
+    "number": 22,
+    "name": "Build",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:33:27Z",
+    "completed_at": "2026-09-29T06:38:42Z"
+   },
+   {
+    "number": 23,
+    "name": "Record iOS gate digest (shadow)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:38:42Z",
+    "completed_at": "2026-09-29T06:38:44Z"
+   },
+   {
+    "number": 24,
+    "name": "Ccache stats",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:38:44Z",
+    "completed_at": "2026-09-29T06:38:44Z"
+   },
+   {
+    "number": 25,
+    "name": "Save ccache (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:38:44Z",
+    "completed_at": "2026-09-29T06:38:44Z"
+   },
+   {
+    "number": 26,
+    "name": "Decide pull-request test suite",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:38:44Z",
+    "completed_at": "2026-09-29T06:38:44Z"
+   },
+   {
+    "number": 27,
+    "name": "Test fast deterministic tier (pull request head)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:38:44Z",
+    "completed_at": "2026-09-29T06:38:44Z"
+   },
+   {
+    "number": 28,
+    "name": "Test what this pull request reaches (pull request head)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:38:44Z",
+    "completed_at": "2026-09-29T06:38:44Z"
+   },
+   {
+    "number": 29,
+    "name": "Test (non-Windows)",
+    "status": "completed",
+    "conclusion": "failure",
+    "started_at": "2026-09-29T06:38:44Z",
+    "completed_at": "2026-09-29T06:43:29Z"
+   },
+   {
+    "number": 30,
+    "name": "Merge-group shadow instruments",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:43:29Z",
+    "completed_at": "2026-09-29T06:45:49Z"
+   },
+   {
+    "number": 31,
+    "name": "Announce a failed PR-head full suite (non-gating)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:49Z",
+    "completed_at": "2026-09-29T06:45:49Z"
+   },
+   {
+    "number": 32,
+    "name": "Observe ctest non-runs (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:45:49Z",
+    "completed_at": "2026-09-29T06:45:51Z"
+   },
+   {
+    "number": 33,
+    "name": "Observe GPU adapter contract (self-hosted macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:51Z",
+    "completed_at": "2026-09-29T06:45:51Z"
+   },
+   {
+    "number": 34,
+    "name": "Test installed SDK capability contract (affected changes)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:51Z",
+    "completed_at": "2026-09-29T06:45:51Z"
+   },
+   {
+    "number": 35,
+    "name": "Install and publish exact GPU-audio SDK (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:51Z",
+    "completed_at": "2026-09-29T06:45:51Z"
+   },
+   {
+    "number": 36,
+    "name": "Upload exact GPU-audio SDK (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:51Z",
+    "completed_at": "2026-09-29T06:45:51Z"
+   },
+   {
+    "number": 37,
+    "name": "Test A2T structural receipt issuer",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:51Z",
+    "completed_at": "2026-09-29T06:45:51Z"
+   },
+   {
+    "number": 38,
+    "name": "Verify A2T structural receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:51Z",
+    "completed_at": "2026-09-29T06:45:51Z"
+   },
+   {
+    "number": 39,
+    "name": "Publish A2T structural verification",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:51Z",
+    "completed_at": "2026-09-29T06:45:51Z"
+   },
+   {
+    "number": 40,
+    "name": "Surface ctest failures (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:45:51Z",
+    "completed_at": "2026-09-29T06:45:51Z"
+   },
+   {
+    "number": 41,
+    "name": "Upload ctest logs and JUnit report",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:45:51Z",
+    "completed_at": "2026-09-29T06:45:53Z"
+   },
+   {
+    "number": 42,
+    "name": "Test (Windows — UTF-8 code page wrapped)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:53Z",
+    "completed_at": "2026-09-29T06:45:53Z"
+   },
+   {
+    "number": 43,
+    "name": "Issue exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:53Z",
+    "completed_at": "2026-09-29T06:45:53Z"
+   },
+   {
+    "number": 44,
+    "name": "Publish exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:53Z",
+    "completed_at": "2026-09-29T06:45:53Z"
+   },
+   {
+    "number": 45,
+    "name": "Upload plugin bundles (macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:53Z",
+    "completed_at": "2026-09-29T06:45:53Z"
+   },
+   {
+    "number": 46,
+    "name": "Upload plugin bundles (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:53Z",
+    "completed_at": "2026-09-29T06:45:53Z"
+   },
+   {
+    "number": 47,
+    "name": "Upload plugin bundles (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-29T06:45:53Z",
+    "completed_at": "2026-09-29T06:45:53Z"
+   },
+   {
+    "number": 94,
+    "name": "Post Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:45:53Z",
+    "completed_at": "2026-09-29T06:45:54Z"
+   },
+   {
+    "number": 95,
+    "name": "Complete job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-29T06:45:54Z",
+    "completed_at": "2026-09-29T06:45:54Z"
+   }
+  ]
+ },
+ "log": "2026-09-29T06:33:21.9306730Z ##[group]Run set -euo pipefail\n2026-09-29T06:33:21.9306920Z set -euo pipefail\n2026-09-29T06:33:21.9307080Z # Seven ctest registrations import numpy, Pillow or scikit-image and\n2026-09-29T06:33:21.9312770Z # skip themselves when one of those is missing. A ctest SKIP reads\n2026-09-29T06:33:21.9313070Z # exactly like a PASS, so a lane that quietly lost a wheel reports\n2026-09-29T06:33:21.9313270Z # green without running the checks it was built for. Installing the\n2026-09-29T06:33:21.9313460Z # declared set on every platform that runs ctest keeps the\n2026-09-29T06:33:21.9313660Z # non-skippable visual-python-deps-present check answerable\n2026-09-29T06:33:21.9313850Z # everywhere, rather than red on the platforms the install misses.\n2026-09-29T06:33:21.9314000Z #\n2026-09-29T06:33:21.9314130Z # The interpreter must be the one CMake configured, not whatever this\n2026-09-29T06:33:21.9314360Z # shell resolves: ctest invokes Python3_EXECUTABLE, so installing into\n2026-09-29T06:33:21.9314570Z # a different interpreter would leave every one of those tests\n2026-09-29T06:33:21.9314850Z # skipping while this step reported success.\n2026-09-29T06:33:21.9314970Z #\n2026-09-29T06:33:21.9315100Z # find_package(Python3 COMPONENTS Interpreter) records the interpreter\n2026-09-29T06:33:21.9315310Z # it resolved in the INTERNAL cache entry _Python3_EXECUTABLE and\n2026-09-29T06:33:21.9315500Z # leaves the public Python3_EXECUTABLE a normal variable, so the\n2026-09-29T06:33:21.9315710Z # public name reaches the cache only when a configure passes\n2026-09-29T06:33:21.9315910Z # -DPython3_EXECUTABLE. The local Shipyard lane passes it; this\n2026-09-29T06:33:21.9316120Z # workflow does not. Read the internal entry first — it holds the\n2026-09-29T06:33:21.9316320Z # value the public variable expanded to when test/cmake registered\n2026-09-29T06:33:21.9316540Z # these tests, which is exactly what ctest launches — and fall back to\n2026-09-29T06:33:21.9316750Z # the public entry for a configure that pinned one explicitly.\n2026-09-29T06:33:21.9316920Z cache=\"$PULP_BUILD_DIR/CMakeCache.txt\"\n2026-09-29T06:33:21.9317080Z py=\"$(sed -n 's/^_Python3_EXECUTABLE:[^=]*=//p' \"$cache\" | head -1)\"\n2026-09-29T06:33:21.9317240Z if [ -z \"$py\" ]; then\n2026-09-29T06:33:21.9317380Z   py=\"$(sed -n 's/^Python3_EXECUTABLE:[^=]*=//p' \"$cache\" | head -1)\"\n2026-09-29T06:33:21.9317520Z fi\n2026-09-29T06:33:21.9317600Z if [ -z \"$py\" ]; then\n2026-09-29T06:33:21.9317730Z   echo \"No Python3 interpreter is recorded in $cache\" >&2\n2026-09-29T06:33:21.9317910Z   echo \"(looked for _Python3_EXECUTABLE, then Python3_EXECUTABLE).\" >&2\n2026-09-29T06:33:21.9318150Z   echo \"The visual-analysis tests resolve their interpreter from that cache entry,\" >&2\n2026-09-29T06:33:21.9318410Z   echo \"so installing into any other interpreter would leave them skipping.\" >&2\n2026-09-29T06:33:21.9318580Z   exit 1\n2026-09-29T06:33:21.9318660Z fi\n2026-09-29T06:33:21.9318790Z # Satisfied already? Then do not touch the network. `--upgrade` asks the\n2026-09-29T06:33:21.9319000Z # index for a newer wheel even when the requirement is met, so it turned\n2026-09-29T06:33:21.9319230Z # a reachable-PyPI assumption into a precondition of the REQUIRED macos\n2026-09-29T06:33:21.9319430Z # gate: on 2026-09-23 an ephemeral VM whose egress refused CONNECT to\n2026-09-29T06:33:21.9319640Z # pypi.org (\"Tunnel connection failed: 403 Forbidden\") failed this step\n2026-09-29T06:33:21.9319840Z # at 21 of 41 and killed every merge_group batch that landed on that\n2026-09-29T06:33:21.9320190Z # host, while the same batch passed on a host whose VMs could reach it.\n2026-09-29T06:33:21.9320400Z # A required gate must not depend on a third-party service being\n2026-09-29T06:33:21.9320600Z # reachable, and the declared set is a floor, not a latest-wins pin.\n2026-09-29T06:33:21.9320780Z if \"$py\" -m pip install --dry-run --no-index --quiet \\\n2026-09-29T06:33:21.9320960Z      -r tools/motion/visual/requirements.txt >/dev/null 2>&1; then\n2026-09-29T06:33:21.9321180Z   echo \"visual-analysis dependencies already satisfied in $py; no index fetch\"\n2026-09-29T06:33:21.9321350Z else\n2026-09-29T06:33:21.9321480Z   # Install the hash-pinned resolution, not the ranges: the same bytes\n2026-09-29T06:33:21.9321690Z   # on every run, so a new upstream release cannot change a gate verdict\n2026-09-29T06:33:21.9321880Z   # and a tampered or truncated download fails the hash check.\n2026-09-29T06:33:21.9322040Z   lock=tools/motion/visual/requirements.lock\n2026-09-29T06:33:21.9322210Z   echo \"Installing the pinned visual-analysis set ($lock) into $py\"\n2026-09-29T06:33:21.9322420Z   # PEP 668 hosts (Homebrew, Debian) refuse a plain --user install and\n2026-09-29T06:33:21.9322660Z   # mark themselves with EXTERNALLY-MANAGED beside the stdlib. Ask once\n2026-09-29T06:33:21.9322860Z   # rather than retrying every install, so a network failure is not\n2026-09-29T06:33:21.9323020Z   # paid twice.\n2026-09-29T06:33:21.9323110Z   pep668=()\n2026-09-29T06:33:21.9323390Z   if \"$py\" -c 'import os, sys, sysconfig; sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path(\"stdlib\"), \"EXTERNALLY-MANAGED\")) else 1)'; then\n2026-09-29T06:33:21.9323670Z     pep668=(--break-system-packages)\n2026-09-29T06:33:21.9323790Z   fi\n2026-09-29T06:33:21.9323860Z   pip_user() {\n2026-09-29T06:33:21.9324030Z     \"$py\" -m pip install ${pep668[@]+\"${pep668[@]}\"} --user --require-hashes -r \"$lock\" \"$@\"\n2026-09-29T06:33:21.9324210Z   }\n2026-09-29T06:33:21.9324350Z   # A tartci gate guest may carry a read-only host wheelhouse. Installing\n2026-09-29T06:33:21.9324560Z   # from it needs no network at all, so the egress relay and PyPI stop\n2026-09-29T06:33:21.9324780Z   # being able to fail the required gate. It is an accelerator, not an\n2026-09-29T06:33:21.9324980Z   # authority: the hashes above still decide what is acceptable.\n2026-09-29T06:33:21.9325160Z   wheelhouse=\"${TARTCI_PIP_WHEELHOUSE:-}\"\n2026-09-29T06:33:21.9325320Z   if [ -n \"$wheelhouse\" ] && [ -d \"$wheelhouse\" ]; then\n2026-09-29T06:33:21.9325500Z     if pip_user --no-index --find-links \"$wheelhouse\"; then\n2026-09-29T06:33:21.9325680Z       echo \"Installed from the host wheelhouse $wheelhouse\"\n2026-09-29T06:33:21.9325830Z       exit 0\n2026-09-29T06:33:21.9325910Z     fi\n2026-09-29T06:33:21.9326100Z     echo \"::warning::host wheelhouse $wheelhouse could not satisfy $lock; falling back to the package index\"\n2026-09-29T06:33:21.9326300Z   fi\n2026-09-29T06:33:21.9326430Z   # pip already retries a dropped connection; these attempts cover a\n2026-09-29T06:33:21.9326620Z   # refusal or an outage that outlasts pip's own short backoff.\n2026-09-29T06:33:21.9326790Z   delay=\"${PULP_PIP_RETRY_DELAY_SECS:-20}\"\n2026-09-29T06:33:21.9326920Z   for attempt in 1 2 3; do\n2026-09-29T06:33:21.9327040Z     if pip_user; then\n2026-09-29T06:33:21.9327140Z       exit 0\n2026-09-29T06:33:21.9327220Z     fi\n2026-09-29T06:33:21.9327310Z     if [ \"$attempt\" -lt 3 ]; then\n2026-09-29T06:33:21.9327510Z       echo \"::warning::pip install attempt $attempt failed; retrying in $(( delay * attempt ))s\"\n2026-09-29T06:33:21.9327720Z       sleep $(( delay * attempt ))\n2026-09-29T06:33:21.9327830Z     fi\n2026-09-29T06:33:21.9327970Z   done\n2026-09-29T06:33:21.9328150Z   echo \"::error::could not install $lock after 3 attempts; the visual-analysis ctests would skip\" >&2\n2026-09-29T06:33:21.9328360Z   exit 1\n2026-09-29T06:33:21.9328440Z fi\n2026-09-29T06:33:21.9328560Z # Whether the set was pre-provisioned or installed here, the\n2026-09-29T06:33:21.9328760Z # non-skippable `visual-python-deps-present` ctest is what proves it.\n2026-09-29T06:33:21.9328960Z # This step only has to stop being a network-dependent tripwire.\n2026-09-29T06:33:21.9351490Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-29T06:33:21.9351640Z env:\n2026-09-29T06:33:21.9351730Z   PULP_BUILD_DIR: build-macos\n2026-09-29T06:33:21.9351840Z   CCACHE_COMPILERCHECK: content\n2026-09-29T06:33:21.9352110Z   CCACHE_NODEPEND: true\n2026-09-29T06:33:21.9352310Z   CCACHE_SLOPPINESS: time_macros\n2026-09-29T06:33:21.9352660Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-29T06:33:21.9353010Z ##[endgroup]\n2026-09-29T06:33:22.6196190Z Installing the pinned visual-analysis set (tools/motion/visual/requirements.lock) into /opt/homebrew/Frameworks/Python.framework/Versions/3.14/bin/python3.14\n2026-09-29T06:33:22.8167700Z Looking in links: /Volumes/My Shared Files/pip-wheelhouse\n2026-09-29T06:33:22.8198830Z Processing /Volumes/My Shared Files/pip-wheelhouse/imageio-2.37.4-py3-none-any.whl (from -r tools/motion/visual/requirements.lock (line 18))\n2026-09-29T06:33:22.8264220Z Processing /Volumes/My Shared Files/pip-wheelhouse/lazy_loader-0.6-py3-none-any.whl (from -r tools/motion/visual/requirements.lock (line 22))\n2026-09-29T06:33:22.8280540Z Processing /Volumes/My Shared Files/pip-wheelhouse/networkx-3.7-py3-none-any.whl (from -r tools/motion/visual/requirements.lock (line 26))\n2026-09-29T06:33:22.8335860Z Processing /Volumes/My Shared Files/pip-wheelhouse/numpy-2.5.3-cp314-cp314-macosx_14_0_arm64.whl (from -r tools/motion/visual/requirements.lock (line 30))\n2026-09-29T06:33:22.8425930Z Processing /Volumes/My Shared Files/pip-wheelhouse/packaging-26.3-py3-none-any.whl (from -r tools/motion/visual/requirements.lock (line 98))\n2026-09-29T06:33:22.8446520Z Processing /Volumes/My Shared Files/pip-wheelhouse/pillow-12.3.0-cp314-cp314-macosx_11_0_arm64.whl (from -r tools/motion/visual/requirements.lock (line 102))\n2026-09-29T06:33:22.8518600Z Processing /Volumes/My Shared Files/pip-wheelhouse/scikit_image-0.26.0-cp314-cp314-macosx_11_0_arm64.whl (from -r tools/motion/visual/requirements.lock (line 191))\n2026-09-29T06:33:22.8673710Z Processing /Volumes/My Shared Files/pip-wheelhouse/scipy-1.18.1-cp314-cp314-macosx_14_0_arm64.whl (from -r tools/motion/visual/requirements.lock (line 242))\n2026-09-29T06:33:22.8932050Z Processing /Volumes/My Shared Files/pip-wheelhouse/tifffile-2026.9.20-py3-none-any.whl (from -r tools/motion/visual/requirements.lock (line 305))\n2026-09-29T06:33:22.9273660Z Installing collected packages: pillow, packaging, numpy, networkx, tifffile, scipy, lazy-loader, imageio, scikit-image\n2026-09-29T06:33:23.9704850Z   WARNING: The scripts f2py and numpy-config are installed in '/Users/admin/Library/Python/3.14/bin' which is not on PATH.\n2026-09-29T06:33:23.9705320Z   Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.\n2026-09-29T06:33:24.8204490Z   WARNING: The scripts lsm2bin, tiff2fsspec, tiffcomment and tifffile are installed in '/Users/admin/Library/Python/3.14/bin' which is not on PATH.\n2026-09-29T06:33:24.8205070Z   Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.\n2026-09-29T06:33:26.9311980Z   WARNING: The scripts imageio_download_bin and imageio_remove_bin are installed in '/Users/admin/Library/Python/3.14/bin' which is not on PATH.\n2026-09-29T06:33:26.9313080Z   Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.\n2026-09-29T06:33:27.1197300Z \n2026-09-29T06:33:27.1213780Z Successfully installed imageio-2.37.4 lazy-loader-0.6 networkx-3.7 numpy-2.5.3 packaging-26.3 pillow-12.3.0 scikit-image-0.26.0 scipy-1.18.1 tifffile-2026.9.20\n2026-09-29T06:33:27.1705020Z Installed from the host wheelhouse /Volumes/My Shared Files/pip-wheelhouse\n2026-09-29T06:38:44.5446440Z ##[group]Run set -euo pipefail\n2026-09-29T06:38:44.5447180Z set -euo pipefail\n2026-09-29T06:38:44.5447360Z # Both event-dependent ctest decisions come from one tested module so\n2026-09-29T06:38:44.5447560Z # the lanes that share them cannot drift apart:\n2026-09-29T06:38:44.5447700Z #\n2026-09-29T06:38:44.5447850Z #   label_exclude — `performance|bench|quality-lab` are RELATIVE-timing\n2026-09-29T06:38:44.5448100Z #     tests (e.g. heritage-performance's \"Representative chain stays\n2026-09-29T06:38:44.5448330Z #     within the shipping CPU budget\", a ratio ≤ 2.0×1.05 against an\n2026-09-29T06:38:44.5448540Z #     in-run baseline). They survive STEADY load but not the load\n2026-09-29T06:38:44.5448750Z #     VARIANCE of a Studio running 2 concurrent build VMs, so they are\n2026-09-29T06:38:44.5448970Z #     excluded wherever the suite runs on the shared self-hosted Macs\n2026-09-29T06:38:44.5449210Z #     and retained on the steady GitHub-hosted Linux/Windows runners.\n2026-09-29T06:38:44.5449430Z #     `slow` is excluded from the gate lanes for the same reason the\n2026-09-29T06:38:44.5449640Z #     queue stays landable: the required macos gate rides a serialized\n2026-09-29T06:38:44.5449820Z #     runner.\n2026-09-29T06:38:44.5449920Z #\n2026-09-29T06:38:44.5450170Z #   stop_on_failure — a merge_group batch that has one failing test is\n2026-09-29T06:38:44.5450400Z #     already unlandable, and a queue multiplies the cost of proving it\n2026-09-29T06:38:44.5450640Z #     twice over: every batch inherits a broken base and every re-formed\n2026-09-29T06:38:44.5450890Z #     batch pays again. The queue therefore stops at the first failure,\n2026-09-29T06:38:44.5451140Z #     while the push lane runs the suite to completion because it is the\n2026-09-29T06:38:44.5451420Z #     only place the full macOS suite ever runs against main.\n2026-09-29T06:38:44.5451580Z #\n2026-09-29T06:38:44.5451750Z # ctest applies --stop-on-failure only after --repeat until-pass has\n2026-09-29T06:38:44.5452000Z # exhausted its retries, so a single flake still self-heals.\n2026-09-29T06:38:44.5452200Z gate_args=\"$(python3 tools/ci/ctest_gate_args.py \\\n2026-09-29T06:38:44.5452420Z   --event-name \"$GITHUB_EVENT_NAME\" --runner-os \"$RUNNER_OS\")\"\n2026-09-29T06:38:44.5452620Z eval \"$gate_args\"\n2026-09-29T06:38:44.5453630Z : \"${label_exclude:?ctest gate arguments did not resolve}\"\n2026-09-29T06:38:44.5454000Z # Expanded unquoted on the ctest line below, where an empty value must\n2026-09-29T06:38:44.5454280Z # disappear rather than become an empty argument. Default it so the\n2026-09-29T06:38:44.5454550Z # bare expansion is safe under `set -u`.\n2026-09-29T06:38:44.5454760Z stop_on_failure=\"${stop_on_failure:-}\"\n2026-09-29T06:38:44.5455030Z echo \"ctest gate args: label_exclude=$label_exclude stop_on_failure=${stop_on_failure:-<none>}\"\n2026-09-29T06:38:44.5455320Z exclude='STFT|VisualizationBridge|Clipboard|Toolbar add items'\n2026-09-29T06:38:44.5455540Z if [ \"${RUNNER_OS}\" = \"macOS\" ]; then\n2026-09-29T06:38:44.5455720Z   # macOS self-hosted required gate stability:\n2026-09-29T06:38:44.5455930Z   # these tests currently fail only on the local runner image\n2026-09-29T06:38:44.5456150Z   # and block unrelated PRs behind the serialized macOS queue.\n2026-09-29T06:38:44.5456400Z   # Keep them visible on Linux/Windows and in dedicated fixes.\n2026-09-29T06:38:44.5456660Z   exclude=\"${exclude}|TextRunPlanner cache clear preserves shaped output contracts\"\n2026-09-29T06:38:44.5457020Z   exclude=\"${exclude}|TextRunPlanner captures scope generation and RTL base direction\"\n2026-09-29T06:38:44.5457720Z   exclude=\"${exclude}|MCP inspector tools map to expected inspector protocol methods\"\n2026-09-29T06:38:44.5458040Z   exclude=\"${exclude}|parse_cmake_project_version extracts VERSION from project\\\\(\\\\)\"\n2026-09-29T06:38:44.5458340Z   exclude=\"${exclude}|MCP pulp_motion_.* tools map to expected Motion\\\\..* methods\"\n2026-09-29T06:38:44.5458620Z   exclude=\"${exclude}|register_font_file resolves a custom family through Skia\"\n2026-09-29T06:38:44.5458880Z   exclude=\"${exclude}|FE0E forces text presentation\"\n2026-09-29T06:38:44.5459130Z   exclude=\"${exclude}|text_align center and right reflect cluster-aware width\"\n2026-09-29T06:38:44.5459420Z   exclude=\"${exclude}|mac harness scroll event carries non-zero deltas through PulpView\"\n2026-09-29T06:38:44.5459730Z   exclude=\"${exclude}|mac harness right-click reaches PulpView::rightMouseDown\"\n2026-09-29T06:38:44.5460070Z   # CoreAudio/StandaloneApp device-opening suites rely on the\n2026-09-29T06:38:44.5460290Z   # PROCESSORS reservation in test/CMakeLists.txt to avoid\n2026-09-29T06:38:44.5460580Z   # RT-thread starvation under parallel ctest; keep that reservation if\n2026-09-29T06:38:44.5460920Z   # those suites stay enabled here.\n2026-09-29T06:38:44.5461050Z fi\n2026-09-29T06:38:44.5461170Z if [ \"${RUNNER_OS}\" = \"Linux\" ]; then\n2026-09-29T06:38:44.5461370Z   # Linux ARM64 PR runner: Skia is present, but the headless VM\n2026-09-29T06:38:44.5461700Z   # exposes an incompatible Vulkan device\n2026-09-29T06:38:44.5461910Z   # (/dev/dri/renderD128 -> VK_ERROR_INCOMPATIBLE_DRIVER) and no\n2026-09-29T06:38:44.5462140Z   # DISPLAY. That makes visual/golden assertions fail as runner\n2026-09-29T06:38:44.5462420Z   # capability checks, not as product regressions. Keep the rest of\n2026-09-29T06:38:44.5462660Z   # the Linux suite green while GPU/visual coverage lives in the\n2026-09-29T06:38:44.5462870Z   # dedicated visual lanes and macOS/Windows required gates.\n2026-09-29T06:38:44.5463130Z   exclude=\"${exclude}|AudioInspectorPanel renders a non-empty headless snapshot\"\n2026-09-29T06:38:44.5463360Z   exclude=\"${exclude}|font v2 Slice 3\\\\.4\"\n2026-09-29T06:38:44.5463600Z   exclude=\"${exclude}|baked native materializer makes a faithful_svg tab_group an interactive overlay\"\n2026-09-29T06:38:44.5463910Z   exclude=\"${exclude}|ImageView value-driven silhouette fill scales with value\"\n2026-09-29T06:38:44.5464140Z   exclude=\"${exclude}|DesignFrameView renders\"\n2026-09-29T06:38:44.5464320Z   exclude=\"${exclude}|DesignTabGroup renders\"\n2026-09-29T06:38:44.5464490Z   exclude=\"${exclude}|DesignStepper renders\"\n2026-09-29T06:38:44.5464710Z   exclude=\"${exclude}|DesignStepper with a single option paints nothing\"\n2026-09-29T06:38:44.5464920Z   exclude=\"${exclude}|DesignFrameView paints\"\n2026-09-29T06:38:44.5465100Z   exclude=\"${exclude}|DesignFrameView tints\"\n2026-09-29T06:38:44.5465290Z   exclude=\"${exclude}|DesignFrameView xy_pad puck renders\"\n2026-09-29T06:38:44.5465480Z   exclude=\"${exclude}|DesignFrameView slides\"\n2026-09-29T06:38:44.5465660Z   exclude=\"${exclude}|DesignFrameView rotates\"\n2026-09-29T06:38:44.5465850Z   # Flaky on the ephemeral macOS CI VMs (offscreen GPU replay is\n2026-09-29T06:38:44.5466080Z   # environment-sensitive: passes locally + on most runs, but\n2026-09-29T06:38:44.5466310Z   # intermittently fails, evicting whole merge-queue batches and\n2026-09-29T06:38:44.5466550Z   # disabling auto-merge on every PR in them). Quarantined until the\n2026-09-29T06:38:44.5466820Z   # offscreen GPU-replay path is stabilized. Tracking: flaky-gpu-3327.\n2026-09-29T06:38:44.5467080Z   exclude=\"${exclude}|Subtree cache composites a GPU image on the replay frame\"\n2026-09-29T06:38:44.5467390Z fi\n2026-09-29T06:38:44.5467570Z # --repeat until-pass:2 retries a failed test once before failing the\n2026-09-29T06:38:44.5467810Z # leg, so a single timing-flake (e.g. a ReDoS-guard test slowed by\n2026-09-29T06:38:44.5468040Z # runner load) self-heals instead of reddening the required `macos`\n2026-09-29T06:38:44.5468290Z # gate and wedging auto-merge. Mirrors sanitizers.yml; each attempt is\n2026-09-29T06:38:44.5468490Z # still bounded by --timeout 120.\n2026-09-29T06:38:44.5468650Z #\n2026-09-29T06:38:44.5468800Z # --output-junit records WHICH tests did not run, and why. A ctest\n2026-09-29T06:38:44.5469100Z # SKIP (SKIP_RETURN_CODE) is otherwise indistinguishable from a PASS\n2026-09-29T06:38:44.5469320Z # to anyone reading this check: the report carries status=\"notrun\"\n2026-09-29T06:38:44.5469560Z # plus <skipped message=\"SKIP_RETURN_CODE=N\"/>, the test's labels, and\n2026-09-29T06:38:44.5469800Z # the skipping command's output. The path must be ABSOLUTE — with\n2026-09-29T06:38:44.5470030Z # --test-dir, ctest resolves a relative --output-junit against the\n2026-09-29T06:38:44.5470260Z # build dir, nesting the file at $PULP_BUILD_DIR/$PULP_BUILD_DIR/.\n2026-09-29T06:38:44.5470470Z # The report is written even when ctest exits nonzero.\n2026-09-29T06:38:44.5470640Z #\n2026-09-29T06:38:44.5470860Z # The selection, the selected inventory, and the exit status are\n2026-09-29T06:38:44.5471110Z # recorded beside the JUnit report so a protected-validation receipt\n2026-09-29T06:38:44.5471370Z # can prove which tests ran and that every one of them passed.\n2026-09-29T06:38:44.5471570Z evidence_dir=\"$RUNNER_TEMP/ctest-evidence\"\n2026-09-29T06:38:44.5471730Z mkdir -p \"$evidence_dir\"\n2026-09-29T06:38:44.5472220Z LABEL_EXCLUDE=\"$label_exclude\" EXCLUDE_REGEX=\"$exclude\" python3 -c 'import json, os; print(json.dumps({\"label_exclude\": os.environ[\"LABEL_EXCLUDE\"], \"exclude_regex\": os.environ[\"EXCLUDE_REGEX\"], \"label_include\": \"\", \"include_regex\": \"\"}))' > \"$evidence_dir/selection.json\"\n2026-09-29T06:38:44.5472770Z # The derivation is keyed on the lease declaration so it rolls out\n2026-09-29T06:38:44.5473000Z # host by host with tartci rather than flipping the whole fleet at\n2026-09-29T06:38:44.5473260Z # once: a runner that declares no lease keeps -j8. A declared lease\n2026-09-29T06:38:44.5473490Z # can only narrow the cores the runner itself reports.\n2026-09-29T06:38:44.5473650Z ctest_jobs=8\n2026-09-29T06:38:44.5473800Z case \"${TARTCI_GUEST_CORES:-}\" in\n2026-09-29T06:38:44.5473940Z   ''|*[!0-9]*|0*) ;;\n2026-09-29T06:38:44.5474050Z   *)\n2026-09-29T06:38:44.5474160Z     ctest_jobs=\"$TARTCI_GUEST_CORES\"\n2026-09-29T06:38:44.5474340Z     visible=\"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)\"\n2026-09-29T06:38:44.5474620Z     if [ \"$visible\" -ge 1 ] 2>/dev/null && [ \"$visible\" -lt \"$ctest_jobs\" ]; then ctest_jobs=\"$visible\"; fi\n2026-09-29T06:38:44.5474870Z     if [ \"$ctest_jobs\" -gt 8 ]; then ctest_jobs=8; fi\n2026-09-29T06:38:44.5480200Z     ;;\n2026-09-29T06:38:44.5480320Z esac\n2026-09-29T06:38:44.5480440Z echo \"ctest parallelism: -j${ctest_jobs}\"\n2026-09-29T06:38:44.5480590Z ctest_exit=0\n2026-09-29T06:38:44.5481090Z ctest --test-dir \"$PULP_BUILD_DIR\" --output-on-failure --repeat until-pass:2 ${stop_on_failure} -C Release -LE \"$label_exclude\" -j\"$ctest_jobs\" --timeout 120 --exclude-regex \"$exclude\" --output-junit \"$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml\" || ctest_exit=$?\n2026-09-29T06:38:44.5481680Z printf '%s\\n' \"$ctest_exit\" > \"$evidence_dir/exit-code\"\n2026-09-29T06:38:44.5481920Z # Inventory of what that selection covers: a listing, not a run, so\n2026-09-29T06:38:44.5482400Z # it takes no stop-on-failure flag. A failed listing leaves an invalid\n2026-09-29T06:38:44.5482640Z # file, and the receipt issuer then refuses rather than guessing.\n2026-09-29T06:38:44.5483030Z ctest --show-only=json-v1 --test-dir \"$PULP_BUILD_DIR\" -C Release -LE \"$label_exclude\" --exclude-regex \"$exclude\" > \"$evidence_dir/selected.json\" || true\n2026-09-29T06:38:44.5483400Z # Tell `shipyard landing` which tier this check's green means. On a\n2026-09-29T06:38:44.5483640Z # pull-request head the gate is still the fast tier, so the full run\n2026-09-29T06:38:44.5483870Z # there reports itself as receipt evidence, not as the check's tier.\n2026-09-29T06:38:44.5484070Z if [ \"$GITHUB_EVENT_NAME\" = pull_request ]; then\n2026-09-29T06:38:44.5484290Z   echo \"::notice::full suite ran as receipt evidence (non-gating): ctest exit $ctest_exit\"\n2026-09-29T06:38:44.5484500Z else\n2026-09-29T06:38:44.5484670Z   echo '::notice title=shipyard-test-tier::{\"schema\":\"shipyard-test-tier/v1\",\"tier\":\"full\"}'\n2026-09-29T06:38:44.5484890Z fi\n2026-09-29T06:38:44.5484980Z exit \"$ctest_exit\"\n2026-09-29T06:38:44.5504470Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-29T06:38:44.5504610Z env:\n2026-09-29T06:38:44.5504710Z   PULP_BUILD_DIR: build-macos\n2026-09-29T06:38:44.5504830Z   CCACHE_COMPILERCHECK: content\n2026-09-29T06:38:44.5504940Z   CCACHE_NODEPEND: true\n2026-09-29T06:38:44.5505140Z   CCACHE_SLOPPINESS: time_macros\n2026-09-29T06:38:44.5505520Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-29T06:38:44.5505890Z ##[endgroup]\n2026-09-29T06:43:28.7095120Z receipt                 =   0.22 sec*proc (23 tests)\n2026-09-29T06:43:28.7095260Z router                  =   0.08 sec*proc (6 tests)\n2026-09-29T06:43:28.7095400Z rt-safety               =   0.00 sec*proc (0 test)\n2026-09-29T06:43:28.7095530Z runtime                 =   4.40 sec*proc (4 tests)\n2026-09-29T06:43:28.7095730Z runtime-eval            =   2.11 sec*proc (9 tests)\n2026-09-29T06:43:28.7095860Z rust                    =   0.00 sec*proc (0 test)\n2026-09-29T06:43:28.7096000Z safety                  =   0.00 sec*proc (0 test)\n2026-09-29T06:43:28.7096130Z sample-region           = 120.25 sec*proc (3 tests)\n2026-09-29T06:43:28.7096280Z sampler                 =   5.73 sec*proc (3 tests)\n2026-09-29T06:43:28.7096420Z scene3d                 =   0.57 sec*proc (1 test)\n2026-09-29T06:43:28.7096550Z sdk                     =  64.70 sec*proc (11 tests)\n2026-09-29T06:43:28.7096690Z security                =   4.96 sec*proc (50 tests)\n2026-09-29T06:43:28.7096830Z sequencer               =   0.12 sec*proc (26 tests)\n2026-09-29T06:43:28.7096970Z service                 =   0.34 sec*proc (25 tests)\n2026-09-29T06:43:28.7097100Z ship                    =  19.23 sec*proc (36 tests)\n2026-09-29T06:43:28.7097240Z shipping-gate           =   5.73 sec*proc (3 tests)\n2026-09-29T06:43:28.7097380Z skia                    =   0.09 sec*proc (3 tests)\n2026-09-29T06:43:28.7097510Z slot                    =   0.03 sec*proc (7 tests)\n2026-09-29T06:43:28.7097640Z smoke                   =   0.01 sec*proc (1 test)\n2026-09-29T06:43:28.7097780Z standalone              =   5.84 sec*proc (4 tests)\n2026-09-29T06:43:28.7097920Z state                   =   0.06 sec*proc (3 tests)\n2026-09-29T06:43:28.7098050Z t0                      =   0.12 sec*proc (9 tests)\n2026-09-29T06:43:28.7098180Z t1                      =   1.61 sec*proc (20 tests)\n2026-09-29T06:43:28.7098310Z t2a                     =   0.06 sec*proc (10 tests)\n2026-09-29T06:43:28.7098450Z telemetry               =   0.09 sec*proc (10 tests)\n2026-09-29T06:43:28.7098590Z templates               =   0.09 sec*proc (1 test)\n2026-09-29T06:43:28.7098720Z threejs                 =   0.00 sec*proc (0 test)\n2026-09-29T06:43:28.7098860Z timeline                =  17.41 sec*proc (47 tests)\n2026-09-29T06:43:28.7099000Z timeout                 =   0.45 sec*proc (14 tests)\n2026-09-29T06:43:28.7099140Z tooling                 =  18.78 sec*proc (11 tests)\n2026-09-29T06:43:28.7099270Z tools                   =   3.00 sec*proc (1 test)\n2026-09-29T06:43:28.7099410Z trace                   =   0.13 sec*proc (21 tests)\n2026-09-29T06:43:28.7099550Z transport               =   0.07 sec*proc (16 tests)\n2026-09-29T06:43:28.7099690Z ui                      =   2.11 sec*proc (9 tests)\n2026-09-29T06:43:28.7099830Z vendor-sdk              =   0.00 sec*proc (1 test)\n2026-09-29T06:43:28.7099970Z view                    =   4.46 sec*proc (212 tests)\n2026-09-29T06:43:28.7100140Z visual                  =   1.07 sec*proc (2 tests)\n2026-09-29T06:43:28.7100280Z vst3                    =   0.16 sec*proc (1 test)\n2026-09-29T06:43:28.7100410Z wasm                    =   0.08 sec*proc (2 tests)\n2026-09-29T06:43:28.7100540Z web                     =   0.10 sec*proc (3 tests)\n2026-09-29T06:43:28.7100680Z windows                 =   0.01 sec*proc (2 tests)\n2026-09-29T06:43:28.7100810Z yoga                    =   0.00 sec*proc (0 test)\n2026-09-29T06:43:28.7100900Z \n2026-09-29T06:43:28.7100940Z Total Test time (real) = 284.00 sec\n2026-09-29T06:43:28.7101020Z \n2026-09-29T06:43:28.7101060Z The following tests did not run:\n2026-09-29T06:43:28.7101260Z \t5596 - register_font_url: detached worker survives allocation throw (Skipped)\n2026-09-29T06:43:28.7101490Z \t8315 - DBus connect_a11y_bus honest-fails without an a11y daemon (Skipped)\n2026-09-29T06:43:28.7101780Z \t10280 - Project package crash proof catches a production reference-admission mutation (Skipped)\n2026-09-29T06:43:28.7102030Z \t12380 - A lane that requires a GPU adapter has one (Skipped)\n2026-09-29T06:43:28.7102240Z \t12962 - V8 engine reports a non-empty runtime version and provider identity (Skipped)\n2026-09-29T06:43:28.7102580Z \t13144 - LottieAnimation composites skottie frames onto a SkiaCanvas (Skipped)\n2026-09-29T06:43:28.7102800Z \t13613 - RenderLoop browser factories select the rAF backend (Skipped)\n2026-09-29T06:43:28.7103030Z \t16378 - LottieView parses and advances when Lottie is compiled in (Skipped)\n2026-09-29T06:43:28.7103330Z \t16379 - LottieView resubscribes to the clock after pause/resume (Skipped)\n2026-09-29T06:43:28.7103590Z \t18726 - [jsx-experiment] Chainer JSX bundle materializes through Claude runtime harness (Skipped)\n2026-09-29T06:43:28.7103900Z \t18729 - [jsx-experiment] TypeScript .tsx bundle materializes through Claude runtime harness (Skipped)\n2026-09-29T06:43:28.7104180Z \t19309 - FileChooser null callback discards results without crashing (Skipped)\n2026-09-29T06:43:28.7104430Z \t19826 - PluginScanner VST3 bundle uses FUID as unique_id when SDK available (Skipped)\n2026-09-29T06:43:28.7104680Z \t19830 - ClapSlot::set_parameter round-trip via get_parameter (Skipped)\n2026-09-29T06:43:28.7104920Z \t19831 - VST3 set_parameter -> get_parameter controller-mirror round-trip (Skipped)\n2026-09-29T06:43:28.7105170Z \t20838 - mac harness captures ELYSIUM default C++ import through GPU path (Skipped)\n2026-09-29T06:43:28.7105430Z \t20839 - mac harness drives ELYSIUM imported knob body through hidden GPU host (Skipped)\n2026-09-29T06:43:28.7105630Z \t21254 - gallery-visual-regression (Skipped)\n2026-09-29T06:43:28.7105790Z \t21255 - component-visual-regression (Skipped)\n2026-09-29T06:43:28.7105930Z \t21309 - wasm-skia-slice-invariants (Skipped)\n2026-09-29T06:43:28.7106060Z \t21355 - android-smoke (Skipped)\n2026-09-29T06:43:28.7106200Z \t21377 - playback-ableton-link-sdk-present (Skipped)\n2026-09-29T06:43:28.7106310Z \n2026-09-29T06:43:28.7106350Z The following tests FAILED:\n2026-09-29T06:43:28.7106480Z \t21427 - pulp-gpu-host-mapped-pointer-probe (Failed)\n2026-09-29T06:43:28.7861780Z Errors while running CTest\n2026-09-29T06:43:29.9309760Z ##[notice]{\"schema\":\"shipyard-test-tier/v1\",\"tier\":\"full\"}\n2026-09-29T06:43:29.9315980Z ##[error]Process completed with exit code 8.\n2026-09-29T06:43:29.9355870Z ##[group]Run python3 tools/ci/merge_group_shadows.py run \\\n2026-09-29T06:43:29.9356150Z python3 tools/ci/merge_group_shadows.py run \\\n2026-09-29T06:43:29.9356390Z   --build-dir \"$PULP_BUILD_DIR\" --source-root \"$GITHUB_WORKSPACE\" \\\n2026-09-29T06:43:29.9356710Z   --repository \"$GITHUB_REPOSITORY\" --merge-sha \"$GITHUB_SHA\" --token \"$GH_TOKEN\" \\\n2026-09-29T06:43:29.9357010Z   --junit \"$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml\" \\\n2026-09-29T06:43:29.9357280Z   --selected-json \"$RUNNER_TEMP/ctest-evidence/selected.json\" \\\n2026-09-29T06:43:29.9357510Z   --ctest-outcome \"failure\" --hours 24 \\\n2026-09-29T06:43:29.9357710Z   --work-dir \"$RUNNER_TEMP/merge-group-shadows\" || true\n2026-09-29T06:43:29.9396530Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-29T06:43:29.9396710Z env:\n2026-09-29T06:43:29.9396820Z   PULP_BUILD_DIR: build-macos\n2026-09-29T06:43:29.9396970Z   CCACHE_COMPILERCHECK: content\n2026-09-29T06:43:29.9397090Z   CCACHE_NODEPEND: true\n2026-09-29T06:43:29.9397190Z   CCACHE_SLOPPINESS: time_macros\n2026-09-29T06:43:29.9397570Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-29T06:43:29.9397940Z   PULP_GH_CLI: gh\n2026-09-29T06:43:29.9399330Z   GH_TOKEN: ***\n2026-09-29T06:43:29.9399420Z ##[endgroup]\n"
+}

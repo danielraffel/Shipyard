@@ -2153,10 +2153,17 @@ mod tests {
     ///
     /// macOS does not implement the guard at all, which is why this only ever
     /// fails in CI.
+    ///
+    /// The probe really runs the fixture, so it runs inside the fixture's own
+    /// directory. Run from the test process's working directory (the crate
+    /// root) a fixture's relative writes land in the checkout: the `.path`
+    /// fixture below rewrote the repository's `.path` on every `cargo test`.
     #[cfg(unix)]
     fn wait_until_executable(path: &std::path::Path) {
+        let fixture_dir = path.parent().expect("fixture has a parent directory");
         for _ in 0..200 {
             let busy = std::process::Command::new(path)
+                .current_dir(fixture_dir)
                 .arg("--probe")
                 .output()
                 .err()
@@ -2171,12 +2178,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn the_readiness_probe_runs_inside_the_fixture_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let script = temp.path().join("probe.sh");
+        std::fs::write(&script, "#!/bin/sh\npwd -P > probe-cwd\n").expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("executable");
+        wait_until_executable(&script);
+
+        let recorded = std::fs::read_to_string(temp.path().join("probe-cwd"))
+            .expect("the probe must write inside the fixture directory, not the checkout");
+        assert_eq!(
+            std::path::Path::new(recorded.trim()),
+            temp.path().canonicalize().expect("canonical temp")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn runner_configuration_receives_the_canonical_path() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("temp");
         let script = temp.path().join("config.sh");
-        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$PATH\" > .path\n").expect("script");
+        // The readiness probe short-circuits so only the real configuration
+        // run writes `.path`.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n[ \"${1:-}\" = \"--probe\" ] && exit 0\nprintf '%s\\n' \"$PATH\" > .path\n",
+        )
+        .expect("script");
         let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).expect("executable");

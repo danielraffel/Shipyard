@@ -149,6 +149,9 @@ pub(super) struct BinaryPairEvidence {
 pub(super) enum PlanExecutionError {
     TimedOut(String),
     Failed(String),
+    /// The host transaction found the host's install guard held (a sandbox
+    /// canary or another update owns the host) and exited before any change.
+    HostBusy(String),
 }
 
 /// Where in a host attempt a failure happened, which decides whether the host
@@ -267,12 +270,26 @@ fn run_update_command(
         &format!("fleet update for host class {}", plan.class),
     )?;
     if !output.status.success() {
-        return Err(PlanExecutionError::Failed(format!(
-            "update command exited {}",
-            output.status.code().unwrap_or(-1)
-        )));
+        return Err(classify_update_failure(&output));
     }
     Ok(output.stdout)
+}
+
+/// A non-zero exit is a deferral only when the exact busy status AND the busy
+/// marker agree: the transaction refused at its first guard, before mutating.
+pub(super) fn classify_update_failure(output: &Output) -> PlanExecutionError {
+    let code = output.status.code();
+    let busy_marker = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .any(|line| line.trim() == auth_support::HOST_BUSY_MARKER);
+    if code == Some(auth_support::HOST_BUSY_EXIT_CODE) && busy_marker {
+        return PlanExecutionError::HostBusy(
+            "the host's install guard is held (a sandbox canary or another update owns \
+             the host); nothing changed"
+                .to_owned(),
+        );
+    }
+    PlanExecutionError::Failed(format!("update command exited {}", code.unwrap_or(-1)))
 }
 
 fn run_bounded_output(
@@ -2164,7 +2181,9 @@ fn validate_generation_evidence(
 
 fn plan_execution_message(error: PlanExecutionError) -> String {
     match error {
-        PlanExecutionError::TimedOut(message) | PlanExecutionError::Failed(message) => message,
+        PlanExecutionError::TimedOut(message)
+        | PlanExecutionError::Failed(message)
+        | PlanExecutionError::HostBusy(message) => message,
     }
 }
 

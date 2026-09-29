@@ -128,7 +128,7 @@ names the response field it came from, and the report always opens with:
 | `queued` | `isInMergeQueue` is true (position from `mergeQueueEntry`) | nothing; do not re-arm |
 | `armed_not_queued` | `autoMergeRequest` set, not yet admitted | nothing; the queue admits it when checks pass |
 | `never_armed` | open, not armed, no removal in the timeline window | `shipyard ship --pr <n>` |
-| `ejected` | last `RemovedFromMergeQueueEvent` was not `merged`, not queued, not armed | new head since, or `invalid_merge_commit`: `shipyard ship --pr <n>`; same head after `failed_checks`/`merge_conflict`: push a fix first; same head after any other reason (`manual`, ...): confirm with whoever dequeued it |
+| `ejected` | last `RemovedFromMergeQueueEvent` was not `merged`, not queued, not armed | new head since, or `invalid_merge_commit`: `shipyard ship --pr <n>`; same head after `failed_checks`/`merge_conflict`: push a fix first, unless the one environment re-enqueue applies (below); same head after any other reason (`manual`, ...): confirm with whoever dequeued it |
 | `merged` / `closed` | PR state | nothing |
 | `unknown` | the read failed or was malformed, or the timeline window is truncated and shows no removal and no new head; exit `9` | do not act |
 
@@ -156,6 +156,19 @@ The query reads `timelineItems(last: 100)`. When `pageInfo.hasPreviousPage`
 is true the report says `TRUNCATED` and the counts are lower bounds. Actor
 identity is not consulted: every queue mutation is attributed to the same App
 actor whether Shipyard or an agent issued it.
+
+### Environment re-enqueue
+
+After a same-head `failed_checks` ejection, `landing --pr` also prints an
+`ENVIRONMENT RE-ENQUEUE` block (`environment_requeue` in `--json`): `ALLOWED`
+or `REFUSED`, the reason, the merge-group commit read, and for each failing
+step of each failing required check the log line that proves a network failure
+or the reason it does not. When allowed, the next action is to re-enqueue the
+same head once with `shipyard ship --pr <n>`, with no new push. The rules and
+their rationale are in `docs/ghapp-guards.md` ("Environment re-enqueue"); the
+repository opts in with `[queue.environment_requeue] enabled = true`.
+`ejections of this head` in HISTORY is the bound's input: the
+`failed_checks`/`merge_conflict` removals of the current head.
 
 ### What the head's green means, and whether the merge group ran tests
 
