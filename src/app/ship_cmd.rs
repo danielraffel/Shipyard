@@ -112,6 +112,7 @@ pub(super) struct ShipStewardHandoff {
 }
 
 mod changed_surface_execution;
+mod fast_forward;
 mod metadata_authority;
 mod prepush_changed_surface;
 mod provenance;
@@ -292,6 +293,10 @@ pub(super) fn ship_command<W: Write>(
             },
             &repo,
             pr_context.number,
+            config
+                .get(crate::environment_requeue::CONFIG_KEY)
+                .and_then(toml::Value::as_bool)
+                == Some(true),
         );
         report_arm_outcome(&outcome, json_mode, stdout)?;
     }
@@ -357,7 +362,7 @@ pub(super) fn ship_command<W: Write>(
         &runtime_paths.state_dir,
         crate::log_retention::LogRetentionPolicy::from_config(config),
     );
-    let request = ShipExecutionRequest {
+    let mut request = ShipExecutionRequest {
         pr: pr_context.number,
         repo,
         branch,
@@ -382,6 +387,21 @@ pub(super) fn ship_command<W: Write>(
     // this under the per-PR lock, but deferring the first check until execution
     // can waste minutes behind unrelated repositories before the request is
     // inevitably cancelled for missing explicit `--adopt-head` authority.
+    //
+    // A head that only moved forward from the recorded one (a follow-up commit,
+    // or a merge of the base branch) is adopted without `--adopt-head`; see
+    // `fast_forward` for why that is safe and rewritten history is not.
+    if let Some(previous) = fast_forward::fast_forward_adoption(cwd, &ship_state, &request) {
+        request.adopt_head = true;
+        if !json_mode {
+            writeln!(
+                stdout,
+                "Adopting fast-forwarded head {previous} -> {}; prior validation evidence is discarded and the new head is re-validated.",
+                request.sha
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
     validate_ship_state_for_submission(&request, &ship_state)
         .map_err(|error| CliFailure::new(2, error.to_string()))?;
 

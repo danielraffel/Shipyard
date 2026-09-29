@@ -66,6 +66,14 @@ def validate_deferral(
     }
     missing_fields = sorted(required_fields.difference(receipt))
     _require(not missing_fields, f"missing required fields: {missing_fields}")
+    # Discriminate first: a guardian that failed for any other reason is not
+    # a deferral at all, and must be reported as its own failure rather than
+    # as a malformed deferral field.
+    failure = receipt.get("failure")
+    _require(
+        isinstance(failure, str) and failure.startswith(ACTIVE_WORKER_FAILURE),
+        f"not an admission deferral; the guardian failed: {failure!r}",
+    )
     _require(SHA256.fullmatch(installed_sha256) is not None, "invalid expected hash")
     _require(canary_root.is_absolute(), "canary root must be absolute")
     expected_root = Path(os.path.normpath(canary_root))
@@ -82,11 +90,6 @@ def validate_deferral(
     _require(isinstance(pid, int) and not isinstance(pid, bool) and pid > 1, "invalid pid")
     start_time = receipt.get("old_production_start_time")
     _require(isinstance(start_time, str) and bool(start_time), "invalid start time")
-    failure = receipt.get("failure")
-    _require(
-        isinstance(failure, str) and failure.startswith(ACTIVE_WORKER_FAILURE),
-        "failure is not the active-worker admission refusal",
-    )
     _require(receipt.get("schema_version") == 1, "unsupported receipt schema")
     _require(receipt.get("reason") == "failed", "unexpected receipt reason")
     _require(receipt.get("candidate_stopped") is True, "candidate was not stopped")
@@ -214,7 +217,14 @@ def validate_retained_reconciliation(
         receipt.get("transition_path") == "corrected-idle-preserve-fence",
         "wrong transition",
     )
-    _require(receipt.get("mutation_fence_proved") is True, "mutation fence missing")
+    # A superseded-production reconciliation binds to the current production
+    # because the prior canary's production (and so its fence) never survived.
+    basis = receipt.get("reconciliation_basis", "fenced")
+    _require(basis in ("fenced", "production-superseded"), "unknown reconciliation basis")
+    _require(
+        receipt.get("mutation_fence_proved") is (basis == "fenced"),
+        "mutation fence evidence disagrees with the reconciliation basis",
+    )
     _require(receipt.get("lease_removed") is False, "retained lease already removed")
     return {
         "schema_version": 1,

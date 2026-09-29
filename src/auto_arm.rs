@@ -30,6 +30,7 @@
 //! [`crate::app::ship_cmd`] (arm-on-open) and
 //! [`crate::app::merge_steward_cmd`] (the periodic backstop).
 
+use crate::environment_requeue::EnvironmentRequeue;
 use crate::merge_steward::StewardPullRequest;
 use crate::pr_queue_state::{PrQueueState, same_head_requeue_allowed};
 
@@ -185,6 +186,20 @@ impl ArmVerdict {
 /// `scripts/ghapp_queue_arm_guard.py`, and the two must stay in lockstep.
 #[must_use]
 pub fn decide_from_queue_state(state: &PrQueueState, draft: bool) -> ArmVerdict {
+    decide_from_queue_state_with_environment(state, draft, None)
+}
+
+/// [`decide_from_queue_state`], where a same-head `failed_checks` ejection
+/// may be answered by an environment re-enqueue verdict
+/// ([`crate::environment_requeue::assess`]). Only an `allowed` verdict turns
+/// [`ArmSkip::EjectedSameHead`] into [`ArmVerdict::Arm`]; the `ghapp` arm
+/// guard re-reads the same evidence before the mutation lands.
+#[must_use]
+pub fn decide_from_queue_state_with_environment(
+    state: &PrQueueState,
+    draft: bool,
+    environment: Option<&EnvironmentRequeue>,
+) -> ArmVerdict {
     // Draft is checked first among the open states but *after* the terminal
     // ones: a merged pull request that was once a draft is merged, not a
     // draft, and reporting it as a draft would read as something to fix.
@@ -214,7 +229,12 @@ pub fn decide_from_queue_state(state: &PrQueueState, draft: bool) -> ArmVerdict 
             // ejection says nothing against it. `invalid_merge_commit` is the
             // one reason that says nothing against the head even unchanged:
             // GitHub failed to build the merge commit.
-            if *new_head_since_removal || same_head_requeue_allowed(reason) {
+            if *new_head_since_removal
+                || same_head_requeue_allowed(reason)
+                || environment.is_some_and(|verdict| {
+                    verdict.allowed && reason.eq_ignore_ascii_case("failed_checks")
+                })
+            {
                 ArmVerdict::Arm
             } else {
                 ArmVerdict::Skip(ArmSkip::EjectedSameHead {

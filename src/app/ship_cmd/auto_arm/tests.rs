@@ -73,7 +73,7 @@ fn arm_accepted() -> String {
 }
 
 fn run(gh: &FakeGh) -> ArmOutcome {
-    arm_native_auto_merge(&|args| gh.run(args), "owner/repo", 7)
+    arm_native_auto_merge(&|args| gh.run(args), "owner/repo", 7, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +274,7 @@ fn a_multi_line_diagnostic_is_collapsed_to_one_line() {
 #[test]
 fn a_repo_without_owner_and_name_arms_nothing() {
     let gh = FakeGh::new(vec![("pr view", Ok(pr_view("PR_node", false)))]);
-    let outcome = arm_native_auto_merge(&|args| gh.run(args), "not-a-slug", 7);
+    let outcome = arm_native_auto_merge(&|args| gh.run(args), "not-a-slug", 7, false);
     assert!(!outcome.armed);
     assert!(outcome.line.contains("could not be read"));
     assert!(!gh.called("enablePullRequestAutoMerge"));

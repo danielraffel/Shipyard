@@ -1037,3 +1037,112 @@ exit 2
     assert!(log.contains("## Advisory lanes"));
     assert!(log.contains("`mac` (overridden via Lane-Policy trailer)"));
 }
+
+/// Run a foreground ship of PR 44 against `repo`'s current HEAD with a merge
+/// that fails, so the ship-state stays active for a second run to drift from.
+#[cfg(unix)]
+fn ship_pr_44_keeping_state(
+    temp: &std::path::Path,
+    repo: &std::path::Path,
+    paths: &RuntimePaths,
+) -> Result<(ExitCode, String), String> {
+    let head = git_capture(&["rev-parse", "HEAD"], repo);
+    let snapshot = temp.join("pr-44.json");
+    std::fs::write(
+        &snapshot,
+        format!(r#"{{"state":"OPEN","headRefName":"feature/test","headRefOid":"{head}"}}"#),
+    )
+    .expect("write snapshot");
+    let mut stdout = Vec::new();
+    ship_command(
+        ShipCommandArgs {
+            allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
+            skip_landability: true,
+            pr: Some(44),
+            base: "main".to_owned(),
+            auto_create_base: None,
+            no_warm: true,
+            resume_from: None,
+            merge_command: None,
+            merge_result: Some(MergeResult::Failure),
+            gh_command: None,
+            pr_snapshot_file: Some(snapshot),
+            allow_unreachable_targets: false,
+            allow_fleet_epoch_drift: false,
+            skip_targets: Vec::new(),
+            adopt_head: false,
+            steward_handoff: None,
+            invocation: ShipInvocation::Direct,
+            foreground: true,
+            arm_auto_merge: false,
+            body_append: None,
+        },
+        &loaded_config(temp),
+        repo,
+        paths,
+        true,
+        &mut stdout,
+    )
+    .map(|code| (code, String::from_utf8_lossy(&stdout).into_owned()))
+    .map_err(|failure| format!("{failure:?}"))
+}
+
+#[cfg(unix)]
+#[test]
+fn ship_command_adopts_a_fast_forwarded_head_without_the_flag() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    seed_repo(&repo);
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let (code, output) = ship_pr_44_keeping_state(temp.path(), &repo, &paths).expect("first ship");
+    assert_eq!(code, ExitCode::SUCCESS, "{output}");
+    let store = ShipStateStore::new(paths.state_dir.join("ship")).expect("store");
+    let old = store.get(44).expect("state kept").head_sha;
+
+    // The branch moves forward with a normal commit: no amend, no force-push.
+    git(&["commit", "-q", "--allow-empty", "-m", "follow-up"], &repo);
+    let new = git_capture(&["rev-parse", "HEAD"], &repo);
+    assert_ne!(old, new);
+
+    let (code, output) = ship_pr_44_keeping_state(temp.path(), &repo, &paths)
+        .expect("a fast-forward must be adopted, not refused as SHA drift");
+    assert_eq!(code, ExitCode::SUCCESS, "{output}");
+    assert_eq!(store.get(44).expect("state").head_sha, new);
+}
+
+#[cfg(unix)]
+#[test]
+fn ship_command_still_refuses_rewritten_history_without_the_flag() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    seed_repo(&repo);
+    git(&["commit", "-q", "--allow-empty", "-m", "pr work"], &repo);
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let (code, output) = ship_pr_44_keeping_state(temp.path(), &repo, &paths).expect("first ship");
+    assert_eq!(code, ExitCode::SUCCESS, "{output}");
+
+    git(
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "--amend",
+            "-m",
+            "rewritten",
+        ],
+        &repo,
+    );
+    let error = ship_pr_44_keeping_state(temp.path(), &repo, &paths)
+        .expect_err("rewritten history still requires explicit --adopt-head");
+    assert!(error.contains("SHA drift"), "{error}");
+    assert!(error.contains("--adopt-head"), "{error}");
+}

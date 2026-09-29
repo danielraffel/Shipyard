@@ -64,6 +64,8 @@ pub mod dependency;
 pub mod diagnostics;
 /// Doctor report generation for machine and environment checks.
 pub mod doctor;
+/// One same-head re-enqueue after a merge-queue ejection the network caused.
+pub mod environment_requeue;
 /// Durable evidence records and cross-branch lookup helpers.
 pub mod evidence;
 pub mod execution_supervisor;

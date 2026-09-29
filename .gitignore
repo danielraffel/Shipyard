@@ -49,3 +49,7 @@ CHANGELOG.md.pre-shipyard.bak
 
 # Claude Code transient scheduler lock
 .claude/scheduled_tasks.lock
+
+# GitHub Actions runner PATH snapshot. Runner directories own this file;
+# it never belongs in the repository root.
+/.path

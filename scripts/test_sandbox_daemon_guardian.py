@@ -3301,6 +3301,271 @@ class GuardianLifecycleTests(unittest.TestCase):
         self.assertEqual(guardian._mode_arg(argv), "shipyard")
         self.assertEqual(guardian._repo_args(argv), ("owner/a", "owner/z"))
 
+    # --- host-level exclusion with fleet install transactions -------------
+
+    def fleet_install_would_proceed(self, guard: Path) -> bool:
+        """Run the non-blocking acquisition a fleet install performs.
+
+        On macOS this is the install transaction's exact `lockf -t 0`; where
+        that utility does not exist, a separate process takes the same flock.
+        """
+        if Path("/usr/bin/lockf").exists():
+            argv = [
+                "/bin/bash",
+                "-c",
+                'exec 9<>"$1"; /usr/bin/lockf -s -t 0 9',
+                "install",
+                str(guard),
+            ]
+        else:
+            argv = [
+                sys.executable,
+                "-c",
+                "import fcntl, sys\n"
+                "handle = open(sys.argv[1], 'a+b')\n"
+                "fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)",
+                str(guard),
+            ]
+        return subprocess.run(argv, check=False, capture_output=True).returncode == 0
+
+    def test_canary_lease_holds_the_fleet_install_guard_until_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            guard = active.fleet_install_guard_path
+            guard.touch(mode=0o600)
+            # Control: the probe must see a free guard, or its "refused"
+            # reading below would prove nothing.
+            self.assertTrue(self.fleet_install_would_proceed(guard))
+            active.acquire()
+            self.assertTrue(active.lease_owned)
+            self.assertTrue(active.fleet_install_guard_held)
+            self.assertEqual(guard.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(
+                self.fleet_install_would_proceed(guard),
+                "a fleet install must not start while a canary owns the host",
+            )
+            active.release()
+            active.release_fleet_install_guard()
+            self.assertTrue(self.fleet_install_would_proceed(guard))
+
+    def test_in_flight_fleet_install_blocks_canary_admission_boundedly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            guard = active.fleet_install_guard_path
+            guard.touch(mode=0o600)
+            with open(guard, "a+b") as installer:
+                fcntl.flock(installer.fileno(), fcntl.LOCK_EX)
+                with mock.patch.object(
+                    guardian, "FLEET_INSTALL_GUARD_WAIT_SECONDS", 0.05
+                ), mock.patch.object(
+                    guardian, "FLEET_INSTALL_GUARD_POLL_SECONDS", 0.01
+                ), self.assertRaisesRegex(
+                    guardian.FleetUpdateInProgress, "fleet install transaction held"
+                ):
+                    active.acquire()
+            self.assertFalse(active.lease_owned)
+            self.assertFalse(active.lease_dir.exists())
+            self.assertIsNone(active.fleet_install_guard)
+
+    def test_terminal_receipt_records_and_then_frees_the_install_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+
+            def lifecycle(acquire, *_rest):
+                acquire()
+                raise RuntimeError("stop after admission")
+
+            with mock.patch.object(guardian, "run_lifecycle", side_effect=lifecycle):
+                active.run()
+            receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
+            self.assertTrue(receipt["fleet_install_guard_held"])
+            self.assertTrue(self.fleet_install_would_proceed(active.fleet_install_guard_path))
+
+    def test_procargs_failure_for_an_exited_pid_is_process_gone(self) -> None:
+        child = subprocess.Popen(["/usr/bin/true"])
+        child.wait()
+        with self.assertRaisesRegex(guardian.ProcessGone, f"process {child.pid} exited"):
+            guardian._raise_procargs_error(child.pid, guardian.errno.EINVAL, "size")
+        # A live process keeps the raw inspection error: that is not "gone".
+        with self.assertRaises(OSError) as raised:
+            guardian._raise_procargs_error(os.getpid(), guardian.errno.EINVAL, "size")
+        self.assertNotIsInstance(raised.exception, guardian.ProcessGone)
+        if sys.platform == "darwin":
+            with self.assertRaises(guardian.ProcessGone):
+                guardian.snapshot_process(child.pid)
+
+    # --- retained lease whose canary never wrote its mutation fence --------
+
+    def write_unfenced_retained_evidence(
+        self, active: guardian.Guardian
+    ) -> tuple[Path, str]:
+        prior, generation = self.write_retained_deadline_evidence(active)
+        (prior / "mutation-fence.json").unlink()
+        receipt_path = prior / "guardian-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt.update(
+            {
+                "mutation_fence_proved": False,
+                "failure": (
+                    "GuardianError: OSError: [Errno 22] KERN_PROCARGS2 size failed; "
+                    "restore production: GuardianError: corrected transition lacks "
+                    "exclusive-audit mutation proof; restore production: "
+                    "GuardianError: installed production binary changed during canary"
+                ),
+                "mutation_guard_path": str(
+                    active.production_state_dir
+                    / f".sandbox-canary-guard-{prior.name}"
+                ),
+                "mutation_probe_output": str(prior / "unexpected-mutation-ran"),
+            }
+        )
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        ready_path = prior / "ready.json"
+        ready = json.loads(ready_path.read_text(encoding="utf-8"))
+        ready["mutation_guard_path"] = receipt["mutation_guard_path"]
+        ready_path.write_text(json.dumps(ready), encoding="utf-8")
+        return prior, generation
+
+    def test_unfenced_retained_lease_reconciles_once_production_was_superseded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            prior, _ = self.write_unfenced_retained_evidence(active)
+            # The fleet update replaced the installed binary the prior canary
+            # snapshotted ("b" * 64 is the recorded hash).
+            active.installed.write_bytes(b"updated release")
+            with mock.patch.object(guardian, "_pid_alive", return_value=False):
+                selected, receipt, _ = active.retained_legacy_evidence()
+            self.assertEqual(selected, prior)
+            self.assertEqual(
+                active.reconciliation_basis, guardian.RECONCILIATION_BASIS_SUPERSEDED
+            )
+            self.assertIs(receipt["mutation_fence_proved"], False)
+
+    def test_unfenced_retained_lease_with_unchanged_production_stays_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            self.write_unfenced_retained_evidence(active)
+            active.installed.write_bytes(b"same release")
+            active.production_pid_file.write_text("222\n", encoding="utf-8")
+            with mock.patch.object(
+                guardian, "_sha256", return_value="b" * 64
+            ), mock.patch.object(
+                guardian, "_process_start", return_value="new"
+            ), mock.patch.object(
+                guardian, "_pid_alive", return_value=False
+            ), self.assertRaisesRegex(
+                guardian.GuardianError, "unchanged.*operator must confirm"
+            ):
+                active.retained_legacy_evidence()
+
+    def test_unfenced_retained_lease_refuses_any_sign_of_production_contact(
+        self,
+    ) -> None:
+        cases = {
+            "probe ran": lambda prior, active: (prior / "unexpected-mutation-ran").touch(),
+            "guard armed": lambda prior, active: (
+                active.production_state_dir / f".sandbox-canary-guard-{prior.name}"
+            ).touch(),
+            "production quiesced": lambda prior, active: self._rewrite_receipt(
+                prior, production_quiesced=True
+            ),
+            "workers at admission": lambda prior, active: self._rewrite_receipt(
+                prior, active_runs=["sy-live"]
+            ),
+            "fence claimed": lambda prior, active: self._rewrite_receipt(
+                prior, mutation_fence_proved=True
+            ),
+        }
+        for name, taint in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                active = self.make_guardian(Path(directory))
+                prior, _ = self.write_unfenced_retained_evidence(active)
+                active.installed.write_bytes(b"updated release")
+                taint(prior, active)
+                with mock.patch.object(
+                    guardian, "_pid_alive", return_value=False
+                ), self.assertRaises(guardian.GuardianError):
+                    active.retained_legacy_evidence()
+                self.assertTrue(active.lease_dir.exists())
+
+    def test_unfenced_retained_lease_refuses_live_prior_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            self.write_unfenced_retained_evidence(active)
+            active.installed.write_bytes(b"updated release")
+            with mock.patch.object(
+                guardian, "_pid_alive", return_value=True
+            ), self.assertRaisesRegex(guardian.GuardianError, "still alive"):
+                active.retained_legacy_evidence()
+
+    def _rewrite_receipt(self, prior: Path, **fields: object) -> None:
+        path = prior / "guardian-receipt.json"
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt.update(fields)
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    def test_superseded_reconciliation_binds_current_production_and_reaps(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            prior, original_generation = self.write_unfenced_retained_evidence(active)
+            active.installed.write_bytes(b"updated release")
+            active.candidate.write_bytes(b"candidate")
+            active.production_pid_file.write_text("777\n", encoding="utf-8")
+            current = guardian.ProcessSnapshot(
+                pid=777,
+                executable=str(active.installed),
+                argv=(str(active.installed), "--mode", "shipyard", "daemon", "run"),
+                environment={"HOME": directory},
+                cwd=directory,
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="after update",
+            )
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                guardian, "_pid_alive", return_value=False
+            ), mock.patch.object(
+                guardian, "snapshot_process", return_value=current
+            ), mock.patch.object(
+                guardian, "_configured_repos", return_value=()
+            ), mock.patch.object(
+                active, "verify_reconciliation_production", return_value=()
+            ), mock.patch.object(
+                active,
+                "final_reconciliation_writer_fence",
+                return_value=contextlib.nullcontext(mock.Mock()),
+            ), mock.patch.object(
+                guardian.time, "sleep"
+            ), mock.patch.object(
+                guardian, "_process_start", return_value=active.owner_start
+            ):
+                active.acquire()
+
+            self.assertIs(active.snapshot, current)
+            self.assertEqual(active.reconciled_prior_canary_root, str(prior))
+            self.assertTrue(active.lease_owned)
+            self.assertNotEqual(active.lease_generation, original_generation)
+            self.assertFalse(active.mutation_fence_proved)
+            intent = json.loads(
+                active.reconciliation_intent.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                intent["reconciliation_basis"], guardian.RECONCILIATION_BASIS_SUPERSEDED
+            )
+            self.assertIs(intent["mutation_fence_proved"], False)
+            active.production_preserved = True
+            active.production_identity_verified = True
+            active.release()
+            active.release_fleet_install_guard()
+
     def test_workflow_ready_wait_covers_bounded_guardian_preflight(self) -> None:
         workflow = (
             Path(__file__).parent.parent / ".github/workflows/sandbox-e2e.yml"

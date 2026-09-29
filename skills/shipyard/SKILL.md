@@ -668,7 +668,12 @@ immediately. A terminal tag opens or refreshes a GitHub issue titled
 `fleet-reconcile: <tag> could not reach the fleet` on the Shipyard repository
 and shows in `shipyard doctor --fleet`. Anything unreadable exits 9 and rolls
 nothing out. A tick that finds the controller lock held records nothing (exit
-75). Install its launchd agent on the controller only with
+75). A host whose install guard (`fleet-auth-support.guard` in its state dir)
+is held, by a running Sandbox canary or another install, refuses before any
+change with exit 75 and `SHIPYARD_FLEET_HOST_BUSY` on stderr; the rollout stops
+there as **deferred** (verdict `deferred`, exit 75), nothing is rolled back,
+and reconcile withdraws the attempt it recorded so the next tick retries
+without waiting out `--retry-hours`. Install its launchd agent on the controller only with
 `scripts/install_fleet_reconcile.sh`. That script is a dry run by default;
 `--install` first rehearses the reconcile under the agent's exact environment
 and refuses to load it on failure.
@@ -2341,7 +2346,13 @@ validation state. A detached, stale, fork-origin, or unrelated checkout is
 rejected; switch to the exact PR worktree instead of using `--pr` as a retarget
 override. A verified intentional head/base change still requires explicit
 `--adopt-head`, and known drift is rejected before queue insertion so it cannot
-wait behind unrelated work only to fail at worker start. Never auto-adopt.
+wait behind unrelated work only to fail at worker start. The one automatic
+case is a fast-forward: when the recorded head is an ancestor of the current
+head on the same base (a follow-up commit, or merging main into the branch),
+Shipyard adopts it itself, prints `Adopting fast-forwarded head <old> -> <new>`,
+and re-validates from scratch. Never automate `--adopt-head` for anything else.
+`--allow-fleet-epoch-drift` is unrelated: it waives the fleet-epoch preflight
+and never touches ship-state SHA drift.
 
 For an already-created PR, the submitting agent must run
 `shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
@@ -2715,6 +2726,22 @@ verdict that positively names infrastructure or another PR counts, and
 `merge_conflict` is never attributable because a conflict is a property of the
 head against its base.
 
+**One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
+when the repo sets `[queue.environment_requeue] enabled = true`: every failing
+required check on the removal's merge-group commit must be an Actions job whose
+every failing step printed a network signature (`Could not resolve host`,
+`ENOTFOUND`, `ECONNRESET`, `Tunnel connection failed`, `curl: (6)`/`(56)`, ...)
+within 60 output lines of its first `##[error]`, and it must be the head's first
+`failed_checks`/`merge_conflict` ejection. Read `shipyard landing --pr <n>`'s
+`ENVIRONMENT RE-ENQUEUE` block before pushing a no-op commit: when it says
+`ALLOWED`, run `shipyard ship --pr <n>` on the same head. Two gotchas the reader
+handles and a hand-rolled grep will not: a `run:` step's script is echoed into
+the log inside `##[group]Run ... ##[endgroup]` and can itself quote the
+signature (Pulp's pip step comment quotes the relay 403, which put a signature
+in `#8933`'s test-failure log), and the first `##[error]` in a log can belong to
+a later `if: always()` step rather than the failing one. A second ejection of
+the same head is always refused: the retry is spent.
+
 **"Un-implicated by the ejecting batch" is weaker than "will pass next time".**
 In the same incident `#8811`'s head was broken anyway, by the same defect class
 in its own file (a grouped member spec whose only case compiles on macOS, so
@@ -3083,7 +3110,9 @@ adopts the current head and **clears the recorded remote runs + evidence** so
 the new head re-validates from scratch — it never blesses stale validation for
 a possibly-different tree. The policy-signature guard still applies (a changed
 merge policy is still refused). Without the flag the old dead-end (manual `gh pr
-merge`) stands.
+merge`) stands. A pure fast-forward (the recorded head is an ancestor of the
+current head, base unchanged) needs no flag: it is adopted the same way,
+automatically.
 
 Other non-mutating checks:
 
@@ -3410,6 +3439,28 @@ initial delay that is ZERO under `cfg(test)` and a full interval in production
 is safe in every test and hazardous only in the field — a startup bug hidden
 from the suite meant to catch it. Assert the production value unconditionally,
 not the one the test build happens to see.
+
+### Nothing on the daemon tick may run a child process without a deadline
+
+The supervisor tick runs on the daemon's main thread, and it validates every
+queued ship job's checkout provenance before anything is dispatched. One
+subprocess there that never returns stops the whole queue: `running: 0`,
+pending jobs aging, IPC still answering `daemon status` (it is a separate
+thread), and no log line at all. Go through `process::run_output_until`, not
+`Command::output()`.
+
+A child can hang with no fault of its own. On macOS the first access to an
+external volume by a process whose TCC-responsible binary has no
+removable-volume grant parks `getcwd` inside `open` until a privacy prompt is
+answered. A daemon inherits responsibility from whatever spawned it, so a
+self-update run by the previous generation's binary (a fresh
+`auth-generations/<hash>` path, never granted) can raise that prompt on an
+unattended host. To diagnose: `sample <daemon-pid>` shows the main thread in
+`observe_merged_ship_jobs`/`git_output`, and `/usr/bin/log show` with a tccd
+filter shows `AUTHREQ_PROMPTING ... SystemPolicyRemovableVolumes` with no
+`AUTHREQ_RESULT`. To recover: `shipyard daemon refresh` from an interactive
+shell, whose responsible app already holds the grant, then kill the orphaned
+`git` child.
 
 ### A reader that shares a writer's lock inherits the writer's lifetime
 

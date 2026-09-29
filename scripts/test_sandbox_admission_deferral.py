@@ -211,6 +211,66 @@ class SandboxAdmissionDeferralTests(unittest.TestCase):
                         lease_dir=lease,
                     )
 
+    def test_failed_guardian_is_reported_as_its_own_failure(self) -> None:
+        # A guardian that failed before transition carries an empty
+        # active_runs; the classifier must name the real failure instead of
+        # complaining about the deferral-only field.
+        failed = copy.deepcopy(self.receipt)
+        failed["active_runs"] = []
+        failed["failure"] = "FileNotFoundError: mutation-fence.json"
+        with self.assertRaisesRegex(
+            sandbox_admission_deferral.DeferralError,
+            r"not an admission deferral; the guardian failed: "
+            r"'FileNotFoundError: mutation-fence.json'",
+        ):
+            self.validate(failed)
+
+    def test_superseded_retained_reconciliation_needs_matching_fence_claim(
+        self,
+    ) -> None:
+        lease = self.root.parent / "shipyard-sandbox-m3-lease"
+        base = {
+            "schema_version": 1,
+            "reason": sandbox_admission_deferral.RETAINED_RECONCILIATION_REASON,
+            "guardian_pid": 456,
+            "guardian_start_time": "Sat Aug 29 21:00:00 2026",
+            "lease_dir": str(lease),
+            "lease_device": 42,
+            "lease_inode": 789,
+            "lease_ctime_ns": 123456789,
+            "lease_generation": "c" * 64,
+            "prior_canary_root": str(self.root.parent / "shipyard-sandbox-m3-123-1"),
+            "candidate_stopped": True,
+            "production_quiesced": False,
+            "production_restored": False,
+            "transition_path": "corrected-idle-preserve-fence",
+            "mutation_fence_proved": False,
+            "reconciliation_basis": "production-superseded",
+            "old_production_pid": 123,
+            "old_production_start_time": "Sat Aug 29 05:44:36 2026",
+            "installed_sha256": HASH,
+            "configured_repos": [],
+            "active_runs": ["sy-live"],
+            "lease_removed": False,
+        }
+
+        def check(receipt: dict[str, object]) -> dict[str, object]:
+            return sandbox_admission_deferral.validate_deferral(
+                receipt, installed_sha256=HASH, canary_root=self.root, lease_dir=lease
+            )
+
+        self.assertEqual(check(base)["lease_inode"], 789)
+        for field, value in (
+            ("mutation_fence_proved", True),
+            ("reconciliation_basis", "fenced"),
+            ("reconciliation_basis", "anything-else"),
+        ):
+            with self.subTest(field=field, value=value):
+                invalid = copy.deepcopy(base)
+                invalid[field] = value
+                with self.assertRaises(sandbox_admission_deferral.DeferralError):
+                    check(invalid)
+
     def make_live_retained_lease(self) -> tuple[Path, dict[str, object]]:
         lease = self.root / "shipyard-sandbox-m3-lease"
         lease.mkdir(mode=0o700)
