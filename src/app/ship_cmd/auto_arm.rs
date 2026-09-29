@@ -30,7 +30,7 @@
 use serde_json::Value;
 
 use crate::auto_arm::{
-    ArmVerdict, arm_mutation_args, arm_response_accepted, decide_from_queue_state,
+    ArmVerdict, arm_mutation_args, arm_response_accepted, decide_from_queue_state_with_environment,
     first_graphql_error, is_arm_guard_refusal, is_auto_merge_disabled_refusal,
 };
 use crate::pr_queue_state::{PR_QUEUE_STATE_QUERY, explain_pr_queue_state};
@@ -50,7 +50,16 @@ pub(super) type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 /// Arm native auto-merge on `pr`, or explain why it was left alone.
 ///
 /// Never returns an error: every failure mode is a reported line.
-pub(super) fn arm_native_auto_merge(run_gh: RunGh<'_>, repo: &str, pr: u64) -> ArmOutcome {
+///
+/// `environment_opt_in` is the repository's
+/// [`crate::environment_requeue::CONFIG_KEY`]: when set, a head ejected once
+/// for an environment failure is armed without a new push.
+pub(super) fn arm_native_auto_merge(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    environment_opt_in: bool,
+) -> ArmOutcome {
     let facts = match read_pr_facts(run_gh, repo, pr) {
         Ok(facts) => facts,
         Err(detail) => {
@@ -60,8 +69,8 @@ pub(super) fn arm_native_auto_merge(run_gh: RunGh<'_>, repo: &str, pr: u64) -> A
             ));
         }
     };
-    let state = match read_queue_state(run_gh, repo, pr) {
-        Ok(value) => explain_pr_queue_state(&value).state,
+    let report = match read_queue_state(run_gh, repo, pr) {
+        Ok(value) => explain_pr_queue_state(&value),
         Err(detail) => {
             return skipped(format!(
                 "⚠︎ Auto-merge not armed on #{pr}: its merge-queue state could not be read \
@@ -70,11 +79,44 @@ pub(super) fn arm_native_auto_merge(run_gh: RunGh<'_>, repo: &str, pr: u64) -> A
         }
     };
 
-    match decide_from_queue_state(&state, facts.draft) {
+    let environment = crate::environment_requeue::assess(run_gh, repo, &report, environment_opt_in);
+    match decide_from_queue_state_with_environment(&report.state, facts.draft, environment.as_ref())
+    {
         ArmVerdict::Skip(skip) => skipped(format!(
-            "▸ Auto-merge left as it is on #{pr}: {}",
-            skip.explain()
+            "▸ Auto-merge left as it is on #{pr}: {}{}",
+            skip.explain(),
+            environment
+                .as_ref()
+                .filter(|verdict| !verdict.allowed)
+                .map_or_else(String::new, |verdict| format!(
+                    " (environment re-enqueue refused: {})",
+                    verdict.reason
+                ))
         )),
+        ArmVerdict::Arm if environment.as_ref().is_some_and(|verdict| verdict.allowed) => {
+            match run_gh(&arm_mutation_args(&facts.node_id)) {
+                Ok(raw) if arm_response_accepted(&raw) => ArmOutcome {
+                    armed: true,
+                    line: format!(
+                        "▸ Auto-merge armed on #{pr} (merge method MERGE) without a new head: \
+                         its one environment re-enqueue ({}).",
+                        environment
+                            .as_ref()
+                            .map_or("", |verdict| verdict.reason.as_str())
+                    ),
+                },
+                Ok(raw) => skipped(format!(
+                    "⚠︎ Auto-merge not armed on #{pr}: GitHub accepted the request but returned \
+                     no armed pull request ({}). Check with `shipyard landing --pr {pr}`.",
+                    first_graphql_error(&raw).unwrap_or_else(|| "no errors reported".to_owned())
+                )),
+                Err(detail) => skipped(format!(
+                    "▸ Auto-merge left as it is on #{pr}: the environment re-enqueue was not \
+                     accepted — {}",
+                    one_line(&detail)
+                )),
+            }
+        }
         ArmVerdict::Arm => match run_gh(&arm_mutation_args(&facts.node_id)) {
             Ok(raw) if arm_response_accepted(&raw) => ArmOutcome {
                 armed: true,

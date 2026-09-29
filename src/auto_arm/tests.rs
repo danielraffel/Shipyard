@@ -1,7 +1,8 @@
 use super::{
     ArmSkip, ArmVerdict, NATIVE_AUTO_MERGE_MUTATION, arm_mutation_args, arm_response_accepted,
-    decide_from_queue_state, first_graphql_error, is_arm_guard_refusal,
-    is_auto_merge_disabled_refusal, merge_state_is_arm_ready, preselect_backstop_candidate,
+    decide_from_queue_state, decide_from_queue_state_with_environment, first_graphql_error,
+    is_arm_guard_refusal, is_auto_merge_disabled_refusal, merge_state_is_arm_ready,
+    preselect_backstop_candidate,
 };
 use crate::merge_steward::StewardPullRequest;
 use crate::pr_queue_state::PrQueueState;
@@ -205,6 +206,66 @@ fn an_ejected_pr_on_the_same_head_is_not_re_armed() {
         ArmVerdict::Skip(ArmSkip::EjectedSameHead {
             reason: "failed_checks".to_owned()
         })
+    );
+}
+
+fn environment_verdict(allowed: bool) -> crate::environment_requeue::EnvironmentRequeue {
+    crate::environment_requeue::EnvironmentRequeue {
+        allowed,
+        reason: "test".to_owned(),
+        merge_group_commit: None,
+        evidence: Vec::new(),
+    }
+}
+
+fn ejected_same_head(reason: &str) -> PrQueueState {
+    PrQueueState::Ejected {
+        reason: reason.to_owned(),
+        at: None,
+        new_head_since_removal: false,
+        requeues_without_new_head: 0,
+    }
+}
+
+#[test]
+fn an_allowed_environment_verdict_arms_the_same_head() {
+    let allowed = environment_verdict(true);
+    assert_eq!(
+        decide_from_queue_state_with_environment(
+            &ejected_same_head("failed_checks"),
+            false,
+            Some(&allowed)
+        ),
+        ArmVerdict::Arm
+    );
+    // A refused verdict, or none, leaves the refusal in place.
+    for environment in [Some(environment_verdict(false)), None] {
+        assert!(matches!(
+            decide_from_queue_state_with_environment(
+                &ejected_same_head("failed_checks"),
+                false,
+                environment.as_ref()
+            ),
+            ArmVerdict::Skip(ArmSkip::EjectedSameHead { .. })
+        ));
+    }
+    // A conflict is the head's own, whatever the checks said.
+    assert!(matches!(
+        decide_from_queue_state_with_environment(
+            &ejected_same_head("merge_conflict"),
+            false,
+            Some(&allowed)
+        ),
+        ArmVerdict::Skip(ArmSkip::EjectedSameHead { .. })
+    ));
+    // Draft still wins.
+    assert_eq!(
+        decide_from_queue_state_with_environment(
+            &ejected_same_head("failed_checks"),
+            true,
+            Some(&allowed)
+        ),
+        ArmVerdict::Skip(ArmSkip::Draft)
     );
 }
 
