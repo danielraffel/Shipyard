@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import ctypes
 import ctypes.util
+import errno
 import fcntl
 import hashlib
 import json
@@ -33,6 +34,14 @@ from typing import Callable, NoReturn, Optional, Union
 
 class GuardianError(RuntimeError):
     """Fail-closed canary transaction error."""
+
+
+class ProcessGone(GuardianError):
+    """A process exited (or was reaped) while it was being inspected."""
+
+
+class FleetUpdateInProgress(GuardianError):
+    """A fleet update held the host's install guard through the admission wait."""
 
 
 class RetainedWriterDomain(GuardianError):
@@ -90,6 +99,24 @@ SANDBOX_CANARY_LABEL_RE = re.compile(
     rf"^{re.escape(SANDBOX_CANARY_LABEL_PREFIX)}([1-9][0-9]*)\.([1-9][0-9]*)$"
 )
 SANDBOX_CANARY_RECOVERY_LIMIT = 4
+# Every fleet install transaction (local or over SSH, from any controller)
+# takes this per-host guard non-blockingly before it swaps the installed
+# binary or refreshes the daemon, and defers when it is held. The guardian
+# holds it for the canary's whole lifetime, so a release rollout can never
+# replace production underneath a running canary; symmetrically, a canary
+# that finds an install in flight waits for it before snapshotting production.
+FLEET_INSTALL_GUARD_NAME = "fleet-auth-support.guard"
+FLEET_INSTALL_GUARD_WAIT_SECONDS = 60.0
+FLEET_INSTALL_GUARD_POLL_SECONDS = 1.0
+# How a retained lease is authenticated for automatic reconciliation.  A
+# "fenced" lease has the prior canary's exact mutation-fence proof and still
+# the exact production it preserved.  A "production-superseded" lease belongs to
+# a canary that never quiesced production, never ran its mutation probe, and
+# whose production daemon or installed binary was replaced out of band (a fleet
+# update) before it could write that proof; its evidence is bound to the
+# current production instead, because the prior one no longer exists.
+RECONCILIATION_BASIS_FENCED = "fenced"
+RECONCILIATION_BASIS_SUPERSEDED = "production-superseded"
 
 
 @dataclass(frozen=True)
@@ -266,6 +293,18 @@ def _run_status_probe(
     return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
+def _raise_procargs_error(pid: int, errno_value: int, phase: str) -> NoReturn:
+    """Name an exited process as gone instead of surfacing a bare errno.
+
+    The kernel answers KERN_PROCARGS2 for a pid that has exited (or is being
+    reaped) with EINVAL/ESRCH. That is a production identity change, not an
+    inspection fault, and callers must be able to tell the two apart.
+    """
+    if errno_value in (errno.EINVAL, errno.ESRCH) and not _pid_alive(pid):
+        raise ProcessGone(f"process {pid} exited while being snapshotted")
+    raise OSError(errno_value, f"KERN_PROCARGS2 {phase} failed")
+
+
 def _darwin_argv_environment(pid: int) -> tuple[str, tuple[str, ...], dict[str, str]]:
     if sys.platform != "darwin":
         raise GuardianError("the production process snapshot is macOS-only")
@@ -276,10 +315,10 @@ def _darwin_argv_environment(pid: int) -> tuple[str, tuple[str, ...], dict[str, 
     mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
     size = ctypes.c_size_t(0)
     if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
-        raise OSError(ctypes.get_errno(), "KERN_PROCARGS2 size failed")
+        _raise_procargs_error(pid, ctypes.get_errno(), "size")
     buffer = ctypes.create_string_buffer(size.value)
     if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
-        raise OSError(ctypes.get_errno(), "KERN_PROCARGS2 read failed")
+        _raise_procargs_error(pid, ctypes.get_errno(), "read")
     data = buffer.raw[: size.value]
     if len(data) < 4:
         raise GuardianError("KERN_PROCARGS2 returned a truncated record")
@@ -1360,6 +1399,12 @@ class Guardian:
             / f".sandbox-canary-guard-{self.root.name}"
         )
         self.mutation_probe_output = self.root / "unexpected-mutation-ran"
+        self.fleet_install_guard_path = (
+            self.production_state_dir / FLEET_INSTALL_GUARD_NAME
+        )
+        self.fleet_install_guard = None
+        self.fleet_install_guard_held = False
+        self.reconciliation_basis = RECONCILIATION_BASIS_FENCED
         self.snapshot: Optional[ProcessSnapshot] = None
         self.candidate_process: Optional[subprocess.Popen] = None
         self.restoration_process: Optional[subprocess.Popen] = None
@@ -1566,6 +1611,52 @@ class Guardian:
                 errors.append(f"{label}: {type(error).__name__}: {error}")
         return recovery
 
+    def hold_fleet_install_guard(self) -> None:
+        """Exclude fleet install transactions from this host for the canary.
+
+        Waits boundedly for an in-flight install (it holds the guard through
+        its daemon refresh), then keeps the guard until the lifecycle ends.
+        The flock dies with this process, so a crashed guardian never blocks
+        a later rollout.
+        """
+        if self.fleet_install_guard is not None:
+            return
+        handle = _open_verified_private_lock(self.fleet_install_guard_path)
+        try:
+            deadline = time.monotonic() + FLEET_INSTALL_GUARD_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if self.stop_requested or time.monotonic() >= deadline:
+                        raise FleetUpdateInProgress(
+                            "a fleet install transaction held "
+                            f"{self.fleet_install_guard_path} for "
+                            f"{FLEET_INSTALL_GUARD_WAIT_SECONDS:.0f}s; the host is "
+                            "being updated, so rerun only the targeted Sandbox job "
+                            "once `shipyard runner fleet-reconcile` reports it current"
+                        ) from None
+                    time.sleep(FLEET_INSTALL_GUARD_POLL_SECONDS)
+            _validate_open_lock_path(
+                self.fleet_install_guard_path, os.fstat(handle.fileno())
+            )
+        except BaseException:
+            handle.close()
+            raise
+        self.fleet_install_guard = handle
+        self.fleet_install_guard_held = True
+
+    def release_fleet_install_guard(self) -> None:
+        handle = self.fleet_install_guard
+        self.fleet_install_guard = None
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
     @contextlib.contextmanager
     def retained_reconciliation_lock(self):
         self.reconciliation_lock.parent.mkdir(parents=True, exist_ok=True)
@@ -1645,7 +1736,11 @@ class Guardian:
             if (
                 intent.get("schema_version") == 1
                 and intent.get("transition_path") == CORRECTED_TRANSITION
-                and intent.get("mutation_fence_proved") is True
+                and (
+                    intent.get("mutation_fence_proved") is True
+                    or intent.get("reconciliation_basis")
+                    == RECONCILIATION_BASIS_SUPERSEDED
+                )
                 and isinstance(intent.get("prior_canary_root"), str)
                 and isinstance(intent.get("lease_device"), int)
                 and isinstance(intent.get("lease_inode"), int)
@@ -1690,7 +1785,14 @@ class Guardian:
             )
         prior_root, receipt = retained[0]
         ready = _json_object(prior_root / "ready.json")
-        mutation = _json_object(prior_root / "mutation-fence.json")
+        fence_path = prior_root / "mutation-fence.json"
+        if not fence_path.exists() and not fence_path.is_symlink():
+            self.authenticate_superseded_retained_lease(prior_root, receipt, ready)
+            self.authenticate_prior_candidate(receipt, ready)
+            self.reconciliation_basis = RECONCILIATION_BASIS_SUPERSEDED
+            return prior_root, receipt, ready
+        self.reconciliation_basis = RECONCILIATION_BASIS_FENCED
+        mutation = _json_object(fence_path)
         failure = receipt.get("failure")
         production_pid = receipt.get("old_production_pid")
         allowed_failure = _is_reconcilable_retained_failure(
@@ -1726,6 +1828,18 @@ class Guardian:
         )
         if not all(required):
             raise GuardianError("prior retained-lease receipt is not safely reconcilable")
+        self.authenticate_prior_candidate(receipt, ready)
+        if mutation.get("production_pid") != receipt.get("old_production_pid") or mutation.get(
+            "production_start_time"
+        ) != receipt.get("old_production_start_time"):
+            raise GuardianError("prior retained-lease mutation identity disagrees")
+        return prior_root, receipt, ready
+
+    @staticmethod
+    def authenticate_prior_candidate(
+        receipt: dict[str, object], ready: dict[str, object]
+    ) -> None:
+        """The prior candidate is dead and its ready/final receipts agree."""
         candidate_pid = ready.get("candidate_pid")
         if not isinstance(candidate_pid, int) or isinstance(candidate_pid, bool):
             raise GuardianError("prior retained-lease candidate pid is invalid")
@@ -1743,11 +1857,82 @@ class Guardian:
                 raise GuardianError(f"prior retained-lease {field} evidence disagrees")
         if ready.get("candidate_sha256") != receipt.get("candidate_sha256"):
             raise GuardianError("prior retained-lease candidate hash disagrees")
-        if mutation.get("production_pid") != receipt.get("old_production_pid") or mutation.get(
-            "production_start_time"
-        ) != receipt.get("old_production_start_time"):
-            raise GuardianError("prior retained-lease mutation identity disagrees")
-        return prior_root, receipt, ready
+
+    def authenticate_superseded_retained_lease(
+        self,
+        prior_root: Path,
+        receipt: dict[str, object],
+        ready: dict[str, object],
+    ) -> None:
+        """Authenticate a retained lease whose canary never wrote its fence.
+
+        Eligible only when the prior canary provably never touched production
+        (never quiesced or restored it, never ran or armed its mutation probe),
+        its candidate is gone, and the production it snapshotted was replaced
+        out of band. Anything else stays fail-closed for an operator.
+        """
+        operator = (
+            f"retained lease {self.lease_dir} from {prior_root} has no "
+            "mutation-fence proof"
+        )
+        required = (
+            receipt.get("schema_version") == 1,
+            receipt.get("transition_path") == CORRECTED_TRANSITION,
+            ready.get("transition_path") == CORRECTED_TRANSITION,
+            receipt.get("candidate_stopped") is True,
+            receipt.get("production_quiesced") is False,
+            receipt.get("production_restored") is False,
+            receipt.get("mutation_fence_proved") is False,
+            receipt.get("old_lifetime_lock_owned") is False,
+            receipt.get("lease_removed") is False,
+            receipt.get("active_runs") == [],
+            isinstance(receipt.get("failure"), str) and bool(receipt.get("failure")),
+        )
+        if not all(required):
+            raise GuardianError(
+                f"{operator} and its receipt does not prove production was untouched; "
+                "operator reconciliation required"
+            )
+        expected_guard = (
+            self.production_state_dir / f".sandbox-canary-guard-{prior_root.name}"
+        )
+        expected_probe = prior_root / "unexpected-mutation-ran"
+        if (
+            receipt.get("mutation_guard_path") != str(expected_guard)
+            or receipt.get("mutation_probe_output") != str(expected_probe)
+            or ready.get("mutation_guard_path") != str(expected_guard)
+        ):
+            raise GuardianError(f"{operator} and names foreign mutation-probe paths")
+        for path in (expected_guard, expected_probe):
+            if path.exists() or path.is_symlink():
+                raise GuardianError(
+                    f"{operator} and its mutation probe left {path}; operator "
+                    "reconciliation required"
+                )
+        if not self.prior_production_superseded(receipt):
+            raise GuardianError(
+                f"{operator} while its production daemon and installed binary are "
+                "unchanged, so no later evidence can stand in for that proof; an "
+                "operator must confirm no guardian or candidate is live and detach "
+                "the lease generation"
+            )
+
+    def prior_production_superseded(self, receipt: dict[str, object]) -> bool:
+        """True when the production a prior canary snapshotted no longer exists."""
+        old_pid = receipt.get("old_production_pid")
+        if not isinstance(old_pid, int) or isinstance(old_pid, bool) or old_pid <= 1:
+            return False
+        if _sha256(self.installed) != receipt.get("installed_sha256"):
+            return True
+        try:
+            current_pid = int(
+                self.production_pid_file.read_text(encoding="utf-8").strip()
+            )
+        except (OSError, ValueError):
+            return False
+        if current_pid != old_pid:
+            return True
+        return _process_start(old_pid) != receipt.get("old_production_start_time")
 
     def snapshot_reconciliation_production(
         self, prior: dict[str, object]
@@ -1761,16 +1946,34 @@ class Guardian:
             diagnostic_root=self.root,
             state_dir=self.production_state_dir,
         )
-        expected = {
-            "old_production_pid": snapshot.pid,
-            "old_production_start_time": snapshot.start_time,
-            "installed_sha256": installed_hash,
-            "argv_sha256": snapshot.argv_sha256,
-            "environment_sha256": snapshot.environment_sha256,
-            "cwd": snapshot.cwd,
-            "mode": _mode_arg(snapshot.argv),
-            "configured_repos": list(configured_repos),
-        }
+        if self.reconciliation_basis == RECONCILIATION_BASIS_SUPERSEDED:
+            # The prior production no longer exists; bind every later check to
+            # the current, exactly identified production daemon instead.
+            if (
+                _mode_arg(snapshot.argv) != "shipyard"
+                or "daemon" not in snapshot.argv
+                or "run" not in snapshot.argv
+            ):
+                raise GuardianError(
+                    f"retained-lease production argv is not Shipyard daemon run: "
+                    f"{snapshot.argv!r}"
+                )
+            if prior.get("mode") not in (None, "shipyard"):
+                raise GuardianError("retained-lease production authority changed: mode")
+            expected = {}
+        else:
+            expected = None
+        if expected is None:
+            expected = {
+                "old_production_pid": snapshot.pid,
+                "old_production_start_time": snapshot.start_time,
+                "installed_sha256": installed_hash,
+                "argv_sha256": snapshot.argv_sha256,
+                "environment_sha256": snapshot.environment_sha256,
+                "cwd": snapshot.cwd,
+                "mode": _mode_arg(snapshot.argv),
+                "configured_repos": list(configured_repos),
+            }
         for field, value in expected.items():
             if prior.get(field) != value:
                 raise GuardianError(f"retained-lease production authority changed: {field}")
@@ -1786,7 +1989,9 @@ class Guardian:
         self.lock_path = self.production_state_dir / ".sandbox-writer-domain.lock"
         self.transition_path = CORRECTED_TRANSITION
         self.old_lifetime_lock_owned = False
-        self.mutation_fence_proved = True
+        self.mutation_fence_proved = (
+            self.reconciliation_basis == RECONCILIATION_BASIS_FENCED
+        )
         return snapshot, configured_repos
 
     def verify_reconciliation_production(self) -> tuple[str, ...]:
@@ -1844,7 +2049,10 @@ class Guardian:
                 "production_quiesced": False,
                 "production_restored": False,
                 "transition_path": CORRECTED_TRANSITION,
-                "mutation_fence_proved": True,
+                "mutation_fence_proved": (
+                    self.reconciliation_basis == RECONCILIATION_BASIS_FENCED
+                ),
+                "reconciliation_basis": self.reconciliation_basis,
                 "old_production_pid": snapshot.pid if snapshot else None,
                 "old_production_start_time": snapshot.start_time if snapshot else None,
                 "installed_sha256": getattr(self, "installed_hash", None),
@@ -1979,7 +2187,10 @@ class Guardian:
                 {
                     "schema_version": 1,
                     "transition_path": CORRECTED_TRANSITION,
-                    "mutation_fence_proved": True,
+                    "mutation_fence_proved": (
+                        self.reconciliation_basis == RECONCILIATION_BASIS_FENCED
+                    ),
+                    "reconciliation_basis": self.reconciliation_basis,
                     "prior_canary_root": str(prior_root),
                     "lease_device": lease_stat.st_dev,
                     "lease_inode": lease_stat.st_ino,
@@ -2019,6 +2230,10 @@ class Guardian:
                 # An authenticated predecessor generation's mutation proof
                 # cannot authorize the fresh generation created below.
                 self.mutation_fence_proved = False
+            # Taken before the lease exists and before production is ever
+            # snapshotted: no install can swap the binary or restart the
+            # daemon between this canary's snapshot and its final receipt.
+            self.hold_fleet_install_guard()
             self.lease_owned = True
             try:
                 lease_stat, lease_generation = _create_lease_generation(self.lease_dir)
@@ -2949,6 +3164,12 @@ class Guardian:
                     "mutation_probe_output": str(self.mutation_probe_output),
                     "lease_removed": not self.lease_dir.exists(),
                     "reconciled_prior_canary_root": self.reconciled_prior_canary_root,
+                    "reconciliation_basis": (
+                        self.reconciliation_basis
+                        if self.reconciled_prior_canary_root is not None
+                        else None
+                    ),
+                    "fleet_install_guard_held": self.fleet_install_guard_held,
                 }
             # This receipt is recovery authority for the narrow crash window
             # between publication and launchd accepting the self-unload.
@@ -2960,6 +3181,8 @@ class Guardian:
                     f"{type(error).__name__}: {error}"
                 )
                 _durable_atomic_json(self.final_receipt, final_payload)
+            finally:
+                self.release_fleet_install_guard()
         production_ready = self.production_restored or self.production_preserved
         return 0 if production_ready and self.candidate_stopped and not self.failure else 1
 

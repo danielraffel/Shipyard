@@ -318,7 +318,20 @@ fn active_advisory_lock_refuses_concurrent_transaction_then_releases() {
     }
     assert!(acquired.exists(), "holder did not acquire lock");
 
-    assert!(!fixture.run(RunOptions::default()).success());
+    let refused = fixture.run_output(RunOptions::default());
+    // A held guard is a deferral, not a failure: the exact busy status and
+    // marker let the controller retry later without burning an attempt.
+    assert_eq!(
+        refused.status.code(),
+        Some(super::super::HOST_BUSY_EXIT_CODE)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .lines()
+            .any(|line| line == super::super::HOST_BUSY_MARKER),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
     assert!(!fixture.helper.exists());
     assert!(!fixture.wrapper.exists());
     holder.kill().expect("stop holder");
