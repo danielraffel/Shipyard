@@ -561,7 +561,7 @@ where
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
             return pr_watch_cmd::pr_watch_command(
-                command,
+                *command,
                 &config,
                 &cwd,
                 &runtime_paths,

@@ -283,7 +283,7 @@ pub(super) enum Command {
     PrWatch {
         /// PR-watch subcommand.
         #[command(subcommand)]
-        command: PrWatchCommand,
+        command: Box<PrWatchCommand>,
     },
     /// Plan a fail-closed exact-head changed-surface test selection in shadow mode.
     #[command(name = "changed-surface-plan")]
@@ -3034,7 +3034,7 @@ mod tests {
         let Command::PrWatch { command } = cli.command else {
             panic!("expected pr-watch");
         };
-        let super::PrWatchCommand::Scan(args) = command else {
+        let super::PrWatchCommand::Scan(args) = *command else {
             panic!("expected scan");
         };
         assert_eq!(args.repo.as_deref(), Some("o/r"));
@@ -3066,7 +3066,7 @@ mod tests {
         let Command::PrWatch { command } = cli.command else {
             panic!("expected pr-watch");
         };
-        let super::PrWatchCommand::Replay(args) = command else {
+        let super::PrWatchCommand::Replay(args) = *command else {
             panic!("expected replay");
         };
         assert_eq!(args.expect, ["8933=1,3,4,5", "8970=3"]);
@@ -3082,7 +3082,7 @@ mod tests {
         let Command::PrWatch { command } = cli.command else {
             panic!("expected pr-watch");
         };
-        let super::PrWatchCommand::Digest(args) = command else {
+        let super::PrWatchCommand::Digest(args) = *command else {
             panic!("expected digest");
         };
         assert!(!args.post);

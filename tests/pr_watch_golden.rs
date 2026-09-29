@@ -42,16 +42,10 @@ fn options(thresholds: Thresholds) -> ReplayOptions {
         tick: Duration::minutes(15),
         thresholds,
         digest: DigestPolicy::default(),
-        expectations: [
-            "8933=1,3,4,5",
-            "8970=3",
-            "9012=2",
-            "9018=2",
-            "9019=2",
-        ]
-        .iter()
-        .map(|text| text.parse::<Expectation>().unwrap())
-        .collect(),
+        expectations: ["8933=1,3,4,5", "8970=3", "9012=2", "9018=2", "9019=2"]
+            .iter()
+            .map(|text| text.parse::<Expectation>().unwrap())
+            .collect(),
         control_merged_clean: true,
     }
 }
@@ -94,7 +88,11 @@ fn golden_replay_raises_the_expected_flags_and_none_on_clean_merges() {
         assert!(result.pass, "#{} missing {:?}", result.pr, result.missing);
     }
     let control = report.control.as_ref().unwrap();
-    assert!(control.pass, "clean merges flagged: {:?}", control.violations);
+    assert!(
+        control.pass,
+        "clean merges flagged: {:?}",
+        control.violations
+    );
     assert!(report.pass);
 }
 
@@ -129,7 +127,11 @@ fn a_repeated_test_is_named_in_the_evidence() {
         .iter()
         .find(|flag| flag.pr == 9012 && flag.kind == FlagKind::RepeatTestFailure)
         .expect("flag 1 on #9012");
-    assert!(flag.evidence.contains("gpu-test-resource-locks"), "{}", flag.evidence);
+    assert!(
+        flag.evidence.contains("gpu-test-resource-locks"),
+        "{}",
+        flag.evidence
+    );
 }
 
 #[test]

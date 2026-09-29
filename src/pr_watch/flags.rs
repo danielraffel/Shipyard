@@ -211,36 +211,9 @@ fn repeat_test_failure(
     if by_check.is_empty() {
         return Vec::new();
     }
-    // The flag holds only while the pull request is still red on that check:
-    // its latest settled pass-or-fail outcome for the check is a failure.
-    let outcomes = outcomes_for(history, pr.number);
-    let latest_is_failure = |name: &str| {
-        outcomes
-            .iter()
-            .filter(|record| record.check.name == name)
-            .filter(|record| record.check.failed() || record.check.succeeded())
-            .filter_map(|record| completed_by(record.check, at).map(|time| (time, record)))
-            .max_by_key(|(time, record)| (*time, record.check.id))
-            .is_some_and(|(_, record)| record.check.failed())
-    };
-    let window_start = at - Duration::hours(thresholds.pre_existing_window_hours);
-    let other_prs = |name: &str, signature: &str| -> BTreeSet<u64> {
-        failures
-            .iter()
-            .filter(|(number, _)| **number != pr.number)
-            .filter(|(_, records)| {
-                records.iter().any(|record| {
-                    record.check.name == name
-                        && record.check.signatures.iter().any(|s| s == signature)
-                        && completed_by(record.check, at).is_some_and(|time| time >= window_start)
-                })
-            })
-            .map(|(number, _)| *number)
-            .collect()
-    };
     let mut flags = Vec::new();
     for (name, signatures) in by_check {
-        if !latest_is_failure(name) {
+        if !still_red(history, pr.number, name, at) {
             continue;
         }
         // (signature, runs, lanes, other PRs) for every repeated signature.
@@ -257,7 +230,7 @@ fn repeat_test_failure(
                     lanes.push(record.lane.clone());
                 }
             }
-            let others = other_prs(name, signature);
+            let others = other_prs_failing(failures, pr.number, name, signature, at, thresholds);
             if others.len() >= thresholds.pre_existing_other_prs {
                 pre_existing.push((signature, runs.len(), others));
             } else {
@@ -267,15 +240,6 @@ fn repeat_test_failure(
         if own_code.is_empty() && pre_existing.is_empty() {
             continue;
         }
-        let listed = |items: Vec<String>| -> String {
-            const SHOWN: usize = 3;
-            let more = items.len().saturating_sub(SHOWN);
-            let mut text = items.into_iter().take(SHOWN).collect::<Vec<_>>().join(", ");
-            if more > 0 {
-                let _ = write!(text, " and {more} more");
-            }
-            text
-        };
         let (verdict, mut evidence) = if own_code.is_empty() {
             let mut others: BTreeSet<u64> = BTreeSet::new();
             for (_, _, prs) in &pre_existing {
@@ -320,6 +284,54 @@ fn repeat_test_failure(
         });
     }
     flags
+}
+
+/// Whether the pull request is still red on `name` at `at`: its latest
+/// settled pass-or-fail outcome for the check is a failure.
+fn still_red(history: &RepoHistory, pr: u64, name: &str, at: DateTime<Utc>) -> bool {
+    outcomes_for(history, pr)
+        .iter()
+        .filter(|record| record.check.name == name)
+        .filter(|record| record.check.failed() || record.check.succeeded())
+        .filter_map(|record| completed_by(record.check, at).map(|time| (time, record)))
+        .max_by_key(|(time, record)| (*time, record.check.id))
+        .is_some_and(|(_, record)| record.check.failed())
+}
+
+/// Other pull requests whose `name` check failed with `signature` within the
+/// pre-existing window before `at`.
+fn other_prs_failing(
+    failures: &BTreeMap<u64, Vec<FailureRecord<'_>>>,
+    pr: u64,
+    name: &str,
+    signature: &str,
+    at: DateTime<Utc>,
+    thresholds: &Thresholds,
+) -> BTreeSet<u64> {
+    let window_start = at - Duration::hours(thresholds.pre_existing_window_hours);
+    failures
+        .iter()
+        .filter(|(number, _)| **number != pr)
+        .filter(|(_, records)| {
+            records.iter().any(|record| {
+                record.check.name == name
+                    && record.check.signatures.iter().any(|s| s == signature)
+                    && completed_by(record.check, at).is_some_and(|time| time >= window_start)
+            })
+        })
+        .map(|(number, _)| *number)
+        .collect()
+}
+
+/// The first three items, then "and N more".
+fn listed(items: Vec<String>) -> String {
+    const SHOWN: usize = 3;
+    let more = items.len().saturating_sub(SHOWN);
+    let mut text = items.into_iter().take(SHOWN).collect::<Vec<_>>().join(", ");
+    if more > 0 {
+        let _ = write!(text, " and {more} more");
+    }
+    text
 }
 
 /// Arming state reconstructed from the timeline.

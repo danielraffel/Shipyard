@@ -306,6 +306,35 @@ fn same_path(a: &Path, b: &Path) -> bool {
     canonical(a) == canonical(b)
 }
 
+/// One line per (pull request, flag) across all episodes.
+fn render_replay_summary(out: &mut String, report: &ReplayReport) {
+    let _ = writeln!(
+        out,
+        "summary by pull request (flag: episodes, first seen, digested?):"
+    );
+    let mut summary: std::collections::BTreeMap<(u64, u8), Vec<&crate::pr_watch::replay::Episode>> =
+        std::collections::BTreeMap::new();
+    for episode in &report.episodes {
+        summary
+            .entry((episode.pr, episode.flag))
+            .or_default()
+            .push(episode);
+    }
+    for ((pr, flag), episodes) in &summary {
+        let first = episodes[0];
+        let digested = episodes.iter().any(|episode| episode.digested_at.is_some());
+        let _ = writeln!(
+            out,
+            "  #{pr} flag {flag} {}: {} episode(s), first {}, {} — {}",
+            first.kind,
+            episodes.len(),
+            first.first_seen_at.format("%m-%d %H:%MZ"),
+            if digested { "digested" } else { "not digested" },
+            first.first_evidence
+        );
+    }
+}
+
 fn render_replay(report: &ReplayReport) -> String {
     let mut out = format!(
         "{} replay {} .. {} every {}m: {} ticks, {} PRs, required checks: {}\n",
@@ -358,31 +387,7 @@ fn render_replay(report: &ReplayReport) -> String {
             .count(),
         report.digests
     );
-    let _ = writeln!(
-        out,
-        "summary by pull request (flag: episodes, first seen, digested?):"
-    );
-    let mut summary: std::collections::BTreeMap<(u64, u8), Vec<&crate::pr_watch::replay::Episode>> =
-        std::collections::BTreeMap::new();
-    for episode in &report.episodes {
-        summary
-            .entry((episode.pr, episode.flag))
-            .or_default()
-            .push(episode);
-    }
-    for ((pr, flag), episodes) in &summary {
-        let first = episodes[0];
-        let digested = episodes.iter().any(|episode| episode.digested_at.is_some());
-        let _ = writeln!(
-            out,
-            "  #{pr} flag {flag} {}: {} episode(s), first {}, {} — {}",
-            first.kind,
-            episodes.len(),
-            first.first_seen_at.format("%m-%d %H:%MZ"),
-            if digested { "digested" } else { "not digested" },
-            first.first_evidence
-        );
-    }
+    render_replay_summary(&mut out, report);
     let _ = writeln!(out, "episodes:");
     for episode in &report.episodes {
         let _ = writeln!(
