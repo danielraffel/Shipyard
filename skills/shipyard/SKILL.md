@@ -3442,6 +3442,38 @@ filter shows `AUTHREQ_PROMPTING ... SystemPolicyRemovableVolumes` with no
 shell, whose responsible app already holds the grant, then kill the orphaned
 `git` child.
 
+The durable fix is the daemon launcher (`shipyard daemon launcher install`,
+macOS, opt-in per host). Facts it rests on, all measured with
+`responsibility_get_pid_responsible_for_pid` and tccd's `AUTHREQ_SUBJECT`:
+
+- The TCC subject of a command-line binary is its **real path**. A launchd
+  program given as the `~/.local/bin/shipyard` symlink is attributed to the
+  resolved `auth-generations/<id>/shipyard`, so pointing a LaunchAgent at the
+  symlink does not stabilize anything.
+- A launchd job is its own responsible process; its children inherit it.
+  Once the responsible pid is gone the kernel reports the process itself, so
+  a daemon orphaned by a short-lived spawner falls back to its own
+  per-generation path.
+- `exec` keeps the pid, so a launcher that execs the generation binary is
+  attributed to the generation path. The launcher must stay resident.
+
+So the launcher is a copy of the signed binary at
+`~/.local/libexec/shipyard/shipyard-daemon-launcher`, run by a per-state-root
+LaunchAgent as `daemon supervise --exec <binary>`, staying the daemon's parent.
+The launcher only spawns `<release> daemon supervise --in-place`, which runs
+the release's own daemon preparation and then `exec`s `daemon run` under the
+same pid. So the daemon runs the generation binary with the direct-spawn argv
+(fleet-update launch evidence is unchanged), and spawn invariants are never
+frozen in the launcher copy, which only an operator reinstall replaces. `install` runs one
+consent probe from launchd (the one-time prompt appears while an operator is
+there) and only then writes `<state>/daemon/launcher.json`; `spawn_detached`
+uses launchd only when that record's SHA-256 still matches the launcher file,
+and falls back to a direct spawn (loudly) on any launchctl failure. Two traps
+met building it: std passes the parent's **signal mask** to children, so the
+supervisor must spawn the daemon before blocking SIGTERM for its forwarding
+thread; and a RunAtLoad probe plist must never be written into
+`~/Library/LaunchAgents`, where it would rerun at every login.
+
 ### A reader that shares a writer's lock inherits the writer's lifetime
 
 The per-PR ship-state lock is held by a ship worker for its **entire run**. Any

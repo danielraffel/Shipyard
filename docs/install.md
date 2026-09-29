@@ -230,6 +230,18 @@ with the caller's exact mode, global-config directory, and state directory; the
 older updater process never reuses its own daemon-spawn implementation after
 replacement. A non-zero child exit or malformed refresh receipt fails closed.
 
+On macOS a detached daemon inherits the privacy (TCC) identity of the process
+that started it, and every release installs under a new path. A daemon
+refreshed by an unattended updater therefore asks macOS for Removable Volumes
+access afresh, and waits on a prompt nobody sees, the first time it touches a
+worktree on an external volume. On such hosts run `shipyard daemon launcher
+install` once from a terminal on that volume and approve the one-time prompt.
+It copies the signed binary to `~/.local/libexec/shipyard/shipyard-daemon-launcher`,
+proves from launchd that the copy can read the volume, and from then on every
+refresh starts the daemon through a per-user LaunchAgent whose resident
+launcher is the stable identity macOS remembers. `shipyard daemon launcher
+status` reports it; `uninstall` goes back to direct spawns.
+
 Non-login SSH and launchd do not need a caller-built `PATH`. Shipyard resolves
 system curl/Bash from canonical absolute locations and starts detached daemons
 with Homebrew, `/usr/local/bin`, `~/.local/bin`, and system tool directories in
