@@ -17,6 +17,13 @@ pub(super) const BEFORE_HELPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_AUTH
 pub(super) const BEFORE_WRAPPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_AUTH_WRAPPER_TARGET=";
 pub(super) const AFTER_HELPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_HELPER_TARGET=";
 pub(super) const AFTER_WRAPPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_WRAPPER_TARGET=";
+/// Exit status of a host transaction that found the host's install guard
+/// already held (a sandbox canary or another update owns the host). Nothing on
+/// the host changed, so the controller defers instead of failing the attempt.
+pub(super) const HOST_BUSY_EXIT_CODE: i32 = 75;
+/// Stderr line that accompanies [`HOST_BUSY_EXIT_CODE`]; both must agree
+/// before a non-zero exit is read as a deferral rather than a failure.
+pub(super) const HOST_BUSY_MARKER: &str = "SHIPYARD_FLEET_HOST_BUSY=fleet-auth-support.guard";
 const WRAPPER_DEFAULT_HELPER: &str = ".config/shipyard/bin/shipyard-github-app-token";
 const LOCK_ACQUISITION_SCRIPT: &str = r#"
 if [ ! -e "$auth_guard" ] && [ ! -L "$auth_guard" ]; then
@@ -30,7 +37,7 @@ test ! -L "$auth_guard"
 test "$(/usr/bin/stat -f '%u' "$auth_guard")" = "$(/usr/bin/id -u)"
 test "$(/usr/bin/stat -f '%Lp' "$auth_guard")" = 600
 exec 9<>"$auth_guard"
-if ! /usr/bin/lockf -s -t 0 9; then exec 9>&-; exit 1; fi
+if ! /usr/bin/lockf -s -t 0 9; then exec 9>&-; /usr/bin/printf '%s\n' SHIPYARD_FLEET_HOST_BUSY=fleet-auth-support.guard >&2; exit 75; fi
 if [ -e "$auth_lock" ] || [ -L "$auth_lock" ]; then
   test -d "$auth_lock"
   test ! -L "$auth_lock"

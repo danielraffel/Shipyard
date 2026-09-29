@@ -1691,7 +1691,8 @@ pub(super) enum RunnerCommand {
     /// Only lagging host classes are rolled; a host ahead of the release stops
     /// the run with an alert (exit 4) and is never downgraded. Exit 9 when
     /// anything is unreadable (nothing is rolled out), 3 while rate-limited,
-    /// 5 once the tag is terminal, 75 when another rollout holds the lock.
+    /// 5 once the tag is terminal, 75 when another rollout holds the lock or a
+    /// host's install guard is held (a Sandbox canary); a deferral is not an attempt.
     #[command(name = "fleet-reconcile")]
     FleetReconcile {
         /// Minutes a release must have been public before it is rolled out.
