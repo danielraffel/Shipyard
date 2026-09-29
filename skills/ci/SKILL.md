@@ -2753,6 +2753,13 @@ the queue absorbs.
 An unreadable surface reports `UNKNOWN`, never `absent`. Treat an `UNKNOWN`
 queue as "determine this before doing bulk work", not as "there is no queue".
 
+**Is the base red? Read `BASE HEALTH` in `shipyard landing`.** Its first line
+judges the base tip directly: the `merge_group` run(s) whose `head_sha` is the
+tip, and the conclusion of each *required* job there (never the run's
+conclusion, which an advisory Linux failure turns red). `HEALTHY`, `RED` (the
+failing required job and, when parseable, its tests), `PENDING`, or `UNPROVEN`
+(no merge-group run built the tip: a direct push), each with the tip SHA.
+
 **A red base overrides "wait for the queue".** `shipyard landing` also reads
 the repository's own `base-poison-signal/v1` annotation (Pulp publishes it from
 `main-health-detector.yml`). When it says `poisoned` and names a fix pull
