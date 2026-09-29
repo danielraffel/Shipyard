@@ -8,14 +8,17 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::app::cli::{
-    MetricsCommand, MetricsImportCommand, MetricsImportGithubArgs, MetricsImportTartciArgs,
-    MetricsRecordArgs,
+    MetricsCommand, MetricsGroupBy, MetricsImportCommand, MetricsImportGithubArgs,
+    MetricsImportTartciArgs, MetricsRecordArgs,
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
+use crate::config::LoadedConfig;
+use crate::identity::RuntimeMode;
 use crate::metrics::proxy::{Basis, ProxyValue, WALL_CONTEXT_LABEL};
 use crate::metrics::{
-    GitHubRunJob, MetricRecordInput, MetricsFinding, MetricsJobRow, MetricsStore,
-    MetricsSummaryRow, StewardshipScorecard, github_job_to_record, parse_duration_ms,
+    GateClass, GitHubRunJob, MetricRecordInput, MetricsFinding, MetricsJobRow, MetricsStore,
+    MetricsSummaryRow, StewardshipScorecard, SummaryGroupBy, github_job_to_record,
+    parse_duration_ms,
 };
 use crate::output::write_pretty_json;
 
@@ -49,17 +52,75 @@ struct MetricsTrendOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct MetricsSummaryOutput {
+    database: String,
+    group_by: SummaryGroupBy,
+    rows: Vec<MetricsSummaryRow>,
+}
+
+#[derive(Debug, Serialize)]
 struct MetricsFindingsOutput {
     database: String,
     project: String,
     profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required: Option<RequiredChecks>,
     findings: Vec<MetricsFinding>,
+}
+
+/// The required status checks `watch` classified lanes against, and where
+/// they came from.
+#[derive(Clone, Debug, Serialize)]
+struct RequiredChecks {
+    /// `flag`, `config` (`[governance] required_status_checks`), or `none`.
+    source: &'static str,
+    checks: Vec<String>,
+}
+
+/// `--required` wins; otherwise the repo config's required status checks.
+fn resolve_required(
+    flags: Vec<String>,
+    config_cwd: Option<(RuntimeMode, &Path)>,
+) -> RequiredChecks {
+    if !flags.is_empty() {
+        return RequiredChecks {
+            source: "flag",
+            checks: flags,
+        };
+    }
+    let from_config: Vec<String> = config_cwd
+        .and_then(|(mode, cwd)| LoadedConfig::load_from_cwd(mode, cwd).ok())
+        .and_then(|config| {
+            config
+                .get("governance.required_status_checks")
+                .and_then(toml::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+    if from_config.is_empty() {
+        RequiredChecks {
+            source: "none",
+            checks: Vec::new(),
+        }
+    } else {
+        RequiredChecks {
+            source: "config",
+            checks: from_config,
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn metrics_command<W: Write>(
     command: MetricsCommand,
     state_dir: &Path,
+    config_cwd: Option<(RuntimeMode, &Path)>,
     json_output: bool,
     stdout: &mut W,
 ) -> Result<std::process::ExitCode, CliFailure> {
@@ -121,10 +182,14 @@ pub(super) fn metrics_command<W: Write>(
             write_trend(stdout, json_output, store.path(), basis, rows, trend)?;
         }
         MetricsCommand::Summary(args) => {
+            let group_by = match args.group_by {
+                MetricsGroupBy::Runner => SummaryGroupBy::Runner,
+                MetricsGroupBy::Host => SummaryGroupBy::Host,
+            };
             let rows = store
-                .summary(args.project.as_deref())
+                .summary_grouped(args.project.as_deref(), group_by)
                 .map_err(|error| CliFailure::new(1, format!("metrics summary failed: {error}")))?;
-            write_summary(stdout, json_output, store.path(), rows)?;
+            write_summary(stdout, json_output, store.path(), group_by, rows)?;
         }
         MetricsCommand::Slowest(args) => {
             let rows = store
@@ -148,22 +213,28 @@ pub(super) fn metrics_command<W: Write>(
                 stdout,
                 json_output,
                 store.path(),
-                args.project,
+                (args.project, None),
                 None,
                 findings,
             )?;
         }
         MetricsCommand::Watch(args) => {
             let since_days = parse_days(&args.since)?;
+            let required = resolve_required(args.required, config_cwd);
             let findings = store
-                .watch(&args.project, since_days, args.basis.into())
+                .watch_with_required(
+                    &args.project,
+                    since_days,
+                    args.basis.into(),
+                    &required.checks,
+                )
                 .map_err(|error| CliFailure::new(1, format!("metrics watch failed: {error}")))?;
             write_findings(
                 stdout,
                 json_output,
                 store.path(),
-                args.project,
-                None,
+                (args.project, None),
+                Some(required),
                 findings,
             )?;
         }
@@ -175,8 +246,8 @@ pub(super) fn metrics_command<W: Write>(
                 stdout,
                 json_output,
                 store.path(),
-                args.project,
-                args.profile,
+                (args.project, args.profile),
+                None,
                 findings,
             )?;
         }
@@ -472,22 +543,28 @@ fn write_summary<W: Write>(
     stdout: &mut W,
     json_output: bool,
     db_path: &Path,
+    group_by: SummaryGroupBy,
     rows: Vec<MetricsSummaryRow>,
 ) -> Result<(), CliFailure> {
     if json_output {
         return write_output(
             stdout,
             true,
-            &MetricsRowsOutput {
+            &MetricsSummaryOutput {
                 database: db_path.display().to_string(),
+                group_by,
                 rows,
             },
             String::new,
         );
     }
+    let machine = match group_by {
+        SummaryGroupBy::Runner => "runner",
+        SummaryGroupBy::Host => "host",
+    };
     writeln!(
         stdout,
-        "project\ttarget\tbackend\thost\tprovider\tcount\tfail_rate\tp50_ms\tp90_ms"
+        "project\ttarget\tbackend\t{machine}\tprovider\tcount\tfail_rate\tp50_ms\tp90_ms"
     )
     .map_err(io_error)?;
     for row in rows {
@@ -513,8 +590,8 @@ fn write_findings<W: Write>(
     stdout: &mut W,
     json_output: bool,
     db_path: &Path,
-    project: String,
-    profile: Option<String>,
+    (project, profile): (String, Option<String>),
+    required: Option<RequiredChecks>,
     findings: Vec<MetricsFinding>,
 ) -> Result<(), CliFailure> {
     if json_output {
@@ -525,10 +602,29 @@ fn write_findings<W: Write>(
                 database: db_path.display().to_string(),
                 project,
                 profile,
+                required,
                 findings,
             },
             String::new,
         );
+    }
+    if let Some(required) = &required {
+        if required.checks.is_empty() {
+            writeln!(
+                stdout,
+                "required checks: none known (pass --required or set [governance] \
+                 required_status_checks); every lane is unclassified"
+            )
+            .map_err(io_error)?;
+        } else {
+            writeln!(
+                stdout,
+                "required checks ({}): {}",
+                required.source,
+                required.checks.join(", ")
+            )
+            .map_err(io_error)?;
+        }
     }
     if findings.is_empty() {
         writeln!(stdout, "No material findings.").map_err(io_error)?;
@@ -541,13 +637,37 @@ fn write_findings<W: Write>(
     {
         writeln!(stdout, "basis: {basis}; wall time is {WALL_CONTEXT_LABEL}").map_err(io_error)?;
     }
+    let mut section = None;
     for finding in findings {
+        if finding.gate.is_some() && finding.gate != section {
+            section = finding.gate;
+            let title = match finding.gate {
+                Some(GateClass::Required) => "required gates:",
+                Some(GateClass::Advisory) => "advisory jobs:",
+                _ => "unclassified lanes:",
+            };
+            writeln!(stdout, "{title}").map_err(io_error)?;
+        }
         writeln!(
             stdout,
             "{}\t{}\t{}\t{}",
             finding.severity, finding.lane, finding.signal, finding.message
         )
         .map_err(io_error)?;
+        if let Some(denominator) = &finding.denominator {
+            writeln!(
+                stdout,
+                "  denominator: {} named {} (each job's own conclusion, never the workflow \
+                 run's): previous n={} ({} success/failure), current n={} ({} success/failure)",
+                denominator.unit,
+                denominator.job_names.join(" | "),
+                denominator.previous_jobs,
+                denominator.previous_decided,
+                denominator.current_jobs,
+                denominator.current_decided,
+            )
+            .map_err(io_error)?;
+        }
     }
     Ok(())
 }
@@ -697,13 +817,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |command: MetricsCommand| {
             let mut output = Vec::new();
-            metrics_command(command, temp.path(), true, &mut output).expect("command");
+            metrics_command(command, temp.path(), None, true, &mut output).expect("command");
             serde_json::from_slice::<Value>(&output).expect("json")
         };
         let scorecard = run(MetricsCommand::Scorecard(
             crate::app::cli::MetricsWatchArgs {
                 project: "shipyard".to_owned(),
                 since: "14d".to_owned(),
+                required: Vec::new(),
                 basis: crate::app::cli::MetricsBasis::Proxy,
             },
         ));
@@ -748,9 +869,11 @@ mod tests {
             MetricsCommand::Scorecard(crate::app::cli::MetricsWatchArgs {
                 project: "shipyard".to_owned(),
                 since: "14d".to_owned(),
+                required: Vec::new(),
                 basis: crate::app::cli::MetricsBasis::Proxy,
             }),
             temp.path(),
+            None,
             false,
             &mut output,
         )

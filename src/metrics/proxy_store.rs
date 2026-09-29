@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, params};
 
-use super::MetricsFinding;
 use super::proxy::{self, Basis, Comparison, ProxySample, ProxyValue, Verdict};
+use super::{Denominator, GateClass, MetricsFinding, job_name};
 
 fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
     raw.and_then(|value| DateTime::parse_from_rfc3339(value).ok())
@@ -30,7 +30,8 @@ pub(super) fn load_samples(
                 jobs.completed_at, jobs.total_ms, jobs.runner_assigned,
                 (SELECT CASE WHEN COUNT(steps.cache_hit) = 0 THEN NULL
                              ELSE MIN(steps.cache_hit) END
-                   FROM steps WHERE steps.job_id = jobs.id)
+                   FROM steps WHERE steps.job_id = jobs.id),
+                jobs.job
            FROM jobs JOIN runs ON runs.id = jobs.run_id
           WHERE (?1 IS NULL OR runs.project = ?1) AND jobs.completed_at IS NOT NULL
           ORDER BY jobs.id",
@@ -49,6 +50,7 @@ pub(super) fn load_samples(
                 total_ms: row.get(7)?,
                 runner_assigned: row.get(8)?,
                 cache_hit: row.get(9)?,
+                job: row.get(10)?,
             })
         })?
         .collect()
@@ -128,6 +130,56 @@ fn finding(
         recommended_actions: actions,
         basis: comparison.basis.as_str(),
         comparison: Some(comparison),
+        denominator: None,
+        gate: None,
+    }
+}
+
+/// Classify a lane from the job names it holds: `Required` when any of them
+/// is a required status check, `Advisory` when none is, and `Unclassified`
+/// when no required set is known.
+pub(super) fn gate_class<'a>(
+    job_names: impl IntoIterator<Item = &'a str>,
+    required: &[String],
+) -> GateClass {
+    if required.is_empty() {
+        return GateClass::Unclassified;
+    }
+    let is_required = job_names.into_iter().any(|name| {
+        required
+            .iter()
+            .any(|check| job_name::matches(check, name) || job_name::canonical(name) == *check)
+    });
+    if is_required {
+        GateClass::Required
+    } else {
+        GateClass::Advisory
+    }
+}
+
+/// The denominator behind a lane's shares: job rows per window, each judged
+/// by that job's own conclusion.
+fn denominator(previous: &[&ProxySample], current: &[&ProxySample]) -> Denominator {
+    let decided = |samples: &[&ProxySample]| {
+        samples
+            .iter()
+            .filter(|sample| proxy::is_success(&sample.status) || proxy::is_failure(&sample.status))
+            .count()
+    };
+    let mut job_names: Vec<String> = previous
+        .iter()
+        .chain(current)
+        .map(|sample| sample.job.clone())
+        .collect();
+    job_names.sort();
+    job_names.dedup();
+    Denominator {
+        unit: "jobs",
+        previous_jobs: previous.len(),
+        current_jobs: current.len(),
+        previous_decided: decided(previous),
+        current_decided: decided(current),
+        job_names,
     }
 }
 
@@ -161,6 +213,7 @@ pub(super) fn watch_findings(
     samples: &[ProxySample],
     since_days: i64,
     now: DateTime<Utc>,
+    required: &[String],
 ) -> Vec<MetricsFinding> {
     let window = Duration::days(since_days.max(1));
     let current_start = now - window;
@@ -173,6 +226,12 @@ pub(super) fn watch_findings(
     let mut findings = Vec::new();
     for (lane, (previous, current)) in lanes {
         let comparison = proxy::compare(&previous, &current, Basis::Proxy);
+        let lane_denominator = denominator(&previous, &current);
+        let class = gate_class(
+            lane_denominator.job_names.iter().map(String::as_str),
+            required,
+        );
+        let before = findings.len();
         match comparison.verdict {
             Verdict::Regressed => findings.push(finding(
                 lane,
@@ -214,7 +273,17 @@ pub(super) fn watch_findings(
             }
             Verdict::Improved | Verdict::Unchanged => {}
         }
+        for item in &mut findings[before..] {
+            item.denominator = Some(lane_denominator.clone());
+            item.gate = Some(class);
+        }
     }
+    // Required gates first: they are what blocks a merge.
+    findings.sort_by_key(|item| match item.gate {
+        Some(GateClass::Required) => 0,
+        Some(GateClass::Unclassified) | None => 1,
+        Some(GateClass::Advisory) => 2,
+    });
     findings
 }
 
