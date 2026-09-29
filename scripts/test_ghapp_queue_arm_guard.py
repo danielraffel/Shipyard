@@ -63,6 +63,12 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
                 self.assertEqual(ejection and ejection["reason"], want["last_ejection_reason"])
                 if "last_ejection_new_head_since" in want:
                     self.assertEqual(ejection["new_head_since"], want["last_ejection_new_head_since"])
+                if "ejections_of_current_head" in want:
+                    self.assertEqual(
+                        got["ejections_of_current_head"], want["ejections_of_current_head"]
+                    )
+                if "merge_group_commit" in want:
+                    self.assertEqual(ejection["merge_group_commit"], want["merge_group_commit"])
                 for key in ("entry_state", "position", "enabled_at", "reason", "new_head_since_removal"):
                     if key in want:
                         self.assertEqual(got[key], want[key])
@@ -70,7 +76,7 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
                 self.assertEqual("allow" if allowed else "refuse", want["guard"])
                 checked += 1
         # Control: the whole corpus, real and labelled-synthetic, was visited.
-        self.assertEqual(checked, 11)
+        self.assertEqual(checked, 15)
 
     def test_real_truncated_same_head_ejection_is_ejected_and_refused(self) -> None:
         response = fixture("pr_real_truncated_same_head_ejected.json")
@@ -1022,6 +1028,246 @@ class BatchAttributionTests(unittest.TestCase):
             self.assertIn("number=8811", calls)
             self.assertIn("event=merge_group&status=failure", calls)
             self.assertIn(f"runs/{self.RUN_ID}/jobs", calls)
+
+
+
+# ---------------------------------------------------------------------------
+# Environment re-enqueue: the Python twin of src/environment_requeue.rs.
+# ---------------------------------------------------------------------------
+
+REPO = "Generous-Corp/pulp"
+
+
+def job_fixture(name: str) -> dict[str, Any]:
+    return fixture(f"job_logs/{name}")
+
+
+def failing_steps(job: dict[str, Any]) -> list[tuple[str, str]]:
+    return [
+        (step["name"], step["started_at"])
+        for step in job["job"]["steps"]
+        if step["conclusion"] == "failure"
+    ]
+
+
+class FakeApi:
+    """Answers the environment reader's reads from real captures."""
+
+    def __init__(self) -> None:
+        checks = fixture("merge_group_required_checks_real.json")
+        self.json: dict[str, Any] = {
+            f"repos/{REPO}/rules/branches/main": checks["rules_branches_main"],
+            f"repos/{REPO}/branches/main/protection/required_status_checks": checks[
+                "required_status_checks"
+            ],
+        }
+        for sha, commit in checks["commits"].items():
+            self.json[f"repos/{REPO}/commits/{sha}/check-runs?per_page=100"] = commit["check_runs"]
+            self.json[f"repos/{REPO}/commits/{sha}/status"] = commit["status"]
+        for pr in (8678, 8911, 8933):
+            self.json[f"repos/{REPO}/pulls/{pr}"] = {"base": {"ref": "main"}}
+        self.text: dict[str, Any] = {}
+        for name in (
+            "job_real_pip_relay_403.json",
+            "job_real_cargo_dns_in_build.json",
+            "job_real_8933_test_failure.json",
+        ):
+            job = job_fixture(name)
+            job_id = job["job"]["id"]
+            self.json[f"repos/{REPO}/actions/jobs/{job_id}"] = job["job"]
+            self.text[f"repos/{REPO}/actions/jobs/{job_id}/logs"] = job["log"]
+
+    def api_json(self, arguments: list[str]) -> Any:
+        value = self.json.get(arguments[1])
+        if value is None:
+            raise guard.GuardError(f"unexpected call {arguments[1]}")
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def api_text(self, arguments: list[str]) -> str:
+        value = self.text.get(arguments[1])
+        if value is None:
+            raise guard.GuardError(f"unexpected call {arguments[1]}")
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def assess(api: FakeApi, name: str, opted_in: bool = True) -> dict[str, Any] | None:
+    classification = guard.classify_pr_queue_state(fixture(name))
+    return guard.assess_environment_requeue(
+        classification, REPO, opted_in, api_json=api.api_json, api_text=api.api_text
+    )
+
+
+class EnvironmentSignaturesAgreeWithSharedCorpus(unittest.TestCase):
+    def test_every_job_log_matches_the_shared_expectations(self) -> None:
+        expected = job_fixture("expected_environment_signatures.json")
+        checked = 0
+        for name, steps in expected.items():
+            if name.startswith("_"):
+                continue
+            job = job_fixture(name)
+            failing = failing_steps(job)
+            self.assertEqual(len(failing), len(steps), name)
+            for step, started in failing:
+                with self.subTest(fixture=name, step=step):
+                    reading = guard.read_failing_step(job["log"], started)
+                    self.assertEqual(reading["reading"], steps[step]["reading"])
+                    self.assertEqual(reading.get("signature"), steps[step]["signature"])
+                    checked += 1
+        self.assertEqual(checked, 6)
+
+    def test_signature_sets_match_the_rust_module(self) -> None:
+        rust = (FIXTURES.parent.parent.parent / "src" / "environment_requeue.rs").read_text()
+        for signature in guard.ENVIRONMENT_SIGNATURES:
+            self.assertIn(f'"{signature}"', rust)
+        self.assertIn(
+            f"FAILURE_PROXIMITY_LINES: usize = {guard.FAILURE_PROXIMITY_LINES};", rust
+        )
+
+    def test_a_signature_in_the_script_echo_is_not_output(self) -> None:
+        log = job_fixture("job_real_8933_test_failure.json")["log"].splitlines()
+        segment = [log[0]]
+        for line in log[1:]:
+            if "##[group]Run " in line:
+                break
+            segment.append(line)
+        self.assertIn("##[group]Run set -euo pipefail", segment[0])
+        # Control: the signature IS in the text handed over, inside the echo.
+        self.assertTrue(any("Tunnel connection failed" in line for line in segment))
+        synthetic = "\n".join(segment) + (
+            "\n2026-09-29T06:33:30.0000000Z ##[error]Process completed with exit code 1.\n"
+        )
+        self.assertEqual(
+            guard.read_failing_step(synthetic, segment[0][:20])["reading"], "no_signature"
+        )
+        # The property itself, independent of the proximity window: no echoed
+        # script line is read as output.
+        output = guard.failing_step_output(synthetic, segment[0][:20])
+        assert output is not None
+        self.assertFalse(any("Tunnel connection failed" in line for line in output))
+        self.assertFalse(any(line.startswith("set -euo pipefail") for line in output))
+
+    def test_a_step_is_read_from_its_own_start_not_an_earlier_error(self) -> None:
+        # Real log: Chrome fails with curl (56) and a later continue-on-error
+        # step errors with exit 2. Read at the later step's start, the earlier
+        # step's signature must not be the answer.
+        job = job_fixture("job_real_chrome_proxy_connect.json")
+        later = next(
+            step for step in job["job"]["steps"] if step["name"].startswith("Observe ctest non-runs")
+        )
+        reading = guard.read_failing_step(job["log"], later["started_at"])
+        self.assertEqual(reading["reading"], "no_signature")
+
+    def test_a_signature_far_from_the_failure_explains_nothing(self) -> None:
+        def build(gap: int) -> str:
+            lines = [
+                "2026-09-29T00:00:00.0000000Z ##[group]Run make",
+                "2026-09-29T00:00:00.1000000Z make",
+                "2026-09-29T00:00:00.2000000Z ##[endgroup]",
+                "2026-09-29T00:00:01.0000000Z warning: Could not resolve host: index.crates.io",
+            ]
+            lines += ["2026-09-29T00:00:01.0000000Z [12/40] Compiling foo.cpp"] * gap
+            lines += [
+                "2026-09-29T00:00:01.0000000Z foo.cpp:1:1: error: expected ';'",
+                "2026-09-29T00:00:01.0000000Z ##[error]Process completed with exit code 1.",
+            ]
+            return "\n".join(lines) + "\n"
+
+        edge = guard.FAILURE_PROXIMITY_LINES - 3
+        self.assertEqual(guard.read_failing_step(build(edge), "2026-09-29T00:00:00Z")["reading"],
+                         "environment")
+        self.assertEqual(
+            guard.read_failing_step(build(edge + 1), "2026-09-29T00:00:00Z")["reading"],
+            "no_signature",
+        )
+
+
+class EnvironmentRequeueWorkedExamples(unittest.TestCase):
+    def test_pip_relay_ejection_of_8678_allows_one_re_enqueue(self) -> None:
+        verdict = assess(FakeApi(), "pr_real_8678_first_environment_ejection.json")
+        assert verdict is not None
+        self.assertTrue(verdict["allowed"], verdict["reason"])
+        self.assertEqual(
+            [(step["check"], step["step"]) for step in verdict["evidence"]],
+            [("macos", "Install visual-analysis Python dependencies")],
+        )
+        classification = guard.classify_pr_queue_state(
+            fixture("pr_real_8678_first_environment_ejection.json")
+        )
+        allowed, message = guard.decide(classification, None, verdict)
+        self.assertTrue(allowed)
+        self.assertIn("one environment re-enqueue", message)
+        self.assertIn("Tunnel connection failed", message)
+        # Control: the same classification without the verdict is refused.
+        self.assertFalse(guard.decide(classification)[0])
+
+    def test_cargo_dns_ejection_of_8911_allows_one_re_enqueue(self) -> None:
+        verdict = assess(FakeApi(), "pr_real_8911_environment_ejection.json")
+        assert verdict is not None
+        self.assertTrue(verdict["allowed"], verdict["reason"])
+        self.assertEqual(verdict["evidence"][0]["signature"], "Could not resolve host")
+
+    def test_test_failure_ejection_of_8933_stays_refused(self) -> None:
+        verdict = assess(FakeApi(), "pr_real_8933_test_failure_ejection.json")
+        assert verdict is not None
+        self.assertFalse(verdict["allowed"])
+        self.assertIn("macos / Test (non-Windows)", verdict["reason"])
+        classification = guard.classify_pr_queue_state(
+            fixture("pr_real_8933_test_failure_ejection.json")
+        )
+        allowed, message = guard.decide(classification, None, verdict)
+        self.assertFalse(allowed)
+        self.assertIn("Environment re-enqueue refused", message)
+
+    def test_a_second_ejection_of_the_same_head_is_refused(self) -> None:
+        verdict = assess(FakeApi(), "pr_real_8678_second_ejection_same_head.json")
+        assert verdict is not None
+        self.assertFalse(verdict["allowed"])
+        self.assertIn("2 times", verdict["reason"])
+
+    def test_not_opted_in_is_refused_without_reading(self) -> None:
+        verdict = assess(FakeApi(), "pr_real_8678_first_environment_ejection.json", False)
+        assert verdict is not None
+        self.assertFalse(verdict["allowed"])
+        self.assertIn("environment_requeue", verdict["reason"])
+
+    def test_an_unreadable_log_refuses(self) -> None:
+        api = FakeApi()
+        api.text[f"repos/{REPO}/actions/jobs/107036733221/logs"] = guard.GuardError("HTTP 404")
+        verdict = assess(api, "pr_real_8678_first_environment_ejection.json")
+        assert verdict is not None
+        self.assertFalse(verdict["allowed"])
+        self.assertIn("could not be read", verdict["reason"])
+
+    def test_a_failed_job_with_no_failing_step_refuses(self) -> None:
+        api = FakeApi()
+        job = dict(api.json[f"repos/{REPO}/actions/jobs/107036733221"])
+        job["steps"] = [dict(step, conclusion="success") for step in job["steps"]]
+        api.json[f"repos/{REPO}/actions/jobs/107036733221"] = job
+        verdict = assess(api, "pr_real_8678_first_environment_ejection.json")
+        assert verdict is not None
+        self.assertFalse(verdict["allowed"])
+        self.assertIn("no failing step recorded", verdict["reason"])
+
+    def test_only_same_head_failed_checks_ejections_are_assessed(self) -> None:
+        for name in ("pr_queued.json", "pr_never_armed.json", "pr_ejected_new_head.json"):
+            self.assertIsNone(assess(FakeApi(), name), name)
+
+    def test_opt_in_is_read_from_the_repository_config(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            config = pathlib.Path(root) / ".shipyard" / "config.toml"
+            config.parent.mkdir()
+            config.write_text("[queue.environment_requeue]\nenabled = true\n", encoding="utf-8")
+            nested = pathlib.Path(root) / "a" / "b"
+            nested.mkdir(parents=True)
+            self.assertTrue(guard.environment_requeue_enabled(nested))
+            config.write_text("[queue.environment_requeue]\nenabled = \"yes\"\n", encoding="utf-8")
+            self.assertFalse(guard.environment_requeue_enabled(nested))
+            config.write_text("[queue]\n", encoding="utf-8")
+            self.assertFalse(guard.environment_requeue_enabled(nested))
 
 
 if __name__ == "__main__":

@@ -266,6 +266,34 @@ pub(super) fn record_attempt(
     Ok(attempts)
 }
 
+/// Undo the attempt [`record_attempt`] wrote for a rollout that deferred
+/// before touching any host, restoring the tag's previous record. Refuses when
+/// the record is no longer the one this tick wrote.
+pub(super) fn withdraw_attempt(
+    state_dir: &Path,
+    tag: &str,
+    attempt: u32,
+    at: DateTime<Utc>,
+    prior: Option<TagAttempts>,
+) -> Result<(), String> {
+    let mut ledger = read_ledger(state_dir)?;
+    let current = ledger.tags.get(tag);
+    if current.map(|entry| (entry.attempts, entry.last_attempt)) != Some((attempt, Some(at))) {
+        return Err(format!(
+            "attempt record for {tag} changed since it was written; left as is"
+        ));
+    }
+    match prior {
+        Some(prior) => {
+            ledger.tags.insert(tag.to_owned(), prior);
+        }
+        None => {
+            ledger.tags.remove(tag);
+        }
+    }
+    write_ledger(state_dir, &ledger)
+}
+
 /// Stop retrying a tag.
 pub(super) fn mark_terminal(state_dir: &Path, tag: &str, reason: &str) -> Result<(), String> {
     let mut ledger = read_ledger(state_dir)?;
@@ -429,6 +457,12 @@ pub(super) enum RolloutOutcome {
     /// A host was mutated and could not be restored. It needs an operator.
     RollbackFailed {
         host_class: String,
+        reason: String,
+    },
+    /// A host refused at its install guard before any change (a sandbox
+    /// canary or another update owns it). Not an attempt: a later tick
+    /// resumes the rollout without waiting out the retry window.
+    Deferred {
         reason: String,
     },
 }
@@ -647,6 +681,13 @@ fn rollout<E: ReconcileEnv>(
 ) -> u8 {
     // Record before mutating: a crash or a failing rollout still counts as an
     // attempt, so a broken release cannot loop every tick.
+    let prior = match read_ledger(state_dir) {
+        Ok(ledger) => ledger.tags.get(tag).cloned(),
+        Err(reason) => {
+            report.decision = ReconcileDecision::Unknown { reason };
+            return EXIT_RECONCILE_UNKNOWN;
+        }
+    };
     let attempt = match record_attempt(state_dir, tag, now) {
         Ok(attempt) => attempt,
         Err(reason) => {
@@ -659,6 +700,19 @@ fn rollout<E: ReconcileEnv>(
     report.rollout = Some(outcome.clone());
     let terminal = match &outcome {
         RolloutOutcome::Verified => return 0,
+        RolloutOutcome::Deferred { .. } => {
+            // A busy host changed nothing, so this tick was not an attempt.
+            // Withdraw exactly the record written above (the controller lock
+            // is held, so nothing else wrote it) and let the next tick retry.
+            if let Err(error) = withdraw_attempt(state_dir, tag, attempt, now, prior) {
+                report
+                    .alerts
+                    .push(format!("could not withdraw the deferred attempt: {error}"));
+            } else {
+                report.attempt = None;
+            }
+            return super::EXIT_CONTROLLER_BUSY;
+        }
         RolloutOutcome::RollbackFailed { host_class, reason } => {
             // Terminal at once and alerted at once: retrying would reinstall
             // onto a host nobody has looked at. The host stays out of every
@@ -1116,6 +1170,48 @@ mod tests {
         RolloutOutcome::Failed {
             reason: "m5 failed post-rollout verification".to_owned(),
         }
+    }
+
+    #[test]
+    fn a_busy_host_defers_without_spending_an_attempt() {
+        let temp = tempfile::tempdir().expect("temp");
+        let start = Utc::now();
+        let mut env = FakeEnv::new(
+            start,
+            &[("m1", "0.208.0"), ("m5", "0.205.0")],
+            RolloutOutcome::Deferred {
+                reason: "m5 is busy".to_owned(),
+            },
+        );
+        let deferred = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(deferred.exit_code, super::super::EXIT_CONTROLLER_BUSY);
+        assert_eq!(deferred.attempt, None);
+        assert!(deferred.terminal.is_none() && env.alerts.is_empty());
+        assert!(
+            !read_ledger(temp.path())
+                .expect("ledger")
+                .tags
+                .contains_key("v0.208.0")
+        );
+
+        // The next tick is not rate-limited by the deferral: it rolls again,
+        // and a real failure then counts as the first attempt.
+        env.outcome = failed();
+        let next = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(env.rollouts.len(), 2);
+        assert_eq!(next.attempt, Some(1));
+
+        // A deferral after a real attempt restores that attempt exactly.
+        let recorded = read_ledger(temp.path()).expect("ledger").tags["v0.208.0"].clone();
+        env.now = start + chrono::Duration::hours(7);
+        env.outcome = RolloutOutcome::Deferred {
+            reason: "m5 is busy".to_owned(),
+        };
+        run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(
+            read_ledger(temp.path()).expect("ledger").tags["v0.208.0"],
+            recorded
+        );
     }
 
     #[test]

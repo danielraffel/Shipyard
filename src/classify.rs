@@ -62,16 +62,16 @@ impl std::fmt::Display for FailureClass {
     }
 }
 
-const INFRA_MARKERS: [&str; 13] = [
+/// Infra markers specific to a validation leg's transport (SSH, runner
+/// liveness, writer leases). The generic network-transport spellings live in
+/// [`crate::environment_requeue::NETWORK_TRANSPORT_MARKERS`], shared with the
+/// merge-queue environment-ejection reader, and are matched alongside these.
+const INFRA_MARKERS: [&str; 9] = [
     "Connection refused",
     "ssh: connect",
-    "Network is unreachable",
-    "Could not resolve host",
     "RUN_IN_DAYS_DEAD",
     "github runner offline",
-    "No route to host",
     "kex_exchange_identification",
-    "Connection reset by peer",
     "Connection closed by remote host",
     "Connection timed out",
     "ssh_exchange_identification",
@@ -93,7 +93,11 @@ pub fn classify_failure(
     if wall_clock_exceeded {
         return FailureClass::Timeout;
     }
-    if INFRA_MARKERS.iter().any(|marker| stderr.contains(marker)) {
+    if INFRA_MARKERS
+        .iter()
+        .chain(crate::environment_requeue::NETWORK_TRANSPORT_MARKERS.iter())
+        .any(|marker| stderr.contains(marker))
+    {
         return FailureClass::Infra;
     }
     if exit_code != 0 {

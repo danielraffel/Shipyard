@@ -1,0 +1,19 @@
+{
+  "_comment": "Ground truth for the job-log excerpts in this directory: per failing step (jobs API conclusion == failure), whether its output carries an environment signature near its failure. Asserted by BOTH src/environment_requeue.rs and scripts/ghapp_queue_arm_guard.py.",
+  "job_real_pip_relay_403.json": {
+    "Install visual-analysis Python dependencies": {"reading": "environment", "signature": "Tunnel connection failed"}
+  },
+  "job_real_chrome_proxy_connect.json": {
+    "Install pinned Chrome for browser-source fidelity (macOS ARM64)": {"reading": "environment", "signature": "Proxy CONNECT aborted"}
+  },
+  "job_real_upload_econnreset.json": {
+    "Upload exact GPU-audio SDK (macOS ARM64)": {"reading": "environment", "signature": "ECONNRESET"},
+    "Upload ctest logs and JUnit report": {"reading": "environment", "signature": "ECONNRESET"}
+  },
+  "job_real_cargo_dns_in_build.json": {
+    "Build": {"reading": "environment", "signature": "Could not resolve host"}
+  },
+  "job_real_8933_test_failure.json": {
+    "Test (non-Windows)": {"reading": "no_signature", "signature": null}
+  }
+}
