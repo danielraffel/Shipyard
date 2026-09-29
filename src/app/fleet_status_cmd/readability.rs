@@ -53,6 +53,11 @@ impl ReadBoundary {
 }
 
 /// Failure texts that mean the call did not complete.
+///
+/// Broad on purpose: these read a GitHub API call's own error text. They are
+/// not reused for CI job logs
+/// ([`crate::environment_requeue::ENVIRONMENT_SIGNATURES`]), where `timeout`
+/// or `server error` is as likely to be the head's own test failing.
 const TRANSIENT_MARKERS: [&str; 16] = [
     "rate limit",
     "rate_limit",

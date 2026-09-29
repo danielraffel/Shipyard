@@ -241,6 +241,10 @@ pub(super) struct RolloutFailure {
     pub(super) ineligible: bool,
     /// The host that was mutated and could not be restored.
     pub(super) rollback_failed_host: Option<String>,
+    /// True when a host refused at its install guard before any change (a
+    /// sandbox canary or another update owns it). Not a failed attempt: the
+    /// rollout simply resumes on a later tick.
+    pub(super) deferred: bool,
     pub(super) failure: CliFailure,
 }
 
@@ -249,6 +253,7 @@ impl From<CliFailure> for RolloutFailure {
         Self {
             ineligible: false,
             rollback_failed_host: None,
+            deferred: false,
             failure,
         }
     }
@@ -285,6 +290,7 @@ pub(super) fn run_fleet_update<W: Write>(
         .map_err(|error| RolloutFailure {
             ineligible: true,
             rollback_failed_host: None,
+            deferred: false,
             failure: CliFailure::new(1, format!("fleet release is ineligible: {error}")),
         })?;
     let mut plans = selected_classes
@@ -534,6 +540,8 @@ struct HostFailure {
     reason: String,
     /// Set when the host was mutated, then could not be restored.
     rollback_failed: bool,
+    /// Set when the host refused at its install guard before any change.
+    deferred: bool,
 }
 
 /// Apply every plan in order, then independently verify each host.
@@ -578,6 +586,7 @@ fn apply_plans<W: Write, O: HostOps>(
                     verified: &verified,
                     failed: Some((plan.class.as_str(), failure.reason.as_str())),
                     rollback_failed: failure.rollback_failed,
+                    deferred: failure.deferred,
                     not_attempted: &not_attempted,
                     skipped_current,
                 },
@@ -586,9 +595,24 @@ fn apply_plans<W: Write, O: HostOps>(
                 .chain(not_attempted)
                 .collect::<Vec<_>>()
                 .join(", ");
+            if failure.deferred {
+                return Err(RolloutFailure {
+                    ineligible: false,
+                    rollback_failed_host: None,
+                    deferred: true,
+                    failure: CliFailure::new(
+                        EXIT_CONTROLLER_BUSY,
+                        format!(
+                            "fleet update deferred at {}; hosts not yet at {target}: {lagging}; retry later",
+                            failure.reason
+                        ),
+                    ),
+                });
+            }
             return Err(RolloutFailure {
                 ineligible: false,
                 rollback_failed_host: failure.rollback_failed.then(|| plan.class.clone()),
+                deferred: false,
                 failure: CliFailure::new(
                     if failure.rollback_failed {
                         EXIT_ROLLBACK_FAILED
@@ -611,6 +635,7 @@ fn apply_plans<W: Write, O: HostOps>(
             verified: &verified,
             failed: None,
             rollback_failed: false,
+            deferred: false,
             not_attempted: &[],
             skipped_current,
         },
@@ -634,6 +659,7 @@ fn roll_back_after<W: Write, O: HostOps>(
     Ok(Some(HostFailure {
         reason: format!("{cause}; {}", outcome.summary()),
         rollback_failed: !matches!(outcome, rollback::RollbackOutcome::RolledBack { .. }),
+        deferred: false,
     }))
 }
 
@@ -649,15 +675,29 @@ fn phase_failure<W: Write, O: HostOps>(
     error: PlanPhaseError,
 ) -> Result<Option<HostFailure>, CliFailure> {
     match error {
+        // The host refused at its install guard: a sandbox canary (or another
+        // update) owns it. Nothing changed, so there is nothing to roll back
+        // and the attempt is deferred rather than failed.
+        PlanPhaseError::Command(PlanExecutionError::HostBusy(error)) => {
+            render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
+            Ok(Some(HostFailure {
+                reason: format!("{} is busy: {error}", plan.class),
+                rollback_failed: false,
+                deferred: true,
+            }))
+        }
         // Nothing on the host changed: there is nothing to roll back, and a
         // rollback of an untouched host could only make things worse.
         PlanPhaseError::BeforeMutation(
-            PlanExecutionError::TimedOut(error) | PlanExecutionError::Failed(error),
+            PlanExecutionError::TimedOut(error)
+            | PlanExecutionError::Failed(error)
+            | PlanExecutionError::HostBusy(error),
         ) => {
             render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
             Ok(Some(HostFailure {
                 reason: format!("{} failed before any change: {error}", plan.class),
                 rollback_failed: false,
+                deferred: false,
             }))
         }
         PlanPhaseError::Command(PlanExecutionError::TimedOut(error)) => {
@@ -678,12 +718,15 @@ fn phase_failure<W: Write, O: HostOps>(
             Ok(Some(HostFailure {
                 reason: format!("{} failed: {error}", plan.class),
                 rollback_failed: false,
+                deferred: false,
             }))
         }
         // The update committed but its evidence could not be read: the host
         // runs something nobody verified, which is never "current".
         PlanPhaseError::AfterCommit(
-            PlanExecutionError::TimedOut(error) | PlanExecutionError::Failed(error),
+            PlanExecutionError::TimedOut(error)
+            | PlanExecutionError::Failed(error)
+            | PlanExecutionError::HostBusy(error),
         ) => {
             render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
             roll_back_after(
@@ -857,6 +900,11 @@ fn rollback_host(
         Err(PlanExecutionError::TimedOut(error) | PlanExecutionError::Failed(error)) => {
             return failed(error);
         }
+        Err(PlanExecutionError::HostBusy(error)) => {
+            return failed(format!(
+                "rollback could not take the host's install guard: {error}"
+            ));
+        }
     };
     if let Err(error) = validate_evidence(&rollback_plan, &rollback_evidence) {
         return failed(format!("rollback evidence failed: {error}"));
@@ -934,6 +982,7 @@ struct FleetSummary<'a> {
     verified: &'a [verify::HostVerification],
     failed: Option<(&'a str, &'a str)>,
     rollback_failed: bool,
+    deferred: bool,
     not_attempted: &'a [String],
     skipped_current: &'a [String],
 }
@@ -956,11 +1005,14 @@ fn render_fleet_summary<W: Write>(
         data.insert("target".to_owned(), Value::from(target));
         data.insert(
             "verdict".to_owned(),
-            Value::from(match (summary.failed, summary.rollback_failed) {
-                (None, _) => "verified",
-                (Some(_), false) => "failed",
-                (Some(_), true) => "rollback_failed",
-            }),
+            Value::from(
+                match (summary.failed, summary.rollback_failed, summary.deferred) {
+                    (None, _, _) => "verified",
+                    (Some(_), _, true) => "deferred",
+                    (Some(_), false, false) => "failed",
+                    (Some(_), true, false) => "rollback_failed",
+                },
+            ),
         );
         data.insert("verified_hosts".to_owned(), Value::from(verified_names));
         data.insert(
@@ -983,6 +1035,17 @@ fn render_fleet_summary<W: Write>(
         );
         write_json_envelope(stdout, "runner.fleet-update", data)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else if let Some((host, reason)) = summary.failed
+        && summary.deferred
+    {
+        writeln!(
+            stdout,
+            "fleet {target}: DEFERRED at {host} ({reason}); verified: [{}]; not attempted: [{}]; already current: [{}]",
+            verified_names.join(", "),
+            summary.not_attempted.join(", "),
+            summary.skipped_current.join(", ")
+        )
+        .map_err(io)?;
     } else if let Some((host, reason)) = summary.failed {
         writeln!(
             stdout,

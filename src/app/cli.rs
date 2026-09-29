@@ -546,7 +546,8 @@ pub(super) enum Command {
         skip_targets: Vec<String>,
         /// Adopt the current head SHA when recorded ship-state drifted (amend /
         /// force-push), re-validating the new head instead of failing on
-        /// SHA drift (Shipyard #346).
+        /// SHA drift (Shipyard #346). A head that fast-forwards the recorded
+        /// one on the same base branch is adopted without this flag.
         #[arg(long = "adopt-head")]
         adopt_head: bool,
         /// Do not arm GitHub-native auto-merge on the pull request. By default
@@ -621,7 +622,8 @@ pub(super) enum Command {
         skill_reason: Option<String>,
         /// Adopt the current head SHA when recorded ship-state drifted (amend /
         /// force-push), re-validating the new head instead of failing on
-        /// SHA drift (Shipyard #346).
+        /// SHA drift (Shipyard #346). A head that fast-forwards the recorded
+        /// one on the same base branch is adopted without this flag.
         #[arg(long = "adopt-head")]
         adopt_head: bool,
         /// Durable workstream identifier for an atomic merge-steward handoff.
@@ -1689,7 +1691,8 @@ pub(super) enum RunnerCommand {
     /// Only lagging host classes are rolled; a host ahead of the release stops
     /// the run with an alert (exit 4) and is never downgraded. Exit 9 when
     /// anything is unreadable (nothing is rolled out), 3 while rate-limited,
-    /// 5 once the tag is terminal, 75 when another rollout holds the lock.
+    /// 5 once the tag is terminal, 75 when another rollout holds the lock or a
+    /// host's install guard is held (a Sandbox canary); a deferral is not an attempt.
     #[command(name = "fleet-reconcile")]
     FleetReconcile {
         /// Minutes a release must have been public before it is rolled out.

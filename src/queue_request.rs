@@ -545,15 +545,17 @@ impl ExecutionProvenance {
         if canonical_cwd != self.canonical_cwd {
             return Err(invalid_snapshot("submitted cwd identity changed"));
         }
-        let repo_root = git_output(cwd, &["rev-parse", "--show-toplevel"])
-            .and_then(|path| fs::canonicalize(path.trim()).ok())
-            .ok_or_else(|| invalid_snapshot("submitted cwd is no longer a Git checkout"))?;
+        let repo_root = git_probe(cwd, &["rev-parse", "--show-toplevel"])
+            .map_err(|failure| failure.into_snapshot_error(NOT_A_CHECKOUT))
+            .and_then(|path| {
+                fs::canonicalize(path.trim()).map_err(|_| invalid_snapshot(NOT_A_CHECKOUT))
+            })?;
         if repo_root != self.repo_root {
             return Err(invalid_snapshot("submitted repository root changed"));
         }
-        let head = git_output(cwd, &["rev-parse", "HEAD"])
+        let head = git_probe(cwd, &["rev-parse", "HEAD"])
             .map(|head| head.trim().to_owned())
-            .ok_or_else(|| invalid_snapshot("submitted Git HEAD is unreadable"))?;
+            .map_err(|failure| failure.into_snapshot_error("submitted Git HEAD is unreadable"))?;
         if head != self.head_sha {
             return Err(invalid_snapshot(format!(
                 "submitted Git HEAD drifted from {} to {head}",
@@ -561,9 +563,12 @@ impl ExecutionProvenance {
             )));
         }
         if let Some(expected_repo) = &self.repo_slug {
-            let remote = git_output(cwd, &["remote", "get-url", "origin"])
-                .and_then(|remote| parse_repo_slug(remote.trim()))
-                .ok_or_else(|| invalid_snapshot("submitted Git origin is unreadable"))?;
+            let remote = git_probe(cwd, &["remote", "get-url", "origin"])
+                .map_err(|failure| failure.into_snapshot_error(ORIGIN_UNREADABLE))
+                .and_then(|remote| {
+                    parse_repo_slug(remote.trim())
+                        .ok_or_else(|| invalid_snapshot(ORIGIN_UNREADABLE))
+                })?;
             if &remote != expected_repo {
                 return Err(invalid_snapshot(format!(
                     "submitted repository changed from {expected_repo} to {remote}"
@@ -622,16 +627,73 @@ fn parse_repo_slug(remote: &str) -> Option<String> {
     (slug.split('/').count() == 2).then(|| slug.to_owned())
 }
 
+/// Upper bound for one checkout-identity Git probe.
+///
+/// The daemon runs these probes on its dispatch thread for every queued ship
+/// job, so an unbounded probe wedges the whole queue. A probe can block
+/// indefinitely without any Git fault: on macOS, the first access to an
+/// external volume by a process whose responsible binary has no
+/// removable-volume grant parks `getcwd` inside `open` until a privacy prompt
+/// is answered, which never happens on an unattended host. Identity probes
+/// are cheap, so a slow one is treated as an unreadable checkout.
+const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const NOT_A_CHECKOUT: &str = "submitted cwd is no longer a Git checkout";
+const ORIGIN_UNREADABLE: &str = "submitted Git origin is unreadable";
+
+#[cfg(test)]
+thread_local! {
+    static GIT_PROBE_OVERRIDE: std::cell::RefCell<Option<(PathBuf, Duration)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn git_probe_program_and_timeout() -> (std::ffi::OsString, Duration) {
+    #[cfg(test)]
+    if let Some((program, timeout)) = GIT_PROBE_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return (program.into_os_string(), timeout);
+    }
+    ("git".into(), GIT_PROBE_TIMEOUT)
+}
+
 fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+    git_probe(cwd, args).ok()
+}
+
+/// Run one bounded Git identity probe, reporting a timeout distinctly from an
+/// unreadable checkout so operators can tell a blocked filesystem from drift.
+fn git_probe(cwd: &Path, args: &[&str]) -> Result<String, GitProbeFailure> {
+    let (program, timeout) = git_probe_program_and_timeout();
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    let label = format!("git {}", args.join(" "));
+    match crate::process::run_output_until(&mut command, std::time::Instant::now() + timeout, label)
+    {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+        Err(crate::process::BoundedOutputError::TimedOut { .. }) => {
+            Err(GitProbeFailure::TimedOut(timeout))
+        }
+        Ok(_) | Err(_) => Err(GitProbeFailure::Failed),
+    }
+}
+
+#[derive(Debug)]
+enum GitProbeFailure {
+    Failed,
+    TimedOut(Duration),
+}
+
+impl GitProbeFailure {
+    fn into_snapshot_error(self, unreadable: &str) -> QueueRequestError {
+        match self {
+            Self::Failed => invalid_snapshot(unreadable),
+            Self::TimedOut(timeout) => invalid_snapshot(format!(
+                "{unreadable}: Git probe timed out after {}s (the checkout may be \
+                 blocked by filesystem access, e.g. an unanswered macOS privacy prompt)",
+                timeout.as_secs_f64()
+            )),
+        }
+    }
 }
 
 /// Queued execution kind.
@@ -3655,6 +3717,67 @@ mod tests {
                 "accepted hostile origin {hostile}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provenance_validate_bounds_a_git_probe_that_never_returns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "Shipyard Test"],
+            vec!["config", "user.email", "shipyard@example.invalid"],
+            vec!["commit", "-q", "--allow-empty", "-m", "fixture"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .expect("head");
+        let head = String::from_utf8(head.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned();
+        let provenance = ExecutionProvenance::capture(&repo, None, &head).expect("capture");
+        provenance.validate(&repo).expect("real git validates");
+
+        // A probe that blocks like a Git child parked on an unanswered macOS
+        // privacy prompt: it never exits on its own.
+        let hung_git = temp.path().join("hung-git");
+        std::fs::write(&hung_git, "#!/bin/sh\nexec sleep 30\n").expect("hung git");
+        std::fs::set_permissions(&hung_git, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        super::GIT_PROBE_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = Some((hung_git, Duration::from_millis(300)));
+        });
+        let started = std::time::Instant::now();
+        let result = provenance.validate(&repo);
+        let elapsed = started.elapsed();
+        super::GIT_PROBE_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+
+        let error = result
+            .expect_err("a hung Git probe must fail closed")
+            .to_string();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "validate must return within the probe bound, took {elapsed:?}"
+        );
+        assert!(
+            error.contains("no longer a Git checkout") && error.contains("timed out"),
+            "timeout must be reported distinctly: {error}"
+        );
     }
 
     #[test]

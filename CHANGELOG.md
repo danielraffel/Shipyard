@@ -3,6 +3,26 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02280"></a>
+## [0.228.0] - 2026-09-29
+
+- fix/sandbox canary fleet update exclusion ([#648](https://github.com/danielraffel/Shipyard/pull/648))
+
+<a id="v02260"></a>
+## [0.226.0] - 2026-09-29
+
+- fix/env ejection requeue ([#645](https://github.com/danielraffel/Shipyard/pull/645))
+
+<a id="v02251"></a>
+## [0.225.1] - 2026-09-29
+
+- fix/daemon bounded provenance git ([#646](https://github.com/danielraffel/Shipyard/pull/646))
+
+<a id="v02250"></a>
+## [0.225.0] - 2026-09-29
+
+- fix/ship ff adopt and untrack path ([#637](https://github.com/danielraffel/Shipyard/pull/637))
+
 <a id="v02242"></a>
 ## [0.224.2] - 2026-09-28
 
@@ -1661,6 +1681,10 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.228.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.228.0
+[0.226.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.226.0
+[0.225.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.225.1
+[0.225.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.225.0
 [0.224.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.224.2
 [0.224.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.224.1
 [0.224.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.224.0

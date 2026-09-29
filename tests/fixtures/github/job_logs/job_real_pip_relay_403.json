@@ -1,0 +1,353 @@
+{
+ "_provenance": {
+  "source": "GET repos/Generous-Corp/pulp/actions/jobs/107036733221 and .../logs, captured 2026-09-29",
+  "job_id": 107036733221,
+  "job_name": "macos",
+  "runner_name": "m5-pulp-gate-slot2-02-15606-8",
+  "run_id": 35815699794,
+  "log_lines_kept": [
+   [
+    1250,
+    1430
+   ]
+  ],
+  "log_lines_total": 1480,
+  "ejected": "Generous-Corp/pulp#8678 at 2026-09-23T03:56:13Z (merge-group commit 2410ca49, required check macos = this job)",
+  "what": "pip through the egress relay: Tunnel connection failed: 403 Forbidden, exit 1. A continue-on-error step after it prints its own ##[error] (exit 2)."
+ },
+ "job": {
+  "id": 107036733221,
+  "name": "macos",
+  "steps": [
+   {
+    "number": 1,
+    "name": "Set up job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:52:55Z",
+    "completed_at": "2026-09-23T03:52:58Z"
+   },
+   {
+    "number": 2,
+    "name": "Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:52:58Z",
+    "completed_at": "2026-09-23T03:53:15Z"
+   },
+   {
+    "number": 3,
+    "name": "Fetch protected capability base",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:53:15Z",
+    "completed_at": "2026-09-23T03:53:15Z"
+   },
+   {
+    "number": 4,
+    "name": "Hydrate bounded GPU provenance commits",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:53:15Z",
+    "completed_at": "2026-09-23T03:53:35Z"
+   },
+   {
+    "number": 5,
+    "name": "Set up Namespace macOS cache",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:53:35Z",
+    "completed_at": "2026-09-23T03:53:35Z"
+   },
+   {
+    "number": 6,
+    "name": "Install Linux dependencies",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:53:35Z",
+    "completed_at": "2026-09-23T03:53:35Z"
+   },
+   {
+    "number": 7,
+    "name": "Namespace cache (brew + ccache + Pulp FetchContent)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:53:35Z",
+    "completed_at": "2026-09-23T03:53:35Z"
+   },
+   {
+    "number": 8,
+    "name": "brew update (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:53:35Z",
+    "completed_at": "2026-09-23T03:53:46Z"
+   },
+   {
+    "number": 9,
+    "name": "Install ccache (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:53:46Z",
+    "completed_at": "2026-09-23T03:54:00Z"
+   },
+   {
+    "number": 10,
+    "name": "Install ccache (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:54:00Z",
+    "completed_at": "2026-09-23T03:54:00Z"
+   },
+   {
+    "number": 11,
+    "name": "Restore FetchContent sources (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:54:00Z",
+    "completed_at": "2026-09-23T03:54:00Z"
+   },
+   {
+    "number": 12,
+    "name": "Restore ccache (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:54:00Z",
+    "completed_at": "2026-09-23T03:54:00Z"
+   },
+   {
+    "number": 13,
+    "name": "Bootstrap repository dependencies",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:54:00Z",
+    "completed_at": "2026-09-23T03:54:18Z"
+   },
+   {
+    "number": 14,
+    "name": "Install pinned Chrome for browser-source fidelity (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:54:18Z",
+    "completed_at": "2026-09-23T03:54:28Z"
+   },
+   {
+    "number": 15,
+    "name": "Save FetchContent sources (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:54:28Z",
+    "completed_at": "2026-09-23T03:54:28Z"
+   },
+   {
+    "number": 16,
+    "name": "Fetch prebuilt Skia (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:54:28Z",
+    "completed_at": "2026-09-23T03:54:28Z"
+   },
+   {
+    "number": 17,
+    "name": "Intel canary — lint + x86_64 GPU-off compile",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:54:28Z",
+    "completed_at": "2026-09-23T03:54:28Z"
+   },
+   {
+    "number": 18,
+    "name": "Ccache effective config (proof of override)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:54:28Z",
+    "completed_at": "2026-09-23T03:54:28Z"
+   },
+   {
+    "number": 19,
+    "name": "Install materialized runtime Node test dependencies (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:54:28Z",
+    "completed_at": "2026-09-23T03:54:28Z"
+   },
+   {
+    "number": 20,
+    "name": "Configure",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:54:28Z",
+    "completed_at": "2026-09-23T03:55:32Z"
+   },
+   {
+    "number": 21,
+    "name": "Install visual-analysis Python dependencies",
+    "status": "completed",
+    "conclusion": "failure",
+    "started_at": "2026-09-23T03:55:32Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 22,
+    "name": "Build",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 23,
+    "name": "Ccache stats",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 24,
+    "name": "Save ccache (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 25,
+    "name": "Test (non-Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 26,
+    "name": "Observe ctest non-runs (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 27,
+    "name": "Observe GPU adapter contract (self-hosted macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 28,
+    "name": "Test installed SDK capability contract (affected changes)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 29,
+    "name": "Test A2T structural receipt issuer",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 30,
+    "name": "Verify A2T structural receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 31,
+    "name": "Publish A2T structural verification",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 32,
+    "name": "Surface ctest failures (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:41Z"
+   },
+   {
+    "number": 33,
+    "name": "Upload ctest logs and JUnit report",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:55:41Z",
+    "completed_at": "2026-09-23T03:55:44Z"
+   },
+   {
+    "number": 34,
+    "name": "Test (Windows — UTF-8 code page wrapped)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:44Z",
+    "completed_at": "2026-09-23T03:55:44Z"
+   },
+   {
+    "number": 35,
+    "name": "Issue exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:44Z",
+    "completed_at": "2026-09-23T03:55:44Z"
+   },
+   {
+    "number": 36,
+    "name": "Publish exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:44Z",
+    "completed_at": "2026-09-23T03:55:44Z"
+   },
+   {
+    "number": 37,
+    "name": "Upload plugin bundles (macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:44Z",
+    "completed_at": "2026-09-23T03:55:44Z"
+   },
+   {
+    "number": 38,
+    "name": "Upload plugin bundles (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:44Z",
+    "completed_at": "2026-09-23T03:55:44Z"
+   },
+   {
+    "number": 39,
+    "name": "Upload plugin bundles (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:55:44Z",
+    "completed_at": "2026-09-23T03:55:44Z"
+   },
+   {
+    "number": 78,
+    "name": "Post Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:55:44Z",
+    "completed_at": "2026-09-23T03:55:44Z"
+   },
+   {
+    "number": 79,
+    "name": "Complete job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:55:44Z",
+    "completed_at": "2026-09-23T03:55:45Z"
+   }
+  ]
+ },
+ "log": "2026-09-23T03:55:29.3825430Z -- Pulp: SVG <image> data-URI decoding enabled (skresources links)\n2026-09-23T03:55:29.6181570Z -- Pulp: using shared cache for Catch2: /Users/admin/Library/Caches/Pulp/fetchcontent-src/catch2-v3.7.1\n2026-09-23T03:55:29.6242900Z -- Performing Test HAVE_FLAG__ffile_prefix_map__Users_admin_Library_Caches_Pulp_fetchcontent_src_catch2_v3_7_1__\n2026-09-23T03:55:29.6992160Z -- Performing Test HAVE_FLAG__ffile_prefix_map__Users_admin_Library_Caches_Pulp_fetchcontent_src_catch2_v3_7_1__ - Success\n2026-09-23T03:55:30.3633420Z -- Pulp: planning/ submodule not initialized — skipping generated-import C++ test targets (pulp-test-design-import-cpp-codegen, pulp-test-design-import-cpp-core-link, pulp-test-design-import-cpp-only). Run `git submodule update --init planning` to enable.\n2026-09-23T03:55:30.5100630Z -- Pulp plugin: SampleRegionAllpass (formats: VST3;CLAP;AU)\n2026-09-23T03:55:31.0557100Z -- pulp-rs: enabled (cargo=/Users/admin/.cargo/bin/cargo, profile=release)\n2026-09-23T03:55:31.0908760Z -- Configuring done (62.3s)\n2026-09-23T03:55:32.6657470Z -- Generating done (1.6s)\n2026-09-23T03:55:32.7029070Z -- Build files have been written to: /Users/admin/actions-runner/_work/pulp/pulp/build-macos\n2026-09-23T03:55:32.7331710Z ##[group]Run set -euo pipefail\n2026-09-23T03:55:32.7331930Z set -euo pipefail\n2026-09-23T03:55:32.7332110Z # Seven ctest registrations import numpy, Pillow or scikit-image and\n2026-09-23T03:55:32.7332350Z # skip themselves when one of those is missing. A ctest SKIP reads\n2026-09-23T03:55:32.7332590Z # exactly like a PASS, so a lane that quietly lost a wheel reports\n2026-09-23T03:55:32.7332820Z # green without running the checks it was built for. Installing the\n2026-09-23T03:55:32.7333030Z # declared set on every platform that runs ctest keeps the\n2026-09-23T03:55:32.7333240Z # non-skippable visual-python-deps-present check answerable\n2026-09-23T03:55:32.7333460Z # everywhere, rather than red on the platforms the install misses.\n2026-09-23T03:55:32.7333620Z #\n2026-09-23T03:55:32.7333760Z # The interpreter must be the one CMake configured, not whatever this\n2026-09-23T03:55:32.7334020Z # shell resolves: ctest invokes Python3_EXECUTABLE, so installing into\n2026-09-23T03:55:32.7334240Z # a different interpreter would leave every one of those tests\n2026-09-23T03:55:32.7334440Z # skipping while this step reported success.\n2026-09-23T03:55:32.7334570Z #\n2026-09-23T03:55:32.7334720Z # find_package(Python3 COMPONENTS Interpreter) records the interpreter\n2026-09-23T03:55:32.7334940Z # it resolved in the INTERNAL cache entry _Python3_EXECUTABLE and\n2026-09-23T03:55:32.7335160Z # leaves the public Python3_EXECUTABLE a normal variable, so the\n2026-09-23T03:55:32.7335370Z # public name reaches the cache only when a configure passes\n2026-09-23T03:55:32.7335580Z # -DPython3_EXECUTABLE. The local Shipyard lane passes it; this\n2026-09-23T03:55:32.7335850Z # workflow does not. Read the internal entry first — it holds the\n2026-09-23T03:55:32.7336070Z # value the public variable expanded to when test/cmake registered\n2026-09-23T03:55:32.7336290Z # these tests, which is exactly what ctest launches — and fall back to\n2026-09-23T03:55:32.7336510Z # the public entry for a configure that pinned one explicitly.\n2026-09-23T03:55:32.7336690Z cache=\"$PULP_BUILD_DIR/CMakeCache.txt\"\n2026-09-23T03:55:32.7336880Z py=\"$(sed -n 's/^_Python3_EXECUTABLE:[^=]*=//p' \"$cache\" | head -1)\"\n2026-09-23T03:55:32.7337050Z if [ -z \"$py\" ]; then\n2026-09-23T03:55:32.7337210Z   py=\"$(sed -n 's/^Python3_EXECUTABLE:[^=]*=//p' \"$cache\" | head -1)\"\n2026-09-23T03:55:32.7337360Z fi\n2026-09-23T03:55:32.7337450Z if [ -z \"$py\" ]; then\n2026-09-23T03:55:32.7337600Z   echo \"No Python3 interpreter is recorded in $cache\" >&2\n2026-09-23T03:55:32.7337810Z   echo \"(looked for _Python3_EXECUTABLE, then Python3_EXECUTABLE).\" >&2\n2026-09-23T03:55:32.7338070Z   echo \"The visual-analysis tests resolve their interpreter from that cache entry,\" >&2\n2026-09-23T03:55:32.7338350Z   echo \"so installing into any other interpreter would leave them skipping.\" >&2\n2026-09-23T03:55:32.7338540Z   exit 1\n2026-09-23T03:55:32.7338620Z fi\n2026-09-23T03:55:32.7338750Z echo \"Installing the declared visual-analysis set into $py\"\n2026-09-23T03:55:32.7339200Z # PEP 668 hosts (Homebrew, Debian) refuse a plain --user install; the\n2026-09-23T03:55:32.7339410Z # second form is the sanctioned override for those hosts.\n2026-09-23T03:55:32.7339640Z \"$py\" -m pip install --user --upgrade -r tools/motion/visual/requirements.txt || \\\n2026-09-23T03:55:32.7339950Z   \"$py\" -m pip install --break-system-packages --user --upgrade -r tools/motion/visual/requirements.txt\n2026-09-23T03:55:32.7362360Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-23T03:55:32.7362530Z env:\n2026-09-23T03:55:32.7362630Z   PULP_BUILD_DIR: build-macos\n2026-09-23T03:55:32.7362980Z   CCACHE_COMPILERCHECK: content\n2026-09-23T03:55:32.7363120Z   CCACHE_NODEPEND: true\n2026-09-23T03:55:32.7363220Z   CCACHE_SLOPPINESS: time_macros\n2026-09-23T03:55:32.7363600Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-23T03:55:32.7363990Z ##[endgroup]\n2026-09-23T03:55:32.7598290Z Installing the declared visual-analysis set into /opt/homebrew/Frameworks/Python.framework/Versions/3.14/bin/python3.14\n2026-09-23T03:55:33.4218040Z error: externally-managed-environment\n2026-09-23T03:55:33.4218180Z \n2026-09-23T03:55:33.4218530Z × This environment is externally managed\n2026-09-23T03:55:33.4218760Z ╰─> To install Python packages system-wide, try brew install\n2026-09-23T03:55:33.4218960Z     xyz, where xyz is the package you are trying to\n2026-09-23T03:55:33.4219120Z     install.\n2026-09-23T03:55:33.4219220Z     \n2026-09-23T03:55:33.4219400Z     If you wish to install a Python library that isn't in Homebrew,\n2026-09-23T03:55:33.4219590Z     use a virtual environment:\n2026-09-23T03:55:33.4219710Z     \n2026-09-23T03:55:33.4219810Z     python3 -m venv path/to/venv\n2026-09-23T03:55:33.4247890Z     source path/to/venv/bin/activate\n2026-09-23T03:55:33.4248050Z     python3 -m pip install xyz\n2026-09-23T03:55:33.4248190Z     \n2026-09-23T03:55:33.4248330Z     If you wish to install a Python application that isn't in Homebrew,\n2026-09-23T03:55:33.4248570Z     it may be easiest to use 'pipx install xyz', which will manage a\n2026-09-23T03:55:33.4248770Z     virtual environment for you. You can install pipx with\n2026-09-23T03:55:33.4248920Z     \n2026-09-23T03:55:33.4249000Z     brew install pipx\n2026-09-23T03:55:33.4249100Z     \n2026-09-23T03:55:33.4249240Z     You may restore the old behavior of pip by passing\n2026-09-23T03:55:33.4249420Z     the '--break-system-packages' flag to pip, or by adding\n2026-09-23T03:55:33.4249630Z     'break-system-packages = true' to your pip.conf file. The latter\n2026-09-23T03:55:33.4249810Z     will permanently disable this error.\n2026-09-23T03:55:33.4249940Z     \n2026-09-23T03:55:33.4250070Z     If you disable this error, we STRONGLY recommend that you additionally\n2026-09-23T03:55:33.4250290Z     pass the '--user' flag to pip, or set 'user = true' in your pip.conf\n2026-09-23T03:55:33.4250510Z     file. Failure to do this can result in a broken Homebrew installation.\n2026-09-23T03:55:33.4250680Z     \n2026-09-23T03:55:33.4250870Z     Read more about this behavior here: <https://peps.python.org/pep-0668/>\n2026-09-23T03:55:33.4251030Z \n2026-09-23T03:55:33.4251360Z note: If you believe this is a mistake, please contact your Python installation or OS distribution provider. You can override this, at the risk of breaking your Python installation or OS, by passing --break-system-packages.\n2026-09-23T03:55:33.4251820Z hint: See PEP 668 for the detailed specification.\n2026-09-23T03:55:33.6119120Z WARNING: Cache entry deserialization failed, entry ignored\n2026-09-23T03:55:33.6151700Z WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'OSError('Tunnel connection failed: 403 Forbidden')': /simple/numpy/\n2026-09-23T03:55:34.1300730Z WARNING: Retrying (Retry(total=3, connect=None, read=None, redirect=None, status=None)) after connection broken by 'OSError('Tunnel connection failed: 403 Forbidden')': /simple/numpy/\n2026-09-23T03:55:35.1388620Z WARNING: Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'OSError('Tunnel connection failed: 403 Forbidden')': /simple/numpy/\n2026-09-23T03:55:37.1525060Z WARNING: Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'OSError('Tunnel connection failed: 403 Forbidden')': /simple/numpy/\n2026-09-23T03:55:41.1625620Z WARNING: Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'OSError('Tunnel connection failed: 403 Forbidden')': /simple/numpy/\n2026-09-23T03:55:41.1658110Z ERROR: Could not find a version that satisfies the requirement numpy>=1.24 (from versions: none)\n2026-09-23T03:55:41.1661090Z ERROR: No matching distribution found for numpy>=1.24\n2026-09-23T03:55:41.2019740Z ##[error]Process completed with exit code 1.\n2026-09-23T03:55:41.2040230Z ##[group]Run if command -v ccache >/dev/null 2>&1; then\n2026-09-23T03:55:41.2040430Z if command -v ccache >/dev/null 2>&1; then\n2026-09-23T03:55:41.2040570Z   ccache --show-stats\n2026-09-23T03:55:41.2040690Z else\n2026-09-23T03:55:41.2040800Z   echo \"ccache not available; skipping stats\"\n2026-09-23T03:55:41.2040950Z fi\n2026-09-23T03:55:41.2055300Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-23T03:55:41.2055450Z env:\n2026-09-23T03:55:41.2055550Z   PULP_BUILD_DIR: build-macos\n2026-09-23T03:55:41.2055660Z   CCACHE_COMPILERCHECK: content\n2026-09-23T03:55:41.2055770Z   CCACHE_NODEPEND: true\n2026-09-23T03:55:41.2055870Z   CCACHE_SLOPPINESS: time_macros\n2026-09-23T03:55:41.2056250Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-23T03:55:41.2056610Z ##[endgroup]\n2026-09-23T03:55:41.3176330Z Cacheable calls:   41202 / 42157 (97.73%)\n2026-09-23T03:55:41.3176560Z   Hits:            38269 / 41202 (92.88%)\n2026-09-23T03:55:41.3176720Z     Direct:        37570 / 38269 (98.17%)\n2026-09-23T03:55:41.3176850Z     Preprocessed:    699 / 38269 ( 1.83%)\n2026-09-23T03:55:41.3177000Z   Misses:           2933 / 41202 ( 7.12%)\n2026-09-23T03:55:41.3177130Z Uncacheable calls:   955 / 42157 ( 2.27%)\n2026-09-23T03:55:41.3177280Z Local storage:\n2026-09-23T03:55:41.3177410Z   Cache size (GB):   0.1 /  40.0 ( 0.16%)\n2026-09-23T03:55:41.3177590Z   Hits:            38269 / 41202 (92.88%)\n2026-09-23T03:55:41.3177740Z   Misses:           2933 / 41202 ( 7.12%)\n2026-09-23T03:55:41.3212780Z ##[group]Run set -uo pipefail\n2026-09-23T03:55:41.3212960Z set -uo pipefail\n2026-09-23T03:55:41.3213120Z junit=\"$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml\"\n2026-09-23T03:55:41.3213340Z listing=\"$(ctest --test-dir \"$PULP_BUILD_DIR\" -N 2>/dev/null)\" || listing=\"\"\n2026-09-23T03:55:41.3213600Z raw_lines=\"$(printf '%s\\n' \"$listing\" | wc -l | tr -d ' ')\"\n2026-09-23T03:55:41.3213820Z registered=\"$(printf '%s\\n' \"$listing\" | sed -n 's/^Total Tests: //p' | tail -1)\"\n2026-09-23T03:55:41.3214070Z # Also echo the control to the job log. $GITHUB_STEP_SUMMARY has no\n2026-09-23T03:55:41.3214280Z # REST API, so a summary-only number cannot be read back from a\n2026-09-23T03:55:41.3214490Z # finished run; the log can. Same reason the ctest-failure step below\n2026-09-23T03:55:41.3214670Z # echoes its names twice.\n2026-09-23T03:55:41.3214940Z echo \"ctest-nonruns: registered(ctest -N raw lines)=$raw_lines registered(total)=${registered:-unknown}\"\n2026-09-23T03:55:41.3215210Z python3 tools/scripts/ctest_nonruns.py \"$junit\" \\\n2026-09-23T03:55:41.3215410Z   --registered \"${registered:-unknown}\" --raw-lines \"$raw_lines\" \\\n2026-09-23T03:55:41.3215620Z   --json-output \"$PULP_BUILD_DIR/ctest.nonruns.json\" \\\n2026-09-23T03:55:41.3215940Z   --leg \"$PULP_CTEST_LEG\" >> \"$GITHUB_STEP_SUMMARY\"\n2026-09-23T03:55:41.3230510Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-23T03:55:41.3230660Z env:\n2026-09-23T03:55:41.3230760Z   PULP_BUILD_DIR: build-macos\n2026-09-23T03:55:41.3230890Z   CCACHE_COMPILERCHECK: content\n2026-09-23T03:55:41.3231020Z   CCACHE_NODEPEND: true\n2026-09-23T03:55:41.3231130Z   CCACHE_SLOPPINESS: time_macros\n2026-09-23T03:55:41.3231490Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-23T03:55:41.3231880Z   PULP_CTEST_LEG: macOS (ARM64) [local]\n2026-09-23T03:55:41.3232010Z ##[endgroup]\n2026-09-23T03:55:41.5043510Z ctest-nonruns: registered(ctest -N raw lines)=24020 registered(total)=1691\n2026-09-23T03:55:41.5458450Z ctest-nonruns: observation=unavailable declared=None testcases=None nonruns=0\n2026-09-23T03:55:41.5504640Z ##[error]Process completed with exit code 2.\n2026-09-23T03:55:41.5545400Z ##[group]Run tdir=\"$PULP_BUILD_DIR/Testing/Temporary\"\n2026-09-23T03:55:41.5545650Z tdir=\"$PULP_BUILD_DIR/Testing/Temporary\"\n2026-09-23T03:55:41.5545790Z {\n2026-09-23T03:55:41.5545910Z   echo \"## ❌ ctest failures — macOS (ARM64) [local]\"\n2026-09-23T03:55:41.5546100Z   if [ -f \"$tdir/LastTestsFailed.log\" ]; then\n2026-09-23T03:55:41.5546250Z     echo \"### Failed tests\"\n2026-09-23T03:55:41.5546400Z     echo '```'; cat \"$tdir/LastTestsFailed.log\"; echo '```'\n2026-09-23T03:55:41.5546590Z     echo \"### Failing assertions (from LastTest.log)\"\n2026-09-23T03:55:41.5546730Z     echo '```'\n2026-09-23T03:55:41.5546930Z     grep -aE \"FAILED:|with expansion:|REQUIRE\\(|REQUIRE_FALSE\\(|CHECK\\(\" \"$tdir/LastTest.log\" 2>/dev/null | head -60\n2026-09-23T03:55:41.5547180Z     echo '```'\n2026-09-23T03:55:41.5547270Z   else\n2026-09-23T03:55:41.5547510Z     echo \"_No ctest result log at \\`$tdir\\` — the test step likely failed before ctest ran (configure/build/crash)._\"\n2026-09-23T03:55:41.5547770Z   fi\n2026-09-23T03:55:41.5547850Z } >> \"$GITHUB_STEP_SUMMARY\"\n2026-09-23T03:55:41.5548020Z # Also echo failed-test names to the (locally-readable) job log.\n2026-09-23T03:55:41.5548310Z { [ -f \"$tdir/LastTestsFailed.log\" ] && { echo \"=== ctest failed tests ===\"; cat \"$tdir/LastTestsFailed.log\"; }; } || true\n2026-09-23T03:55:41.5563050Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-23T03:55:41.5563210Z env:\n2026-09-23T03:55:41.5563300Z   PULP_BUILD_DIR: build-macos\n2026-09-23T03:55:41.5563410Z   CCACHE_COMPILERCHECK: content\n2026-09-23T03:55:41.5563530Z   CCACHE_NODEPEND: true\n2026-09-23T03:55:41.5563620Z   CCACHE_SLOPPINESS: time_macros\n2026-09-23T03:55:41.5563970Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-23T03:55:41.5564350Z ##[endgroup]\n2026-09-23T03:55:41.5765020Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/\n2026-09-23T03:55:41.5766060Z ##[group]Run actions/upload-artifact@v5\n2026-09-23T03:55:41.5766190Z with:\n"
+}

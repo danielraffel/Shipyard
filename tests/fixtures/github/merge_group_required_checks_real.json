@@ -1,0 +1,732 @@
+{
+ "_provenance": {
+  "source": "GET repos/Generous-Corp/pulp/commits/<sha>/check-runs?per_page=100 and .../status, and GET repos/Generous-Corp/pulp/branches/main/protection/required_status_checks, captured 2026-09-29. Check runs trimmed to id/name/status/conclusion/app.slug; statuses to context/state."
+ },
+ "required_status_checks": {
+  "contexts": [
+   "Enforce version & skill sync",
+   "Build + prove + (owner-gated) deploy",
+   "Vellum trusted freeze",
+   "Vellum freeze",
+   "macos"
+  ]
+ },
+ "rules_branches_main": [
+  {
+   "type": "merge_queue",
+   "parameters": {
+    "merge_method": "MERGE",
+    "max_entries_to_build": 3,
+    "min_entries_to_merge": 1,
+    "max_entries_to_merge": 5,
+    "min_entries_to_merge_wait_minutes": 1,
+    "grouping_strategy": "ALLGREEN",
+    "check_response_timeout_minutes": 120
+   },
+   "ruleset_source_type": "Repository",
+   "ruleset_source": "Generous-Corp/pulp",
+   "ruleset_id": 19431100
+  }
+ ],
+ "commits": {
+  "2410ca497342cfc0264bf5b72713de0b56099a0f": {
+   "check_runs": {
+    "total_count": 24,
+    "check_runs": [
+     {
+      "id": 107042011931,
+      "name": "linux",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107042011845,
+      "name": "windows",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036733890,
+      "name": "github.event_name == 'merge_group' && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true' || needs.protected-receipt-reuse.outputs.macos_reused == 'true') && 'macos' || 'macos-merge-unused'",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036733221,
+      "name": "macos",
+      "status": "completed",
+      "conclusion": "failure",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036733195,
+      "name": "Linux (x64) [github-hosted]",
+      "status": "completed",
+      "conclusion": "failure",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036690938,
+      "name": "Windows MIDI Services SDK compile-gate (advisory)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036690908,
+      "name": "Windows MSVC release-path gate",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036690838,
+      "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true') && 'macos' || 'macos-pr-unused'",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036690458,
+      "name": "Windows BLE compile-gate (advisory)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036690419,
+      "name": "a2t-protected-event",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036689694,
+      "name": "protected-receipt-reuse",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036636842,
+      "name": "android-emulator-test",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036636361,
+      "name": "android-build",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036636308,
+      "name": "Pulp repository-isolation local proof",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036636191,
+      "name": "Trusted base executor",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036636063,
+      "name": "resolve-runners",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036635539,
+      "name": "Enforce version & skill sync",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036635519,
+      "name": "resolve-provider",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036635357,
+      "name": "classify",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036635347,
+      "name": "Build + prove + (owner-gated) deploy",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036635207,
+      "name": "Vellum trusted freeze",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036635198,
+      "name": "android-run-fixtures",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036635100,
+      "name": "api-contracts",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 107036635026,
+      "name": "Vellum freeze",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     }
+    ]
+   },
+   "status": {
+    "state": "pending",
+    "statuses": []
+   }
+  },
+  "a8efc64d8240e5584f082b02330869ce2e25733b": {
+   "check_runs": {
+    "total_count": 25,
+    "check_runs": [
+     {
+      "id": 108611773049,
+      "name": "linux",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108611772948,
+      "name": "windows",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608242796,
+      "name": "github.event_name == 'merge_group' && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true' || needs.protected-receipt-reuse.outputs.macos_reused == 'true') && 'macos' || 'macos-merge-unused'",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608241905,
+      "name": "Linux (x64) [github-hosted]",
+      "status": "completed",
+      "conclusion": "failure",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608241896,
+      "name": "macos",
+      "status": "completed",
+      "conclusion": "failure",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608209591,
+      "name": "Windows MSVC release-path gate",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608209560,
+      "name": "a2t-protected-event",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608209418,
+      "name": "Windows BLE compile-gate (advisory)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608209371,
+      "name": "Windows MIDI Services SDK compile-gate (advisory)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608209112,
+      "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true') && 'macos' || 'macos-pr-unused'",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608208590,
+      "name": "protected-receipt-reuse",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608169265,
+      "name": "android-emulator-test",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608168758,
+      "name": "Pulp repository-isolation local proof",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608168751,
+      "name": "pr-gate-settle",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608168720,
+      "name": "Trusted base executor",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608168522,
+      "name": "android-build",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608168407,
+      "name": "resolve-runners",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608168351,
+      "name": "Build + prove + (owner-gated) deploy",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608168234,
+      "name": "classify",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608168111,
+      "name": "resolve-provider",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608167962,
+      "name": "api-contracts",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608167958,
+      "name": "Enforce version & skill sync",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608167957,
+      "name": "android-run-fixtures",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608167908,
+      "name": "Vellum trusted freeze",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 108608167841,
+      "name": "Vellum freeze",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     }
+    ]
+   },
+   "status": {
+    "state": "pending",
+    "statuses": []
+   }
+  },
+  "72515ddd3aa0bcd67142e2f3147bef1b1b781af2": {
+   "check_runs": {
+    "total_count": 25,
+    "check_runs": [
+     {
+      "id": 109292434403,
+      "name": "windows",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109292432271,
+      "name": "linux",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284817830,
+      "name": "github.event_name == 'merge_group' && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true' || needs.protected-receipt-reuse.outputs.macos_reused == 'true') && 'macos' || 'macos-merge-unused'",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284816084,
+      "name": "Linux (x64) [github-hosted]",
+      "status": "completed",
+      "conclusion": "failure",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284816079,
+      "name": "macos",
+      "status": "completed",
+      "conclusion": "failure",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284759691,
+      "name": "a2t-protected-event",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284759641,
+      "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true') && 'macos' || 'macos-pr-unused'",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284758618,
+      "name": "protected-receipt-reuse",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284726984,
+      "name": "Windows MSVC release-path gate",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284726577,
+      "name": "Windows BLE compile-gate (advisory)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284726508,
+      "name": "Windows MIDI Services SDK compile-gate (advisory)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284654317,
+      "name": "android-emulator-test",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284653830,
+      "name": "pr-gate-settle",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284653530,
+      "name": "Pulp repository-isolation local proof",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284653215,
+      "name": "android-build",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284652990,
+      "name": "resolve-runners",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284652604,
+      "name": "resolve-provider",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284652440,
+      "name": "classify",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284652279,
+      "name": "Trusted base executor",
+      "status": "completed",
+      "conclusion": "skipped",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284652126,
+      "name": "Build + prove + (owner-gated) deploy",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284651990,
+      "name": "api-contracts",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284651796,
+      "name": "android-run-fixtures",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284651738,
+      "name": "Vellum freeze",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284651491,
+      "name": "Enforce version & skill sync",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 109284651273,
+      "name": "Vellum trusted freeze",
+      "status": "completed",
+      "conclusion": "success",
+      "app": {
+       "slug": "github-actions"
+      }
+     }
+    ]
+   },
+   "status": {
+    "state": "pending",
+    "statuses": []
+   }
+  }
+ }
+}
