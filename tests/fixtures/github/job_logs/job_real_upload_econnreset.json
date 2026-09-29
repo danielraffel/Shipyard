@@ -1,0 +1,377 @@
+{
+ "_provenance": {
+  "source": "GET repos/Generous-Corp/pulp/actions/jobs/108394332394 and .../logs, captured 2026-09-29",
+  "job_id": 108394332394,
+  "job_name": "macos",
+  "runner_name": "m5-pulp-gate-01-60006-38",
+  "run_id": 36238386608,
+  "log_lines_kept": [
+   [
+    63470,
+    63565
+   ]
+  ],
+  "log_lines_total": 63578,
+  "ejected": "Generous-Corp/pulp#8895 (merge-group commit ef392782)",
+  "what": "Two actions/upload-artifact steps fail with ##[error]Unable to make request: ECONNRESET."
+ },
+ "job": {
+  "id": 108394332394,
+  "name": "macos",
+  "steps": [
+   {
+    "number": 1,
+    "name": "Set up job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:22:41Z",
+    "completed_at": "2026-09-26T11:22:46Z"
+   },
+   {
+    "number": 2,
+    "name": "Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:22:46Z",
+    "completed_at": "2026-09-26T11:22:56Z"
+   },
+   {
+    "number": 3,
+    "name": "Fetch protected capability base",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:22:56Z",
+    "completed_at": "2026-09-26T11:22:56Z"
+   },
+   {
+    "number": 4,
+    "name": "Hydrate bounded GPU provenance commits",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:22:56Z",
+    "completed_at": "2026-09-26T11:23:17Z"
+   },
+   {
+    "number": 5,
+    "name": "Set up Namespace macOS cache",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:23:17Z",
+    "completed_at": "2026-09-26T11:23:17Z"
+   },
+   {
+    "number": 6,
+    "name": "Install Linux dependencies",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:23:17Z",
+    "completed_at": "2026-09-26T11:23:17Z"
+   },
+   {
+    "number": 7,
+    "name": "Namespace cache (brew + ccache + Pulp FetchContent)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:23:17Z",
+    "completed_at": "2026-09-26T11:23:17Z"
+   },
+   {
+    "number": 8,
+    "name": "brew update (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:23:17Z",
+    "completed_at": "2026-09-26T11:23:29Z"
+   },
+   {
+    "number": 9,
+    "name": "Install ccache (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:23:29Z",
+    "completed_at": "2026-09-26T11:23:42Z"
+   },
+   {
+    "number": 10,
+    "name": "Install ccache (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:23:42Z",
+    "completed_at": "2026-09-26T11:23:42Z"
+   },
+   {
+    "number": 11,
+    "name": "Restore FetchContent sources (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:23:42Z",
+    "completed_at": "2026-09-26T11:23:42Z"
+   },
+   {
+    "number": 12,
+    "name": "Restore ccache (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:23:42Z",
+    "completed_at": "2026-09-26T11:23:42Z"
+   },
+   {
+    "number": 13,
+    "name": "Bootstrap repository dependencies",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:23:42Z",
+    "completed_at": "2026-09-26T11:24:00Z"
+   },
+   {
+    "number": 14,
+    "name": "Install pinned Chrome for browser-source fidelity (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:24:00Z",
+    "completed_at": "2026-09-26T11:24:09Z"
+   },
+   {
+    "number": 15,
+    "name": "Save FetchContent sources (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:24:09Z",
+    "completed_at": "2026-09-26T11:24:09Z"
+   },
+   {
+    "number": 16,
+    "name": "Fetch prebuilt Skia (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:24:09Z",
+    "completed_at": "2026-09-26T11:24:10Z"
+   },
+   {
+    "number": 17,
+    "name": "Intel canary — lint + x86_64 GPU-off compile",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:24:10Z",
+    "completed_at": "2026-09-26T11:24:10Z"
+   },
+   {
+    "number": 18,
+    "name": "Ccache effective config (proof of override)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:24:10Z",
+    "completed_at": "2026-09-26T11:24:10Z"
+   },
+   {
+    "number": 19,
+    "name": "Install materialized runtime Node test dependencies (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:24:10Z",
+    "completed_at": "2026-09-26T11:24:10Z"
+   },
+   {
+    "number": 20,
+    "name": "Configure",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:24:10Z",
+    "completed_at": "2026-09-26T11:25:18Z"
+   },
+   {
+    "number": 21,
+    "name": "Install visual-analysis Python dependencies",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:25:18Z",
+    "completed_at": "2026-09-26T11:25:23Z"
+   },
+   {
+    "number": 22,
+    "name": "Build",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:25:23Z",
+    "completed_at": "2026-09-26T11:28:19Z"
+   },
+   {
+    "number": 23,
+    "name": "Ccache stats",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:28:19Z",
+    "completed_at": "2026-09-26T11:28:19Z"
+   },
+   {
+    "number": 24,
+    "name": "Save ccache (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:28:19Z",
+    "completed_at": "2026-09-26T11:28:19Z"
+   },
+   {
+    "number": 25,
+    "name": "Test fast deterministic tier (pull request head)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:28:19Z",
+    "completed_at": "2026-09-26T11:28:19Z"
+   },
+   {
+    "number": 26,
+    "name": "Test (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:28:19Z",
+    "completed_at": "2026-09-26T11:37:14Z"
+   },
+   {
+    "number": 27,
+    "name": "Observe ctest non-runs (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:37:14Z",
+    "completed_at": "2026-09-26T11:37:15Z"
+   },
+   {
+    "number": 28,
+    "name": "Observe GPU adapter contract (self-hosted macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:37:15Z",
+    "completed_at": "2026-09-26T11:37:16Z"
+   },
+   {
+    "number": 29,
+    "name": "Test installed SDK capability contract (affected changes)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:37:16Z",
+    "completed_at": "2026-09-26T11:39:07Z"
+   },
+   {
+    "number": 30,
+    "name": "Install and publish exact GPU-audio SDK (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:39:07Z",
+    "completed_at": "2026-09-26T11:39:20Z"
+   },
+   {
+    "number": 31,
+    "name": "Upload exact GPU-audio SDK (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "failure",
+    "started_at": "2026-09-26T11:39:20Z",
+    "completed_at": "2026-09-26T11:40:25Z"
+   },
+   {
+    "number": 32,
+    "name": "Test A2T structural receipt issuer",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:40:25Z",
+    "completed_at": "2026-09-26T11:40:25Z"
+   },
+   {
+    "number": 33,
+    "name": "Verify A2T structural receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:40:25Z",
+    "completed_at": "2026-09-26T11:40:25Z"
+   },
+   {
+    "number": 34,
+    "name": "Publish A2T structural verification",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:40:25Z",
+    "completed_at": "2026-09-26T11:40:25Z"
+   },
+   {
+    "number": 35,
+    "name": "Surface ctest failures (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:40:25Z",
+    "completed_at": "2026-09-26T11:40:25Z"
+   },
+   {
+    "number": 36,
+    "name": "Upload ctest logs and JUnit report",
+    "status": "completed",
+    "conclusion": "failure",
+    "started_at": "2026-09-26T11:40:25Z",
+    "completed_at": "2026-09-26T11:41:30Z"
+   },
+   {
+    "number": 37,
+    "name": "Test (Windows — UTF-8 code page wrapped)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:41:30Z",
+    "completed_at": "2026-09-26T11:41:30Z"
+   },
+   {
+    "number": 38,
+    "name": "Issue exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:41:30Z",
+    "completed_at": "2026-09-26T11:41:30Z"
+   },
+   {
+    "number": 39,
+    "name": "Publish exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:41:30Z",
+    "completed_at": "2026-09-26T11:41:30Z"
+   },
+   {
+    "number": 40,
+    "name": "Upload plugin bundles (macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:41:30Z",
+    "completed_at": "2026-09-26T11:41:30Z"
+   },
+   {
+    "number": 41,
+    "name": "Upload plugin bundles (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:41:30Z",
+    "completed_at": "2026-09-26T11:41:30Z"
+   },
+   {
+    "number": 42,
+    "name": "Upload plugin bundles (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-26T11:41:30Z",
+    "completed_at": "2026-09-26T11:41:30Z"
+   },
+   {
+    "number": 84,
+    "name": "Post Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:41:30Z",
+    "completed_at": "2026-09-26T11:41:31Z"
+   },
+   {
+    "number": 85,
+    "name": "Complete job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-26T11:41:31Z",
+    "completed_at": "2026-09-26T11:41:32Z"
+   }
+  ]
+ },
+ "log": "2026-09-26T11:39:09.7901240Z -- Installing: /Users/admin/actions-runner/_work/_temp/pulp-gpu-audio-sdk/external/skia-build/build/mac-gpu/lib/Release/libsksg.a\n2026-09-26T11:39:09.7902910Z -- Installing: /Users/admin/actions-runner/_work/_temp/pulp-gpu-audio-sdk/external/skia-build/build/mac-gpu/lib/Release/libdawn_combined.a\n2026-09-26T11:39:09.7904660Z -- Installing: /Users/admin/actions-runner/_work/_temp/pulp-gpu-audio-sdk/external/skia-build/build/mac-gpu/lib/Release/libskshaper.a\n2026-09-26T11:39:09.7906330Z -- Installing: /Users/admin/actions-runner/_work/_temp/pulp-gpu-audio-sdk/external/skia-build/build/mac-gpu/lib/Release/libskunicode_icu.a\n2026-09-26T11:39:09.7908330Z -- Installing: /Users/admin/actions-runner/_work/_temp/pulp-gpu-audio-sdk/external/skia-build/build/mac-gpu/lib/Release/libskunicode_core.a\n2026-09-26T11:39:09.7909810Z -- Installing: /Users/admin/actions-runner/_work/_temp/pulp-gpu-audio-sdk/external/skia-build/build/share\n2026-09-26T11:39:09.7910750Z -- Installing: /Users/admin/actions-runner/_work/_temp/pulp-gpu-audio-sdk/external/skia-build/build/share/icudtl.dat\n2026-09-26T11:39:20.7568860Z ##[group]Run actions/upload-artifact@v5\n2026-09-26T11:39:20.7569000Z with:\n2026-09-26T11:39:20.7569150Z   name: pulp-gpu-audio-sdk-ef392782a3ff18de164f4807518b3fdc40b8e0b0-macos\n2026-09-26T11:39:20.7569500Z   path: /Users/admin/actions-runner/_work/_temp/pulp-gpu-audio-sdk.tar.gz\n/Users/admin/actions-runner/_work/_temp/pulp-gpu-audio-sdk.receipt.json\n\n2026-09-26T11:39:20.7569780Z   if-no-files-found: error\n2026-09-26T11:39:20.7569880Z   retention-days: 7\n2026-09-26T11:39:20.7569970Z   compression-level: 0\n2026-09-26T11:39:20.7570050Z   overwrite: false\n2026-09-26T11:39:20.7570140Z   include-hidden-files: false\n2026-09-26T11:39:20.7570240Z env:\n2026-09-26T11:39:20.7570320Z   PULP_BUILD_DIR: build-macos\n2026-09-26T11:39:20.7570430Z   CCACHE_COMPILERCHECK: content\n2026-09-26T11:39:20.7570530Z   CCACHE_NODEPEND: true\n2026-09-26T11:39:20.7570630Z   CCACHE_SLOPPINESS: time_macros\n2026-09-26T11:39:20.7570970Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-26T11:39:20.7571310Z ##[endgroup]\n2026-09-26T11:39:20.9853330Z (node:87379) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.\n2026-09-26T11:39:20.9853730Z (Use `node --trace-deprecation ...` to show where the warning was created)\n2026-09-26T11:39:20.9881430Z Multiple search paths detected. Calculating the least common ancestor of all paths\n2026-09-26T11:39:20.9882970Z The least common ancestor is /Users/admin/actions-runner/_work/_temp. This will be the root directory of the artifact\n2026-09-26T11:39:20.9883290Z With the provided path, there will be 2 files uploaded\n2026-09-26T11:39:20.9884480Z Artifact name is valid!\n2026-09-26T11:39:20.9884710Z Root directory input is valid!\n2026-09-26T11:39:21.6557100Z Beginning upload of artifact content to blob storage\n2026-09-26T11:39:21.6921520Z (node:87379) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.\n2026-09-26T11:40:25.7354430Z ##[error]Unable to make request: ECONNRESET\nIf you are using self-hosted runners, please make sure your runner has access to all GitHub endpoints: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#communication-between-self-hosted-runners-and-github\n2026-09-26T11:40:25.7943450Z ##[group]Run tdir=\"$PULP_BUILD_DIR/Testing/Temporary\"\n2026-09-26T11:40:25.7943850Z tdir=\"$PULP_BUILD_DIR/Testing/Temporary\"\n2026-09-26T11:40:25.7944150Z {\n2026-09-26T11:40:25.7944410Z   echo \"## ❌ ctest failures — macOS (ARM64) [local]\"\n2026-09-26T11:40:25.7944810Z   if [ -f \"$tdir/LastTestsFailed.log\" ]; then\n2026-09-26T11:40:25.7945110Z     echo \"### Failed tests\"\n2026-09-26T11:40:25.7945440Z     echo '```'; cat \"$tdir/LastTestsFailed.log\"; echo '```'\n2026-09-26T11:40:25.7945800Z     echo \"### Failing assertions (from LastTest.log)\"\n2026-09-26T11:40:25.7946110Z     echo '```'\n2026-09-26T11:40:25.7946560Z     grep -aE \"FAILED:|with expansion:|REQUIRE\\(|REQUIRE_FALSE\\(|CHECK\\(\" \"$tdir/LastTest.log\" 2>/dev/null | head -60\n2026-09-26T11:40:25.7947460Z     echo '```'\n2026-09-26T11:40:25.7947670Z   else\n2026-09-26T11:40:25.7948150Z     echo \"_No ctest result log at \\`$tdir\\` — the test step likely failed before ctest ran (configure/build/crash)._\"\n2026-09-26T11:40:25.7948630Z   fi\n2026-09-26T11:40:25.7948820Z } >> \"$GITHUB_STEP_SUMMARY\"\n2026-09-26T11:40:25.7949160Z # Also echo failed-test names to the (locally-readable) job log.\n2026-09-26T11:40:25.7949760Z { [ -f \"$tdir/LastTestsFailed.log\" ] && { echo \"=== ctest failed tests ===\"; cat \"$tdir/LastTestsFailed.log\"; }; } || true\n2026-09-26T11:40:25.7982210Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-26T11:40:25.7982500Z env:\n2026-09-26T11:40:25.7982700Z   PULP_BUILD_DIR: build-macos\n2026-09-26T11:40:25.7982930Z   CCACHE_COMPILERCHECK: content\n2026-09-26T11:40:25.7983160Z   CCACHE_NODEPEND: true\n2026-09-26T11:40:25.7983370Z   CCACHE_SLOPPINESS: time_macros\n2026-09-26T11:40:25.7984110Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-26T11:40:25.7984850Z ##[endgroup]\n2026-09-26T11:40:25.8302400Z ##[group]Run actions/upload-artifact@v5\n2026-09-26T11:40:25.8302590Z with:\n2026-09-26T11:40:25.8302690Z   name: ctest-logs-macos\n2026-09-26T11:40:25.8302980Z   path: build-macos/Testing/Temporary/\nbuild-macos/ctest.junit.xml\nbuild-macos/ctest-pr-fast.junit.xml\nbuild-macos/ctest.nonruns.json\n\n2026-09-26T11:40:25.8303270Z   if-no-files-found: ignore\n2026-09-26T11:40:25.8303380Z   retention-days: 7\n2026-09-26T11:40:25.8303490Z   compression-level: 6\n2026-09-26T11:40:25.8303610Z   overwrite: false\n2026-09-26T11:40:25.8303720Z   include-hidden-files: false\n2026-09-26T11:40:25.8303840Z env:\n2026-09-26T11:40:25.8303930Z   PULP_BUILD_DIR: build-macos\n2026-09-26T11:40:25.8304050Z   CCACHE_COMPILERCHECK: content\n2026-09-26T11:40:25.8304170Z   CCACHE_NODEPEND: true\n2026-09-26T11:40:25.8304280Z   CCACHE_SLOPPINESS: time_macros\n2026-09-26T11:40:25.8304670Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-26T11:40:25.8305030Z ##[endgroup]\n2026-09-26T11:40:25.9195370Z (node:87516) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.\n2026-09-26T11:40:25.9199310Z (Use `node --trace-deprecation ...` to show where the warning was created)\n2026-09-26T11:40:25.9223790Z Multiple search paths detected. Calculating the least common ancestor of all paths\n2026-09-26T11:40:25.9224660Z The least common ancestor is /Users/admin/actions-runner/_work/pulp/pulp/build-macos. This will be the root directory of the artifact\n2026-09-26T11:40:25.9225300Z With the provided path, there will be 5 files uploaded\n2026-09-26T11:40:25.9226510Z Artifact name is valid!\n2026-09-26T11:40:25.9226770Z Root directory input is valid!\n2026-09-26T11:40:26.6553680Z Beginning upload of artifact content to blob storage\n2026-09-26T11:40:26.7693320Z (node:87516) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.\n2026-09-26T11:41:30.8079340Z ##[error]Unable to make request: ECONNRESET\nIf you are using self-hosted runners, please make sure your runner has access to all GitHub endpoints: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#communication-between-self-hosted-runners-and-github\n2026-09-26T11:41:30.8238330Z Post job cleanup.\n2026-09-26T11:41:30.8993050Z [command]/opt/homebrew/bin/git version\n2026-09-26T11:41:30.9071910Z git version 2.54.0\n2026-09-26T11:41:30.9084410Z Copying '/Users/admin/.gitconfig' to '/Users/admin/actions-runner/_work/_temp/b77afcb9-66cb-497a-a1fc-c433e4e11c60/.gitconfig'\n"
+}

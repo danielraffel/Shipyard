@@ -1,0 +1,708 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "number": 8933,
+        "state": "OPEN",
+        "headRefOid": "aca6727e457b3c7dc2082eee074a1f44b1a062e1",
+        "isInMergeQueue": false,
+        "mergeQueueEntry": null,
+        "autoMergeRequest": null,
+        "timelineItems": {
+          "pageInfo": {
+            "hasPreviousPage": false
+          },
+          "nodes": [
+            {
+              "__typename": "AutoMergeEnabledEvent",
+              "createdAt": "2026-09-27T12:55:38Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "AutoMergeDisabledEvent",
+              "createdAt": "2026-09-27T12:56:55Z",
+              "reason": "Manually disabled by user",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "AutoMergeEnabledEvent",
+              "createdAt": "2026-09-27T13:13:04Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "HeadRefForcePushedEvent",
+              "createdAt": "2026-09-27T23:12:10Z",
+              "afterCommit": {
+                "oid": "0d16f73b1509a983d93a8566a9d123767555ecec"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-28T01:47:46Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-28T02:07:08Z",
+              "reason": "manual",
+              "actor": {
+                "login": "shipyard-local"
+              },
+              "beforeCommit": {
+                "oid": "e1b86ff7926b72154f62dfe873552591d7d6dce5",
+                "parents": {
+                  "nodes": [
+                    {
+                      "oid": "e32bee3b45fe5c7b1ebfc42be9b442b5afcea8a6"
+                    },
+                    {
+                      "oid": "8a8b8a65bb574273bf8079e8c1f1be9ca4d1d337"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "__typename": "AutoMergeEnabledEvent",
+              "createdAt": "2026-09-28T02:14:39Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-28T03:47:01Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-28T04:36:51Z",
+              "reason": "failed_checks",
+              "actor": {
+                "login": "github-merge-queue"
+              },
+              "beforeCommit": {
+                "oid": "adb1c0ac552b3d72979b5a5f9b254b646873f588",
+                "parents": {
+                  "nodes": [
+                    {
+                      "oid": "1985f94787ee360b7a648e53be4071d00cb0fa36"
+                    },
+                    {
+                      "oid": "395bd724fcb6e296a5ee2b24c32cb525c0ce2e73"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "__typename": "HeadRefForcePushedEvent",
+              "createdAt": "2026-09-28T05:12:53Z",
+              "afterCommit": {
+                "oid": "2592fbeaf8b38260334693a503459d0c2df8afa5"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-28T05:51:43Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-28T06:03:47Z",
+              "reason": "manual",
+              "actor": {
+                "login": "shipyard-local"
+              },
+              "beforeCommit": {
+                "oid": "2559ec7f6e49ee114ed6014446b637d9705f6d81",
+                "parents": {
+                  "nodes": [
+                    {
+                      "oid": "4ed370c1eea590889ba07bdcccce6fc3d2d52816"
+                    },
+                    {
+                      "oid": "2592fbeaf8b38260334693a503459d0c2df8afa5"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "__typename": "HeadRefForcePushedEvent",
+              "createdAt": "2026-09-28T06:46:29Z",
+              "afterCommit": {
+                "oid": "e4d67da22ac97a321bd5c040acc53bebae10d377"
+              }
+            },
+            {
+              "__typename": "AutoMergeEnabledEvent",
+              "createdAt": "2026-09-28T06:47:22Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "HeadRefForcePushedEvent",
+              "createdAt": "2026-09-28T07:56:20Z",
+              "afterCommit": {
+                "oid": "c9c785f6cf81dba0f1eeae43f4a00037725523c0"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-28T15:15:08Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-28T15:33:02Z",
+              "reason": "failed_checks",
+              "actor": {
+                "login": "github-merge-queue"
+              },
+              "beforeCommit": {
+                "oid": "b7498768850cb641e1cb1a7b54b6a671e934eab7",
+                "parents": {
+                  "nodes": [
+                    {
+                      "oid": "ed878f2a5cce38111f29df53b39b639aa72c84af"
+                    },
+                    {
+                      "oid": "75874d4fe45aba6ceef6fc2945c35fca5393a3f0"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "__typename": "HeadRefForcePushedEvent",
+              "createdAt": "2026-09-29T04:04:58Z",
+              "afterCommit": {
+                "oid": "cc0dc60163d45085c7cb10011aa8b8904987a84f"
+              }
+            },
+            {
+              "__typename": "HeadRefForcePushedEvent",
+              "createdAt": "2026-09-29T05:15:35Z",
+              "afterCommit": {
+                "oid": "1348869dd401a4d5081c4bff8ea5b1a090da7d8d"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "01332de092fdb65c799d9097f4b687e5fec52c45"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "3aa934f03c8b162c5b86a051e2a810f41b08aac4"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "ee153093ae351ce76c121a3de2be82900aacd36e"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "b0e24faf8a59c4ef3bb5801bfcf39bf53d116a0c"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "7d74c58978cabfdade4176450ce47c87ebb71183"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "49b868ec661fc2323aba7dcd8466142eb26d23ae"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "99877ae945213f83e2dd1e16c0bd3f57e316a6a5"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "a7cd6846cdafcc768535575668bef03dde9e03f6"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "fbac5165fb7d33830a7a21f2bbdc4f9b01baaf62"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "8bd523fadcd78bec7b633a9a5994c8c1e98af59e"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "e7f5693ab95f1c119a3348f41b89a13fd82a3ca5"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "982988350c775554698f013fb459837d33505919"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "af6f1b8b9bad829b5bf6e002e1253a14ecc36168"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "c3bc2a8a2632356f9cecdf725dcb47af85db07a2"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "0af36070d6bcece6bdb937168aabc727c9d14450"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "16c6daa2174b6232103bb2dd64d4a3ea7c8e1247"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "d035a21544e46dfa5aadcb5310793e15f4dc84c5"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "1b55484eeb99e9049cc07d34fd8a4fafb7bc276e"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "03a6c2d406625ba530643debb020096b88edac4d"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "c31be2819d407ecf5a8377811aaa3e77debb8ec6"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "d96a2ce1b5bc34738c14503b48b0e23170ca313f"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "aa6e3101b00881ac52544ff07a5728b1a6a68e67"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "d34b8b669a7a8e60cfffbcde9b1914bfd873698d"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "f91accc3036bb7b0518a35d3e92b2b22cc94c34a"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "164e9b039c8249f0a9618fc76071ee9ea9785845"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "e99b214a9dce8a8f04ffd9f72968c306b5fd2ef9"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "431d74cb082adcd69fb6456eb9431d2017af9e02"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "bb68b114eb18cf3cd567c6b0cd7a01e7e9ae3cf0"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "6fb4a267d2a43c08b167e6a311a26be117a221de"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "16fe91332db75ee740411829b93f282185202846"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "365fb407ca32ba5e8a421ade458b6fe7d5e5fa82"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "0027fa55467b098a78c45f27c5807aa3b0546048"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "1b38a8d37c3791724d854595d86dcf2eba822aaf"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "e9f1c811fbba93563ecb92fb2025ea84fcbb19c8"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "aedd742f20190ca227e9bc797fa4daae069809d2"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "b7e441e59f1f509722ff56041f5e45624110e7de"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "762006d997f5a521ce9846f23513340f5493b3de"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "aeb11f3fd8f5cf12fdfbf357a5cda36329616530"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "80d4a79abee2c183397abbb6af053876045e8e83"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "526b731632a99ba59716f516ad8e494d3eb272aa"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "00eab7fa8135445ec9861da3492b8b2a8019f313"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "2e99418e37aa088e7a214b444299508a029fb02c"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "b86d91bad4d965e6335f5c05252bf705bd5c7b4f"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "3975b76dcd1b693d01be2b97e573b7eb603960cf"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "f652a84825645815b58bc723e423e307ba5ab872"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "b09f9169bc8ea25d67855fe45eec123a45b77c8c"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "9fbe58998d70cf841879d0fa9b23e32b9b177db7"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "03012a3459f3ff6240a35cb364a99aef56f8de24"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "3c45b3d710ee1074e0d4f6e71a27bc66848fd424"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "7ffbef527ff6ee90bc948c8e885f038afa97e55c"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "b1cd7e5d55ac88118ab35833a35ec790e303a7b5"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "0f1d6bbeeae2501568194245dede8472da8b89f7"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "29b325248f400a7c3597c6c31dcdd6a341c030a9"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "0973435b37cce14a52386a226a466c8a8956ae73"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "db7508ad72cef3979f89c103c8cd4567eb774951"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "9004aba8e14a75c986e8c04513f112a337c7bae0"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "c5d0b9a35fa422536ac02155824ded603c26d0d9"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "6df86bcf283c22c050acf58fbe52497aef007b0c"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "096ade19ea62fb511e73d13f5867684b7f5ab50a"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "4a8478a7c62c47379d54277d8bdd820c06730251"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "8b9ca6a13559781206889f3fced49385e736aacf"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "e963604bcf8fc8dfb51b0285cfc7775ee1c7d3d1"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "784ffe093a2a4c74686dad5d955c64ae783ace54"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "f0782eebe68cd17f736661ea29372f8418b7c1bc"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "8e06ec9fdc54da73be8a28d73ee20a3769922cf6"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "1555f47afd0891a8432f3dd5565512aa1aae1a33"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "a7694da4fd59344319dcf73c1c8bbf9be4cd85d1"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "d5bf9c71e24e7ce93a4c72406f76f396739b06ab"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "a6c785690c6c3ce93a21c27948a1f768cc1cf52d"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "cd70dafe28ae2cb2513a4b0033807da7e799b884"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "2a23cc8c1651ed7ad2453d07dcb569f50f10ac20"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "fc642765956dea548f4a07b0445686aa4785a0f1"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "4b625650757fb3cf1e59f371de924d1cd431f4f4"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "ddfffe2200f10c04fbf0669fef251dd06718fb79"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "19ad8a2f368e8fe9d95c09b403dbcc51cd6bd700"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "fc399ea648466003d78f6565c91a63497a3957e4"
+              }
+            },
+            {
+              "__typename": "HeadRefForcePushedEvent",
+              "createdAt": "2026-09-29T05:26:18Z",
+              "afterCommit": {
+                "oid": "fc399ea648466003d78f6565c91a63497a3957e4"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "aca6727e457b3c7dc2082eee074a1f44b1a062e1"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-29T06:08:30Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-29T06:56:30Z",
+              "reason": "failed_checks",
+              "actor": {
+                "login": "github-merge-queue"
+              },
+              "beforeCommit": {
+                "oid": "72515ddd3aa0bcd67142e2f3147bef1b1b781af2",
+                "parents": {
+                  "nodes": [
+                    {
+                      "oid": "61b7abf2f689a964e2f7ecf55764278d907a8c02"
+                    },
+                    {
+                      "oid": "aca6727e457b3c7dc2082eee074a1f44b1a062e1"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
