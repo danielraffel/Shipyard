@@ -1957,6 +1957,58 @@ pub(super) enum DaemonCommand {
         #[arg(long = "repo")]
         repos: Vec<String>,
     },
+    /// Manage the macOS launchd launcher that gives the daemon a stable
+    /// privacy identity across updates.
+    Launcher {
+        #[command(subcommand)]
+        command: DaemonLauncherCommand,
+    },
+    /// Run the daemon as a child and stay resident as its parent. The launchd
+    /// agent's program; not for interactive use.
+    #[command(hide = true)]
+    Supervise {
+        /// Shipyard binary that runs `daemon run`.
+        #[arg(long = "exec", required_unless_present = "contract")]
+        exec: Option<std::path::PathBuf>,
+        /// Repo(s) to advertise from the daemon status endpoint.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Print the supervise argument contract and exit.
+        #[arg(long)]
+        contract: bool,
+    },
+    /// Read each path and record the outcome. Run from launchd by
+    /// `daemon launcher install`; not for interactive use.
+    #[command(hide = true, name = "launcher-probe")]
+    LauncherProbe {
+        /// Directory to list.
+        #[arg(long = "path", required = true)]
+        paths: Vec<std::path::PathBuf>,
+        /// Where to write the JSON outcome.
+        #[arg(long)]
+        result: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum DaemonLauncherCommand {
+    /// Copy this binary to a stable path, prove from launchd that it can read
+    /// the external volume(s) (approve the one-time macOS prompt if shown),
+    /// then start the daemon through launchd from now on.
+    Install {
+        /// Volume to probe, e.g. /Volumes/Workshop. Defaults to the external
+        /// volume holding the current directory.
+        #[arg(long = "probe-path")]
+        probe_paths: Vec<std::path::PathBuf>,
+        /// Seconds to wait for the probe, including any consent prompt.
+        #[arg(long = "wait-secs", default_value_t = 300)]
+        wait_secs: u64,
+    },
+    /// Report whether the launcher is installed and active.
+    Status,
+    /// Stop starting the daemon through launchd. The running daemon is left
+    /// alone; the next refresh spawns it directly.
+    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]

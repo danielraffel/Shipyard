@@ -5,7 +5,10 @@ use std::process::ExitCode;
 
 use serde_json::Value;
 
-use super::{CliFailure, cli::DaemonCommand};
+use super::{
+    CliFailure,
+    cli::{DaemonCommand, DaemonLauncherCommand},
+};
 use crate::daemon_ipc::read_daemon_status;
 use crate::daemon_runtime::{
     DaemonRunConfig, DaemonRunError, DaemonSpawnFailedError, SpawnRequest, normalize_repos,
@@ -174,7 +177,256 @@ pub(super) fn daemon_command<W: Write>(
         DaemonCommand::Reconcile { repos } => {
             daemon_reconcile(mode, runtime_paths, json, stdout, &repos)
         }
+        DaemonCommand::Launcher { command } => daemon_launcher_command(
+            command,
+            mode,
+            global_dir_override.as_deref(),
+            state_dir_override.as_deref(),
+            runtime_paths,
+            json,
+            stdout,
+        ),
+        DaemonCommand::Supervise {
+            exec,
+            repos,
+            contract,
+        } => daemon_supervise(
+            mode,
+            global_dir_override,
+            state_dir_override,
+            runtime_paths,
+            exec,
+            repos,
+            contract,
+            stdout,
+        ),
+        DaemonCommand::LauncherProbe { paths, result } => daemon_launcher_probe(&paths, &result),
     }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn daemon_supervise<W: Write>(
+    mode: RuntimeMode,
+    global_dir_override: Option<PathBuf>,
+    state_dir_override: Option<PathBuf>,
+    runtime_paths: &RuntimePaths,
+    exec: Option<PathBuf>,
+    repos: Vec<String>,
+    contract: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    if contract {
+        writeln!(stdout, "{}", crate::daemon_launcher::SUPERVISE_CONTRACT)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let binary = exec.ok_or_else(|| CliFailure::new(2, "--exec is required"))?;
+    let request = SpawnRequest {
+        binary,
+        mode,
+        global_dir_override,
+        state_dir_override,
+        state_dir: runtime_paths.state_dir.clone(),
+        repos,
+    };
+    let code = crate::daemon_launcher::supervise(&request)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+fn daemon_supervise<W: Write>(
+    _mode: RuntimeMode,
+    _global_dir_override: Option<PathBuf>,
+    _state_dir_override: Option<PathBuf>,
+    _runtime_paths: &RuntimePaths,
+    _exec: Option<PathBuf>,
+    _repos: Vec<String>,
+    _contract: bool,
+    _stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    Err(CliFailure::new(
+        2,
+        "daemon supervise is only supported on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn daemon_launcher_probe(paths: &[PathBuf], result: &Path) -> Result<ExitCode, CliFailure> {
+    let ok = crate::daemon_launcher::probe(paths, result)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+#[cfg(not(unix))]
+fn daemon_launcher_probe(_paths: &[PathBuf], _result: &Path) -> Result<ExitCode, CliFailure> {
+    Err(CliFailure::new(
+        2,
+        "daemon launcher-probe is only supported on Unix",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_launcher_command<W: Write>(
+    command: DaemonLauncherCommand,
+    mode: RuntimeMode,
+    global_dir_override: Option<&Path>,
+    state_dir_override: Option<&Path>,
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    use crate::daemon_launcher as launcher;
+
+    let home = crate::paths::home_dir();
+    let state_dir = &runtime_paths.state_dir;
+    match command {
+        DaemonLauncherCommand::Install {
+            probe_paths,
+            wait_secs,
+        } => {
+            let source = std::env::current_exe()
+                .and_then(std::fs::canonicalize)
+                .map_err(|error| {
+                    CliFailure::new(3, format!("failed to locate current binary: {error}"))
+                })?;
+            let probe_paths = if probe_paths.is_empty() {
+                launcher::default_probe_paths(
+                    &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+                )
+            } else {
+                probe_paths
+            };
+            let mut mode_arguments: Vec<std::ffi::OsString> =
+                vec!["--mode".into(), mode.as_str().into()];
+            if let Some(global_dir) = global_dir_override {
+                mode_arguments.extend(["--global-dir".into(), global_dir.into()]);
+            }
+            if let Some(state) = state_dir_override {
+                mode_arguments.extend(["--state-dir".into(), state.into()]);
+            }
+            let mut launchctl = launcher::SystemLaunchctl::for_current_user();
+            let record = launcher::install(
+                &mut launcher::InstallPlan {
+                    source,
+                    home,
+                    state_dir: state_dir.clone(),
+                    mode_arguments,
+                    probe_paths,
+                    wait: std::time::Duration::from_secs(wait_secs),
+                    launchctl: &mut launchctl,
+                },
+                &mut std::io::stderr(),
+            )
+            .map_err(|error| CliFailure::new(3, error))?;
+            render_launcher_record(stdout, json, "daemon:launcher:install", Some(&record), true)
+        }
+        DaemonLauncherCommand::Status => {
+            let record = launcher::read_record(state_dir);
+            let active = launcher::active_launcher(state_dir).is_some();
+            render_launcher_record(
+                stdout,
+                json,
+                "daemon:launcher:status",
+                record.as_ref(),
+                active,
+            )
+        }
+        DaemonLauncherCommand::Uninstall => {
+            let existed =
+                launcher::uninstall(state_dir, &home).map_err(|error| CliFailure::new(3, error))?;
+            if json {
+                let mut data = BTreeMap::new();
+                data.insert("was_installed".to_owned(), Value::Bool(existed));
+                write_json_envelope(stdout, "daemon:launcher:uninstall", data)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            } else if existed {
+                writeln!(
+                    stdout,
+                    "launcher deactivated; the next `shipyard daemon refresh` spawns the daemon directly."
+                )
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            } else {
+                writeln!(stdout, "launcher was not installed.")
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::needless_pass_by_value)]
+fn daemon_launcher_command<W: Write>(
+    _command: DaemonLauncherCommand,
+    _mode: RuntimeMode,
+    _global_dir_override: Option<&Path>,
+    _state_dir_override: Option<&Path>,
+    _runtime_paths: &RuntimePaths,
+    _json: bool,
+    _stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    Err(CliFailure::new(
+        2,
+        "the daemon launcher manages a macOS privacy identity and is only available on macOS",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn render_launcher_record<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    command: &str,
+    record: Option<&crate::daemon_launcher::LauncherRecord>,
+    active: bool,
+) -> Result<ExitCode, CliFailure> {
+    let failure = |error: &dyn std::fmt::Display| CliFailure::new(1, error.to_string());
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("installed".to_owned(), Value::Bool(record.is_some()));
+        data.insert("active".to_owned(), Value::Bool(active));
+        data.insert(
+            "record".to_owned(),
+            serde_json::to_value(record).map_err(|error| failure(&error))?,
+        );
+        write_json_envelope(stdout, command, data).map_err(|error| failure(&error))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    match record {
+        None => writeln!(
+            stdout,
+            "launcher not installed; the daemon inherits the privacy identity of whatever starts it."
+        )
+        .map_err(|error| failure(&error))?,
+        Some(record) => writeln!(
+            stdout,
+            "launcher {} ({})\n  path: {}\n  launchd label: {}\n  probed: {}\n  installed by {} at {}",
+            if active { "active" } else { "INACTIVE" },
+            if active {
+                "the daemon is started through launchd"
+            } else {
+                "the launcher file changed or is missing; rerun `shipyard daemon launcher install`"
+            },
+            record.launcher_path.display(),
+            record.label,
+            record
+                .probed_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            record.installed_by_version,
+            record.installed_at
+        )
+        .map_err(|error| failure(&error))?,
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Compare the webhook this host INTENDS against the one GitHub HOLDS.

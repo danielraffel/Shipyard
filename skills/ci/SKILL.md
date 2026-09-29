@@ -935,6 +935,25 @@ click on a Tailscale-ready Mac) and troubleshooting. The macOS
 menu-bar app (`shipyard-macos-gui`) is a thin subscriber to this
 same daemon.
 
+
+### Unattended hosts on an external volume: install the daemon launcher once
+
+On a Mac whose worktrees live on an external volume (m3's `/Volumes/Workshop`),
+a daemon started by an unattended updater inherits a per-release privacy
+identity that has never been granted Removable Volumes access, and its first
+git probe there waits on a prompt nobody answers. Run once, from a terminal on
+that volume, with someone at the desk:
+
+```bash
+shipyard daemon launcher install        # approve the one-time prompt if shown
+shipyard daemon launcher status
+shipyard daemon refresh                 # now started through launchd
+```
+
+After that every refresh, including a fleet self-update's, starts the daemon
+through the stable launcher, whose consent survives updates. `daemon launcher
+uninstall` returns to direct spawns. Hosts on internal disks need nothing.
+
 ## `shipyard verdicts` — the verdict nobody consumed
 
 Every row in the `watch` table below assumes **someone is still there to
