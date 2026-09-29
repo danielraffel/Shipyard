@@ -1140,6 +1140,7 @@ pub(crate) enum PrWatchCommand {
     Digest(PrWatchDigestArgs),
 }
 
+#[allow(clippy::struct_excessive_bools)] // Independent opt-in write switches.
 #[derive(Debug, Args)]
 pub(crate) struct PrWatchScanArgs {
     /// Owner/repo slug. Defaults to the current checkout's repository.
@@ -1160,6 +1161,14 @@ pub(crate) struct PrWatchScanArgs {
     /// Read every answer live instead of reusing settled answers.
     #[arg(long = "no-cache")]
     pub(crate) no_cache: bool,
+    /// Plan the hand-back (dry run): resolve owners, probe liveness
+    /// read-only, and print the label/notify/inbox deliveries it would make.
+    #[arg(long)]
+    pub(crate) handback: bool,
+    /// Deliver the hand-back through the channels `[pr_watch.handback]`
+    /// enables. Needs `[pr_watch.handback] enabled = true`.
+    #[arg(long = "deliver-handback")]
+    pub(crate) deliver_handback: bool,
 }
 
 #[derive(Debug, Args)]
