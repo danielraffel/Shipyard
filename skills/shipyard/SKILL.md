@@ -569,6 +569,29 @@ paths named `shipyard` and `ghapp`. Machine-global command auth must be exactly
 wrapper + `token --app-id VALUE --private-key ABS --repo {repo_slug}`. Direct
 `ghapp` resolves only that shape through its sibling Shipyard after grammar and
 repo validation; the wrapper pins API, cache, and resolved repo arguments.
+The `ghapp` grammar (`GHAPP_COMMAND_GRAMMAR`, pinned by the digest in
+`scripts/fixtures/ghapp-native-help-digests.tsv`) is checked row by row against
+native `--help` of every fleet gh version; re-run that check on each host before
+changing either. Native gh 2.100+ withholds a response containing terminal
+escape sequences unless `--allow-escape-sequences` is passed, and 2.94 has no
+such flag, so the wrapper owns it: it accepts and drops the flag, adds it only
+when the native `--help` lists it, and neutralizes escape sequences in job logs
+(`api …/actions/jobs/N/logs`, `run view --log/--log-failed`), `pr diff`, and any
+`api` call that asked for them. Binary endpoints (`runs/N/logs` archives) are
+never rewritten. `pr diff` and `run download` are read-only and allowed; `pr
+edit` stays outside the grammar and prints its exact `ghapp api -X PATCH …`
+equivalent. The native-help probe must read the whole help text before
+matching: `gh … --help | grep -q` under `pipefail` fails whenever grep exits
+first and gh dies of SIGPIPE (exit 141), which silently skipped the flag and
+left `api …/logs` refused after release.
+
+`shipyard update` never installs the ghapp wrapper: `~/.local/bin/ghapp` runs
+the generation named by `~/.local/bin/ghapp.shipyard-generation`, and only
+`shipyard runner fleet-update` publishes a generation and moves that selector.
+`src/auth_generation.rs` reads the selected generation's bundled Shipyard
+version; `shipyard update` (outside a fleet rollout) and `shipyard doctor`
+(`ghapp-generation`, advisory) warn when it differs from the CLI and print the
+exact `shipyard runner fleet-update --to vX --all-hosts --apply` to run.
 Also configure explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir`
 on every remote `[host_class.<name>]`. Review `shipyard runner fleet-update
 --to vX.Y.Z --host-class <class>` and then use the same command with `--apply`;
@@ -1407,6 +1430,10 @@ title, and a branch that had merged its base at the tip as "Merge
 remote-tracking branch …". When the base ref is unreachable the tip walk is the
 fallback, and it skips `Merge ` subjects. `pr.body.attribution` appends a
 closing line once (not if a commit body already carries it).
+`--body-append` (on `pr` and `ship`) reads the live body after the provenance
+hook and writes it back once with the text inserted before `<!-- whence `,
+through `pr_text::apply_body_append`; an `@file` is read at dispatch, before
+any side effect, and a failed append is a warning, not a failed ship.
 
 ## Tests that spawn a daemon look-alike must reap it on every exit path
 
@@ -1418,6 +1445,11 @@ under init forever; seven accumulated on one CI host before this was caught.
 `DaemonStub` leads its own process group and kills it on drop (panics), and
 the stub exits once the test process is gone (a harness timeout skips drop).
 Check a host with `ps -Ao pid,ppid,command | grep shipyard-daemon-run`.
+Every wait in those tests polls a condition with a generous deadline (15 s):
+a loaded CI host can take seconds to start the stub shell or to finish tearing
+a killed one down. `terminate_daemon_pid` likewise polls up to
+`DAEMON_KILL_SETTLE` (10 s) after `SIGKILL` before reporting failure, because a
+killed process is not a zombie until the kernel finishes its exit.
 
 ## cfg-gated tests: gate the helpers identically
 
@@ -2400,6 +2432,11 @@ steward status/label writes only; normal observation remains on configured auth.
 
 Read [references/merge-steward.md](references/merge-steward.md) before operating
 the steward, changing its policy, or recovering a pending cancellation.
+Runner admission's `admission authority changed during active-run inspection`
+is usually unrelated repository activity (a push or merge-group run elsewhere)
+landing mid-inspection; the plan is remade from fresh reads up to three times
+before it is reported. See "Runner admission" in that reference before touching
+the fence.
 
 ### Pulp disposable Linux health lease
 

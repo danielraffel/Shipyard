@@ -52,6 +52,8 @@ pub(super) struct PrCommandArgs {
     pub(super) arm_auto_merge: bool,
     /// Sibling branches whose own commits are carried onto this branch first.
     pub(super) fold: Vec<String>,
+    /// Forwarded to `ship`: text appended to the pull request body once.
+    pub(super) body_append: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -328,6 +330,7 @@ pub(super) fn pr_command<W: Write>(
             invocation: ShipInvocation::PrCommand,
             foreground: false,
             arm_auto_merge: args.arm_auto_merge,
+            body_append: args.body_append,
         },
         config,
         cwd,
@@ -856,6 +859,7 @@ mod tests {
             python_command: None,
             arm_auto_merge: false,
             fold: Vec::new(),
+            body_append: None,
         }
     }
 

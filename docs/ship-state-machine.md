@@ -308,7 +308,7 @@ authoritative even when an unrelated hosted check has a similar target name.
 - **To:** `STATE_FRESH`
 - **Trigger:** `shipyard ship` on a branch
 - **Writes:** `ShipStateStore.save(ShipState(..., dispatched_runs=[], evidence_snapshot={}))` at cli.py:2675 — **before** preflight runs at cli.py:2679
-- **Externals:** `git push -u origin <branch>` at cli.py:2602 (return code ignored — see "External matrix" below), `gh pr list` / `gh pr create` for PR number. The Rust implementation falls back to REST `gh api repos/<owner>/<repo>/pulls` when GitHub GraphQL is rate-limited, so PR creation can still produce a tracked ship-state record. A PR Shipyard creates is titled and described from the non-merge commits in `origin/<base>..HEAD` (`src/pr_text.rs`): the body is never empty, and `pr.body.attribution` closes it with a configured line.
+- **Externals:** `git push -u origin <branch>` at cli.py:2602 (return code ignored — see "External matrix" below), `gh pr list` / `gh pr create` for PR number. The Rust implementation falls back to REST `gh api repos/<owner>/<repo>/pulls` when GitHub GraphQL is rate-limited, so PR creation can still produce a tracked ship-state record. A PR Shipyard creates is titled and described from the non-merge commits in `origin/<base>..HEAD` (`src/pr_text.rs`): the body is never empty, and `pr.body.attribution` closes it with a configured line. `--body-append` adds text to the live body once, before the provenance block, after the provenance hook and before arming; a failed append only warns.
 - **Failure modes**
   - Explicit `shipyard ship --pr <n>` runs from a checkout whose canonical
     GitHub repository, local branch, or full `HEAD` differs from the

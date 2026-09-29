@@ -16,6 +16,8 @@
 pub mod app;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.
 pub mod artifact_transport;
+/// Which release the installed `ghapp` wrapper generation comes from.
+pub mod auth_generation;
 /// Decide whether GitHub-native auto-merge may be armed on one pull request,
 /// so a green pull request cannot sit unqueued because nothing armed it.
 pub mod auto_arm;

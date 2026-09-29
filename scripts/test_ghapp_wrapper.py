@@ -56,7 +56,7 @@ class GhappWrapperTests(unittest.TestCase):
             )
         }
 
-        self.assertEqual(set(verified), {"2.93.0", "2.96.0"})
+        self.assertEqual(set(verified), {"2.94.0", "2.100.0", "2.101.0"})
         self.assertTrue(all(expected == digest for expected in verified.values()))
 
     def test_every_supported_long_boolean_preserves_following_repo(self) -> None:
@@ -596,6 +596,103 @@ class GhappWrapperTests(unittest.TestCase):
             "api repos/Generous-Corp/pulp/hooks --jq length\n",
         )
 
+    ESCAPED = "\x1b[36;1mline\x1b[0m\n\x1b]0;title\x07ok\tx\x1b(B\n"
+    NEUTRAL = "line\nok\tx\n"
+
+    def use_escaping_gh(self, *, knows_flag: bool = True, status: int = 0) -> None:
+        """A native gh that prints escape sequences and may know the flag."""
+        help_text = "--allow-escape-sequences" if knows_flag else "--jq"
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "[ \"${GH_TOKEN:-}\" = ghs_private_fixture ] || exit 92\n"
+            # Like native gh, the help keeps writing after the matching line,
+            # far past a pipe buffer: a reader that stops at the first match
+            # makes this writer die of SIGPIPE.
+            "case \" $* \" in *\" --help \"*) printf '%s\\n' '" + help_text + "';"
+            " i=0; while [ $i -lt 6000 ]; do"
+            " echo \"      --filler-$i   padding padding padding padding padding\";"
+            " i=$((i+1)); done; exit 0 ;; esac\n"
+            "printf '%s\\n' \"$*\" > \"$GH_LOG\"\n"
+            "printf '\\033[36;1mline\\033[0m\\n\\033]0;title\\007ok\\tx\\033(B\\n'\n"
+            f"exit {status}\n",
+            encoding="utf-8",
+        )
+
+    def test_job_logs_are_printed_with_escape_sequences_neutralized(self) -> None:
+        self.use_escaping_gh()
+        result = self.run_wrapper("api", "repos/owner/repo/actions/jobs/5/logs")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, self.NEUTRAL)
+        self.assertEqual(
+            self.gh_log.read_text(),
+            "api --allow-escape-sequences repos/owner/repo/actions/jobs/5/logs\n",
+        )
+
+    def test_a_gh_without_the_flag_still_gets_neutralized_logs(self) -> None:
+        self.use_escaping_gh(knows_flag=False)
+        result = self.run_wrapper("api", "/repos/owner/repo/actions/jobs/5/logs")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, self.NEUTRAL)
+        self.assertNotIn("--allow-escape-sequences", self.gh_log.read_text())
+
+    def test_other_endpoints_and_binary_archives_pass_through_untouched(self) -> None:
+        self.use_escaping_gh()
+        for endpoint in (
+            "repos/owner/repo/pulls/1",
+            "repos/owner/repo/actions/runs/5/logs",
+        ):
+            with self.subTest(endpoint=endpoint):
+                result = self.run_wrapper("api", endpoint)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, self.ESCAPED)
+                self.assertNotIn("--allow-escape-sequences", self.gh_log.read_text())
+
+    def test_an_explicit_allow_escape_sequences_is_accepted_and_neutralized(self) -> None:
+        self.use_escaping_gh()
+        result = self.run_wrapper(
+            "api", "--allow-escape-sequences", "repos/owner/repo/pulls/1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, self.NEUTRAL)
+
+    def test_run_view_logs_are_neutralized_and_the_exit_status_is_kept(self) -> None:
+        self.use_escaping_gh(status=3)
+        result = self.run_wrapper("run", "view", "5", "--log-failed", "--repo", "owner/repo")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.stdout, self.NEUTRAL)
+
+        self.use_escaping_gh()
+        plain = self.run_wrapper("run", "view", "5", "--repo", "owner/repo")
+        self.assertEqual(plain.stdout, self.ESCAPED, "only logs are rewritten")
+
+    def test_read_only_pr_diff_and_run_download_are_in_the_grammar(self) -> None:
+        self.use_escaping_gh()
+        diff = self.run_wrapper("pr", "diff", "7", "--name-only", "--repo", "owner/repo")
+        self.assertEqual(diff.returncode, 0, diff.stderr)
+        self.assertEqual(diff.stdout, self.NEUTRAL)
+        self.assertIn("pr diff --allow-escape-sequences 7 --name-only", self.gh_log.read_text())
+
+        download = self.run_wrapper(
+            "run", "download", "5", "-n", "logs", "-D", "out", "--repo", "owner/repo"
+        )
+        self.assertEqual(download.returncode, 0, download.stderr)
+        self.assertIn("run download 5 -n logs -D out", self.gh_log.read_text())
+
+    def test_pr_edit_is_refused_with_the_exact_rest_equivalent(self) -> None:
+        result = self.run_wrapper(
+            "pr", "edit", "8959", "--repo", "Generous-Corp/pulp",
+            "--title", "fix: it's done", "--body-file", "/tmp/body.md", "--add-label", "x",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "ghapp api -X PATCH repos/Generous-Corp/pulp/pulls/8959 "
+            "-f title=fix:\\ it\\\'s\\ done -F body=@/tmp/body.md",
+            result.stderr,
+        )
+        self.assertIn("not translated: --add-label", result.stderr)
+        self.assertFalse(self.gh_log.exists())
+        self.assertFalse(self.helper_log.exists())
+
     def test_cli_mode_requires_release_matched_sibling_resolver(self) -> None:
         self.shipyard.unlink()
 
@@ -923,7 +1020,7 @@ class GhappWrapperTests(unittest.TestCase):
                 self.assertFalse(self.gh_log.exists())
 
     def test_absolute_api_endpoint_after_unmodeled_flags_fails_untouched(self) -> None:
-        flag_forms = (("-iXGET",), ("--allow-escape-sequences",))
+        flag_forms = (("-iXGET",), ("--unmodeled-flag",))
         for flags in flag_forms:
             with self.subTest(flags=flags):
                 result = self.run_wrapper(
@@ -935,6 +1032,17 @@ class GhappWrapperTests(unittest.TestCase):
                 self.assertIn("outside privileged grammar", result.stderr)
                 self.assertFalse(self.helper_log.exists())
                 self.assertFalse(self.gh_log.exists())
+        # The wrapper consumes --allow-escape-sequences itself, so the absolute
+        # endpoint behind it reaches, and fails, the endpoint check instead.
+        result = self.run_wrapper(
+            "api",
+            "--allow-escape-sequences",
+            "HTTPS://attacker.example/repos/B/target/hooks",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fully qualified API endpoints are not permitted", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
 
     def test_api_option_value_is_not_mistaken_for_endpoint(self) -> None:
         result = self.run_wrapper(

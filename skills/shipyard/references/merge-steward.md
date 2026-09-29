@@ -70,6 +70,22 @@ the final force-cancel boundary re-reads blocker, opt-out, management label,
 exact-head handoff status, PR number, and base; a late authority loss leaves the
 pending record and a durable rejected-revalidation audit without another POST.
 
+## Runner admission: a fence that must hold, not a fence that must never move
+
+Runner admission (the typed verdict tartci lanes read before claiming or
+cloning) plans against an *authority*: every open pull request's head and
+managed state plus the merge queue's group heads. After inspecting the
+superseded runs it re-reads that authority and refuses a plan whose authority
+moved (`admission authority changed during active-run inspection`). On
+Generous-Corp/pulp every such refusal over 48 h (63 across m1, m3 and m5)
+followed a pull-request push or merge-group run within minutes; the base rate
+for a random window was 38%. So `with_stable_admission_authority` discards the
+plan and makes it again from fresh reads, up to three times, for both the
+initial observation and the active-run revalidation. Only an authority that
+never holds (`… (3 consecutive attempts)`) is an error, and every other error
+returns at once. Never loosen the fence itself: a plan must still be made under
+the authority it is checked against.
+
 ## Arming backstop (`--arm-unqueued`)
 
 The steward enqueues only pull requests explicitly handed to it. Everything else

@@ -95,6 +95,9 @@ pub(super) struct ShipCommandArgs {
     /// pull request cannot sit unqueued because nothing armed it. `--no-arm`
     /// clears it.
     pub(super) arm_auto_merge: bool,
+    /// Text (or `@file` contents) added to the pull request body once, after
+    /// the attribution line and before the provenance block.
+    pub(super) body_append: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,6 +245,38 @@ pub(super) fn ship_command<W: Write>(
             &sha,
             &pr_context,
         )?;
+    }
+    if let Some(text) = args.body_append.as_deref()
+        && !repo.is_empty()
+    {
+        let append_actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+        let line = match crate::pr_text::apply_body_append(
+            &|gh_args: &[String]| {
+                append_actions
+                    .run_gh(gh_args)
+                    .map_err(|error| error.to_string())
+            },
+            &repo,
+            pr_context.number,
+            text,
+        ) {
+            Ok(crate::pr_text::BodyAppend::Appended) => {
+                format!("▸ Appended to the body of #{}", pr_context.number)
+            }
+            Ok(crate::pr_text::BodyAppend::AlreadyPresent) => format!(
+                "▸ Body of #{} already carries the appended text",
+                pr_context.number
+            ),
+            Err(error) => format!(
+                "⚠︎ Could not append to the body of #{}: {error}",
+                pr_context.number
+            ),
+        };
+        if json_mode {
+            let _ = crate::writer_domain_lease::write_stderr(format_args!("{line}"));
+        } else {
+            writeln!(stdout, "{line}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
     }
     // Arm native auto-merge from the one chokepoint every route into `ship`
     // passes through, so `shipyard pr`, a bare `ship`, and `ship --pr` all get

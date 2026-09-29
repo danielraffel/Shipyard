@@ -96,6 +96,12 @@ body is never empty. Set `pr.body.attribution` (for example the Claude Code
 longer needs patching after `shipyard pr`. Before this, 32 of 47 Pulp PRs it
 opened were edited afterwards, 30 of them to add that line.
 
+To add a note to a PR body (a proxy reading, a follow-up), use
+`shipyard pr --body-append "<text>"` or `shipyard ship --pr <n> --body-append
+@notes.md` instead of hand-patching with `ghapp api -X PATCH`. The text lands
+once, after the attribution line and before the `<!-- whence` block; the same
+text again is a no-op.
+
 ## `shipyard pr` arms auto-merge; you no longer do it by hand
 
 `ship` arms GitHub-native auto-merge (merge method **MERGE**) as soon as it
@@ -286,6 +292,7 @@ writer custody before mutation.
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
 | **Self-update: apply latest stable** | `shipyard update` (governed machine-global auth; downloads the tag-matched installer completely before execution) |
 | **Self-update and refresh daemon after verification** | `shipyard update --to vX.Y.Z --refresh-daemon` |
+| **Install a released ghapp wrapper fix** | `shipyard update` does NOT install the ghapp wrapper; only `shipyard runner fleet-update --to vX.Y.Z --all-hosts [--apply]` publishes a new auth generation. `shipyard update` and `shipyard doctor` (`ghapp-generation`) warn with that exact command when the live generation lags the CLI |
 | **Self-update: pin / rollback to a specific tag** | `shipyard update --to v0.53.0` |
 | **Self-update hits "rate limit exceeded"** | v0.68.0+ auto-uses `gh`/`GITHUB_TOKEN` auth; if still rate-limited (60/hr unauth, no `gh` login), run `gh auth login` or export `GITHUB_TOKEN` and retry. Not a missing-`.dmg` error. |
 | **Stuck-runner: kill specific worker (with recovery)** | `shipyard runner kill --pid <pid> --reason "..." [--retrigger]` |

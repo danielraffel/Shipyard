@@ -121,6 +121,83 @@ pub fn compose_pr_body_with_policy(
     body
 }
 
+/// Marker that opens the provenance block a stamping hook appends.
+const PROVENANCE_MARKER: &str = "<!-- whence ";
+
+/// `text`, or the contents of the file named by a leading `@`.
+pub fn resolve_body_append(argument: &str, cwd: &Path) -> Result<String, String> {
+    let Some(path) = argument.strip_prefix('@') else {
+        return Ok(argument.to_owned());
+    };
+    let path = cwd.join(path);
+    std::fs::read_to_string(&path)
+        .map_err(|error| format!("--body-append {}: {error}", path.display()))
+}
+
+/// `body` with `text` added once: after everything already written (the
+/// attribution line included) and before the provenance block, which stays
+/// last. `None` when the text is blank or already present, so repeating an
+/// append changes nothing.
+#[must_use]
+pub fn append_to_body(body: &str, text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || body.contains(text) {
+        return None;
+    }
+    let (head, tail) = body
+        .find(PROVENANCE_MARKER)
+        .map_or((body, ""), |at| body.split_at(at));
+    let head = head.trim_end();
+    let mut next = if head.is_empty() {
+        text.to_owned()
+    } else {
+        format!("{head}\n\n{text}")
+    };
+    if !tail.is_empty() {
+        next.push_str("\n\n");
+        next.push_str(tail);
+    }
+    Some(next)
+}
+
+/// What `apply_body_append` did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BodyAppend {
+    /// The body was rewritten with the text added.
+    Appended,
+    /// The text was already there (or blank); nothing was written.
+    AlreadyPresent,
+}
+
+/// Read pull request `number`'s body and write it back with `text` appended.
+pub fn apply_body_append(
+    gh: &dyn Fn(&[String]) -> Result<String, String>,
+    repo: &str,
+    number: u64,
+    text: &str,
+) -> Result<BodyAppend, String> {
+    let path = format!("repos/{repo}/pulls/{number}");
+    let raw = gh(&["api".to_owned(), path.clone()])?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| format!("unparseable pull request: {error}"))?;
+    let body = value
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let Some(next) = append_to_body(body, text) else {
+        return Ok(BodyAppend::AlreadyPresent);
+    };
+    gh(&[
+        "api".to_owned(),
+        "-X".to_owned(),
+        "PATCH".to_owned(),
+        path,
+        "-f".to_owned(),
+        format!("body={next}"),
+    ])?;
+    Ok(BodyAppend::Appended)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CommitText {
     subject: String,
@@ -227,7 +304,10 @@ mod tests {
 
     use crate::lane_policy::LanePolicy;
 
-    use super::{compose_pr_body, compose_pr_body_with_policy, compose_pr_title};
+    use super::{
+        BodyAppend, append_to_body, apply_body_append, compose_pr_body,
+        compose_pr_body_with_policy, compose_pr_title, resolve_body_append,
+    };
 
     const ATTRIBUTION: &str = "🤖 Generated with [Claude Code](https://claude.com/claude-code)";
 
@@ -431,5 +511,94 @@ mod tests {
                 "Why\n\n## Advisory lanes\nThe following lanes are **advisory** — their status is informational and does not block merge:\n- `windows` (overridden via Lane-Policy trailer)\n\n{ATTRIBUTION}"
             )
         );
+    }
+
+    const STAMP: &str = "<!-- whence {\"prov\": {\"session\": \"s1\"}} -->\n\n---\n### Provenance\n<!-- /whence -->";
+
+    #[test]
+    fn appended_text_lands_after_the_attribution_and_before_the_provenance_block() {
+        let body = format!("Why.\n\n{ATTRIBUTION}\n\n{STAMP}");
+        let next = append_to_body(&body, "Proxy: 3 of 9 before.\n").expect("appended");
+        assert_eq!(
+            next,
+            format!("Why.\n\n{ATTRIBUTION}\n\nProxy: 3 of 9 before.\n\n{STAMP}")
+        );
+        assert_eq!(
+            append_to_body(&next, "Proxy: 3 of 9 before."),
+            None,
+            "idempotent"
+        );
+        assert_eq!(append_to_body(&body, "  \n"), None, "blank adds nothing");
+    }
+
+    #[test]
+    fn without_a_provenance_block_the_text_closes_the_body() {
+        assert_eq!(
+            append_to_body("Why.\n", "Note.").as_deref(),
+            Some("Why.\n\nNote.")
+        );
+        assert_eq!(append_to_body("", "Note.").as_deref(), Some("Note."));
+        assert_eq!(
+            append_to_body(STAMP, "Note.").as_deref(),
+            Some(format!("Note.\n\n{STAMP}").as_str())
+        );
+    }
+
+    #[test]
+    fn apply_reads_the_live_body_and_writes_only_when_something_changes() {
+        use std::cell::RefCell;
+
+        let body = RefCell::new(format!("Why.\n\n{STAMP}"));
+        let writes = RefCell::new(0);
+        let gh = |args: &[String]| -> Result<String, String> {
+            if args.iter().any(|arg| arg == "PATCH") {
+                assert_eq!(args[3], "repos/o/r/pulls/7");
+                let next = args
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix("body="))
+                    .expect("body field");
+                *body.borrow_mut() = next.to_owned();
+                *writes.borrow_mut() += 1;
+                return Ok("{}".to_owned());
+            }
+            Ok(serde_json::json!({ "body": *body.borrow() }).to_string())
+        };
+        assert_eq!(
+            apply_body_append(&gh, "o/r", 7, "Note."),
+            Ok(BodyAppend::Appended)
+        );
+        assert!(body.borrow().contains("Note.\n\n<!-- whence"));
+        assert_eq!(
+            apply_body_append(&gh, "o/r", 7, "Note."),
+            Ok(BodyAppend::AlreadyPresent)
+        );
+        assert_eq!(*writes.borrow(), 1, "the repeat wrote nothing");
+
+        let null_body = |args: &[String]| -> Result<String, String> {
+            if args.iter().any(|arg| arg == "PATCH") {
+                assert!(args.iter().any(|arg| arg == "body=Note."));
+                return Ok("{}".to_owned());
+            }
+            Ok(r#"{"body": null}"#.to_owned())
+        };
+        assert_eq!(
+            apply_body_append(&null_body, "o/r", 8, "Note."),
+            Ok(BodyAppend::Appended)
+        );
+    }
+
+    #[test]
+    fn an_at_argument_reads_a_file_relative_to_the_checkout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.md"), "From a file.\n").expect("write");
+        assert_eq!(
+            resolve_body_append("@note.md", temp.path()).as_deref(),
+            Ok("From a file.\n")
+        );
+        assert_eq!(
+            resolve_body_append("plain", temp.path()).as_deref(),
+            Ok("plain")
+        );
+        assert!(resolve_body_append("@missing.md", temp.path()).is_err());
     }
 }
