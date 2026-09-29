@@ -3304,23 +3304,38 @@ class GuardianLifecycleTests(unittest.TestCase):
     # --- host-level exclusion with fleet install transactions -------------
 
     def fleet_install_would_proceed(self, guard: Path) -> bool:
-        """Run the exact non-blocking acquisition a fleet install performs."""
-        result = subprocess.run(
-            [
+        """Run the non-blocking acquisition a fleet install performs.
+
+        On macOS this is the install transaction's exact `lockf -t 0`; where
+        that utility does not exist, a separate process takes the same flock.
+        """
+        if Path("/usr/bin/lockf").exists():
+            argv = [
                 "/bin/bash",
                 "-c",
                 'exec 9<>"$1"; /usr/bin/lockf -s -t 0 9',
                 "install",
                 str(guard),
-            ],
-            check=False,
-        )
-        return result.returncode == 0
+            ]
+        else:
+            argv = [
+                sys.executable,
+                "-c",
+                "import fcntl, sys\n"
+                "handle = open(sys.argv[1], 'a+b')\n"
+                "fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)",
+                str(guard),
+            ]
+        return subprocess.run(argv, check=False, capture_output=True).returncode == 0
 
     def test_canary_lease_holds_the_fleet_install_guard_until_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
             guard = active.fleet_install_guard_path
+            guard.touch(mode=0o600)
+            # Control: the probe must see a free guard, or its "refused"
+            # reading below would prove nothing.
+            self.assertTrue(self.fleet_install_would_proceed(guard))
             active.acquire()
             self.assertTrue(active.lease_owned)
             self.assertTrue(active.fleet_install_guard_held)
