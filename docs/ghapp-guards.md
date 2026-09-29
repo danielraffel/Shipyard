@@ -162,6 +162,13 @@ runs:
 <command...> --repo <owner/name> --pr <number> --run-id <id>
 ```
 
+The run is searched by creation time, `created=<removal-6h>..<removal+5m>`,
+100 per page and at most 3 pages, never by recency. Every workflow of every
+failed group is its own run, so on `Generous-Corp/pulp` "the latest 20 failed
+runs" covered about an hour, and a certified ejection (`pulp#9048`) could not be
+re-admitted once that hour passed. A window with nothing matching, or busier
+than the read cap, refuses and says which.
+
 ### What certifies, and what does not
 
 The attributor must print one JSON object on stdout:

@@ -2679,7 +2679,10 @@ fix first); any other reason except `invalid_merge_commit` is refused with
 A same-head `failed_checks` refusal can be lifted, but only by the repository,
 never by inference. If the repo declares `[queue.attribution] command = [...]`
 (argv list; a shell string is rejected) in `.shipyard/config.toml`, the guard
-resolves the ejecting `merge_group` run, collects its failing jobs and steps,
+resolves the ejecting `merge_group` run (searched by creation time around the
+removal, `created=<removal-6h>..<removal+5m>`, at most 3 pages of 100 -- never
+"the newest N failed runs", which on a busy queue stopped reaching the ejector
+after about an hour), collects its failing jobs and steps,
 and runs that command with `--repo/--pr/--run-id`. Certifying requires exit 0, a
 JSON object, a `run_id` equal to the run the guard resolved, `implicates_head`
 exactly `false`, and `verdict` of `infrastructure` or `other_pull_request` with
