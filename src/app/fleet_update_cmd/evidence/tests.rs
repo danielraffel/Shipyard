@@ -853,3 +853,29 @@ fn remote_supervisor_kills_term_ignoring_descendants_after_leader_exits() {
         "TERM-ignoring descendant survived the remote timeout boundary"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn only_the_exact_busy_status_and_marker_classify_as_a_deferral() {
+    use std::os::unix::process::ExitStatusExt;
+    let output = |code: i32, stderr: &str| Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+    };
+    let marker = format!("noise\n{}\n", auth_support::HOST_BUSY_MARKER);
+    assert!(matches!(
+        classify_update_failure(&output(auth_support::HOST_BUSY_EXIT_CODE, &marker)),
+        PlanExecutionError::HostBusy(_)
+    ));
+    // A bare 75 (some other tool's status) or a marker on another status is
+    // an ordinary failure: only both together prove the guard refused first.
+    assert!(matches!(
+        classify_update_failure(&output(auth_support::HOST_BUSY_EXIT_CODE, "boom\n")),
+        PlanExecutionError::Failed(_)
+    ));
+    assert!(matches!(
+        classify_update_failure(&output(1, &marker)),
+        PlanExecutionError::Failed(_)
+    ));
+}

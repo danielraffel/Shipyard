@@ -2072,6 +2072,45 @@ fn a_committed_transaction_is_rolled_back_after_evidence_or_timeout_failures() {
 }
 
 #[test]
+fn a_busy_host_defers_the_rollout_without_rollback_or_later_hosts() {
+    let plans = ["m3", "m5"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut ops = TestOps {
+        execute: |_: &HostUpdatePlan| {
+            Err(evidence::PlanPhaseError::Command(
+                PlanExecutionError::HostBusy("sandbox canary owns the host".to_owned()),
+            ))
+        },
+        verify: verified_ok,
+        rollback: rolled_back_ok,
+        installed: Some("0.136.0".to_owned()),
+        rollbacks: Vec::new(),
+    };
+    let error =
+        apply_plans(&plans, &[], "v0.137.0", true, &mut output, &mut ops).expect_err("deferred");
+    assert!(
+        ops.rollbacks.is_empty(),
+        "an untouched busy host is never rolled back"
+    );
+    assert!(error.deferred);
+    assert!(!error.ineligible);
+    assert!(error.rollback_failed_host.is_none());
+    assert_eq!(error.failure.code, EXIT_CONTROLLER_BUSY);
+    assert!(
+        error.failure.message.contains("deferred at m3 is busy")
+            && error.failure.message.contains("m3, m5"),
+        "{}",
+        error.failure.message
+    );
+    let summary = rollout_receipts(output).pop().expect("summary");
+    assert_eq!(summary["verdict"], "deferred");
+    assert_eq!(summary["not_attempted_hosts"], serde_json::json!(["m5"]));
+}
+
+#[test]
 fn a_failure_before_mutation_is_never_rolled_back_and_a_post_commit_one_always_is() {
     let plans = vec![host_update_plan(&named_host("studio"), "v0.137.0").expect("plan")];
     // A controller-local probe timing out before the update command ran: the
@@ -2165,6 +2204,7 @@ fn a_fleet_update_rollback_failure_quarantines_and_alerts_like_reconcile() {
     let failure = RolloutFailure {
         ineligible: false,
         rollback_failed_host: Some("m5".to_owned()),
+        deferred: false,
         failure: CliFailure::new(EXIT_ROLLBACK_FAILED, "ROLLBACK TO v0.208.0 FAILED"),
     };
     let error = record_cli_rollback_failure(temp.path(), "0.209.0", failure, |title, body| {

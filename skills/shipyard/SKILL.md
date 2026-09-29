@@ -643,7 +643,12 @@ immediately. A terminal tag opens or refreshes a GitHub issue titled
 `fleet-reconcile: <tag> could not reach the fleet` on the Shipyard repository
 and shows in `shipyard doctor --fleet`. Anything unreadable exits 9 and rolls
 nothing out. A tick that finds the controller lock held records nothing (exit
-75). Install its launchd agent on the controller only with
+75). A host whose install guard (`fleet-auth-support.guard` in its state dir)
+is held, by a running Sandbox canary or another install, refuses before any
+change with exit 75 and `SHIPYARD_FLEET_HOST_BUSY` on stderr; the rollout stops
+there as **deferred** (verdict `deferred`, exit 75), nothing is rolled back,
+and reconcile withdraws the attempt it recorded so the next tick retries
+without waiting out `--retry-hours`. Install its launchd agent on the controller only with
 `scripts/install_fleet_reconcile.sh`. That script is a dry run by default;
 `--install` first rehearses the reconcile under the agent's exact environment
 and refuses to load it on failure.
