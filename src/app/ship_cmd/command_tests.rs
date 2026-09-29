@@ -1040,6 +1040,7 @@ exit 2
 
 /// Run a foreground ship of PR 44 against `repo`'s current HEAD with a merge
 /// that fails, so the ship-state stays active for a second run to drift from.
+#[cfg(unix)]
 fn ship_pr_44_keeping_state(
     temp: &std::path::Path,
     repo: &std::path::Path,
