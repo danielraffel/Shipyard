@@ -854,6 +854,7 @@ fn remote_supervisor_kills_term_ignoring_descendants_after_leader_exits() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn only_the_exact_busy_status_and_marker_classify_as_a_deferral() {
     use std::os::unix::process::ExitStatusExt;
