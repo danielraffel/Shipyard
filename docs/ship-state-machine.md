@@ -318,8 +318,15 @@ authoritative even when an unrelated hosted check has a similar target name.
     checkout as the PR head.*
   - The exact checkout matches the live PR, but existing scoped ship-state
     records a different head or base → Shipyard rejects synchronously before
-    queue insertion. *Recovery: first prove the head change is intentional,
-    then rerun with explicit `--adopt-head`; never enable automatic adoption.*
+    queue insertion, with one exception: when the recorded head is an ancestor
+    of the current head and the base is unchanged (a follow-up commit or a
+    merge of the base into the PR branch), the command adopts the new head
+    itself and re-validates it from scratch, exactly as `--adopt-head` would.
+    That adds no trust: the exact-checkout guard above already proved the new
+    head IS the live PR head, and adoption clears every run and evidence entry
+    recorded for the old head. *Recovery for rewritten history (amend /
+    force-push) or a base change: first prove the head change is intentional,
+    then rerun with explicit `--adopt-head`; never automate that flag.*
   - Configured PR provenance is malformed, cannot start, or exits nonzero while required → `shipyard pr` exits before the steward status/label or queue/validation state is created. The argv is executed directly, exact PR facts are expanded and exported as `SHIPYARD_PR_*`, and the submitting process environment supplies agent/router context. *Recovery: repair provenance and rerun `shipyard pr`; do not use a recovery agent to overwrite submitter attribution.*
   - Requested steward handoff fails (invalid workstream/context, GitHub write denial, closed PR, exact-head mismatch, conflicting route ownership, or ambiguous provider identity) → `shipyard pr` exits before queue or validation state is created. Private intent is crash-consistent before the first GitHub mutation; status is written before the label and the head is re-read between them, so a concurrent head move can leave only a harmless stale-head status, never a managed label authorized by that stale receipt. Replay paginates status observations and uses the newest matching status to reconcile an uncertain write. Intentional owner replacement requires an explicit transfer with the same immutable work identity. *Recovery: resolve the failure and resubmit the current exact head; do not infer a transfer from an existing receipt.*
   - `git push` fails silently → `find_pr_for_branch` may still find an existing PR; the local SHA may not match the remote. A fresh state is saved for a branch whose tip may not be pushed. *Recovery: none automatic — the drift check on the next resume will catch it, but between the stale push and the next resume the state claims a SHA that doesn't exist on the remote.*
@@ -472,7 +479,7 @@ authoritative even when an unrelated hosted check has a similar target name.
 - **Writes:** refreshes `pr_url` / `pr_title` / `commit_subject`; then runs `_execute_job` which iterates **every** `job.target_names` at cli.py:4219 regardless of the existing `evidence_snapshot`.
 - **Externals:** `git rev-parse HEAD` (drift check) — the check only runs after `ship` has already confirmed branch/SHA exist (cli.py:2582); a missing HEAD aborts before drift detection, not after.
 - **Failure modes**
-  - SHA drift (`is_sha_drift`): ship refuses to resume. *Recovery: `--no-resume`, or `--adopt-head` (#346) to adopt the current head when you amended/force-pushed the tip (e.g. added a required trailer). `--adopt-head` updates `head_sha` to the live SHA and **clears `dispatched_runs` + `evidence_snapshot`** so the new head re-validates from scratch — it never preserves evidence across a possibly-different tree, and the policy-signature guard below still applies. The Rust path implements this in `load_or_create_state` (`ship.rs`), gated by the flag plumbed through `ShipExecutionRequest`/`QueuedShipRequest`.*
+  - SHA drift (`is_sha_drift`): ship refuses to resume unless the current head fast-forwards the recorded one on the same base, which is adopted automatically (`src/app/ship_cmd/fast_forward.rs`). *Recovery: `--no-resume`, or `--adopt-head` (#346) to adopt the current head when you amended/force-pushed the tip (e.g. added a required trailer). `--adopt-head` updates `head_sha` to the live SHA and **clears `dispatched_runs` + `evidence_snapshot`** so the new head re-validates from scratch — it never preserves evidence across a possibly-different tree, and the policy-signature guard below still applies. The Rust path implements this in `load_or_create_state` (`ship.rs`), gated by the flag plumbed through `ShipExecutionRequest`/`QueuedShipRequest`.*
   - Policy drift: required-platforms / target-list / mode changed. *Recovery: same.*
   - State file is corrupt → `ShipStateStore.get` catches `JSONDecodeError`/`KeyError`/`ValueError` and returns None; the caller creates a fresh state and overwrites the corrupt file.
 - **Observation for Phase B:** resume does NOT skip a lane that already passed. A Phase B test that asserts lane-skip-on-resume would be asserting behavior that doesn't exist today. That may itself be a bug (double-work on resume) — if so, file it as a Phase B-adjacent issue rather than codifying the wrong expectation.
