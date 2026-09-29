@@ -19,6 +19,7 @@ use std::path::Path;
 
 use super::CliFailure;
 use crate::config::LoadedConfig;
+use crate::gate_cost::ReadCache;
 use crate::identity::RuntimeMode;
 use crate::landability::gate;
 use crate::landing::gather::{DEFAULT_MAX_JOB_READS, DEFAULT_RUN_SAMPLE, GatherOptions};
@@ -38,6 +39,9 @@ pub(super) struct LandingArgs {
     pub pr: Option<u64>,
     /// Emit the machine-readable form.
     pub json: bool,
+    /// Shipyard's state directory, for the read cache that serves completed
+    /// job-log signatures to the `--pr` verdict. `None` disables caching.
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 /// Run `shipyard landing`.
@@ -54,6 +58,7 @@ pub(super) fn landing_command<W: Write>(
         max_job_reads,
         pr,
         json,
+        state_dir,
     } = args;
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -73,7 +78,17 @@ pub(super) fn landing_command<W: Write>(
 
     let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
     if let Some(pr) = pr {
-        let report = pr_state::gather(&actions, &repo, pr);
+        let cache = state_dir.map_or_else(ReadCache::disabled, |dir| {
+            // The PR watch cache: its signature entries are keyed by job id
+            // and never change once a job completed, so both commands share.
+            ReadCache::open(
+                &dir.join("pr-watch")
+                    .join("cache")
+                    .join(repo.replace('/', "__").to_ascii_lowercase()),
+                std::time::SystemTime::now(),
+            )
+        });
+        let report = pr_state::gather_cached(&actions, &repo, pr, &cache);
         if json {
             pr_state::write_json(stdout, &report)
         } else {
@@ -84,8 +99,8 @@ pub(super) fn landing_command<W: Write>(
             return Err(CliFailure::new(
                 EXIT_LANDING_UNKNOWN,
                 format!(
-                    "PR #{pr}'s merge-queue state could not be determined; do not act on it as \
-                     if it were unarmed"
+                    "PR #{pr}'s merge-queue state or landing verdict could not be determined; \
+                     do not act on it as if it were unarmed, green, or flaky"
                 ),
             ));
         }

@@ -466,6 +466,7 @@ where
                     max_job_reads,
                     pr,
                     json: cli.json,
+                    state_dir: Some(runtime_paths.state_dir.clone()),
                 },
                 stdout,
             );

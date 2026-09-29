@@ -11,10 +11,14 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::cloud::GitHubActions;
+use crate::gate_cost::ReadCache;
+use crate::landing::verdict::{self, LandingVerdict, VerdictState};
+use crate::landing::verdict_gather;
 use crate::pr_queue_state::{
     NewHeadBasis, PR_QUEUE_STATE_QUERY, PrQueueReport, PrQueueState, REST_AUTO_MERGE_PREFACE,
     explain_pr_queue_state, same_head_requeue_allowed, same_head_requeue_cascades,
 };
+use crate::pr_watch::Thresholds;
 use crate::validation_signals::{self, PrValidationSignals};
 
 /// Machine-readable envelope for one PR's queue state.
@@ -37,6 +41,10 @@ pub struct PrStateReport {
     /// `shipyard-test-tier` / `shipyard-receipt-decision` annotation contract
     /// (see [`crate::validation_signals`]).
     pub validation: PrValidationSignals,
+    /// The one line to quote about this pull request: RED, PENDING, GREEN or
+    /// UNKNOWN on its current head's required checks, with repeat and
+    /// shared-failure evidence (see [`super::verdict`]).
+    pub verdict: LandingVerdict,
 }
 
 impl PrStateReport {
@@ -44,12 +52,26 @@ impl PrStateReport {
     #[must_use]
     pub const fn is_unknown(&self) -> bool {
         matches!(self.classification.state, PrQueueState::Unknown { .. })
+            || matches!(self.verdict.state, VerdictState::Unknown)
     }
 }
 
-/// Read one pull request's queue facts and classify them.
+/// Read one pull request's queue facts and classify them, without a read
+/// cache for the verdict's log signatures.
 #[must_use]
 pub fn gather(actions: &GitHubActions, repo: &str, pr: u64) -> PrStateReport {
+    gather_cached(actions, repo, pr, &ReadCache::disabled())
+}
+
+/// Read one pull request's queue facts, classify them, and take its landing
+/// verdict, serving completed job-log signatures from `cache`.
+#[must_use]
+pub fn gather_cached(
+    actions: &GitHubActions,
+    repo: &str,
+    pr: u64,
+    cache: &ReadCache,
+) -> PrStateReport {
     let classification = match read(actions, repo, pr) {
         Ok(value) => explain_pr_queue_state(&value),
         Err(detail) => explain_pr_queue_state(&serde_json::json!({
@@ -62,6 +84,15 @@ pub fn gather(actions: &GitHubActions, repo: &str, pr: u64) -> PrStateReport {
         repo,
         pr,
     );
+    let reader = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+    let verdict = verdict_for(
+        &reader,
+        cache,
+        repo,
+        pr,
+        &classification.state,
+        chrono::Utc::now(),
+    );
     PrStateReport {
         schema_version: super::SCHEMA_VERSION,
         preface: REST_AUTO_MERGE_PREFACE.to_owned(),
@@ -70,6 +101,30 @@ pub fn gather(actions: &GitHubActions, repo: &str, pr: u64) -> PrStateReport {
         classification,
         next_action,
         validation,
+        verdict,
+    }
+}
+
+/// Gather and compute one pull request's landing verdict.
+#[must_use]
+pub fn verdict_for(
+    reader: &verdict_gather::Reader<'_>,
+    cache: &ReadCache,
+    repo: &str,
+    pr: u64,
+    queue: &PrQueueState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> LandingVerdict {
+    match verdict_gather::gather(reader, cache, repo, pr, now) {
+        Ok(facts) => verdict::compute(&facts, Some(queue), &Thresholds::default()),
+        Err(failure) => verdict::unknown(
+            pr,
+            failure.head_sha,
+            &failure.detail,
+            Some(verdict::queue_suffix(queue)),
+            failure.gaps,
+            failure.api_calls,
+        ),
     }
 }
 
@@ -163,6 +218,8 @@ pub fn write_json<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io::
 /// Write the human-readable form.
 pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io::Result<()> {
     let classification = &report.classification;
+    write_verdict(stdout, &report.verdict)?;
+    writeln!(stdout)?;
     writeln!(stdout, "{}", report.preface)?;
     writeln!(stdout)?;
     writeln!(
@@ -224,6 +281,19 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io:
         writeln!(stdout, "  {:<26} <- {}", "", fact.source)?;
     }
     Ok(())
+}
+
+/// Write the verdict line, then anything that qualifies it.
+///
+/// The line comes first, on its own, so an agent can quote it verbatim; the
+/// gaps follow indented because a verdict read around a gap is still the
+/// verdict, with a stated blind spot.
+pub fn write_verdict<W: Write>(stdout: &mut W, verdict: &LandingVerdict) -> std::io::Result<()> {
+    writeln!(stdout, "{}", verdict.line)?;
+    for gap in &verdict.gaps {
+        writeln!(stdout, "  gap: {gap}")?;
+    }
+    writeln!(stdout, "  ({} API calls)", verdict.api_calls)
 }
 
 /// Write the VALIDATION block: what the head's green means, and whether the
@@ -316,9 +386,12 @@ mod tests {
         let mut out = Vec::new();
         write_human(&mut out, &report).expect("render");
         let text = String::from_utf8(out).expect("utf8");
-        assert!(text.starts_with(
-            "REST pulls/<n>.auto_merge is null for every queued PR (GitHub consumes auto-merge \
-             on enqueue) — never read it as 'unarmed'."
+        // The verdict line leads, so it is the line an agent quotes; the REST
+        // trap leads the queue section right after it.
+        assert!(text.starts_with("VERDICT #8669 "), "{text}");
+        assert!(text.contains(
+            "\n\nREST pulls/<n>.auto_merge is null for every queued PR (GitHub consumes \
+             auto-merge on enqueue) — never read it as 'unarmed'."
         ));
         assert!(
             text.contains("PR #8669 in Generous-Corp/pulp: QUEUED"),
@@ -326,7 +399,15 @@ mod tests {
         );
         assert!(text.contains("at position 1"));
         assert!(text.contains("<- data.repository.pullRequest.isInMergeQueue"));
-        assert!(!report.is_unknown());
+        assert!(!matches!(
+            report.classification.state,
+            PrQueueState::Unknown { .. }
+        ));
+        // This fake answers every read with the queue fixture, so the
+        // required-checks read is not a required-checks response: the verdict
+        // must say UNKNOWN rather than find "no required checks".
+        assert_eq!(report.verdict.state, VerdictState::Unknown);
+        assert!(report.is_unknown());
         let calls = std::fs::read_to_string(temp.path().join("calls")).expect("calls");
         assert!(calls.contains("number=8669"), "{calls}");
         assert!(calls.contains("owner=Generous-Corp"), "{calls}");
