@@ -102,16 +102,26 @@ fn scan_command<W: Write>(
         .state_file
         .unwrap_or_else(|| ledger::default_path(&runtime_paths.state_dir, &repo, &watch.base));
     let actions = actions_for(cwd, config, &repo, explicit);
+    // Bind a `ghapp` wrapper on PATH to this repository even outside a checkout.
+    let repo_binding = repo.clone();
     let reader = |argv: &[String]| {
         actions
-            .run_gh_with_timeout(argv, GITHUB_READ_TIMEOUT)
+            .run_gh_with_timeout_env(
+                argv,
+                GITHUB_READ_TIMEOUT,
+                &[("GH_REPO", repo_binding.as_str())],
+            )
             .map_err(|error| error.to_string())
     };
     // The only mutating requests this command can send are the sticky
     // comment's POST/PATCH, and only with --post-comments.
     let writer = |argv: &[String]| {
         actions
-            .run_gh_with_timeout(argv, GITHUB_READ_TIMEOUT)
+            .run_gh_with_timeout_env(
+                argv,
+                GITHUB_READ_TIMEOUT,
+                &[("GH_REPO", repo_binding.as_str())],
+            )
             .map_err(|error| error.to_string())
     };
     let digest_argv = watch.digest_command.clone();
@@ -262,6 +272,8 @@ fn replay_command<W: Write>(
         gather(&reader, &ReadCache::disabled(), &query, &watch.thresholds)
     } else {
         let actions = actions_for(cwd, config, &repo, explicit);
+        // Bind a `ghapp` wrapper on PATH to this repository even outside a checkout.
+        let repo_binding = repo.clone();
         let recorder = args
             .record
             .as_deref()
@@ -270,7 +282,11 @@ fn replay_command<W: Write>(
             .map_err(io_failure)?;
         let reader = |argv: &[String]| {
             let answer = actions
-                .run_gh_with_timeout(argv, GITHUB_READ_TIMEOUT)
+                .run_gh_with_timeout_env(
+                    argv,
+                    GITHUB_READ_TIMEOUT,
+                    &[("GH_REPO", repo_binding.as_str())],
+                )
                 .map_err(|error| error.to_string())?;
             if let Some(recorder) = &recorder {
                 recorder.record(argv, &answer);

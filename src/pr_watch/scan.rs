@@ -567,12 +567,12 @@ pub fn daemon_pass(
         let timeout = StdDuration::from_secs(120);
         let reader = |argv: &[String]| {
             actions
-                .run_gh_with_timeout(argv, timeout)
+                .run_gh_with_timeout_env(argv, timeout, &[("GH_REPO", repo.as_str())])
                 .map_err(|error| error.to_string())
         };
         let writer = |argv: &[String]| {
             actions
-                .run_gh_with_timeout(argv, timeout)
+                .run_gh_with_timeout_env(argv, timeout, &[("GH_REPO", repo.as_str())])
                 .map_err(|error| error.to_string())
         };
         let argv = watch.digest_command.clone();

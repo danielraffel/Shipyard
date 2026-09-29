@@ -78,6 +78,10 @@ responses and nothing can write by accident:
 - the log of every failed required job, reduced to its signatures;
 - merge bases, only for heads that could form a flag-4 candidate.
 
+Every request carries `GH_REPO=<repo>`, so a `ghapp` wrapper on `PATH` binds
+its App installation to the repository even when the command (or the daemon)
+runs outside a checkout.
+
 A head's push time is the creation time of its first gate run (or its
 force-push event), never its commit date, which the author controls.
 Settled answers are cached under `<state>/pr-watch/cache/<repo>`: required jobs
