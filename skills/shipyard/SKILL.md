@@ -3410,6 +3410,28 @@ is safe in every test and hazardous only in the field — a startup bug hidden
 from the suite meant to catch it. Assert the production value unconditionally,
 not the one the test build happens to see.
 
+### Nothing on the daemon tick may run a child process without a deadline
+
+The supervisor tick runs on the daemon's main thread, and it validates every
+queued ship job's checkout provenance before anything is dispatched. One
+subprocess there that never returns stops the whole queue: `running: 0`,
+pending jobs aging, IPC still answering `daemon status` (it is a separate
+thread), and no log line at all. Go through `process::run_output_until`, not
+`Command::output()`.
+
+A child can hang with no fault of its own. On macOS the first access to an
+external volume by a process whose TCC-responsible binary has no
+removable-volume grant parks `getcwd` inside `open` until a privacy prompt is
+answered. A daemon inherits responsibility from whatever spawned it, so a
+self-update run by the previous generation's binary (a fresh
+`auth-generations/<hash>` path, never granted) can raise that prompt on an
+unattended host. To diagnose: `sample <daemon-pid>` shows the main thread in
+`observe_merged_ship_jobs`/`git_output`, and `/usr/bin/log show` with a tccd
+filter shows `AUTHREQ_PROMPTING ... SystemPolicyRemovableVolumes` with no
+`AUTHREQ_RESULT`. To recover: `shipyard daemon refresh` from an interactive
+shell, whose responsible app already holds the grant, then kill the orphaned
+`git` child.
+
 ### A reader that shares a writer's lock inherits the writer's lifetime
 
 The per-PR ship-state lock is held by a ship worker for its **entire run**. Any
