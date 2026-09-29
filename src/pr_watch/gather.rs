@@ -574,6 +574,7 @@ fn read_group_runs(
             created_at: run.created_at,
             conclusion: run.conclusion.clone(),
             required_jobs: Vec::new(),
+            attribution: None,
         };
         let needs_jobs = run.status == "completed" && run.conclusion.as_deref() == Some("failure");
         if !needs_jobs {

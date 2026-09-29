@@ -19,7 +19,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::flags::{Flag, FlagKind};
+use super::flags::{DigestRoute, Flag, FlagKind};
 use crate::file_lock::LockedFile;
 
 /// Ledger schema identifier.
@@ -46,6 +46,9 @@ pub struct Ledger {
     pub last_digest_at: Option<DateTime<Utc>>,
     /// A digest claimed but not yet confirmed delivered.
     pub digest_claim: Option<DigestClaim>,
+    /// When each shared-failure test was last announced by a digest.
+    #[serde(default)]
+    pub shared_announced: BTreeMap<String, DateTime<Utc>>,
 }
 
 impl Ledger {
@@ -61,6 +64,7 @@ impl Ledger {
             last_scan_at: None,
             last_digest_at: None,
             digest_claim: None,
+            shared_announced: BTreeMap::new(),
         }
     }
 
@@ -101,6 +105,15 @@ pub struct LedgerEntry {
     pub addressed_reason: Option<String>,
     /// When a digest carried it.
     pub digested_at: Option<DateTime<Utc>>,
+    /// How the digest treats it.
+    #[serde(default)]
+    pub route: DigestRoute,
+    /// Tests shared with other pull requests ([`DigestRoute::Shared`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_tests: Vec<String>,
+    /// Other pull requests failing them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_prs: Vec<u64>,
 }
 
 /// A sticky comment this tool owns.
@@ -119,6 +132,9 @@ pub struct DigestClaim {
     pub claimed_at: DateTime<Utc>,
     /// Entry ids it carries.
     pub ids: Vec<String>,
+    /// Shared-failure test keys it announces.
+    #[serde(default)]
+    pub shared: Vec<String>,
 }
 
 /// What a pull request looks like right now, for [`reconcile`].
@@ -152,6 +168,7 @@ pub struct LedgerEvent {
 }
 
 /// Fold one scan's flags into the ledger.
+#[allow(clippy::too_many_lines)]
 pub fn reconcile(
     ledger: &mut Ledger,
     flags: &[Flag],
@@ -182,6 +199,9 @@ pub fn reconcile(
             addressed_at: None,
             addressed_reason: None,
             digested_at: None,
+            route: flag.route,
+            shared_tests: flag.shared_tests.clone(),
+            related_prs: flag.related_prs.clone(),
         };
         match ledger.entries.get_mut(&id) {
             Some(entry)
@@ -192,6 +212,9 @@ pub fn reconcile(
                 entry.head_sha.clone_from(&flag.head_sha);
                 entry.verdict.clone_from(&flag.verdict);
                 entry.evidence.clone_from(&flag.evidence);
+                entry.route = flag.route;
+                entry.shared_tests.clone_from(&flag.shared_tests);
+                entry.related_prs.clone_from(&flag.related_prs);
                 entry.title.clone_from(&title);
                 entry.url.clone_from(&url);
                 if acknowledged {

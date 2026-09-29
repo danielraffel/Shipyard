@@ -20,7 +20,9 @@ use crate::paths::RuntimePaths;
 use crate::pr_watch::digest::{self, DigestOutcome};
 use crate::pr_watch::fixtures::{FixtureReader, Recorder};
 use crate::pr_watch::replay::{Expectation, ReplayOptions, ReplayReport, replay};
-use crate::pr_watch::scan::{ScanReport, ScanRequest, WatchConfig, run_digest_command, scan};
+use crate::pr_watch::scan::{
+    AttributorCommand, ScanReport, ScanRequest, WatchConfig, run_digest_command, scan,
+};
 use crate::pr_watch::{WatchQuery, gather, ledger};
 
 /// Per-request bound. Observation must never strand the invoking agent.
@@ -90,6 +92,12 @@ fn scan_command<W: Write>(
     if let Some(base) = args.base {
         watch.base = base;
     }
+    if args.digest && watch.digest_command.is_empty() {
+        return Err(CliFailure::new(
+            WAIT_EXIT_INVALID,
+            "pr-watch scan --digest needs [pr_watch.digest] command = [\"...\"]",
+        ));
+    }
     let state_path = args
         .state_file
         .unwrap_or_else(|| ledger::default_path(&runtime_paths.state_dir, &repo, &watch.base));
@@ -115,9 +123,28 @@ fn scan_command<W: Write>(
         state_path,
         post_comments: args.post_comments,
         post_digest: args.digest,
+        plan_comments: true,
     };
-    let report = scan(&reader, &writer, &mut sender, &cache, &request, Utc::now())
-        .map_err(|error| CliFailure::new(1, format!("pr-watch scan failed: {error}")))?;
+    // The repository's batch attributor (`[queue.attribution] command`), when
+    // this checkout has one, can clear a flag-3 ejection for a neighbour.
+    let attributor_command = AttributorCommand::discover(config, cwd);
+    let ask = |pr: u64, run_id: u64| {
+        attributor_command
+            .as_ref()
+            .and_then(|command| command.ask(&request.repo, pr, run_id))
+    };
+    let attributor: Option<&crate::pr_watch::scan::Attributor<'_>> =
+        attributor_command.is_some().then_some(&ask);
+    let report = scan(
+        &reader,
+        &writer,
+        &mut sender,
+        attributor,
+        &cache,
+        &request,
+        Utc::now(),
+    )
+    .map_err(|error| CliFailure::new(1, format!("pr-watch scan failed: {error}")))?;
     if json {
         write_pretty_json(stdout, &report).map_err(io_failure)?;
     } else {
@@ -177,8 +204,8 @@ fn render_digest_outcome(outcome: &DigestOutcome) -> String {
         DigestOutcome::Skipped => {
             "skipped (nothing aged in, or sent within the interval)".to_owned()
         }
-        DigestOutcome::WouldSend { flags } => format!("would send {flags} flag(s) (dry run)"),
-        DigestOutcome::Sent { flags } => format!("sent {flags} flag(s)"),
+        DigestOutcome::WouldSend { lines } => format!("would send {lines} line(s) (dry run)"),
+        DigestOutcome::Sent { lines } => format!("sent {lines} line(s)"),
     }
 }
 
@@ -306,6 +333,23 @@ fn same_path(a: &Path, b: &Path) -> bool {
     canonical(a) == canonical(b)
 }
 
+fn render_digest_stats(out: &mut String, stats: &crate::pr_watch::replay::DigestStats) {
+    let _ = writeln!(
+        out,
+        "digests: {} sent; {} PRs got a line ({} per-PR lines), {} shared-failure lines; max {} lines in one digest",
+        stats.digests, stats.prs_digested, stats.pr_lines, stats.shared_lines, stats.max_lines
+    );
+    let prs: Vec<String> = stats
+        .per_pr
+        .iter()
+        .map(|(pr, lines)| format!("#{pr}x{lines}"))
+        .collect();
+    let _ = writeln!(out, "  PRs digested (lines): {}", prs.join(" "));
+    for (test, times) in &stats.shared_tests {
+        let _ = writeln!(out, "  shared failure: {test} announced {times}x");
+    }
+}
+
 /// One line per (pull request, flag) across all episodes.
 fn render_replay_summary(out: &mut String, report: &ReplayReport) {
     let _ = writeln!(
@@ -387,6 +431,7 @@ fn render_replay(report: &ReplayReport) -> String {
             .count(),
         report.digests
     );
+    render_digest_stats(&mut out, &report.digest_stats);
     render_replay_summary(&mut out, report);
     let _ = writeln!(out, "episodes:");
     for episode in &report.episodes {

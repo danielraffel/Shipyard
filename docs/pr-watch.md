@@ -48,7 +48,17 @@ is not a bare "Process completed with exit code N".
 Flag 3 is "named for", not "proved culprit". GitHub names a merge group after
 its last entry, so a batch-mate's failure is attributed to it; the parent
 group's status is shown so a reader can see a failure that was already failing
-upstream. Flag 4's "main moved" is inferred from the merge base
+upstream. When `scan` runs inside a checkout whose config declares
+`[queue.attribution] command` (and the script it names exists there), it asks
+that attributor about each failed group behind a flag 3, with the same argv
+Shipyard's queue-arm guard uses (`--repo R --pr N --run-id ID`, run from the
+repository root; at most 8 calls per pass, decisive verdicts cached). When the
+attributor clears the pull request for every failed group (`implicates_head`
+exactly `false` with verdict `other_pull_request` naming another PR, or
+`infrastructure`), the flag stays on the sticky comment labelled
+"neighbour of #N" and leaves the digest. Without an attributor (the daemon
+runs outside any checkout; `replay` does not call it) flag 3 keeps the
+named-failed-groups rule. Flag 4's "main moved" is inferred from the merge base
 (`compare/<base>...<head>`), which is why its evidence says so.
 
 ## Sources
@@ -97,7 +107,15 @@ acknowledges a PR's flags.
 
 The digest runs at most once per `interval_minutes` (60), carries only flags
 unaddressed on the same head for at least `min_age_minutes` (120) that no
-earlier digest carried, and is skipped when empty. It is claim-then-send: the
+earlier digest carried, and is skipped when empty. It has one line per pull
+request: its highest-severity flag (red while armed, then repeated ejection,
+repeated test failure, rebase treadmill, split) with the count and kinds of the
+flags it has. A repeated test failure whose verdict is "failing on
+main/pre-existing" is a main-health signal, not an owner action, so it gets no
+per-PR line; instead the digest carries at most one shared-failure line per
+test ("`test` failing across #a, #b, #c — likely main/cross-PR"), announced
+again no sooner than 24 hours later. Flags routed comment-only (a neighbour's
+ejection) never reach the digest. The sticky comment still shows every flag. It is claim-then-send: the
 claim is persisted, then the configured argv runs with the
 `shipyard.pr-watch.digest/v1` JSON on stdin (exit 0 = delivered). A failure
 rolls the claim back so the next pass retries; a claim found at start (the
@@ -111,12 +129,22 @@ process died mid-send) counts as delivered, so a lost write never double-posts.
   "window": {"min_age_minutes": 120},
   "flags": [
     {"pr": 8933, "title": "...", "url": "https://github.com/Generous-Corp/pulp/pull/8933",
-     "kind": "repeat_test_failure", "verdict": "code failure, not flake",
+     "kind": "repeated_ejection", "verdict": "repeatedly ejected from the merge queue",
      "evidence": "...", "first_seen_at": "2026-09-29T03:10:00Z",
-     "age_minutes": 230, "head_sha": "fc399ea64..."}
+     "age_minutes": 230, "head_sha": "fc399ea64...",
+     "count": 3, "kinds": ["repeated_ejection", "repeat_test_failure", "split_candidate"]}
+  ],
+  "shared_failures": [
+    {"check": "macos", "test": "consumption-census-drift", "prs": [8933, 8986, 9034],
+     "verdict": "likely main/cross-PR", "first_seen_at": "2026-09-29T02:40:00Z",
+     "evidence": "`consumption-census-drift` (`macos`) failing across #8933, #8986, #9034 — likely main/cross-PR"}
   ]
 }
 ```
+
+Every `flags[]` entry keeps the v1 fields; `count`, `kinds` and
+`shared_failures` are additive, so a v1 consumer that ignores unknown keys
+keeps working. A digest with no `flags` and no `shared_failures` is never sent.
 
 ## Replay
 
@@ -127,7 +155,9 @@ ledger; `--state-file` writes the simulated end state to an explicit path and
 refuses the live one. It exits 1 when an `--expect PR=FLAGS` is not met or,
 with `--control merged-clean`, when any flag was raised on a PR that merged in
 the window with zero failed required jobs and zero `failed_checks` removals.
-`--until` pins the window end so a replay stays reproducible.
+`--until` pins the window end so a replay stays reproducible. The report's
+`digest_stats` counts the simulated digests, the pull requests that got a
+line, per-PR and shared-failure lines, and the most lines in one digest.
 
 The history reflects today's pull-request metadata (changed files, commits,
 labels) and timelines with at most 100 queue events per PR (a longer timeline

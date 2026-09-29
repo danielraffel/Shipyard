@@ -10,7 +10,7 @@ use serde_json::json;
 
 use super::comment::{self, CommentAction};
 use super::digest::{self, DigestOutcome, DigestPolicy};
-use super::flags::{FlagKind, Thresholds, evaluate};
+use super::flags::{DigestRoute, FlagKind, Thresholds, evaluate};
 use super::ledger::{self, Ledger, PrNow};
 use super::replay::{Expectation, ReplayOptions, replay};
 use super::*;
@@ -119,6 +119,7 @@ fn group(id: u64, pr: u64, at: DateTime<Utc>, failed_jobs: &[&str]) -> GroupRun 
             .enumerate()
             .map(|(i, name)| check(id * 10 + i as u64, name, "failure", at, &[]))
             .collect(),
+        attribution: None,
     }
 }
 
@@ -515,6 +516,9 @@ fn flag(pr: u64, kind: FlagKind, head: &str) -> Flag {
         verdict: "v".to_owned(),
         evidence: "e".to_owned(),
         head_sha: head.to_owned(),
+        route: DigestRoute::PerPr,
+        shared_tests: Vec::new(),
+        related_prs: Vec::new(),
     }
 }
 
@@ -627,12 +631,13 @@ fn digest_carries_only_aged_unaddressed_flags_and_never_split_alone() {
         digest::select(&ledger, t(1, 59), policy).is_none(),
         "younger than 2 h"
     );
-    let ids = digest::select(&ledger, t(2, 0), policy).expect("aged in");
+    let selection = digest::select(&ledger, t(2, 0), policy).expect("aged in");
     assert_eq!(
-        ids.len(),
+        selection.ids().len(),
         2,
         "split rides along with another flag on the PR"
     );
+    assert_eq!(selection.per_pr.len(), 1, "one line per PR");
     // A split flag alone never reaches a digest.
     let mut alone = Ledger::new("o/r", "main");
     ledger::reconcile(
@@ -682,7 +687,7 @@ fn digest_is_claimed_then_sent_and_rolled_back_on_failure() {
     };
     let (outcome, _) =
         digest::run(&mut ledger, t(3, 15), policy, true, &mut persist, &mut ok).unwrap();
-    assert_eq!(outcome, DigestOutcome::Sent { flags: 1 });
+    assert_eq!(outcome, DigestOutcome::Sent { lines: 1 });
     let payload: serde_json::Value = serde_json::from_str(&sent.borrow()).unwrap();
     assert_eq!(payload["schema"], "shipyard.pr-watch.digest/v1");
     assert_eq!(payload["repo"], "o/r");
@@ -715,6 +720,7 @@ fn a_stale_claim_counts_as_delivered() {
     ledger.digest_claim = Some(ledger::DigestClaim {
         claimed_at: t(2, 0),
         ids: vec![id],
+        shared: Vec::new(),
     });
     let mut persist = |_: &Ledger| Ok(());
     let mut never = |_: &str| -> Result<(), String> { panic!("must not resend") };
@@ -929,12 +935,14 @@ fn run_scan(post_comments: bool) -> ScanRun {
         state_path: dir.path().join("ledger.json"),
         post_comments,
         post_digest: false,
+        plan_comments: true,
     };
     let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
     let report = super::scan::scan(
         &reader,
         &writer,
         &mut sender,
+        None,
         &crate::gate_cost::ReadCache::disabled(),
         &request,
         now,
@@ -1059,4 +1067,293 @@ fn expectations_parse_and_reject_nonsense() {
     assert_eq!(parsed.kinds.len(), 4);
     assert!("8933".parse::<Expectation>().is_err());
     assert!("8933=9".parse::<Expectation>().is_err());
+}
+
+#[test]
+fn a_daemon_style_scan_without_posting_reads_no_comment_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let reads = std::sync::Mutex::new(Vec::new());
+    let reader = |argv: &[String]| {
+        reads.lock().unwrap().push(argv.to_vec());
+        fake_github(argv)
+    };
+    let writer = |_: &[String]| -> Result<String, String> { panic!("no writes") };
+    let mut sender = |_: &str| -> Result<(), String> { panic!("no digest") };
+    let request = super::scan::ScanRequest {
+        repo: "o/r".to_owned(),
+        config: super::scan::WatchConfig {
+            lookback: Duration::days(2),
+            ..super::scan::WatchConfig::default()
+        },
+        state_path: dir.path().join("ledger.json"),
+        post_comments: false,
+        post_digest: false,
+        plan_comments: false,
+    };
+    let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
+    let report = super::scan::scan(
+        &reader,
+        &writer,
+        &mut sender,
+        None,
+        &crate::gate_cost::ReadCache::disabled(),
+        &request,
+        now,
+    )
+    .unwrap();
+    assert_eq!(kinds(&report.flags, 42), vec![2]);
+    assert!(report.comment_actions.is_empty());
+    assert!(
+        !reads
+            .into_inner()
+            .unwrap()
+            .iter()
+            .any(|argv| argv.iter().any(|a| a.ends_with("/comments")))
+    );
+}
+
+// ---- digest grouping, shared failures, attribution -------------------------------
+
+fn routed(pr: u64, kind: FlagKind, route: DigestRoute, tests: &[&str], related: &[u64]) -> Flag {
+    Flag {
+        key: if kind == FlagKind::RepeatTestFailure {
+            MACOS.to_owned()
+        } else {
+            String::new()
+        },
+        route,
+        shared_tests: tests.iter().map(|t| (*t).to_owned()).collect(),
+        related_prs: related.to_vec(),
+        ..flag(pr, kind, "h")
+    }
+}
+
+fn open_prs(numbers: &[u64]) -> BTreeMap<u64, PrNow> {
+    numbers
+        .iter()
+        .flat_map(|pr| now_map(*pr, "h", true))
+        .collect()
+}
+
+#[test]
+fn the_digest_has_one_line_per_pr_naming_its_most_severe_flag() {
+    let mut ledger = Ledger::new("o/r", "main");
+    let flags = [
+        flag(1, FlagKind::RepeatedEjection, "h"),
+        flag(1, FlagKind::RedWhileArmed, "h"),
+        flag(1, FlagKind::SplitCandidate, "h"),
+        flag(2, FlagKind::RebaseTreadmill, "h"),
+    ];
+    ledger::reconcile(&mut ledger, &flags, &open_prs(&[1, 2]), t(0, 0));
+    let policy = DigestPolicy::default();
+    let selection = digest::select(&ledger, t(2, 0), policy).unwrap();
+    let payload = digest::payload(&ledger, &selection, t(2, 0), policy);
+    assert_eq!(payload.flags.len(), 2, "one line per PR");
+    let first = &payload.flags[0];
+    assert_eq!(
+        (first.pr, first.kind.as_str(), first.count),
+        (1, "red_while_armed", 3)
+    );
+    assert_eq!(
+        first.kinds,
+        ["red_while_armed", "repeated_ejection", "split_candidate"]
+    );
+    assert_eq!(payload.lines(), 2);
+}
+
+#[test]
+fn shared_failures_leave_the_per_pr_lines_and_are_announced_once_per_test() {
+    let mut ledger = Ledger::new("o/r", "main");
+    let flags = [
+        routed(
+            1,
+            FlagKind::RepeatTestFailure,
+            DigestRoute::Shared,
+            &["census-drift"],
+            &[2, 3],
+        ),
+        routed(
+            2,
+            FlagKind::RepeatTestFailure,
+            DigestRoute::Shared,
+            &["census-drift"],
+            &[1],
+        ),
+        routed(
+            3,
+            FlagKind::RepeatTestFailure,
+            DigestRoute::Shared,
+            &["census-drift", "other"],
+            &[1],
+        ),
+    ];
+    ledger::reconcile(&mut ledger, &flags, &open_prs(&[1, 2, 3]), t(0, 0));
+    let policy = DigestPolicy::default();
+    let mut persist = |_: &Ledger| Ok(());
+    let sent = RefCell::new(Vec::<String>::new());
+    let mut deliver = |payload: &str| {
+        sent.borrow_mut().push(payload.to_owned());
+        Ok(())
+    };
+    let (outcome, payload) = digest::run(
+        &mut ledger,
+        t(2, 0),
+        policy,
+        true,
+        &mut persist,
+        &mut deliver,
+    )
+    .unwrap();
+    let payload = payload.unwrap();
+    assert_eq!(outcome, DigestOutcome::Sent { lines: 2 });
+    assert!(
+        payload.flags.is_empty(),
+        "shared failures are not owner lines"
+    );
+    let census = payload
+        .shared_failures
+        .iter()
+        .find(|line| line.test == "census-drift")
+        .unwrap();
+    assert_eq!(census.prs, [1, 2, 3]);
+    assert!(
+        census.evidence.contains("likely main/cross-PR"),
+        "{}",
+        census.evidence
+    );
+    // A new PR failing the same test within 24 h: not re-announced.
+    ledger::reconcile(
+        &mut ledger,
+        &[
+            flags[0].clone(),
+            flags[1].clone(),
+            flags[2].clone(),
+            routed(
+                4,
+                FlagKind::RepeatTestFailure,
+                DigestRoute::Shared,
+                &["census-drift"],
+                &[1],
+            ),
+        ],
+        &open_prs(&[1, 2, 3, 4]),
+        t(3, 0),
+    );
+    assert!(digest::select(&ledger, t(6, 0), policy).is_none());
+    // A day later it may be announced again.
+    assert!(digest::select(&ledger, t(27, 0), policy).is_some());
+}
+
+#[test]
+fn comment_only_flags_never_reach_the_digest() {
+    let mut ledger = Ledger::new("o/r", "main");
+    ledger::reconcile(
+        &mut ledger,
+        &[routed(
+            1,
+            FlagKind::RepeatedEjection,
+            DigestRoute::CommentOnly,
+            &[],
+            &[],
+        )],
+        &open_prs(&[1]),
+        t(0, 0),
+    );
+    assert!(digest::select(&ledger, t(5, 0), DigestPolicy::default()).is_none());
+}
+
+#[test]
+fn an_attributor_that_blames_a_neighbour_downgrades_flag3_to_comment_only() {
+    let base = pr(
+        400,
+        vec![head(
+            "c1",
+            t(0, 0),
+            "success",
+            vec![check(1, MACOS, "success", t(0, 30), &[])],
+        )],
+        vec![],
+    );
+    let neighbour = Attribution {
+        verdict: "other_pull_request".to_owned(),
+        implicates_head: Some(false),
+        implicated_pr: Some(399),
+    };
+    let mut groups = vec![
+        group(1, 400, t(2, 0), &[MACOS]),
+        group(2, 400, t(3, 0), &[MACOS]),
+    ];
+    groups[0].attribution = Some(neighbour.clone());
+    let one_cleared = history(vec![base.clone()], groups.clone());
+    let flag3 = |h: &RepoHistory| {
+        evaluate(h, t(3, 5), &Thresholds::default())
+            .into_iter()
+            .find(|f| f.kind == FlagKind::RepeatedEjection)
+            .unwrap()
+    };
+    assert_eq!(
+        flag3(&one_cleared).route,
+        DigestRoute::PerPr,
+        "every group must be cleared"
+    );
+    groups[1].attribution = Some(neighbour);
+    let cleared = flag3(&history(vec![base], groups));
+    assert_eq!(cleared.route, DigestRoute::CommentOnly);
+    assert_eq!(cleared.verdict, "neighbour of #399");
+    let body = comment::render(&[&cleared]).unwrap();
+    assert!(body.contains("neighbour of #399"), "{body}");
+}
+
+#[test]
+fn attribution_clears_only_on_positive_evidence() {
+    let parse = |text: &str| Attribution::parse(text).unwrap();
+    assert!(
+        parse(r#"{"verdict":"other_pull_request","implicates_head":false,"implicated_pr":7}"#)
+            .clears(8)
+    );
+    assert!(parse(r#"{"verdict":"infrastructure","implicates_head":false}"#).clears(8));
+    assert!(
+        !parse(r#"{"verdict":"other_pull_request","implicates_head":false,"implicated_pr":8}"#)
+            .clears(8)
+    );
+    assert!(!parse(r#"{"verdict":"unexplained","implicates_head":null}"#).clears(8));
+    assert!(!parse(r#"{"verdict":"implicates_head","implicates_head":true}"#).clears(8));
+    assert!(Attribution::parse("not json").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_configured_attributor_runs_from_the_checkout_with_the_guards_argv() {
+    let root = tempfile::tempdir().unwrap();
+    let global = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".shipyard")).unwrap();
+    std::fs::write(
+        root.path().join(".shipyard/config.toml"),
+        "[queue.attribution]\ncommand = [\"sh\", \"attr.sh\"]\n",
+    )
+    .unwrap();
+    let load = || {
+        crate::config::LoadedConfig::load(
+            Some(global.path().to_path_buf()),
+            Some(root.path().join(".shipyard")),
+            None,
+            crate::config::LocalOverlaySource::None,
+        )
+        .unwrap()
+    };
+    // The script is absent: no attributor, not an error.
+    assert!(super::scan::AttributorCommand::discover(&load(), root.path()).is_none());
+    std::fs::write(
+        root.path().join("attr.sh"),
+        "[ \"$1 $3 $5\" = \"--repo --pr --run-id\" ] || exit 3\n\
+         printf '{\"run_id\": 99, \"pr\": %s, \"verdict\": \"other_pull_request\", \
+         \"implicates_head\": false, \"implicated_pr\": 7}' \"$4\"\n",
+    )
+    .unwrap();
+    let command = super::scan::AttributorCommand::discover(&load(), root.path()).unwrap();
+    let found = command.ask("o/r", 42, 99).unwrap();
+    assert!(found.clears(42));
+    assert_eq!(found.implicated_pr, Some(7));
+    // A verdict about another run is not a ruling on this one.
+    assert!(command.ask("o/r", 42, 100).is_none());
 }

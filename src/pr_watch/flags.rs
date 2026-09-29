@@ -65,6 +65,18 @@ impl FlagKind {
         !matches!(self, Self::RebaseTreadmill | Self::SplitCandidate)
     }
 
+    /// Digest severity: the per-PR digest line names the highest.
+    #[must_use]
+    pub fn severity(self) -> u8 {
+        match self {
+            Self::RedWhileArmed => 5,
+            Self::RepeatedEjection => 4,
+            Self::RepeatTestFailure => 3,
+            Self::RebaseTreadmill => 2,
+            Self::SplitCandidate => 1,
+        }
+    }
+
     /// Stable snake-case name (the digest contract's `kind`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -94,6 +106,30 @@ pub struct Flag {
     pub evidence: String,
     /// Head the flag was evaluated against.
     pub head_sha: String,
+    /// Where the digest carries it. The sticky comment carries every flag.
+    #[serde(default)]
+    pub route: DigestRoute,
+    /// For [`DigestRoute::Shared`]: the tests failing across pull requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_tests: Vec<String>,
+    /// For [`DigestRoute::Shared`]: the other pull requests failing them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_prs: Vec<u64>,
+}
+
+/// How the digest treats a flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigestRoute {
+    /// One line per pull request, owner action.
+    #[default]
+    PerPr,
+    /// A failure shared across pull requests (likely main): at most one
+    /// "shared failure" line per test, not an owner action.
+    Shared,
+    /// Sticky comment only (for example, an ejection the batch attributor
+    /// pinned on a neighbour).
+    CommentOnly,
 }
 
 impl Flag {
@@ -182,6 +218,7 @@ fn completed_by(check: &CheckFact, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
 
 /// Flag 1: one flag per (pull request, required check), listing every
 /// failing test that repeated on that check.
+#[allow(clippy::too_many_lines)]
 fn repeat_test_failure(
     history: &RepoHistory,
     failures: &BTreeMap<u64, Vec<FailureRecord<'_>>>,
@@ -240,7 +277,23 @@ fn repeat_test_failure(
         if own_code.is_empty() && pre_existing.is_empty() {
             continue;
         }
-        let (verdict, mut evidence) = if own_code.is_empty() {
+        let shared = own_code.is_empty();
+        let (shared_tests, related_prs): (Vec<String>, Vec<u64>) = if shared {
+            let mut related: BTreeSet<u64> = BTreeSet::new();
+            for (_, _, prs) in &pre_existing {
+                related.extend(prs);
+            }
+            (
+                pre_existing
+                    .iter()
+                    .map(|(signature, _, _)| (*signature).to_owned())
+                    .collect(),
+                related.into_iter().collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let (verdict, mut evidence) = if shared {
             let mut others: BTreeSet<u64> = BTreeSet::new();
             for (_, _, prs) in &pre_existing {
                 others.extend(prs);
@@ -281,6 +334,15 @@ fn repeat_test_failure(
             verdict: verdict.to_owned(),
             evidence,
             head_sha: head.to_owned(),
+            // A failure shared with other pull requests is a main-health
+            // signal, not an owner action: it gets a shared digest line.
+            route: if shared {
+                DigestRoute::Shared
+            } else {
+                DigestRoute::PerPr
+            },
+            shared_tests,
+            related_prs,
         });
     }
     flags
@@ -435,6 +497,9 @@ fn red_while_armed(
                 thresholds.red_minutes
             ),
             head_sha: head.sha.clone(),
+            route: DigestRoute::PerPr,
+            shared_tests: Vec::new(),
+            related_prs: Vec::new(),
         });
     }
     flags
@@ -487,18 +552,49 @@ fn repeated_ejection(
             )
         })
         .collect();
+    let mut evidence = format!(
+        "{} merge groups named for #{} failed a required job (named for, not proved culprit): {}",
+        failed.len(),
+        pr.number,
+        parts.join("; ")
+    );
+    // The batch attributor, when it ruled on every failed group, can clear
+    // the named pull request: the flag stays on the comment, labelled, and
+    // leaves the digest.
+    let cleared = failed.iter().all(|run| {
+        run.attribution
+            .as_ref()
+            .is_some_and(|attribution| attribution.clears(pr.number))
+    });
+    let (verdict, route) = if cleared {
+        let blamed: BTreeSet<u64> = failed
+            .iter()
+            .filter_map(|run| run.attribution.as_ref()?.implicated_pr)
+            .collect();
+        let label = if blamed.is_empty() {
+            "neighbour or infrastructure (attributor)".to_owned()
+        } else {
+            let blamed_list: Vec<String> = blamed.iter().map(|n| format!("#{n}")).collect();
+            format!("neighbour of {}", blamed_list.join(", "))
+        };
+        let _ = write!(evidence, "; attributor: {label}");
+        (label, DigestRoute::CommentOnly)
+    } else {
+        (
+            "repeatedly ejected from the merge queue".to_owned(),
+            DigestRoute::PerPr,
+        )
+    };
     Some(Flag {
         pr: pr.number,
         kind: FlagKind::RepeatedEjection,
         key: String::new(),
-        verdict: "repeatedly ejected from the merge queue".to_owned(),
-        evidence: format!(
-            "{} merge groups named for #{} failed a required job (named for, not proved culprit): {}",
-            failed.len(),
-            pr.number,
-            parts.join("; ")
-        ),
+        verdict,
+        evidence,
         head_sha: head.to_owned(),
+        route,
+        shared_tests: Vec::new(),
+        related_prs: Vec::new(),
     })
 }
 
@@ -574,6 +670,9 @@ fn rebase_treadmill(
             chain.join(", ")
         ),
         head_sha: head.to_owned(),
+        route: DigestRoute::PerPr,
+        shared_tests: Vec::new(),
+        related_prs: Vec::new(),
     })
 }
 
@@ -645,5 +744,8 @@ fn split_candidate(
             thresholds.split_commits
         ),
         head_sha: head.to_owned(),
+        route: DigestRoute::PerPr,
+        shared_tests: Vec::new(),
+        related_prs: Vec::new(),
     })
 }

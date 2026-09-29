@@ -22,6 +22,151 @@ use crate::gate_cost::{ReadCache, SyncGhReader};
 pub type GhWriter<'a> = dyn Fn(&[String]) -> Result<String, String> + 'a;
 /// Delivers a digest payload.
 pub type DigestSender<'a> = dyn FnMut(&str) -> Result<(), String> + 'a;
+/// Asks the repository's batch attributor about one failed merge group:
+/// `(pull request, run id)` to its verdict, `None` when it did not rule.
+pub type Attributor<'a> = dyn Fn(u64, u64) -> Option<super::Attribution> + 'a;
+
+/// Attributor calls per pass, most recent failed groups first. Each call reads
+/// GitHub itself, so the pass bounds them.
+pub const MAX_ATTRIBUTIONS_PER_PASS: usize = 8;
+
+/// `[queue.attribution] command` and the checkout it runs from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttributorCommand {
+    /// Argv; Shipyard appends `--repo R --pr N --run-id ID`.
+    pub argv: Vec<String>,
+    /// Repository root (the directory holding `.shipyard/config.toml`).
+    pub root: PathBuf,
+}
+
+impl AttributorCommand {
+    /// The configured attributor, when the config names one and it is present
+    /// in the checkout at `cwd` (a relative script path must exist under the
+    /// root). Absent or unusable means "no attribution", never an error.
+    #[must_use]
+    pub fn discover(config: &LoadedConfig, cwd: &std::path::Path) -> Option<Self> {
+        let argv: Vec<String> = config
+            .get("queue.attribution.command")
+            .and_then(toml::Value::as_array)?
+            .iter()
+            .map(|part| part.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        if argv.is_empty() || argv.iter().any(String::is_empty) {
+            return None;
+        }
+        let root = cwd
+            .ancestors()
+            .find(|dir| dir.join(".shipyard").join("config.toml").is_file())?
+            .to_path_buf();
+        let scripts_present = argv.iter().skip(1).all(|part| {
+            let is_script = std::path::Path::new(part)
+                .extension()
+                .is_some_and(|ext| ext == "py" || ext == "sh");
+            !is_script || part.starts_with('-') || root.join(part).is_file()
+        });
+        scripts_present.then_some(Self { argv, root })
+    }
+
+    /// Run it for one failed group. Exit 0 and a JSON verdict naming this run
+    /// are required; anything else is "did not rule".
+    #[must_use]
+    pub fn ask(&self, repo: &str, pr: u64, run_id: u64) -> Option<super::Attribution> {
+        #[cfg(unix)]
+        {
+            let (program, rest) = self.argv.split_first()?;
+            let mut command = std::process::Command::new(program);
+            command
+                .args(rest)
+                .args([
+                    "--repo",
+                    repo,
+                    "--pr",
+                    &pr.to_string(),
+                    "--run-id",
+                    &run_id.to_string(),
+                ])
+                .current_dir(&self.root);
+            let deadline = Instant::now() + StdDuration::from_secs(180);
+            let output =
+                crate::process::run_output_until(&mut command, deadline, "queue attribution")
+                    .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+            if value.get("run_id").and_then(serde_json::Value::as_u64) != Some(run_id) {
+                return None;
+            }
+            super::Attribution::parse(&stdout)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (repo, pr, run_id);
+            None
+        }
+    }
+}
+
+/// Fill in attributions for the failed merge groups that make an open pull
+/// request's flag 3, most recent first, at most [`MAX_ATTRIBUTIONS_PER_PASS`]
+/// calls. Decisive verdicts are cached per run.
+fn attribute(
+    history: &mut super::RepoHistory,
+    attributor: &Attributor<'_>,
+    cache: &ReadCache,
+    now: DateTime<Utc>,
+    thresholds: &Thresholds,
+) {
+    let mut failed_by_pr: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    for (index, run) in history.group_runs.iter().enumerate() {
+        let Some(pr) = run.pr else { continue };
+        let open = history
+            .prs
+            .get(&pr)
+            .is_some_and(|entry| open_at(entry, now));
+        let failed = run
+            .required_jobs
+            .iter()
+            .any(|job| job.failed() && history.required_checks.contains(&job.name));
+        if open && failed {
+            failed_by_pr.entry(pr).or_default().push(index);
+        }
+    }
+    let mut wanted: Vec<(DateTime<Utc>, u64, usize)> = Vec::new();
+    for (pr, runs) in failed_by_pr {
+        if runs.len() >= thresholds.failed_groups {
+            wanted.extend(
+                runs.into_iter()
+                    .map(|index| (history.group_runs[index].created_at, pr, index)),
+            );
+        }
+    }
+    wanted.sort_by_key(|item| std::cmp::Reverse(item.0));
+    let mut asked = 0;
+    for (_, pr, index) in wanted {
+        let run_id = history.group_runs[index].id;
+        let key = format!("pr-watch:attribution:{}:{run_id}:{pr}", history.repo);
+        if let Some(value) = cache.get(&key)
+            && let Ok(found) = serde_json::from_value::<super::Attribution>(value)
+        {
+            history.group_runs[index].attribution = Some(found);
+            continue;
+        }
+        if asked >= MAX_ATTRIBUTIONS_PER_PASS {
+            continue;
+        }
+        asked += 1;
+        if let Some(found) = attributor(pr, run_id) {
+            if found.implicates_head.is_some()
+                && let Ok(value) = serde_json::to_value(&found)
+            {
+                cache.put(&key, &value);
+            }
+            history.group_runs[index].attribution = Some(found);
+        }
+    }
+}
 
 /// `[pr_watch]` settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +318,10 @@ pub struct ScanRequest {
     pub post_comments: bool,
     /// Deliver the digest through the sender.
     pub post_digest: bool,
+    /// Plan comments (reads comment lists of flagged pull requests that have
+    /// no recorded comment). A dry-run CLI plans to show what it would send;
+    /// the daemon plans only when it will post.
+    pub plan_comments: bool,
 }
 
 /// What one pass found and did.
@@ -237,6 +386,7 @@ pub fn scan(
     reader: &SyncGhReader<'_>,
     writer: &GhWriter<'_>,
     sender: &mut DigestSender<'_>,
+    attributor: Option<&Attributor<'_>>,
     cache: &ReadCache,
     request: &ScanRequest,
     now: DateTime<Utc>,
@@ -250,7 +400,10 @@ pub fn scan(
         from: now - config.lookback,
         to: now,
     };
-    let history = gather(reader, cache, &query, &config.thresholds)?;
+    let mut history = gather(reader, cache, &query, &config.thresholds)?;
+    if let Some(attributor) = attributor {
+        attribute(&mut history, attributor, cache, now, &config.thresholds);
+    }
     let flags = evaluate(&history, now, &config.thresholds);
     let prs = pr_now(&history, now);
     let open_prs: Vec<u64> = prs
@@ -268,13 +421,17 @@ pub fn scan(
         .filter(|flag| !prs.get(&flag.pr).is_some_and(|pr| pr.acknowledged))
         .cloned()
         .collect();
-    let (actions, mut gaps) = comment::plan(
-        reader,
-        &mut ledger,
-        &commentable,
-        &open_prs,
-        config.comment_author.as_deref(),
-    );
+    let (actions, mut gaps) = if request.plan_comments || request.post_comments {
+        comment::plan(
+            reader,
+            &mut ledger,
+            &commentable,
+            &open_prs,
+            config.comment_author.as_deref(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let comment_errors = if request.post_comments {
         comment::apply(&mut ledger, &actions, writer)
     } else {
@@ -433,8 +590,16 @@ pub fn daemon_pass(
             state_path: ledger::default_path(state_dir, &repo, &watch.base),
             post_comments: watch.post_comments,
             post_digest: watch.digest && !watch.digest_command.is_empty(),
+            plan_comments: watch.post_comments,
         };
-        match scan(&reader, &writer, &mut sender, &cache, &request, now) {
+        if watch.digest && watch.digest_command.is_empty() {
+            pass.errors.push(format!(
+                "{repo}: [pr_watch] digest = true but [pr_watch.digest] command is empty; not sending"
+            ));
+        }
+        // The daemon runs outside any checkout, so it has no repository
+        // attributor; flag 3 stays on the named-failed-groups rule there.
+        match scan(&reader, &writer, &mut sender, None, &cache, &request, now) {
             Ok(report) => {
                 pass.flags.insert(repo.clone(), report.flags.len());
                 pass.errors.extend(

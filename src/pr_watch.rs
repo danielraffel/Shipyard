@@ -49,7 +49,7 @@ pub mod ledger;
 pub mod replay;
 pub mod scan;
 
-pub use flags::{Flag, FlagKind, Thresholds, evaluate};
+pub use flags::{DigestRoute, Flag, FlagKind, Thresholds, evaluate};
 pub use gather::{WatchQuery, gather};
 pub use ledger::{Ledger, LedgerEntry};
 pub use replay::{Expectation, ReplayReport, replay};
@@ -200,6 +200,51 @@ pub struct GroupRun {
     pub conclusion: Option<String>,
     /// Required jobs of the run. Read only for runs that did not succeed.
     pub required_jobs: Vec<CheckFact>,
+    /// The repository's batch attributor's ruling on this failed group, when
+    /// one was configured and asked (live scans only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<Attribution>,
+}
+
+/// A `[queue.attribution] command` verdict for one failed merge group, as
+/// Shipyard's queue-arm guard reads it: `implicates_head` exactly `false`
+/// with a verdict that positively names why clears the named pull request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attribution {
+    /// `implicates_head`, `other_pull_request`, `infrastructure`, `unexplained`.
+    pub verdict: String,
+    /// `Some(false)` only on positive evidence the head is not the cause.
+    pub implicates_head: Option<bool>,
+    /// The pull request the attributor blamed instead, if any.
+    pub implicated_pr: Option<u64>,
+}
+
+impl Attribution {
+    /// Whether this clears the named pull request (`pr`).
+    #[must_use]
+    pub fn clears(&self, pr: u64) -> bool {
+        self.implicates_head == Some(false)
+            && matches!(
+                self.verdict.as_str(),
+                "other_pull_request" | "infrastructure"
+            )
+            && self.implicated_pr != Some(pr)
+    }
+
+    /// Parse the attributor's stdout.
+    #[must_use]
+    pub fn parse(stdout: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+        Some(Self {
+            verdict: value.get("verdict")?.as_str()?.to_owned(),
+            implicates_head: value
+                .get("implicates_head")
+                .and_then(serde_json::Value::as_bool),
+            implicated_pr: value
+                .get("implicated_pr")
+                .and_then(serde_json::Value::as_u64),
+        })
+    }
 }
 
 impl GroupRun {

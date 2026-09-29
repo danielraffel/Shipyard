@@ -128,6 +128,44 @@ pub struct ControlResult {
     pub pass: bool,
 }
 
+/// What the simulated digests would have carried.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DigestStats {
+    /// Digests sent.
+    pub digests: u64,
+    /// Distinct pull requests that got a per-PR line.
+    pub prs_digested: usize,
+    /// Per-PR lines across all digests.
+    pub pr_lines: u64,
+    /// Shared-failure lines across all digests.
+    pub shared_lines: u64,
+    /// Most lines in one digest.
+    pub max_lines: usize,
+    /// Pull requests, in order of first appearance, with their line count.
+    pub per_pr: BTreeMap<u64, u64>,
+    /// Shared-failure tests announced, with how often.
+    pub shared_tests: BTreeMap<String, u64>,
+}
+
+impl DigestStats {
+    fn record(&mut self, payload: &digest::DigestPayload) {
+        self.digests += 1;
+        self.pr_lines += payload.flags.len() as u64;
+        self.shared_lines += payload.shared_failures.len() as u64;
+        self.max_lines = self.max_lines.max(payload.lines());
+        for line in &payload.flags {
+            *self.per_pr.entry(line.pr).or_default() += 1;
+        }
+        for line in &payload.shared_failures {
+            *self
+                .shared_tests
+                .entry(format!("{} ({})", line.test, line.check))
+                .or_default() += 1;
+        }
+        self.prs_digested = self.per_pr.len();
+    }
+}
+
 /// The replay report.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReplayReport {
@@ -153,6 +191,8 @@ pub struct ReplayReport {
     pub expectations: Vec<ExpectationResult>,
     /// Control result.
     pub control: Option<ControlResult>,
+    /// What the simulated digests carried.
+    pub digest_stats: DigestStats,
     /// Digests that would have been sent.
     pub digests: u64,
     /// Read gaps.
@@ -215,6 +255,7 @@ pub fn replay(history: &RepoHistory, options: &ReplayOptions) -> ReplayReport {
     let mut episodes: BTreeMap<(String, DateTime<Utc>), Episode> = BTreeMap::new();
     let mut ticks = 0_u64;
     let mut digests = 0_u64;
+    let mut stats = DigestStats::default();
     let mut at = history.from + options.tick;
     while at <= history.to {
         ticks += 1;
@@ -265,7 +306,7 @@ pub fn replay(history: &RepoHistory, options: &ReplayOptions) -> ReplayReport {
         // Simulate a digest that always delivers.
         let mut persist = |_: &Ledger| Ok(());
         let mut send = |_: &str| Ok(());
-        if let Ok((digest::DigestOutcome::Sent { .. }, _)) = digest::run(
+        if let Ok((digest::DigestOutcome::Sent { .. }, Some(payload))) = digest::run(
             &mut ledger,
             at,
             options.digest,
@@ -274,6 +315,7 @@ pub fn replay(history: &RepoHistory, options: &ReplayOptions) -> ReplayReport {
             &mut send,
         ) {
             digests += 1;
+            stats.record(&payload);
             for (id, entry) in &ledger.entries {
                 if entry.digested_at == Some(at)
                     && let Some(episode) = episodes.get_mut(&(id.clone(), entry.first_seen_at))
@@ -345,6 +387,7 @@ pub fn replay(history: &RepoHistory, options: &ReplayOptions) -> ReplayReport {
         expectations,
         control,
         digests,
+        digest_stats: stats,
         gaps: history.gaps.clone(),
         pass,
     }

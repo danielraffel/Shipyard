@@ -1,24 +1,36 @@
 //! The hourly digest: at most one per interval, carrying only flags that have
 //! held on the same head for the minimum age and have not been sent before.
 //!
+//! One line per pull request: its highest-severity flag, with a count of the
+//! flags it has. A repeated test failure that other pull requests share
+//! ("failing on main/pre-existing") is not an owner action, so it does not
+//! appear per pull request; instead the digest carries at most one "shared
+//! failure" line per test, re-announced no sooner than
+//! [`SHARED_REANNOUNCE_HOURS`]. A flag routed comment-only (an ejection the
+//! batch attributor pinned on a neighbour) never reaches the digest.
+//!
 //! Delivery is claim-then-send. The claim is persisted before the configured
 //! command runs; a failed command rolls the claim back so the next pass
 //! retries; a claim found at start (the process died after claiming) is
 //! treated as delivered, so a lost state write never double-posts.
 //!
 //! The payload is the `shipyard.pr-watch.digest/v1` JSON contract, written to
-//! the command's stdin. An empty digest is never sent.
+//! the command's stdin. Every `flags[]` entry keeps the contract's fields;
+//! `count`, `kinds` and the top-level `shared_failures` are additive. An
+//! empty digest is never sent.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::flags::FlagKind;
-use super::ledger::{DigestClaim, Ledger};
+use super::flags::{DigestRoute, FlagKind};
+use super::ledger::{DigestClaim, Ledger, LedgerEntry};
 
 /// Digest schema identifier.
 pub const DIGEST_SCHEMA: &str = "shipyard.pr-watch.digest/v1";
+/// A shared-failure test is announced at most once per this many hours.
+pub const SHARED_REANNOUNCE_HOURS: i64 = 24;
 
 /// Digest timing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +51,7 @@ impl Default for DigestPolicy {
 }
 
 /// The digest contract payload.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DigestPayload {
     /// [`DIGEST_SCHEMA`].
     pub schema: String,
@@ -49,19 +61,31 @@ pub struct DigestPayload {
     pub generated_at: String,
     /// Selection window.
     pub window: DigestWindow,
-    /// The flags.
+    /// One entry per pull request.
     pub flags: Vec<DigestFlag>,
+    /// At most one entry per test failing across pull requests.
+    #[serde(default)]
+    pub shared_failures: Vec<SharedFailure>,
+}
+
+impl DigestPayload {
+    /// Lines a renderer would print: one per pull request plus one per
+    /// shared failure.
+    #[must_use]
+    pub fn lines(&self) -> usize {
+        self.flags.len() + self.shared_failures.len()
+    }
 }
 
 /// `window` object.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DigestWindow {
     /// Minimum flag age, minutes.
     pub min_age_minutes: i64,
 }
 
-/// One digest flag.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// One pull request's digest line: its highest-severity flag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DigestFlag {
     /// Pull request.
     pub pr: u64,
@@ -69,89 +93,196 @@ pub struct DigestFlag {
     pub title: String,
     /// URL.
     pub url: String,
-    /// Contract kind name.
+    /// Contract kind name of the highest-severity flag.
     pub kind: String,
-    /// Verdict.
+    /// Its verdict.
     pub verdict: String,
-    /// Evidence line.
+    /// Its evidence line.
     pub evidence: String,
-    /// Episode start.
+    /// Earliest episode start among the pull request's flags in this digest.
     pub first_seen_at: String,
-    /// Age, minutes.
+    /// Age of that earliest episode, minutes.
     pub age_minutes: i64,
-    /// Head the flag holds on.
+    /// Head the flags hold on.
     pub head_sha: String,
+    /// Flags the pull request has in this digest.
+    pub count: usize,
+    /// Their kinds, highest severity first.
+    pub kinds: Vec<String>,
+}
+
+/// One test failing across pull requests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedFailure {
+    /// Required check.
+    pub check: String,
+    /// Failing test (or error signature).
+    pub test: String,
+    /// Pull requests seen failing it.
+    pub prs: Vec<u64>,
+    /// Always "likely main/cross-PR".
+    pub verdict: String,
+    /// The line to print.
+    pub evidence: String,
+    /// Earliest episode start behind it.
+    pub first_seen_at: String,
 }
 
 fn stamp(time: DateTime<Utc>) -> String {
     time.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Entry ids a digest at `now` would carry. `None` when the interval has not
+/// What a digest at one instant would carry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Selection {
+    /// Per pull request: entry ids, highest severity first.
+    pub per_pr: BTreeMap<u64, Vec<String>>,
+    /// Per shared test key (`check|test`): contributing entry ids.
+    pub shared: BTreeMap<String, Vec<String>>,
+}
+
+impl Selection {
+    /// Every entry id the digest carries.
+    #[must_use]
+    pub fn ids(&self) -> Vec<String> {
+        let mut ids: BTreeSet<String> = BTreeSet::new();
+        ids.extend(self.per_pr.values().flatten().cloned());
+        ids.extend(self.shared.values().flatten().cloned());
+        ids.into_iter().collect()
+    }
+}
+
+fn shared_key(entry: &LedgerEntry, test: &str) -> String {
+    format!("{}|{test}", entry.key)
+}
+
+/// What a digest at `now` would carry. `None` when the interval has not
 /// elapsed or nothing qualifies.
 #[must_use]
-pub fn select(ledger: &Ledger, now: DateTime<Utc>, policy: DigestPolicy) -> Option<Vec<String>> {
+pub fn select(ledger: &Ledger, now: DateTime<Utc>, policy: DigestPolicy) -> Option<Selection> {
     if ledger
         .last_digest_at
         .is_some_and(|last| now - last < policy.interval)
     {
         return None;
     }
-    let eligible = |kind_ok: &dyn Fn(FlagKind) -> bool| {
-        ledger
-            .entries
-            .iter()
-            .filter(|(_, entry)| {
-                entry.addressed_at.is_none()
-                    && entry.digested_at.is_none()
-                    && now - entry.first_seen_at >= policy.min_age
-                    && kind_ok(entry.kind)
-            })
-            .map(|(id, entry)| (id.clone(), entry.pr))
-            .collect::<Vec<_>>()
-    };
-    let primary = eligible(&|kind| kind != FlagKind::SplitCandidate);
-    if primary.is_empty() {
-        return None;
+    let eligible = ledger.entries.iter().filter(|(_, entry)| {
+        entry.addressed_at.is_none()
+            && entry.digested_at.is_none()
+            && now - entry.first_seen_at >= policy.min_age
+    });
+    let mut selection = Selection::default();
+    let mut splits: Vec<(&String, &LedgerEntry)> = Vec::new();
+    let reannounce = Duration::hours(SHARED_REANNOUNCE_HOURS);
+    for (id, entry) in eligible {
+        match entry.route {
+            DigestRoute::CommentOnly => {}
+            DigestRoute::Shared => {
+                for test in &entry.shared_tests {
+                    let key = shared_key(entry, test);
+                    let recent = ledger
+                        .shared_announced
+                        .get(&key)
+                        .is_some_and(|at| now - *at < reannounce);
+                    if !recent {
+                        selection.shared.entry(key).or_default().push(id.clone());
+                    }
+                }
+            }
+            DigestRoute::PerPr if entry.kind == FlagKind::SplitCandidate => {
+                splits.push((id, entry));
+            }
+            DigestRoute::PerPr => selection
+                .per_pr
+                .entry(entry.pr)
+                .or_default()
+                .push(id.clone()),
+        }
     }
-    let prs: BTreeSet<u64> = primary.iter().map(|(_, pr)| *pr).collect();
-    let mut ids: Vec<String> = primary.into_iter().map(|(id, _)| id).collect();
     // The split advisory never travels alone: only beside another flag on the
     // same pull request in this digest.
-    ids.extend(
-        eligible(&|kind| kind == FlagKind::SplitCandidate)
-            .into_iter()
-            .filter(|(_, pr)| prs.contains(pr))
-            .map(|(id, _)| id),
-    );
-    ids.sort();
-    Some(ids)
+    for (id, entry) in splits {
+        if let Some(ids) = selection.per_pr.get_mut(&entry.pr) {
+            ids.push(id.clone());
+        }
+    }
+    for ids in selection.per_pr.values_mut() {
+        ids.sort_by_key(|id| {
+            std::cmp::Reverse(
+                ledger
+                    .entries
+                    .get(id)
+                    .map_or(0, |entry| entry.kind.severity()),
+            )
+        });
+    }
+    if selection.per_pr.is_empty() && selection.shared.is_empty() {
+        return None;
+    }
+    Some(selection)
 }
 
-/// Build the payload for `ids`.
+/// Build the payload for a selection.
 #[must_use]
 pub fn payload(
     ledger: &Ledger,
-    ids: &[String],
+    selection: &Selection,
     now: DateTime<Utc>,
     policy: DigestPolicy,
 ) -> DigestPayload {
-    let mut flags: Vec<DigestFlag> = ids
+    let flags = selection
+        .per_pr
         .iter()
-        .filter_map(|id| ledger.entries.get(id))
-        .map(|entry| DigestFlag {
-            pr: entry.pr,
-            title: entry.title.clone(),
-            url: entry.url.clone(),
-            kind: entry.kind.as_str().to_owned(),
-            verdict: entry.verdict.clone(),
-            evidence: entry.evidence.clone(),
-            first_seen_at: stamp(entry.first_seen_at),
-            age_minutes: (now - entry.first_seen_at).num_minutes(),
-            head_sha: entry.head_sha.clone(),
+        .filter_map(|(pr, ids)| {
+            let entries: Vec<&LedgerEntry> =
+                ids.iter().filter_map(|id| ledger.entries.get(id)).collect();
+            let top = entries.first()?;
+            let first_seen = entries.iter().map(|entry| entry.first_seen_at).min()?;
+            Some(DigestFlag {
+                pr: *pr,
+                title: top.title.clone(),
+                url: top.url.clone(),
+                kind: top.kind.as_str().to_owned(),
+                verdict: top.verdict.clone(),
+                evidence: top.evidence.clone(),
+                first_seen_at: stamp(first_seen),
+                age_minutes: (now - first_seen).num_minutes(),
+                head_sha: top.head_sha.clone(),
+                count: entries.len(),
+                kinds: entries
+                    .iter()
+                    .map(|entry| entry.kind.as_str().to_owned())
+                    .collect(),
+            })
         })
         .collect();
-    flags.sort_by(|a, b| a.pr.cmp(&b.pr).then_with(|| a.kind.cmp(&b.kind)));
+    let shared_failures = selection
+        .shared
+        .iter()
+        .filter_map(|(key, ids)| {
+            let (check, test) = key.split_once('|')?;
+            let entries: Vec<&LedgerEntry> =
+                ids.iter().filter_map(|id| ledger.entries.get(id)).collect();
+            let mut prs: BTreeSet<u64> = BTreeSet::new();
+            for entry in &entries {
+                prs.insert(entry.pr);
+                prs.extend(entry.related_prs.iter().copied());
+            }
+            let first_seen = entries.iter().map(|entry| entry.first_seen_at).min()?;
+            let names: Vec<String> = prs.iter().map(|pr| format!("#{pr}")).collect();
+            Some(SharedFailure {
+                check: check.to_owned(),
+                test: test.to_owned(),
+                prs: prs.into_iter().collect(),
+                verdict: "likely main/cross-PR".to_owned(),
+                evidence: format!(
+                    "`{test}` (`{check}`) failing across {} — likely main/cross-PR",
+                    names.join(", ")
+                ),
+                first_seen_at: stamp(first_seen),
+            })
+        })
+        .collect();
     DigestPayload {
         schema: DIGEST_SCHEMA.to_owned(),
         repo: ledger.repo.clone(),
@@ -160,6 +291,7 @@ pub fn payload(
             min_age_minutes: policy.min_age.num_minutes(),
         },
         flags,
+        shared_failures,
     }
 }
 
@@ -171,14 +303,30 @@ pub enum DigestOutcome {
     Skipped,
     /// Built but not sent (dry run).
     WouldSend {
-        /// Flags it would carry.
-        flags: usize,
+        /// Lines it would carry.
+        lines: usize,
     },
     /// Delivered.
     Sent {
-        /// Flags it carried.
-        flags: usize,
+        /// Lines it carried.
+        lines: usize,
     },
+}
+
+fn mark_sent(ledger: &mut Ledger, ids: &[String], shared: &[String], at: DateTime<Utc>) {
+    for id in ids {
+        if let Some(entry) = ledger.entries.get_mut(id) {
+            entry.digested_at = Some(at);
+        }
+    }
+    for key in shared {
+        ledger.shared_announced.insert(key.clone(), at);
+    }
+    let horizon = at - Duration::hours(SHARED_REANNOUNCE_HOURS * 7);
+    ledger
+        .shared_announced
+        .retain(|_, announced| *announced > horizon);
+    ledger.last_digest_at = Some(at);
 }
 
 /// Settle a claim left by an interrupted attempt: treat it as delivered.
@@ -186,12 +334,7 @@ pub fn settle_stale_claim(ledger: &mut Ledger) -> bool {
     let Some(claim) = ledger.digest_claim.take() else {
         return false;
     };
-    for id in &claim.ids {
-        if let Some(entry) = ledger.entries.get_mut(id) {
-            entry.digested_at = Some(claim.claimed_at);
-        }
-    }
-    ledger.last_digest_at = Some(claim.claimed_at);
+    mark_sent(ledger, &claim.ids, &claim.shared, claim.claimed_at);
     true
 }
 
@@ -212,37 +355,35 @@ pub fn run(
     if settle_stale_claim(ledger) {
         persist(ledger)?;
     }
-    let Some(ids) = select(ledger, now, policy) else {
+    let Some(selection) = select(ledger, now, policy) else {
         return Ok((DigestOutcome::Skipped, None));
     };
-    let body = payload(ledger, &ids, now, policy);
+    let body = payload(ledger, &selection, now, policy);
     if !post {
         return Ok((
             DigestOutcome::WouldSend {
-                flags: body.flags.len(),
+                lines: body.lines(),
             },
             Some(body),
         ));
     }
     let text = serde_json::to_string_pretty(&body).map_err(|error| error.to_string())?;
+    let ids = selection.ids();
+    let shared: Vec<String> = selection.shared.keys().cloned().collect();
     ledger.digest_claim = Some(DigestClaim {
         claimed_at: now,
         ids: ids.clone(),
+        shared: shared.clone(),
     });
     persist(ledger)?;
     match send(&text) {
         Ok(()) => {
             ledger.digest_claim = None;
-            for id in &ids {
-                if let Some(entry) = ledger.entries.get_mut(id) {
-                    entry.digested_at = Some(now);
-                }
-            }
-            ledger.last_digest_at = Some(now);
+            mark_sent(ledger, &ids, &shared, now);
             persist(ledger)?;
             Ok((
                 DigestOutcome::Sent {
-                    flags: body.flags.len(),
+                    lines: body.lines(),
                 },
                 Some(body),
             ))
