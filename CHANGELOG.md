@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02260"></a>
+## [0.226.0] - 2026-09-29
+
+- fix/env ejection requeue ([#645](https://github.com/danielraffel/Shipyard/pull/645))
+
 <a id="v02251"></a>
 ## [0.225.1] - 2026-09-29
 
@@ -1671,6 +1676,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.226.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.226.0
 [0.225.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.225.1
 [0.225.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.225.0
 [0.224.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.224.2
