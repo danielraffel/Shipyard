@@ -546,6 +546,11 @@ pub fn run(
         return report;
     }
     let deliver = mode == HandbackMode::Deliver;
+    // A plan shows every tier-1 channel, marking the ones the config leaves
+    // off; a delivery uses only the enabled ones.
+    let notify_on = config.notify || !deliver;
+    let inbox_on = config.inbox || !deliver;
+    let off_note = |enabled: bool| if enabled { "" } else { " [off in config]" };
     let mut state = ledger.handback.clone();
     let open = |pr: u64| {
         history
@@ -683,7 +688,7 @@ pub fn run(
                     last.map(|at| at.format("%H:%MZ").to_string())
                         .unwrap_or_default()
                 ));
-            } else if !(config.notify || config.inbox) {
+            } else if !(notify_on || inbox_on) {
                 view.held = Some("notify and inbox are off".to_owned());
             } else {
                 let batch = batches.entry(o.session.clone()).or_insert(SessionBatch {
@@ -752,7 +757,7 @@ pub fn run(
             report.actions.push(planned);
             ok
         };
-        if config.notify {
+        if notify_on {
             if let Some(surface) = &batch.surface {
                 let (title, body) = notification(&entries);
                 if run_host(
@@ -763,7 +768,11 @@ pub fn run(
                         body: body.clone(),
                     },
                     None,
-                    format!("{title} | {}", body.replace('\n', " | ")),
+                    format!(
+                        "{title} | {}{}",
+                        body.replace('\n', " | "),
+                        off_note(config.notify)
+                    ),
                     &mut report,
                 ) {
                     channels.push("notify".to_owned());
@@ -801,7 +810,7 @@ pub fn run(
                 }
             }
         }
-        if config.inbox {
+        if inbox_on {
             let lines: String = entries
                 .iter()
                 .map(|(id, e)| inbox_line(&ledger.repo, id, e, now) + "\n")
@@ -817,8 +826,9 @@ pub fn run(
                 },
                 Some(lines),
                 format!(
-                    "{} line(s) -> {place}:~/.local/state/shipyard/inbox/{session}.jsonl",
-                    entries.len()
+                    "{} line(s) -> {place}:~/.local/state/shipyard/inbox/{session}.jsonl{}",
+                    entries.len(),
+                    off_note(config.inbox)
                 ),
                 &mut report,
             ) {

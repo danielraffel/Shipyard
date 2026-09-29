@@ -1094,3 +1094,49 @@ fn every_host_argv_a_pass_produces_is_allowlisted() {
         check_argv(&run.argv, CMUX).unwrap();
     }
 }
+
+#[test]
+fn a_plan_shows_channels_the_config_leaves_off_and_delivery_skips_them() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Plan,
+        &mut runner,
+        true,
+    );
+    let notify = out
+        .report
+        .actions
+        .iter()
+        .find(|a| a.action == "notify")
+        .unwrap();
+    assert!(
+        notify.summary.ends_with("[off in config]"),
+        "{}",
+        notify.summary
+    );
+    assert!(out.report.actions.iter().any(|a| a.action == "inbox"));
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(
+        out.report
+            .actions
+            .iter()
+            .all(|a| a.action.contains("label"))
+    );
+    assert!(runner.local_inbox.is_empty());
+    assert!(ledger.handback.delivered.is_empty());
+}
