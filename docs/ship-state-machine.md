@@ -653,6 +653,16 @@ continuously-active-writer Phase 2 boundary.
 - **Idempotency:** a later one-shot first polls the queue. An already queued PR
   is not armed again; a terminal removal newer than the current ship-state is
   not rearmed. A new validated head creates newer ship-state and may be armed.
+- **Head-scoped admission:** before arming, admission also reads the PR's
+  queue timeline (`PR_QUEUE_STATE_QUERY`) and refuses a head the queue removed
+  for `failed_checks` or `merge_conflict` with no new head since, however new
+  the ship-state is. Ship-state is host-local, so a re-ship from another host
+  or after the original state was archived creates a fresh state for the same
+  SHA; the attempt-scoped rule above cannot see a removal that predates it.
+  `invalid_merge_commit` and `manual` removals that predate the attempt still
+  admit, and an unreadable timeline refuses. The merge steward's ordinary
+  enqueue applies the same verdict (its hosted-setup recovery, which carries
+  its own infrastructure evidence, does not).
 - **Guard marker:** every queue-mutating `gh` command Shipyard issues itself
   (the `enqueuePullRequest` arm, the classic `gh pr merge`, the audited
   disable/dequeue revocations, and the merge steward's enqueue) sets

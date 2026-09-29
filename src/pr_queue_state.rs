@@ -82,6 +82,90 @@ pub fn same_head_requeue_allowed(reason: &str) -> bool {
     reason.eq_ignore_ascii_case("invalid_merge_commit")
 }
 
+/// Whether one of Shipyard's own enqueue paths may enqueue `head` now.
+///
+/// Shipyard's internal enqueues (`shipyard auto-merge` admission, the merge
+/// steward) set `SHIPYARD_INTERNAL_QUEUE_MUTATION`, so the `ghapp` arm guard
+/// steps aside for them. This is the head-scoped verdict those paths apply in
+/// its place.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum InternalEnqueueVerdict {
+    /// Nothing on the timeline speaks against enqueuing this head.
+    Admit,
+    /// The queue removed this exact head for a reason that re-adding it
+    /// repeats ([`same_head_requeue_cascades`]), and no new head followed.
+    RefuseEjectedSameHead {
+        /// `RemovedFromMergeQueueEvent.reason`.
+        reason: String,
+        /// `RemovedFromMergeQueueEvent.createdAt`.
+        at: Option<String>,
+    },
+    /// The state could not be read. Never treated as permission.
+    Unknown {
+        /// What was missing or malformed.
+        detail: String,
+    },
+}
+
+impl InternalEnqueueVerdict {
+    /// One line naming why the head is refused, for a refusal message.
+    #[must_use]
+    pub fn refusal(&self, pr: u64, head: &str) -> Option<String> {
+        match self {
+            Self::Admit => None,
+            Self::RefuseEjectedSameHead { reason, at } => Some(format!(
+                "merge queue removed PR #{pr} at head {head} for {reason}{} and no new head has \
+                 been pushed since; refusing to re-enqueue the same head (a fresh ship-state \
+                 does not change the head that failed). Push a fix, or have an operator \
+                 re-enqueue it deliberately",
+                at.as_deref()
+                    .map_or_else(String::new, |at| format!(" at {at}"))
+            )),
+            Self::Unknown { detail } => Some(format!(
+                "merge-queue state of PR #{pr} could not be determined ({detail}); refusing to \
+                 enqueue head {head} blind"
+            )),
+        }
+    }
+}
+
+/// Decide whether an internal enqueue of `head` is allowed, by head rather
+/// than by when the caller's own attempt started.
+///
+/// Refuses only an unchanged head removed for `failed_checks` or
+/// `merge_conflict`: re-adding it re-runs a known failure and, under
+/// `ALLGREEN` grouping, fails its batch-mates. `invalid_merge_commit` says
+/// nothing against the head, and `manual` (or any other reason) is a person's
+/// or tool's decision that the attempt-scoped admission rules already handle,
+/// so both admit here. A head that differs from the live head is left to the
+/// caller's own head-drift check.
+#[must_use]
+pub fn internal_enqueue_verdict(report: &PrQueueReport, head: &str) -> InternalEnqueueVerdict {
+    match &report.state {
+        PrQueueState::Unknown { detail } => InternalEnqueueVerdict::Unknown {
+            detail: detail.clone(),
+        },
+        PrQueueState::Ejected {
+            reason,
+            at,
+            new_head_since_removal: false,
+            ..
+        } if same_head_requeue_cascades(reason)
+            && report
+                .head_oid
+                .as_deref()
+                .is_some_and(|live| live.eq_ignore_ascii_case(head)) =>
+        {
+            InternalEnqueueVerdict::RefuseEjectedSameHead {
+                reason: reason.clone(),
+                at: at.clone(),
+            }
+        }
+        _ => InternalEnqueueVerdict::Admit,
+    }
+}
+
 /// The merge-queue state of one pull request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "class", rename_all = "snake_case")]
@@ -604,6 +688,74 @@ mod tests {
 
     fn expected() -> Value {
         fixture("expected_classifications.json")
+    }
+
+    /// The #8811 capture with its removal reason replaced.
+    fn same_head_ejection(reason: &str) -> Value {
+        let mut response = fixture("pr_real_8811_same_head_ejected.json");
+        let nodes = response
+            .pointer_mut("/data/repository/pullRequest/timelineItems/nodes")
+            .and_then(Value::as_array_mut)
+            .expect("timeline nodes");
+        let removal = nodes.last_mut().expect("removal node");
+        removal["reason"] = Value::from(reason);
+        response
+    }
+
+    const HEAD_8811: &str = "e147f2d09972babcc9977e82a46470e17f9de538";
+
+    #[test]
+    fn internal_enqueue_refuses_the_same_head_after_failed_checks() {
+        let report = explain_pr_queue_state(&fixture("pr_real_8811_same_head_ejected.json"));
+        let verdict = internal_enqueue_verdict(&report, HEAD_8811);
+        assert_eq!(
+            verdict,
+            InternalEnqueueVerdict::RefuseEjectedSameHead {
+                reason: "failed_checks".to_owned(),
+                at: Some("2026-09-25T04:12:51Z".to_owned()),
+            }
+        );
+        let message = verdict.refusal(8811, HEAD_8811).expect("refusal message");
+        assert!(message.contains("failed_checks"), "{message}");
+        assert!(message.contains(HEAD_8811), "{message}");
+        let conflict = explain_pr_queue_state(&same_head_ejection("merge_conflict"));
+        assert!(matches!(
+            internal_enqueue_verdict(&conflict, HEAD_8811),
+            InternalEnqueueVerdict::RefuseEjectedSameHead { .. }
+        ));
+    }
+
+    #[test]
+    fn internal_enqueue_admits_a_new_head_and_non_cascading_reasons() {
+        let new_head = explain_pr_queue_state(&fixture("pr_ejected_new_head.json"));
+        let head = new_head.head_oid.clone().expect("head");
+        assert_eq!(
+            internal_enqueue_verdict(&new_head, &head),
+            InternalEnqueueVerdict::Admit
+        );
+        for reason in ["invalid_merge_commit", "manual"] {
+            let report = explain_pr_queue_state(&same_head_ejection(reason));
+            assert_eq!(
+                internal_enqueue_verdict(&report, HEAD_8811),
+                InternalEnqueueVerdict::Admit,
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            internal_enqueue_verdict(
+                &explain_pr_queue_state(&fixture("pr_never_armed.json")),
+                HEAD_8811
+            ),
+            InternalEnqueueVerdict::Admit
+        );
+    }
+
+    #[test]
+    fn internal_enqueue_never_reads_an_unreadable_state_as_permission() {
+        let report = explain_pr_queue_state(&serde_json::json!({"errors":[{"message":"boom"}]}));
+        let verdict = internal_enqueue_verdict(&report, HEAD_8811);
+        assert!(matches!(verdict, InternalEnqueueVerdict::Unknown { .. }));
+        assert!(verdict.refusal(1, HEAD_8811).is_some());
     }
 
     #[test]
