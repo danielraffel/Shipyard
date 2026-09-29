@@ -2696,6 +2696,22 @@ verdict that positively names infrastructure or another PR counts, and
 `merge_conflict` is never attributable because a conflict is a property of the
 head against its base.
 
+**One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
+when the repo sets `[queue.environment_requeue] enabled = true`: every failing
+required check on the removal's merge-group commit must be an Actions job whose
+every failing step printed a network signature (`Could not resolve host`,
+`ENOTFOUND`, `ECONNRESET`, `Tunnel connection failed`, `curl: (6)`/`(56)`, ...)
+within 60 output lines of its first `##[error]`, and it must be the head's first
+`failed_checks`/`merge_conflict` ejection. Read `shipyard landing --pr <n>`'s
+`ENVIRONMENT RE-ENQUEUE` block before pushing a no-op commit: when it says
+`ALLOWED`, run `shipyard ship --pr <n>` on the same head. Two gotchas the reader
+handles and a hand-rolled grep will not: a `run:` step's script is echoed into
+the log inside `##[group]Run ... ##[endgroup]` and can itself quote the
+signature (Pulp's pip step comment quotes the relay 403, which put a signature
+in `#8933`'s test-failure log), and the first `##[error]` in a log can belong to
+a later `if: always()` step rather than the failing one. A second ejection of
+the same head is always refused: the retry is spent.
+
 **"Un-implicated by the ejecting batch" is weaker than "will pass next time".**
 In the same incident `#8811`'s head was broken anyway, by the same defect class
 in its own file (a grouped member spec whose only case compiles on macOS, so

@@ -73,7 +73,11 @@ pub(super) fn landing_command<W: Write>(
 
     let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
     if let Some(pr) = pr {
-        let report = pr_state::gather(&actions, &repo, pr);
+        let environment_opt_in = config
+            .get(crate::environment_requeue::CONFIG_KEY)
+            .and_then(toml::Value::as_bool)
+            == Some(true);
+        let report = pr_state::gather_with_environment(&actions, &repo, pr, environment_opt_in);
         if json {
             pr_state::write_json(stdout, &report)
         } else {

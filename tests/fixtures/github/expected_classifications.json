@@ -6,6 +6,7 @@
     "entry_state": "AWAITING_CHECKS",
     "position": 1,
     "requeues_without_new_head": 0,
+    "ejections_of_current_head": 0,
     "last_ejection_reason": null,
     "guard": "refuse"
   },
@@ -13,6 +14,7 @@
     "pr": 8672,
     "class": "never_armed",
     "requeues_without_new_head": 0,
+    "ejections_of_current_head": 0,
     "last_ejection_reason": null,
     "guard": "allow"
   },
@@ -21,6 +23,7 @@
     "class": "armed_not_queued",
     "enabled_at": "2026-09-21T23:10:04Z",
     "requeues_without_new_head": 0,
+    "ejections_of_current_head": 0,
     "last_ejection_reason": null,
     "guard": "refuse"
   },
@@ -30,6 +33,7 @@
     "entry_state": "AWAITING_CHECKS",
     "position": 3,
     "requeues_without_new_head": 1,
+    "ejections_of_current_head": 1,
     "last_ejection_reason": "failed_checks",
     "last_ejection_new_head_since": false,
     "guard": "refuse"
@@ -39,6 +43,7 @@
     "class": "armed_not_queued",
     "enabled_at": "2026-09-22T18:57:52Z",
     "requeues_without_new_head": 4,
+    "ejections_of_current_head": 0,
     "last_ejection_reason": "failed_checks",
     "last_ejection_new_head_since": true,
     "guard": "refuse"
@@ -47,6 +52,7 @@
     "pr": 8721,
     "class": "merged",
     "requeues_without_new_head": 0,
+    "ejections_of_current_head": 0,
     "last_ejection_reason": null,
     "guard": "refuse"
   },
@@ -56,6 +62,7 @@
     "reason": "manual",
     "new_head_since_removal": true,
     "requeues_without_new_head": 0,
+    "ejections_of_current_head": 0,
     "last_ejection_reason": "manual",
     "last_ejection_new_head_since": true,
     "guard": "allow"
@@ -65,6 +72,7 @@
     "class": "armed_not_queued",
     "enabled_at": "2026-09-22T22:01:34Z",
     "requeues_without_new_head": 0,
+    "ejections_of_current_head": 0,
     "last_ejection_reason": "manual",
     "last_ejection_new_head_since": true,
     "guard": "refuse"
@@ -74,6 +82,7 @@
     "pr": 900001,
     "class": "unknown",
     "requeues_without_new_head": 0,
+    "ejections_of_current_head": 0,
     "last_ejection_reason": null,
     "guard": "refuse"
   },
@@ -84,6 +93,7 @@
     "reason": "failed_checks",
     "new_head_since_removal": false,
     "requeues_without_new_head": 3,
+    "ejections_of_current_head": 4,
     "last_ejection_reason": "failed_checks",
     "last_ejection_new_head_since": false,
     "guard": "refuse"
@@ -95,8 +105,60 @@
     "reason": "failed_checks",
     "new_head_since_removal": true,
     "requeues_without_new_head": 0,
+    "ejections_of_current_head": 0,
     "last_ejection_reason": "failed_checks",
     "last_ejection_new_head_since": true,
     "guard": "allow"
+  },
+  "pr_real_8678_first_environment_ejection.json": {
+    "real_truncated": true,
+    "pr": 8678,
+    "class": "ejected",
+    "reason": "failed_checks",
+    "new_head_since_removal": false,
+    "requeues_without_new_head": 0,
+    "ejections_of_current_head": 1,
+    "merge_group_commit": "2410ca497342cfc0264bf5b72713de0b56099a0f",
+    "last_ejection_reason": "failed_checks",
+    "last_ejection_new_head_since": false,
+    "guard": "refuse"
+  },
+  "pr_real_8678_second_ejection_same_head.json": {
+    "real_truncated": true,
+    "pr": 8678,
+    "class": "ejected",
+    "reason": "failed_checks",
+    "new_head_since_removal": false,
+    "requeues_without_new_head": 1,
+    "ejections_of_current_head": 2,
+    "merge_group_commit": "b82856ec34d1604401d88934a9c806f50197c396",
+    "last_ejection_reason": "failed_checks",
+    "last_ejection_new_head_since": false,
+    "guard": "refuse"
+  },
+  "pr_real_8911_environment_ejection.json": {
+    "real_truncated": true,
+    "pr": 8911,
+    "class": "ejected",
+    "reason": "failed_checks",
+    "new_head_since_removal": false,
+    "requeues_without_new_head": 0,
+    "ejections_of_current_head": 1,
+    "merge_group_commit": "a8efc64d8240e5584f082b02330869ce2e25733b",
+    "last_ejection_reason": "failed_checks",
+    "last_ejection_new_head_since": false,
+    "guard": "refuse"
+  },
+  "pr_real_8933_test_failure_ejection.json": {
+    "pr": 8933,
+    "class": "ejected",
+    "reason": "failed_checks",
+    "new_head_since_removal": false,
+    "requeues_without_new_head": 0,
+    "ejections_of_current_head": 1,
+    "merge_group_commit": "72515ddd3aa0bcd67142e2f3147bef1b1b781af2",
+    "last_ejection_reason": "failed_checks",
+    "last_ejection_new_head_since": false,
+    "guard": "refuse"
   }
 }

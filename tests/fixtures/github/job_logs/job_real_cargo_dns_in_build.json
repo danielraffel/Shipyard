@@ -1,0 +1,389 @@
+{
+ "_provenance": {
+  "source": "GET repos/Generous-Corp/pulp/actions/jobs/108608241896 and .../logs, captured 2026-09-29",
+  "job_id": 108608241896,
+  "job_name": "macos",
+  "runner_name": "m1-pulp-gate-01-13592-14",
+  "run_id": 36315085363,
+  "log_lines_kept": [
+   [
+    1372,
+    1441
+   ],
+   [
+    15280,
+    15443
+   ]
+  ],
+  "log_lines_total": 15521,
+  "ejected": "Generous-Corp/pulp#8911 (merge-group commit a8efc64d); a new head was pushed 2 minutes later",
+  "what": "Build step: cargo cannot resolve index.crates.io, exit 101. Lines 1442-15279 (build output) are elided."
+ },
+ "job": {
+  "id": 108608241896,
+  "name": "macos",
+  "steps": [
+   {
+    "number": 1,
+    "name": "Set up job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:27:42Z",
+    "completed_at": "2026-09-27T11:27:45Z"
+   },
+   {
+    "number": 2,
+    "name": "Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:27:45Z",
+    "completed_at": "2026-09-27T11:28:04Z"
+   },
+   {
+    "number": 3,
+    "name": "Fetch protected capability base",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:28:04Z",
+    "completed_at": "2026-09-27T11:28:04Z"
+   },
+   {
+    "number": 4,
+    "name": "Hydrate bounded GPU provenance commits",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:28:04Z",
+    "completed_at": "2026-09-27T11:28:40Z"
+   },
+   {
+    "number": 5,
+    "name": "Set up Namespace macOS cache",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:28:40Z",
+    "completed_at": "2026-09-27T11:28:40Z"
+   },
+   {
+    "number": 6,
+    "name": "Install Linux dependencies",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:28:40Z",
+    "completed_at": "2026-09-27T11:28:40Z"
+   },
+   {
+    "number": 7,
+    "name": "Namespace cache (brew + ccache + Pulp FetchContent)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:28:40Z",
+    "completed_at": "2026-09-27T11:28:40Z"
+   },
+   {
+    "number": 8,
+    "name": "brew update (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:28:40Z",
+    "completed_at": "2026-09-27T11:28:52Z"
+   },
+   {
+    "number": 9,
+    "name": "Install ccache (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:28:52Z",
+    "completed_at": "2026-09-27T11:29:12Z"
+   },
+   {
+    "number": 10,
+    "name": "Install ccache (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:29:12Z",
+    "completed_at": "2026-09-27T11:29:12Z"
+   },
+   {
+    "number": 11,
+    "name": "Restore FetchContent sources (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:29:12Z",
+    "completed_at": "2026-09-27T11:29:12Z"
+   },
+   {
+    "number": 12,
+    "name": "Restore ccache (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:29:12Z",
+    "completed_at": "2026-09-27T11:29:12Z"
+   },
+   {
+    "number": 13,
+    "name": "Bootstrap repository dependencies",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:29:12Z",
+    "completed_at": "2026-09-27T11:29:34Z"
+   },
+   {
+    "number": 14,
+    "name": "Install pinned Chrome for browser-source fidelity (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:29:34Z",
+    "completed_at": "2026-09-27T11:29:40Z"
+   },
+   {
+    "number": 15,
+    "name": "Save FetchContent sources (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:29:40Z",
+    "completed_at": "2026-09-27T11:29:40Z"
+   },
+   {
+    "number": 16,
+    "name": "Fetch prebuilt Skia (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:29:40Z",
+    "completed_at": "2026-09-27T11:29:41Z"
+   },
+   {
+    "number": 17,
+    "name": "Intel canary — lint + x86_64 GPU-off compile",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:29:41Z",
+    "completed_at": "2026-09-27T11:29:41Z"
+   },
+   {
+    "number": 18,
+    "name": "Ccache effective config (proof of override)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:29:41Z",
+    "completed_at": "2026-09-27T11:29:41Z"
+   },
+   {
+    "number": 19,
+    "name": "Install materialized runtime Node test dependencies (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:29:41Z",
+    "completed_at": "2026-09-27T11:29:41Z"
+   },
+   {
+    "number": 20,
+    "name": "Configure",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:29:41Z",
+    "completed_at": "2026-09-27T11:31:44Z"
+   },
+   {
+    "number": 21,
+    "name": "Install visual-analysis Python dependencies",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:31:44Z",
+    "completed_at": "2026-09-27T11:31:54Z"
+   },
+   {
+    "number": 22,
+    "name": "Build",
+    "status": "completed",
+    "conclusion": "failure",
+    "started_at": "2026-09-27T11:31:54Z",
+    "completed_at": "2026-09-27T11:38:17Z"
+   },
+   {
+    "number": 23,
+    "name": "Ccache stats",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:38:17Z",
+    "completed_at": "2026-09-27T11:38:18Z"
+   },
+   {
+    "number": 24,
+    "name": "Save ccache (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:18Z",
+    "completed_at": "2026-09-27T11:38:18Z"
+   },
+   {
+    "number": 25,
+    "name": "Decide pull-request test suite",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:18Z",
+    "completed_at": "2026-09-27T11:38:18Z"
+   },
+   {
+    "number": 26,
+    "name": "Test fast deterministic tier (pull request head)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:18Z",
+    "completed_at": "2026-09-27T11:38:18Z"
+   },
+   {
+    "number": 27,
+    "name": "Test (non-Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:18Z",
+    "completed_at": "2026-09-27T11:38:18Z"
+   },
+   {
+    "number": 28,
+    "name": "Observe ctest non-runs (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:38:18Z",
+    "completed_at": "2026-09-27T11:38:20Z"
+   },
+   {
+    "number": 29,
+    "name": "Observe GPU adapter contract (self-hosted macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:20Z",
+    "completed_at": "2026-09-27T11:38:20Z"
+   },
+   {
+    "number": 30,
+    "name": "Test installed SDK capability contract (affected changes)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:20Z",
+    "completed_at": "2026-09-27T11:38:20Z"
+   },
+   {
+    "number": 31,
+    "name": "Install and publish exact GPU-audio SDK (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:20Z",
+    "completed_at": "2026-09-27T11:38:20Z"
+   },
+   {
+    "number": 32,
+    "name": "Upload exact GPU-audio SDK (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:20Z",
+    "completed_at": "2026-09-27T11:38:20Z"
+   },
+   {
+    "number": 33,
+    "name": "Test A2T structural receipt issuer",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:20Z",
+    "completed_at": "2026-09-27T11:38:20Z"
+   },
+   {
+    "number": 34,
+    "name": "Verify A2T structural receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:20Z",
+    "completed_at": "2026-09-27T11:38:20Z"
+   },
+   {
+    "number": 35,
+    "name": "Publish A2T structural verification",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:20Z",
+    "completed_at": "2026-09-27T11:38:20Z"
+   },
+   {
+    "number": 36,
+    "name": "Surface ctest failures (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:38:20Z",
+    "completed_at": "2026-09-27T11:38:20Z"
+   },
+   {
+    "number": 37,
+    "name": "Upload ctest logs and JUnit report",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:38:20Z",
+    "completed_at": "2026-09-27T11:38:23Z"
+   },
+   {
+    "number": 38,
+    "name": "Test (Windows — UTF-8 code page wrapped)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:23Z",
+    "completed_at": "2026-09-27T11:38:23Z"
+   },
+   {
+    "number": 39,
+    "name": "Issue exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:23Z",
+    "completed_at": "2026-09-27T11:38:23Z"
+   },
+   {
+    "number": 40,
+    "name": "Publish exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:23Z",
+    "completed_at": "2026-09-27T11:38:23Z"
+   },
+   {
+    "number": 41,
+    "name": "Upload plugin bundles (macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:23Z",
+    "completed_at": "2026-09-27T11:38:23Z"
+   },
+   {
+    "number": 42,
+    "name": "Upload plugin bundles (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:23Z",
+    "completed_at": "2026-09-27T11:38:23Z"
+   },
+   {
+    "number": 43,
+    "name": "Upload plugin bundles (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-27T11:38:23Z",
+    "completed_at": "2026-09-27T11:38:23Z"
+   },
+   {
+    "number": 86,
+    "name": "Post Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:38:23Z",
+    "completed_at": "2026-09-27T11:38:24Z"
+   },
+   {
+    "number": 87,
+    "name": "Complete job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-27T11:38:24Z",
+    "completed_at": "2026-09-27T11:38:26Z"
+   }
+  ]
+ },
+ "log": "2026-09-27T11:31:54.3279590Z ##[group]Run if [ \"${RUNNER_OS}\" = \"macOS\" ]; then\n2026-09-27T11:31:54.3279950Z if [ \"${RUNNER_OS}\" = \"macOS\" ]; then\n2026-09-27T11:31:54.3280300Z   # The gate reports \"not applicable here\" with exit 77, the autotools\n2026-09-27T11:31:54.3280730Z   # skip convention. 77 is still nonzero and this step runs under\n2026-09-27T11:31:54.3281150Z   # `bash -e`, so calling it bare turns every skip into a failure of the\n2026-09-27T11:31:54.3281560Z   # REQUIRED macos check — and aborts before `cmake --build`, so the\n2026-09-27T11:31:54.3281960Z   # build the check exists to run never happens either. The skip is\n2026-09-27T11:31:54.3282340Z   # reachable in practice, not theoretical: the gate needs the\n2026-09-27T11:31:54.3282720Z   # iphonesimulator and iphoneos SDKs, and tart-provision.sh\n2026-09-27T11:31:54.3283130Z   # deliberately trims simulator payload from the golden image.\n2026-09-27T11:31:54.3283560Z   # Distinguish skip from failure; a real gate failure must still red\n2026-09-27T11:31:54.3283900Z   # the check.\n2026-09-27T11:31:54.3284150Z   if [ \"$IOS_COMPILE_REQUIRED\" = false ]; then\n2026-09-27T11:31:54.3284580Z     echo \"::notice::iOS compile gate skipped by exact changed-surface authorization\"\n2026-09-27T11:31:54.3284900Z   else\n2026-09-27T11:31:54.3285070Z     set +e\n2026-09-27T11:31:54.3285270Z     bash test/cmake/test_ios_compile_gate.sh \\\n2026-09-27T11:31:54.3285560Z       \"$GITHUB_WORKSPACE\" \"$PULP_BUILD_DIR-ios\"\n2026-09-27T11:31:54.3285810Z     ios_gate_rc=$?\n2026-09-27T11:31:54.3285990Z     set -e\n2026-09-27T11:31:54.3286180Z     if [ \"$ios_gate_rc\" = 77 ]; then\n2026-09-27T11:31:54.3286560Z       echo \"::notice::iOS compile gate skipped (exit 77) — required SDKs absent on this runner\"\n2026-09-27T11:31:54.3286950Z     elif [ \"$ios_gate_rc\" != 0 ]; then\n2026-09-27T11:31:54.3287280Z       echo \"::error::iOS compile gate failed (exit ${ios_gate_rc})\"\n2026-09-27T11:31:54.3287580Z       exit \"$ios_gate_rc\"\n2026-09-27T11:31:54.3287780Z     fi\n2026-09-27T11:31:54.3287930Z   fi\n2026-09-27T11:31:54.3288080Z fi\n2026-09-27T11:31:54.3288330Z # Parallelism is DERIVED here, never a literal. This one step runs on\n2026-09-27T11:31:54.3288740Z # runners with different shapes — self-hosted macOS gate VMs sized by\n2026-09-27T11:31:54.3289230Z # their tartci lease, GitHub-hosted Linux/Windows/macOS, and an\n2026-09-27T11:31:54.3289630Z # external contributor's checkout — and no single number is correct\n2026-09-27T11:31:54.3290040Z # for all of them. A literal is also a silent ceiling: it keeps its\n2026-09-27T11:31:54.3290440Z # value when a VM is resized, so the resize buys nothing and the\n2026-09-27T11:31:54.3290780Z # no-op reads as \"more cores did not help\".\n2026-09-27T11:31:54.3291030Z #\n2026-09-27T11:31:54.3291270Z # The governor bounds the build by min(cores, RAM/1.5GiB): it takes a\n2026-09-27T11:31:54.3291730Z # tartci lease share where a lease store exists, and falls back to\n2026-09-27T11:31:54.3292140Z # that tier-0 bound where none does (inside a build VM, or a plain\n2026-09-27T11:31:54.3292560Z # checkout). It never fails the build for a missing or denied lease,\n2026-09-27T11:31:54.3293010Z # so this is safe on every leg including a fork PR. It passes no\n2026-09-27T11:31:54.3293460Z # -j itself — CMAKE_BUILD_PARALLEL_LEVEL from the wrapper governs,\n2026-09-27T11:31:54.3293850Z # which is why no --parallel flag belongs on the governed command.\n2026-09-27T11:31:54.3294150Z #\n2026-09-27T11:31:54.3294410Z # Windows keeps a literal, and that is not an oversight. The governor\n2026-09-27T11:31:54.3295250Z # exists to divide a SHARED host; the Windows leg is a GitHub-hosted\n2026-09-27T11:31:54.3295730Z # ephemeral 4-core runner that shares with nobody, so a literal that\n2026-09-27T11:31:54.3296190Z # matches a fixed runner shape is already correct there. It is also\n2026-09-27T11:31:54.3296600Z # the one leg this PR cannot prove: `windows` is excluded from the\n2026-09-27T11:31:54.3297000Z # `pull_request` and `merge_group` matrices (see the matrix builder\n2026-09-27T11:31:54.3297380Z # above), so it runs only on push/nightly/dispatch — and no workflow\n2026-09-27T11:31:54.3297770Z # runs this wrapper under MSYS bash today, where a checked-out .sh\n2026-09-27T11:31:54.3298140Z # does not carry a filesystem exec bit. Do not fold these branches\n2026-09-27T11:31:54.3298540Z # together without first proving that path on a dispatch run.\n2026-09-27T11:31:54.3298860Z if [ \"${RUNNER_OS}\" = \"Windows\" ]; then\n2026-09-27T11:31:54.3299180Z   cmake --build \"$PULP_BUILD_DIR\" --config Release --parallel 4\n2026-09-27T11:31:54.3299490Z else\n2026-09-27T11:31:54.3299830Z   tools/ci/governed-build.sh cmake --build \"$PULP_BUILD_DIR\" --config Release\n2026-09-27T11:31:54.3300220Z fi\n2026-09-27T11:31:54.3300500Z # Build finished cleanly → clear the in-progress sentinel (ODR guard).\n2026-09-27T11:31:54.3300860Z rm -f \"$PULP_BUILD_DIR/.pulp-build-incomplete\"\n2026-09-27T11:31:54.3340600Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-27T11:31:54.3340970Z env:\n2026-09-27T11:31:54.3341180Z   PULP_BUILD_DIR: build-macos\n2026-09-27T11:31:54.3341400Z   CCACHE_COMPILERCHECK: content\n2026-09-27T11:31:54.3341610Z   CCACHE_NODEPEND: true\n2026-09-27T11:31:54.3341790Z   CCACHE_SLOPPINESS: time_macros\n2026-09-27T11:31:54.3342420Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-27T11:31:54.3343130Z   IOS_COMPILE_REQUIRED: false\n2026-09-27T11:31:54.3343340Z ##[endgroup]\n2026-09-27T11:36:03.1099140Z ld: warning: ignoring duplicate libraries: 'core/events/libpulp-events.a'\n2026-09-27T11:36:03.4781980Z [4291/4343] Linking CXX executable test/pulp-test-mac-hover-cursor-live\n2026-09-27T11:36:03.7144570Z [4292/4343] Linking CXX executable test/pulp-test-super-convolver-dsp\n2026-09-27T11:36:03.7245910Z ld: warning: ignoring duplicate libraries: 'core/canvas/libpulp-canvas.a', 'core/render/libpulp-render.a'\n2026-09-27T11:36:03.9388520Z [4293/4343] Linking CXX executable test/pulp-test-super-convolver-clap-params\n2026-09-27T11:36:03.9489810Z ld: warning: ignoring duplicate libraries: 'core/canvas/libpulp-canvas.a', 'core/render/libpulp-render.a'\n2026-09-27T11:36:04.0273800Z [4294/4343] Linking CXX executable test/pulp-test-super-convolver-web-gpu\n2026-09-27T11:36:04.2339920Z [4295/4343] Building CXX object test/CMakeFiles/pulp-super-convolver-web-guard.dir/super_convolver_web_guard.cpp.o\n2026-09-27T11:36:04.2702720Z [4296/4343] Linking CXX executable test/pulp-test-super-convolver-web-cpu\n2026-09-27T11:36:04.5368950Z [4297/4343] Linking CXX executable test/pulp-test-authoring-capsule\n2026-09-27T11:36:04.5470290Z ld: warning: ignoring duplicate libraries: 'core/runtime/libpulp-runtime.a'\n2026-09-27T11:36:04.5572360Z [4298/4343] Linking CXX executable test/pulp-test-authoring-capsule-hostile\n2026-09-27T11:36:04.5674080Z ld: warning: ignoring duplicate libraries: 'core/runtime/libpulp-runtime.a'\n2026-09-27T11:36:04.7976420Z [4299/4343] Linking CXX executable test/pulp-test-web-gpu-convolver\n2026-09-27T11:36:04.8278340Z [4300/4343] Generating pulp-control-shipping-stamps/pulp-test-control-shipping-real-component.STANDALONE.Release.stamp\n2026-09-27T11:36:05.1111150Z [4301/4343] Linking CXX executable test/pulp-test-sample-region-sequencer\n2026-09-27T11:36:05.1140890Z ld: warning: ignoring duplicate libraries: 'core/audio/libpulp-audio.a', 'core/format/libpulp-format.a', 'core/graph/libpulp-graph.a', 'core/host/libpulp-host.a', 'core/timeline/libpulp-timeline.a'\n2026-09-27T11:36:05.1238470Z [4302/4343] Linking CXX executable test/pulp-test-control-sample-region\n2026-09-27T11:36:05.1440110Z [4303/4343] Generating pulp-control-shipping-stamps/pulp-test-inspector-stripped-artifact.STANDALONE.Release.stamp\n2026-09-27T11:36:05.8009900Z [4304/4343] Linking CXX executable test/web-compat/pulp-test-web-compat-layout\n2026-09-27T11:36:05.8564490Z [4305/4343] Linking CXX executable test/web-compat/pulp-test-web-compat-parser\n2026-09-27T11:36:06.4266590Z [4306/4343] Linking CXX executable test/web-compat/pulp-test-web-compat-events\n2026-09-27T11:36:06.7039690Z [4307/4343] Linking CXX executable test/web-compat/pulp-test-web-compat-prelude\n2026-09-27T11:36:07.1089280Z [4308/4343] Linking CXX executable test/web-compat/pulp-test-web-compat-animation\n2026-09-27T11:36:07.3436680Z [4309/4343] Linking CXX executable test/web-compat/pulp-test-webgpu-mock-buffer\n2026-09-27T11:36:07.7999070Z [4310/4343] Linking CXX executable test/web-compat/pulp-test-webgpu-native-draw\n2026-09-27T11:36:07.8101480Z ld: warning: ignoring duplicate libraries: 'core/render/libpulp-render.a', 'core/state/libpulp-state.a'\n2026-09-27T11:36:07.8876280Z [4311/4343] Linking CXX executable test/web-compat/pulp-test-threejs-bridge\n2026-09-27T11:36:07.8977610Z ld: warning: ignoring duplicate libraries: 'core/render/libpulp-render.a', 'core/state/libpulp-state.a'\n2026-09-27T11:36:08.4942500Z [4312/4343] Linking CXX executable test/web-compat/pulp-test-web-compat-reftest\n2026-09-27T11:36:08.5144300Z [4313/4343] Linking CXX executable test/web-compat/pulp-test-web-compat-fixture\n2026-09-27T11:36:09.1496020Z [4314/4343] Linking CXX executable test/web-compat/pulp-test-headless-frame-pump\n2026-09-27T11:36:09.1682950Z [4315/4343] Linking CXX executable test/web-compat/pulp-test-minimal-append\n2026-09-27T11:36:09.8268780Z [4316/4343] Linking CXX executable test/web-compat/pulp-test-popover-row-template-1147\n2026-09-27T11:36:09.8293130Z [4317/4343] Linking CXX executable test/web-compat/pulp-test-css-translator-gaps-1434\n2026-09-27T11:36:10.5137380Z [4318/4343] Linking CXX executable test/web-compat/pulp-test-svg-path-range-orientation-1899\n2026-09-27T11:36:10.5157830Z [4319/4343] Linking CXX executable test/web-compat/pulp-test-svg-primitives-1926\n2026-09-27T11:36:10.9162310Z [4320/4343] Linking CXX executable examples/sample-region-allpass/sample-region-allpass-consumer\n2026-09-27T11:36:13.4693120Z [4321/4343] Generating pulp-control-shipping-stamps/pulp-control-gpu-health-standalone-product-fixture.STANDALONE.Release.stamp\n2026-09-27T11:36:13.4995440Z [4322/4343] Generating pulp-control-shipping-stamps/SampleRegionAllpass_VST3.VST3.Release.stamp\n2026-09-27T11:36:13.5197030Z [4323/4343] Generating pulp-control-shipping-stamps/SampleRegionAllpass_CLAP.CLAP.Release.stamp\n2026-09-27T11:36:13.5435280Z [4324/4343] Generating pulp-control-shipping-stamps/SampleRegionAllpass_AU.AUV2.Release.stamp\n2026-09-27T11:36:13.6169050Z [4325/4343] Linking CXX executable tools/cli/gpu_probe/pulp-test-gpu-probe-result\n2026-09-27T11:36:13.9489830Z [4326/4343] Linking CXX executable tools/cli/gpu_probe/pulp-test-gpu-dpr-native-measurement\n2026-09-27T11:36:14.3330270Z [4327/4343] Linking CXX executable tools/cli/gpu_probe/pulp-test-gpu-probe-native-recipes\n2026-09-27T11:36:14.4623060Z [4328/4343] Linking CXX executable tools/cli/pulp-test-cli-gpu-artifact-publication\n2026-09-27T11:36:14.5263340Z [4329/4343] Linking CXX executable tools/cli/pulp-test-cli-au-info-plist\n2026-09-27T11:36:15.1465440Z [4330/4343] Linking CXX executable tools/cli/pulp-test-cli-swap-pack\n2026-09-27T11:36:15.1567770Z ld: warning: ignoring duplicate libraries: 'core/runtime/libpulp-runtime.a'\n2026-09-27T11:36:15.7037700Z [4331/4343] Linking CXX executable tools/cli/pulp-test-cli-bake\n2026-09-27T11:36:15.7138870Z ld: warning: ignoring duplicate libraries: 'core/runtime/libpulp-runtime.a'\n2026-09-27T11:36:16.1684480Z [4332/4343] Linking CXX executable tools/cli/pulp-test-cli-timeline\n2026-09-27T11:36:16.1778710Z ld: warning: ignoring duplicate libraries: 'core/audio/libpulp-audio.a', 'core/timeline/libpulp-timeline.a', 'tools/timeline/libpulp-tool-timeline.a'\n2026-09-27T11:36:16.1791070Z [4332/4343] Building pulp-rs (Rust CLI) via cargo (release profile)\n2026-09-27T11:36:16.6309560Z     Updating crates.io index\n2026-09-27T11:36:46.6389650Z warning: spurious network error (3 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:36:49.6873090Z warning: spurious network error (2 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:36:53.1983230Z warning: spurious network error (1 try remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:36:59.7118030Z warning: spurious network error (3 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:00.2714970Z warning: spurious network error (2 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:03.7749430Z warning: spurious network error (1 try remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:10.2768310Z warning: spurious network error (3 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:11.1736780Z warning: spurious network error (2 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:14.6848300Z warning: spurious network error (1 try remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:21.1971890Z warning: spurious network error (3 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:22.2403120Z warning: spurious network error (2 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:25.7503020Z warning: spurious network error (1 try remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:32.2632520Z warning: spurious network error (3 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:32.8908600Z warning: spurious network error (2 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:36.4031500Z warning: spurious network error (1 try remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:42.9154340Z warning: spurious network error (3 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:43.9461940Z warning: spurious network error (2 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:47.4498870Z warning: spurious network error (1 try remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:53.9619080Z warning: spurious network error (3 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:54.6949670Z warning: spurious network error (2 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:37:58.2065500Z warning: spurious network error (1 try remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:38:04.7189610Z warning: spurious network error (3 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:38:05.9163180Z warning: spurious network error (2 tries remaining): [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:38:17.8725170Z error: failed to get `anyhow` as a dependency of package `pulp-rs v0.0.1 (/Users/admin/actions-runner/_work/pulp/pulp/experimental/pulp-rs)`\n2026-09-27T11:38:17.8735770Z \n2026-09-27T11:38:17.8735890Z Caused by:\n2026-09-27T11:38:17.8736120Z   failed to load source for dependency `anyhow`\n2026-09-27T11:38:17.8736320Z \n2026-09-27T11:38:17.8736380Z Caused by:\n2026-09-27T11:38:17.8736570Z   unable to update registry `crates-io`\n2026-09-27T11:38:17.8736730Z \n2026-09-27T11:38:17.8736780Z Caused by:\n2026-09-27T11:38:17.8736930Z   download of config.json failed\n2026-09-27T11:38:17.8737090Z \n2026-09-27T11:38:17.8737150Z Caused by:\n2026-09-27T11:38:17.8737420Z   [6] Couldn't resolve host name (Could not resolve host: index.crates.io)\n2026-09-27T11:38:17.8744790Z [4335/4343] Linking CXX executable tools/screenshot/pulp-screenshot\n2026-09-27T11:38:17.8745240Z ld: warning: ignoring duplicate libraries: 'core/state/libpulp-state.a'\n2026-09-27T11:38:17.8745700Z [4337/4343] Linking CXX executable tools/appearance/pulp-appearance-audit\n2026-09-27T11:38:17.8746190Z ld: warning: ignoring duplicate libraries: 'core/state/libpulp-state.a'\n2026-09-27T11:38:17.8746600Z [4338/4343] Linking CXX executable tools/design/pulp-design-debug\n2026-09-27T11:38:17.8747170Z ld: warning: ignoring duplicate libraries: 'core/state/libpulp-state.a'\n2026-09-27T11:38:17.8747690Z [4339/4343] Linking CXX executable tools/import-design/pulp-design-ir-observe\n2026-09-27T11:38:17.8748260Z ld: warning: ignoring duplicate libraries: 'core/platform/libpulp-platform.a', 'core/state/libpulp-state.a'\n2026-09-27T11:38:17.8748790Z [4340/4343] Linking CXX executable tools/import-design/pulp-annotated-capture-import\n2026-09-27T11:38:17.8749310Z ld: warning: ignoring duplicate libraries: 'core/platform/libpulp-platform.a', 'core/state/libpulp-state.a'\n2026-09-27T11:38:17.8749790Z [4341/4343] Linking CXX executable tools/import-design/pulp-svg-probe\n2026-09-27T11:38:17.8750260Z ld: warning: ignoring duplicate libraries: 'core/platform/libpulp-platform.a', 'core/state/libpulp-state.a'\n2026-09-27T11:38:17.8751210Z FAILED: [code=101] experimental/pulp-rs/cargo-target/release/pulp pulp /Users/admin/actions-runner/_work/pulp/pulp/build-macos/experimental/pulp-rs/cargo-target/release/pulp /Users/admin/actions-runner/_work/pulp/pulp/build-macos/pulp \n2026-09-27T11:38:17.8755460Z cd /Users/admin/actions-runner/_work/pulp/pulp/experimental/pulp-rs && /opt/homebrew/bin/cmake -E env CARGO_TARGET_DIR=/Users/admin/actions-runner/_work/pulp/pulp/build-macos/experimental/pulp-rs/cargo-target PULP_RS_BUILD_VERSION=0.876.1 /Users/admin/.cargo/bin/cargo build --release --manifest-path /Users/admin/actions-runner/_work/pulp/pulp/experimental/pulp-rs/Cargo.toml && /opt/homebrew/bin/cmake -E touch /Users/admin/actions-runner/_work/pulp/pulp/build-macos/experimental/pulp-rs/cargo-target/release/pulp && /opt/homebrew/bin/cmake -E copy /Users/admin/actions-runner/_work/pulp/pulp/build-macos/experimental/pulp-rs/cargo-target/release/pulp /Users/admin/actions-runner/_work/pulp/pulp/build-macos/pulp && /opt/homebrew/bin/cmake -E cmake_transform_depfile Ninja gccdepfile /Users/admin/actions-runner/_work/pulp/pulp /Users/admin/actions-runner/_work/pulp/pulp/experimental/pulp-rs /Users/admin/actions-runner/_work/pulp/pulp/build-macos /Users/admin/actions-runner/_work/pulp/pulp/build-macos/experimental/pulp-rs /Users/admin/actions-runner/_work/pulp/pulp/build-macos/experimental/pulp-rs/cargo-target/release/pulp.d /Users/admin/actions-runner/_work/pulp/pulp/build-macos/CMakeFiles/d/1ef23753330330d084e1b7822814110d0cec553f449fa4f79f6c3687032a5d7d.d\n2026-09-27T11:38:17.8759290Z ninja: build stopped: subcommand failed.\n2026-09-27T11:38:17.9033210Z [governed-build] build failed rc=101 after 383s\n2026-09-27T11:38:17.9127800Z [governed-build]   host: cores=3 load(start)=[4.94 17.15 11.19] load(now)=[5.58 14.15 12.33]\n2026-09-27T11:38:17.9128230Z [governed-build]   build: -j3 (floor=2) lease=none\n2026-09-27T11:38:17.9217950Z [governed-build]   VERDICT: the host was contended (build pinned at the parallelism\n2026-09-27T11:38:17.9218440Z [governed-build]   floor and/or load well above core count). Confirm against a quiet\n2026-09-27T11:38:17.9219760Z [governed-build]   host before concluding the diff is at fault — this signature has\n2026-09-27T11:38:17.9220240Z [governed-build]   passed on re-run with no code change.\n2026-09-27T11:38:17.9294070Z ##[error]Process completed with exit code 101.\n2026-09-27T11:38:17.9360160Z ##[group]Run if command -v ccache >/dev/null 2>&1; then\n2026-09-27T11:38:17.9360480Z if command -v ccache >/dev/null 2>&1; then\n2026-09-27T11:38:17.9360710Z   ccache --show-stats\n2026-09-27T11:38:17.9360890Z else\n2026-09-27T11:38:17.9361110Z   echo \"ccache not available; skipping stats\"\n2026-09-27T11:38:17.9361380Z fi\n2026-09-27T11:38:17.9938990Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-27T11:38:17.9939250Z env:\n2026-09-27T11:38:17.9939410Z   PULP_BUILD_DIR: build-macos\n2026-09-27T11:38:17.9939610Z   CCACHE_COMPILERCHECK: content\n2026-09-27T11:38:17.9939790Z   CCACHE_NODEPEND: true\n2026-09-27T11:38:17.9939970Z   CCACHE_SLOPPINESS: time_macros\n2026-09-27T11:38:17.9940550Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-27T11:38:17.9941150Z ##[endgroup]\n2026-09-27T11:38:18.0879060Z Cacheable calls:   308 /  308 (100.0%)\n2026-09-27T11:38:18.0879470Z   Hits:            303 /  308 (98.38%)\n2026-09-27T11:38:18.0879720Z     Direct:        303 /  303 (100.0%)\n2026-09-27T11:38:18.0879950Z     Preprocessed:    0 /  303 ( 0.00%)\n2026-09-27T11:38:18.0880180Z   Misses:            5 /  308 ( 1.62%)\n2026-09-27T11:38:18.0880370Z Local storage:\n2026-09-27T11:38:18.0880580Z   Cache size (GB): 0.7 / 40.0 ( 1.70%)\n2026-09-27T11:38:18.0880800Z   Hits:            303 /  308 (98.38%)\n2026-09-27T11:38:18.0881000Z   Misses:            5 /  308 ( 1.62%)\n2026-09-27T11:38:18.0931380Z ##[group]Run set -uo pipefail\n2026-09-27T11:38:18.0941520Z set -uo pipefail\n2026-09-27T11:38:18.0941890Z junit=\"$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml\"\n2026-09-27T11:38:18.0942340Z listing=\"$(ctest --test-dir \"$PULP_BUILD_DIR\" -N 2>/dev/null)\" || listing=\"\"\n2026-09-27T11:38:18.0942740Z raw_lines=\"$(printf '%s\\n' \"$listing\" | wc -l | tr -d ' ')\"\n2026-09-27T11:38:18.0943150Z registered=\"$(printf '%s\\n' \"$listing\" | sed -n 's/^Total Tests: //p' | tail -1)\"\n2026-09-27T11:38:18.0943580Z # Also echo the control to the job log. $GITHUB_STEP_SUMMARY has no\n2026-09-27T11:38:18.0943950Z # REST API, so a summary-only number cannot be read back from a\n2026-09-27T11:38:18.0944330Z # finished run; the log can. Same reason the ctest-failure step below\n2026-09-27T11:38:18.0944630Z # echoes its names twice.\n2026-09-27T11:38:18.0945050Z echo \"ctest-nonruns: registered(ctest -N raw lines)=$raw_lines registered(total)=${registered:-unknown}\"\n2026-09-27T11:38:18.0945610Z python3 tools/scripts/ctest_nonruns.py \"$junit\" \\\n2026-09-27T11:38:18.0946060Z   --registered \"${registered:-unknown}\" --raw-lines \"$raw_lines\" \\\n2026-09-27T11:38:18.0946460Z   --json-output \"$PULP_BUILD_DIR/ctest.nonruns.json\" \\\n2026-09-27T11:38:18.0946790Z   --leg \"$PULP_CTEST_LEG\" >> \"$GITHUB_STEP_SUMMARY\"\n2026-09-27T11:38:18.0971050Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-27T11:38:18.0971280Z env:\n2026-09-27T11:38:18.0971440Z   PULP_BUILD_DIR: build-macos\n2026-09-27T11:38:18.0971630Z   CCACHE_COMPILERCHECK: content\n2026-09-27T11:38:18.0971810Z   CCACHE_NODEPEND: true\n2026-09-27T11:38:18.0971980Z   CCACHE_SLOPPINESS: time_macros\n2026-09-27T11:38:18.0972580Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n2026-09-27T11:38:18.0973220Z   PULP_CTEST_LEG: macOS (ARM64) [local]\n2026-09-27T11:38:18.0973410Z ##[endgroup]\n2026-09-27T11:38:20.7432480Z ctest-nonruns: registered(ctest -N raw lines)=22168 registered(total)=22165\n2026-09-27T11:38:20.8950900Z ctest-nonruns: observation=unavailable declared=None testcases=None nonruns=0\n2026-09-27T11:38:20.9014950Z ##[error]Process completed with exit code 2.\n"
+}

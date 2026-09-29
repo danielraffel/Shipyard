@@ -293,6 +293,10 @@ pub(super) fn ship_command<W: Write>(
             },
             &repo,
             pr_context.number,
+            config
+                .get(crate::environment_requeue::CONFIG_KEY)
+                .and_then(toml::Value::as_bool)
+                == Some(true),
         );
         report_arm_outcome(&outcome, json_mode, stdout)?;
     }
