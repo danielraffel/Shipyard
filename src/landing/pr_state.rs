@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::cloud::GitHubActions;
+use crate::environment_requeue::{self, EnvironmentRequeue};
 use crate::gate_cost::ReadCache;
 use crate::landing::verdict::{self, LandingVerdict, VerdictState};
 use crate::landing::verdict_gather;
@@ -45,6 +46,11 @@ pub struct PrStateReport {
     /// UNKNOWN on its current head's required checks, with repeat and
     /// shared-failure evidence (see [`super::verdict`]).
     pub verdict: LandingVerdict,
+    /// Whether the one environment re-enqueue is available after a same-head
+    /// `failed_checks` ejection, with its evidence; absent for every other
+    /// state (see [`crate::environment_requeue`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_requeue: Option<EnvironmentRequeue>,
 }
 
 impl PrStateReport {
@@ -56,20 +62,25 @@ impl PrStateReport {
     }
 }
 
-/// Read one pull request's queue facts and classify them, without a read
-/// cache for the verdict's log signatures.
+/// Read one pull request's queue facts and classify them, for a repository
+/// that has not opted in to environment re-enqueues, without a read cache for
+/// the verdict's log signatures.
 #[must_use]
 pub fn gather(actions: &GitHubActions, repo: &str, pr: u64) -> PrStateReport {
-    gather_cached(actions, repo, pr, &ReadCache::disabled())
+    gather_cached(actions, repo, pr, false, &ReadCache::disabled())
 }
 
 /// Read one pull request's queue facts, classify them, and take its landing
-/// verdict, serving completed job-log signatures from `cache`.
+/// verdict, serving completed job-log signatures from `cache`; after a
+/// same-head `failed_checks` ejection, also read whether the network caused
+/// it. `environment_opt_in` is the repository's
+/// [`crate::environment_requeue::CONFIG_KEY`].
 #[must_use]
 pub fn gather_cached(
     actions: &GitHubActions,
     repo: &str,
     pr: u64,
+    environment_opt_in: bool,
     cache: &ReadCache,
 ) -> PrStateReport {
     let classification = match read(actions, repo, pr) {
@@ -78,7 +89,14 @@ pub fn gather_cached(
             "errors": [{"message": detail}]
         })),
     };
-    let next_action = next_action(&classification.state, pr);
+    let environment_requeue = environment_requeue::assess(
+        &|args: &[String]| actions.run_gh(args).map_err(|error| error.to_string()),
+        repo,
+        &classification,
+        environment_opt_in,
+    );
+    let next_action =
+        next_action_with_environment(&classification.state, pr, environment_requeue.as_ref());
     let validation = validation_signals::gather_pr(
         &|args: &[String]| actions.run_gh(args).map_err(|error| error.to_string()),
         repo,
@@ -101,6 +119,7 @@ pub fn gather_cached(
         classification,
         next_action,
         validation,
+        environment_requeue,
         verdict,
     }
 }
@@ -208,6 +227,33 @@ pub fn next_action(state: &PrQueueState, pr: u64) -> String {
     }
 }
 
+/// [`next_action`], answered by the environment re-enqueue verdict when
+/// there is one: an allowed verdict replaces "push a fix first", and a refused
+/// one says why the retry is not available.
+#[must_use]
+pub fn next_action_with_environment(
+    state: &PrQueueState,
+    pr: u64,
+    environment: Option<&EnvironmentRequeue>,
+) -> String {
+    match (state, environment) {
+        (PrQueueState::Ejected { reason, at, .. }, Some(verdict)) if verdict.allowed => {
+            format!(
+                "Ejected for {reason} at {} by an ENVIRONMENT failure, and this is the head's \
+                 first ejection: re-enqueue this head once with `shipyard ship --pr {pr}` \
+                 (no new push needed). If the queue ejects it again, push a fix first.",
+                at.as_deref().unwrap_or("an unknown time")
+            )
+        }
+        (_, Some(verdict)) => format!(
+            "{} Environment re-enqueue refused: {}.",
+            next_action(state, pr),
+            verdict.reason
+        ),
+        (_, None) => next_action(state, pr),
+    }
+}
+
 /// Write the machine-readable form.
 pub fn write_json<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io::Result<()> {
     let text = serde_json::to_string_pretty(report)
@@ -267,6 +313,11 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io:
     )?;
     writeln!(
         stdout,
+        "  ejections of this head   {}",
+        classification.ejections_of_current_head
+    )?;
+    writeln!(
+        stdout,
         "  timeline window          {}",
         match classification.timeline_complete {
             Some(true) => "complete",
@@ -274,6 +325,10 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io:
             None => "UNKNOWN (pageInfo not reported)",
         }
     )?;
+    if let Some(verdict) = &report.environment_requeue {
+        writeln!(stdout)?;
+        write_environment(stdout, verdict)?;
+    }
     writeln!(stdout)?;
     writeln!(stdout, "FACTS")?;
     for fact in &classification.facts {
@@ -294,6 +349,32 @@ pub fn write_verdict<W: Write>(stdout: &mut W, verdict: &LandingVerdict) -> std:
         writeln!(stdout, "  gap: {gap}")?;
     }
     writeln!(stdout, "  ({} API calls)", verdict.api_calls)
+}
+
+/// Write the ENVIRONMENT RE-ENQUEUE block: whether the one same-head retry
+/// is allowed, and the log lines it rests on.
+pub fn write_environment<W: Write>(
+    stdout: &mut W,
+    verdict: &EnvironmentRequeue,
+) -> std::io::Result<()> {
+    writeln!(stdout, "ENVIRONMENT RE-ENQUEUE")?;
+    writeln!(
+        stdout,
+        "  {}: {}",
+        if verdict.allowed {
+            "ALLOWED"
+        } else {
+            "REFUSED"
+        },
+        verdict.reason
+    )?;
+    if let Some(commit) = &verdict.merge_group_commit {
+        writeln!(stdout, "  merge-group commit       {commit}")?;
+    }
+    for step in &verdict.evidence {
+        writeln!(stdout, "    {}", step.render())?;
+    }
+    Ok(())
 }
 
 /// Write the VALIDATION block: what the head's green means, and whether the
@@ -375,6 +456,40 @@ mod tests {
             local_overlay_source: crate::config::LocalOverlaySource::None,
         };
         GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(path)
+    }
+
+    #[test]
+    fn an_allowed_environment_verdict_replaces_push_a_fix_first() {
+        let state = PrQueueState::Ejected {
+            reason: "failed_checks".to_owned(),
+            at: Some("2026-09-23T03:56:13Z".to_owned()),
+            new_head_since_removal: false,
+            requeues_without_new_head: 0,
+        };
+        let verdict = |allowed| EnvironmentRequeue {
+            allowed,
+            reason: "because".to_owned(),
+            merge_group_commit: Some("2410ca497342".to_owned()),
+            evidence: Vec::new(),
+        };
+        let allowed = next_action_with_environment(&state, 8678, Some(&verdict(true)));
+        assert!(allowed.contains("ENVIRONMENT failure"), "{allowed}");
+        assert!(allowed.contains("`shipyard ship --pr 8678`"));
+        assert!(!allowed.contains("push a fix first, then"), "{allowed}");
+        let refused = next_action_with_environment(&state, 8678, Some(&verdict(false)));
+        assert!(refused.contains("push a fix first"), "{refused}");
+        assert!(refused.ends_with("Environment re-enqueue refused: because."));
+        assert_eq!(
+            next_action_with_environment(&state, 8678, None),
+            next_action(&state, 8678)
+        );
+        let mut out = Vec::new();
+        write_environment(&mut out, &verdict(true)).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.starts_with("ENVIRONMENT RE-ENQUEUE\n  ALLOWED: because"),
+            "{text}"
+        );
     }
 
     #[cfg(unix)]

@@ -1,0 +1,352 @@
+{
+ "_provenance": {
+  "source": "GET repos/Generous-Corp/pulp/actions/jobs/107035036014 and .../logs, captured 2026-09-29",
+  "job_id": 107035036014,
+  "job_name": "macos",
+  "runner_name": "m5-pulp-gate-slot2-02-15606-3",
+  "run_id": 35815134809,
+  "log_lines_kept": [
+   [
+    485,
+    605
+   ]
+  ],
+  "log_lines_total": 672,
+  "what": "Install pinned Chrome: curl: (56) Proxy CONNECT aborted, exit 56; a continue-on-error step after it errors with exit 2."
+ },
+ "job": {
+  "id": 107035036014,
+  "name": "macos",
+  "steps": [
+   {
+    "number": 1,
+    "name": "Set up job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:41:49Z",
+    "completed_at": "2026-09-23T03:41:53Z"
+   },
+   {
+    "number": 2,
+    "name": "Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:41:53Z",
+    "completed_at": "2026-09-23T03:42:10Z"
+   },
+   {
+    "number": 3,
+    "name": "Fetch protected capability base",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:42:10Z",
+    "completed_at": "2026-09-23T03:42:10Z"
+   },
+   {
+    "number": 4,
+    "name": "Hydrate bounded GPU provenance commits",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:42:10Z",
+    "completed_at": "2026-09-23T03:42:30Z"
+   },
+   {
+    "number": 5,
+    "name": "Set up Namespace macOS cache",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:42:30Z",
+    "completed_at": "2026-09-23T03:42:30Z"
+   },
+   {
+    "number": 6,
+    "name": "Install Linux dependencies",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:42:30Z",
+    "completed_at": "2026-09-23T03:42:30Z"
+   },
+   {
+    "number": 7,
+    "name": "Namespace cache (brew + ccache + Pulp FetchContent)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:42:30Z",
+    "completed_at": "2026-09-23T03:42:30Z"
+   },
+   {
+    "number": 8,
+    "name": "brew update (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:42:30Z",
+    "completed_at": "2026-09-23T03:42:40Z"
+   },
+   {
+    "number": 9,
+    "name": "Install ccache (macOS)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:42:40Z",
+    "completed_at": "2026-09-23T03:42:54Z"
+   },
+   {
+    "number": 10,
+    "name": "Install ccache (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:42:54Z",
+    "completed_at": "2026-09-23T03:42:54Z"
+   },
+   {
+    "number": 11,
+    "name": "Restore FetchContent sources (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:42:54Z",
+    "completed_at": "2026-09-23T03:42:54Z"
+   },
+   {
+    "number": 12,
+    "name": "Restore ccache (GitHub-hosted)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:42:54Z",
+    "completed_at": "2026-09-23T03:42:54Z"
+   },
+   {
+    "number": 13,
+    "name": "Bootstrap repository dependencies",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:42:54Z",
+    "completed_at": "2026-09-23T03:43:22Z"
+   },
+   {
+    "number": 14,
+    "name": "Install pinned Chrome for browser-source fidelity (macOS ARM64)",
+    "status": "completed",
+    "conclusion": "failure",
+    "started_at": "2026-09-23T03:43:22Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 15,
+    "name": "Save FetchContent sources (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 16,
+    "name": "Fetch prebuilt Skia (macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 17,
+    "name": "Intel canary — lint + x86_64 GPU-off compile",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 18,
+    "name": "Ccache effective config (proof of override)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 19,
+    "name": "Install materialized runtime Node test dependencies (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 20,
+    "name": "Configure",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 21,
+    "name": "Install visual-analysis Python dependencies",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 22,
+    "name": "Build",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 23,
+    "name": "Ccache stats",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 24,
+    "name": "Save ccache (main push, GitHub-hosted Linux/Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 25,
+    "name": "Test (non-Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 26,
+    "name": "Observe ctest non-runs (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 27,
+    "name": "Observe GPU adapter contract (self-hosted macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 28,
+    "name": "Test installed SDK capability contract (affected changes)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 29,
+    "name": "Test A2T structural receipt issuer",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 30,
+    "name": "Verify A2T structural receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 31,
+    "name": "Publish A2T structural verification",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 32,
+    "name": "Surface ctest failures (non-Windows)",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 33,
+    "name": "Upload ctest logs and JUnit report",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 34,
+    "name": "Test (Windows — UTF-8 code page wrapped)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 35,
+    "name": "Issue exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 36,
+    "name": "Publish exact protected-validation receipt",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 37,
+    "name": "Upload plugin bundles (macOS)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 38,
+    "name": "Upload plugin bundles (Windows)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 39,
+    "name": "Upload plugin bundles (Linux)",
+    "status": "completed",
+    "conclusion": "skipped",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:34Z"
+   },
+   {
+    "number": 78,
+    "name": "Post Run actions/checkout@v5",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:43:34Z",
+    "completed_at": "2026-09-23T03:43:35Z"
+   },
+   {
+    "number": 79,
+    "name": "Complete job",
+    "status": "completed",
+    "conclusion": "success",
+    "started_at": "2026-09-23T03:43:35Z",
+    "completed_at": "2026-09-23T03:43:35Z"
+   }
+  ]
+ },
+ "log": "2026-09-23T03:43:22.2139240Z   ✓ Linking AudioUnitSDK from shared cache...\n2026-09-23T03:43:22.2166690Z   ✓ AudioUnitSDK ready\n2026-09-23T03:43:22.2174690Z \n2026-09-23T03:43:22.2175040Z ── Dependency bootstrap complete ──\n2026-09-23T03:43:22.2175250Z \n2026-09-23T03:43:22.2175460Z   Dependencies are ready. Skipping configure/build because --deps-only was requested.\n2026-09-23T03:43:22.2234690Z ##[group]Run set -euo pipefail\n2026-09-23T03:43:22.2234960Z set -euo pipefail\n2026-09-23T03:43:22.2235210Z chrome_root=\"$RUNNER_TEMP/pulp-chrome-for-testing-151.0.7922.47\"\n2026-09-23T03:43:22.2235660Z chrome=\"$chrome_root/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\"\n2026-09-23T03:43:22.2236070Z if [ ! -x \"$chrome\" ]; then\n2026-09-23T03:43:22.2236300Z   archive=\"$RUNNER_TEMP/chrome-mac-arm64.zip\"\n2026-09-23T03:43:22.2236570Z   curl --fail --location --retry 3 --output \"$archive\" \\\n2026-09-23T03:43:22.2237350Z     https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.47/mac-arm64/chrome-mac-arm64.zip\n2026-09-23T03:43:22.2237930Z   expected=9529990b6afd9867a862c7a5bff2a4a8eef84614d910acac22e4c5fa5c24daee\n2026-09-23T03:43:22.2238520Z   actual=$(shasum -a 256 \"$archive\" | awk '{print $1}')\n2026-09-23T03:43:22.2238980Z   [ \"$actual\" = \"$expected\" ] || { echo \"Chrome archive SHA-256 mismatch\" >&2; exit 1; }\n2026-09-23T03:43:22.2239300Z   mkdir -p \"$chrome_root\"\n2026-09-23T03:43:22.2239510Z   unzip -q \"$archive\" -d \"$chrome_root\"\n2026-09-23T03:43:22.2239720Z fi\n2026-09-23T03:43:22.2239980Z [ -x \"$chrome\" ] || { echo \"Chrome executable missing after verified extraction\" >&2; exit 1; }\n2026-09-23T03:43:22.2240350Z echo \"PULP_DESIGN_BROWSER=$chrome\" >> \"$GITHUB_ENV\"\n2026-09-23T03:43:22.2268500Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-23T03:43:22.2268710Z env:\n2026-09-23T03:43:22.2268850Z   PULP_BUILD_DIR: build-macos\n2026-09-23T03:43:22.2269010Z   CCACHE_COMPILERCHECK: content\n2026-09-23T03:43:22.2269160Z   CCACHE_NODEPEND: true\n2026-09-23T03:43:22.2269310Z   CCACHE_SLOPPINESS: time_macros\n2026-09-23T03:43:22.2269460Z ##[endgroup]\n2026-09-23T03:43:22.2673810Z   % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n2026-09-23T03:43:22.2674400Z                                  Dload  Upload   Total   Spent    Left  Speed\n2026-09-23T03:43:22.2674700Z \n2026-09-23T03:43:23.2840570Z   0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0\n2026-09-23T03:43:24.2906430Z   0     0    0     0    0     0      0      0 --:--:--  0:00:01 --:--:--     0\n2026-09-23T03:43:25.2951710Z   0     0    0     0    0     0      0      0 --:--:--  0:00:02 --:--:--     0\n2026-09-23T03:43:26.3014390Z   0     0    0     0    0     0      0      0 --:--:--  0:00:03 --:--:--     0\n2026-09-23T03:43:27.3136190Z   0     0    0     0    0     0      0      0 --:--:--  0:00:04 --:--:--     0\n2026-09-23T03:43:28.3139370Z   0     0    0     0    0     0      0      0 --:--:--  0:00:05 --:--:--     0\n2026-09-23T03:43:29.3193940Z   0     0    0     0    0     0      0      0 --:--:--  0:00:06 --:--:--     0\n2026-09-23T03:43:30.3268630Z   0     0    0     0    0     0      0      0 --:--:--  0:00:07 --:--:--     0\n2026-09-23T03:43:31.3349020Z   0     0    0     0    0     0      0      0 --:--:--  0:00:08 --:--:--     0\n2026-09-23T03:43:32.3418020Z   0     0    0     0    0     0      0      0 --:--:--  0:00:09 --:--:--     0\n2026-09-23T03:43:33.3509540Z   0     0    0     0    0     0      0      0 --:--:--  0:00:10 --:--:--     0\n2026-09-23T03:43:34.2836440Z   0     0    0     0    0     0      0      0 --:--:--  0:00:11 --:--:--     0\n2026-09-23T03:43:34.2837310Z   0     0    0     0    0     0      0      0 --:--:--  0:00:12 --:--:--     0\n2026-09-23T03:43:34.2838130Z   0     0    0     0    0     0      0      0 --:--:--  0:00:12 --:--:--     0\n2026-09-23T03:43:34.2839320Z curl: (56) Proxy CONNECT aborted\n2026-09-23T03:43:34.2855790Z ##[error]Process completed with exit code 56.\n2026-09-23T03:43:34.2927990Z ##[group]Run # Proves the job-level ccache correctness overrides actually reached\n2026-09-23T03:43:34.2928590Z # Proves the job-level ccache correctness overrides actually reached\n2026-09-23T03:43:34.2929050Z # this step's environment (vs the runner-service .env). Expect\n2026-09-23T03:43:34.2929490Z # compiler_check=content, depend_mode=false, direct_mode=false,\n2026-09-23T03:43:34.2929860Z # sloppiness=time_macros.\n2026-09-23T03:43:34.2930140Z if command -v ccache >/dev/null 2>&1; then\n2026-09-23T03:43:34.2930450Z   ccache --show-config 2>/dev/null \\\n2026-09-23T03:43:34.2930890Z     | grep -iE 'compiler_check|depend_mode|direct_mode|sloppiness|cache_dir' || true\n2026-09-23T03:43:34.2931330Z else\n2026-09-23T03:43:34.2931570Z   echo \"ccache not available; skipping config proof\"\n2026-09-23T03:43:34.2931850Z fi\n2026-09-23T03:43:34.2963230Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-23T03:43:34.2963590Z env:\n2026-09-23T03:43:34.2963780Z   PULP_BUILD_DIR: build-macos\n2026-09-23T03:43:34.2964060Z   CCACHE_COMPILERCHECK: content\n2026-09-23T03:43:34.2964270Z   CCACHE_NODEPEND: true\n2026-09-23T03:43:34.2964520Z   CCACHE_SLOPPINESS: time_macros\n2026-09-23T03:43:34.2964750Z ##[endgroup]\n2026-09-23T03:43:34.3430650Z (default) cache_dir = /Users/admin/Library/Caches/ccache\n2026-09-23T03:43:34.3431000Z (environment) compiler_check = content\n2026-09-23T03:43:34.3431370Z (environment) depend_mode = false\n2026-09-23T03:43:34.3431550Z (default) direct_mode = true\n2026-09-23T03:43:34.3431690Z (environment) sloppiness = time_macros\n2026-09-23T03:43:34.3461290Z ##[group]Run if command -v ccache >/dev/null 2>&1; then\n2026-09-23T03:43:34.3461540Z if command -v ccache >/dev/null 2>&1; then\n2026-09-23T03:43:34.3461680Z   ccache --show-stats\n2026-09-23T03:43:34.3461790Z else\n2026-09-23T03:43:34.3461910Z   echo \"ccache not available; skipping stats\"\n2026-09-23T03:43:34.3462050Z fi\n2026-09-23T03:43:34.3476000Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-23T03:43:34.3476160Z env:\n2026-09-23T03:43:34.3476250Z   PULP_BUILD_DIR: build-macos\n2026-09-23T03:43:34.3476370Z   CCACHE_COMPILERCHECK: content\n2026-09-23T03:43:34.3476490Z   CCACHE_NODEPEND: true\n2026-09-23T03:43:34.3476600Z   CCACHE_SLOPPINESS: time_macros\n2026-09-23T03:43:34.3476710Z ##[endgroup]\n2026-09-23T03:43:34.5079310Z Cacheable calls:   41202 / 42157 (97.73%)\n2026-09-23T03:43:34.5079580Z   Hits:            38269 / 41202 (92.88%)\n2026-09-23T03:43:34.5079720Z     Direct:        37570 / 38269 (98.17%)\n2026-09-23T03:43:34.5079920Z     Preprocessed:    699 / 38269 ( 1.83%)\n2026-09-23T03:43:34.5082780Z   Misses:           2933 / 41202 ( 7.12%)\n2026-09-23T03:43:34.5082950Z Uncacheable calls:   955 / 42157 ( 2.27%)\n2026-09-23T03:43:34.5083080Z Local storage:\n2026-09-23T03:43:34.5083190Z   Cache size (GB):   0.1 /  40.0 ( 0.16%)\n2026-09-23T03:43:34.5083330Z   Hits:            38269 / 41202 (92.88%)\n2026-09-23T03:43:34.5083450Z   Misses:           2933 / 41202 ( 7.12%)\n2026-09-23T03:43:34.5104910Z ##[group]Run set -uo pipefail\n2026-09-23T03:43:34.5105060Z set -uo pipefail\n2026-09-23T03:43:34.5105210Z junit=\"$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml\"\n2026-09-23T03:43:34.5105450Z listing=\"$(ctest --test-dir \"$PULP_BUILD_DIR\" -N 2>/dev/null)\" || listing=\"\"\n2026-09-23T03:43:34.5105670Z raw_lines=\"$(printf '%s\\n' \"$listing\" | wc -l | tr -d ' ')\"\n2026-09-23T03:43:34.5105910Z registered=\"$(printf '%s\\n' \"$listing\" | sed -n 's/^Total Tests: //p' | tail -1)\"\n2026-09-23T03:43:34.5106140Z # Also echo the control to the job log. $GITHUB_STEP_SUMMARY has no\n2026-09-23T03:43:34.5106360Z # REST API, so a summary-only number cannot be read back from a\n2026-09-23T03:43:34.5106580Z # finished run; the log can. Same reason the ctest-failure step below\n2026-09-23T03:43:34.5106750Z # echoes its names twice.\n2026-09-23T03:43:34.5106990Z echo \"ctest-nonruns: registered(ctest -N raw lines)=$raw_lines registered(total)=${registered:-unknown}\"\n2026-09-23T03:43:34.5107250Z python3 tools/scripts/ctest_nonruns.py \"$junit\" \\\n2026-09-23T03:43:34.5107440Z   --registered \"${registered:-unknown}\" --raw-lines \"$raw_lines\" \\\n2026-09-23T03:43:34.5107640Z   --json-output \"$PULP_BUILD_DIR/ctest.nonruns.json\" \\\n2026-09-23T03:43:34.5107810Z   --leg \"$PULP_CTEST_LEG\" >> \"$GITHUB_STEP_SUMMARY\"\n2026-09-23T03:43:34.5121740Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}\n2026-09-23T03:43:34.5121880Z env:\n2026-09-23T03:43:34.5121980Z   PULP_BUILD_DIR: build-macos\n2026-09-23T03:43:34.5122090Z   CCACHE_COMPILERCHECK: content\n2026-09-23T03:43:34.5122210Z   CCACHE_NODEPEND: true\n2026-09-23T03:43:34.5122310Z   CCACHE_SLOPPINESS: time_macros\n2026-09-23T03:43:34.5122430Z   PULP_CTEST_LEG: macOS (ARM64) [local]\n2026-09-23T03:43:34.5122550Z ##[endgroup]\n2026-09-23T03:43:34.5551020Z ctest-nonruns: registered(ctest -N raw lines)=1 registered(total)=unknown\n2026-09-23T03:43:34.6728160Z ctest-nonruns: observation=unavailable declared=None testcases=None nonruns=0\n2026-09-23T03:43:34.6728510Z ctest-nonruns: JSON output unavailable: [Errno 2] No such file or directory: 'build-macos/ctest.nonruns.json'\n2026-09-23T03:43:34.6768850Z ##[error]Process completed with exit code 2.\n"
+}

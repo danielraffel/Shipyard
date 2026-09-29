@@ -78,6 +78,10 @@ pub(super) fn landing_command<W: Write>(
 
     let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
     if let Some(pr) = pr {
+        let environment_opt_in = config
+            .get(crate::environment_requeue::CONFIG_KEY)
+            .and_then(toml::Value::as_bool)
+            == Some(true);
         let cache = state_dir.map_or_else(ReadCache::disabled, |dir| {
             // The PR watch cache: its signature entries are keyed by job id
             // and never change once a job completed, so both commands share.
@@ -88,7 +92,7 @@ pub(super) fn landing_command<W: Write>(
                 std::time::SystemTime::now(),
             )
         });
-        let report = pr_state::gather_cached(&actions, &repo, pr, &cache);
+        let report = pr_state::gather_cached(&actions, &repo, pr, environment_opt_in, &cache);
         if json {
             pr_state::write_json(stdout, &report)
         } else {

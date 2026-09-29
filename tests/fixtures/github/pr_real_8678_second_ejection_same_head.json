@@ -1,0 +1,138 @@
+{
+  "_provenance": {
+    "source_pr": "Generous-Corp/pulp#8678",
+    "captured": "2026-09-29 with PR_QUEUE_STATE_QUERY",
+    "cut_after_timeline_index": 11,
+    "cut_event_created_at": "2026-09-23T05:29:22Z",
+    "note": "Cut right after the SECOND failed_checks removal of the unchanged head f0fb2fb3 (merge group b82856ec, the same pip relay 403): the head already had its re-enqueue."
+  },
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "number": 8678,
+        "state": "OPEN",
+        "headRefOid": "f0fb2fb38ef5c900efad7ea0630906f081db53a9",
+        "isInMergeQueue": false,
+        "mergeQueueEntry": null,
+        "autoMergeRequest": null,
+        "timelineItems": {
+          "pageInfo": {
+            "hasPreviousPage": false
+          },
+          "nodes": [
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "15cd0988dee03f4f394f2b63dd02267b1ade77a9"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "277ceab38cc3253ad18b61d744cd1e7568dbb6eb"
+              }
+            },
+            {
+              "__typename": "AutoMergeEnabledEvent",
+              "createdAt": "2026-09-21T23:10:04Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "7895b6c3610769cdbf5b0232af5ed17d3b0dfb27"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-22T22:39:06Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "f0fb2fb38ef5c900efad7ea0630906f081db53a9"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-22T23:38:33Z",
+              "reason": "manual",
+              "actor": {
+                "login": "shipyard-local"
+              },
+              "beforeCommit": null
+            },
+            {
+              "__typename": "AutoMergeEnabledEvent",
+              "createdAt": "2026-09-22T23:42:17Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-23T02:30:54Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-23T03:56:13Z",
+              "reason": "failed_checks",
+              "actor": {
+                "login": "github-merge-queue"
+              },
+              "beforeCommit": {
+                "oid": "2410ca497342cfc0264bf5b72713de0b56099a0f",
+                "parents": {
+                  "nodes": [
+                    {
+                      "oid": "8cfa6d0aa5ce74f4cdcd01f6e033d6b17230e062"
+                    },
+                    {
+                      "oid": "f0fb2fb38ef5c900efad7ea0630906f081db53a9"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-09-23T04:29:05Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-09-23T05:29:22Z",
+              "reason": "failed_checks",
+              "actor": {
+                "login": "github-merge-queue"
+              },
+              "beforeCommit": {
+                "oid": "b82856ec34d1604401d88934a9c806f50197c396",
+                "parents": {
+                  "nodes": [
+                    {
+                      "oid": "8cfa6d0aa5ce74f4cdcd01f6e033d6b17230e062"
+                    },
+                    {
+                      "oid": "f0fb2fb38ef5c900efad7ea0630906f081db53a9"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
