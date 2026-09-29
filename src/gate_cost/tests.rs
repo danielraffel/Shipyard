@@ -758,34 +758,48 @@ fn a_short_created_listing_is_completed_by_the_event_walk() {
 }
 
 /// A gate whose `name:` is an expression GitHub reported unevaluated is still
-/// counted, a run with no gate job at all adds nothing, and both are named.
+/// counted once per attempt, a run cancelled before its gate started counts
+/// one unstarted attempt (not one per alternate), a run with no gate job at
+/// all adds nothing, and each case is named.
 #[test]
-fn a_gate_reported_under_an_unevaluated_name_is_counted_and_named() {
+#[allow(clippy::float_cmp)] // exact reporting is the property under test
+fn a_gate_reported_under_an_unevaluated_name_is_counted_once_and_named() {
     let mut responses = fixture();
-    let expression = "github.event_name == 'pull_request' && 'macos' || 'macos-unused'";
+    let gate = "matrix.key == 'macos' && 'macos' || format('{0}', matrix.name)";
+    let pr_alternate = "github.event_name == 'pull_request' && 'macos' || 'macos-pr-unused'";
+    let mg_alternate = "github.event_name == 'merge_group' && 'macos' || 'macos-merge-unused'";
+    // Run 101: the gate ran under its unevaluated name; its skipped
+    // alternates resolve to `macos` too.
     responses.insert(
         "repos/o/r/actions/runs/101/jobs".to_owned(),
         jobs_page(&[
-            job(1, expression, 1, "success", 20),
-            job(
-                11,
-                "github.event_name == 'merge_group' && 'macos' || 'x'",
-                1,
-                "skipped",
-                0,
-            ),
+            job(11, pr_alternate, 1, "skipped", 0),
+            job(1, gate, 1, "success", 20),
+            job(12, mg_alternate, 1, "skipped", 0),
             job(2, "linux", 1, "success", 40),
         ]),
     );
+    // Run 102: cancelled before anything started; every name unevaluated.
+    responses.insert(
+        "repos/o/r/actions/runs/102/jobs".to_owned(),
+        jobs_page(&[
+            unassigned(job(3, pr_alternate, 1, "cancelled", 0), &["ubuntu-latest"]),
+            unassigned(job(4, gate, 1, "cancelled", 0), &["self-hosted"]),
+            unassigned(job(13, mg_alternate, 1, "cancelled", 0), &["ubuntu-latest"]),
+        ]),
+    );
+    // Run 103: no gate job at all.
     responses.insert(
         "repos/o/r/actions/runs/103/jobs".to_owned(),
         jobs_page(&[job(5, "linux", 1, "success", 3)]),
     );
     let report = run_fixture(responses).expect("fixture gathers");
-    // Run 101's 20 minutes still count; the skipped alternate does not; run
-    // 103 has no gate job.
-    assert_eq!(report.pr_head.jobs, 3);
-    assert_eq!(report.pr_head.jobs_ran, 3);
+    assert_eq!(report.pr_head.jobs, 2, "one gate attempt per run attempt");
+    assert_eq!(
+        report.pr_head.by_conclusion,
+        BTreeMap::from([("cancelled".to_owned(), 1), ("success".to_owned(), 1)])
+    );
+    assert_eq!(report.pr_head.gate_minutes, 20.0);
     let gap = report
         .telemetry_gaps
         .iter()
@@ -793,14 +807,26 @@ fn a_gate_reported_under_an_unevaluated_name_is_counted_and_named() {
         .expect("named as a gap");
     assert!(
         gap.reason
-            .starts_with("2 of 3 `pull_request` run(s) have no job named exactly `macos`"),
+            .starts_with("3 of 3 `pull_request` run(s) have no job named exactly `macos`"),
         "{}",
         gap.reason
     );
     assert!(
         gap.reason
-            .contains("1 of them were matched through an unevaluated job name")
+            .contains("; 1 were cancelled before the gate started"),
+        "{}",
+        gap.reason
     );
-    assert!(gap.reason.contains(expression));
-    assert!(gap.reason.contains("1 run(s) carry no gate job at all"));
+    assert!(
+        gap.reason
+            .contains("; 1 ran the gate under an unevaluated name"),
+        "{}",
+        gap.reason
+    );
+    assert!(gap.reason.contains(gate), "{}", gap.reason);
+    assert!(
+        gap.reason.contains("; 1 run(s) carry no gate job at all"),
+        "{}",
+        gap.reason
+    );
 }

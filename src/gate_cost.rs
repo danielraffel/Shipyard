@@ -212,10 +212,14 @@ pub struct GateCostObservation {
 pub struct GateAbsence {
     /// Runs with no exactly-named gate job.
     pub runs: usize,
-    /// Of those, runs whose gate was found only through a job whose reported
+    /// Of those, runs whose gate was matched through a job whose reported
     /// name is an unevaluated expression or matrix placeholder resolving to
-    /// the gate name.
-    pub resolved: usize,
+    /// the gate name, and that job never got a runner: GitHub leaves `name:`
+    /// unevaluated for a job cancelled or skipped before it started.
+    pub resolved_unstarted: usize,
+    /// Of those, runs whose matched job ran under its unevaluated name: the
+    /// workflow's gate `name:` itself no longer evaluates to the gate.
+    pub resolved_ran: usize,
     /// Up to three distinct reported names that resolved to the gate.
     pub resolved_names: Vec<String>,
 }
@@ -584,22 +588,32 @@ pub fn compute(observation: &GateCostObservation) -> GateCostReport {
             "{} of {total} `{event}` run(s) have no job named exactly `{}`",
             absence.runs, query.gate_job
         );
-        if absence.resolved > 0 {
+        if absence.resolved_unstarted > 0 {
             let _ = write!(
                 reason,
-                "; {} of them were matched through an unevaluated job name ({}), so the \
-                 workflow's `name:` for the gate is now an expression and should be renamed \
-                 back to a literal",
-                absence.resolved,
-                absence.resolved_names.join(" | ")
+                "; {} were cancelled before the gate started, which leaves every job name \
+                 unevaluated, and count as one gate attempt each through the unevaluated name",
+                absence.resolved_unstarted
             );
         }
-        if absence.runs > absence.resolved {
+        if absence.resolved_ran > 0 {
+            let _ = write!(
+                reason,
+                "; {} ran the gate under an unevaluated name, so the workflow's gate `name:` no \
+                 longer evaluates to `{}` and should be made a literal again",
+                absence.resolved_ran, query.gate_job
+            );
+        }
+        let resolved = absence.resolved_unstarted + absence.resolved_ran;
+        if resolved > 0 {
+            let _ = write!(reason, " (names: {})", absence.resolved_names.join(" | "));
+        }
+        if absence.runs > resolved {
             let _ = write!(
                 reason,
                 "; {} run(s) carry no gate job at all and add no gate minutes (renamed, \
                  moved to another workflow, or not scheduled)",
-                absence.runs - absence.resolved
+                absence.runs - resolved
             );
         }
         gaps.push(TelemetryGap {
@@ -1114,7 +1128,16 @@ pub fn gather_cached(
             let exact = jobs
                 .iter()
                 .any(|job| text(job, "name").as_deref() == Some(query.gate_job.as_str()));
-            let mut resolved_here = false;
+            // No exactly-named gate job: GitHub reported the gate's name
+            // unevaluated. One job per attempt stands for the gate: the one
+            // that got a runner, else the first that was not skipped. The
+            // gate's skipped or cancelled alternates carry the same resolved
+            // name and must not multiply the attempt.
+            let fallback = if exact {
+                BTreeMap::new()
+            } else {
+                resolved_gate_jobs(&jobs, &query.gate_job)
+            };
             for job in &jobs {
                 let runner_name = text(job, "runner_name").filter(|name| !name.trim().is_empty());
                 let labels = job_labels(job);
@@ -1128,23 +1151,18 @@ pub fn gather_cached(
                 let is_gate = if exact {
                     name == query.gate_job
                 } else {
-                    // No exactly-named gate job: GitHub reported the gate's
-                    // name unevaluated. Take the instance that ran.
-                    let resolved = job_name::matches(&query.gate_job, &name)
-                        && text(job, "conclusion").as_deref() != Some("skipped");
-                    if resolved {
-                        resolved_here = true;
-                        let absence = gate_absent.entry(event.clone()).or_default();
-                        if absence.resolved_names.len() < 3
-                            && !absence.resolved_names.contains(&name)
-                        {
-                            absence.resolved_names.push(name.clone());
-                        }
-                    }
-                    resolved
+                    job.get("id")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|id| fallback.values().any(|picked| *picked == id))
                 };
                 if !is_gate {
                     continue;
+                }
+                if !exact {
+                    let absence = gate_absent.entry(event.clone()).or_default();
+                    if absence.resolved_names.len() < 3 && !absence.resolved_names.contains(&name) {
+                        absence.resolved_names.push(name.clone());
+                    }
                 }
                 gate_jobs.push(GateJobSample {
                     run_id,
@@ -1160,10 +1178,18 @@ pub fn gather_cached(
                 });
             }
             if !exact {
+                let ran = jobs.iter().any(|job| {
+                    job.get("id")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|id| fallback.values().any(|picked| *picked == id))
+                        && text(job, "runner_name").is_some_and(|name| !name.trim().is_empty())
+                });
                 let absence = gate_absent.entry(event.clone()).or_default();
                 absence.runs += 1;
-                if resolved_here {
-                    absence.resolved += 1;
+                if ran {
+                    absence.resolved_ran += 1;
+                } else if !fallback.is_empty() {
+                    absence.resolved_unstarted += 1;
                 }
             }
             if let Some(outcome) = outcome {
@@ -1199,6 +1225,37 @@ pub fn gather_cached(
         listing_gaps,
         gate_absent,
     })
+}
+
+/// Per run attempt, the id of the one job that stands for `gate_job` when no
+/// job carries its exact name: among jobs whose unevaluated name resolves to
+/// it and that were not skipped, the first that got a runner, else the first.
+fn resolved_gate_jobs(jobs: &[Value], gate_job: &str) -> BTreeMap<u64, u64> {
+    let mut picked: BTreeMap<u64, (bool, u64)> = BTreeMap::new();
+    for job in jobs {
+        let (Some(id), Some(name)) = (job.get("id").and_then(Value::as_u64), text(job, "name"))
+        else {
+            continue;
+        };
+        if !job_name::matches(gate_job, &name)
+            || text(job, "conclusion").as_deref() == Some("skipped")
+        {
+            continue;
+        }
+        let attempt = job.get("run_attempt").and_then(Value::as_u64).unwrap_or(1);
+        let ran = text(job, "runner_name").is_some_and(|name| !name.trim().is_empty());
+        match picked.get(&attempt) {
+            Some((true, _)) => {}
+            Some((false, _)) if !ran => {}
+            _ => {
+                picked.insert(attempt, (ran, id));
+            }
+        }
+    }
+    picked
+        .into_iter()
+        .map(|(attempt, (_, id))| (attempt, id))
+        .collect()
 }
 
 /// Pages of the unfiltered event listing walked for the cross-check; 1000

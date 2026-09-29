@@ -871,9 +871,10 @@ shipyard metrics import github --repo Generous-Corp/pulp --limit 50 --json
 tartci runtime export --repo Generous-Corp/pulp |
   shipyard metrics import tartci --json
 shipyard metrics summary --project pulp --json
+shipyard metrics summary --project pulp --group-by host --json
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
-shipyard metrics watch --project pulp --since 14d --json
+shipyard metrics watch --project pulp --since 14d --json   # required gates first; --required <check> overrides config
 shipyard metrics advise --project pulp --json
 shipyard metrics compare --project pulp --baseline github-hosted --candidate macstudio --json
 ```
@@ -898,7 +899,15 @@ question really is duration. `gate-cost` likewise leads with count-based
 proxies (runs per merged PR, starvation, unserved labels, wait per job ahead,
 merge-queue attempts and ejections by cause, push cancellations) and keeps
 minutes as context. It caches settled GitHub answers between runs and reports
-its own cost on the `reads:` line; `--no-cache` reads everything live. Definitions and floors: `docs/cli-reference.md`
+its own cost on the `reads:` line; `--no-cache` reads everything live. Its
+`run_listing` gap means the `created=` listing came back short and the event
+walk restored the missed runs; `gate_job_name` means some runs had no job
+named exactly `--gate-job`. `watch` shares are job-level (each job's own
+conclusion, never the run's), carry a `denominator`, and are split into
+`required` and `advisory` lanes via `--required` or `[governance]
+required_status_checks`. `advise` keys lanes by resolved job name and host and
+reports `no_healthy_lane` when a sampled gate fails too often; `summary
+--group-by host` folds ephemeral runners into their host. Definitions and floors: `docs/cli-reference.md`
 ("Proxy-first verdicts").
 
 When fixing GitHub importer bugs, keep Actions list endpoints absolute

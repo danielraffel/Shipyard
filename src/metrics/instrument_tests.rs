@@ -90,6 +90,14 @@ fn jit_gate_store() -> (tempfile::TempDir, MetricsStore) {
             Some("studio-pulp-gate-01-76663-2"),
             3,
         ),
+        // Superseded by a push: says nothing about the host's health.
+        github_job(
+            10,
+            "macos",
+            "cancelled",
+            Some("m5studio-pulp-gate-01-42746-23"),
+            2,
+        ),
         github_job(7, PR_ALTERNATE, "skipped", None, 0),
         github_job(8, PR_ALTERNATE, "skipped", None, 0),
         github_job(9, PR_ALTERNATE, "skipped", None, 0),
@@ -141,7 +149,7 @@ fn summary_groups_ephemeral_runners_by_host_on_request() {
     let by_runner = macos(store.summary(Some("pulp")).expect("summary"));
     assert_eq!(
         by_runner.len(),
-        6,
+        7,
         "one row per throwaway runner: {by_runner:?}"
     );
     let by_host = macos(
@@ -151,7 +159,7 @@ fn summary_groups_ephemeral_runners_by_host_on_request() {
     );
     assert_eq!(
         by_host,
-        [("m5studio".to_owned(), 4), ("studio".to_owned(), 2)]
+        [("m5studio".to_owned(), 5), ("studio".to_owned(), 2)]
     );
 }
 

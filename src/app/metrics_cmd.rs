@@ -892,4 +892,74 @@ mod tests {
         assert!(output.contains("submit-to-receipt=unavailable"));
         assert!(output.contains("model-tokens=unavailable"));
     }
+
+    #[test]
+    fn watch_human_output_names_its_required_set_and_job_denominator() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        for (days_ago, status, count) in [(10, "success", 12), (2, "success", 6), (2, "failure", 6)]
+        {
+            for index in 0..count {
+                let completed = Utc::now() - chrono::Duration::days(days_ago)
+                    + chrono::Duration::minutes(index);
+                store
+                    .record(&MetricRecordInput {
+                        project: "p".to_owned(),
+                        job: "macos".to_owned(),
+                        target: Some("macos-gate/merge_group".to_owned()),
+                        duration_ms: 60_000,
+                        status: status.to_owned(),
+                        completed_at: Some(completed),
+                        ..MetricRecordInput::default()
+                    })
+                    .expect("record");
+            }
+        }
+        let watch = |required: Vec<String>, json: bool| {
+            let mut output = Vec::new();
+            metrics_command(
+                MetricsCommand::Watch(crate::app::cli::MetricsWatchArgs {
+                    project: "p".to_owned(),
+                    since: "7d".to_owned(),
+                    required,
+                    basis: crate::app::cli::MetricsBasis::Proxy,
+                }),
+                temp.path(),
+                None,
+                json,
+                &mut output,
+            )
+            .expect("watch");
+            String::from_utf8(output).expect("utf-8")
+        };
+        let text = watch(vec!["macos".to_owned()], false);
+        assert!(
+            text.starts_with("required checks (flag): macos\n"),
+            "{text}"
+        );
+        assert!(text.contains("required gates:\n"), "{text}");
+        assert!(text.contains("(n=12/12 jobs (success+failure))"), "{text}");
+        assert!(
+            text.contains("denominator: jobs named macos (each job's own conclusion"),
+            "{text}"
+        );
+        assert!(
+            text.contains("previous n=12 (12 success/failure), current n=12"),
+            "{text}"
+        );
+
+        let unknown = watch(Vec::new(), false);
+        assert!(
+            unknown.starts_with("required checks: none known"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("unclassified lanes:"), "{unknown}");
+
+        let json: Value =
+            serde_json::from_str(&watch(vec!["macos".to_owned()], true)).expect("json");
+        assert_eq!(json["required"]["source"], "flag");
+        assert_eq!(json["findings"][0]["gate"], "required");
+        assert_eq!(json["findings"][0]["denominator"]["unit"], "jobs");
+        assert_eq!(json["findings"][0]["denominator"]["current_decided"], 12);
+    }
 }

@@ -305,9 +305,11 @@ writer custody before mutation.
 | Import recent GitHub Actions timing into runner metrics | `shipyard metrics import github --repo <owner/repo> --limit 20 --json` |
 | Import tartci VM timing into runner metrics | `tartci runtime export --repo <owner/repo> | shipyard metrics import tartci --json` |
 | Summarize runner timing history | `shipyard metrics summary --project <name> --json` |
+| Summarize timing per physical host (fold ephemeral runners) | `shipyard metrics summary --project <name> --group-by host --json` |
 | Show one bounded stewardship scorecard | `shipyard metrics scorecard --project <name> --since 30d --json` |
 | Gate-minutes per merged PR, batch fullness, receipt reuse (live, read-only) | `shipyard metrics gate-cost --repo <owner/repo> --workflow <file> --gate-job <job> --since 48h --json` |
-| Ask for agent-readable runner health findings | `shipyard metrics watch --project <name> --since 14d --json` |
+| Ask for agent-readable runner health findings (required gates vs advisory, job denominators) | `shipyard metrics watch --project <name> --since 14d [--required <check>] --json` |
+| Ask where a job class runs fastest and healthiest | `shipyard metrics advise --project <name> --json` |
 | Compare local vs GitHub runner timing | `shipyard metrics compare --project <name> --baseline github-hosted --candidate macstudio --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
 | Cancel a job | `shipyard cancel <job_id>` |
@@ -632,6 +634,17 @@ rather than inventing a value. Treat insufficient-sample findings as "keep
 collecting", not as proof of a regression. Escalate only when the finding
 includes enough samples and a material delta for that repo/lane.
 
+Every `watch` share is over job rows judged by the job's own conclusion, never
+the workflow run's (an advisory red job turns a run red while the required
+gate is green). Read `denominator` for the per-window job counts and `gate`
+for `required` / `advisory` / `unclassified`; the required set comes from
+`--required` or `[governance] required_status_checks`. `advise` keys lanes by
+resolved job name and physical host, counts only success/failure, and says
+`no_healthy_lane` (with per-host failure rates) when a sampled gate is simply
+failing too often; `insufficient_healthy_samples` now means fewer than 3
+decided jobs. Use `summary --group-by host` when rows came from
+`metrics import github`, whose host column is otherwise the ephemeral runner.
+
 `shipyard metrics gate-cost` is the merge-throughput view and reads GitHub
 live, not the metrics store. Its headline is required-gate wall minutes (PR-head
 and merge-group runs of one workflow/job, every attempt, failures included)
@@ -647,7 +660,15 @@ says how many requests went to GitHub and how many the cache served. Use
 `--no-cache` to force every read live. A short page is an error, never a
 smaller number. A merge-group run with no decision counts as not
 reused and appears under `telemetry_gaps`, as does queue-depth history, which
-GitHub does not record.
+GitHub does not record. The `created=` run listing is cross-checked against the
+plain event listing; a `run_listing` gap means GitHub answered the filtered
+listing short (seen live: 11 of 624 `pull_request` runs) and the missed runs
+were added. A `gate_job_name` gap means some runs had no job named exactly
+`--gate-job`: cancelled before the gate started (GitHub leaves every name
+unevaluated; counted as one unstarted attempt), ran under an unevaluated name
+(counted, but make the workflow's gate `name:` a literal again), or no gate job
+at all.
+If PR-head numbers collapse without either gap, rerun before acting on them.
 
 When debugging GitHub imports, remember that Shipyard invokes `gh api` with
 absolute `/repos/...` paths and forces `-X GET` when query parameters are passed
