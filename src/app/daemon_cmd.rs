@@ -494,7 +494,7 @@ fn render_daemon_start<W: Write>(
 
     writeln!(
         stdout,
-        "daemon started (pid {pid}); registering {} repo(s).",
+        "daemon started (pid {pid}); advertising {} repo(s).",
         repos.len()
     )?;
     Ok(())
@@ -634,14 +634,14 @@ fn render_daemon_refresh<W: Write>(
     if outcome.stopped_prior {
         writeln!(
             stdout,
-            "daemon refreshed (new pid {}); registered {} repo(s).",
+            "daemon refreshed (new pid {}); advertising {} repo(s).",
             outcome.new_pid,
             outcome.repos.len()
         )?;
     } else {
         writeln!(
             stdout,
-            "no prior daemon; started fresh (pid {}); registered {} repo(s).",
+            "no prior daemon; started fresh (pid {}); advertising {} repo(s).",
             outcome.new_pid,
             outcome.repos.len()
         )?;
@@ -723,7 +723,7 @@ fn render_daemon_status<W: Write>(
 
     writeln!(
         stdout,
-        "daemon running · tunnel={backend} · {url}\nsubscribers={subscribers} · repos={repos_text}"
+        "daemon running · tunnel={backend} · {url}\nsubscribers={subscribers} · advertises={repos_text}"
     )?;
     Ok(())
 }
@@ -903,7 +903,7 @@ mod tests {
             .expect("human render");
         assert_eq!(
             String::from_utf8(human_out).expect("utf8"),
-            "daemon started (pid 4242); registering 1 repo(s).\n"
+            "daemon started (pid 4242); advertising 1 repo(s).\n"
         );
     }
 
@@ -949,7 +949,7 @@ mod tests {
         render_daemon_refresh(&mut human_out, false, &outcome).expect("human render");
         assert_eq!(
             String::from_utf8(human_out).expect("utf8"),
-            "daemon refreshed (new pid 9090); registered 2 repo(s).\n"
+            "daemon refreshed (new pid 9090); advertising 2 repo(s).\n"
         );
 
         let fresh = DaemonRefreshOutcome {
@@ -961,7 +961,7 @@ mod tests {
         render_daemon_refresh(&mut fresh_out, false, &fresh).expect("human render");
         assert_eq!(
             String::from_utf8(fresh_out).expect("utf8"),
-            "no prior daemon; started fresh (pid 8080); registered 0 repo(s).\n"
+            "no prior daemon; started fresh (pid 8080); advertising 0 repo(s).\n"
         );
 
         let error = DaemonRefreshError {
@@ -1062,10 +1062,49 @@ mod tests {
         render_daemon_status(&mut human_out, false, temp.path()).expect("human render");
         let text = String::from_utf8(human_out).expect("utf8");
         assert!(text.contains("daemon running"));
-        assert!(text.contains("repos=owner/status"));
+        assert!(text.contains("advertises=owner/status"));
 
         assert!(stop_running(temp.path()));
         worker.join().expect("join");
+    }
+
+    #[test]
+    fn daemon_human_output_says_advertise_not_operate() {
+        // `--repo` only controls what the daemon ADVERTISES from its status
+        // endpoint; it is not the daemon's working set. Human-facing strings
+        // that say "registering"/"registered"/"watches" invite reading the
+        // status banner as the set of repos the daemon acts on, which is how a
+        // stale, unresolvable slug once survived unnoticed across restarts.
+        let mut out = Vec::new();
+        render_daemon_start(&mut out, false, 4242, &["owner/a".to_owned()]).unwrap();
+        let start = String::from_utf8(out).unwrap();
+        assert!(start.contains("advertising"), "start: {start}");
+        for implies_operation in ["registering", "registered", "watches"] {
+            assert!(
+                !start.contains(implies_operation),
+                "start text must not imply the daemon operates on these repos: {start}"
+            );
+        }
+
+        let mut out = Vec::new();
+        render_daemon_refresh(
+            &mut out,
+            false,
+            &DaemonRefreshOutcome {
+                stopped_prior: true,
+                new_pid: 9090,
+                repos: vec!["owner/a".to_owned(), "owner/b".to_owned()],
+            },
+        )
+        .unwrap();
+        let refresh = String::from_utf8(out).unwrap();
+        assert!(refresh.contains("advertising"), "refresh: {refresh}");
+        for implies_operation in ["registering", "registered", "watches"] {
+            assert!(
+                !refresh.contains(implies_operation),
+                "refresh text must not imply operation: {refresh}"
+            );
+        }
     }
 
     #[cfg(unix)]

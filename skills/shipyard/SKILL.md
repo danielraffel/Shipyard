@@ -32,6 +32,11 @@ because nothing consumed the feed.
   sync, 1 warn, 2 alarm, 3 blocked on a human action. Use it before concluding
   a daemon is healthy from `daemon status` alone — status prints what the daemon
   INTENDS, which was correct throughout the outage.
+- `daemon status`'s repo line is an ADVERTISEMENT, not a working set. `--repo`
+  on `start`/`run`/`refresh` only controls what the status endpoint advertises, so
+  status prints `advertises=` and start/refresh say "advertising N repo(s)". An
+  unresolvable slug there is cosmetic and can persist across restarts; judge what
+  a host actually serves from `shipyard runner fleet-status`, never from this line.
 - A registration believed good is re-asserted on a schedule
   (`WEBHOOK_REVERIFY_INTERVAL`). Do not "optimize" that away by suppressing the
   re-check after a success; the suppression is the bug.

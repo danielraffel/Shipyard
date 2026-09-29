@@ -1154,7 +1154,7 @@ fn daemon_watched_repos_entry(
     }
     Some(DoctorEntry {
         ok: problems.is_empty(),
-        version: Some(format!("daemon watches {} repo(s)", repos.len())),
+        version: Some(format!("daemon advertises {} repo(s)", repos.len())),
         detail: (!detail.is_empty()).then(|| detail.join("\n")),
         error: None,
     })
