@@ -546,7 +546,8 @@ pub(super) enum Command {
         skip_targets: Vec<String>,
         /// Adopt the current head SHA when recorded ship-state drifted (amend /
         /// force-push), re-validating the new head instead of failing on
-        /// SHA drift (Shipyard #346).
+        /// SHA drift (Shipyard #346). A head that fast-forwards the recorded
+        /// one on the same base branch is adopted without this flag.
         #[arg(long = "adopt-head")]
         adopt_head: bool,
         /// Do not arm GitHub-native auto-merge on the pull request. By default
@@ -621,7 +622,8 @@ pub(super) enum Command {
         skill_reason: Option<String>,
         /// Adopt the current head SHA when recorded ship-state drifted (amend /
         /// force-push), re-validating the new head instead of failing on
-        /// SHA drift (Shipyard #346).
+        /// SHA drift (Shipyard #346). A head that fast-forwards the recorded
+        /// one on the same base branch is adopted without this flag.
         #[arg(long = "adopt-head")]
         adopt_head: bool,
         /// Durable workstream identifier for an atomic merge-steward handoff.

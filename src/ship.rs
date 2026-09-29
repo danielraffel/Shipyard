@@ -93,11 +93,11 @@ pub struct ShipExecutionRequest {
     pub resume_from: Option<String>,
     /// Target names whose failures should not block merge.
     pub advisory_targets: BTreeSet<String>,
-    /// Adopt the current head SHA when the recorded ship-state drifted — but
-    /// ONLY when the amended commit has the same tree (e.g. a trailer-only
-    /// `--amend`). The command layer verifies same-tree before setting this and
-    /// refuses a content change, so prior evidence is never blessed for a
-    /// different tree (Shipyard #346).
+    /// Adopt the current head SHA (and base branch) when the recorded
+    /// ship-state drifted. Adoption clears prior runs and evidence, so the new
+    /// head is re-validated from scratch and nothing validated for the old head
+    /// is credited to it. Set by `--adopt-head`, or by the command layer when
+    /// the current head is a fast-forward descendant of the recorded one.
     pub adopt_head: bool,
     /// Optional PR snapshot file used to keep already-merged observation
     /// offline and deterministic. When `Some`, the admit-pass observation reads
@@ -295,7 +295,7 @@ impl Display for ShipExecutionError {
             Self::ShaDrift { existing, current } => {
                 write!(
                     formatter,
-                    "ship state SHA drift: existing {existing}, current {current}"
+                    "ship state SHA drift: existing {existing}, current {current}; re-run with --adopt-head to adopt and re-validate the current head (a fast-forward descendant is adopted automatically; --allow-fleet-epoch-drift does not affect this check)"
                 )
             }
             Self::BaseDrift { existing, current } => write!(

@@ -2395,7 +2395,9 @@ Switch to the exact PR worktree when this guard rejects a stale, detached,
 fork-origin, or unrelated checkout. If that exact worktree intentionally moved
 since the previous ship attempt, Shipyard also rejects the stale scoped
 ship-state before queue insertion; verify the new head, then acknowledge it
-with explicit `--adopt-head`. Never automate that flag.
+with explicit `--adopt-head`. Never automate that flag. A fast-forward (the
+recorded head is an ancestor of the new head on the same base, e.g. after
+merging main into the branch) is the exception: Shipyard adopts it itself.
 
 Never run `gh pr create` + release separately. Never run the gate scripts by hand.
 

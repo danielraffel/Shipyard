@@ -2316,7 +2316,13 @@ validation state. A detached, stale, fork-origin, or unrelated checkout is
 rejected; switch to the exact PR worktree instead of using `--pr` as a retarget
 override. A verified intentional head/base change still requires explicit
 `--adopt-head`, and known drift is rejected before queue insertion so it cannot
-wait behind unrelated work only to fail at worker start. Never auto-adopt.
+wait behind unrelated work only to fail at worker start. The one automatic
+case is a fast-forward: when the recorded head is an ancestor of the current
+head on the same base (a follow-up commit, or merging main into the branch),
+Shipyard adopts it itself, prints `Adopting fast-forwarded head <old> -> <new>`,
+and re-validates from scratch. Never automate `--adopt-head` for anything else.
+`--allow-fleet-epoch-drift` is unrelated: it waives the fleet-epoch preflight
+and never touches ship-state SHA drift.
 
 For an already-created PR, the submitting agent must run
 `shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
@@ -3058,7 +3064,9 @@ adopts the current head and **clears the recorded remote runs + evidence** so
 the new head re-validates from scratch — it never blesses stale validation for
 a possibly-different tree. The policy-signature guard still applies (a changed
 merge policy is still refused). Without the flag the old dead-end (manual `gh pr
-merge`) stands.
+merge`) stands. A pure fast-forward (the recorded head is an ancestor of the
+current head, base unchanged) needs no flag: it is adopted the same way,
+automatically.
 
 Other non-mutating checks:
 
