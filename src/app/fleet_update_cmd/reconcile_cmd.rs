@@ -94,6 +94,9 @@ impl ReconcileEnv for LiveEnv<'_> {
                     reason: failure.failure.message().to_owned(),
                 }
             }
+            Err(failure) if failure.deferred => RolloutOutcome::Deferred {
+                reason: failure.failure.message().to_owned(),
+            },
             Err(failure) if failure.ineligible => RolloutOutcome::Ineligible {
                 reason: failure.failure.message().to_owned(),
             },
@@ -187,6 +190,9 @@ fn failure_message(report: &ReconcileReport) -> String {
         );
     }
     match (&report.decision, &report.rollout) {
+        (_, Some(RolloutOutcome::Deferred { reason })) => {
+            format!("fleet rollout deferred; a host is busy and nothing on it changed: {reason}")
+        }
         (_, Some(RolloutOutcome::Failed { reason })) if report.terminal.is_none() => format!(
             "fleet rollout attempt {} failed: {reason}",
             report.attempt.unwrap_or_default()

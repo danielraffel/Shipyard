@@ -33,6 +33,7 @@ as `shipyard landing --pr <n>` (see `docs/landing-model.md`).
 | already queued | refuse: nothing to do; REST `auto_merge` is `null` for every queued PR |
 | auto-merge armed, not yet queued | refuse: the queue will pick it up |
 | removed for `failed_checks`, same head, batch attributor certifies the head | allow (the repository ruled the ejecting batch's failure not this head's; see [Batch attribution](#batch-attribution)) |
+| removed for `failed_checks`, same head, first ejection of that head, every failing required check failed on the network, repository opted in | allow, once (see [Environment re-enqueue](#environment-re-enqueue)) |
 | removed for `failed_checks` / `merge_conflict`, same head | refuse: under ALLGREEN a same-head re-enqueue fails its batch-mates; push a fix first |
 | removed for any other reason (`manual`, ...), same head | refuse: confirm with whoever dequeued it |
 | merged / closed | refuse |
@@ -40,6 +41,84 @@ as `shipyard landing --pr <n>` (see `docs/landing-model.md`).
 
 A GraphQL body read from stdin (`--input -`, `query=@-`) cannot be inspected
 and is refused as ambiguous.
+
+## Environment re-enqueue
+
+A batch that died because the network did (a package relay answered 403, a
+download host did not resolve, an upload connection was reset) says nothing
+against the head, yet the same-head refusal made the only way back into the
+queue a new push, and a whole required-gate cycle for a commit that changes
+nothing. Over 2026-09-15..29 on `Generous-Corp/pulp`, 15 queue ejections were
+environment failures and 12 of them were followed by exactly such a push.
+
+A repository opts in with:
+
+```toml
+# .shipyard/config.toml
+[queue.environment_requeue]
+enabled = true
+```
+
+Then, for a same-head `failed_checks` ejection only, the guard (and
+`shipyard landing --pr`, and `ship`'s arm-on-open, which share
+`src/environment_requeue.rs`) allows **one** re-enqueue when all of these hold:
+
+| requirement | why |
+|---|---|
+| the timeline window is complete and shows exactly one `failed_checks`/`merge_conflict` removal of the current head | the allowance is one retry per head; a head ejected twice has had it, and a truncated window cannot prove it has not |
+| the removal names its merge-group commit (`beforeCommit`) | that commit's check runs are the ones that ejected it; no run-resolution heuristic |
+| the base's required checks (rulesets plus classic protection) can be read and are non-empty | only a **required** failure ejects; an advisory lane failing a real test is not what removed the head |
+| every failing required check on the merge-group commit is a GitHub Actions job concluded `failure`, and no required commit status failed | a `timed_out`/`cancelled` job or a status has no log that could prove anything |
+| every failing step of each such job (jobs API `conclusion == failure`) printed an environment signature within 60 output lines of that step's first `##[error]` | positive evidence at the failure, not anywhere in a long log |
+
+The signatures are the network-transport spellings shared with Shipyard's infra
+classifier (`Could not resolve host`, `Network is unreachable`, `No route to
+host`, `Connection reset by peer`) plus `ENOTFOUND`, `getaddrinfo`,
+`EAI_AGAIN`, `ECONNRESET`, `Tunnel connection failed`, `Proxy CONNECT aborted`,
+`Temporary failure in name resolution`, `curl: (6)` and `curl: (56)`. Broad
+words such as `timeout`, `rate limit` or `Connection refused` are deliberately
+absent: a test the head broke prints them too.
+
+Two traps shaped the reader. **A step's own script can contain the signature**:
+Pulp's `Install visual-analysis Python dependencies` step carries a comment
+quoting `Tunnel connection failed: 403 Forbidden`, and GitHub echoes a `run:`
+script into the log inside `##[group]Run ... ##[endgroup]`. Those lines are never
+read as output. **The first `##[error]` in a log is not the failing step**: an
+`if: always()` / `continue-on-error` step after it prints its own. The failing
+step comes from the jobs API and its output from the first `Run` segment at or
+after the step's `started_at`, through that segment's first `##[error]`.
+
+### Why this is not the inference refused above
+
+[Batch attribution](#why-the-guard-does-not-rule-for-itself) refuses to read
+*absence* ("no test failed") as innocence. This reads *presence*: the step that
+failed printed, at its failure, a line only the network produces. The residual
+risk is a head whose own content names an unreachable host, and a head broken
+in a way the dead batch never reached (`#8811`). Both are why the allowance is
+bounded to one retry per head and off unless the repository opts in: the worst
+a wrong allowance costs is the one batch the retry joins, and the second
+ejection is refused with the ordinary "push a fix first".
+
+### Relationship to a declared attributor
+
+The guard asks the repository's [batch attributor](#batch-attribution) first.
+When it certifies, that allow stands and the environment reader is not
+consulted. When it does not certify, including a verdict of
+`implicates_head: true`, the environment reader still runs. That is deliberate:
+Pulp's attributor reads chain ancestry (the batch's parent passed, so this head
+is the culprit), which compares outcomes rather than causes. A parent that
+passed on a host that could reach PyPI says nothing about a batch that died on
+a host that could not, and `--certify` returns `implicates_head: true` for both
+`pulp#8678`'s pip-relay ejection and `pulp#8911`'s cargo-DNS ejection. The
+environment verdict rests on the failing step's own output instead, which a
+content-level implication (the head owns a failing ctest case) cannot share:
+such a step failed on a test, not on a network signature at its failure.
+
+An allowed re-enqueue is not silent: the guard prints
+`queue-arm-guard: note: ...` with the verdict and each step's matching log line.
+A refused one appends `Environment re-enqueue refused: <reason>` to the
+ordinary refusal. `shipyard landing --pr <n>` prints the same verdict and
+evidence under `ENVIRONMENT RE-ENQUEUE`.
 
 ## Batch attribution
 
@@ -242,7 +321,7 @@ on a base with a merge queue:
 | never armed, not queued, mergeable, green | allow | refuse | arm it (`shipyard ship --pr <n>`) |
 | queued, or armed and not yet queued | refuse (nothing to do) | refuse | wait for the queue |
 | removed for `invalid_merge_commit`, same head | allow | refuse | re-arm as is |
-| removed for `failed_checks` / `merge_conflict`, same head | refuse (unless the repository's attributor certifies the batch) | allow | push a fix, or refresh if the batch failed on infrastructure; then `shipyard ship --pr <n>` |
+| removed for `failed_checks` / `merge_conflict`, same head | refuse (unless the repository's attributor certifies the batch, or the one [environment re-enqueue](#environment-re-enqueue) applies) | allow | push a fix, or refresh if the batch failed on infrastructure; then `shipyard ship --pr <n>` |
 | removed for `manual` (or any other reason), same head | refuse: confirm with whoever dequeued it | allow | confirm, then fix or refresh, then `shipyard ship --pr <n>` |
 | removed, new head since | allow | normal policy (refuse when mergeable and green) | re-arm |
 | conflicting (`CONFLICTING` / `DIRTY`) | as its queue state says | allow | refresh or resolve locally |

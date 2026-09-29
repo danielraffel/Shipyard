@@ -268,6 +268,15 @@ Note the converse, which *is* a behaviour change — once armed, GitHub may merg
 as soon as the **required** contexts are green, which can precede the completion
 of a broader Shipyard target set.
 
+A pull request the queue ejected on its current head is normally left unarmed.
+The one exception is a repository that opted in with
+`[queue.environment_requeue] enabled = true`: when the head's first
+`failed_checks` ejection is proven a network failure
+(`src/environment_requeue.rs`), arm-on-open arms that same head once and says so
+(`... without a new head: its one environment re-enqueue`). The `ghapp`
+queue-arm guard re-reads the same evidence before the mutation lands. The
+periodic steward backstop does not take this path.
+
 Policy and refusals live in `src/auto_arm.rs`; the ship-side transport is
 `src/app/ship_cmd/auto_arm.rs`; the periodic counterpart for pull requests that
 slipped through anyway is `shipyard runner steward --arm-unqueued`.

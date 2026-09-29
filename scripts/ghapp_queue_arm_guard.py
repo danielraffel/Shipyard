@@ -256,6 +256,44 @@ def _new_head_since(
     return False, "no_evidence"
 
 
+def _ejections_of_head(
+    nodes: list[Any], removed_heads: list[str | None], head: str | None
+) -> int:
+    """``failed_checks`` / ``merge_conflict`` removals of ``head``.
+
+    A removal that names its head counts when that head is ``head``; one that
+    names none counts once it follows the first push of ``head`` (or when no
+    push of it is visible), so an unattributable removal is charged to the
+    current head rather than assumed away. Mirrors
+    ``PrQueueReport::ejections_of_current_head``.
+    """
+    if head is None:
+        return 0
+    first_push = next(
+        (
+            index
+            for index, node in enumerate(nodes)
+            if (_pushed_oid(node) or "").lower() == head.lower()
+        ),
+        None,
+    )
+    count = 0
+    for index, node in enumerate(nodes):
+        if _typename(node) != "RemovedFromMergeQueueEvent":
+            continue
+        reason = node.get("reason") if isinstance(node.get("reason"), str) else ""
+        if reason.lower() not in RETRY_HAZARD_REASONS:
+            continue
+        removed = removed_heads[index]
+        if removed is not None:
+            charged = removed.lower() == head.lower()
+        else:
+            charged = first_push is None or index > first_push
+        if charged:
+            count += 1
+    return count
+
+
 def classify_pr_queue_state(response: Any) -> dict[str, Any]:
     """Classify a GraphQL pull-request response. Unreadable input is ``unknown``."""
     errors = response.get("errors") if isinstance(response, dict) else None
@@ -331,6 +369,7 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
             "new_head_since": new_head_since,
             "removed_head": removed,
             "new_head_basis": basis,
+            "merge_group_commit": _oid(nodes[index].get("beforeCommit")),
         }
 
     entry = pr.get("mergeQueueEntry") if isinstance(pr.get("mergeQueueEntry"), dict) else None
@@ -343,6 +382,7 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
         "head": head,
         "repo": repository.get("nameWithOwner") if isinstance(repository, dict) else None,
         "requeues_without_new_head": requeues,
+        "ejections_of_current_head": _ejections_of_head(nodes, removed_heads, head),
         "last_ejection": last_ejection,
         "timeline_complete": timeline_complete,
     }
@@ -388,7 +428,9 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
 
 
 def decide(
-    classification: dict[str, Any], attribution: dict[str, Any] | None = None
+    classification: dict[str, Any],
+    attribution: dict[str, Any] | None = None,
+    environment: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Return ``(allowed, message)`` for one classified pull request.
 
@@ -397,6 +439,12 @@ def decide(
     the ejecting run could not be resolved, or the verdict did not certify. Only
     a verdict whose ``certified`` is exactly ``True`` can turn a same-head
     refusal into an allow; every other value leaves the refusal in place.
+
+    ``environment`` is :func:`assess_environment_requeue`'s verdict, or
+    ``None`` when it does not apply. Only ``allowed`` exactly ``True`` turns a
+    same-head ``failed_checks`` refusal into an allow; otherwise its reason is
+    appended to the refusal so the caller sees why the one environment
+    re-enqueue was not available.
 
     Refusal text names the correct path only. Override mechanisms are
     documented for operators in docs/ghapp-guards.md and deliberately not
@@ -434,7 +482,19 @@ def decide(
                 f"attributor certified the ejecting batch against this head: "
                 f"{attribution.get('detail', 'no detail given')}"
             )
+        if (
+            environment
+            and environment.get("allowed") is True
+            and reason.lower() == "failed_checks"
+        ):
+            return True, (
+                f"{label} was ejected for {reason} at {at} by an environment failure, and this "
+                f"is its one environment re-enqueue: {environment.get('reason')}. "
+                + "; ".join(_describe_step(step) for step in environment.get("evidence") or [])
+            )
         note = f" {attribution['detail']}" if attribution and attribution.get("detail") else ""
+        if environment and environment.get("reason"):
+            note += f" Environment re-enqueue refused: {environment['reason']}."
         return False, (
             f"{label} was ejected for {reason} at {at}; re-enqueuing the same head under "
             f"ALLGREEN fails its batch-mates. Push a fix first, then {land}. If the batch "
@@ -847,6 +907,322 @@ def attribute_ejecting_batch(
 
 
 # ---------------------------------------------------------------------------
+# Environment ejections: one same-head re-enqueue after the network, not the
+# head, failed the batch. The Python twin of src/environment_requeue.rs; both
+# assert against tests/fixtures/github/job_logs/.
+#
+# Positive evidence only. Every failing REQUIRED check on the ejecting
+# merge-group commit must be an Actions job whose every failing step (jobs API
+# conclusion == failure) printed an environment signature within
+# FAILURE_PROXIMITY_LINES output lines of that step's first ##[error]. A step's
+# own `##[group]Run` script echo is never read as output: a script can quote
+# the signature. Bounded to the head's first failed_checks/merge_conflict
+# ejection, and off unless the repository sets
+# `[queue.environment_requeue] enabled = true`.
+# ---------------------------------------------------------------------------
+
+NETWORK_TRANSPORT_MARKERS = (
+    "Could not resolve host",
+    "Network is unreachable",
+    "No route to host",
+    "Connection reset by peer",
+)
+ENVIRONMENT_SIGNATURES = NETWORK_TRANSPORT_MARKERS + (
+    "ENOTFOUND",
+    "getaddrinfo",
+    "EAI_AGAIN",
+    "Tunnel connection failed",
+    "Proxy CONNECT aborted",
+    "Temporary failure in name resolution",
+    "ECONNRESET",
+    "curl: (6)",
+    "curl: (56)",
+)
+FAILURE_PROXIMITY_LINES = 60
+_RUN_GROUP = "##[group]Run "
+_END_GROUP = "##[endgroup]"
+_ERROR = "##[error]"
+_STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d")
+
+
+def _split_timestamp(raw: str) -> tuple[str | None, str]:
+    raw = raw.lstrip("\ufeff")
+    if len(raw) < 20 or not _STAMP.match(raw):
+        return None, raw
+    end = raw.find("Z")
+    if end < 0:
+        return None, raw
+    text = raw[end + 1 :]
+    return raw[:19], text[1:] if text.startswith(" ") else text
+
+
+def _segments(log: str) -> list[dict[str, Any]]:
+    """Each ``##[group]Run`` header with the output after its ``##[endgroup]``."""
+    segments: list[dict[str, Any]] = []
+    in_echo = False
+    for raw in log.splitlines():
+        stamp, text = _split_timestamp(raw)
+        if text.startswith(_RUN_GROUP):
+            segments.append({"started": stamp, "output": [], "has_error": False})
+            in_echo = True
+            continue
+        if not segments:
+            continue
+        if in_echo:
+            if text.startswith(_END_GROUP):
+                in_echo = False
+            continue
+        if text.startswith(_ERROR):
+            segments[-1]["has_error"] = True
+        segments[-1]["output"].append(text)
+    return segments
+
+
+def failing_step_output(log: str, started_at: str) -> list[str] | None:
+    """Output of the step that started at ``started_at``, through its first ``##[error]``."""
+    started_at = started_at[:19]
+    if len(started_at) < 19:
+        return None
+    output: list[str] = []
+    for segment in _segments(log):
+        if segment["started"] is None or segment["started"] < started_at:
+            continue
+        if segment["has_error"]:
+            lines = segment["output"]
+            error = next(i for i, line in enumerate(lines) if line.startswith(_ERROR))
+            output.extend(lines[: error + 1])
+            return output
+        output.extend(segment["output"])
+    return None
+
+
+def signature_near_failure(output: list[str]) -> dict[str, str] | None:
+    for line in reversed(output[-FAILURE_PROXIMITY_LINES:]):
+        for signature in ENVIRONMENT_SIGNATURES:
+            if signature in line:
+                return {"signature": signature, "line": line.strip()[:240]}
+    return None
+
+
+def read_failing_step(log: str, started_at: str) -> dict[str, Any]:
+    output = failing_step_output(log, started_at)
+    if output is None:
+        return {"reading": "not_located"}
+    hit = signature_near_failure(output)
+    if hit is None:
+        return {"reading": "no_signature"}
+    return {"reading": "environment", **hit}
+
+
+def environment_requeue_enabled(start: pathlib.Path | None = None) -> bool:
+    """Whether the nearest ``.shipyard/config.toml`` opts in."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+        return False
+    here = (start or pathlib.Path.cwd()).resolve()
+    for directory in (here, *here.parents):
+        config = directory / ".shipyard" / "config.toml"
+        if not config.is_file():
+            continue
+        try:
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        section = parsed.get("queue")
+        section = section.get("environment_requeue") if isinstance(section, dict) else None
+        return isinstance(section, dict) and section.get("enabled") is True
+    return False
+
+
+def run_real_gh_text(arguments: list[str]) -> str:
+    real_gh = os.environ.get("GHAPP_REAL_GH", "/opt/homebrew/bin/gh")
+    try:
+        completed = subprocess.run(
+            [real_gh, *arguments], check=False, capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GuardError(str(error)) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()
+        raise GuardError(detail[-1] if detail else f"exit {completed.returncode}")
+    return completed.stdout
+
+
+def _describe_step(step: dict[str, Any]) -> str:
+    reading = step["reading"]
+    if reading == "environment":
+        what = f"environment ({step['signature']}): {step['line']}"
+    elif reading == "no_signature":
+        what = f"no environment signature within {FAILURE_PROXIMITY_LINES} lines of its failure"
+    else:
+        what = "its output could not be located in the job log"
+    return f"{step['check']} / {step['step']} [job {step['job_id']}]: {what}"
+
+
+def _required_contexts(api_json: Any, repo: str, base: str) -> list[str]:
+    contexts: list[str] = []
+    rules = api_json(["api", f"repos/{repo}/rules/branches/{base}"])
+    for rule in rules if isinstance(rules, list) else []:
+        if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+            continue
+        parameters = rule.get("parameters") if isinstance(rule.get("parameters"), dict) else {}
+        for check in parameters.get("required_status_checks") or []:
+            if isinstance(check, dict) and isinstance(check.get("context"), str):
+                contexts.append(check["context"])
+    try:
+        classic = api_json(["api", f"repos/{repo}/branches/{base}/protection/required_status_checks"])
+    except GuardError as error:
+        if "404" not in str(error):
+            raise
+        classic = {}
+    for context in (classic.get("contexts") if isinstance(classic, dict) else None) or []:
+        if isinstance(context, str):
+            contexts.append(context)
+    return sorted(set(contexts))
+
+
+def assess_environment_requeue(
+    classification: dict[str, Any],
+    repo: str | None,
+    opted_in: bool,
+    api_json: Any = run_real_gh,
+    api_text: Any = run_real_gh_text,
+) -> dict[str, Any] | None:
+    """Whether the one environment re-enqueue is allowed; ``None`` when it does not apply."""
+    if classification.get("class") != "ejected" or classification.get("new_head_since_removal"):
+        return None
+    if str(classification.get("reason") or "").lower() != "failed_checks":
+        return None
+    ejection = classification.get("last_ejection") or {}
+    sha = ejection.get("merge_group_commit")
+
+    def refuse(reason: str, evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        return {"allowed": False, "reason": reason, "merge_group_commit": sha,
+                "evidence": evidence or []}
+
+    if not opted_in:
+        return refuse(
+            "this repository has not opted in to environment re-enqueues "
+            "(`[queue.environment_requeue] enabled = true` in .shipyard/config.toml)"
+        )
+    if classification.get("timeline_complete") is not True:
+        return refuse(
+            "the timeline window does not reach the start of history, so an earlier ejection "
+            "of this head cannot be ruled out"
+        )
+    count = classification.get("ejections_of_current_head")
+    if count != 1:
+        return refuse(
+            f"the queue has ejected this head {count} times; the one environment re-enqueue a "
+            "head is allowed has been spent"
+        )
+    if not isinstance(sha, str) or not sha:
+        return refuse(
+            "the removal names no merge-group commit, so the checks that ejected it cannot be read"
+        )
+    repo = classification.get("repo") or repo
+    number = classification.get("pr")
+    if not isinstance(repo, str) or not repo or not isinstance(number, int):
+        return refuse("the repository or pull request could not be resolved")
+    short = sha[:12]
+    try:
+        pull = api_json(["api", f"repos/{repo}/pulls/{number}"])
+        base = (pull.get("base") or {}).get("ref") if isinstance(pull, dict) else None
+        if not isinstance(base, str):
+            return refuse(f"PR #{number} carries no base ref")
+        try:
+            required = _required_contexts(api_json, repo, base)
+        except GuardError as error:
+            return refuse(f"the required checks of `{base}` could not be read ({error})")
+        if not required:
+            return refuse(f"`{base}` declares no required checks, so no failure can be scoped to them")
+        runs = api_json(["api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"])
+        listed = runs.get("check_runs") if isinstance(runs, dict) else None
+        if not isinstance(listed, list):
+            return refuse(f"check runs of {short} could not be read")
+        if runs.get("total_count") != len(listed):
+            return refuse(f"{sha} has more check runs than one page returned; refusing a partial reading")
+        failed: list[dict[str, Any]] = []
+        for context in required:
+            named = [run for run in listed if isinstance(run, dict) and run.get("name") == context]
+            if not named:
+                continue
+            latest = max(named, key=lambda run: run.get("id") if isinstance(run.get("id"), int) else 0)
+            if latest.get("status") != "completed":
+                return refuse(f"required check `{context}` on {sha} has not completed")
+            conclusion = latest.get("conclusion") or "none"
+            if conclusion in ("success", "neutral", "skipped"):
+                continue
+            app = latest.get("app") if isinstance(latest.get("app"), dict) else {}
+            failed.append({"name": context, "id": latest.get("id"), "conclusion": conclusion,
+                           "actions_job": app.get("slug") == "github-actions"})
+        statuses = api_json(["api", f"repos/{repo}/commits/{sha}/status"])
+        for status in (statuses.get("statuses") if isinstance(statuses, dict) else None) or []:
+            if (isinstance(status, dict) and status.get("context") in required
+                    and status.get("state") in ("failure", "error")):
+                failed.append({"name": status["context"], "id": None,
+                               "conclusion": status["state"], "actions_job": False})
+        if not failed:
+            return refuse(
+                f"no required check failed on merge-group commit {short}, so the ejection is "
+                "unexplained"
+            )
+        evidence: list[dict[str, Any]] = []
+        for check in failed:
+            if not check["actions_job"] or not isinstance(check["id"], int):
+                return refuse(
+                    f"required check `{check['name']}` ({check['conclusion']}) is not a GitHub "
+                    "Actions job, so it has no log to read"
+                )
+            if check["conclusion"] != "failure":
+                return refuse(
+                    f"required check `{check['name']}` concluded `{check['conclusion']}`, which is "
+                    "not an environment signature"
+                )
+            job_id = check["id"]
+            job = api_json(["api", f"repos/{repo}/actions/jobs/{job_id}"])
+            steps = job.get("steps") if isinstance(job, dict) else None
+            failing = [step for step in steps or [] if isinstance(step, dict)
+                       and step.get("conclusion") == "failure"]
+            if not failing:
+                return refuse(
+                    f"`{check['name']}` [job {job_id}] failed with no failing step recorded, which "
+                    "is not evidence of anything"
+                )
+            try:
+                log = api_text(["api", f"repos/{repo}/actions/jobs/{job_id}/logs"])
+            except GuardError as error:
+                return refuse(
+                    f"the log of `{check['name']}` [job {job_id}] could not be read ({error})"
+                )
+            for step in failing:
+                started = step.get("started_at")
+                reading = (read_failing_step(log, started) if isinstance(started, str)
+                           else {"reading": "not_located"})
+                evidence.append({"check": check["name"], "job_id": job_id,
+                                 "step": step.get("name") or "", **reading})
+    except GuardError as error:
+        return refuse(f"{error}")
+    unexplained = [_describe_step(step) for step in evidence if step["reading"] != "environment"]
+    if unexplained:
+        return refuse(
+            f"a required failure on merge-group commit {short} is not an environment failure: "
+            + "; ".join(unexplained),
+            evidence,
+        )
+    return {
+        "allowed": True,
+        "reason": (
+            f"every failing required check on merge-group commit {short} failed on the network, "
+            "and this is the head's first ejection"
+        ),
+        "merge_group_commit": sha,
+        "evidence": evidence,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Request detection.
 # ---------------------------------------------------------------------------
 
@@ -1034,11 +1410,22 @@ def main(args: list[str]) -> int:
             # A declared attributor the guard cannot even read is not a reason to
             # allow; it is a reason to say so and keep refusing.
             attribution = {"certified": False, "detail": f"{error}."}
-        verdicts.append(decide(target, attribution))
+        environment = None
+        if not (attribution and attribution.get("certified") is True):
+            try:
+                environment = assess_environment_requeue(
+                    target, repo, environment_requeue_enabled()
+                )
+            except GuardError as error:
+                environment = {"allowed": False, "reason": f"{error}", "evidence": []}
+        verdicts.append(decide(target, attribution, environment))
     refusals = [message for allowed, message in verdicts if not allowed]
     if not refusals:
         for allowed, message in verdicts:
-            if allowed and "batch attributor certified" in message:
+            if allowed and (
+                "batch attributor certified" in message
+                or "one environment re-enqueue" in message
+            ):
                 print(f"queue-arm-guard: note: {message}", file=sys.stderr)
         return 0
     message = " | ".join(refusals)
