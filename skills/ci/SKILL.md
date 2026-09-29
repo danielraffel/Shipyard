@@ -2342,6 +2342,18 @@ hatch, fixed by making it canonicalise rather than demand canonical input. If
 you see the same symptom again, read the failing step name and check whether the
 handoff or the PR creation failed — they leave very different states behind.
 
+### A local queue with `running: 0` and aging pending jobs: sample the daemon
+
+When `shipyard status` shows pending local jobs that never start while the
+daemon answers `daemon status`, do not start with leases or the merge-queue
+hold. `sample <daemon-pid>` first: if the main thread is parked in a child
+process (for example `git rev-parse` inside `observe_merged_ship_jobs`), the
+tick is wedged on that child. A known macOS cause is an unanswered
+removable-volume privacy prompt after a self-update; see the `shipyard` skill,
+"Nothing on the daemon tick may run a child process without a deadline". A
+stale lease in `daemon-worker-capacity/leases.json` from a dead owner is taken
+over after 30s and is not by itself a wedge.
+
 ## Troubleshooting
 
 - `shipyard doctor --json` — checks git, ssh, gh, nsc are installed
