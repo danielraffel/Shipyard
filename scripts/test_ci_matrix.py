@@ -249,7 +249,8 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual(workflow.count(predicate), 3)
         self.assertNotIn("startsWith(runner.name, 'pulp-studio')", workflow)
         self.assertIn('test "$RUNNER_NAME" = "Shipyard-studio-02"', workflow)
-        self.assertIn('test "$(hostname)" = "Daniels-Mac-Studio.local"', workflow)
+        self.assertIn('Daniels-Mac-Studio.local|Daniels-Mac-Studio-m3.local) ;;', workflow)
+        self.assertIn('sandbox-e2e must run on M3; hostname is', workflow)
         self.assertIn('test "$($installed runner tag)" = "studio"', workflow)
 
     def test_sandbox_m3_candidate_is_exact_and_production_is_restored(self) -> None:

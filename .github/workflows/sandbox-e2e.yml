@@ -105,7 +105,13 @@ jobs:
         run: |
           set -euo pipefail
           test "$RUNNER_NAME" = "Shipyard-studio-02"
-          test "$(hostname)" = "Daniels-Mac-Studio.local"
+          # M3 was renamed Daniels-Mac-Studio -> Daniels-Mac-Studio-m3 when a second
+          # Mac Studio joined the fleet; accept either so the rename cannot fail
+          # this job silently, and name the mismatch when it does fail.
+          case "$(hostname)" in
+            Daniels-Mac-Studio.local|Daniels-Mac-Studio-m3.local) ;;
+            *) echo "sandbox-e2e must run on M3; hostname is $(hostname)" >&2; exit 1 ;;
+          esac
           installed="$HOME/.local/bin/shipyard"
           test -x "$installed"
           test "$($installed runner tag)" = "studio"
