@@ -1485,11 +1485,11 @@ impl WebhookRejection {
 /// visible on the host rather than only in the repository's delivery log.
 #[cfg(unix)]
 fn log_rejected_delivery(delivery: Option<&str>, response: &HttpResponse, reason: &str) {
-    eprintln!(
+    let _ = crate::writer_domain_lease::write_stderr(format_args!(
         "shipyard daemon: rejected webhook delivery {} with HTTP {}: {reason}",
         delivery.unwrap_or("(unknown)"),
         response.status,
-    );
+    ));
 }
 
 /// Read one HTTP request, tolerating a request that arrives across many
