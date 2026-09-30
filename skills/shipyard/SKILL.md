@@ -958,6 +958,16 @@ execution, ignores tracked attempts to supply values, and snapshots resolved
 values only under its protected machine state for daemon-owned work. Never use
 this table for credentials or signing material.
 
+## A failed `ghapp api` call has an empty stdout
+
+Native `gh api` prints the error body (`{"message":"Not Found",...}`) on stdout
+and exits non-zero, so `n=$(ghapp api ... --jq ...)` in a script that does not
+check the exit code counted a 404 as one row of data. The wrapper now captures
+`api` stdout and, on a non-zero exit, writes it to stderr instead: a failed
+call's stdout is always empty, a successful call's is unchanged. Check the exit
+code anyway; read the error body from stderr, never from stdout. The fallback
+when the caller closed stderr (`2>&-`) still execs native gh unchanged.
+
 ## GitHub Auth And Quota
 
 Shipyard's operational GitHub calls can be configured with `[github.auth]`.
