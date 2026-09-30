@@ -51,7 +51,9 @@ pub mod ledger;
 pub mod replay;
 pub mod scan;
 
-pub use flags::{DigestRoute, Flag, FlagKind, Thresholds, evaluate};
+pub use flags::{
+    DigestRoute, Flag, FlagKind, RepeatFinding, Thresholds, evaluate, repeat_findings,
+};
 pub use gather::{WatchQuery, gather};
 pub use ledger::{Ledger, LedgerEntry};
 pub use replay::{Expectation, ReplayReport, replay};
