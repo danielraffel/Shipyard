@@ -47,6 +47,7 @@ mod parallel_proof_canary_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
+mod pr_watch_cmd;
 mod profile_apply_cmd;
 mod quarantine_cmd;
 mod queue_cmd;
@@ -558,6 +559,22 @@ where
                 stdout,
             );
         }
+        Command::PrWatch { command } => {
+            let config = LoadedConfig::load_from_cwd_with_global_dir(
+                cli.mode.into(),
+                &cwd,
+                runtime_paths.global_dir.clone(),
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            return pr_watch_cmd::pr_watch_command(
+                *command,
+                &config,
+                &cwd,
+                &runtime_paths,
+                cli.json,
+                stdout,
+            );
+        }
         Command::ChangedSurfacePlan { target, pr, repo } => {
             let config = LoadedConfig::load_from_cwd_with_global_dir(
                 cli.mode.into(),
@@ -712,6 +729,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Queue
         | Command::QueueHold { .. }
         | Command::QueueObserve { .. }
+        | Command::PrWatch { .. }
         | Command::ChangedSurfacePlan { .. }
         | Command::ChangedSurfaceTrialStatus { .. }
         | Command::ParallelProofCanary { .. }

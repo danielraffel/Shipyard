@@ -260,6 +260,9 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut next_reconcile_at = Instant::now() + initial_reconcile_delay();
     let mut sweep_in_flight = false;
     let mut next_sweep_at = Instant::now() + initial_sweep_delay();
+    let (pr_watch_tx, pr_watch_rx) = mpsc::channel::<crate::pr_watch::scan::DaemonPass>();
+    let mut pr_watch_in_flight = false;
+    let mut next_pr_watch_at = Instant::now() + initial_pr_watch_delay();
     let mut previous_states = ship_state_map(&ship_dir);
     let mut next_ship_state_scan_at = Instant::now() + SHIP_STATE_SCAN_INTERVAL;
     let mut registration_sync = RegistrationSyncState::default();
@@ -312,6 +315,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             sweep_in_flight = false;
             publish_abandon_events(&server, &last_event_at, &abandon);
         }
+        while let Ok(pass) = pr_watch_rx.try_recv() {
+            pr_watch_in_flight = false;
+            publish_pr_watch_pass(&server, &last_event_at, &pass);
+        }
         let now = Instant::now();
         let has_subscribers = server.subscriber_count() > 0;
         if should_start_reconcile(has_subscribers, reconcile_in_flight, now, next_reconcile_at) {
@@ -327,6 +334,16 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             sweep_in_flight = true;
             next_sweep_at = now + Duration::from_secs(RECONCILE_INTERVAL_SECONDS);
             start_sweep_worker(config.mode, config.state_dir.clone(), sweep_tx.clone());
+        }
+        if should_start_pr_watch(pr_watch_in_flight, now, next_pr_watch_at) {
+            pr_watch_in_flight = true;
+            next_pr_watch_at = now + Duration::from_secs(PR_WATCH_INTERVAL_SECONDS);
+            start_pr_watch_worker(
+                config.global_dir.clone(),
+                config.state_dir.clone(),
+                repos.clone(),
+                pr_watch_tx.clone(),
+            );
         }
         // Note: we deliberately do NOT push `next_reconcile_at` forward while
         // idle. Doing so would force a freshly-attached subscriber to wait up
@@ -651,6 +668,57 @@ fn start_sweep_worker(mode: RuntimeMode, state_dir: PathBuf, sender: mpsc::Sende
         };
         let _ = sender.send(report);
     });
+}
+
+/// PR watch runs every 15 minutes.
+#[cfg(unix)]
+const PR_WATCH_INTERVAL_SECONDS: u64 = 15 * 60;
+
+/// The first PR-watch pass waits one full interval: a restarted daemon must
+/// not add a burst of GitHub reads to its own start-up, and a pass that is
+/// disabled by config costs nothing either way.
+#[cfg(unix)]
+fn initial_pr_watch_delay() -> Duration {
+    Duration::from_secs(PR_WATCH_INTERVAL_SECONDS)
+}
+
+/// Never overlap a pass with itself; never run before the deadline. The pass
+/// itself decides whether `[pr_watch] enabled` is on, re-reading config each
+/// time so a toggle needs no restart.
+#[cfg(unix)]
+fn should_start_pr_watch(in_flight: bool, now: Instant, next_at: Instant) -> bool {
+    !in_flight && now >= next_at
+}
+
+#[cfg(unix)]
+fn start_pr_watch_worker(
+    global_dir: PathBuf,
+    state_dir: PathBuf,
+    repos: Vec<String>,
+    sender: mpsc::Sender<crate::pr_watch::scan::DaemonPass>,
+) {
+    thread::spawn(move || {
+        let pass = crate::pr_watch::scan::daemon_pass(&global_dir, &state_dir, &repos, Utc::now());
+        let _ = sender.send(pass);
+    });
+}
+
+#[cfg(unix)]
+fn publish_pr_watch_pass(
+    server: &IpcServer,
+    last_event_at: &Arc<Mutex<Option<f64>>>,
+    pass: &crate::pr_watch::scan::DaemonPass,
+) {
+    if !pass.enabled && pass.errors.is_empty() {
+        return;
+    }
+    if let Ok(mut last_event_at) = last_event_at.lock() {
+        *last_event_at = Some(daemon_timestamp());
+    }
+    server.broadcast_event(serde_json::json!({
+        "kind": "pr_watch_pass",
+        "payload": pass,
+    }));
 }
 
 #[cfg(unix)]
@@ -2002,6 +2070,41 @@ mod tests {
             initial_sweep_delay(),
             Duration::from_secs(RECONCILE_INTERVAL_SECONDS)
         );
+    }
+
+    #[test]
+    fn the_first_pr_watch_pass_waits_one_interval() {
+        assert_eq!(
+            initial_pr_watch_delay(),
+            Duration::from_secs(PR_WATCH_INTERVAL_SECONDS)
+        );
+        assert_eq!(PR_WATCH_INTERVAL_SECONDS, 900);
+    }
+
+    #[test]
+    fn pr_watch_respects_in_flight_and_deadline() {
+        let now = StdInstant::now();
+        let due = now.checked_sub(StdDuration::from_secs(1)).unwrap();
+        let not_due = now + StdDuration::from_secs(5);
+        assert!(!should_start_pr_watch(true, now, due));
+        assert!(!should_start_pr_watch(false, now, not_due));
+        assert!(should_start_pr_watch(false, now, due));
+    }
+
+    #[test]
+    fn a_disabled_pr_watch_pass_reads_nothing() {
+        let global = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // No config at all: disabled by default, no repository is touched.
+        let pass = crate::pr_watch::scan::daemon_pass(
+            global.path(),
+            state.path(),
+            &["o/r".to_owned()],
+            Utc::now(),
+        );
+        assert!(!pass.enabled);
+        assert!(pass.flags.is_empty() && pass.errors.is_empty());
+        assert!(!state.path().join("pr-watch").exists());
     }
 
     #[test]

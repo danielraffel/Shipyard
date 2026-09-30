@@ -383,6 +383,19 @@ state root and takes an exclusive per-cursor lock. It exposes no mutation flag,
 does not acquire a mutation lease, and needs no write credential. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
 
+Use `shipyard pr-watch scan --repo <owner/repo>` for read-only flags on stuck
+open PRs: the same required-check test failing on two runs (or
+"failing on main/pre-existing" when two other PRs fail it too), armed but red
+for over 30 minutes with no push, two or more failed merge groups named for the
+PR, and a head replaced three times in 24 hours while the base moved. A split
+advisory (open over 3 days, over 60 files or 30 commits) only rides along with
+another flag. It is a dry run by default; `--post-comments` edits one sticky
+comment (comment endpoints only) and `--digest` sends the hourly digest through
+`[pr_watch.digest] command`. `shipyard pr-watch replay --since 7d --expect
+PR=FLAGS --control merged-clean` runs the same rules over a past window. The
+daemon job is off unless `[pr_watch] enabled = true`. See
+[`docs/pr-watch.md`](../../docs/pr-watch.md).
+
 Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
 --target <name>` for the shadow-only exact-head selector. Policy must come from
 the authenticated protected base and may contain only reviewed path globs plus

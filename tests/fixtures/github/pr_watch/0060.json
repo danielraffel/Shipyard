@@ -1,0 +1,15 @@
+{
+ "argv": [
+  "api",
+  "--paginate",
+  "--slurp",
+  "-X",
+  "GET",
+  "repos/Generous-Corp/pulp/commits/cc2de129c4b04a82a37b724517b6d02872ae4c91/check-runs",
+  "-f",
+  "filter=all",
+  "-f",
+  "per_page=100"
+ ],
+ "response": "[{\"total_count\": 7, \"check_runs\": [{\"id\": 109241547850, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-29T03:25:12Z\", \"completed_at\": \"2026-09-29T03:32:55Z\"}, {\"id\": 109239648223, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-29T03:16:51Z\", \"completed_at\": \"2026-09-29T03:16:50Z\"}, {\"id\": 109239553407, \"name\": \"macos\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-29T03:43:52Z\", \"completed_at\": \"2026-09-29T03:53:55Z\"}, {\"id\": 109239447324, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-29T03:15:59Z\", \"completed_at\": \"2026-09-29T03:15:59Z\"}, {\"id\": 109239446855, \"name\": \"Build + prove + (owner-gated) deploy\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-29T03:16:01Z\", \"completed_at\": \"2026-09-29T03:28:13Z\"}, {\"id\": 109239445049, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-29T03:16:01Z\", \"completed_at\": \"2026-09-29T03:25:09Z\"}, {\"id\": 109239444845, \"name\": \"Vellum freeze\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-29T03:16:01Z\", \"completed_at\": \"2026-09-29T03:16:41Z\"}]}]"
+}

@@ -67,7 +67,7 @@ const READ_WORKERS: usize = 4;
 
 /// Map `items` through `work` on at most [`READ_WORKERS`] threads, keeping
 /// input order.
-fn parallel_map<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn parallel_map<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut slots: Vec<Option<R>> = std::iter::repeat_with(|| None).take(items.len()).collect();
     let results = std::sync::Mutex::new(&mut slots);
@@ -698,7 +698,11 @@ fn read_json(gh: &GhReader<'_>, args: &[String]) -> Result<Value, String> {
 }
 
 /// `gh api --paginate --slurp` over a list endpoint: every page, as an array.
-fn read_pages(gh: &GhReader<'_>, path: &str, fields: &[String]) -> Result<Vec<Value>, String> {
+pub(crate) fn read_pages(
+    gh: &GhReader<'_>,
+    path: &str,
+    fields: &[String],
+) -> Result<Vec<Value>, String> {
     let mut args = strings(&["api", "--paginate", "--slurp", "-X", "GET", path]);
     for field in fields {
         args.push("-f".to_owned());
@@ -712,7 +716,11 @@ fn read_pages(gh: &GhReader<'_>, path: &str, fields: &[String]) -> Result<Vec<Va
 
 /// Items from every page under `key`, checked against the first page's
 /// `total_count` so a short read is an error rather than a smaller number.
-fn collect_counted(pages: &[Value], key: &str, what: &str) -> Result<Vec<Value>, String> {
+pub(crate) fn collect_counted(
+    pages: &[Value],
+    key: &str,
+    what: &str,
+) -> Result<Vec<Value>, String> {
     let items: Vec<Value> = pages
         .iter()
         .filter_map(|page| page.get(key).and_then(Value::as_array))

@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/108779350888/logs"
+ ],
+ "response": "2026-09-28T04:05:44.3515550Z The following tests FAILED:\n2026-09-28T04:05:44.3515860Z \t7890 - WaveNet completion policy is explicit non-realtime configuration (Failed)\n2026-09-28T04:05:44.3516300Z \t21242 - sample-region-compat-baseline (Failed)            compatibility sample-region\n2026-09-28T04:05:44.3911090Z Errors while running CTest\n2026-09-28T04:05:46.8533760Z ##[error]Process completed with exit code 8.\n"
+}

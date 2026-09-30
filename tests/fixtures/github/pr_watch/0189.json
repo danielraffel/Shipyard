@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/109167658387/logs"
+ ],
+ "response": "2026-09-28T22:52:33.4560440Z The following tests FAILED:\n2026-09-28T22:52:33.4560610Z \t21441 - wide-non-native-selftest (Failed)\n2026-09-28T22:52:33.4563460Z Errors while running CTest\n2026-09-28T22:52:33.4618610Z ##[error]wide-non-native-selftest failed on this pull request head; it is a test this diff reaches, and it would fail the merge group too\n2026-09-28T22:52:33.4738210Z ##[error]Process completed with exit code 1.\n2026-09-28T22:52:35.0582570Z ##[error]Process completed with exit code 2.\n"
+}
