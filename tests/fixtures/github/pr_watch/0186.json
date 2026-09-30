@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/108995484089/logs"
+ ],
+ "response": "2026-09-28T15:32:20.2634770Z The following tests FAILED:\n2026-09-28T15:32:20.2635000Z \t21363 - pulp-gpu-host-mapped-pointer-probe (Failed)\n2026-09-28T15:32:20.3544130Z Errors while running CTest\n2026-09-28T15:32:21.5898510Z ##[error]Process completed with exit code 8.\n"
+}

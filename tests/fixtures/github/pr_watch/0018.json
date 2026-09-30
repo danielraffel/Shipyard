@@ -1,0 +1,15 @@
+{
+ "argv": [
+  "api",
+  "--paginate",
+  "--slurp",
+  "-X",
+  "GET",
+  "repos/Generous-Corp/pulp/commits/cdb6ec77b4f7ea77b2e8f8b40528bde2ef0caabe/check-runs",
+  "-f",
+  "filter=all",
+  "-f",
+  "per_page=100"
+ ],
+ "response": "[{\"total_count\": 7, \"check_runs\": [{\"id\": 108627902349, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"failure\", \"started_at\": \"2026-09-27T13:22:03Z\", \"completed_at\": \"2026-09-27T13:29:21Z\"}, {\"id\": 108626561719, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-27T13:13:42Z\", \"completed_at\": \"2026-09-27T13:13:42Z\"}, {\"id\": 108626545416, \"name\": \"macos\", \"status\": \"completed\", \"conclusion\": \"cancelled\", \"started_at\": \"2026-09-27T13:13:38Z\", \"completed_at\": \"2026-09-27T13:24:53Z\"}, {\"id\": 108626474884, \"name\": \"Build + prove + (owner-gated) deploy\", \"status\": \"completed\", \"conclusion\": \"cancelled\", \"started_at\": \"2026-09-27T13:13:11Z\", \"completed_at\": \"2026-09-27T13:24:49Z\"}, {\"id\": 108626431519, \"name\": \"Vellum freeze\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-27T13:12:55Z\", \"completed_at\": \"2026-09-27T13:13:31Z\"}, {\"id\": 108626431243, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"failure\", \"started_at\": \"2026-09-27T13:12:55Z\", \"completed_at\": \"2026-09-27T13:22:01Z\"}, {\"id\": 108626426719, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-27T13:12:51Z\", \"completed_at\": \"2026-09-27T13:12:51Z\"}]}]"
+}

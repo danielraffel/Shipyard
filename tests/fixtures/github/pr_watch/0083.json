@@ -1,0 +1,15 @@
+{
+ "argv": [
+  "api",
+  "--paginate",
+  "--slurp",
+  "-X",
+  "GET",
+  "repos/Generous-Corp/pulp/actions/runs/36383717569/jobs",
+  "-f",
+  "filter=all",
+  "-f",
+  "per_page=100"
+ ],
+ "response": "[{\"total_count\": 1, \"jobs\": [{\"id\": 108804712824, \"name\": \"macos\", \"status\": \"completed\", \"conclusion\": \"failure\", \"started_at\": \"2026-09-28T05:52:20Z\", \"completed_at\": \"2026-09-28T06:16:47Z\"}]}]"
+}

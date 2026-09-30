@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/109127655586/logs"
+ ],
+ "response": "2026-09-28T21:06:12.0283230Z The following tests FAILED:\n2026-09-28T21:06:12.0283480Z \t21132 - gpu-test-resource-locks (Failed)                  pr-fast\n2026-09-28T21:06:12.0285910Z Errors while running CTest\n2026-09-28T21:06:12.0300730Z ##[error]Process completed with exit code 8.\n2026-09-28T21:06:13.6751180Z ##[error]Process completed with exit code 2.\n"
+}

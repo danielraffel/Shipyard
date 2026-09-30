@@ -376,7 +376,15 @@ queued and armed PRs, so what changes for them is:
   proceeding.
 
 Re-enqueues after `invalid_merge_commit`, and anything after a new head, are
-unaffected. To avoid the transition entirely, update every Shipyard binary on
+unaffected.
+
+Marked binaries do not simply step around the guard: `shipyard auto-merge`
+admission and the merge steward's ordinary enqueue read the same
+`PR_QUEUE_STATE_QUERY` timeline and refuse a same-head re-enqueue after
+`failed_checks` / `merge_conflict` themselves, whatever the age of the local
+ship-state. They differ from the guard on `manual` removals, which the
+attempt-scoped admission rules handle, and they do not consult the batch
+attributor. To avoid the transition entirely, update every Shipyard binary on
 the host (and refresh its daemon) before running `shipyard guards install`.
 
 ## Growing the real-response corpus

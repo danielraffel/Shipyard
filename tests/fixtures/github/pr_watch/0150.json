@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/compare/main...aca6727e457b3c7dc2082eee074a1f44b1a062e1",
+  "--jq",
+  "{status: .status, merge_base: .merge_base_commit.sha}"
+ ],
+ "response": "{\"merge_base\":\"6e95d5cabf8ea7fe440b145923ddbab79b0ff7c1\",\"status\":\"ahead\"}\n"
+}

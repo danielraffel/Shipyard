@@ -187,6 +187,7 @@ enqueue path. See the shipyard skill's
 | Show all queued jobs | `shipyard queue --json` |
 | Experimental authority schema v5 | No operational command exists. Official builds are v4-only; an explicit source test build may validate the reserved request shape only to return `ExperimentalAuthorityRefused`, with no writer, queue mutation, outcome, backend, execution, or authority. |
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
+| Flag stuck open PRs (repeat test failure, red while armed, repeated ejection, rebase treadmill; split advisory) | `shipyard pr-watch scan --repo <owner/repo> [--post-comments] [--digest]` (read-only dry run by default; `replay --since 7d --expect PR=FLAGS --control merged-clean` simulates a past window; see `docs/pr-watch.md`) |
 | Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |
 | Shadow-plan changed-surface tests for an exact PR head | `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n> --target <name>` (base-owned literal tests only; full suite remains authoritative; identity mismatch hard-fails, ambiguity falls back full) |
 | Authorize an exact metadata-only PR without a native worker | Configure trusted machine-global `[metadata_authority]` plus one repository entry containing a narrow path allowlist and exact required hosted checks. `shipyard pr` emits an immutable exact base/head/tree/path/check/policy receipt and queues zero native targets only when every observation agrees; unknown paths, stale/pending checks, SHA drift, or policy ambiguity preserve full validation or refuse execution. Project config cannot activate or widen this tier. |
@@ -287,8 +288,9 @@ writer custody before mutation.
 | **Triage a steward exception without a resident agent** | `shipyard runner recovery-worker` inspects/revalidates one durable exact-head request without launching a model; add `--apply` for one bounded phase-1 classification attempt, or `--drain --apply` for the bounded current snapshot. Policy is machine-global only; Shipyard constructs a tool-disabled argv, clears the inherited environment, uses a global model lease and overall deadline, and accepts strict JSON that can classify/escalate but cannot authorize repairs, paths, or tests. Provider/quota failures terminalize; unsafe findings escalate; neither blocks unrelated PRs. |
 | **Understand daemon shadow observation** | With an existing work ledger, the daemon observes policy-covered native nonterminal exact PR heads even with zero IPC subscribers; inert imported history is never scheduled. Relevant webhooks debounce for 2s with a 10s maximum burst age; overflow is requeued. An 8-target round-robin catch-up runs every 5m; exact-target cooldown, four-read concurrency, and a rolling-hour request ceiling with worst-case page reservation bound cost. Each exact target uses producer-provenanced pagination through exact-repository auth loaded only from trusted machine-global configuration, exhaustive through 1,000 contexts and fail-closed beyond; request evidence counts every page. Token-helper preparation is separately bounded and cached, and pre-command failures do not count as requests. Only changed snapshots and redacted fetch failure/recovery transitions emit `shadow_observation_transition` to IPC and the retained supervised daemon stderr log, including exact-head, API-cost, latency, policy-revision, and zero-model evidence. Repeated failures stay quiet. This phase cannot write GitHub, the ledger, or Linear; publish a wake; activate; or dispatch. |
 | **Recognize an assigned-capacity dispatch wedge** | The daemon can publish one durable `dispatch_wedge` actionable wake after two stable observations prove that the exact current merge-queue job remains queued with no assigned runner while a compatible runner is online and idle. Authority binds repository identity, PR/head, merge-group head, run/attempt/job, labels, queue position, policy, and the final authenticated PR/queue reread. Head movement, regenerated/dequeued groups, incomplete pagination, label mismatch, busy/offline capacity, or ambiguous evidence refuses publication. Restart preserves the observation deadline and exact pending publication; a failed or capacity-less observation gets a bounded durable follow-up. This is diagnosis and escalation only: it does not cancel, requeue, mutate selectors or runners, reorder GitHub's queue, or retry work. |
-| **Run sandbox E2E beside production Shipyard safely** | Each protected queue/supervisor/ship mutation holds the shared host-global writer-domain lease only for its critical section; streamed logs reacquire per append, while idle daemons and read-only commands own no lease. Sandbox E2E keeps the fair-entry turnstile and data-domain lease exclusive from snapshot through contamination assertion. A production mutation waits boundedly, then exits `75` with `sandbox_writer_domain_overlap` instead of racing evidence. If the guardian refuses before transition because production workers are active, classify the canary as safely deferred only through `scripts/sandbox_admission_deferral.py`; its exact receipt, installed hash, mutation-probe path, lease absence, daemon PID, and live process start identity must all agree at both workflow checkpoints. That admission deferral is INFRA/retryable and does not justify rerunning the production job. The macOS guardian observes only the exact no-holder/contended ambiguity through a bounded stable-idle window while continuously fencing production identity, binary, config, and active workers; any holder or drift still fails closed. If a corrected-path cleanup retains the host lease solely because workers appeared after its mutation proof, the launchd-owned guardian may reconcile it without a model: authenticate the unique prior ready/mutation/final receipts, preserve exact production identity and configuration while workers drain, prove stable idle again immediately before removing the exact device/inode/ctime plus cryptographically random lease generation, and publish a durable pending/terminal receipt. Removal first atomically detaches that generation under a unique tombstone name, then deletes only the revalidated detached identity; crash debris cannot authorize or block a later fixed-name lease and is retained for evidence rather than guessed away. A lease retained by a canary that never wrote its mutation fence is reconcilable the same way only when its receipts prove it never touched production (never quiesced or restored it, never armed or ran its mutation probe, no workers at admission, candidate dead) and the production it snapshotted was replaced out of band (daemon pid/start or installed binary changed, e.g. by a fleet update); the reconciliation then binds to the current production and its receipts say `reconciliation_basis: production-superseded` with `mutation_fence_proved: false`. With production unchanged, a fence-less lease stays fail-closed for an operator. The guardian holds the host's fleet install guard (`fleet-auth-support.guard` in the production state dir) from before lease creation until its terminal receipt, so a fleet rollout defers (exit 75, no attempt spent) instead of replacing production mid-canary; a canary that finds an install in flight waits 60s, then fails `FleetUpdateInProgress` (INFRA/retryable). A process that exits while being inspected is reported as `ProcessGone`, not a raw KERN_PROCARGS2 errno. Pre-generation legacy leases require explicit operator reconciliation; ambiguous, unexpectedly populated, live-owner, quiesced, identity-drifted, or foreign-holder cases remain untouched. A pending/deferred retained-lease result is only INFRA/retryable evidence, never physical-canary or release acceptance. After its terminal receipt proves the exact lease generation was removed, rerun only the targeted macOS Sandbox job; do not rerun the whole workflow or rebuild unchanged binaries. After cleanup, confirm daemon IPC liveness through a bounded exact-PID-fenced window and require the receipt's configured repositories rather than treating one status miss as death. The guardian must fsync its terminal receipt before self-unloading its exact launchd label; later runs may recover only a bounded set of inert, receipt-authenticated registrations, and terminal workflow paths must fail closed if a successful full inventory does not prove the current label disappeared. Keep failure artifacts inside explicit canary/runner temp roots. Do not add filename/PID/job-ID exemptions or delete either lock file. Restart v0.108.1 daemons during rollout because they hold the obsolete lifetime lease. |
+| **Run sandbox E2E beside production Shipyard safely** | Each protected queue/supervisor/ship mutation holds the shared host-global writer-domain lease only for its critical section; streamed logs reacquire per append, while idle daemons and read-only commands own no lease. Sandbox E2E keeps the fair-entry turnstile and data-domain lease exclusive from snapshot through contamination assertion. A production mutation waits boundedly, then exits `75` with `sandbox_writer_domain_overlap` instead of racing evidence. If the guardian refuses before transition because production workers are active, classify the canary as safely deferred only through `scripts/sandbox_admission_deferral.py`; its exact receipt, installed hash, mutation-probe path, lease absence, daemon PID, and live process start identity must all agree at both workflow checkpoints. That admission deferral is INFRA/retryable and does not justify rerunning the production job. The macOS guardian observes only the exact no-holder/contended ambiguity through a bounded stable-idle window while continuously fencing production identity, binary, config, and active workers; any holder or drift still fails closed. If a corrected-path cleanup retains the host lease solely because workers appeared after its mutation proof, the launchd-owned guardian may reconcile it without a model: authenticate the unique prior ready/mutation/final receipts, preserve exact production identity and configuration while workers drain, prove stable idle again immediately before removing the exact device/inode/ctime plus cryptographically random lease generation, and publish a durable pending/terminal receipt. Removal first atomically detaches that generation under a unique tombstone name, then deletes only the revalidated detached identity; crash debris cannot authorize or block a later fixed-name lease and is retained for evidence rather than guessed away. A lease retained by a canary that never wrote its mutation fence is reconcilable the same way only when its receipts prove it never touched production (never quiesced or restored it, never armed or ran its mutation probe, no workers at admission, candidate dead) and the production it snapshotted was replaced out of band (daemon pid/start or installed binary changed, e.g. by a fleet update); the reconciliation then binds to the current production and its receipts say `reconciliation_basis: production-superseded` with `mutation_fence_proved: false`. With production unchanged, a fence-less lease stays fail-closed for an operator. The guardian holds the host's fleet install guard (`fleet-auth-support.guard` in the production state dir) from before lease creation until its terminal receipt, so a fleet rollout defers (exit 75, no attempt spent) instead of replacing production mid-canary; fleet-reconcile's attempt ledger never rewrites itself on an idle tick, defers a tick before recording when the controller's own guard is held, and takes the shared writer-domain lease for every real write, so it can never land inside a contamination audit (the audit stays strict; nothing in `fleet-reconcile/` is exempted); a canary that finds an install in flight waits 60s, then fails `FleetUpdateInProgress` (INFRA/retryable). A process that exits while being inspected is reported as `ProcessGone`, not a raw KERN_PROCARGS2 errno. Pre-generation legacy leases require explicit operator reconciliation; ambiguous, unexpectedly populated, live-owner, quiesced, identity-drifted, or foreign-holder cases remain untouched. A pending/deferred retained-lease result is only INFRA/retryable evidence, never physical-canary or release acceptance. After its terminal receipt proves the exact lease generation was removed, rerun only the targeted macOS Sandbox job; do not rerun the whole workflow or rebuild unchanged binaries. After cleanup, confirm daemon IPC liveness through a bounded exact-PID-fenced window and require the receipt's configured repositories rather than treating one status miss as death. The guardian must fsync its terminal receipt before self-unloading its exact launchd label; later runs may recover only a bounded set of inert, receipt-authenticated registrations, and terminal workflow paths must fail closed if a successful full inventory does not prove the current label disappeared. Keep failure artifacts inside explicit canary/runner temp roots. Do not add filename/PID/job-ID exemptions or delete either lock file. Restart v0.108.1 daemons during rollout because they hold the obsolete lifetime lease. |
 | **Sandbox E2E exits 1 with no message at the host guard** | The macOS Sandbox job pins itself to M3 by runner name, machine tag and hostname. M3 is now `Daniels-Mac-Studio-m3.local` (renamed when a second Mac Studio joined); the guard accepts that and the old `Daniels-Mac-Studio.local`, and prints the hostname when neither matches. If a host is renamed again, update that `case` and `scripts/test_ci_matrix.py` together; failing here is host identity, not the PR. |
+| **Sandbox E2E fails at "Verify M3 guardian and production daemon invariants" although the guardian receipt says `completed`** | The production daemon's parent is checked by `scripts/production_daemon_parent.py`, never by a bare `ppid == 1`. On a daemon-launcher host (`shipyard daemon launcher install`) the daemon's parent is the resident `~/.local/libexec/shipyard/shipyard-daemon-launcher --mode shipyard daemon supervise --exec <installed>`, which launchd owns. Both shapes pass; any other parent (a candidate or sandbox supervisor, an `--in-place` hand-off, a launcher not under launchd) fails. If the launcher's argv contract (`launcher_arguments` in `src/daemon_launcher.rs`) changes, update the script and `scripts/test_production_daemon_parent.py` together. |
 | **Drain cloud-queued macOS jobs to local when a slot frees** | `shipyard runner reroute-watch [--apply] [--once] [--interval N] [--flap-window N]` (observe-only without `--apply`; logs per-host capacity + candidate list; flap-guard, one-reroute-per-tick, slot/fail-closed) |
 | **Runner provisioning: deregister a runner** | `shipyard runner remove --name <repo>-<tag>-NN --yes [--purge-dir]`; removal must use the compound `svc.sh uninstall`, not `stop`, so the LaunchAgent registration is removed before GitHub deregistration |
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
@@ -306,9 +308,11 @@ writer custody before mutation.
 | Import recent GitHub Actions timing into runner metrics | `shipyard metrics import github --repo <owner/repo> --limit 20 --json` |
 | Import tartci VM timing into runner metrics | `tartci runtime export --repo <owner/repo> | shipyard metrics import tartci --json` |
 | Summarize runner timing history | `shipyard metrics summary --project <name> --json` |
+| Summarize timing per physical host (fold ephemeral runners) | `shipyard metrics summary --project <name> --group-by host --json` |
 | Show one bounded stewardship scorecard | `shipyard metrics scorecard --project <name> --since 30d --json` |
 | Gate-minutes per merged PR, batch fullness, receipt reuse (live, read-only) | `shipyard metrics gate-cost --repo <owner/repo> --workflow <file> --gate-job <job> --since 48h --json` |
-| Ask for agent-readable runner health findings | `shipyard metrics watch --project <name> --since 14d --json` |
+| Ask for agent-readable runner health findings (required gates vs advisory, job denominators) | `shipyard metrics watch --project <name> --since 14d [--required <check>] --json` |
+| Ask where a job class runs fastest and healthiest | `shipyard metrics advise --project <name> --json` |
 | Compare local vs GitHub runner timing | `shipyard metrics compare --project <name> --baseline github-hosted --candidate macstudio --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
 | Cancel a job | `shipyard cancel <job_id>` |
@@ -633,6 +637,17 @@ rather than inventing a value. Treat insufficient-sample findings as "keep
 collecting", not as proof of a regression. Escalate only when the finding
 includes enough samples and a material delta for that repo/lane.
 
+Every `watch` share is over job rows judged by the job's own conclusion, never
+the workflow run's (an advisory red job turns a run red while the required
+gate is green). Read `denominator` for the per-window job counts and `gate`
+for `required` / `advisory` / `unclassified`; the required set comes from
+`--required` or `[governance] required_status_checks`. `advise` keys lanes by
+resolved job name and physical host, counts only success/failure, and says
+`no_healthy_lane` (with per-host failure rates) when a sampled gate is simply
+failing too often; `insufficient_healthy_samples` now means fewer than 3
+decided jobs. Use `summary --group-by host` when rows came from
+`metrics import github`, whose host column is otherwise the ephemeral runner.
+
 `shipyard metrics gate-cost` is the merge-throughput view and reads GitHub
 live, not the metrics store. Its headline is required-gate wall minutes (PR-head
 and merge-group runs of one workflow/job, every attempt, failures included)
@@ -648,7 +663,15 @@ says how many requests went to GitHub and how many the cache served. Use
 `--no-cache` to force every read live. A short page is an error, never a
 smaller number. A merge-group run with no decision counts as not
 reused and appears under `telemetry_gaps`, as does queue-depth history, which
-GitHub does not record.
+GitHub does not record. The `created=` run listing is cross-checked against the
+plain event listing; a `run_listing` gap means GitHub answered the filtered
+listing short (seen live: 11 of 624 `pull_request` runs) and the missed runs
+were added. A `gate_job_name` gap means some runs had no job named exactly
+`--gate-job`: cancelled before the gate started (GitHub leaves every name
+unevaluated; counted as one unstarted attempt), ran under an unevaluated name
+(counted, but make the workflow's gate `name:` a literal again), or no gate job
+at all.
+If PR-head numbers collapse without either gap, rerun before acting on them.
 
 When debugging GitHub imports, remember that Shipyard invokes `gh api` with
 absolute `/repos/...` paths and forces `-X GET` when query parameters are passed
@@ -935,6 +958,25 @@ See [`docs/live-mode.md`](../../docs/live-mode.md) for setup (≈1
 click on a Tailscale-ready Mac) and troubleshooting. The macOS
 menu-bar app (`shipyard-macos-gui`) is a thin subscriber to this
 same daemon.
+
+
+### Unattended hosts on an external volume: install the daemon launcher once
+
+On a Mac whose worktrees live on an external volume (m3's `/Volumes/Workshop`),
+a daemon started by an unattended updater inherits a per-release privacy
+identity that has never been granted Removable Volumes access, and its first
+git probe there waits on a prompt nobody answers. Run once, from a terminal on
+that volume, with someone at the desk:
+
+```bash
+shipyard daemon launcher install        # approve the one-time prompt if shown
+shipyard daemon launcher status
+shipyard daemon refresh                 # now started through launchd
+```
+
+After that every refresh, including a fleet self-update's, starts the daemon
+through the stable launcher, whose consent survives updates. `daemon launcher
+uninstall` returns to direct spawns. Hosts on internal disks need nothing.
 
 ## `shipyard verdicts` — the verdict nobody consumed
 
@@ -1558,7 +1600,10 @@ arming or observing the queue and leaves ship-state active. A queue supervisor
 re-enqueues only after it previously observed the PR (persisted across process
 restarts) and GitHub reports `invalid_merge_commit`; `failed_checks`,
 manual/unknown removal, head drift, and HTTP 403/rate-limit responses stop
-fail-closed.
+fail-closed. Admission reads the PR's queue timeline too: a head the queue
+removed for `failed_checks` / `merge_conflict` with no new head since is refused
+even by a fresh ship-state for the same SHA, so re-shipping from another host
+does not re-enqueue it. Push a fix.
 
 ### "Validated green but not merged" — read the status before blaming the PR
 
@@ -2764,6 +2809,13 @@ the queue absorbs.
 
 An unreadable surface reports `UNKNOWN`, never `absent`. Treat an `UNKNOWN`
 queue as "determine this before doing bulk work", not as "there is no queue".
+
+**Is the base red? Read `BASE HEALTH` in `shipyard landing`.** Its first line
+judges the base tip directly: the `merge_group` run(s) whose `head_sha` is the
+tip, and the conclusion of each *required* job there (never the run's
+conclusion, which an advisory Linux failure turns red). `HEALTHY`, `RED` (the
+failing required job and, when parseable, its tests), `PENDING`, or `UNPROVEN`
+(no merge-group run built the tip: a direct push), each with the tip SHA.
 
 **A red base overrides "wait for the queue".** `shipyard landing` also reads
 the repository's own `base-poison-signal/v1` annotation (Pulp publishes it from

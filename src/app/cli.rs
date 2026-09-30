@@ -274,6 +274,17 @@ pub(super) enum Command {
         )]
         max_polls: Option<u64>,
     },
+    /// Read-only flags for stuck open pull requests: repeated test failures,
+    /// red-while-armed, repeated merge-queue ejections, rebase treadmills.
+    ///
+    /// Nothing is changed on GitHub except, with `--post-comments`, one
+    /// sticky comment per flagged pull request. See docs/pr-watch.md.
+    #[command(name = "pr-watch")]
+    PrWatch {
+        /// PR-watch subcommand.
+        #[command(subcommand)]
+        command: Box<PrWatchCommand>,
+    },
     /// Plan a fail-closed exact-head changed-surface test selection in shadow mode.
     #[command(name = "changed-surface-plan")]
     ChangedSurfacePlan {
@@ -933,7 +944,12 @@ pub(crate) enum MetricsCommand {
     /// List recent job rows.
     List(MetricsListArgs),
     /// Summarize p50/p90/min/max/failure-rate by project,target,backend,host.
-    Summary(MetricsProjectArgs),
+    ///
+    /// `--group-by runner` (default) keys the host column by the recorded
+    /// machine name, which for GitHub-imported jobs is the ephemeral runner.
+    /// `--group-by host` folds runners into their physical host: a
+    /// `*-host-<id>` label, else the `shipyard runner tag` in the runner name.
+    Summary(MetricsSummaryArgs),
     /// Show slowest successful jobs.
     Slowest(MetricsListArgs),
     /// Compare before/after windows per job class.
@@ -1115,6 +1131,104 @@ pub(crate) struct MetricsGateCostArgs {
     /// runs.
     #[arg(long)]
     pub(crate) no_cache: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PrWatchCommand {
+    /// One pass over the repository's pull requests. Dry run by default:
+    /// prints the flags and the comment and digest it would send.
+    Scan(PrWatchScanArgs),
+    /// Offline simulation of a past window, evaluating the same rules at
+    /// every tick. Exits 1 when an `--expect` fails or a cleanly merged pull
+    /// request was flagged (`--control merged-clean`).
+    Replay(PrWatchReplayArgs),
+    /// Build the hourly digest from the ledger; `--post` delivers it through
+    /// `[pr_watch.digest] command`.
+    Digest(PrWatchDigestArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PrWatchScanArgs {
+    /// Owner/repo slug. Defaults to the current checkout's repository.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Base branch. Defaults to `[pr_watch] base`, else `main`.
+    #[arg(long)]
+    pub(crate) base: Option<String>,
+    /// Create or update the sticky PR comment (comment endpoints only).
+    #[arg(long = "post-comments")]
+    pub(crate) post_comments: bool,
+    /// Also deliver the digest through `[pr_watch.digest] command`.
+    #[arg(long)]
+    pub(crate) digest: bool,
+    /// Override the ledger path.
+    #[arg(long = "state-file")]
+    pub(crate) state_file: Option<PathBuf>,
+    /// Read every answer live instead of reusing settled answers.
+    #[arg(long = "no-cache")]
+    pub(crate) no_cache: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PrWatchReplayArgs {
+    /// Owner/repo slug. Defaults to the current checkout's repository.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Base branch. Defaults to `[pr_watch] base`, else `main`.
+    #[arg(long)]
+    pub(crate) base: Option<String>,
+    /// Window length ending at --until (or now), for example `7d`.
+    #[arg(long, default_value = "7d")]
+    pub(crate) since: String,
+    /// Window end, RFC 3339. Defaults to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+    /// Evaluation step, for example `15m`.
+    #[arg(long, default_value = "15m")]
+    pub(crate) tick: String,
+    /// `PR=FLAGS`, for example `8933=1,3,4,5`: these flags must be raised on
+    /// that pull request at some tick. Repeatable.
+    #[arg(long = "expect")]
+    pub(crate) expect: Vec<String>,
+    /// Control check. `merged-clean`: no flag on a pull request that merged
+    /// with zero failed required jobs and zero `failed_checks` removals.
+    #[arg(long, value_enum)]
+    pub(crate) control: Option<PrWatchControl>,
+    /// Write the simulated ledger here (a throwaway path; never live state).
+    #[arg(long = "state-file")]
+    pub(crate) state_file: Option<PathBuf>,
+    /// Read every answer live instead of reusing settled answers.
+    #[arg(long = "no-cache")]
+    pub(crate) no_cache: bool,
+    /// Record every GitHub request and answer into this directory.
+    #[arg(long, hide = true)]
+    pub(crate) record: Option<PathBuf>,
+    /// Serve GitHub answers from a recording instead of the network.
+    #[arg(long, hide = true)]
+    pub(crate) fixtures: Option<PathBuf>,
+}
+
+/// Replay control checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PrWatchControl {
+    /// No flags on cleanly merged pull requests.
+    MergedClean,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PrWatchDigestArgs {
+    /// Owner/repo slug. Defaults to the current checkout's repository.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Base branch. Defaults to `[pr_watch] base`, else `main`.
+    #[arg(long)]
+    pub(crate) base: Option<String>,
+    /// Deliver it (claim-then-send). Without this, print it.
+    #[arg(long)]
+    pub(crate) post: bool,
+    /// Override the ledger path.
+    #[arg(long = "state-file")]
+    pub(crate) state_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1312,6 +1426,25 @@ pub(crate) struct MetricsTrendArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct MetricsSummaryArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+    /// Machine grouping: `runner` (recorded name) or `host` (physical host).
+    #[arg(long = "group-by", value_enum, default_value_t = MetricsGroupBy::Runner)]
+    pub(crate) group_by: MetricsGroupBy,
+}
+
+/// Machine grouping for `metrics summary`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum MetricsGroupBy {
+    /// The recorded machine name (an ephemeral runner for GitHub imports).
+    Runner,
+    /// The physical host behind the runner.
+    Host,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct MetricsWatchArgs {
     /// Project key.
     #[arg(long)]
@@ -1319,6 +1452,11 @@ pub(crate) struct MetricsWatchArgs {
     /// Recent window, for example `14d`.
     #[arg(long = "since", default_value = "14d")]
     pub(crate) since: String,
+    /// Required status-check name; repeatable. Lanes holding one are
+    /// reported as `required`, the rest as `advisory`. Defaults to
+    /// `[governance] required_status_checks` from the repo config.
+    #[arg(long = "required")]
+    pub(crate) required: Vec<String>,
     /// Verdict basis: load-independent `proxy` (default) or `wall-time`.
     #[arg(long, value_enum, default_value_t = MetricsBasis::Proxy)]
     pub(crate) basis: MetricsBasis,
@@ -1958,6 +2096,62 @@ pub(super) enum DaemonCommand {
         #[arg(long = "repo")]
         repos: Vec<String>,
     },
+    /// Manage the macOS launchd launcher that gives the daemon a stable
+    /// privacy identity across updates.
+    Launcher {
+        #[command(subcommand)]
+        command: DaemonLauncherCommand,
+    },
+    /// Run the daemon as a child and stay resident as its parent. The launchd
+    /// agent's program; not for interactive use.
+    #[command(hide = true)]
+    Supervise {
+        /// Shipyard binary that runs `daemon run`.
+        #[arg(long = "exec", required_unless_present = "contract")]
+        exec: Option<std::path::PathBuf>,
+        /// Repo(s) to advertise from the daemon status endpoint.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Print the supervise argument contract and exit.
+        #[arg(long)]
+        contract: bool,
+        /// Prepare the daemon with this binary's spawn code and replace this
+        /// process with `daemon run`. Used by the resident launcher.
+        #[arg(long = "in-place")]
+        in_place: bool,
+    },
+    /// Read each path and record the outcome. Run from launchd by
+    /// `daemon launcher install`; not for interactive use.
+    #[command(hide = true, name = "launcher-probe")]
+    LauncherProbe {
+        /// Directory to list.
+        #[arg(long = "path", required = true)]
+        paths: Vec<std::path::PathBuf>,
+        /// Where to write the JSON outcome.
+        #[arg(long)]
+        result: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum DaemonLauncherCommand {
+    /// Copy this binary to a stable path, prove from launchd that it can read
+    /// the external volume(s) (approve the one-time macOS prompt if shown),
+    /// then start the daemon through launchd from now on.
+    Install {
+        /// Volume to probe, e.g. /Volumes/Workshop. Defaults to the external
+        /// volume holding the current directory.
+        #[arg(long = "probe-path")]
+        probe_paths: Vec<std::path::PathBuf>,
+        /// Seconds to wait for the probe, including any consent prompt.
+        #[arg(long = "wait-secs", default_value_t = 300)]
+        wait_secs: u64,
+    },
+    /// Report whether the launcher is installed and active.
+    Status,
+    /// Stop starting the daemon through launchd. The running daemon is left
+    /// alone; the next refresh spawns it directly.
+    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2918,6 +3112,68 @@ mod tests {
         };
         assert_eq!(args.project, "pulp");
         assert_eq!(args.since, "30d");
+    }
+
+    #[test]
+    fn pr_watch_scan_defaults_to_a_dry_run() {
+        let cli = Cli::try_parse_from(["shipyard", "pr-watch", "scan", "--repo", "o/r", "--json"])
+            .expect("pr-watch scan");
+        assert!(cli.json);
+        let Command::PrWatch { command } = cli.command else {
+            panic!("expected pr-watch");
+        };
+        let super::PrWatchCommand::Scan(args) = *command else {
+            panic!("expected scan");
+        };
+        assert_eq!(args.repo.as_deref(), Some("o/r"));
+        assert!(!args.post_comments && !args.digest);
+    }
+
+    #[test]
+    fn pr_watch_replay_parses_expectations_control_and_window() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "pr-watch",
+            "replay",
+            "--repo",
+            "o/r",
+            "--since",
+            "7d",
+            "--tick",
+            "15m",
+            "--expect",
+            "8933=1,3,4,5",
+            "--expect",
+            "8970=3",
+            "--control",
+            "merged-clean",
+            "--until",
+            "2026-09-29T06:15:00Z",
+        ])
+        .expect("pr-watch replay");
+        let Command::PrWatch { command } = cli.command else {
+            panic!("expected pr-watch");
+        };
+        let super::PrWatchCommand::Replay(args) = *command else {
+            panic!("expected replay");
+        };
+        assert_eq!(args.expect, ["8933=1,3,4,5", "8970=3"]);
+        assert_eq!(args.control, Some(super::PrWatchControl::MergedClean));
+        assert_eq!(args.since, "7d");
+        assert_eq!(args.until.as_deref(), Some("2026-09-29T06:15:00Z"));
+    }
+
+    #[test]
+    fn pr_watch_digest_posts_only_when_asked() {
+        let cli = Cli::try_parse_from(["shipyard", "pr-watch", "digest", "--repo", "o/r"])
+            .expect("pr-watch digest");
+        let Command::PrWatch { command } = cli.command else {
+            panic!("expected pr-watch");
+        };
+        let super::PrWatchCommand::Digest(args) = *command else {
+            panic!("expected digest");
+        };
+        assert!(!args.post);
     }
 
     #[test]

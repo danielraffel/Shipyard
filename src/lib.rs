@@ -50,6 +50,9 @@ pub mod config;
 pub mod ctest_inventory;
 /// Unix socket IPC primitives for daemon subscribers and status reads.
 pub mod daemon_ipc;
+/// Stable macOS privacy identity (launchd launcher) for the detached daemon.
+#[cfg(unix)]
+pub mod daemon_launcher;
 /// Minimal daemon runtime and lifecycle helpers.
 pub mod daemon_runtime;
 /// Shared daemon/CLI version comparison helpers.
@@ -193,6 +196,8 @@ pub mod pr_fold;
 pub mod pr_queue_state;
 /// Pull request title/body composition.
 pub mod pr_text;
+/// Read-only flags for stuck open pull requests (`shipyard pr-watch`).
+pub mod pr_watch;
 /// Submission preflight checks for `ship --pr`.
 pub mod preflight;
 /// Prepared-state cache for warm stage reruns.

@@ -303,7 +303,7 @@ fn recovery_revalidates_queue_absence_after_persisting_the_intent() {
 
 #[cfg(unix)]
 #[test]
-fn unreadable_optional_recovery_proof_preserves_ordinary_exact_head_enqueue() {
+fn unreadable_optional_recovery_proof_falls_back_to_the_head_scoped_ordinary_enqueue() {
     let temp = tempfile::tempdir().expect("temp");
     fs::write(temp.path().join("timeline-error"), "error").expect("marker");
     let (actions, calls_path, witness) = queue_recovery_gh(
@@ -330,8 +330,14 @@ fn unreadable_optional_recovery_proof_preserves_ordinary_exact_head_enqueue() {
         true,
     );
 
-    assert_eq!(mutation.as_deref(), Some("enqueued"));
-    assert!(error.is_none(), "{error:?}");
+    // The fallback is the ordinary enqueue, and the ordinary enqueue judges
+    // the head against the queue timeline. The same timeline that made the
+    // recovery proof unreadable leaves that verdict unreadable too, so the
+    // fallback refuses rather than re-enqueuing a head the queue may have
+    // ejected for its own failure.
+    assert!(mutation.is_none(), "{mutation:?}");
+    let error = error.expect("unreadable queue state is an error");
+    assert!(error.contains("could not be determined"), "{error}");
     assert!(ledger.queue_recovery_receipts.is_empty());
     assert!(
         ledger
@@ -340,9 +346,8 @@ fn unreadable_optional_recovery_proof_preserves_ordinary_exact_head_enqueue() {
             .any(|entry| { entry.action == "queue_priority_recovery_unreadable_fell_back" })
     );
     let calls = fs::read_to_string(calls_path).expect("calls");
-    assert!(calls.contains("enqueuePullRequest"), "{calls}");
-    assert!(!calls.contains("jump:true"), "{calls}");
-    assert_internal_marker_only_on_enqueue(&temp);
+    assert!(calls.contains("isInMergeQueue"), "{calls}");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
 }
 
 #[cfg(unix)]
@@ -983,6 +988,59 @@ esac
     assert!(ledger_path.exists());
 }
 
+/// A `failed_checks` ejection leaves the head's own checks green, so live
+/// revalidation still classifies it `ArmMergeQueue`. The head-scoped queue
+/// verdict is what keeps the steward from re-enqueuing it.
+#[cfg(unix)]
+#[test]
+fn steward_does_not_enqueue_a_green_head_the_queue_ejected_for_failed_checks() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[{{"__typename":"PullRequestCommit","commit":{{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}},{{"__typename":"AddedToMergeQueueEvent","createdAt":"2026-09-25T04:05:50Z"}},{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-09-25T04:12:51Z","reason":"failed_checks"}}]}}}}}}}}}}' ;;
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"stackConfig"*) printf '%s' '{{"data":{{"repository":{{"stackConfig":null,"pullRequest":{{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":null,"stackEntry":null}}}}}}}}' ;;
+  *"stackEntry"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":null,"stackEntry":null}}}}}}}}' ;;
+  *"enqueuePullRequest"*) printf '%s' '{{"data":{{"enqueuePullRequest":{{"mergeQueueEntry":{{"position":1}}}}}}}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            log.display()
+        ),
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+    let (mutation, error) = mutate_pr(
+        &context,
+        &pr,
+        &queue_policy(),
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+    );
+
+    assert_eq!(
+        mutation.as_deref(),
+        Some("skipped_ejected_same_head:failed_checks")
+    );
+    assert!(error.is_none(), "{error:?}");
+    let calls = fs::read_to_string(log).expect("calls");
+    assert!(calls.contains("isInMergeQueue"), "{calls}");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+}
+
 #[cfg(unix)]
 #[test]
 fn enqueue_transport_mutates_only_after_live_queue_and_head_revalidation() {
@@ -994,6 +1052,7 @@ fn enqueue_transport_mutates_only_after_live_queue_and_head_revalidation() {
             r#"
 printf '%s\n' "$*" >> '{}'
 case "$*" in
+  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *"query=query("*"mergeQueue"*)
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
   "pr view "*)
@@ -2046,6 +2105,7 @@ fn steward_ambiguous_failure_is_durable_shared_uncertainty() {
             r#"
 printf '%s\n' "$*" >> '{}'
 case "$*" in
+  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *"query=query("*"mergeQueue"*)
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
   "pr view "*)
@@ -2435,6 +2495,7 @@ fn enqueue_requirements_refusal_is_waiting_not_control_plane_failure() {
         &temp,
         r#"
 case "$*" in
+  *"isInMergeQueue"*) printf '%s' '{"data":{"repository":{"pullRequest":{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{"pageInfo":{"hasPreviousPage":false},"nodes":[]}}}}}' ;;
   *"query=query("*"mergeQueue"*)
     printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   "pr view "*)
