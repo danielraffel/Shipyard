@@ -936,6 +936,7 @@ fn run_scan(post_comments: bool) -> ScanRun {
         post_comments,
         post_digest: false,
         plan_comments: true,
+        handback: super::handback::HandbackMode::Off,
     };
     let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
     let report = super::scan::scan(
@@ -946,6 +947,7 @@ fn run_scan(post_comments: bool) -> ScanRun {
         &crate::gate_cost::ReadCache::disabled(),
         &request,
         now,
+        None,
     )
     .unwrap();
     let reads = reads.into_inner().unwrap();
@@ -1089,6 +1091,7 @@ fn a_daemon_style_scan_without_posting_reads_no_comment_lists() {
         post_comments: false,
         post_digest: false,
         plan_comments: false,
+        handback: super::handback::HandbackMode::Off,
     };
     let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
     let report = super::scan::scan(
@@ -1099,6 +1102,7 @@ fn a_daemon_style_scan_without_posting_reads_no_comment_lists() {
         &crate::gate_cost::ReadCache::disabled(),
         &request,
         now,
+        None,
     )
     .unwrap();
     assert_eq!(kinds(&report.flags, 42), vec![2]);
@@ -1356,4 +1360,60 @@ fn the_configured_attributor_runs_from_the_checkout_with_the_guards_argv() {
     assert_eq!(found.implicated_pr, Some(7));
     // A verdict about another run is not a ruling on this one.
     assert!(command.ask("o/r", 42, 100).is_none());
+}
+
+#[test]
+fn a_planned_handback_rides_the_scan_and_writes_nothing() {
+    struct NoHost;
+    impl super::handback::host::HostRunner for NoHost {
+        fn run(
+            &mut self,
+            invocation: &super::handback::host::Invocation,
+        ) -> Result<String, super::handback::host::RunError> {
+            panic!("no owner, so no host command: {:?}", invocation.argv)
+        }
+        fn append_local_inbox(&mut self, _: &str, _: &str) -> Result<(), String> {
+            panic!("no inbox in a plan")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let reader = |argv: &[String]| fake_github(argv);
+    let writer = |argv: &[String]| -> Result<String, String> { panic!("wrote {argv:?}") };
+    let mut sender = |_: &str| -> Result<(), String> { panic!("no digest") };
+    let request = super::scan::ScanRequest {
+        repo: "o/r".to_owned(),
+        config: super::scan::WatchConfig {
+            lookback: Duration::days(2),
+            ..super::scan::WatchConfig::default()
+        },
+        state_path: dir.path().join("ledger.json"),
+        post_comments: false,
+        post_digest: false,
+        plan_comments: false,
+        handback: super::handback::HandbackMode::Plan,
+    };
+    let mut runner = NoHost;
+    let mut deps = super::handback::Deps {
+        runner: &mut runner,
+        state_dir: dir.path().to_path_buf(),
+        local_names: Vec::new(),
+        local_machine: None,
+    };
+    let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
+    let report = super::scan::scan(
+        &reader,
+        &writer,
+        &mut sender,
+        None,
+        &crate::gate_cost::ReadCache::disabled(),
+        &request,
+        now,
+        Some(&mut deps),
+    )
+    .unwrap();
+    let handback = report.handback.expect("hand-back report");
+    assert_eq!(handback.owners.len(), 1);
+    assert_eq!(handback.owners[0].pr, 42);
+    assert_eq!(handback.owners[0].record.state, "none");
+    assert!(handback.actions.iter().all(|action| !action.sent));
 }

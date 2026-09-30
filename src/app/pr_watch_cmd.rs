@@ -19,6 +19,7 @@ use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
 use crate::pr_watch::digest::{self, DigestOutcome};
 use crate::pr_watch::fixtures::{FixtureReader, Recorder};
+use crate::pr_watch::handback::{self, HandbackMode, HandbackReport};
 use crate::pr_watch::replay::{Expectation, ReplayOptions, ReplayReport, replay};
 use crate::pr_watch::scan::{
     AttributorCommand, ScanReport, ScanRequest, WatchConfig, run_digest_command, scan,
@@ -98,6 +99,19 @@ fn scan_command<W: Write>(
             "pr-watch scan --digest needs [pr_watch.digest] command = [\"...\"]",
         ));
     }
+    if args.deliver_handback && !watch.handback.enabled {
+        return Err(CliFailure::new(
+            WAIT_EXIT_INVALID,
+            "pr-watch scan --deliver-handback needs [pr_watch.handback] enabled = true",
+        ));
+    }
+    let handback_mode = if args.deliver_handback {
+        HandbackMode::Deliver
+    } else if args.handback {
+        HandbackMode::Plan
+    } else {
+        HandbackMode::Off
+    };
     let state_path = args
         .state_file
         .unwrap_or_else(|| ledger::default_path(&runtime_paths.state_dir, &repo, &watch.base));
@@ -134,6 +148,7 @@ fn scan_command<W: Write>(
         post_comments: args.post_comments,
         post_digest: args.digest,
         plan_comments: true,
+        handback: handback_mode,
     };
     // The repository's batch attributor (`[queue.attribution] command`), when
     // this checkout has one, can clear a flag-3 ejection for a neighbour.
@@ -145,6 +160,17 @@ fn scan_command<W: Write>(
     };
     let attributor: Option<&crate::pr_watch::scan::Attributor<'_>> =
         attributor_command.is_some().then_some(&ask);
+    let mut runner = handback::host::ProcessHostRunner {
+        cmux_path: request.config.handback.cmux_path.clone(),
+        timeout: StdDuration::from_secs(request.config.handback.timeout_seconds),
+        inbox_dir: handback::host::default_inbox_dir(),
+    };
+    let mut deps = handback::Deps {
+        runner: &mut runner,
+        state_dir: runtime_paths.state_dir.clone(),
+        local_names: handback::local_host_names(),
+        local_machine: handback::owner::local_machine_identity(&runtime_paths.state_dir),
+    };
     let report = scan(
         &reader,
         &writer,
@@ -153,6 +179,7 @@ fn scan_command<W: Write>(
         &cache,
         &request,
         Utc::now(),
+        Some(&mut deps),
     )
     .map_err(|error| CliFailure::new(1, format!("pr-watch scan failed: {error}")))?;
     if json {
@@ -198,6 +225,9 @@ fn render_scan(report: &ScanReport) -> String {
         let _ = writeln!(out, "comment error: {error}");
     }
     let _ = writeln!(out, "digest: {}", render_digest_outcome(&report.digest));
+    if let Some(handback) = &report.handback {
+        render_handback(&mut out, handback);
+    }
     for gap in &report.gaps {
         let _ = writeln!(out, "gap: {gap}");
     }
@@ -207,6 +237,76 @@ fn render_scan(report: &ScanReport) -> String {
         report.reads.github, report.reads.cached
     );
     out
+}
+
+fn render_handback(out: &mut String, report: &HandbackReport) {
+    let verb = if report.mode == HandbackMode::Deliver {
+        "deliver"
+    } else {
+        "plan (dry run; --deliver-handback to send)"
+    };
+    let _ = writeln!(out, "hand-back: {verb}");
+    for view in &report.owners {
+        let owner = view.record.owner.as_ref().map_or_else(
+            || "no owner".to_owned(),
+            |o| {
+                format!(
+                    "{} {} on {} via {:?}",
+                    o.agent,
+                    o.session,
+                    o.host
+                        .as_deref()
+                        .unwrap_or(if o.local { "this host" } else { "?" }),
+                    o.source
+                )
+            },
+        );
+        let _ = writeln!(
+            out,
+            "  #{} tier {}: owner {owner}; {} ({}){}{}",
+            view.pr,
+            view.tier,
+            view.record.state,
+            view.record.detail,
+            if view.record.unowned {
+                "; UNOWNED in digest"
+            } else {
+                ""
+            },
+            view.held
+                .as_deref()
+                .map(|held| format!("; held: {held}"))
+                .unwrap_or_default(),
+        );
+    }
+    for action in &report.actions {
+        let status = if action.sent {
+            "sent".to_owned()
+        } else if let Some(error) = &action.error {
+            format!("error: {error}")
+        } else {
+            "would send".to_owned()
+        };
+        let prs: Vec<String> = action.prs.iter().map(|pr| format!("#{pr}")).collect();
+        let _ = writeln!(
+            out,
+            "  tier {} {} {} [{status}]: {}",
+            action.tier,
+            action.action,
+            prs.join(","),
+            action.summary
+        );
+        if let Some(argv) = &action.argv {
+            let shown: Vec<String> = argv
+                .iter()
+                .map(|arg| arg.chars().take(120).collect())
+                .collect();
+            let _ = writeln!(out, "      argv: {shown:?}");
+        }
+    }
+    for gap in &report.gaps {
+        let _ = writeln!(out, "  hand-back gap: {gap}");
+    }
 }
 
 fn render_digest_outcome(outcome: &DigestOutcome) -> String {
