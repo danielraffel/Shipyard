@@ -25,7 +25,13 @@ It is read-only. It prints one row per feature (`present`, `partial`,
 adopt in dependency order. Three controls run before any verdict: `origin/BASE`
 resolves to a non-empty tree, the checkout's `origin` is the named repository,
 and the API returns that repository's own name. If a control fails, the rows it
-feeds read `UNKNOWN`, never `absent`.
+feeds read `UNKNOWN`, never `absent`. A partial read counts as a failed read:
+branch protection answering 403 without admin scope, `allow_auto_merge` omitted
+for a caller without push access, or a landing report that never reached its
+`VALIDATION` section all yield `UNKNOWN`; only GitHub's explicit 404 "Branch
+not protected" is read as a real absence. `skills/ci/scripts/test_adoption_audit.sh`
+covers each of those cases offline with stub `ghapp` and `shipyard` binaries,
+plus a healthy and an unprotected control. Run it after editing the audit.
 
 Measured on 2026-09-30:
 

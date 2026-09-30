@@ -29,6 +29,9 @@ fi
 # An error body (404 "Branch not protected") arrives on stdout, so a failed
 # read must yield nothing rather than be parsed as data.
 api() { local o; if o="$($GH api "$@" 2>/dev/null)"; then printf '%s\n' "$o"; fi; }
+# ok when the endpoint answers; used where an empty answer would otherwise be
+# read as "nothing configured" (a 401/403/5xx must not become absent).
+api_ok() { $GH api "$@" >/dev/null 2>&1; }
 
 rows=()
 # row FEATURE STATUS EVIDENCE [PROVEN]
@@ -105,10 +108,17 @@ else
 fi
 
 # ── Live protection: required contexts + effective rules ──────────────────
-req=""; rules=""
+req=""; rules=""; prot_read=ok; rules_read=ok
 if [ "$ctl_api" = ok ]; then
-  req="$(api "repos/$REPO/branches/$BASE/protection" \
-      --jq '.required_status_checks.contexts[]')"
+  # An unprotected branch answers 404 "Branch not protected", which is a real
+  # absence. Any other failure (401, 403 without admin, 5xx) is unreadable.
+  if api_ok "repos/$REPO/branches/$BASE/protection"; then
+    req="$(api "repos/$REPO/branches/$BASE/protection" \
+        --jq '.required_status_checks.contexts[]')"
+  elif ! $GH api "repos/$REPO/branches/$BASE/protection" 2>&1 | grep -q 'Branch not protected'; then
+    prot_read="branch protection unreadable"
+  fi
+  api_ok "repos/$REPO/rules/branches/$BASE" || rules_read="effective branch rules unreadable"
   rules="$(api "repos/$REPO/rules/branches/$BASE" --jq '.[].type')"
   req="$req
 $(api "repos/$REPO/rules/branches/$BASE" \
@@ -120,6 +130,8 @@ nreq="$(printf '%s\n' "$req" | sed '/^$/d' | wc -l | tr -d ' ')"
 # ── 2. required checks (live, and declared to Shipyard) ─────────────────────
 if [ "$ctl_api" != ok ]; then
   row "required checks" UNKNOWN "$ctl_api"
+elif [ "$prot_read" != ok ] || [ "$rules_read" != ok ]; then
+  row "required checks" UNKNOWN "$prot_read / $rules_read"
 else
   declared=no; has_cfg '^required_status_checks' && declared=yes
   if [ "$nreq" -gt 0 ] && [ "$declared" = yes ]; then st=present
@@ -151,6 +163,8 @@ else
     done <<< "$req"
   fi
   if [ "$wf_ctl" = 0 ]; then st=UNKNOWN
+  elif [ "$n_gate_wfs" -gt 0 ] && { [ "$ctl_api" != ok ] || [ "$prot_read" != ok ] || [ "$rules_read" != ok ]; }; then
+    st=UNKNOWN; required_gate=unreadable
   elif [ "$required_gate" = yes ]; then st=present
   elif [ "$n_gate_wfs" -gt 0 ]; then st=partial
   else st=absent; fi
@@ -163,6 +177,8 @@ fi
 # ── 4. merge queue ─────────────────────────────────────────────────────────
 if [ "$ctl_api" != ok ]; then
   row "merge queue" UNKNOWN "$ctl_api"
+elif [ "$rules_read" != ok ]; then
+  row "merge queue" UNKNOWN "$rules_read"
 else
   n_rulesets="$(api "repos/$REPO/rulesets" --jq 'length')"; n_rulesets="${n_rulesets:-?}"
   if printf '%s\n' "$rules" | grep -qx merge_queue; then
@@ -180,11 +196,13 @@ fi
 
 # ── 5. auto-merge allowed ──────────────────────────────────────────────────
 if [ "$ctl_api" != ok ]; then
-  row "auto-merge" UNKNOWN "$ctl_api"
+  row "auto-merge (MERGE)" UNKNOWN "$ctl_api"
 else
   am="$(api "repos/$REPO" --jq '.allow_auto_merge')"
   mc="$(api "repos/$REPO" --jq '.allow_merge_commit')"
-  if [ "$am" = true ] && [ "$mc" = true ]; then st=present
+  # Both fields are omitted for a caller without push access; null is unreadable.
+  if { [ "$am" != true ] && [ "$am" != false ]; } || { [ "$mc" != true ] && [ "$mc" != false ]; }; then st=UNKNOWN
+  elif [ "$am" = true ] && [ "$mc" = true ]; then st=present
   elif [ "$am" = true ] || [ "$mc" = true ]; then st=partial
   else st=absent; fi
   row "auto-merge (MERGE)" "$st" "allow_auto_merge=$am allow_merge_commit=$mc"
@@ -233,6 +251,7 @@ else
   has_cfg '^\[landability\]' && decl=$((decl+1))
   if [ "$decl" = 2 ]; then st=present
   elif [ "$decl" = 1 ]; then st=partial
+  elif [ "$nrun" = "?" ]; then st=UNKNOWN
   elif [ "$nrun" = 0 ]; then st="n/a"
   else st=absent; fi
   row "runner governance" "$st" "$nrun repo runner(s) (org runners not counted); declared sections=$decl/2"
