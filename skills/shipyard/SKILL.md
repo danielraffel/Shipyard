@@ -915,6 +915,13 @@ a collection gap, not a regression. Prefer filing issues or changing profiles
 only when `watch`, `advise`, or `compare` reports enough samples and a material
 delta relative to that repo's baseline.
 
+Check freshness first: a leading `STALE: last github import …` line (JSON
+`freshness.status`) means nothing has imported recently, so a low count is the
+missing import, not the lane. Import by hand, or ask the operator to enable the
+daemon's `[metrics.import]` job (off by default; never edit the machine-global
+config from an agent session). `--project` takes `owner/name` or the short
+name interchangeably; `--fail-on-stale` exits 3 on `stale`/`empty`.
+
 Judge CI changes by the proxies, not by wall time. `compare`, `watch`,
 `trend`, and `scorecard` verdicts default to load-independent proxies
 (failure share, cancelled share, starvation share, attempts per PR, queue wait
