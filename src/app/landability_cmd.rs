@@ -29,7 +29,7 @@ use chrono::Utc;
 use serde_json::json;
 
 use super::CliFailure;
-use crate::config::LoadedConfig;
+use crate::config::{LoadedConfig, ProjectLayerSource};
 use crate::fleet_service::{LaneServiceThresholds, RegisteredRunner};
 use crate::identity::RuntimeMode;
 use crate::landability::attestation::{AttestationSet, local_attestation_paths};
@@ -87,6 +87,17 @@ pub(super) fn landability_command<W: Write>(
     let mut base = base_arg
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| gate::resolve_base(&config));
+    // What the base requires is the base's own policy; a stale or edited
+    // checkout must not answer with its copy.
+    let (config, policy_source) =
+        config.with_project_layer_at_ref(mode, cwd, &format!("origin/{base}"));
+    if json {
+        if matches!(policy_source, ProjectLayerSource::WorkingTreeFallback { .. }) {
+            eprintln!("{}", policy_source.describe());
+        }
+    } else {
+        let _ = writeln!(stdout, "  note: {}", policy_source.describe());
+    }
 
     // Post-open evidence, link (5). Only spent when a pull request number was
     // given: at `shipyard pr` time there is no pull request to read, and the

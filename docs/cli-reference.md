@@ -111,7 +111,7 @@ shipyard ci profile plan normal-local-fast --repo OWNER/REPO --json
 # Governance
 shipyard governance status     # declared vs live drift
 shipyard governance diff       # dry-run apply
-shipyard governance apply      # bring live state in line with config
+shipyard governance apply --yes  # write live state to match config (without --yes: preview only)
 shipyard governance export     # snapshot to TOML
 shipyard governance use <name> # switch profile (solo / multi / custom)
 
