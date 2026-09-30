@@ -23,6 +23,8 @@ use serde_json::Value;
 
 use crate::validation_signals::{Annotation, GhReader, parse_annotations};
 
+pub mod tip;
+
 /// Annotation title the detector publishes.
 pub const SIGNAL_TITLE: &str = "base-poison-signal";
 /// Schema identifier inside the annotation message.

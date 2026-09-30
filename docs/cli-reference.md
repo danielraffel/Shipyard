@@ -39,7 +39,7 @@ shipyard dependency pulp update           # qualify latest/stable/fixed and open
 shipyard dependency pulp verify           # fresh, cache-bypassing CI verification
 
 # Understand how a repo lands work (read-only)
-shipyard landing                             # merge queue, strict, enqueue, check placement, backlog
+shipyard landing                             # merge queue, strict, enqueue, check placement, backlog, base tip health (HEALTHY/RED/PENDING/UNPROVEN from the tip's merge_group required jobs)
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                      # machine-readable; exit 9 when any headline field is UNKNOWN
 shipyard landing --pr 123                    # one PR: queued / armed_not_queued / ejected / never_armed / merged, with sources;
@@ -85,10 +85,12 @@ shipyard metrics record --project pulp --job linux-arm64 --step compile --durati
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics summary --project pulp --json
+shipyard metrics summary --project pulp --group-by host --json   # fold ephemeral runners into their host
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
 shipyard metrics slowest --project pulp --limit 20
 shipyard metrics watch --project pulp --since 14d --json
+shipyard metrics watch --project pulp --since 7d --required macos   # override [governance] required_status_checks
 shipyard metrics advise --project pulp --profile normal --json
 shipyard metrics compare --project pulp --lane windows-arm64 --before 7d --after 7d --json
 shipyard metrics compare --project pulp --basis wall-time --json   # duration verdict (load-dependent)
@@ -432,6 +434,42 @@ but a job starved before any runner has no host):
 | `queue_wait_per_job_ahead_ms` | median of wait / (1 + same-lane jobs queued earlier and still waiting) | n>=10 queued jobs; 25% and 1s |
 | `cache_hit_rate` | jobs whose every reported step hit / jobs reporting | n>=10; >2 pooled SE and 5 points |
 
+Every share is over job rows, each judged by that job's own conclusion; a
+workflow run's conclusion (which an advisory job elsewhere in the run can turn
+red) is never used. Each proxy names its unit in the text (`failure_share
+regressed 0.078->0.470 (n=154/336 jobs (success+failure))`) and in JSON
+(`proxies[].unit`).
+
+`watch` also attaches to each finding a `denominator` (`unit: "jobs"`, job rows
+and success/failure jobs per window, and the job names in the lane) and a
+`gate` class: `required` when the lane holds a required status check,
+`advisory` otherwise, `unclassified` when no required set is known. The
+required set is `--required <check>` (repeatable) or else `[governance]
+required_status_checks`; the JSON `required` block says which (`flag`,
+`config`, `none`). Required gates are listed first, under their own heading in
+human output. A lane is keyed by target, so a gate the importer splits into
+several targets (for example native runs and hosted placeholders) is reported
+per target, each with its own denominator.
+
+`summary --group-by host` folds machine names into the physical host: a
+`*-host-<id>` runner label, else the `shipyard runner tag` in a just-in-time
+runner name (`m5studio-pulp-gate-01-42746-25` -> `m5studio`) or in a
+registered `<repo>-<tag>-NN` name; `GitHub Actions ...` runners fold into
+`github-hosted`. The default `--group-by runner` keeps the recorded name, which
+for `metrics import github` rows is the ephemeral runner.
+
+`advise` keys lanes by resolved job name and host the same way, so a gate
+served by throwaway runners accumulates samples. A job GitHub reported with an
+unevaluated name (a job skipped by its `if:` keeps its `${{ }}` `name:`
+expression, for example `... && 'macos' || 'macos-pr-unused'`) files under the
+name it evaluates to when it runs. Only success and failure count: skipped,
+cancelled, and unfinished jobs say nothing about a lane's health. Signals:
+`preferred_lane` (fastest p50 among lanes with >=3 decided jobs and <=10%
+failures), `no_healthy_lane` (sampled, but every lane is over the failure
+ceiling; the message lists per-host failure rates and `sample_count` is the
+decided total), and `insufficient_healthy_samples` (no lane has 3 decided jobs
+yet).
+
 Recording rows that feed the proxies: `shipyard metrics import github` stores
 the queue time and whether a runner was assigned automatically. `shipyard
 metrics record` accepts `--queued-at`, `--runner-assigned true|false`, and a
@@ -454,6 +492,23 @@ check run, commit parents) are cached under the state directory and reused by
 later runs; in-flight runs are always read live. `reads` reports the requests
 sent to GitHub and the answers served from the cache; `--no-cache` reads
 everything live.
+
+Two listing checks guard the gate-run population. The `created=` window
+listing is cross-checked against the plain event listing (newest first,
+walked back to the window start, at most 10 pages): GitHub has answered the
+filtered listing short with a `total_count` that agreed with the short list
+(11 `pull_request` runs where 624 existed), which a page-count check cannot
+see. Runs the walk finds are counted and the disagreement is a `run_listing`
+gap. And when a run has no job named exactly `--gate-job`, one job per run
+attempt whose reported name is an unevaluated expression or `${{ matrix.* }}`
+placeholder resolving to it stands for the gate (the one that got a runner,
+else the first that was not skipped). GitHub leaves every `name:` unevaluated
+in a run cancelled before its jobs started, so such a run counts one unstarted
+gate attempt rather than one per alternate job. The `gate_job_name` gap splits
+those runs into cancelled-before-start, ran-under-an-unevaluated-name (the
+workflow's gate `name:` no longer evaluates to the gate: make it a literal),
+and no gate job at all, so a workflow rename cannot silently shrink the
+PR-head count.
 
 `shipyard status` is intentionally limited to queue/target state and does not
 probe GitHub quota. Use `shipyard doctor --rate-limit` when you need to confirm

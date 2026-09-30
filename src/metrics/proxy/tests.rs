@@ -22,6 +22,7 @@ fn sample(job: &Job) -> ProxySample {
     let started = queued + Duration::seconds(job.wait_s);
     ProxySample {
         lane: "macos".to_owned(),
+        job: "macos".to_owned(),
         status: job.status.to_owned(),
         pr: Some(("o/r".to_owned(), job.pr)),
         queued_at: Some(queued),

@@ -1106,3 +1106,33 @@ fn stale_pr_wedge_is_pulp_macos_policy_only() {
         .is_empty()
     );
 }
+
+fn queue_state_fixture(name: &str) -> serde_json::Value {
+    let path = format!(
+        "{}/tests/fixtures/github/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("json")
+}
+
+#[test]
+fn green_head_checks_do_not_arm_a_head_the_queue_ejected_for_failed_checks() {
+    // #8811: the merge group failed, so the queue ejected the head, but the
+    // head's own required checks stayed green.
+    let mut pr = green_pr();
+    pr.head_sha = "e147f2d09972babcc9977e82a46470e17f9de538".to_owned();
+    let decision = classify_pr(&pr, &queue_policy(), &BTreeMap::new());
+    assert_eq!(decision, StewardDecision::ArmMergeQueue);
+    let report = crate::pr_queue_state::explain_pr_queue_state(&queue_state_fixture(
+        "pr_real_8811_same_head_ejected.json",
+    ));
+    let verdict = crate::pr_queue_state::internal_enqueue_verdict(&report, &pr.head_sha);
+    assert!(!arm_survives_queue_state(&decision, &verdict));
+
+    let new_head = crate::pr_queue_state::explain_pr_queue_state(&queue_state_fixture(
+        "pr_ejected_new_head.json",
+    ));
+    let head = new_head.head_oid.clone().expect("head");
+    let verdict = crate::pr_queue_state::internal_enqueue_verdict(&new_head, &head);
+    assert!(arm_survives_queue_state(&decision, &verdict));
+}

@@ -355,7 +355,12 @@ malformed authority, and a non-null queue still stop or select the queue path.
 
 Never treat queue absence alone as permission to rearm. The PR must first have
 been observed in the queue (durably recorded across restarts), and only an
-`invalid_merge_commit` removal may be re-enqueued automatically. Failed checks,
+`invalid_merge_commit` removal may be re-enqueued automatically. Admission is
+also head-scoped: `auto-merge` and the steward's ordinary enqueue read the PR's
+queue timeline and refuse a head removed for `failed_checks` /
+`merge_conflict` with no new head since, even from a ship-state created after
+the removal (another host, an archived state), so re-shipping the same SHA
+cannot re-enqueue it; push a fix. Failed checks,
 manual/unknown removal, head drift, malformed authority data, or a
 403/rate-limit response stop fail-closed. The sole reviewed exception is the
 default-off steward flag `--recover-hosted-setup-eviction-priority`: it may use
@@ -673,7 +678,12 @@ is held, by a running Sandbox canary or another install, refuses before any
 change with exit 75 and `SHIPYARD_FLEET_HOST_BUSY` on stderr; the rollout stops
 there as **deferred** (verdict `deferred`, exit 75), nothing is rolled back,
 and reconcile withdraws the attempt it recorded so the next tick retries
-without waiting out `--retry-hours`. Install its launchd agent on the controller only with
+without waiting out `--retry-hours`. When the controller's own install guard
+is held (a Sandbox canary on the controller), the tick defers before recording
+anything. The attempt ledger (`fleet-reconcile/attempts.json`) is production
+persistence in the protected state tree: a tick that changes nothing does not
+rewrite it, and every real write holds the shared sandbox writer-domain lease,
+so it waits for (and then defers to, exit 75) an exclusive Sandbox audit. Install its launchd agent on the controller only with
 `scripts/install_fleet_reconcile.sh`. That script is a dry run by default;
 `--install` first rehearses the reconcile under the agent's exact environment
 and refuses to load it on failure.
@@ -901,9 +911,10 @@ shipyard metrics import github --repo Generous-Corp/pulp --limit 50 --json
 tartci runtime export --repo Generous-Corp/pulp |
   shipyard metrics import tartci --json
 shipyard metrics summary --project pulp --json
+shipyard metrics summary --project pulp --group-by host --json
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
-shipyard metrics watch --project pulp --since 14d --json
+shipyard metrics watch --project pulp --since 14d --json   # required gates first; --required <check> overrides config
 shipyard metrics advise --project pulp --json
 shipyard metrics compare --project pulp --baseline github-hosted --candidate macstudio --json
 ```
@@ -928,7 +939,15 @@ question really is duration. `gate-cost` likewise leads with count-based
 proxies (runs per merged PR, starvation, unserved labels, wait per job ahead,
 merge-queue attempts and ejections by cause, push cancellations) and keeps
 minutes as context. It caches settled GitHub answers between runs and reports
-its own cost on the `reads:` line; `--no-cache` reads everything live. Definitions and floors: `docs/cli-reference.md`
+its own cost on the `reads:` line; `--no-cache` reads everything live. Its
+`run_listing` gap means the `created=` listing came back short and the event
+walk restored the missed runs; `gate_job_name` means some runs had no job
+named exactly `--gate-job`. `watch` shares are job-level (each job's own
+conclusion, never the run's), carry a `denominator`, and are split into
+`required` and `advisory` lanes via `--required` or `[governance]
+required_status_checks`. `advise` keys lanes by resolved job name and host and
+reports `no_healthy_lane` when a sampled gate fails too often; `summary
+--group-by host` folds ephemeral runners into their host. Definitions and floors: `docs/cli-reference.md`
 ("Proxy-first verdicts").
 
 When fixing GitHub importer bugs, keep Actions list endpoints absolute
@@ -3462,6 +3481,47 @@ filter shows `AUTHREQ_PROMPTING ... SystemPolicyRemovableVolumes` with no
 shell, whose responsible app already holds the grant, then kill the orphaned
 `git` child.
 
+The durable fix is the daemon launcher (`shipyard daemon launcher install`,
+macOS, opt-in per host). Facts it rests on, all measured with
+`responsibility_get_pid_responsible_for_pid` and tccd's `AUTHREQ_SUBJECT`:
+
+- The TCC subject of a command-line binary is its **real path**. A launchd
+  program given as the `~/.local/bin/shipyard` symlink is attributed to the
+  resolved `auth-generations/<id>/shipyard`, so pointing a LaunchAgent at the
+  symlink does not stabilize anything.
+- A launchd job is its own responsible process; its children inherit it.
+  Once the responsible pid is gone the kernel reports the process itself, so
+  a daemon orphaned by a short-lived spawner falls back to its own
+  per-generation path.
+- `exec` keeps the pid, so a launcher that execs the generation binary is
+  attributed to the generation path. The launcher must stay resident.
+
+So the launcher is a copy of the signed binary at
+`~/.local/libexec/shipyard/shipyard-daemon-launcher`, run by a per-state-root
+LaunchAgent as `daemon supervise --exec <binary>`, staying the daemon's parent.
+The launcher only spawns `<release> daemon supervise --in-place`, which runs
+the release's own daemon preparation and then `exec`s `daemon run` under the
+same pid. So the daemon runs the generation binary with the direct-spawn argv
+(fleet-update launch evidence is unchanged), and spawn invariants are never
+frozen in the launcher copy, which only an operator reinstall replaces. `install` runs one
+consent probe from launchd (the one-time prompt appears while an operator is
+there) and only then writes `<state>/daemon/launcher.json`; `spawn_detached`
+uses launchd only when that record's SHA-256 still matches the launcher file,
+and falls back to a direct spawn (loudly) on any launchctl failure. Two traps
+met building it: std passes the parent's **signal mask** to children, so the
+supervisor must spawn the daemon before blocking SIGTERM for its forwarding
+thread; and a RunAtLoad probe plist must never be written into
+`~/Library/LaunchAgents`, where it would rerun at every login.
+
+A launcher host changes the daemon's parent: it is the resident launcher, not
+launchd (1). Any check that the production daemon "is still launchd-owned"
+must accept both shapes and nothing else. The Sandbox E2E M3 invariant does
+this through `scripts/production_daemon_parent.py`: parent pid 1, or a parent
+whose command is exactly `<~/.local/libexec/shipyard/shipyard-daemon-launcher>
+--mode shipyard daemon supervise --exec <installed> [--repo …]` (no
+`--in-place`) and whose own parent is pid 1. A bare `ppid == 1` assertion fails
+every run on a launcher host even though the sandbox passed.
+
 ### A reader that shares a writer's lock inherits the writer's lifetime
 
 The per-PR ship-state lock is held by a ship worker for its **entire run**. Any
@@ -3788,6 +3848,15 @@ reported as unparseable rather than dropped, and the weakest reported tier is
 the head's headline. Merge-group reads are restricted to check runs of
 `merge_group` workflow runs, because a merged commit also carries the base
 branch's push runs.
+
+`src/base_health/tip.rs` is the primary base-health reading in `landing`: base
+tip SHA → `actions/runs?head_sha=<tip>&event=merge_group` (re-filtered on
+`head_sha`) → each run's jobs, judged only on the jobs named by the required
+contexts (`HEALTHY` / `RED` / `PENDING` / `UNPROVEN` / `UNKNOWN`). Never judge
+from a run conclusion: advisory jobs fail runs. A missing required job on a
+finished run, or one only skipped, is `UNPROVEN`, not `HEALTHY`. Failing test
+names come from `diagnostics::AutoParser` over at most two failing required
+jobs' logs.
 
 `src/base_health.rs` reads a repository's `base-poison-signal/v1` annotation
 (title `base-poison-signal`) from the newest completed `success`/`failure` run
