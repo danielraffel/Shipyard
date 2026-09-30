@@ -189,6 +189,19 @@ visibility and planning, but Linear failure must never block execution, wake,
 repair routing, queue admission, or merge. Never project provider session IDs,
 credentials, private paths, or raw prompts.
 
+## Governance policy comes from the base, and `apply` needs `--yes`
+
+`shipyard governance status|diff|apply` and `shipyard landability` read
+`.shipyard/config.toml` from `origin/<base>` (`governance.base_branch`, else
+`ship.base_branch`, else `main`), not from the working tree, and print which
+ref they used. A stale checkout used to report its own copy: a branch cut
+before a required context was added would call live protection "drifted" and
+`apply` would have removed the context. A `WARNING: could not read policy
+from ...` line means the fallback to the working tree ran; fetch the base
+before trusting the answer. `governance apply` without `--yes` prints the plan,
+writes nothing and exits 2; status and diff name `apply --yes` only next to
+the field list it would write.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every
@@ -2718,7 +2731,10 @@ fix first); any other reason except `invalid_merge_commit` is refused with
 A same-head `failed_checks` refusal can be lifted, but only by the repository,
 never by inference. If the repo declares `[queue.attribution] command = [...]`
 (argv list; a shell string is rejected) in `.shipyard/config.toml`, the guard
-resolves the ejecting `merge_group` run, collects its failing jobs and steps,
+resolves the ejecting `merge_group` run (searched by creation time around the
+removal, `created=<removal-6h>..<removal+5m>`, at most 3 pages of 100 -- never
+"the newest N failed runs", which on a busy queue stopped reaching the ejector
+after about an hour), collects its failing jobs and steps,
 and runs that command with `--repo/--pr/--run-id`. Certifying requires exit 0, a
 JSON object, a `run_id` equal to the run the guard resolved, `implicates_head`
 exactly `false`, and `verdict` of `infrastructure` or `other_pull_request` with
@@ -2739,6 +2755,16 @@ at the same step for an unrelated-to-either-PR cause already on the base. Only a
 verdict that positively names infrastructure or another PR counts, and
 `merge_conflict` is never attributable because a conflict is a property of the
 head against its base.
+
+**The attributor runs on the wrapper's trusted PATH, which has no `ghapp`.**
+`ghapp` starts guards with `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:…`
+and the guard's subprocess inherits it, so an attributor that shells out to
+`ghapp` (in `~/.local/bin`) dies with `FileNotFoundError` and exits 1. From the
+guard that reads only as "the attributor exited 1, so it did not rule": a correct
+flake verdict is silently discarded. Read the API through `$GHAPP_REAL_GH` with
+the exported `GH_TOKEN`/`GH_REPO`, and reproduce under
+`env -i HOME=$HOME PATH=<trusted path>`, never in an interactive shell. The
+refusal quotes the attributor's stderr tail.
 
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing

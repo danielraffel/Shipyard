@@ -3,7 +3,7 @@
 Shipyard manages a project's GitHub-side governance settings —
 branch protection on `main`, tag protection on release tags, default
 workflow token permissions, release approval gates — declaratively from
-`.shipyard/config.toml`. Pick a profile, run `shipyard governance apply`,
+`.shipyard/config.toml`. Pick a profile, run `shipyard governance apply --yes`,
 and the live GitHub state matches the profile. Drift between the declared
 config and the live state is reported by `shipyard governance status`.
 
@@ -48,15 +48,26 @@ exist to coordinate multiple humans).
 ## Commands
 
 ```bash
-shipyard governance status     # show declared vs live drift per branch
-shipyard governance diff       # what `apply` would change (dry run)
-shipyard governance apply      # bring live GitHub state in line with config
+shipyard governance status       # show declared vs live drift per branch
+shipyard governance diff         # what `apply` would change (dry run)
+shipyard governance apply        # preview only: prints the plan, writes nothing, exits 2
+shipyard governance apply --yes  # write branch protection to match config
 ```
 
 `status` is the rollup view that shows where things stand without
 clicking through six GitHub settings pages. `diff` is the dry-run
-before any mutation. `apply` is the idempotent apply — re-running
-it on an aligned repo issues zero API writes.
+before any mutation. `apply --yes` is the idempotent apply: re-running
+it on an aligned repo issues zero API writes. Without `--yes`, `apply`
+prints the same plan and writes nothing, so a copied command cannot
+change branch protection by accident.
+
+`status`, `diff` and `apply` read the policy from the base branch as
+fetched (`origin/<base>`, where `<base>` is `governance.base_branch`,
+else `ship.base_branch`, else `main`), not from the working tree. A stale
+or edited checkout otherwise reports, and applies, its own copy of the
+policy. The first output line names the ref the policy came from; if
+that ref cannot be read, it says so with a WARNING and falls back to the
+working tree. `shipyard landability` reads its policy the same way.
 
 `shipyard doctor` grows a "Governance" section that folds main-branch
 drift into the same health check as git, ssh, and cloud auth, so CI
@@ -91,5 +102,5 @@ switch so you don't have to figure it out from first principles.
 adopt Shipyard's governance profile system. Pulp runs on the `solo`
 profile because it has a single maintainer today; switching to `multi`
 would be a single-line edit to `[project].profile` in
-`.shipyard/config.toml` plus a `shipyard governance apply`, with no
+`.shipyard/config.toml` plus a `shipyard governance apply --yes`, with no
 other config changes.

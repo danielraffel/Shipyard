@@ -9,7 +9,7 @@ use serde_json::{Value as JsonValue, json};
 use toml::{Table, Value};
 
 use super::{CliFailure, branch_cmd::detect_repo_from_remote, cli::GovernanceCommand};
-use crate::config::LoadedConfig;
+use crate::config::{LoadedConfig, ProjectLayerSource};
 use crate::governance::{
     ApplyResult, BranchProtectionRules, GovernanceGh, build_apply_plan, build_status,
     compute_drift, execute_apply_plan, get_branch_protection, resolve_branch_rules,
@@ -27,7 +27,30 @@ pub(super) fn governance_command<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let (config, source) = policy_from_base(&config, mode, cwd);
+    if json_mode {
+        // Keep the JSON envelope on stdout parseable; a fallback still has to
+        // be seen, so it goes to stderr.
+        if matches!(source, ProjectLayerSource::WorkingTreeFallback { .. }) {
+            eprintln!("{}", source.describe());
+        }
+    } else {
+        writeln!(stdout, "{}", source.describe())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
     governance_command_with(command, &config, cwd, json_mode, stdout, None, None)
+}
+
+/// Governance policy describes what a protected branch requires, so it is read
+/// from that branch as fetched (`origin/<base>`), not from whatever the working
+/// tree happens to hold.
+fn policy_from_base(
+    config: &LoadedConfig,
+    mode: RuntimeMode,
+    cwd: &Path,
+) -> (LoadedConfig, ProjectLayerSource) {
+    let base = crate::landability::gate::resolve_base(config);
+    config.with_project_layer_at_ref(mode, cwd, &format!("origin/{base}"))
 }
 
 fn governance_command_with<W: Write>(
@@ -51,17 +74,30 @@ fn governance_command_with<W: Write>(
         GovernanceCommand::Apply {
             branches,
             dry_run,
+            yes,
             from_path,
-        } => governance_apply(
-            &repo,
-            config,
-            &branches_or_main(branches),
-            dry_run,
-            from_path.as_deref(),
-            json_mode,
-            stdout,
-            &gh,
-        ),
+        } => {
+            let code = governance_apply(
+                &repo,
+                config,
+                &branches_or_main(branches),
+                dry_run || !yes,
+                from_path.as_deref(),
+                json_mode,
+                stdout,
+                &gh,
+            )?;
+            if !dry_run && !yes {
+                writeln!(
+                    stdout,
+                    "\nNothing written. `shipyard governance apply` changes branch protection; \
+                     re-run with --yes to write the plan above."
+                )
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+                return Ok(ExitCode::from(2));
+            }
+            Ok(code)
+        }
         GovernanceCommand::Diff { branches } => {
             let branches = branches_or_main(branches);
             governance_diff(&repo, config, &branches, stdout, &gh)
@@ -199,8 +235,11 @@ fn governance_diff<W: Write>(
     }
     if any_drift {
         writeln!(stdout).map_err(|error| CliFailure::new(1, error.to_string()))?;
-        writeln!(stdout, "Run: shipyard governance apply")
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        writeln!(
+            stdout,
+            "To write these changes to branch protection: shipyard governance apply --yes"
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     if status.has_errors() {
         writeln!(
@@ -507,8 +546,11 @@ fn write_status_text<W: Write>(
         if report.live_unprotected {
             writeln!(
                 stdout,
-                "  ERROR {}: UNPROTECTED (run: shipyard governance apply)",
-                report.branch
+                "  ERROR {}: UNPROTECTED; `governance apply --yes` would create protection \
+                 with {} field(s) from profile `{}` (preview: shipyard governance diff)",
+                report.branch,
+                report.entries.len(),
+                status.profile_name
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
             continue;
@@ -536,8 +578,11 @@ fn write_status_text<W: Write>(
                 )
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             }
-            writeln!(stdout, "      fix: shipyard governance apply")
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            writeln!(
+                stdout,
+                "      `governance apply --yes` would write the config values above to branch protection"
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         if !deviated.is_empty() && drifted.is_empty() {
             writeln!(
@@ -772,6 +817,7 @@ mod tests {
             GovernanceCommand::Apply {
                 branches: vec![String::from("main")],
                 dry_run: true,
+                yes: false,
                 from_path: None,
             },
             &loaded_config(temp.path()),
@@ -790,6 +836,75 @@ mod tests {
         assert_eq!(value["changed"], true);
         assert_eq!(value["results"][0]["action"], "update");
         assert_eq!(value["results"][0]["executed"], false);
+    }
+
+    fn apply_json(yes: bool) -> (std::process::ExitCode, bool, Vec<u8>) {
+        let temp = TempDir::new().expect("tempdir");
+        let git = fake_git(temp.path());
+        let put_marker = temp.path().join("put-called");
+        let gh = fake_gh_read_and_put(temp.path(), &put_marker);
+        let mut stdout = Vec::new();
+        let code = governance_command_with(
+            GovernanceCommand::Apply {
+                branches: vec![String::from("main")],
+                dry_run: false,
+                yes,
+                from_path: None,
+            },
+            &loaded_config(temp.path()),
+            temp.path(),
+            false,
+            &mut stdout,
+            Some(&git),
+            Some(&gh),
+        )
+        .expect("apply");
+        (code, put_marker.exists(), stdout)
+    }
+
+    #[test]
+    fn governance_apply_without_yes_previews_and_writes_nothing() {
+        let (code, put_called, stdout) = apply_json(false);
+        assert!(
+            !put_called,
+            "apply without --yes must not write branch protection"
+        );
+        assert_eq!(code, std::process::ExitCode::from(2));
+        let text = String::from_utf8(stdout).expect("utf8");
+        assert!(text.contains("Nothing written"), "{text}");
+        assert!(text.contains("--yes"), "{text}");
+    }
+
+    #[test]
+    fn governance_apply_with_yes_writes_branch_protection() {
+        // Control for the test above: the same fixture does reach the PUT.
+        let (code, put_called, _) = apply_json(true);
+        assert!(put_called);
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn governance_status_names_the_change_and_the_confirming_flag() {
+        let temp = TempDir::new().expect("tempdir");
+        let git = fake_git(temp.path());
+        let gh = fake_gh_read(temp.path());
+        let mut stdout = Vec::new();
+        governance_command_with(
+            GovernanceCommand::Status {
+                branches: vec![String::from("main")],
+            },
+            &loaded_config(temp.path()),
+            temp.path(),
+            false,
+            &mut stdout,
+            Some(&git),
+            Some(&gh),
+        )
+        .expect("status");
+        let text = String::from_utf8(stdout).expect("utf8");
+        assert!(text.contains("require_strict_status: config="), "{text}");
+        assert!(text.contains("governance apply --yes"), "{text}");
+        assert!(!text.contains("fix: shipyard governance apply\n"), "{text}");
     }
 
     #[test]
