@@ -151,6 +151,19 @@ requests the steward itself declines to own, so it cannot contend with the
 enqueue path. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
 
+## Governance policy comes from the base, and `apply` needs `--yes`
+
+`shipyard governance status|diff|apply` and `shipyard landability` read
+`.shipyard/config.toml` from `origin/<base>` (`governance.base_branch`, else
+`ship.base_branch`, else `main`), not from the working tree, and print which
+ref they used. A stale checkout used to report its own copy: a branch cut
+before a required context was added would call live protection "drifted" and
+`apply` would have removed the context. A `WARNING: could not read policy
+from ...` line means the fallback to the working tree ran; fetch the base
+before trusting the answer. `governance apply` without `--yes` prints the plan,
+writes nothing and exits 2; status and diff name `apply --yes` only next to
+the field list it would write.
+
 ## Quick reference
 
 | Task | Command |

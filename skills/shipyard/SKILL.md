@@ -189,6 +189,19 @@ visibility and planning, but Linear failure must never block execution, wake,
 repair routing, queue admission, or merge. Never project provider session IDs,
 credentials, private paths, or raw prompts.
 
+## Governance policy comes from the base, and `apply` needs `--yes`
+
+`shipyard governance status|diff|apply` and `shipyard landability` read
+`.shipyard/config.toml` from `origin/<base>` (`governance.base_branch`, else
+`ship.base_branch`, else `main`), not from the working tree, and print which
+ref they used. A stale checkout used to report its own copy: a branch cut
+before a required context was added would call live protection "drifted" and
+`apply` would have removed the context. A `WARNING: could not read policy
+from ...` line means the fallback to the working tree ran; fetch the base
+before trusting the answer. `governance apply` without `--yes` prints the plan,
+writes nothing and exits 2; status and diff name `apply --yes` only next to
+the field list it would write.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every
