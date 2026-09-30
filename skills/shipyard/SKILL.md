@@ -3870,7 +3870,26 @@ they are siblings rather than one inside the other.
 | `backlog.rs` | open pull requests counted by `mergeStateStatus` |
 | `gather.rs` | the reads; nothing here mutates |
 | `render.rs` | human and `--json` forms |
-| `pr_state.rs` | `--pr <n>`: queue class plus the `VALIDATION` block (test tier of the head's required checks, merge-group receipt decisions) from `crate::validation_signals` |
+| `pr_state.rs` | `--pr <n>`: the verdict line first, then queue class plus the `VALIDATION` block (test tier of the head's required checks, merge-group receipt decisions) from `crate::validation_signals` |
+| `verdict.rs` | pure: `VerdictFacts` → `LandingVerdict` (RED / PENDING / GREEN / UNKNOWN, repeat and shared evidence, failed merge group on this head, queue suffix) |
+| `verdict_gather.rs` | the bounded reads behind the verdict, through an argv reader so tests replay inline bodies |
+
+**The verdict line is the one line agents quote** (`shipyard landing --pr
+<n>`, first line; JSON `verdict`). When reporting PR state, quote it; never
+call a red required check a flake, infrastructure, or "not a code failure"
+while `REPEAT` is shown. `REPEAT` is PR watch's flag-1 rule, not a second
+definition: `crate::pr_watch::repeat_findings` returns the structured findings
+both surfaces render, and `prs_failing_signature` answers the shared-failure
+test for a single failure. Keep them one rule. Invariants worth protecting:
+required means branch protection's contexts, filtered in the pure layer as
+well as at the read (a failed merge-group run that failed only an advisory job
+is not red); a required-checks response with neither `contexts` nor `checks`
+is UNKNOWN, not "no required checks"; merge groups are found through the PR's
+queue residency windows (an unfiltered `merge_group` listing covers only a few
+hours on a busy repo, because every workflow of a group is its own run); a
+`pull_request` run's `pull_requests` array is often empty, so other PRs'
+runs are attributed through the open-PR head-branch map from the same GraphQL
+read, and the rest are counted as a gap rather than dropped silently.
 
 `src/validation_signals.rs` owns the `shipyard-test-tier` /
 `shipyard-receipt-decision` annotation contract (`docs/validation-signals.md`)

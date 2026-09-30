@@ -402,10 +402,14 @@ pub(super) enum Command {
         /// Defaults to 15. Zero skips placement entirely.
         #[arg(long = "max-job-reads", value_name = "COUNT")]
         max_job_reads: Option<usize>,
-        /// Instead of the repository model, classify one pull request's
-        /// merge-queue state (queued, armed, ejected, never armed, merged)
-        /// from GraphQL queue membership and timeline history, with the
-        /// field each fact came from. One API call. Exit 9 when UNKNOWN.
+        /// Instead of the repository model, report one pull request. The
+        /// first line is the VERDICT to quote (RED / PENDING / GREEN /
+        /// UNKNOWN on the current head's required checks, failing tests,
+        /// REPEAT or shared-failure evidence, queue state), from a bounded
+        /// set of reads whose count is printed. Then its merge-queue state
+        /// (queued, armed, ejected, never armed, merged) from GraphQL queue
+        /// membership and timeline history, with the field each fact came
+        /// from. Exit 9 when either is UNKNOWN.
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },

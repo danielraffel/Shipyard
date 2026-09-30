@@ -42,7 +42,12 @@ shipyard dependency pulp verify           # fresh, cache-bypassing CI verificati
 shipyard landing                             # merge queue, strict, enqueue, check placement, backlog, base tip health (HEALTHY/RED/PENDING/UNPROVEN from the tip's merge_group required jobs)
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                      # machine-readable; exit 9 when any headline field is UNKNOWN
-shipyard landing --pr 123                    # one PR: queued / armed_not_queued / ejected / never_armed / merged, with sources;
+shipyard landing --pr 123                    # one PR. First line: the VERDICT to quote, RED / PENDING / GREEN / UNKNOWN on the
+                                             #   current head's required checks (branch protection), failing tests from the job log,
+                                             #   REPEAT on K heads (same test on >=2 runs of the PR) or "also failing on #a,#b —
+                                             #   likely main/shared", a failed merge group on this head, and the queue suffix;
+                                             #   `gap:` lines and the API-call count follow. JSON: `verdict`. Exit 9 when UNKNOWN.
+                                             # Then queued / armed_not_queued / ejected / never_armed / merged, with sources;
                                              #   plus VALIDATION: head test tier (fast / full / unknown) and merge-group receipt decisions
 
 # Is the base red? (reads the repo's own base-poison-signal/v1 annotation)

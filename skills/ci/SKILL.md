@@ -2854,6 +2854,19 @@ the same thing alone. Advice needs a fresh signal (under 2 h) and a named fix;
 switching it to `on` is an owner decision, taken only after dry-run records
 show it picks the right pull request.
 
+**When reporting a PR's state, quote the VERDICT line.** `shipyard landing
+--pr <n>` opens with one line, e.g. `VERDICT #8933 head fc399ea6: RED — macos
+failed cmake-forge-catalog-install (REPEAT on 2 heads: cc6302b9, fc399ea6);
+other required: 4 green; queue: ejected failed_checks at T, same head`. Quote
+it rather than paraphrasing check states. **Never call a red required check a
+flake, infrastructure, or "not a code failure" while `REPEAT` is shown**: the
+same test already failed on another head or merge group of the same PR. Only
+`also failing on #a,#b — likely main/shared` supports a not-this-PR reading,
+and even then the PR cannot land until it is green. `PENDING` is not "in
+progress, probably fine", `UNKNOWN` is not green, and a `RED — merge group run
+N ... failed` with a green head means the full suite failed where the head ran
+a fast tier. Details: `docs/landing-model.md`.
+
 **Before arming or enqueuing ONE pull request: `shipyard landing --pr <n>`.**
 REST `pulls/<n>.auto_merge` is `null` for every queued PR — GitHub consumes
 auto-merge on enqueue — so never read that `null` as "unarmed". The command
