@@ -26,6 +26,32 @@ is `UNKNOWN`.
 | how to enqueue, with the exact merge method this repo requires | the queue's own configuration |
 | where each required check actually executes | a completed job's `runner_name` / `runner_group_name` |
 | open-pull-request backlog by mergeability | GraphQL `pullRequests.mergeStateStatus` |
+| base health: did the base tip pass its required gate | `GET commits/{base}` → `actions/runs?head_sha=<tip>&event=merge_group` → each run's `jobs`, judged on the required contexts' jobs; the detector's `base-poison-signal/v1` annotation is shown beside it |
+
+### Base health reads the tip
+
+Under a merge queue with the `MERGE` method the base tip is the head of the
+merge group that landed it, so the `merge_group` runs whose `head_sha` is the
+tip carry the gate verdict for exactly that commit. `BASE HEALTH` prints one of:
+
+- `HEALTHY` — every required context ran on the tip's merge group and passed.
+- `RED` — a required context failed; the failing job is named, and its failing
+  tests when a log parser recognises them (only failing *required* jobs are
+  read, at most two).
+- `PENDING` — a required context is still running or not yet created.
+- `UNPROVEN` — no `merge_group` run built the tip (a direct or admin push), a
+  required context never ran or was only skipped, or no required contexts are
+  configured.
+- `UNKNOWN` — GitHub could not be read.
+
+The verdict comes from the required **jobs**, never from a run's conclusion: a
+run concludes `failure` whenever any job fails, advisory ones included, so a
+run conclusion reports a green tip as red whenever an advisory leg is broken.
+The detector annotation is printed underneath as a secondary reading; when the
+tip is `HEALTHY` and the detector says `suspected` or `poisoned`, the report
+flags the disagreement. Jump advice still comes only from the detector. JSON
+carries the reading under `base_tip` (`verdict`, `tip_sha`,
+`required_contexts`, `runs`, `jobs`, `api_calls`).
 
 ## Why branch protection is the wrong place to look for a queue
 
@@ -107,9 +133,12 @@ rulesets list, two ruleset details, one branch protection, one GraphQL round
 trip (default branch + base-ref existence + queue + backlog), up to six
 check-run reads to find which runs produced the required contexts, and a job
 read per candidate run. Both loops stop as soon as every context is placed.
-The report prints the number of API calls it actually spent rather than an
-estimate: roughly 5 on a small repository, roughly 30 on one with five
-required contexts and a large backlog.
+The tip read adds one commit read, one run listing, and one job listing per
+`merge_group` run for the tip until every required context is found (plus up
+to two job logs when a required job failed). The report prints the number of
+API calls it actually spent rather than an estimate: roughly 5 on a small
+repository, roughly 30-40 on one with five required contexts and a large
+backlog.
 
 `--run-sample` and `--max-job-reads` bound the fallback sweep used when the
 check-run route does not cover every context.

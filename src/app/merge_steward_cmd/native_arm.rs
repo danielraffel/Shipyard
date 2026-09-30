@@ -296,7 +296,7 @@ fn arm(actions: &GitHubActions, number: u64, head_sha: String, node_id: &str) ->
     }
 }
 
-fn read_queue_state(
+pub(super) fn read_queue_state(
     actions: &GitHubActions,
     repo: &str,
     pr: u64,

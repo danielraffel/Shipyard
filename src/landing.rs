@@ -164,7 +164,11 @@ pub struct LandingReport {
     pub required_checks: placement::PlacementFinding,
     /// Open pull requests grouped by mergeability.
     pub backlog: backlog::BacklogFinding,
-    /// The repository's own verdict on whether the base branch is red.
+    /// Whether the base tip itself passed its required gate, read from the
+    /// `merge_group` run that built it.
+    pub base_tip: crate::base_health::tip::TipHealth,
+    /// The repository's own verdict on whether the base branch is red, read
+    /// from its detector's annotation. Secondary to [`Self::base_tip`].
     pub base_health: crate::base_health::BaseHealthFinding,
     /// Present when the base is poisoned and a fix pull request is named.
     pub base_jump: Option<crate::base_health::JumpAdvice>,

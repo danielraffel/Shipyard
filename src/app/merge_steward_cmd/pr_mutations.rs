@@ -201,6 +201,30 @@ fn enqueue_unstacked_pull_request(
             );
         }
     };
+    // Hosted-setup recovery deliberately re-enqueues the same head: its
+    // evidence attributes the removal to infrastructure, not to the head.
+    if recovery.is_none()
+        && let Some(skip) = same_head_enqueue_refusal(context, &pr)
+    {
+        return match skip {
+            Ok(outcome) => match guard.finish(&outcome) {
+                Ok(()) => (Some(outcome), None),
+                Err(error) => (
+                    Some(outcome),
+                    Some(format!("enqueue skip mutation audit failed: {error}")),
+                ),
+            },
+            Err(error) => {
+                let audit_error = guard.finish("queue_state_unreadable").err();
+                (
+                    None,
+                    Some(audit_error.map_or(error.clone(), |audit_error| {
+                        format!("{error}; mutation audit also failed: {audit_error}")
+                    })),
+                )
+            }
+        };
+    }
     if let Some(observed_recovery) = recovery {
         match recovery_evidence(context.actions, context.observation, &pr, ledger) {
             Ok(Some(live_recovery)) if live_recovery == *observed_recovery => {}
@@ -530,6 +554,42 @@ fn enqueue_unstacked_pull_request(
             }
         }
     }
+}
+
+/// The head-scoped queue verdict for an ordinary steward enqueue.
+///
+/// `None` admits. `Some(Ok(outcome))` is a deliberate skip of a head the queue
+/// already ejected; `Some(Err(_))` is a queue state that could not be read,
+/// which never admits.
+fn same_head_enqueue_refusal(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+) -> Option<Result<String, String>> {
+    let response = match super::native_arm::read_queue_state(
+        context.actions,
+        &context.observation.repo,
+        pr.fact.number,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            return Some(Err(format!(
+                "could not read merge-queue timeline before enqueue: {error}"
+            )));
+        }
+    };
+    let report = crate::pr_queue_state::explain_pr_queue_state(&response);
+    let verdict = crate::pr_queue_state::internal_enqueue_verdict(&report, &pr.fact.head_sha);
+    if crate::merge_steward::arm_survives_queue_state(&StewardDecision::ArmMergeQueue, &verdict) {
+        return None;
+    }
+    Some(match verdict {
+        crate::pr_queue_state::InternalEnqueueVerdict::RefuseEjectedSameHead { reason, .. } => {
+            Ok(format!("skipped_ejected_same_head:{reason}"))
+        }
+        other => Err(other
+            .refusal(pr.fact.number, &pr.fact.head_sha)
+            .unwrap_or_else(|| "merge-queue state refused enqueue".to_owned())),
+    })
 }
 
 fn final_enqueue_revalidation(

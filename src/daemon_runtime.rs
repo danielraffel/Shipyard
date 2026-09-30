@@ -406,6 +406,9 @@ struct RegistrationState {
     // Status must never wait behind synchronous GitHub webhook I/O. Publish a
     // separate snapshot and refresh it only after registrar mutations finish.
     published_repos: Mutex<Vec<String>>,
+    // Registration is retried on every tunnel/reconcile pass, and a standing
+    // 403 would otherwise write the same line to the daemon log each time.
+    error_log: Mutex<RegistrationErrorLog>,
 }
 
 #[cfg(unix)]
@@ -415,6 +418,7 @@ impl RegistrationState {
         Self {
             registrar: Mutex::new(registrar),
             published_repos: Mutex::new(published_repos),
+            error_log: Mutex::new(RegistrationErrorLog::default()),
         }
     }
 
@@ -847,10 +851,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
 /// Spawn the daemon as a detached child process and verify the IPC socket
 /// becomes reachable before reporting success.
 pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedError> {
-    let daemon_dir = request.state_dir.join("daemon");
-    crate::writer_domain_lease::ensure_protected_dir_all(&daemon_dir)
-        .map_err(|error| io_spawn_error(&error))?;
-    let temp_dir = prepare_daemon_temp_dir(&daemon_dir).map_err(|error| io_spawn_error(&error))?;
+    let (daemon_dir, temp_dir) = prepare_daemon_dirs(&request.state_dir)?;
 
     if read_daemon_status(&request.state_dir).is_some() {
         return Ok(read_pid_file(&daemon_dir.join("daemon.pid")).unwrap_or(0));
@@ -872,6 +873,53 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
     }
     cleanup_stale_runtime_files(&daemon_dir).map_err(|error| io_spawn_error(&error))?;
 
+    // A daemon spawned here inherits this process's macOS privacy
+    // "responsible process". When the launchd launcher is installed, launchd
+    // starts it instead so the daemon's privacy identity is the stable
+    // launcher path rather than whatever invoked this refresh.
+    #[cfg(target_os = "macos")]
+    if let Some(launcher) = crate::daemon_launcher::active_launcher(&request.state_dir) {
+        match crate::daemon_launcher::start_via_launchd(request, &launcher) {
+            Ok(()) => {
+                return wait_for_daemon_ready(request, 0, LAUNCHD_READY_TIMEOUT);
+            }
+            Err(error) => {
+                let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                    "shipyard daemon: launchd launcher unavailable ({error}); spawning directly, so the daemon inherits this process's privacy identity"
+                ));
+            }
+        }
+    }
+
+    let mut command = prepare_daemon_child(request, &daemon_dir, &temp_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
+    }
+
+    let child = command.spawn().map_err(|error| io_spawn_error(&error))?;
+    let fallback_pid = child.id();
+    drop(child);
+
+    wait_for_daemon_ready(request, fallback_pid, Duration::from_secs(3))
+}
+
+/// How long a launchd-started daemon may take to publish its status. Longer
+/// than a direct spawn because launchd first starts the launcher process.
+#[cfg(target_os = "macos")]
+const LAUNCHD_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Build the `daemon run` child command for `request`: log rotation, the
+/// protected stdio fence, the unattended PATH, and a private TMPDIR. Shared by
+/// the direct spawn and the launchd launcher, so both produce the identical
+/// argv that fleet-update evidence compares against.
+pub fn prepare_daemon_child(
+    request: &SpawnRequest,
+    daemon_dir: &Path,
+    temp_dir: &Path,
+) -> Result<Command, DaemonSpawnFailedError> {
     let log_path = daemon_dir.join("daemon.log");
     let retention_config = request.global_dir_override.clone().map_or_else(
         || LoadedConfig::load_machine_global(request.mode),
@@ -895,37 +943,58 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
 
     let mut command = Command::new(&request.binary);
     command.env("PATH", crate::paths::unattended_tool_path());
-    command.env("TMPDIR", &temp_dir);
-    command.arg("--mode").arg(request.mode.as_str());
-    if let Some(global_dir) = &request.global_dir_override {
-        command.arg("--global-dir").arg(global_dir);
-    }
-    if let Some(state_dir) = &request.state_dir_override {
-        command.arg("--state-dir").arg(state_dir);
-    }
-    command.arg("daemon").arg("run");
+    command.env("TMPDIR", temp_dir);
+    command.args(daemon_run_arguments(request));
     command.env(
         crate::writer_domain_lease::PROTECTED_STDIO_PATH_ENV,
         &log_path,
     );
-    for repo in normalize_repos(request.repos.clone()) {
-        command.arg("--repo").arg(repo);
-    }
     command.stdin(Stdio::null());
     command.stdout(Stdio::from(stdout));
     command.stderr(Stdio::from(stderr));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
+    Ok(command)
+}
 
-        command.process_group(0);
+/// The arguments after the binary for a `daemon run` child of `request`.
+#[must_use]
+pub fn daemon_run_arguments(request: &SpawnRequest) -> Vec<std::ffi::OsString> {
+    let mut arguments: Vec<std::ffi::OsString> =
+        vec!["--mode".into(), request.mode.as_str().into()];
+    if let Some(global_dir) = &request.global_dir_override {
+        arguments.push("--global-dir".into());
+        arguments.push(global_dir.into());
     }
+    if let Some(state_dir) = &request.state_dir_override {
+        arguments.push("--state-dir".into());
+        arguments.push(state_dir.into());
+    }
+    arguments.push("daemon".into());
+    arguments.push("run".into());
+    for repo in normalize_repos(request.repos.clone()) {
+        arguments.push("--repo".into());
+        arguments.push(repo.into());
+    }
+    arguments
+}
 
-    let child = command.spawn().map_err(|error| io_spawn_error(&error))?;
-    let fallback_pid = child.id();
-    drop(child);
+/// Prepare the daemon directory and its private temporary directory, returning
+/// both. Shared by the direct spawn and the launchd launcher.
+pub fn prepare_daemon_dirs(state_dir: &Path) -> Result<(PathBuf, PathBuf), DaemonSpawnFailedError> {
+    let daemon_dir = state_dir.join("daemon");
+    crate::writer_domain_lease::ensure_protected_dir_all(&daemon_dir)
+        .map_err(|error| io_spawn_error(&error))?;
+    let temp_dir = prepare_daemon_temp_dir(&daemon_dir).map_err(|error| io_spawn_error(&error))?;
+    Ok((daemon_dir, temp_dir))
+}
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+fn wait_for_daemon_ready(
+    request: &SpawnRequest,
+    fallback_pid: u32,
+    timeout: Duration,
+) -> Result<u32, DaemonSpawnFailedError> {
+    let daemon_dir = request.state_dir.join("daemon");
+    let log_path = daemon_dir.join("daemon.log");
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if read_daemon_status(&request.state_dir).is_some() {
             let pid = read_pid_file(&daemon_dir.join("daemon.pid")).unwrap_or(fallback_pid);
@@ -1594,13 +1663,25 @@ fn register_webhooks(
     };
     let mut first_error = None;
     for repo in repos {
-        if let Err(error) = registrar.ensure_registered(repo, public_url, secret) {
-            let message = registration_error_message(repo, &error);
-            let _ = crate::writer_domain_lease::write_stderr(format_args!(
-                "shipyard daemon: failed to register webhook for {repo}: {message}"
-            ));
-            if first_error.is_none() {
-                first_error = Some(message);
+        match registrar.ensure_registered(repo, public_url, secret) {
+            Ok(_) => {
+                if let Ok(mut log) = registration.error_log.lock() {
+                    log.clear(repo);
+                }
+            }
+            Err(error) => {
+                let message = registration_error_message(repo, &error);
+                let should_log = registration.error_log.lock().map_or(true, |mut log| {
+                    log.should_log(repo, &message, Instant::now())
+                });
+                if should_log {
+                    let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                        "shipyard daemon: failed to register webhook for {repo}: {message}"
+                    ));
+                }
+                if first_error.is_none() {
+                    first_error = Some(message);
+                }
             }
         }
     }
@@ -1612,6 +1693,39 @@ fn register_webhooks(
         *status_error = first_error;
     }
     succeeded
+}
+
+/// How often an unchanged webhook-registration failure is repeated in the
+/// daemon log. A changed message is always logged immediately.
+#[cfg(unix)]
+const REGISTRATION_ERROR_RELOG_INTERVAL: Duration = Duration::from_hours(1);
+
+/// Rate limit for webhook-registration failure lines: one line per repository
+/// per distinct message, repeated at most once per
+/// [`REGISTRATION_ERROR_RELOG_INTERVAL`] while the failure stands. The status
+/// endpoint still reports every failure; only the log is throttled.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct RegistrationErrorLog {
+    last: BTreeMap<String, (String, Instant)>,
+}
+
+#[cfg(unix)]
+impl RegistrationErrorLog {
+    fn should_log(&mut self, repo: &str, message: &str, now: Instant) -> bool {
+        if let Some((previous, logged_at)) = self.last.get(repo)
+            && previous == message
+            && now.saturating_duration_since(*logged_at) < REGISTRATION_ERROR_RELOG_INTERVAL
+        {
+            return false;
+        }
+        self.last.insert(repo.to_owned(), (message.to_owned(), now));
+        true
+    }
+
+    fn clear(&mut self, repo: &str) {
+        self.last.remove(repo);
+    }
 }
 
 #[cfg(unix)]
@@ -1878,6 +1992,38 @@ impl Drop for PidFileGuard {
 mod tests {
     use super::*;
     use std::time::{Duration as StdDuration, Instant as StdInstant};
+
+    #[test]
+    fn registration_error_log_repeats_an_unchanged_failure_at_most_hourly() {
+        let mut log = RegistrationErrorLog::default();
+        let start = StdInstant::now();
+        let forbidden = "HTTP 403: Resource not accessible by integration";
+
+        assert!(log.should_log("o/a", forbidden, start));
+        assert!(!log.should_log("o/a", forbidden, start + StdDuration::from_secs(60)));
+        assert!(!log.should_log(
+            "o/a",
+            forbidden,
+            start + StdDuration::from_secs(59 * 60 + 59)
+        ));
+        // Another repository is tracked independently.
+        assert!(log.should_log("o/b", forbidden, start + StdDuration::from_secs(60)));
+        // The hourly reminder fires once the interval has passed.
+        let reminder = start + REGISTRATION_ERROR_RELOG_INTERVAL;
+        assert!(log.should_log("o/a", forbidden, reminder));
+        assert!(!log.should_log("o/a", forbidden, reminder + StdDuration::from_secs(1)));
+    }
+
+    #[test]
+    fn registration_error_log_reports_a_changed_or_recurring_failure_immediately() {
+        let mut log = RegistrationErrorLog::default();
+        let start = StdInstant::now();
+        assert!(log.should_log("o/a", "HTTP 403", start));
+        assert!(log.should_log("o/a", "HTTP 500", start + StdDuration::from_secs(1)));
+        // Success clears the entry, so the same failure coming back is news.
+        log.clear("o/a");
+        assert!(log.should_log("o/a", "HTTP 500", start + StdDuration::from_secs(2)));
+    }
 
     /// The whole point of the fix: a local sweep must not wait for a subscriber.
     ///
