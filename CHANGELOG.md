@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02310"></a>
+## [0.231.0] - 2026-09-30
+
+- fix/head scoped queue guard ([#638](https://github.com/danielraffel/Shipyard/pull/638))
+
 <a id="v02300"></a>
 ## [0.230.0] - 2026-09-29
 
@@ -1691,6 +1696,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.231.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.231.0
 [0.230.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.230.0
 [0.229.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.229.0
 [0.228.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.228.0

@@ -9,6 +9,7 @@
 use std::io::Write;
 
 use crate::base_health::BaseHealthFinding;
+use crate::base_health::tip::{TipHealth, TipVerdict};
 use crate::landing::placement::Placement;
 use crate::landing::{LandingReport, SurfaceOutcome, Verdict};
 
@@ -202,21 +203,39 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &LandingReport) -> std::io:
     writeln!(stdout)?;
 
     writeln!(stdout, "BASE HEALTH")?;
+    write_tip(stdout, &report.base_tip)?;
     match &report.base_health {
         BaseHealthFinding::Signal(observation) => {
             writeln!(
                 stdout,
-                "  {}  detector run {} at {}",
+                "  detector  {}  run {} at {}",
                 observation.signal.status.to_uppercase(),
                 observation.run_id,
                 observation.observed_at.to_rfc3339()
             )?;
             if !observation.signal.tests.is_empty() {
-                writeln!(stdout, "  tests  {}", observation.signal.tests.join(", "))?;
+                writeln!(
+                    stdout,
+                    "            tests  {}",
+                    observation.signal.tests.join(", ")
+                )?;
+            }
+            if matches!(report.base_tip.verdict, TipVerdict::Healthy)
+                && matches!(observation.signal.status.as_str(), "suspected" | "poisoned")
+            {
+                writeln!(
+                    stdout,
+                    "            ! disagrees with the tip's required jobs; a detector that \
+                     reads a run's conclusion counts advisory failures"
+                )?;
             }
         }
-        BaseHealthFinding::NoSignal { detail } => writeln!(stdout, "  no signal ({detail})")?,
-        BaseHealthFinding::Unreadable { detail } => writeln!(stdout, "  UNKNOWN ({detail})")?,
+        BaseHealthFinding::NoSignal { detail } => {
+            writeln!(stdout, "  detector  no signal ({detail})")?;
+        }
+        BaseHealthFinding::Unreadable { detail } => {
+            writeln!(stdout, "  detector  UNKNOWN ({detail})")?;
+        }
     }
     writeln!(stdout)?;
 
@@ -257,6 +276,127 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &LandingReport) -> std::io:
     Ok(())
 }
 
+fn write_tip<W: Write>(stdout: &mut W, tip: &TipHealth) -> std::io::Result<()> {
+    let sha = tip.tip_sha.as_deref().unwrap_or("UNKNOWN");
+    writeln!(
+        stdout,
+        "  {}  tip {sha} of `{}`",
+        tip.verdict.label(),
+        tip.base
+    )?;
+    match &tip.verdict {
+        TipVerdict::Healthy => {
+            let contexts = tip.required_contexts.join(", ");
+            writeln!(
+                stdout,
+                "  required jobs passed on its merge group: {contexts}"
+            )?;
+        }
+        TipVerdict::Red { failing } => {
+            for context in failing {
+                writeln!(
+                    stdout,
+                    "  {}  {}  run {} job {}{}",
+                    context.context,
+                    context.conclusion,
+                    context.run_id,
+                    context.job_id,
+                    context
+                        .url
+                        .as_deref()
+                        .map_or_else(String::new, |url| format!("  {url}"))
+                )?;
+                if !context.tests.is_empty() {
+                    writeln!(stdout, "    tests  {}", context.tests.join(", "))?;
+                }
+            }
+        }
+        TipVerdict::Pending { waiting } => {
+            writeln!(stdout, "  waiting on {}", waiting.join(", "))?;
+        }
+        TipVerdict::Unproven { detail } | TipVerdict::Unreadable { detail } => {
+            writeln!(stdout, "  {detail}")?;
+        }
+    }
+    // Only the runs that carried a required job; the rest are advisory to
+    // this verdict and their conclusions are not it.
+    let runs: Vec<String> = tip
+        .runs
+        .iter()
+        .filter(|run| tip.jobs.iter().any(|job| job.run_id == run.id))
+        .map(|run| format!("{} ({})", run.id, run.name.as_deref().unwrap_or("?")))
+        .collect();
+    if !runs.is_empty() {
+        writeln!(stdout, "  merge_group runs  {}", runs.join(", "))?;
+    }
+    Ok(())
+}
+
 fn optional(value: Option<u64>) -> String {
     value.map_or_else(|| "UNKNOWN".to_owned(), |value| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base_health::tip::{ContextJob, FailingContext, TipRun};
+
+    fn render(tip: &TipHealth) -> String {
+        let mut out = Vec::new();
+        write_tip(&mut out, tip).expect("render");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn red_tip_names_the_sha_the_failing_gate_and_its_tests() {
+        let tip = TipHealth {
+            base: "main".to_owned(),
+            tip_sha: Some("abc123".to_owned()),
+            verdict: TipVerdict::Red {
+                failing: vec![FailingContext {
+                    context: "macos".to_owned(),
+                    conclusion: "failure".to_owned(),
+                    run_id: 7,
+                    job_id: 70,
+                    url: None,
+                    tests: vec!["42 - pulp-test-widgets (Failed)".to_owned()],
+                }],
+            },
+            required_contexts: vec!["macos".to_owned()],
+            runs: vec![
+                TipRun {
+                    id: 7,
+                    name: Some("Build and Test".to_owned()),
+                    status: Some("completed".to_owned()),
+                    conclusion: Some("failure".to_owned()),
+                    url: None,
+                },
+                TipRun {
+                    id: 8,
+                    name: Some("Unrelated".to_owned()),
+                    status: Some("completed".to_owned()),
+                    conclusion: Some("success".to_owned()),
+                    url: None,
+                },
+            ],
+            jobs: vec![ContextJob {
+                context: "macos".to_owned(),
+                run_id: 7,
+                job_id: 70,
+                status: "completed".to_owned(),
+                conclusion: Some("failure".to_owned()),
+                url: None,
+            }],
+            api_calls: 4,
+        };
+        let text = render(&tip);
+        assert!(text.contains("RED  tip abc123 of `main`"), "{text}");
+        assert!(text.contains("macos  failure  run 7 job 70"), "{text}");
+        assert!(text.contains("pulp-test-widgets"), "{text}");
+        assert!(
+            text.contains("merge_group runs  7 (Build and Test)"),
+            "{text}"
+        );
+        assert!(!text.contains("Unrelated"), "{text}");
+    }
 }

@@ -355,7 +355,12 @@ malformed authority, and a non-null queue still stop or select the queue path.
 
 Never treat queue absence alone as permission to rearm. The PR must first have
 been observed in the queue (durably recorded across restarts), and only an
-`invalid_merge_commit` removal may be re-enqueued automatically. Failed checks,
+`invalid_merge_commit` removal may be re-enqueued automatically. Admission is
+also head-scoped: `auto-merge` and the steward's ordinary enqueue read the PR's
+queue timeline and refuse a head removed for `failed_checks` /
+`merge_conflict` with no new head since, even from a ship-state created after
+the removal (another host, an archived state), so re-shipping the same SHA
+cannot re-enqueue it; push a fix. Failed checks,
 manual/unknown removal, head drift, malformed authority data, or a
 403/rate-limit response stop fail-closed. The sole reviewed exception is the
 default-off steward flag `--recover-hosted-setup-eviction-priority`: it may use
@@ -3809,6 +3814,15 @@ reported as unparseable rather than dropped, and the weakest reported tier is
 the head's headline. Merge-group reads are restricted to check runs of
 `merge_group` workflow runs, because a merged commit also carries the base
 branch's push runs.
+
+`src/base_health/tip.rs` is the primary base-health reading in `landing`: base
+tip SHA → `actions/runs?head_sha=<tip>&event=merge_group` (re-filtered on
+`head_sha`) → each run's jobs, judged only on the jobs named by the required
+contexts (`HEALTHY` / `RED` / `PENDING` / `UNPROVEN` / `UNKNOWN`). Never judge
+from a run conclusion: advisory jobs fail runs. A missing required job on a
+finished run, or one only skipped, is `UNPROVEN`, not `HEALTHY`. Failing test
+names come from `diagnostics::AutoParser` over at most two failing required
+jobs' logs.
 
 `src/base_health.rs` reads a repository's `base-poison-signal/v1` annotation
 (title `base-poison-signal`) from the newest completed `success`/`failure` run
