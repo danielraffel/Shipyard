@@ -78,6 +78,10 @@ MERGE_GROUP_RUN_WINDOW = timedelta(hours=6)
 MERGE_GROUP_RUN_SKEW = timedelta(minutes=5)
 MERGE_GROUP_RUN_PAGE = 100
 MERGE_GROUP_RUN_MAX_PAGES = 3
+# How much of a failed attributor's stderr a refusal quotes: enough to carry a
+# traceback's final exception line, never a whole log.
+ATTRIBUTOR_STDERR_TAIL_LINES = 5
+ATTRIBUTOR_STDERR_TAIL_CHARS = 600
 MERGE_GROUP_ANCESTRY_PROBES = 3
 OPERATOR_NOTE = (
     "An explicit authority override exists for operators; see docs/ghapp-guards.md."
@@ -764,6 +768,27 @@ def _describe(batch: dict[str, Any]) -> str:
     return f"Batch run {batch['run_id']} failed: " + "; ".join(parts) + "."
 
 
+def _stderr_tail(stderr: str | None) -> str:
+    """The last few lines of an attributor's stderr, safe to print in a refusal.
+
+    Control characters (terminal escape sequences included) are dropped, since
+    the text is repository-produced and reaches an operator's terminal.
+    """
+    if not stderr:
+        return ""
+    printable = "".join(ch for ch in stderr if ch == "\n" or ch == "\t" or ch.isprintable())
+    lines = [line.rstrip() for line in printable.splitlines() if line.strip()]
+    tail = " | ".join(lines[-ATTRIBUTOR_STDERR_TAIL_LINES:])
+    if len(tail) > ATTRIBUTOR_STDERR_TAIL_CHARS:
+        tail = "..." + tail[-ATTRIBUTOR_STDERR_TAIL_CHARS:]
+    return tail
+
+
+def _with_stderr(detail: str, stderr: str | None) -> str:
+    tail = _stderr_tail(stderr)
+    return f"{detail} Attributor stderr (tail): {tail}" if tail else detail
+
+
 def read_attributor_verdict(
     command: list[str], root: pathlib.Path, repo: str, number: int, batch: dict[str, Any]
 ) -> dict[str, Any]:
@@ -795,9 +820,10 @@ def read_attributor_verdict(
     if completed.returncode != 0:
         return {
             "certified": False,
-            "detail": (
+            "detail": _with_stderr(
                 f"{evidence} The attributor exited {completed.returncode}, "
-                "so it did not rule."
+                "so it did not rule.",
+                completed.stderr,
             ),
         }
     try:
@@ -805,7 +831,10 @@ def read_attributor_verdict(
     except json.JSONDecodeError as error:
         return {
             "certified": False,
-            "detail": f"{evidence} The attributor's verdict was not JSON: {error}.",
+            "detail": _with_stderr(
+                f"{evidence} The attributor's verdict was not JSON: {error}.",
+                completed.stderr,
+            ),
         }
     if not isinstance(verdict, dict):
         return {

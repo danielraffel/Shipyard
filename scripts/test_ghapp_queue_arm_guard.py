@@ -599,7 +599,9 @@ class BatchAttributionTests(unittest.TestCase):
         os.chdir(self.root)
         self.addCleanup(os.chdir, cwd)
 
-    def declare(self, verdict: Any, *, exit_code: int = 0, command: Any = None) -> None:
+    def declare(
+        self, verdict: Any, *, exit_code: int = 0, command: Any = None, stderr: str = ""
+    ) -> None:
         """Write a `.shipyard/config.toml` declaring a stub attributor."""
         (self.root / ".shipyard").mkdir(parents=True, exist_ok=True)
         script = self.root / "attribute.py"
@@ -608,6 +610,7 @@ class BatchAttributionTests(unittest.TestCase):
             "import sys, pathlib\n"
             f"pathlib.Path({str(self.root / 'argv')!r}).write_text(' '.join(sys.argv[1:]))\n"
             f"sys.stdout.write({body!r})\n"
+            f"sys.stderr.write({stderr!r})\n"
             f"raise SystemExit({exit_code})\n",
             encoding="utf-8",
         )
@@ -789,6 +792,28 @@ class BatchAttributionTests(unittest.TestCase):
                 code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
                 self.assertEqual(code, 1)
                 self.assertIn("Push a fix first", message)
+
+    def test_a_crashed_attributor_s_stderr_tail_reaches_the_refusal(self) -> None:
+        """A bare "exited 1" hid a FileNotFoundError for `ghapp` off the guard's PATH."""
+        traceback = (
+            "Traceback (most recent call last):\n"
+            + "".join(f'  File "attribute.py", line {n}, in frame\n' for n in range(20))
+            + "\x1b[31mFileNotFoundError: [Errno 2] No such file or directory: 'ghapp'\x1b[0m\n"
+        )
+        self.declare("", exit_code=1, stderr=traceback)
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 1)
+        self.assertIn("The attributor exited 1", message)
+        self.assertIn("No such file or directory: 'ghapp'", message)
+        # A tail, not the whole traceback, and no terminal escapes.
+        self.assertNotIn("line 0,", message)
+        self.assertNotIn("\x1b", message)
+
+    def test_a_silent_failure_adds_no_stderr_clause(self) -> None:
+        self.declare("", exit_code=1)
+        _, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertIn("The attributor exited 1", message)
+        self.assertNotIn("Attributor stderr", message)
 
     def test_an_unresolvable_ejecting_batch_refuses(self) -> None:
         self.declare(self.certifies())
