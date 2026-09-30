@@ -118,7 +118,7 @@ pub(super) struct TagAttempts {
 }
 
 /// Persisted attempt ledger, keyed by tag.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct AttemptLedger {
     #[serde(default)]
     pub(super) tags: BTreeMap<String, TagAttempts>,
@@ -148,14 +148,49 @@ pub(super) struct Quarantine {
 /// at the 15-minute agent interval).
 pub(super) const UNREACHABLE_ALERT_TICKS: u32 = 4;
 
-/// Read, change and atomically rewrite the ledger.
+/// Read, change and atomically rewrite the ledger. A change that leaves the
+/// ledger as it was writes nothing: the ledger lives in the protected
+/// production state tree, and an idle tick must not touch it.
 pub(super) fn update_ledger<F: FnOnce(&mut AttemptLedger)>(
     state_dir: &Path,
     change: F,
 ) -> Result<(), String> {
-    let mut ledger = read_ledger(state_dir)?;
+    let before = read_ledger(state_dir)?;
+    let mut ledger = before.clone();
     change(&mut ledger);
+    if ledger == before {
+        return Ok(());
+    }
     write_ledger(state_dir, &ledger)
+}
+
+/// Why the host's own install guard is held right now, if it is: a Sandbox
+/// canary (or an install) owns this host, so a rollout tick must defer before
+/// it records anything. Probes without creating or modifying the guard.
+pub(super) fn local_install_guard_held(state_dir: &Path) -> Result<Option<String>, String> {
+    let path = state_dir.join(super::auth_support::INSTALL_GUARD_NAME);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("open {}: {error}", path.display())),
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            let _ = fs2::FileExt::unlock(&file);
+            Ok(None)
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Ok(Some(format!(
+                "this host's install guard {} is held (a Sandbox canary or an install owns the \
+                 host); the tick recorded nothing",
+                path.display()
+            )))
+        }
+        Err(error) => Err(format!("probe {}: {error}", path.display())),
+    }
 }
 
 /// Clear an operator-resolved quarantine. When the host's failed rollback is
@@ -239,6 +274,12 @@ fn write_ledger(state_dir: &Path, ledger: &AttemptLedger) -> Result<(), String> 
     let parent = path
         .parent()
         .ok_or_else(|| "fleet-reconcile ledger path has no parent".to_owned())?;
+    // The ledger is production persistence in the protected state tree: like
+    // every other such write it holds the shared writer-domain lease, so it
+    // waits for (and then defers to) an exclusive Sandbox contamination audit
+    // instead of landing inside one.
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
+        .map_err(|error| format!("fleet-reconcile ledger writer domain: {error}"))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("create fleet-reconcile state dir: {error}"))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
@@ -477,6 +518,11 @@ pub(super) trait ReconcileEnv {
     fn rollout(&mut self, tag: &str, host_classes: &[String]) -> RolloutOutcome;
     /// Open or refresh the operator alert for this condition.
     fn alert(&mut self, title: &str, body: &str) -> Result<(), String>;
+    /// `Some(reason)` when this controller host is owned by a Sandbox canary
+    /// or an install, so a rollout tick must defer without recording.
+    fn local_host_busy(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 /// Everything one reconcile tick observed and did.
@@ -679,6 +725,20 @@ fn rollout<E: ReconcileEnv>(
     lagging: &[String],
     now: DateTime<Utc>,
 ) -> u8 {
+    // A canary (or an install) owning this host defers the tick before
+    // anything is recorded: the ledger sits in the state tree that canary
+    // audits, and a deferred tick is not an attempt.
+    match env.local_host_busy() {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            report.rollout = Some(RolloutOutcome::Deferred { reason });
+            return super::EXIT_CONTROLLER_BUSY;
+        }
+        Err(reason) => {
+            report.decision = ReconcileDecision::Unknown { reason };
+            return EXIT_RECONCILE_UNKNOWN;
+        }
+    }
     // Record before mutating: a crash or a failing rollout still counts as an
     // attempt, so a broken release cannot loop every tick.
     let prior = match read_ledger(state_dir) {
@@ -690,6 +750,12 @@ fn rollout<E: ReconcileEnv>(
     };
     let attempt = match record_attempt(state_dir, tag, now) {
         Ok(attempt) => attempt,
+        // A Sandbox audit held the writer domain through the bounded wait:
+        // nothing was written and nothing rolled, so this is a deferral.
+        Err(reason) if crate::writer_domain_lease::is_writer_domain_overlap(&reason) => {
+            report.rollout = Some(RolloutOutcome::Deferred { reason });
+            return super::EXIT_CONTROLLER_BUSY;
+        }
         Err(reason) => {
             report.decision = ReconcileDecision::Unknown { reason };
             return EXIT_RECONCILE_UNKNOWN;
@@ -1125,6 +1191,7 @@ mod tests {
         outcome: RolloutOutcome,
         rollouts: Vec<(String, Vec<String>)>,
         alerts: Vec<(String, String)>,
+        busy: Option<String>,
     }
 
     impl FakeEnv {
@@ -1139,6 +1206,7 @@ mod tests {
                 outcome,
                 rollouts: Vec::new(),
                 alerts: Vec::new(),
+                busy: None,
             }
         }
     }
@@ -1164,12 +1232,88 @@ mod tests {
             self.alerts.push((title.to_owned(), body.to_owned()));
             Ok(())
         }
+        fn local_host_busy(&mut self) -> Result<Option<String>, String> {
+            Ok(self.busy.clone())
+        }
     }
 
     fn failed() -> RolloutOutcome {
         RolloutOutcome::Failed {
             reason: "m5 failed post-rollout verification".to_owned(),
         }
+    }
+
+    #[test]
+    fn a_busy_controller_host_defers_before_writing_the_ledger() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut env = FakeEnv::new(
+            Utc::now(),
+            &[("m1", "0.208.0"), ("m5", "0.205.0")],
+            RolloutOutcome::Verified,
+        );
+        env.busy = Some("sandbox canary owns this host".to_owned());
+        let report = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(report.exit_code, super::super::EXIT_CONTROLLER_BUSY);
+        assert!(env.rollouts.is_empty(), "a busy host is never rolled");
+        assert_eq!(report.attempt, None);
+        assert!(matches!(
+            report.rollout,
+            Some(RolloutOutcome::Deferred { .. })
+        ));
+        assert!(
+            !ledger_path(temp.path()).exists(),
+            "a deferred tick writes nothing into the audited state tree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_tick_leaves_the_ledger_file_untouched() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().expect("temp");
+        record_attempt(temp.path(), "v0.207.0", Utc::now()).expect("seed");
+        let identity = || {
+            let metadata = std::fs::metadata(ledger_path(temp.path())).expect("ledger");
+            (metadata.ino(), metadata.mtime_nsec(), metadata.mtime())
+        };
+        let before = identity();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // An up-to-date tick with every host reachable changes nothing.
+        let mut env = FakeEnv::new(
+            Utc::now(),
+            &[("m1", "0.208.0"), ("m5", "0.208.0")],
+            RolloutOutcome::Verified,
+        );
+        let report = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert!(matches!(report.decision, ReconcileDecision::UpToDate));
+        assert_eq!(identity(), before, "an idle tick rewrote the ledger");
+        // A real change still persists.
+        update_ledger(temp.path(), |ledger| {
+            ledger.ahead_alerted.insert("v0.208.0".to_owned());
+        })
+        .expect("update");
+        assert_ne!(identity(), before);
+    }
+
+    #[test]
+    fn install_guard_probe_sees_another_holder_and_never_creates_the_guard() {
+        let temp = tempfile::tempdir().expect("temp");
+        let guard = temp
+            .path()
+            .join(super::super::auth_support::INSTALL_GUARD_NAME);
+        assert_eq!(local_install_guard_held(temp.path()), Ok(None));
+        assert!(!guard.exists(), "probing must not create the guard");
+        std::fs::write(&guard, b"").expect("guard");
+        assert_eq!(local_install_guard_held(temp.path()), Ok(None));
+        let holder = std::fs::File::open(&guard).expect("holder");
+        fs2::FileExt::lock_exclusive(&holder).expect("hold");
+        assert!(
+            local_install_guard_held(temp.path())
+                .expect("probe")
+                .is_some_and(|reason| reason.contains("recorded nothing"))
+        );
+        fs2::FileExt::unlock(&holder).expect("release");
+        assert_eq!(local_install_guard_held(temp.path()), Ok(None));
     }
 
     #[test]

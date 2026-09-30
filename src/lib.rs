@@ -50,6 +50,9 @@ pub mod config;
 pub mod ctest_inventory;
 /// Unix socket IPC primitives for daemon subscribers and status reads.
 pub mod daemon_ipc;
+/// Stable macOS privacy identity (launchd launcher) for the detached daemon.
+#[cfg(unix)]
+pub mod daemon_launcher;
 /// Minimal daemon runtime and lifecycle helpers.
 pub mod daemon_runtime;
 /// Shared daemon/CLI version comparison helpers.
