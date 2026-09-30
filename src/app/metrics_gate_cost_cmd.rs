@@ -374,6 +374,8 @@ mod tests {
             placement_jobs: Vec::new(),
             runner_census: Err("not read".to_owned()),
             reads: gate_cost::ReadStats::default(),
+            listing_gaps: Vec::new(),
+            gate_absent: BTreeMap::new(),
         });
         let text = render(&report);
         let starts: Vec<&str> = text
