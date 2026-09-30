@@ -2033,6 +2033,17 @@ library contract alone does not activate selection: the queue/orchestration
 layer must still snapshot and substitute the immutable plan before bounded
 results can become authoritative.
 
+A provenance fallback (stale base, merge-base mismatch, incomplete diff) still
+binds the digest of the base policy whenever that policy validates, so it
+promotes to an ordinary full-suite disposition and, under `shadow_compare`,
+reaches the stale-base shadow comparison. `promotion_error` with "policy
+digest does not match" therefore means a genuinely different policy; "carries
+no policy digest" means the base policy itself failed validation. When reading
+`changed-surface-results/**/fallback-*` diagnostics, a `full_fallback` line
+names the planner reason after the colon (for example
+`PlannerSelectedFull: TestTopologyChanged`): that reason, not the planner, is
+usually what keeps a repository at zero reduced selections.
+
 ## Cross-PR evidence reuse
 
 When PR B rebases onto PR A's merged SHA and B's diff doesn't touch any
