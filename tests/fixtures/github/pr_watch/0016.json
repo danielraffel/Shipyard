@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/branches/main"
+ ],
+ "response": "{\"protection\": {\"required_status_checks\": {\"contexts\": [\"Enforce version & skill sync\", \"Build + prove + (owner-gated) deploy\", \"Vellum trusted freeze\", \"Vellum freeze\", \"macos\"]}}}"
+}

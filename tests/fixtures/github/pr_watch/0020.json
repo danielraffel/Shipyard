@@ -1,0 +1,15 @@
+{
+ "argv": [
+  "api",
+  "--paginate",
+  "--slurp",
+  "-X",
+  "GET",
+  "repos/Generous-Corp/pulp/commits/cd837f84eb6b7e198b8499ce94d192f3600bd15a/check-runs",
+  "-f",
+  "filter=all",
+  "-f",
+  "per_page=100"
+ ],
+ "response": "[{\"total_count\": 7, \"check_runs\": [{\"id\": 108689606275, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-27T19:21:40Z\", \"completed_at\": \"2026-09-27T19:21:40Z\"}, {\"id\": 108689602888, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"failure\", \"started_at\": \"2026-09-27T19:21:41Z\", \"completed_at\": \"2026-09-27T19:22:17Z\"}, {\"id\": 108632233303, \"name\": \"macos\", \"status\": \"completed\", \"conclusion\": \"failure\", \"started_at\": \"2026-09-27T13:59:17Z\", \"completed_at\": \"2026-09-27T14:23:03Z\"}, {\"id\": 108631889579, \"name\": \"Build + prove + (owner-gated) deploy\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-27T13:46:27Z\", \"completed_at\": \"2026-09-27T14:06:26Z\"}, {\"id\": 108631889492, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-27T13:46:27Z\", \"completed_at\": \"2026-09-27T13:55:39Z\"}, {\"id\": 108631888933, \"name\": \"Vellum freeze\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-27T13:46:26Z\", \"completed_at\": \"2026-09-27T13:47:06Z\"}, {\"id\": 108631884566, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-27T13:46:23Z\", \"completed_at\": \"2026-09-27T13:46:22Z\"}]}]"
+}

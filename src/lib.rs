@@ -196,6 +196,8 @@ pub mod pr_fold;
 pub mod pr_queue_state;
 /// Pull request title/body composition.
 pub mod pr_text;
+/// Read-only flags for stuck open pull requests (`shipyard pr-watch`).
+pub mod pr_watch;
 /// Submission preflight checks for `ship --pr`.
 pub mod preflight;
 /// Prepared-state cache for warm stage reruns.

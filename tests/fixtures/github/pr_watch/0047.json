@@ -1,0 +1,15 @@
+{
+ "argv": [
+  "api",
+  "--paginate",
+  "--slurp",
+  "-X",
+  "GET",
+  "repos/Generous-Corp/pulp/commits/f5987a46d5429294e099224cc0a8d03dff6588e8/check-runs",
+  "-f",
+  "filter=all",
+  "-f",
+  "per_page=100"
+ ],
+ "response": "[{\"total_count\": 10, \"check_runs\": [{\"id\": 108777353192, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-28T03:37:52Z\", \"completed_at\": \"2026-09-28T03:37:51Z\"}, {\"id\": 108777350375, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-28T03:37:53Z\", \"completed_at\": \"2026-09-28T03:47:08Z\"}, {\"id\": 108742182565, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-28T00:30:17Z\", \"completed_at\": \"2026-09-28T00:37:19Z\"}, {\"id\": 108740916944, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-28T00:23:00Z\", \"completed_at\": \"2026-09-28T00:22:59Z\"}, {\"id\": 108740768410, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-28T00:22:09Z\", \"completed_at\": \"2026-09-28T00:22:09Z\"}, {\"id\": 108740628510, \"name\": \"macos\", \"status\": \"completed\", \"conclusion\": \"failure\", \"started_at\": \"2026-09-28T00:37:47Z\", \"completed_at\": \"2026-09-28T00:50:11Z\"}, {\"id\": 108740553154, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-28T00:20:56Z\", \"completed_at\": \"2026-09-28T00:20:56Z\"}, {\"id\": 108740551468, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-28T00:20:58Z\", \"completed_at\": \"2026-09-28T00:30:15Z\"}, {\"id\": 108740551176, \"name\": \"Build + prove + (owner-gated) deploy\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-28T00:20:58Z\", \"completed_at\": \"2026-09-28T00:35:38Z\"}, {\"id\": 108740551075, \"name\": \"Vellum freeze\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-28T00:20:58Z\", \"completed_at\": \"2026-09-28T00:21:36Z\"}]}]"
+}

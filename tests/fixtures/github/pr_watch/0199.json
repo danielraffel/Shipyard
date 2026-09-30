@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/109245304063/logs"
+ ],
+ "response": "2026-09-29T03:51:12.0557370Z ##[error]iOS compile gate failed (exit 65)\n2026-09-29T03:51:12.0559370Z ##[error]Process completed with exit code 65.\n2026-09-29T03:51:12.5699350Z ##[error]Process completed with exit code 2.\n"
+}

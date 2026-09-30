@@ -182,7 +182,20 @@ fn reader(responses: BTreeMap<String, Value>) -> impl Fn(&[String]) -> Result<St
                 .iter()
                 .find_map(|arg| arg.strip_prefix("event="))
                 .ok_or("no event")?;
-            format!("runs:{event}")
+            // The unfiltered event walk reads `walk:<event>:<page>` when a
+            // fixture provides it, and otherwise the same listing as the
+            // `created` filter (so the two agree).
+            let walk_page = args.iter().find_map(|arg| arg.strip_prefix("page="));
+            match walk_page {
+                Some(page)
+                    if !args.iter().any(|arg| arg.starts_with("created="))
+                        && responses.contains_key(&format!("walk:{event}:{page}")) =>
+                {
+                    format!("walk:{event}:{page}")
+                }
+                Some(page) if page != "1" => return Ok(json!({"workflow_runs": []}).to_string()),
+                _ => format!("runs:{event}"),
+            }
         } else {
             path.clone()
         };
@@ -705,4 +718,115 @@ fn entries_older_than_the_age_limit_are_pruned_on_open() {
     assert_eq!(ReadCache::open(dir.path(), now).get("k"), Some(json!(1)));
     let later = now + cache::MAX_ENTRY_AGE + std::time::Duration::from_secs(60);
     assert_eq!(ReadCache::open(dir.path(), later).get("k"), None);
+}
+
+/// A short `created` listing whose `total_count` agrees with itself: the
+/// failure `collect_counted` cannot see. The event walk finds the runs it
+/// missed, they are counted, and the disagreement is named.
+#[test]
+fn a_short_created_listing_is_completed_by_the_event_walk() {
+    let mut responses = fixture();
+    responses.insert(
+        "runs:pull_request".to_owned(),
+        json!([{"total_count": 1, "workflow_runs": [
+            {"id": 101, "created_at": "2026-09-24T09:00:00Z"}
+        ]}]),
+    );
+    responses.insert(
+        "walk:pull_request:1".to_owned(),
+        json!({"workflow_runs": [
+            {"id": 103, "created_at": "2026-09-25T09:00:00Z"},
+            {"id": 102, "created_at": "2026-09-24T12:00:00Z"},
+            {"id": 101, "created_at": "2026-09-24T09:00:00Z"},
+            {"id": 99, "created_at": "2026-09-23T09:00:00Z"}
+        ]}),
+    );
+    let report = run_fixture(responses).expect("fixture gathers");
+    assert_eq!(report.pr_head.runs, 3, "the walk restores runs 102 and 103");
+    assert_eq!(report.pr_head.jobs, 4);
+    let gap = report
+        .telemetry_gaps
+        .iter()
+        .find(|gap| gap.signal == "run_listing")
+        .expect("the disagreement is a gap");
+    assert!(
+        gap.reason.contains("returned 1 `pull_request` run(s)")
+            && gap.reason.contains("found 2 more"),
+        "{}",
+        gap.reason
+    );
+}
+
+/// A gate whose `name:` is an expression GitHub reported unevaluated is still
+/// counted once per attempt, a run cancelled before its gate started counts
+/// one unstarted attempt (not one per alternate), a run with no gate job at
+/// all adds nothing, and each case is named.
+#[test]
+#[allow(clippy::float_cmp)] // exact reporting is the property under test
+fn a_gate_reported_under_an_unevaluated_name_is_counted_once_and_named() {
+    let mut responses = fixture();
+    let gate = "matrix.key == 'macos' && 'macos' || format('{0}', matrix.name)";
+    let pr_alternate = "github.event_name == 'pull_request' && 'macos' || 'macos-pr-unused'";
+    let mg_alternate = "github.event_name == 'merge_group' && 'macos' || 'macos-merge-unused'";
+    // Run 101: the gate ran under its unevaluated name; its skipped
+    // alternates resolve to `macos` too.
+    responses.insert(
+        "repos/o/r/actions/runs/101/jobs".to_owned(),
+        jobs_page(&[
+            job(11, pr_alternate, 1, "skipped", 0),
+            job(1, gate, 1, "success", 20),
+            job(12, mg_alternate, 1, "skipped", 0),
+            job(2, "linux", 1, "success", 40),
+        ]),
+    );
+    // Run 102: cancelled before anything started; every name unevaluated.
+    responses.insert(
+        "repos/o/r/actions/runs/102/jobs".to_owned(),
+        jobs_page(&[
+            unassigned(job(3, pr_alternate, 1, "cancelled", 0), &["ubuntu-latest"]),
+            unassigned(job(4, gate, 1, "cancelled", 0), &["self-hosted"]),
+            unassigned(job(13, mg_alternate, 1, "cancelled", 0), &["ubuntu-latest"]),
+        ]),
+    );
+    // Run 103: no gate job at all.
+    responses.insert(
+        "repos/o/r/actions/runs/103/jobs".to_owned(),
+        jobs_page(&[job(5, "linux", 1, "success", 3)]),
+    );
+    let report = run_fixture(responses).expect("fixture gathers");
+    assert_eq!(report.pr_head.jobs, 2, "one gate attempt per run attempt");
+    assert_eq!(
+        report.pr_head.by_conclusion,
+        BTreeMap::from([("cancelled".to_owned(), 1), ("success".to_owned(), 1)])
+    );
+    assert_eq!(report.pr_head.gate_minutes, 20.0);
+    let gap = report
+        .telemetry_gaps
+        .iter()
+        .find(|gap| gap.signal == "gate_job_name")
+        .expect("named as a gap");
+    assert!(
+        gap.reason
+            .starts_with("3 of 3 `pull_request` run(s) have no job named exactly `macos`"),
+        "{}",
+        gap.reason
+    );
+    assert!(
+        gap.reason
+            .contains("; 1 were cancelled before the gate started"),
+        "{}",
+        gap.reason
+    );
+    assert!(
+        gap.reason
+            .contains("; 1 ran the gate under an unevaluated name"),
+        "{}",
+        gap.reason
+    );
+    assert!(gap.reason.contains(gate), "{}", gap.reason);
+    assert!(
+        gap.reason.contains("; 1 run(s) carry no gate job at all"),
+        "{}",
+        gap.reason
+    );
 }

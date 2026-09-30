@@ -15,6 +15,7 @@
 //! | one GraphQL query | default branch, effective merge queue, and the open-pull-request backlog |
 //! | `actions/runs` | candidate runs to derive placement from |
 //! | `runs/{id}/jobs`, bounded | the runner identity that actually picked each gate up |
+//! | `commits/{base}`, `actions/runs?head_sha=<tip>&event=merge_group`, their `jobs` | whether the base tip passed its required gate |
 //!
 //! The job reads stop as soon as every required context has been placed, so a
 //! healthy repository costs far fewer than the cap.
@@ -123,6 +124,16 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         ));
     }
 
+    // The tip itself: its merge-group run's required jobs say whether the
+    // commit on the base passed the gate. Read directly, so a missing or stale
+    // detector cannot leave the base's health unknown.
+    let base_tip = {
+        let reader = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+        let tip = crate::base_health::tip::read_tip(&reader, repo, base, &contexts);
+        api_calls += tip.api_calls;
+        tip
+    };
+
     // A few reads that name a red base and the pull request that fixes it:
     // the one situation in which "wait for the queue" is the wrong advice.
     let base_health = {
@@ -151,6 +162,7 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
             notes: placement_notes,
         },
         backlog: backlog_finding,
+        base_tip,
         base_health,
         base_jump,
         surfaces,

@@ -988,6 +988,22 @@ impl GitHubActions {
         Ok(String::from_utf8_lossy(output.stdout()).to_string())
     }
 
+    /// Like [`Self::run_gh_with_timeout`] with extra environment for the child,
+    /// for example `GH_REPO` so a `ghapp` wrapper on `PATH` binds its
+    /// installation to the repository when no checkout names it.
+    pub(crate) fn run_gh_with_timeout_env(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        env: &[(&str, &str)],
+    ) -> Result<String, GitHubError> {
+        let output = self.run_gh_with_timeout_output_limits(args, timeout, None, env)?;
+        if !output.success() {
+            return Err(output.command_error(args));
+        }
+        Ok(String::from_utf8_lossy(output.stdout()).to_string())
+    }
+
     pub(crate) fn run_gh_with_timeout_output(
         &self,
         args: &[String],

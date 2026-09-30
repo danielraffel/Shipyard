@@ -1153,6 +1153,29 @@ fn queue_admission(
         ));
     }
 
+    let queue_state = fetch_pr_queue_state(client, cwd, state)?;
+    admission_after_removal(&observation, &queue_state, state)?;
+    Ok(QueueAdmission::Arm {
+        pr_id: observation.id,
+    })
+}
+
+/// Every removal-history rule queue admission applies before arming.
+///
+/// The attempt-scoped rules ([`removal_blocks_rearm`],
+/// [`queue_absence_allows_arm`]) judge removals that happened during this
+/// ship-state's own attempt. They cannot see a removal that predates the
+/// ship-state: a ship-state re-created for the same SHA (another host, an
+/// archived or lost state) would otherwise re-enqueue a head the queue
+/// already ejected. The head-scoped verdict closes that gap: it reads the
+/// full queue timeline and refuses the unchanged head after a
+/// `failed_checks` / `merge_conflict` removal no matter when this ship-state
+/// was created.
+fn admission_after_removal(
+    observation: &crate::merge_queue::QueuePrObservation,
+    queue_state: &crate::pr_queue_state::PrQueueReport,
+    state: &ShipState,
+) -> Result<(), String> {
     if removal_blocks_rearm(
         observation.removal_event_present,
         observation.removal_reason.as_deref(),
@@ -1176,9 +1199,49 @@ fn queue_admission(
             state.pr
         ));
     }
-    Ok(QueueAdmission::Arm {
-        pr_id: observation.id,
-    })
+    if let Some(refusal) =
+        crate::pr_queue_state::internal_enqueue_verdict(queue_state, &state.head_sha)
+            .refusal(state.pr, &state.head_sha)
+    {
+        return Err(refusal);
+    }
+    Ok(())
+}
+
+/// Read the head-scoped queue timeline ([`crate::pr_queue_state::PR_QUEUE_STATE_QUERY`]).
+fn fetch_pr_queue_state(
+    client: &GhClient,
+    cwd: &Path,
+    state: &ShipState,
+) -> Result<crate::pr_queue_state::PrQueueReport, String> {
+    let (owner, name) = state
+        .repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository slug {:?}", state.repo))?;
+    let output = gh(client, cwd)?
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
+            "-F",
+            &format!("owner={owner}"),
+            "-F",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={}", state.pr),
+        ])
+        .output()
+        .map_err(|error| format!("failed to read merge-queue timeline: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read merge-queue timeline: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let body: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("merge-queue timeline returned invalid JSON: {error}"))?;
+    Ok(crate::pr_queue_state::explain_pr_queue_state(&body))
 }
 
 fn removal_blocks_rearm(
@@ -3737,6 +3800,92 @@ mod tests {
             Some("2026-07-23T12:01:00Z"),
             &state,
         ));
+    }
+
+    fn queue_fixture(name: &str) -> Value {
+        let path = format!(
+            "{}/tests/fixtures/github/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("json")
+    }
+
+    /// #8811's live capture: ejected for `failed_checks` at 04:12:51Z with
+    /// head `e147f2d…` and no new head since, `reason` optionally replaced.
+    fn ejected_8811(reason: &str) -> Value {
+        let mut response = queue_fixture("pr_real_8811_same_head_ejected.json");
+        let nodes = response
+            .pointer_mut("/data/repository/pullRequest/timelineItems/nodes")
+            .and_then(Value::as_array_mut)
+            .expect("nodes");
+        nodes.last_mut().expect("removal")["reason"] = Value::from(reason);
+        response
+    }
+
+    const HEAD_8811: &str = "e147f2d09972babcc9977e82a46470e17f9de538";
+
+    /// The admission poll's view of the same removal (`timelineItems(last:1)`).
+    fn poll_observation(head: &str, reason: &str) -> crate::merge_queue::QueuePrObservation {
+        crate::merge_queue::parse_pr_observation(&serde_json::json!({"data":{"repository":{
+            "pullRequest":{"id":"PR_node","headRefOid":head,"baseRefName":"main",
+                "merged":false,"autoMergeRequest":null,
+                "timelineItems":{"nodes":[{"reason":reason,"createdAt":"2026-09-25T04:12:51Z"}]}},
+            "mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}))
+        .expect("observation")
+    }
+
+    /// A ship-state created after the removal, as a re-ship from another host
+    /// or after the original state was archived would create it.
+    fn fresh_state(head: &str) -> ShipState {
+        let created = chrono::DateTime::parse_from_rfc3339("2026-09-25T05:00:00Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        let mut state = ShipState::new(8811, "Generous-Corp/pulp", "fix/x", "main", head, "p");
+        state.created_at = created;
+        state.updated_at = created;
+        state
+    }
+
+    #[test]
+    fn fresh_ship_state_cannot_re_enqueue_a_head_the_queue_ejected_for_failed_checks() {
+        let state = fresh_state(HEAD_8811);
+        let queue_state =
+            crate::pr_queue_state::explain_pr_queue_state(&ejected_8811("failed_checks"));
+        let error = admission_after_removal(
+            &poll_observation(HEAD_8811, "failed_checks"),
+            &queue_state,
+            &state,
+        )
+        .expect_err("same head after failed_checks must be refused");
+        assert!(error.contains("failed_checks"), "{error}");
+        assert!(error.contains(HEAD_8811), "{error}");
+        assert!(error.contains("no new head"), "{error}");
+    }
+
+    #[test]
+    fn fresh_ship_state_admits_a_new_head_after_failed_checks() {
+        let response = queue_fixture("pr_ejected_new_head.json");
+        let queue_state = crate::pr_queue_state::explain_pr_queue_state(&response);
+        let head = queue_state.head_oid.clone().expect("head");
+        admission_after_removal(
+            &poll_observation(&head, "manual"),
+            &queue_state,
+            &fresh_state(&head),
+        )
+        .expect("a new head is a different head");
+    }
+
+    #[test]
+    fn fresh_ship_state_admits_same_head_after_non_cascading_removal() {
+        for reason in ["invalid_merge_commit", "manual"] {
+            let queue_state = crate::pr_queue_state::explain_pr_queue_state(&ejected_8811(reason));
+            admission_after_removal(
+                &poll_observation(HEAD_8811, reason),
+                &queue_state,
+                &fresh_state(HEAD_8811),
+            )
+            .unwrap_or_else(|error| panic!("{reason} must admit: {error}"));
+        }
     }
 
     #[test]

@@ -1,0 +1,15 @@
+{
+ "argv": [
+  "api",
+  "--paginate",
+  "--slurp",
+  "-X",
+  "GET",
+  "repos/Generous-Corp/pulp/commits/0599797cc12871f640288ce1311c6f5130b81fdb/check-runs",
+  "-f",
+  "filter=all",
+  "-f",
+  "per_page=100"
+ ],
+ "response": "[{\"total_count\": 10, \"check_runs\": [{\"id\": 108626198195, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-27T13:11:30Z\", \"completed_at\": \"2026-09-27T13:11:30Z\"}, {\"id\": 108626195858, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"failure\", \"started_at\": \"2026-09-27T13:11:31Z\", \"completed_at\": \"2026-09-27T13:12:51Z\"}, {\"id\": 108623898637, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"failure\", \"started_at\": \"2026-09-27T12:57:22Z\", \"completed_at\": \"2026-09-27T12:59:13Z\"}, {\"id\": 108623847170, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-27T12:57:01Z\", \"completed_at\": \"2026-09-27T12:57:01Z\"}, {\"id\": 108623718565, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-27T12:56:11Z\", \"completed_at\": \"2026-09-27T12:56:11Z\"}, {\"id\": 108623661099, \"name\": \"macos\", \"status\": \"completed\", \"conclusion\": \"cancelled\", \"started_at\": \"2026-09-27T13:10:16Z\", \"completed_at\": \"2026-09-27T13:13:12Z\"}, {\"id\": 108623590366, \"name\": \"Enforce version & skill sync\", \"status\": \"completed\", \"conclusion\": \"failure\", \"started_at\": \"2026-09-27T12:55:25Z\", \"completed_at\": \"2026-09-27T12:57:20Z\"}, {\"id\": 108623590354, \"name\": \"Build + prove + (owner-gated) deploy\", \"status\": \"completed\", \"conclusion\": \"cancelled\", \"started_at\": \"2026-09-27T12:55:25Z\", \"completed_at\": \"2026-09-27T13:13:09Z\"}, {\"id\": 108623590324, \"name\": \"Vellum freeze\", \"status\": \"completed\", \"conclusion\": \"success\", \"started_at\": \"2026-09-27T12:55:25Z\", \"completed_at\": \"2026-09-27T12:56:02Z\"}, {\"id\": 108623589709, \"name\": \"Vellum trusted freeze\", \"status\": \"completed\", \"conclusion\": \"skipped\", \"started_at\": \"2026-09-27T12:55:23Z\", \"completed_at\": \"2026-09-27T12:55:23Z\"}]}]"
+}

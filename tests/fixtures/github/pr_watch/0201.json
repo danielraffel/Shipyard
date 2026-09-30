@@ -1,0 +1,7 @@
+{
+ "argv": [
+  "api",
+  "repos/Generous-Corp/pulp/actions/jobs/109250709003/logs"
+ ],
+ "response": "2026-09-29T04:17:13.7538290Z The following tests FAILED:\n2026-09-29T04:17:13.7538470Z \t21548 - script-test-inputs-drift (Failed)                 pr-fast\n2026-09-29T04:17:13.7539730Z Errors while running CTest\n2026-09-29T04:17:13.7551340Z ##[error]Process completed with exit code 8.\n2026-09-29T04:17:14.7574780Z ##[error]Process completed with exit code 2.\n"
+}
