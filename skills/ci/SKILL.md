@@ -1577,7 +1577,10 @@ arming or observing the queue and leaves ship-state active. A queue supervisor
 re-enqueues only after it previously observed the PR (persisted across process
 restarts) and GitHub reports `invalid_merge_commit`; `failed_checks`,
 manual/unknown removal, head drift, and HTTP 403/rate-limit responses stop
-fail-closed.
+fail-closed. Admission reads the PR's queue timeline too: a head the queue
+removed for `failed_checks` / `merge_conflict` with no new head since is refused
+even by a fresh ship-state for the same SHA, so re-shipping from another host
+does not re-enqueue it. Push a fix.
 
 ### "Validated green but not merged" — read the status before blaming the PR
 
@@ -2783,6 +2786,13 @@ the queue absorbs.
 
 An unreadable surface reports `UNKNOWN`, never `absent`. Treat an `UNKNOWN`
 queue as "determine this before doing bulk work", not as "there is no queue".
+
+**Is the base red? Read `BASE HEALTH` in `shipyard landing`.** Its first line
+judges the base tip directly: the `merge_group` run(s) whose `head_sha` is the
+tip, and the conclusion of each *required* job there (never the run's
+conclusion, which an advisory Linux failure turns red). `HEALTHY`, `RED` (the
+failing required job and, when parseable, its tests), `PENDING`, or `UNPROVEN`
+(no merge-group run built the tip: a direct push), each with the tip SHA.
 
 **A red base overrides "wait for the queue".** `shipyard landing` also reads
 the repository's own `base-poison-signal/v1` annotation (Pulp publishes it from
