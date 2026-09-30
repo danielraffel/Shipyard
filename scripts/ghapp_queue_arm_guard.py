@@ -55,6 +55,7 @@ import pathlib
 import re
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from types import ModuleType
 from typing import Any
 
@@ -70,11 +71,17 @@ BATCH_ATTRIBUTABLE_REASONS = ("failed_checks",)
 # ("no test failure", "unknown") is not a certification; see the docstring.
 CERTIFYING_VERDICTS = ("infrastructure", "other_pull_request")
 ATTRIBUTOR_TIMEOUT_SECONDS = 120
+# The ejecting run is searched by creation time around the removal, not by
+# recency: on a busy queue every workflow of every failed group is its own run,
+# so "the latest N failed runs" covers only the last hour or so.
+MERGE_GROUP_RUN_WINDOW = timedelta(hours=6)
+MERGE_GROUP_RUN_SKEW = timedelta(minutes=5)
+MERGE_GROUP_RUN_PAGE = 100
+MERGE_GROUP_RUN_MAX_PAGES = 3
 # How much of a failed attributor's stderr a refusal quotes: enough to carry a
 # traceback's final exception line, never a whole log.
 ATTRIBUTOR_STDERR_TAIL_LINES = 5
 ATTRIBUTOR_STDERR_TAIL_CHARS = 600
-MERGE_GROUP_RUN_SCAN = 20
 MERGE_GROUP_ANCESTRY_PROBES = 3
 OPERATOR_NOTE = (
     "An explicit authority override exists for operators; see docs/ghapp-guards.md."
@@ -672,19 +679,40 @@ def resolve_ejecting_batch(
 
     A batch's read-only queue branch is named after one of its entries only, so
     naming is a fast path and commit ancestry is the fallback for a pull request
-    that was not the batch's namesake. Anything unresolved raises: a wrong run
-    would attribute the wrong failure.
+    that was not the batch's namesake. The listing is bounded by creation time
+    around ``at`` and a page cap, not by recency, because a busy queue buries
+    the ejector under later failures within the hour. Anything unresolved
+    raises: a wrong run would attribute the wrong failure.
     """
-    response = run_real_gh(
-        [
-            "api",
-            f"repos/{owner}/{name}/actions/runs"
-            f"?event=merge_group&status=failure&per_page={MERGE_GROUP_RUN_SCAN}",
-        ]
+    try:
+        removed = datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise GuardError(f"cannot read the removal time {at!r}") from error
+
+    def _iso(moment: datetime) -> str:
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    window = (
+        f"{_iso(removed - MERGE_GROUP_RUN_WINDOW)}..{_iso(removed + MERGE_GROUP_RUN_SKEW)}"
     )
-    runs = response.get("workflow_runs") if isinstance(response, dict) else None
-    if not isinstance(runs, list):
-        raise GuardError("cannot list failed merge_group runs")
+    runs: list[Any] = []
+    exhausted = False
+    for page in range(1, MERGE_GROUP_RUN_MAX_PAGES + 1):
+        response = run_real_gh(
+            [
+                "api",
+                f"repos/{owner}/{name}/actions/runs"
+                f"?event=merge_group&status=failure&created={window}"
+                f"&per_page={MERGE_GROUP_RUN_PAGE}&page={page}",
+            ]
+        )
+        listed = response.get("workflow_runs") if isinstance(response, dict) else None
+        if not isinstance(listed, list):
+            raise GuardError("cannot list failed merge_group runs")
+        runs.extend(listed)
+        if len(listed) < MERGE_GROUP_RUN_PAGE:
+            exhausted = True
+            break
     candidates = [
         run
         for run in runs
@@ -721,9 +749,14 @@ def resolve_ejecting_batch(
     for run in candidates[:MERGE_GROUP_ANCESTRY_PROBES]:
         if _contains_head(owner, name, head, run["head_sha"]):
             return _selected(run)
+    scope = (
+        f"created {window}"
+        if exhausted
+        else f"in the newest {len(runs)} created {window} (read cap reached)"
+    )
     raise GuardError(
-        f"no failed merge_group run before {at} contains head {head[:12]}; the ejecting batch "
-        "cannot be identified"
+        f"no failed merge_group run {scope} before {at} contains head {head[:12]}; "
+        "the ejecting batch cannot be identified"
     )
 
 
