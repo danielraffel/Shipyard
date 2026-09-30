@@ -13,6 +13,7 @@ use super::comment::{self, CommentAction};
 use super::digest::{self, DigestOutcome, DigestPayload, DigestPolicy};
 use super::flags::{Flag, Thresholds, evaluate};
 use super::gather::{WatchQuery, gather};
+use super::handback::{self, HandbackConfig, HandbackMode, HandbackReport};
 use super::ledger::{self, PrNow};
 use super::{ACK_LABEL, head_at, open_at};
 use crate::config::LoadedConfig;
@@ -195,6 +196,8 @@ pub struct WatchConfig {
     pub digest_policy: DigestPolicy,
     /// Rule thresholds.
     pub thresholds: Thresholds,
+    /// `[pr_watch.handback]`.
+    pub handback: HandbackConfig,
 }
 
 impl Default for WatchConfig {
@@ -212,6 +215,7 @@ impl Default for WatchConfig {
             digest_command: Vec::new(),
             digest_policy: DigestPolicy::default(),
             thresholds: Thresholds::default(),
+            handback: HandbackConfig::default(),
         }
     }
 }
@@ -250,6 +254,7 @@ impl WatchConfig {
             post_comments: boolean(config, "pr_watch.post_comments").unwrap_or(false),
             digest: boolean(config, "pr_watch.digest").unwrap_or(false),
             repos: strings(config, "pr_watch.repos").unwrap_or_default(),
+            handback: HandbackConfig::from_config(config),
             ..Self::default()
         };
         if let Some(base) = config.get_str("pr_watch.base") {
@@ -322,6 +327,8 @@ pub struct ScanRequest {
     /// no recorded comment). A dry-run CLI plans to show what it would send;
     /// the daemon plans only when it will post.
     pub plan_comments: bool,
+    /// Hand-back: off, plan (dry run), or deliver.
+    pub handback: HandbackMode,
 }
 
 /// What one pass found and did.
@@ -351,6 +358,9 @@ pub struct ScanReport {
     pub gaps: Vec<String>,
     /// GitHub reads sent / served from cache.
     pub reads: crate::gate_cost::ReadStats,
+    /// Hand-back plan or deliveries, when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handback: Option<HandbackReport>,
 }
 
 /// Current pull-request facts for the ledger.
@@ -376,12 +386,14 @@ pub fn pr_now(history: &super::RepoHistory, at: DateTime<Utc>) -> BTreeMap<u64, 
         .collect()
 }
 
-/// Run one pass.
+/// Run one pass. `handback` supplies the host runner and local identity the
+/// hand-back needs; it runs only when both it and `request.handback` ask.
 ///
 /// # Errors
 /// When the history cannot be read or the ledger cannot be locked, loaded,
 /// or saved. Comment and digest delivery failures are reported, not raised,
 /// except a digest failure after its claim is rolled back.
+#[allow(clippy::too_many_arguments)]
 pub fn scan(
     reader: &SyncGhReader<'_>,
     writer: &GhWriter<'_>,
@@ -390,6 +402,7 @@ pub fn scan(
     cache: &ReadCache,
     request: &ScanRequest,
     now: DateTime<Utc>,
+    handback: Option<&mut handback::Deps<'_>>,
 ) -> Result<ScanReport, String> {
     let config = &request.config;
     let query = WatchQuery {
@@ -437,6 +450,19 @@ pub fn scan(
     } else {
         Vec::new()
     };
+    let handback_report = match handback {
+        Some(deps) if request.handback != HandbackMode::Off => Some(handback::run(
+            &mut ledger,
+            &history,
+            now,
+            &config.handback,
+            request.handback,
+            reader,
+            writer,
+            deps,
+        )),
+        _ => None,
+    };
     ledger::save(&request.state_path, &ledger)?;
     let mut persist = |ledger: &ledger::Ledger| ledger::save(&request.state_path, ledger);
     let (digest, digest_payload) = digest::run(
@@ -461,6 +487,7 @@ pub fn scan(
         ledger_changes: events.len(),
         gaps,
         reads: cache.stats(),
+        handback: handback_report,
     })
 }
 
@@ -524,6 +551,7 @@ pub struct DaemonPass {
 /// the daemon's advertised repositories. Comments and digest follow
 /// `post_comments` / `digest`, both off by default.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn daemon_pass(
     global_dir: &std::path::Path,
     state_dir: &std::path::Path,
@@ -591,6 +619,11 @@ pub fn daemon_pass(
             post_comments: watch.post_comments,
             post_digest: watch.digest && !watch.digest_command.is_empty(),
             plan_comments: watch.post_comments,
+            handback: if watch.handback.enabled {
+                HandbackMode::Deliver
+            } else {
+                HandbackMode::Off
+            },
         };
         if watch.digest && watch.digest_command.is_empty() {
             pass.errors.push(format!(
@@ -599,7 +632,27 @@ pub fn daemon_pass(
         }
         // The daemon runs outside any checkout, so it has no repository
         // attributor; flag 3 stays on the named-failed-groups rule there.
-        match scan(&reader, &writer, &mut sender, None, &cache, &request, now) {
+        let mut runner = handback::host::ProcessHostRunner {
+            cmux_path: watch.handback.cmux_path.clone(),
+            timeout: StdDuration::from_secs(watch.handback.timeout_seconds),
+            inbox_dir: handback::host::default_inbox_dir(),
+        };
+        let mut deps = handback::Deps {
+            runner: &mut runner,
+            state_dir: state_dir.to_path_buf(),
+            local_names: handback::local_host_names(),
+            local_machine: handback::owner::local_machine_identity(state_dir),
+        };
+        match scan(
+            &reader,
+            &writer,
+            &mut sender,
+            None,
+            &cache,
+            &request,
+            now,
+            Some(&mut deps),
+        ) {
             Ok(report) => {
                 pass.flags.insert(repo.clone(), report.flags.len());
                 pass.errors.extend(

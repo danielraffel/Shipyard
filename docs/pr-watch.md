@@ -1,11 +1,13 @@
 # PR watch
 
 `shipyard pr-watch` flags open pull requests that are stuck in a way a person
-should look at, with one evidence line per flag. It is read-only on GitHub.
-The only write it can make is one opt-in sticky comment per flagged pull
-request, and that is off unless `--post-comments` (or `[pr_watch]
-post_comments = true` for the daemon) asks for it. It never rebases,
-dequeues, arms, re-runs, or messages a session.
+should look at, with one evidence line per flag. It is read-only on GitHub
+except for two opt-in writes: one sticky comment per flagged pull request
+(`--post-comments`, or `[pr_watch] post_comments = true` for the daemon), and
+the [hand-back](#hand-back)'s `shipyard:needs-agent` label plus a non-input
+notification to the owning agent session (`--deliver-handback`, or
+`[pr_watch.handback] enabled = true`). It never rebases, dequeues, arms,
+re-runs, resumes an agent, or types into a session.
 
 ```bash
 # One pass; a dry run that prints flags and the comment/digest it would send.
@@ -146,8 +148,9 @@ process died mid-send) counts as delivered, so a lost write never double-posts.
 }
 ```
 
-Every `flags[]` entry keeps the v1 fields; `count`, `kinds` and
-`shared_failures` are additive, so a v1 consumer that ignores unknown keys
+Every `flags[]` entry keeps the v1 fields; `count`, `kinds`,
+`shared_failures`, and (when the hand-back ran) `owner` (`state`, `unowned`,
+`agent`, `host`, `session`, `resume`, `path`) are additive, so a v1 consumer that ignores unknown keys
 keeps working. A digest with no `flags` and no `shared_failures` is never sent.
 
 ## Replay
@@ -166,6 +169,95 @@ line, per-PR and shared-failure lines, and the most lines in one digest.
 The history reflects today's pull-request metadata (changed files, commits,
 labels) and timelines with at most 100 queue events per PR (a longer timeline
 is reported as a gap).
+
+## Hand-back
+
+A red pull request is handed back to the session that owns it, in tiers. All of
+it is behind `[pr_watch.handback] enabled` (off by default); `scan --handback`
+plans it as a dry run whatever the config says, and `scan --deliver-handback`
+(or the daemon, when enabled) sends through the channels the config turns on.
+
+A flag is **owner-actionable** when its digest route is per-PR (not a
+"failing on main/pre-existing" shared failure, not an ejection the attributor
+pinned on a neighbour) and it is a repeated test failure, red while armed, or a
+repeated ejection. A rebase treadmill (the base moving) and the split advisory
+are not.
+
+| tier | when | what |
+|---|---|---|
+| 0 | an owner-actionable flag holds | the sticky comment, plus the `shipyard:needs-agent` label; the label is removed when every such flag is addressed |
+| 1 | the owner's session is live | `cmux notify --surface <uuid>` (and, with `status = true`, a `shipyard-pr-<n>` sidebar pill, cleared later) plus an inbox line on the owner's host |
+| 2 | the owner is dead, unknown, or unreachable for `unowned_after_hours` | the pull request's digest line carries `owner.unowned = true` with the `whence` resume hint |
+
+**Label.** Only added or removed, never defined: if the repository has no
+`shipyard:needs-agent` label the pass reports it and adds nothing (GitHub would
+otherwise create it on add). A label the pass did not add is never removed, and
+one a person removed is not put back during the same episode.
+
+**Owner.** The merge steward's exact-head handoff record (on this machine's
+state directory) wins; otherwise the `<!-- whence {...} -->` marker in the pull
+request body (`prov.host`, `agent`, `session`, `terminal_address`, `resume`,
+`path`). A malformed marker (not JSON, no session, a session or surface that
+does not look like one) is reported, never guessed at. The stamped host name
+routes through `[pr_watch.handback.hosts]` to an ssh alias (or `"local"`); a
+host absent from the map is local only when it is this machine's `hostname -s`,
+and otherwise unreachable. Nothing about the fleet is hardcoded.
+
+**Liveness.** `cmux sessions list --json --session <id>` on the owner's host
+(read-only). Live means a record for exactly that session with
+`agent_lifecycle = running` and `stored_pid_exists = true`; the record's current
+surface is used. No record or a stopped one is dead; unreadable output is
+unknown; an ssh failure or an unmapped host is unreachable.
+
+**Once per episode.** A delivery is recorded in the ledger (`handback.delivered`)
+against the flag episode's start, so an unchanged episode is never re-sent; a
+new episode (new head, or a flag that cleared and came back) is. A session gets
+at most one delivery per `session_interval_minutes` (pending episodes wait) and
+several pull requests for one session go out as one notification. A delivery
+whose every channel failed is not recorded and is retried next pass.
+
+**Commands.** The only processes the hand-back can start are
+`cmux sessions list`, `cmux notify`, `cmux set-status`/`clear-status` (key
+`shipyard-pr-<n>`), and one fixed `sh -c` inbox append, run directly or as
+`ssh -o BatchMode=yes -o ConnectTimeout=10 -- <alias> <single-quoted words>`.
+Every argv passes an allowlist before it runs, and tests assert `cmux send`,
+`send-key`, agent CLIs (`claude --resume`, `codex exec resume`), extra ssh
+options, and unquoted shell never pass. It never types into a session, resumes
+or starts an agent, or arms/dequeues a pull request.
+
+**Inbox.** One JSON line per episode (`shipyard.pr-watch.handback/v1`: `id`,
+`pr`, `url`, `title`, `kind`, `key`, `verdict`, `evidence`, `head_sha`,
+`first_seen_at`, `delivered_at`) appended to
+`~/.local/state/shipyard/inbox/<session-id>.jsonl` (`$SHIPYARD_INBOX_DIR`
+overrides locally). The Shipyard Claude plugin's `hooks/handback-inbox.py` runs
+at SessionStart and UserPromptSubmit: it is silent when the inbox is absent or
+empty; otherwise it claims the file (rename), prints at most five entries
+(2,000 characters, each line 300) as agent context, and moves them to
+`<session-id>.shown.jsonl` so they show once. Codex reads the same hook
+contract from `~/.codex/hooks.json`; add the script there to cover Codex
+sessions:
+
+```json
+{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "timeout": 5,
+  "command": "python3 /path/to/Shipyard/hooks/handback-inbox.py"}]}]}}
+```
+
+```toml
+[pr_watch.handback]
+enabled = false          # daemon delivers only when true
+label = true             # tier 0 label add/remove
+notify = false           # tier 1 cmux notify
+status = false           # tier 1 sidebar pill (with notify)
+inbox = false            # tier 1 inbox line
+session_interval_minutes = 30
+unowned_after_hours = 1
+timeout_seconds = 20
+# cmux_path = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+
+[pr_watch.handback.hosts]   # stamped host name -> ssh alias, or "local"
+m3 = "m3"
+Daniels-Mac-Studio-m3 = "m3"
+```
 
 ## Daemon job and config
 

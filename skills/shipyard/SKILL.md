@@ -409,6 +409,18 @@ PR=FLAGS --control merged-clean` runs the same rules over a past window. The
 daemon job is off unless `[pr_watch] enabled = true`. See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
+`shipyard pr-watch scan --handback` plans the hand-back (dry run): for a PR
+with an owner-actionable flag it resolves the owner (steward handoff record,
+else the PR body's `whence` marker), probes the session read-only with
+`cmux sessions list`, and prints the `shipyard:needs-agent` label change, the
+`cmux notify` on the live session's surface, and the inbox line it would write
+to `~/.local/state/shipyard/inbox/<session>.jsonl` on the owner's host (the
+plugin's SessionStart/UserPromptSubmit hook shows that inbox to the agent once).
+Owners not live for `unowned_after_hours` are marked unowned on the digest line.
+`--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
+daemon delivers when that is on. It never types into a session (no
+`cmux send`), never resumes or starts an agent, and never arms or dequeues.
+
 Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
 --target <name>` for the shadow-only exact-head selector. Policy must come from
 the authenticated protected base and may contain only reviewed path globs plus
