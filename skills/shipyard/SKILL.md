@@ -406,7 +406,10 @@ another flag. It is a dry run by default; `--post-comments` edits one sticky
 comment (comment endpoints only) and `--digest` sends the hourly digest through
 `[pr_watch.digest] command`. `shipyard pr-watch replay --since 7d --expect
 PR=FLAGS --control merged-clean` runs the same rules over a past window. The
-daemon job is off unless `[pr_watch] enabled = true`. See
+daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
+`[pr_watch.digest] enabled = true` (never `[pr_watch] digest = true` beside a
+`[pr_watch.digest]` table: TOML rejects a key that is both, and a table without
+`enabled` stays off with a warning in the `pr_watch_pass` event). See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
 `shipyard pr-watch scan --handback` plans the hand-back (dry run): for a PR
