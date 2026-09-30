@@ -3,6 +3,16 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02300"></a>
+## [0.230.0] - 2026-09-29
+
+- fix/daemon stable tcc identity ([#647](https://github.com/danielraffel/Shipyard/pull/647))
+
+<a id="v02290"></a>
+## [0.229.0] - 2026-09-29
+
+- fix/reconcile quiet ledger ([#651](https://github.com/danielraffel/Shipyard/pull/651))
+
 <a id="v02280"></a>
 ## [0.228.0] - 2026-09-29
 
@@ -1681,6 +1691,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.230.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.230.0
+[0.229.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.229.0
 [0.228.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.228.0
 [0.226.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.226.0
 [0.225.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.225.1

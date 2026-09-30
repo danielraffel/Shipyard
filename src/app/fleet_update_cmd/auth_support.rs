@@ -17,6 +17,9 @@ pub(super) const BEFORE_HELPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_AUTH
 pub(super) const BEFORE_WRAPPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_AUTH_WRAPPER_TARGET=";
 pub(super) const AFTER_HELPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_HELPER_TARGET=";
 pub(super) const AFTER_WRAPPER_TARGET_PREFIX: &str = "SHIPYARD_FLEET_AFTER_AUTH_WRAPPER_TARGET=";
+/// Per-host guard every install transaction locks before mutating; a Sandbox
+/// canary holds it for its whole lifetime.
+pub(super) const INSTALL_GUARD_NAME: &str = "fleet-auth-support.guard";
 /// Exit status of a host transaction that found the host's install guard
 /// already held (a sandbox canary or another update owns the host). Nothing on
 /// the host changed, so the controller defers instead of failing the attempt.
