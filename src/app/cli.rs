@@ -2345,6 +2345,9 @@ pub(super) enum GovernanceCommand {
         /// Show what would change without writing.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Write branch protection. Without it, apply only previews.
+        #[arg(long = "yes", short = 'y', conflicts_with = "dry_run")]
+        yes: bool,
         /// Apply rules from a snapshot file instead of project config.
         #[arg(long = "from")]
         from_path: Option<PathBuf>,

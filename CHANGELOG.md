@@ -3,6 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02340"></a>
+## [0.234.0] - 2026-09-30
+
+- fix/governance policy from base ([#658](https://github.com/danielraffel/Shipyard/pull/658))
+- fix/guard ejecting batch window ([#650](https://github.com/danielraffel/Shipyard/pull/650))
+- fix/guard attributor env ([#649](https://github.com/danielraffel/Shipyard/pull/649))
+
 <a id="v02330"></a>
 ## [0.233.0] - 2026-09-30
 
@@ -1711,6 +1718,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.234.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.234.0
 [0.233.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.233.0
 [0.232.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.232.1
 [0.232.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.232.0
