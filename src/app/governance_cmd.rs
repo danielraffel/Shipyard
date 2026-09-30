@@ -865,7 +865,10 @@ mod tests {
     #[test]
     fn governance_apply_without_yes_previews_and_writes_nothing() {
         let (code, put_called, stdout) = apply_json(false);
-        assert!(!put_called, "apply without --yes must not write branch protection");
+        assert!(
+            !put_called,
+            "apply without --yes must not write branch protection"
+        );
         assert_eq!(code, std::process::ExitCode::from(2));
         let text = String::from_utf8(stdout).expect("utf8");
         assert!(text.contains("Nothing written"), "{text}");

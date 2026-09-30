@@ -92,7 +92,10 @@ pub(super) fn landability_command<W: Write>(
     let (config, policy_source) =
         config.with_project_layer_at_ref(mode, cwd, &format!("origin/{base}"));
     if json {
-        if matches!(policy_source, ProjectLayerSource::WorkingTreeFallback { .. }) {
+        if matches!(
+            policy_source,
+            ProjectLayerSource::WorkingTreeFallback { .. }
+        ) {
             eprintln!("{}", policy_source.describe());
         }
     } else {

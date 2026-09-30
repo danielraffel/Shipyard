@@ -159,7 +159,10 @@ impl LoadedConfig {
         git_ref: &str,
     ) -> (Self, ProjectLayerSource) {
         let identity = ProductIdentity::for_mode(mode);
-        let spec = format!("{git_ref}:{}/config.toml", identity.tracked_project_dir_name);
+        let spec = format!(
+            "{git_ref}:{}/config.toml",
+            identity.tracked_project_dir_name
+        );
         let fallback = |reason: String| {
             (
                 self.clone(),
@@ -187,8 +190,8 @@ impl LoadedConfig {
             Err(error) => return fallback(format!("{spec} is not valid TOML: {error}")),
         };
         let mut data = Table::new();
-        let layered = merge_if_present(&mut data, &self.global_dir.join("config.toml"))
-            .and_then(|()| {
+        let layered =
+            merge_if_present(&mut data, &self.global_dir.join("config.toml")).and_then(|()| {
                 deep_merge(&mut data, &project);
                 match &self.local_dir {
                     Some(local_dir) => merge_if_present(&mut data, &local_dir.join("config.toml")),
@@ -367,8 +370,11 @@ mod tests {
         let global_dir = sandbox.path().join("global");
         std::fs::create_dir_all(repo.join(".shipyard")).expect("project dir");
         std::fs::create_dir_all(&global_dir).expect("global dir");
-        std::fs::write(global_dir.join("config.toml"), "[defaults]\npriority = \"normal\"\n")
-            .expect("write global");
+        std::fs::write(
+            global_dir.join("config.toml"),
+            "[defaults]\npriority = \"normal\"\n",
+        )
+        .expect("write global");
         git(&["init", "-q", "-b", "main"], &repo);
         std::fs::write(
             repo.join(".shipyard/config.toml"),
@@ -385,19 +391,20 @@ mod tests {
         )
         .expect("write stale config");
 
-        let working = LoadedConfig::load_from_cwd_with_global_dir(
-            RuntimeMode::Isolated,
-            &repo,
-            global_dir,
-        )
-        .expect("load");
+        let working =
+            LoadedConfig::load_from_cwd_with_global_dir(RuntimeMode::Isolated, &repo, global_dir)
+                .expect("load");
         let checks = |config: &LoadedConfig| {
             config
                 .get("governance.required_status_checks")
                 .and_then(toml::Value::as_array)
                 .map(Vec::len)
         };
-        assert_eq!(checks(&working), Some(1), "control: the working tree is stale");
+        assert_eq!(
+            checks(&working),
+            Some(1),
+            "control: the working tree is stale"
+        );
 
         let (base, source) =
             working.with_project_layer_at_ref(RuntimeMode::Isolated, &repo, "origin/main");
@@ -407,7 +414,10 @@ mod tests {
 
         let (fallback, source) =
             working.with_project_layer_at_ref(RuntimeMode::Isolated, &repo, "origin/absent");
-        assert!(matches!(source, ProjectLayerSource::WorkingTreeFallback { .. }));
+        assert!(matches!(
+            source,
+            ProjectLayerSource::WorkingTreeFallback { .. }
+        ));
         assert!(source.describe().starts_with("WARNING"));
         assert_eq!(checks(&fallback), Some(1));
     }
