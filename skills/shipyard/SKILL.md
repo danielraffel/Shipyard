@@ -3479,6 +3479,15 @@ supervisor must spawn the daemon before blocking SIGTERM for its forwarding
 thread; and a RunAtLoad probe plist must never be written into
 `~/Library/LaunchAgents`, where it would rerun at every login.
 
+A launcher host changes the daemon's parent: it is the resident launcher, not
+launchd (1). Any check that the production daemon "is still launchd-owned"
+must accept both shapes and nothing else. The Sandbox E2E M3 invariant does
+this through `scripts/production_daemon_parent.py`: parent pid 1, or a parent
+whose command is exactly `<~/.local/libexec/shipyard/shipyard-daemon-launcher>
+--mode shipyard daemon supervise --exec <installed> [--repo …]` (no
+`--in-place`) and whose own parent is pid 1. A bare `ppid == 1` assertion fails
+every run on a launcher host even though the sandbox passed.
+
 ### A reader that shares a writer's lock inherits the writer's lifetime
 
 The per-PR ship-state lock is held by a ship worker for its **entire run**. Any
