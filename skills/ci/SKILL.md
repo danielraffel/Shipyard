@@ -164,6 +164,14 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+## A missing key is not an empty list
+
+`validation_signals` reads a merge group's check runs page by page. A page
+without a `check_runs` array (an error body, a schema change) used to count as
+zero runs, which reported "no receipt decisions" for a group nobody read. It is
+now an error and the group reads `unreadable`. When adding a GitHub reader,
+treat a missing collection key as an error, never as `unwrap_or_default()`.
+
 ## Quick reference
 
 | Task | Command |
