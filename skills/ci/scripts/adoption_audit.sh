@@ -20,6 +20,10 @@ REPO="${1:-}"
 BASE="${2:-main}"
 GH="${GH:-ghapp}"
 PR_SAMPLE="${PR_SAMPLE:-2}"
+# Merged PRs read for the cheap per-PR proxies (author, auto-merge events).
+EFFECT_SAMPLE="${EFFECT_SAMPLE:-10}"
+# The GitHub App identity `shipyard pr` opens pull requests as.
+APP_LOGIN="${SHIPYARD_APP_LOGIN:-shipyard-local[bot]}"
 
 if [ -z "$REPO" ]; then
   echo "usage: $0 OWNER/REPO [BASE]" >&2
@@ -68,10 +72,11 @@ has_cfg() { printf '%s\n' "$cfg" | grep -Eq "$1"; }
 tree_has() { git ls-tree -r --name-only "origin/$BASE" | grep -Eq "$1"; }
 
 # ── Sample recent merged PRs once; several rows read these reports ────────
-tier_fast=0; tier_seen=0; reuse=0; refuse=0; sampled=""; landing_ok=0; mg_runs=0; outs=""
+tier_fast=0; tier_seen=0; reuse=0; refuse=0; sampled=""; landing_ok=0; mg_runs=0; outs=""; merged=""
 if [ "$ctl_git" = ok ] && [ "$ctl_api" = ok ] && [ "$ctl_cli" = ok ]; then
-  prs="$(api "repos/$REPO/pulls?state=closed&base=$BASE&per_page=30" \
-      --jq '[.[]|select(.merged_at)][].number' 2>/dev/null | head -n "$PR_SAMPLE")"
+  merged="$(api "repos/$REPO/pulls?state=closed&base=$BASE&per_page=30" \
+      --jq '[.[]|select(.merged_at)][]|"\(.number) \(.user.login)"')"
+  prs="$(printf '%s\n' "$merged" | sed '/^$/d' | head -n "$PR_SAMPLE" | cut -d' ' -f1)"
   for n in $prs; do
     out="$(shipyard landing --repo "$REPO" --pr "$n" 2>&1 || true)"
     sampled="$sampled #$n"
@@ -104,7 +109,16 @@ else
     s=$((s+1)); ev="$ev version_bump_check.py"
   fi
   case $s in 3) st=present ;; 0) st=absent ;; *) st=partial ;; esac
-  row "shipyard pr flow" "$st" "${ev:-no config, no gate scripts}"
+  # Proxy: share of recent merged PRs opened as the App. ghapp uses the same
+  # identity, so this proves App-routed submission, not the gates by itself.
+  pv=unmeasured
+  n_m="$(printf '%s\n' "$merged" | sed '/^$/d' | head -n "$EFFECT_SAMPLE" | wc -l | tr -d ' ')"
+  if [ "${n_m:-0}" -gt 0 ]; then
+    n_app="$(printf '%s\n' "$merged" | sed '/^$/d' | head -n "$EFFECT_SAMPLE" | grep -cF " $APP_LOGIN")"
+    if [ "$n_app" -gt 0 ]; then pv="yes ($n_app/$n_m merged PRs opened as $APP_LOGIN)"
+    else pv="no (0/$n_m merged PRs opened as $APP_LOGIN)"; fi
+  fi
+  row "shipyard pr flow" "$st" "${ev:-no config, no gate scripts}" "$pv"
 fi
 
 # ── Live protection: required contexts + effective rules ──────────────────
@@ -168,8 +182,10 @@ else
   elif [ "$required_gate" = yes ]; then st=present
   elif [ "$n_gate_wfs" -gt 0 ]; then st=partial
   else st=absent; fi
+  # Running is not blocking: the CI copy is proven only by blocks, which
+  # need per-step job reads this audit does not spend.
   if [ "$landing_ok" = 0 ] || [ -z "$gate_ctx" ]; then pv=unmeasured
-  elif reported "$gate_ctx"; then pv="yes ('$gate_ctx' reported on sampled heads)"
+  elif reported "$gate_ctx"; then pv="unmeasured (runs on heads; blocks not counted)"
   else pv="no ('$gate_ctx' never reported on sampled heads)"; fi
   row "version/skill-sync gates" "$st" "$n_gate_wfs of $wf_ctl workflow(s) run the gate scripts; required=$required_gate" "$pv"
 fi
@@ -205,7 +221,20 @@ else
   elif [ "$am" = true ] && [ "$mc" = true ]; then st=present
   elif [ "$am" = true ] || [ "$mc" = true ]; then st=partial
   else st=absent; fi
-  row "auto-merge (MERGE)" "$st" "allow_auto_merge=$am allow_merge_commit=$mc"
+  # Proxy: merged PRs whose timeline shows AutoMergeEnabledEvent.
+  pv=unmeasured; n_ae=0; n_read=0
+  owner="${REPO%%/*}"; name="${REPO#*/}"
+  for n in $(printf '%s\n' "$merged" | sed '/^$/d' | head -n "$EFFECT_SAMPLE" | cut -d' ' -f1); do
+    c="$(api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$n){timelineItems(itemTypes:[AUTO_MERGE_ENABLED_EVENT],first:1){totalCount}}}}" \
+        --jq '.data.repository.pullRequest.timelineItems.totalCount')"
+    case "$c" in ''|*[!0-9]*) continue ;; esac
+    n_read=$((n_read+1)); [ "$c" -gt 0 ] && n_ae=$((n_ae+1))
+  done
+  if [ "$n_read" -gt 0 ]; then
+    if [ "$n_ae" -gt 0 ]; then pv="yes ($n_ae/$n_read merged PRs had auto-merge enabled)"
+    else pv="no (0/$n_read merged PRs had auto-merge enabled)"; fi
+  fi
+  row "auto-merge (MERGE)" "$st" "allow_auto_merge=$am allow_merge_commit=$mc" "$pv"
 fi
 
 if [ -z "$sampled" ] || [ "$landing_ok" = 0 ]; then
@@ -218,7 +247,12 @@ else
   if [ "$tier_fast" -gt 0 ]; then pv="yes ($tier_fast fast-tier head check(s))"; else pv=no; fi
   row "PR-head fast tier" "$st" "shipyard-test-tier: $tier_fast fast / $tier_seen annotated (PRs$sampled)" "$pv"
   if [ $((reuse + refuse)) -gt 0 ]; then st=present; else st=absent; fi
-  if [ "$reuse" -gt 0 ]; then pv="yes ($reuse reuse decision(s))"; else pv="no (0 reuse decisions)"; fi
+  # Reuse is a low-yield effect (a few merge groups in ten), so a small sample
+  # with no reuse is not evidence of "no": below the floor it is unmeasured.
+  dec=$((reuse + refuse))
+  if [ "$reuse" -gt 0 ]; then pv="yes ($reuse of $dec decisions reused)"
+  elif [ "$dec" -ge "${RECEIPT_MIN_DECISIONS:-10}" ]; then pv="no (0 of $dec decisions reused)"
+  else pv="unmeasured (0 of $dec reused; below ${RECEIPT_MIN_DECISIONS:-10}, use metrics gate-cost)"; fi
   row "protected receipt reuse" "$st" "shipyard-receipt-decision: $reuse reuse / $refuse refuse (PRs$sampled)" "$pv"
 fi
 
@@ -280,11 +314,13 @@ for r in "${rows[@]}"; do
   printf '%-28s %-9s %-40s %s\n' "$f" "$s" "$p" "$e"
 done
 
-# Adoption order: each feature depends on the ones above it.
+# Adoption order: each feature depends on the ones above it. The CI copy of
+# the version/skill gates and runner governance are left out: neither has a
+# demonstrated effect yet (see references/adoption.md), so neither is
+# recommended.
 next=""
-for f in "shipyard pr flow" "required checks" "version/skill-sync gates" \
-         "auto-merge (MERGE)" "merge queue" "PR-head fast tier" \
-         "protected receipt reuse" "runner governance"; do
+for f in "shipyard pr flow" "required checks" "auto-merge (MERGE)" "merge queue" \
+         "PR-head fast tier" "protected receipt reuse"; do
   for r in "${rows[@]}"; do
     IFS='|' read -r rf rs _ <<< "$r"
     if [ "$rf" = "$f" ] && { [ "$rs" = absent ] || [ "$rs" = partial ] || [ "$rs" = UNKNOWN ]; }; then

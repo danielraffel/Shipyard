@@ -61,13 +61,17 @@ echo '{"required_status_checks":{"contexts":["Enforce version & skill sync","mac
 echo '[{"type":"merge_queue","parameters":{"merge_method":"MERGE"}}]' > "$T/fx/rules.json"
 echo '[{"id":1}]' > "$T/fx/rulesets.json"
 echo '{"total_count":2}' > "$T/fx/runners.json"
-echo '[{"number":7,"merged_at":"2026-09-30T00:00:00Z"}]' > "$T/fx/pulls.json"
+echo '[{"number":7,"merged_at":"2026-09-30T00:00:00Z","user":{"login":"shipyard-local[bot]"}}]' > "$T/fx/pulls.json"
+echo '{"data":{"repository":{"pullRequest":{"timelineItems":{"totalCount":1}}}}}' > "$T/fx/graphql.json"
 
 cat > "$T/bin/ghapp" <<'EOF'
 #!/usr/bin/env bash
 # args: api PATH [--jq EXPR]
 path="$2"; jq_expr="."
-[ "${3:-}" = "--jq" ] && jq_expr="$4"
+shift 2
+while [ $# -gt 0 ]; do
+  case "$1" in --jq) jq_expr="$2"; shift 2 ;; *) shift ;; esac
+done
 fx="$STUB_FX"; mode="${STUB_GH:-healthy}"
 deny() { echo "{\"message\":\"$1\",\"status\":\"$2\"}"; echo "gh: $1 (HTTP $2)" >&2; exit 1; }
 [ "$mode" = down ] && deny "Bad credentials" 401
@@ -84,6 +88,7 @@ case "$path" in
     [ "$mode" = noadmin ] && deny "Resource not accessible by integration" 403
     f=runners.json ;;
   repos/*/*/pulls*) f=pulls.json ;;
+  graphql) f=graphql.json ;;
   repos/*/*)
     if [ "$mode" = foreign ]; then echo '{"full_name":"someone/else"}' | jq -r "$jq_expr"; exit 0; fi
     if [ "$mode" = noadmin ]; then jq -r "del(.allow_auto_merge,.allow_merge_commit) | $jq_expr" "$fx/repo.json"; exit 0; fi
@@ -99,6 +104,10 @@ case "$1" in
   --version) echo "shipyard 0.0.0" ;;
   landing)
     if [ "${STUB_LANDING:-ok}" = broken ]; then echo "error: GitHub API rate limited"; exit 9; fi
+    if [ "${STUB_LANDING:-ok}" = refuse ]; then
+      printf 'VALIDATION\n  merge group def (merge commit): full suite ran in this merge group\n    macos: validated in full: receipt refused because no artifact\n'
+      exit 0
+    fi
     cat <<'OUT'
 PR #7 in acme/widget: MERGED
 VALIDATION
@@ -118,7 +127,7 @@ chmod +x "$T/bin/ghapp" "$T/bin/shipyard"
 
 # Directory holding only the tools the audit needs, minus shipyard.
 mkdir -p "$T/noship"
-for tool in git jq python3 bash sed grep sort wc tr head cat mktemp dirname env; do
+for tool in git jq python3 bash sed grep sort wc tr head cut cat mktemp dirname env; do
   p="$(command -v "$tool" 2>/dev/null)"; case "$p" in /*) ln -sf "$p" "$T/noship/$tool" ;; esac
 done
 ln -sf "$T/bin/ghapp" "$T/noship/ghapp"
@@ -130,6 +139,14 @@ run() { # run CWD PATHDIR [VAR=VAL...]
 }
 PATH_BASE="$T/noship"
 
+proven_of() { # proven_of OUTPUT FEATURE -> first word of the PROVEN column
+  printf '%s\n' "$1" | awk -v f="$2" 'substr($0,1,length(f))==f { rest=substr($0,39); split(rest,a," "); print a[1]; exit }'
+}
+expect_proven() { # expect_proven CASE OUTPUT FEATURE WANT
+  local got; got="$(proven_of "$2" "$3")"
+  if [ "$got" = "$4" ]; then passes=$((passes+1))
+  else fails=$((fails+1)); echo "FAIL [$1] $3 proven: want $4, got '${got:-<missing>}'"; fi
+}
 status_of() { # status_of OUTPUT FEATURE
   printf '%s\n' "$1" | awk -v f="$2" 'substr($0,1,length(f))==f { rest=substr($0,29); split(rest,a," "); print a[1]; exit }'
 }
@@ -145,6 +162,12 @@ api_rows=("required checks" "version/skill-sync gates" "merge queue" "auto-merge
 # Control: healthy fixtures produce present everywhere.
 out="$(run "$T/work" "$T/bin")"
 for f in "shipyard pr flow" "${api_rows[@]}" "host classes (this machine)"; do expect healthy "$out" "$f" present; done
+for f in "shipyard pr flow" "required checks" "merge queue" "auto-merge (MERGE)" \
+         "PR-head fast tier" "protected receipt reuse" "host classes (this machine)"; do
+  expect_proven healthy "$out" "$f" yes
+done
+# Running is not blocking: the gate row must never claim proof from presence.
+expect_proven healthy "$out" "version/skill-sync gates" unmeasured
 
 # Control: a genuinely unprotected branch is a real absence, not UNKNOWN.
 out="$(run "$T/work" "$T/bin" STUB_GH=unprotected)"
@@ -154,6 +177,7 @@ expect unprotected "$out" "merge queue" absent
 # 401 / no network: every API-fed row is UNKNOWN; git-only rows still answer.
 out="$(run "$T/work" "$T/bin" STUB_GH=down)"
 for f in "${api_rows[@]}"; do expect api-down "$out" "$f" UNKNOWN; done
+expect_proven api-down "$out" "shipyard pr flow" unmeasured
 expect api-down "$out" "shipyard pr flow" present
 
 # The API answers for a different repository.
@@ -176,6 +200,11 @@ expect wrong-cwd "$out" "version/skill-sync gates" UNKNOWN
 out="$(run "$T/work" "$T/bin" STUB_LANDING=broken)"
 expect landing-broken "$out" "PR-head fast tier" UNKNOWN
 expect landing-broken "$out" "protected receipt reuse" UNKNOWN
+
+# Two refusals and no reuse: too few decisions to call a low-yield effect absent.
+out="$(run "$T/work" "$T/bin" STUB_LANDING=refuse)"
+expect refuse-only "$out" "protected receipt reuse" present
+expect_proven refuse-only "$out" "protected receipt reuse" unmeasured
 
 # No shipyard binary on PATH.
 out="$(run "$T/work" "$T/noship")"

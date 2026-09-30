@@ -6,10 +6,25 @@ whether the repository already has it. Detect first; the most expensive
 mistake here is reimplementing something that is already wired, or wiring the
 queue before the checks it depends on.
 
-Pulp (`Generous-Corp/pulp`) is the most complete consumer and is used below as
-the worked example. Where a capability exists only in Pulp's own tooling, this
-page says so and names what would have to move into Shipyard for another
-repository to get it without copying Pulp.
+**Only features with a demonstrated effect are recommended here.** Each
+section carries a verdict from the 2026-09-30 feature-proof audit (Pulp's
+planning repo, `research/2026-09-30-feature-proof-audit.md`), which asked of
+every feature: is it on main, does it run on the live path, and does it produce
+a measurable effect, with a count, a source, a sample size and a control.
+
+| verdict | meaning here |
+|---|---|
+| WORKING | documented; adopt it |
+| not ready: `<reason>` | BROKEN or UNPROVEN. Detect it so you do not rebuild it, but do not adopt or rely on it yet |
+| (absent from this page) | DEAD. It never runs; do not adopt it |
+
+Re-check a "not ready" verdict against a newer audit before acting on it; they
+are dated facts, not permanent ones.
+
+Pulp (`Generous-Corp/pulp`) is the most complete consumer and is the worked
+example. Where a capability exists only in Pulp's own tooling, this page says
+so and names what would have to move into Shipyard for another repository to
+get it without copying Pulp.
 
 ## Run the adoption audit first
 
@@ -20,36 +35,50 @@ repository provenance from the working directory):
 skills/ci/scripts/adoption_audit.sh OWNER/REPO [BASE]
 ```
 
-It is read-only. It prints one row per feature (`present`, `partial`,
-`absent`, `n/a`, or `UNKNOWN`), the evidence for each, and the next feature to
-adopt in dependency order. Three controls run before any verdict: `origin/BASE`
-resolves to a non-empty tree, the checkout's `origin` is the named repository,
-and the API returns that repository's own name. If a control fails, the rows it
-feeds read `UNKNOWN`, never `absent`. A partial read counts as a failed read:
-branch protection answering 403 without admin scope, `allow_auto_merge` omitted
-for a caller without push access, or a landing report that never reached its
-`VALIDATION` section all yield `UNKNOWN`; only GitHub's explicit 404 "Branch
-not protected" is read as a real absence. `skills/ci/scripts/test_adoption_audit.sh`
-covers each of those cases offline with stub `ghapp` and `shipyard` binaries,
-plus a healthy and an unprotected control. Run it after editing the audit.
+It is read-only. Each row has two separate verdicts:
 
-Measured on 2026-09-30:
+- **STATUS** (`present`, `partial`, `absent`, `n/a`, `UNKNOWN`): is it
+  configured?
+- **PROVEN** (`yes`, `no`, `unmeasured`, `-`): did it have a non-zero effect on
+  recently merged PRs, measured with the proxy named in its section below?
 
-| feature | Pulp | tartci | Shipyard |
-|---|---|---|---|
-| `shipyard pr` flow | present | absent | present |
-| required checks | present (6 live, declared) | partial (1 live, undeclared) | absent (branch unprotected) |
-| version/skill-sync gates | present (required) | absent | partial (runs, not required) |
-| merge queue | present (MERGE) | absent | absent |
-| auto-merge allowed | present | present | partial (auto-merge off) |
-| PR-head fast tier | present | absent | absent |
-| protected receipt reuse | present | absent | absent |
-| host classes (machine) | present | present (same machine) | present (same machine) |
-| runner governance | present | n/a (hosted only) | absent (1 runner, undeclared) |
+`present` alone never means working. The report ends with the next feature to
+adopt (only WORKING features are recommended) and a "present but not proven"
+list.
 
-Recommended next: tartci, the `shipyard pr` flow; Shipyard, required checks.
+Controls run before any verdict: `origin/BASE` resolves to a non-empty tree,
+the checkout's `origin` is the named repository, the API returns that
+repository's own name, and each landing report reached its `VALIDATION`
+section. If a control fails, the rows it feeds read `UNKNOWN`, never `absent`.
+A partial read counts as a failed read: branch protection answering 403
+without admin scope, `allow_auto_merge` omitted for a caller without push
+access, or a missing tool all yield `UNKNOWN`; only GitHub's explicit 404
+"Branch not protected" is read as a real absence. A low-yield effect (receipt
+reuse) needs 10 decisions before a zero reads `no`.
 
-Two instrument traps the audit already avoids, and that hand-run probes hit:
+`skills/ci/scripts/test_adoption_audit.sh` covers each failure case offline
+with stub `ghapp` and `shipyard` binaries, plus healthy and unprotected
+controls. Run it after editing the audit.
+
+Measured on 2026-09-30 (10 merged PRs for author and auto-merge, 2 for
+landing reports):
+
+| feature | Pulp status / proven | tartci status / proven |
+|---|---|---|
+| `shipyard pr` flow | present / yes (6 of 10 opened as the App) | absent |
+| required checks | present / yes (6 of 6 reported on heads) | partial (1 live, undeclared) / yes (1 of 1) |
+| version/skill-sync gates (CI) | present / unmeasured (not ready) | absent |
+| merge queue | present / yes (2 merge-group runs) | absent |
+| auto-merge (MERGE) | present / yes (10 of 10) | present / yes (10 of 10) |
+| PR-head fast tier | present / yes | absent |
+| protected receipt reuse | present / unmeasured (0 of 2, below floor) | absent |
+| host classes (machine) | present / yes (4 of 4 readable) | same machine, same answer |
+| runner governance | present / unmeasured (not ready) | n/a (hosted runners only) |
+
+Recommended next: Pulp, nothing in the core set; tartci, the `shipyard pr`
+flow.
+
+Instrument traps the audit already avoids, and that hand-run probes hit:
 
 - **Classic branch protection does not report rulesets.** `branches/main/protection`
   has no merge-queue field, so its silence is not absence. Read
@@ -57,11 +86,11 @@ Two instrument traps the audit already avoids, and that hand-run probes hit:
   rulesets) or `repos/O/R/rulesets`.
 - **A 404 body arrives on stdout.** `ghapp api repos/O/R/branches/main/protection`
   on an unprotected branch prints `{"message":"Branch not protected",...}`,
-  which a `--jq` filter or a line count happily reads as one required context.
-  Test the exit status, not the output.
-
-And three that apply to Shipyard's own readers:
-
+  which a `--jq` filter or a line count reads as one required context. Test the
+  exit status, not the output.
+- **The PR author is the App for `ghapp` too.** `shipyard-local[bot]` opens PRs
+  from both `shipyard pr` and plain `ghapp`; tartci's PRs are App-authored with
+  no Shipyard config. Read the author share as "App-routed", not "gated".
 - `shipyard landability` and `shipyard governance status` read
   `.shipyard/config.toml` from the **working tree**, not from the base. On a
   stale checkout of Pulp, `landability` reported five required contexts as
@@ -76,24 +105,27 @@ And three that apply to Shipyard's own readers:
   apply`. That is a write that would change branch protection. Never run it
   from an audit.
 
+The feature-proof audit did not measure `landability`, `governance status` or
+`landing` as features; they are the instruments. Cross-check what they report
+against the raw API reads above before acting on it.
+
 ## Adoption order
 
 Each step assumes the ones before it:
 
 1. `shipyard pr` flow (config + gate scripts).
 2. Required checks, live and declared to Shipyard.
-3. Version/skill-sync gate as a required check.
-4. Auto-merge allowed, merge method MERGE.
-5. Merge queue, only once strict up-to-date protection is causing a treadmill.
-6. PR-head fast tier, only with a queue (the full suite has to run somewhere).
-7. Protected receipt reuse, only with a queue and full-suite evidence on heads.
-8. Runner governance and host classes, only with self-hosted runners.
+3. Auto-merge allowed, merge method MERGE.
+4. Merge queue, once strict up-to-date protection is causing a treadmill.
+5. PR-head fast tier, only with a queue (the full suite has to run somewhere).
+6. Protected receipt reuse, only with a queue and full-suite evidence on heads.
 
+Host classes and `fleet-update` are machine setup, independent of this order.
 Take a proxy baseline (last section) **before** step 1 and after each step.
 
 ---
 
-## 1. `shipyard pr` flow
+## 1. `shipyard pr` flow: WORKING
 
 **Gives:** one command that runs skill-sync and version-bump gates, pushes,
 opens the PR as the App, arms native auto-merge (MERGE), and validates.
@@ -110,9 +142,7 @@ git show origin/main:.shipyard/config.toml | grep -E '^(skill_sync|version_bump)
 
 Present when the config exists and both scripts resolve by the order in
 [gate-scripts.md](../../../docs/gate-scripts.md) (env var, `[validation]` key,
-`tools/scripts/`, `scripts/`). Do not use the PR author as evidence: both
-`shipyard pr` and plain `ghapp` open PRs as `shipyard-local[bot]` (tartci's PRs
-are App-authored and it has no Shipyard config).
+`tools/scripts/`, `scripts/`).
 
 **Adopt:**
 
@@ -125,21 +155,30 @@ are App-authored and it has no Shipyard config).
 3. Optional pin: `tools/shipyard.toml`, then `shipyard pin show` / `pin bump`.
 4. Optional: `[pr.body] attribution = "..."` so agents stop hand-patching bodies.
 
-**Verify:** share of PRs merged in the window that carry a version-bump or
-trailer decision from the gate (`git log --merges origin/main` against
-`Version-Bump:` / `chore: bump versions`), and `shipyard pr` exit 0 on a trivial
-branch. Gate refusals caught locally per PR is the proxy; how long `pr` took is
-not.
+**Not ready: the local mac validation lane.** `shipyard pr` also dispatches the
+repository's `[targets.*]` lanes. For Pulp's `backend = "local"` mac target the
+audit found 1 green of 147 runs since 2026-09-02, and 64 of 64 failed in the
+last 7 days (42.3 host-hours), while nothing consumed the verdict. Do not
+declare a local target as a merge signal in a new repository. A
+`[targets.<name>] default = false` switch that makes such a lane opt-in is
+being built in Shipyard; it is not released yet. Until it is, a failing local
+lane verdict is not a PR failure (GitHub's required checks decide merging).
 
-## 2. Required checks
+**Verify (audit proxy):** share of recent merged PRs opened as the App (Pulp:
+14 of 20) together with Shipyard ship-state records on the submitting hosts
+(`shipyard ship-state list`; Pulp: 83 in 7 days). The audit script reports the
+first as PROVEN.
 
-**Gives:** the contexts GitHub itself enforces. Everything later (auto-merge,
-the queue, `landability`) keys off this list.
+## 2. Required checks: WORKING (GitHub)
+
+**Gives:** the contexts GitHub itself enforces. Auto-merge, the queue and
+`landability` all key off this list. This is a GitHub feature, not a Shipyard
+one; the feature-proof audit relied on it rather than scoring it.
 
 **Detect:**
 
 ```sh
-ghapp api repos/O/R/branches/main/protection --jq '.required_status_checks'   # exit 1 = unprotected
+ghapp api repos/O/R/branches/main/protection --jq '.required_status_checks'   # exits 1 when unprotected; the 404 body is on stdout
 ghapp api repos/O/R/rules/branches/main \
   --jq '.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context'
 ghapp api repos/O/R --jq .full_name                                          # control
@@ -152,22 +191,27 @@ declared (Shipyard cannot then tell a required red from an advisory one).
 
 **Adopt:** declare `[governance] required_status_checks` to match the live
 protection exactly, and `[landability] workflows` listing every workflow that
-produces one of those contexts. Then `shipyard landability` must report every
-required context `triggered` and every lane `served`. Keep required workflows
-free of `paths:` filters under `pull_request`: a path-filtered required check
-stays pending forever.
+produces one of those contexts. Keep required workflows free of `paths:`
+filters under `pull_request`: a path-filtered required check stays pending
+forever.
 
 Found while writing this: Pulp's `[governance]` lists 3 contexts, live
 protection requires 6 (`shipyard governance status` exit 1). Declared and live
 drifting is the normal failure; re-check after every protection change.
 
-**Verify:** `shipyard landability` exit 0 with zero `no_producer` and zero
-`unserved`; `shipyard governance status` exit 0.
+**Verify:** every required context reported by a check run on recent PR heads
+(the audit script's PROVEN: Pulp 6 of 6). `shipyard landability` should also
+report zero `no_producer` and zero `unserved`.
 
-## 3. Version / skill-sync gates as a required check
+## 3. Version / skill-sync gates in CI: not ready
 
-**Gives:** the same two scripts `shipyard pr` runs locally, enforced in CI so a
-PR opened any other way is still gated.
+**Not ready: UNPROVEN in CI.** The audit found 0 blocks by the skill-sync or
+version-bump steps in 200 runs of Pulp's required `Enforce version & skill
+sync` (control: the same job failed 3 times, on other steps). `shipyard pr`
+runs the same checks before it pushes, so the CI copy is a backstop whose
+effect has not been observed. Adopt the local gates through step 1; add the CI
+copy only if PRs reach the repository by routes other than `shipyard pr`, and
+measure its blocks when you do.
 
 **Detect:**
 
@@ -177,20 +221,14 @@ git grep -l 'runs-on' origin/main -- .github/workflows | wc -l                  
 ```
 
 Present only when one of those workflows' job `name:` is also a required
-context (Pulp: `Enforce version & skill sync` in `version-skill-check.yml`).
-Shipyard runs the gate but does not require it, which the audit reports as
-`partial`.
+context. Shipyard's own repository runs the gate but does not require it
+(`partial`).
 
-**Adopt:** copy Shipyard's `.github/workflows/version-skill-check.yml`, point
-it at the repository's script paths, then add its job name to protection and
-to `[governance]`. Pre-push layer: `.githooks/pre-push` calling the same
-scripts in `--mode=report`.
+**Verify (audit proxy):** failures of the skill-sync and version-bump steps,
+by step conclusion, per 100 runs of the required job. Zero with the job failing
+on other steps is "unproven", not "working".
 
-**Verify:** count of PRs in the window whose check `Enforce version & skill
-sync` (or the repo's name for it) failed and was then fixed by a bump or
-trailer commit before merge; zero merged PRs with a source change and no bump.
-
-## 4. Auto-merge (MERGE)
+## 4. Auto-merge (MERGE): WORKING
 
 **Gives:** server-owned landing that survives the agent process. `shipyard pr`
 and every route into `ship` arm it with method MERGE, so nobody hand-rolls the
@@ -205,13 +243,13 @@ shipyard landing --repo O/R --base main      # ACTION line names the landing pat
 ```
 
 **Adopt:** enable "Allow auto-merge" and merge commits in repository settings.
-Nothing in Shipyard config. `shipyard:no-auto-merge` label opts a PR out.
+Nothing in Shipyard config. The `shipyard:no-auto-merge` label opts a PR out.
 
-**Verify:** green PRs that are neither armed nor queued should be 0.
-`shipyard runner steward --arm-unqueued` (audit-only without `--apply`) lists
-them; `shipyard landing` BACKLOG shows how many are armed.
+**Verify (audit proxy):** merged PRs whose timeline has an
+`AutoMergeEnabledEvent` (Pulp: 39 of 40; control: 40 of 40 have
+`AddedToMergeQueueEvent`). The audit script reads it per PR through GraphQL.
 
-## 5. Merge queue
+## 5. Merge queue: WORKING
 
 **Gives:** batched validation of up to N PRs on the merged result. With strict
 up-to-date protection and no queue, every merge makes every other PR `behind`
@@ -225,34 +263,43 @@ ghapp api repos/O/R/rulesets --jq '.[]|"\(.name) \(.enforcement)"'   # control: 
 shipyard landing --repo O/R --base main     # MERGE QUEUE: PRESENT/ABSENT, surfaces consulted
 ```
 
-`shipyard landing` reads rulesets, classic protection and the GraphQL
-`mergeQueue`, and says which surface could not answer. Pulp: ruleset
-`main-merge-queue`, active, ALLGREEN, MERGE, max 5 to merge.
+Pulp: ruleset `main-merge-queue`, active, ALLGREEN, MERGE, max 5 to merge.
 
 **Adopt:** a branch ruleset with a `merge_queue` rule, `merge_method: MERGE`,
 enforcement `active`. Every required workflow must also trigger on
-`merge_group` or the queue waits forever (`shipyard landability` checks
-triggers). Land with `shipyard ship --pr N`; do not merge directly.
+`merge_group`, or the queue waits forever. Let GitHub's native auto-merge do
+the enqueueing: in the audit it did all of it. Shipyard's own enqueue path
+was dormant (last write 2026-09-15), and the queue-tick merge path and the
+merge-steward workflow were dead (0 merges in 1,005 ticks; no run since
+2026-08-27), so do not adopt either.
 
-**Verify:** `shipyard metrics gate-cost` `merge queue: attempts per merged PR`
-(Pulp 1.18, n=22) and `batch fullness` (Pulp 1.05 of max 5, n=21). A
-queue that only ever forms batches of 1 is serialising, not batching.
+**Verify (audit proxy):** `shipyard metrics gate-cost`: merge-queue attempts
+per merged PR and batch fullness (audit, Pulp: 125 merged PRs, 1.29 PRs per
+batch of max 5, 36 ejections). A queue that only forms batches of 1 is
+serialising, not batching.
 
-## 6. PR-head fast tier
+## 6. PR-head fast tier: WORKING (Pulp)
 
 **Gives:** PR heads run a narrowed deterministic tier and the full suite runs
 in the merge group. Heads report in seconds instead of occupying a full gate.
 
 **Generic part (Shipyard):** the `shipyard-test-tier/v1` annotation contract
-([validation-signals.md](../../../docs/validation-signals.md)) and its
-readers: `shipyard landing --pr N` prints "GREEN on the fast tier, NOT full
-validation" instead of a bare green.
+([validation-signals.md](../../../docs/validation-signals.md)) and its readers:
+`shipyard landing --pr N` prints "GREEN on the fast tier, NOT full validation"
+instead of a bare green.
 
 **Repository part:** choosing the tier. Pulp uses a ctest label `pr-fast`
-(`test/cmake/pr_fast_tests.cmake`), a contract test that stops the tier going
-empty (`tools/scripts/pr_fast_tier_check.py`), and, additionally, ctests
-selected from the PR's base-to-head diff (`tools/ci/pr_head_affected_tests.py`).
-That selector is Pulp-only: it reads Pulp's CMake graph and `pulp affected`.
+(`test/cmake/pr_fast_tests.cmake`) with `--no-tests=error` so an empty label
+fails, and additionally runs the ctests its base-to-head diff reaches
+(`tools/ci/pr_head_affected_tests.py`, WORKING in the audit: 94 selections, 10
+real failures caught on PR heads). That selector is Pulp-only: it reads Pulp's
+CMake graph through `pulp affected`.
+
+**Trap seen in the audit:** anything that reads the full-suite JUnit on every
+job breaks on fast heads, because the fast tier writes a different file. Pulp's
+"Observe ctest non-runs" step read `ctest.junit.xml`, found nothing, and put a
+red annotation on 48 of 48 fast-tier PR jobs. Key such readers on the tier
+annotation.
 
 **Detect:**
 
@@ -262,60 +309,73 @@ shipyard landing --repo O/R --pr <recent merged PR>
 #   lint: tier unknown (no shipyard-test-tier annotation)                  <- absent
 ```
 
-Control: the report must reach its `VALIDATION` section; if it does not, the
-zero is the instrument.
-
-**Adopt:** after the queue. In the gate job, branch on `github.event_name`:
-on `pull_request` run the narrowed selector and emit
+**Adopt:** after the queue. In the gate job, branch on `github.event_name`: on
+`pull_request` run the narrowed selector and emit
 `::notice title=shipyard-test-tier::{"schema":"shipyard-test-tier/v1","tier":"fast","selector":"<name>","full_suite_runs_in":"merge_group"}`;
 on `merge_group` run everything and emit `{"schema":"shipyard-test-tier/v1","tier":"full"}`.
-Keep the fast tier's JUnit separate so it can never be mistaken for full
-evidence.
+Keep the fast tier's JUnit separate so it can never become full evidence.
 
-**Verify:** merge-group ejections caused by a PR's own test, per merged PR
-(Pulp's pre-queue poka-yoke took this from 4.3/day to 2.2/day). If that rises
-after adopting the tier, the tier is missing tests that PRs break.
+**Verify (audit proxy):** fast-tier PR head jobs that failed on a real test
+(Pulp macOS: 15 of 129; each a failure caught before the queue), against
+`shipyard-test-tier` fast notices as the control that the tier ran (106).
 
-## 7. Protected receipt reuse
+## 7. Protected receipt reuse: WORKING, low yield
 
-**Gives:** a singleton merge group whose tree is exactly one that already
-passed the full suite skips re-running it.
+**Gives:** a merge group whose tree already passed the full suite on its PR
+head skips re-running it.
 
-**Generic part (Shipyard):** the `shipyard-receipt-decision/v1` annotation, its
-rendering in `shipyard landing --pr N`, and `shipyard metrics gate-cost`
-`receipt reuse` rate. `[targets.*] reuse_if_paths_unchanged` is a different,
-Shipyard-side evidence reuse for Shipyard's own targets; it does not make a
-GitHub required check skip.
+**Audit:** reuse in 5 of 31 macOS merge groups (16%) since the job-level
+conclusion fix at 2026-09-29T15:30Z; each reused `macos` job took 2 to 5 s and
+logged that it did not run the suite. The main loss: 31 of 70 heads had a
+receipt, but on a base the queue had already moved past.
+
+**Generic part (Shipyard):** the `shipyard-receipt-decision/v1` annotation
+(WORKING: 172 notices in 94 merge-group runs), its rendering in `shipyard
+landing --pr N`, and the reuse rate in `shipyard metrics gate-cost`.
 
 **Pulp-only:** issuing and verifying the receipt. `tools/scripts/protected_merge_receipt.py`
-(`download`, `verify`, `note`, `publish-notes`), the `protected-receipt-reuse`
-job in `build.yml`, and the rule that a receipt must carry real ctest evidence
-(JUnit, exit, selection; a fast-tier run never qualifies). The verifier is
-loaded from the protected base, never the head. To make this generic, Shipyard
-needs the invariant "no reuse receipt without evidence that validation ran"
-plus an issuer/verifier with a repository-supplied test-result adapter
-(JUnit path, inventory count, selection digest).
+(`issue`, `download`, `verify`, `note`, `publish-notes`), the
+`protected-receipt-reuse` job in `build.yml`, and the rule that a receipt must
+carry real ctest evidence (JUnit, exit, selection; a fast-tier run never
+qualifies). The verifier is loaded from the protected base, never the head. To
+make this generic, Shipyard needs the invariant "no reuse receipt without
+evidence that validation ran" plus an issuer and verifier with a
+repository-supplied test-result adapter (JUnit path, inventory count, selection
+digest).
+
+**Not ready around it:**
+- Binary-identity shadow: BROKEN, `compared` never emitted in 70 of 70 merge
+  groups.
+- Per-test receipts, read half: BROKEN, 0 receipts used in 28 of 28 runs while
+  every prior receipt was refused (the write half works).
+- The label-set refusal fix: UNPROVEN, no post-fix sample yet.
 
 **Detect:**
 
 ```sh
 shipyard landing --repo O/R --pr <recent merged PR>
-#   macos: reused receipt from run 123: 812 selected / 800 passed   <- present
+#   macos: reused receipt from run 123: 812 selected / 800 passed   <- reuse
 #   macos: validated in full: receipt refused because ...            <- wired, refusing
-shipyard metrics gate-cost --repo O/R --workflow build.yml --gate-job macos --since 48h
-#   receipt reuse: 5 of 27 merge-group runs (0.19); 18 refused, 4 no decision
 ```
 
-**Adopt:** only after 5 and 6, and only when heads run the full suite as
+**Adopt:** only after the merge queue and the fast tier, and only when heads run the full suite as
 evidence (Pulp runs it non-gating on the head so a receipt exists). Emit a
 decision annotation for every merge group, reuse or refuse, so "no decision"
 stays a visible gap rather than a silent full run.
 
-**Verify:** `gate-cost` receipt reuse rate over singleton merge groups, with
-refusals by reason. A 0 with every run "no decision" is a broken emitter, not a
-low rate.
+**Verify (audit proxy):** reuse decisions / merge-group runs since the last
+change to the receipt path, with refusals by reason:
 
-## 8. Host classes and `runner fleet-update`
+```sh
+shipyard metrics gate-cost --repo O/R --workflow build.yml --gate-job macos --since 48h
+#   receipt reuse: 5 of 27 merge-group runs (0.19); 18 refused, 4 no decision
+```
+
+A zero with every run "no decision" is a broken emitter, not a low rate. Below
+about 10 decisions a zero is not evidence either way; the audit script reports
+it as `unmeasured`.
+
+## 8. Host classes and `runner fleet-update`: WORKING
 
 **Gives:** named self-hosted machines Shipyard can probe for VM capacity, and
 one command that rolls an exact Shipyard release across them.
@@ -335,65 +395,67 @@ shipyard --mode isolated runner capacity --json | jq .configured       # control
 `github_cli`, `github_token_helper`, `shipyard_mode`, `shipyard_global_dir`,
 `shipyard_state_dir` ([install.md](../../../docs/install.md)). Then
 `shipyard runner fleet-update --to vX.Y.Z --host-class <name>` prints the plan;
-`--apply` rolls it. Do not use `fleet-update` as a detection probe: it is a
-fleet operation even when it only plans, and `runner capacity` answers the
-detection question without touching the rollout path. `shipyard runner fleet-reconcile` is the
-backstop for releases that did not roll themselves out.
+`--apply` rolls it. `shipyard runner fleet-reconcile` is the backstop for
+releases that did not roll out on their own. Do not use `fleet-update` as a
+detection probe: it is a fleet operation even when it only plans, and
+`runner capacity` answers the detection question without touching the rollout
+path.
 
-**Verify:** `shipyard runner fleet-reconcile` reports zero lagging classes
-after soak; `runner fleet-status` exit 0.
+Known risk: the release soak keys on the newest tag, so several releases in
+an hour can hold every rollout until the cadence slows.
 
-## 9. Self-hosted runner governance
+**Verify (audit proxy):** rollouts and verified host installs from
+`fleet-reconcile` / `fleet-update` records (audit: 10 rollouts, 37 verified
+installs, 1 failed). The audit script's PROVEN counts readable host classes,
+which proves the probe path, not a rollout.
 
-**Generic (Shipyard):** `[runner.fleet.expected_host.*]` (label-subset
-inventory that stays visible when nothing is registered), `[landability]`,
-`runner fleet-status`, `runner audit` (host-class naming drift), `runner
-watch` (hung workers, stale runs), `rescue`, and health leases that fall back
-to hosted runners when a lease expires ([fleet-lease.md](../../../docs/fleet-lease.md)).
+## 9. Self-hosted runner governance: not ready
 
-**Not in Shipyard:** core+memory admission leases, gate VM pools and
-work-conserving tiers live in tartci; Pulp routes its raw builds through them
-with `tools/ci/governed-build.sh`. A repository gets those by running tartci on
-its hosts, not by adopting Shipyard.
+**Not ready: UNPROVEN as a Shipyard feature.** The audit measured only
+Shipyard's queue admission (160 admission locks in 7 days, which proves
+attempts, not effect). It did not measure `[runner.fleet.expected_host.*]`,
+`runner fleet-status`, `runner audit`, `runner watch`, `rescue` or the health
+leases in [fleet-lease.md](../../../docs/fleet-lease.md). Detect them so you do
+not rebuild them; do not treat them as proven.
+
+**Not in Shipyard:** core and memory admission leases live in tartci (WORKING,
+though its release signal reports failure on 2,670 of 2,670 releases, so a real
+failure is indistinguishable). Pulp routes raw builds through them with
+`tools/ci/governed-build.sh`. tartci's VM reaper is BROKEN (0 stopped VMs
+deleted since 2026-08-15, about 400 GB stranded), and its pulp CLI auto-apply
+is BROKEN on two of three hosts. A repository gets these by running tartci, not
+by adopting Shipyard.
 
 **Detect:**
 
 ```sh
 ghapp api repos/O/R/actions/runners --jq .total_count     # org-registered runners are not counted
 git show origin/main:.shipyard/config.toml | grep -E '^\[(runner\.fleet\.expected_host\.|landability\])'
-shipyard landability --repo O/R --base main               # served / unserved per lane
 ```
 
 `n/a` for a hosted-only repository (tartci). A repository with registered
 runners and neither section is `absent` (Shipyard itself).
 
-**Adopt:** declare expected hosts by labels unique to each host; if every
-runner shares one label set, a per-host entry matches the whole pool and reads
-all hosts online while one serves, so leave those to `fleet-status`'s host
-list instead (Pulp's config explains this for its gate hosts).
-
 **Verify:** `shipyard metrics gate-cost` `starvation` (jobs cancelled before a
-runner was assigned / jobs) and `placement` (jobs on label sets nothing serves).
-Pulp: 5 of 77 starved, all withdrawn by a push; 0 of 496 unplaced.
+runner was assigned / jobs) and `placement` (jobs on label sets nothing
+serves). Pulp, 24 h: 5 of 77 starved, all withdrawn by a push; 0 of 496
+unplaced. Use these to prove the effect before calling it adopted.
 
 ## 10. Proxy-first measurement
 
 **Gives:** a before/after verdict that does not depend on how busy the hosts
-were. Pulp's `proxy-first-eval` skill states the habit; Shipyard implements the
-instruments.
+were. Pulp's `proxy-first-eval` skill states the habit; Shipyard provides the
+instrument.
 
-**Generic (Shipyard):** `shipyard metrics gate-cost` (gate runs per merged PR,
-wasted attempts, starvation, placement, queue wait per job ahead, batch
-fullness, receipt reuse; minutes shown as load-dependent context only) and
-`shipyard metrics scorecard` (verdict against the previous equal window, with
-minimum samples and detection floors).
+**WORKING:** `shipyard metrics gate-cost` reads live from GitHub: gate runs per
+merged PR, wasted attempts, starvation, placement, queue wait per job ahead,
+batch fullness, receipt reuse. Minutes are shown as load-dependent context
+only.
 
-**Pulp-only:** `tools/scripts/build_speed_scorecard.py` (build-graph proxies:
-compile units rebuilt, cache hit rate, header blast radius).
-
-**Detect:** a habit is not in the tree. Ask whether the repository's recent
-CI changes cite a count with source, floor and n. The instrument is available
-wherever `shipyard metrics gate-cost --help` runs.
+**Not ready:** `shipyard metrics scorecard`, `watch` and `trend` read the local
+metrics store, whose GitHub import has been stale since 2026-09-27 and reports
+"insufficient sample" rather than "stale". Pulp's
+`tools/scripts/build_speed_scorecard.py` (build-graph proxies) is Pulp-only.
 
 **Adopt:** before step 1, record a baseline:
 
@@ -409,13 +471,17 @@ the same instrument (a known-present repository, or `--mode isolated`).
 **Verify:** each adopted feature names its own proxy above; a feature whose
 proxy did not move was not adopted, whatever the wall clock says.
 
-## Also detectable, optional
+## Also detectable, all not ready
 
-| feature | detect |
-|---|---|
-| version pin | `tools/shipyard.toml`; `shipyard pin show` (refuses without it) |
-| changelog regeneration | `[release.changelog]`, `[release.post_tag_hook]`; see the `changelog` skill |
-| changed-surface selection | `[targets.<t>.changed_surface_selection]`; `shipyard changed-surface-plan` ([changed-surface-selection.md](../../../docs/changed-surface-selection.md)) |
-| batch attribution | `[queue.attribution] command = [...]` (argv list; Pulp's attributor `tools/scripts/queue_batch_attribute.py` is Pulp-only) |
-| one retry after a network ejection | `[queue.environment_requeue] enabled = true` |
-| base health | `shipyard landing` BASE HEALTH; needs a `main-health-detector.yml` workflow (Pulp's is repository code) |
+Detect these so you do not rebuild them. None had a demonstrated effect in the
+audit.
+
+| feature | detect | why not ready |
+|---|---|---|
+| changed-surface selection | `[targets.<t>.changed_surface_selection]`; `shipyard changed-surface-plan` | BROKEN: 0 of 174 bounded selections in 7 days; 63 refused on a policy-digest mismatch |
+| changelog post-tag sync | `[release.post_tag_hook]`, `.github/workflows/post-tag-sync.yml` | Pulp's copy is DEAD: 100 of 100 runs cancelled on an unserved runner label; CHANGELOG 73 releases stale |
+| base health | `shipyard landing` BASE HEALTH; a `main-health-detector.yml` workflow (Pulp's is repository code) | UNPROVEN: `batch_streak` 0 in 112 verdicts while a streak existed; judges one context only |
+| batch attribution | `[queue.attribution] command = [...]` (Pulp's attributor is Pulp-only) | not measured by the audit |
+| one retry after a network ejection | `[queue.environment_requeue] enabled = true` | not measured by the audit |
+| daemon-driven waits | `shipyard daemon status`; `shipyard wait` | BROKEN in part: 38% and 66% of webhook deliveries rejected on two hosts, 0 daemon events to waiters. `shipyard wait` still works by polling (first answer 18 to 30 s) |
+| version pin | `tools/shipyard.toml`; `shipyard pin show` | Pulp's pin (v0.143.0) is read only by two dead workflows |
