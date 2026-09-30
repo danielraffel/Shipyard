@@ -70,7 +70,8 @@ forwards in more than one write (headers and body usually arrive separately).
 `read_webhook_request` therefore switches the stream back to blocking mode and
 reads to the end of the headers, then exactly `Content-Length` bytes, under one
 deadline. Every refused delivery writes one `rejected webhook delivery <guid>
-with HTTP <status>: <reason>` line to `daemon/daemon.log`; match that GUID
+(<event>) with HTTP <status>: <reason> [body <received> of <Content-Length>
+bytes]` line to `daemon/daemon.log`; match that GUID
 against the repository's hook delivery log. A quiet `daemon.log` is normal on a
 healthy host: registration failures were the only other routine writer.
 
