@@ -257,6 +257,10 @@ verdict, which is the point of making every target opt-in. Emptying a non-empty
 default set with `--skip-target` is still refused (exit 2) before any state is
 written, as it always was.
 
+`ship-state list` and `ship-state show` name each opt-in target
+(`mac: opt-in, not run (GitHub required checks decide)`), so a PR with no
+record reads as delegated rather than as a lane that never started.
+
 ## Arming auto-merge is outside the state machine
 
 Once `resolve_pr_context` has a pull-request number — for `shipyard pr`, a bare

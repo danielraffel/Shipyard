@@ -159,6 +159,22 @@ Wait on the outcome with `shipyard wait pr <n>` or GitHub itself.
 `shipyard run` has nothing to delegate to, so with only opt-in targets and no
 `--targets` it exits 2 and asks for one.
 
+**An opt-in target is reported, never silently absent.** Every surface that
+lists targets or explains a verdict names it with the same line:
+
+```
+mac: opt-in, not run (GitHub required checks decide)
+```
+
+`shipyard status` prints it in place of `reachable=` (JSON: `status`,
+`verdict_owner`, no `reachable`), `shipyard ship-state list` prints it above the
+records (JSON: `opt_in_targets`), `shipyard ship-state show <pr>` names it when
+a PR has no ship-state, `shipyard landing` has a `LOCAL SHIPYARD TARGETS`
+section (JSON: `opt_in_targets`), and `shipyard doctor` shows it as a Runners
+row. Unless it is requested, an opt-in target is never probed, never counted
+as a Shipyard-derived required context in landability, and never reported as a
+deliberate skip or validation gap, including when `--skip-target` names it.
+
 `--skip-target` keeps its meaning: skipping every **default** target is still
 an error (exit 2, "No targets remain after --skip-target filtering."). A
 `--target` that names no configured target, or a name passed to both

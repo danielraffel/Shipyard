@@ -221,7 +221,14 @@ exit 2
     assert_eq!(output["pr"], 88);
     assert_eq!(output["validation"], "delegated");
     assert_eq!(output["verdict_owner"], "required-checks");
-    assert_eq!(output["opt_in_targets"], serde_json::json!(["mac"]));
+    assert_eq!(
+        output["opt_in_targets"],
+        serde_json::json!([{
+            "name": "mac",
+            "status": "opt-in, not run",
+            "verdict_owner": "required-checks",
+        }])
+    );
     let pushed = git_capture(&["rev-parse", "refs/heads/feature/test"], &remote);
     assert_eq!(pushed, git_capture(&["rev-parse", "HEAD"], &repo));
     assert!(!paths.state_dir.join("queue.json").exists());
@@ -298,4 +305,102 @@ fn ship_skipping_the_only_default_target_exits_two_before_any_push() {
     assert_eq!(error.code, 2);
     assert!(stdout.is_empty());
     assert!(!paths.state_dir.join("queue.json").exists());
+}
+
+#[test]
+fn skipping_an_unrequested_opt_in_target_is_not_reported_as_a_gap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    seed_repo(&repo);
+    let head = git_capture(&["rev-parse", "HEAD"], &repo);
+    let snapshot = temp.path().join("pr.json");
+    std::fs::write(
+        &snapshot,
+        format!(r#"{{"headRefName":"feature/test","headRefOid":"{head}"}}"#),
+    )
+    .expect("write snapshot");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let run = |skip: &str| {
+        let mut args = ship_args(Some(42), None);
+        args.pr_snapshot_file = Some(snapshot.clone());
+        args.skip_targets = vec![skip.to_owned()];
+        let mut stdout = Vec::new();
+        let config = format!(
+            "{DEFAULT_MAC_OPT_IN_LINUX}\n[targets.extra]\nbackend = \"local\"\nplatform = \"linux-x64\"\n"
+        );
+        let _ = ship_command(
+            args,
+            &config_from(temp.path(), &config),
+            &repo,
+            &paths,
+            false,
+            &mut stdout,
+        );
+        String::from_utf8(stdout).expect("utf8")
+    };
+
+    let opt_in = run("linux");
+    assert!(!opt_in.contains("deliberately skipped"), "{opt_in}");
+    // Control: skipping a default target is still announced.
+    let default = run("extra");
+    assert!(
+        default.contains("Target 'extra' deliberately skipped"),
+        "{default}"
+    );
+}
+
+#[test]
+fn an_opt_in_target_is_never_a_shipyard_required_context() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    seed_repo(&repo);
+    std::fs::create_dir_all(repo.join(".github/workflows")).expect("workflows dir");
+    std::fs::write(
+        repo.join(".github/workflows/build.yml"),
+        "name: build\non: pull_request\njobs:\n  macos:\n    runs-on: macos-15\n    steps:\n      - run: true\n",
+    )
+    .expect("workflow");
+    super::test_support::git(&["add", "."], &repo);
+    super::test_support::git(&["commit", "-q", "-m", "workflow"], &repo);
+    let contexts = |default_line: &str| {
+        let config = format!(
+            "[merge]\nrequire_platforms = [\"macos\"]\n\n[targets.mac]\nbackend = \"local\"\nplatform = \"macos-arm64\"\nworkflow = \"build\"\n{default_line}\n"
+        );
+        crate::landability::gate::shipyard_required_contexts(
+            &config_from(temp.path(), &config),
+            &repo,
+            "main",
+        )
+    };
+
+    assert_eq!(
+        contexts("")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["macos"],
+        "control: a default target's workflow is a Shipyard-derived context"
+    );
+    assert!(contexts("default = false").is_empty());
+}
+
+#[test]
+fn delegated_human_output_names_each_opt_in_target() {
+    let mut out = Vec::new();
+    super::render_required_checks_delegation(
+        &config_from(std::path::Path::new("/nonexistent"), OPT_IN_MAC),
+        88,
+        false,
+        &mut out,
+    )
+    .expect("render");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains("  mac: opt-in, not run (GitHub required checks decide)"),
+        "{text}"
+    );
 }

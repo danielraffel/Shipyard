@@ -136,7 +136,12 @@ pub(super) fn run_command<W: Write>(
         resolve_targets(config, mode).map_err(|error| CliFailure::new(1, error.to_string()))?;
     let opt_in =
         opt_in_target_names(&config.data).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let skipped_targets = skipped_present(&resolved, args.targets.as_deref(), &args.skip_targets)?;
+    let mut skipped_targets =
+        skipped_present(&resolved, args.targets.as_deref(), &args.skip_targets)?;
+    if args.targets.is_none() {
+        // An opt-in target is not in the default set, so skipping it is no gap.
+        skipped_targets.retain(|name| !opt_in.contains(name));
+    }
     let all_opt_in = args.targets.is_none()
         && resolved
             .iter()

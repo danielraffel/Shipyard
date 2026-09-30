@@ -180,6 +180,8 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &LandingReport) -> std::io:
     }
     writeln!(stdout)?;
 
+    write_opt_in_targets(stdout, &report.opt_in_targets)?;
+
     writeln!(stdout, "BACKLOG")?;
     if let Some(unreadable) = &report.backlog.unreadable {
         writeln!(
@@ -334,6 +336,22 @@ fn write_tip<W: Write>(stdout: &mut W, tip: &TipHealth) -> std::io::Result<()> {
 
 fn optional(value: Option<u64>) -> String {
     value.map_or_else(|| "UNKNOWN".to_owned(), |value| value.to_string())
+}
+
+/// The section naming local Shipyard targets that a plain `shipyard pr` does
+/// not run. Omitted when there are none, since then every target runs.
+pub(crate) fn write_opt_in_targets<W: Write>(
+    stdout: &mut W,
+    targets: &[crate::opt_in_targets::OptInTarget],
+) -> std::io::Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    writeln!(stdout, "LOCAL SHIPYARD TARGETS")?;
+    for target in targets {
+        writeln!(stdout, "  {}", target.line())?;
+    }
+    writeln!(stdout)
 }
 
 #[cfg(test)]

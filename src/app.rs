@@ -1462,14 +1462,20 @@ fn handle_ship_state_command<W: Write>(
                         .as_deref(),
                 )
             };
+            let opt_in = crate::opt_in_targets::from_config(&config);
             crate::ship_liveness::with_liveness_context(state_dir, stale_after, |liveness| {
-                ship_state_list(store, liveness, &mut lifecycle_of, json, stdout)
+                ship_state_list(store, liveness, &mut lifecycle_of, &opt_in, json, stdout)
             })
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Show { pr } => {
             let repository = self::branch_cmd::detect_repo_from_remote(cwd, None);
-            ship_state_show(store, repository.as_deref(), pr, json, stdout)
+            // A missing config is not an error for `show`; it only loses the
+            // opt-in explanation for an absent record.
+            let opt_in = LoadedConfig::load_from_cwd(mode, cwd)
+                .map(|config| crate::opt_in_targets::from_config(&config))
+                .unwrap_or_default();
+            ship_state_show(store, repository.as_deref(), pr, &opt_in, json, stdout)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Discard { pr } => {

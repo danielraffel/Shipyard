@@ -539,10 +539,7 @@ fn render_required_checks_delegation<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let opt_in = opt_in_target_names(&config.data)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?
-        .into_iter()
-        .collect::<Vec<_>>();
+    let opt_in = crate::opt_in_targets::from_config(config);
     if json_mode {
         write_json_envelope(
             stdout,
@@ -550,15 +547,14 @@ fn render_required_checks_delegation<W: Write>(
             fields([
                 ("pr", Value::from(pr)),
                 ("validation", Value::from("delegated")),
-                ("verdict_owner", Value::from("required-checks")),
+                (
+                    "verdict_owner",
+                    Value::from(crate::opt_in_targets::VERDICT_OWNER),
+                ),
                 (
                     "opt_in_targets",
-                    Value::from(
-                        opt_in
-                            .iter()
-                            .map(|name| Value::from(name.as_str()))
-                            .collect::<Vec<_>>(),
-                    ),
+                    serde_json::to_value(&opt_in)
+                        .map_err(|error| CliFailure::new(1, error.to_string()))?,
                 ),
             ]),
         )
@@ -566,11 +562,13 @@ fn render_required_checks_delegation<W: Write>(
     } else {
         writeln!(
             stdout,
-            "No Shipyard targets run by default for PR #{pr}: every configured target is opt-in ({}). \
-             The pull request's required checks decide. Validate locally with --target <name>.",
-            opt_in.join(", ")
+            "PR #{pr}: no Shipyard target runs by default; validate locally with --target <name>."
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        for target in &opt_in {
+            writeln!(stdout, "  {}", target.line())
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -677,7 +675,10 @@ fn prepare_ship_targets<W: Write>(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let opt_in =
         opt_in_target_names(&config.data).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let skipped_targets = skipped_present(&resolved, &args.skip_targets)?;
+    let mut skipped_targets = skipped_present(&resolved, &args.skip_targets)?;
+    // Skipping an opt-in target nobody requested changes nothing, so it is
+    // not reported as a deliberate skip (a validation gap) either.
+    skipped_targets.retain(|name| !opt_in.contains(name) || args.targets.contains(name));
     let targets = select_targets(resolved, &opt_in, &args.targets, &args.skip_targets)?;
     if !perform_preflight {
         return Ok(targets);
