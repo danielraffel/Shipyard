@@ -239,6 +239,24 @@ The gate never dispatches, cancels, or retries in response. See
 `skills/shipyard/SKILL.md` for the classifier and `src/landability/` for the
 implementation.
 
+## Opt-in targets: a ship that validates nothing locally writes no state
+
+A target with `default = false` is left out of the ship's target set unless
+`--target <name>` or the active profile names it (see `docs/targets.md`). When
+that leaves the set empty, `ship` still pushes, resolves or opens the pull
+request and arms native auto-merge, then returns exit 0 with
+`validation: "delegated"` and `verdict_owner: "required-checks"`. It queues no
+job and writes **no** `ShipState`.
+
+That is deliberate. A state with no dispatched runs and no evidence has no
+terminal verdict (`ship_terminal_verdict` returns `None`), so `watch` would
+report it in flight forever and the resume sweep would eventually classify it
+as an orphan and mark it abandoned, which reads as a failure that never
+happened. With no state, the pull request's required checks are the only
+verdict, which is the point of making every target opt-in. Emptying a non-empty
+default set with `--skip-target` is still refused (exit 2) before any state is
+written, as it always was.
+
 ## Arming auto-merge is outside the state machine
 
 Once `resolve_pr_context` has a pull-request number — for `shipyard pr`, a bare
