@@ -61,6 +61,19 @@ reasons, and they need opposite responses:
 the external daemon-health watchdog to clear token caches every five minutes
 against a credential that was working fine.
 
+## A webhook 400 is the receiver, and it is logged
+
+The daemon answers a delivery it cannot read with `400 bad request`. An
+accepted socket inherits `O_NONBLOCK` from the non-blocking listener on macOS,
+so a reader that trusts `set_read_timeout` refuses any delivery the tunnel
+forwards in more than one write (headers and body usually arrive separately).
+`read_webhook_request` therefore switches the stream back to blocking mode and
+reads to the end of the headers, then exactly `Content-Length` bytes, under one
+deadline. Every refused delivery writes one `rejected webhook delivery <guid>
+with HTTP <status>: <reason>` line to `daemon/daemon.log`; match that GUID
+against the repository's hook delivery log. A quiet `daemon.log` is normal on a
+healthy host: registration failures were the only other routine writer.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.
