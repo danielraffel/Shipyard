@@ -944,7 +944,12 @@ pub(crate) enum MetricsCommand {
     /// List recent job rows.
     List(MetricsListArgs),
     /// Summarize p50/p90/min/max/failure-rate by project,target,backend,host.
-    Summary(MetricsProjectArgs),
+    ///
+    /// `--group-by runner` (default) keys the host column by the recorded
+    /// machine name, which for GitHub-imported jobs is the ephemeral runner.
+    /// `--group-by host` folds runners into their physical host: a
+    /// `*-host-<id>` label, else the `shipyard runner tag` in the runner name.
+    Summary(MetricsSummaryArgs),
     /// Show slowest successful jobs.
     Slowest(MetricsListArgs),
     /// Compare before/after windows per job class.
@@ -1421,6 +1426,25 @@ pub(crate) struct MetricsTrendArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct MetricsSummaryArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+    /// Machine grouping: `runner` (recorded name) or `host` (physical host).
+    #[arg(long = "group-by", value_enum, default_value_t = MetricsGroupBy::Runner)]
+    pub(crate) group_by: MetricsGroupBy,
+}
+
+/// Machine grouping for `metrics summary`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum MetricsGroupBy {
+    /// The recorded machine name (an ephemeral runner for GitHub imports).
+    Runner,
+    /// The physical host behind the runner.
+    Host,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct MetricsWatchArgs {
     /// Project key.
     #[arg(long)]
@@ -1428,6 +1452,11 @@ pub(crate) struct MetricsWatchArgs {
     /// Recent window, for example `14d`.
     #[arg(long = "since", default_value = "14d")]
     pub(crate) since: String,
+    /// Required status-check name; repeatable. Lanes holding one are
+    /// reported as `required`, the rest as `advisory`. Defaults to
+    /// `[governance] required_status_checks` from the repo config.
+    #[arg(long = "required")]
+    pub(crate) required: Vec<String>,
     /// Verdict basis: load-independent `proxy` (default) or `wall-time`.
     #[arg(long, value_enum, default_value_t = MetricsBasis::Proxy)]
     pub(crate) basis: MetricsBasis,

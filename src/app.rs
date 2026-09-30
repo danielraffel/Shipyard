@@ -364,7 +364,13 @@ where
                     cli.json,
                     stdout,
                 ),
-                command => metrics_command(command, &runtime_paths.state_dir, cli.json, stdout),
+                command => metrics_command(
+                    command,
+                    &runtime_paths.state_dir,
+                    Some((cli.mode.into(), &cwd)),
+                    cli.json,
+                    stdout,
+                ),
             };
         }
         Command::Auth { command } => {

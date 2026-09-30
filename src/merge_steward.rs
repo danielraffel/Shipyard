@@ -392,6 +392,27 @@ pub fn classify_pr(
     }
 }
 
+/// Whether a steward `ArmMergeQueue` decision survives the head-scoped queue
+/// verdict.
+///
+/// [`classify_pr`] reads only the pull request's own head checks, and a
+/// `failed_checks` ejection leaves those green: the merge group failed, not
+/// the head's own run. So on its own it re-enqueues a head the queue just
+/// ejected. The steward's enqueue sets `SHIPYARD_INTERNAL_QUEUE_MUTATION`, so
+/// the `ghapp` arm guard does not judge it; this is the same verdict applied
+/// in its place. An unreadable queue state is never permission.
+#[must_use]
+pub fn arm_survives_queue_state(
+    decision: &StewardDecision,
+    verdict: &crate::pr_queue_state::InternalEnqueueVerdict,
+) -> bool {
+    matches!(decision, StewardDecision::ArmMergeQueue)
+        && matches!(
+            verdict,
+            crate::pr_queue_state::InternalEnqueueVerdict::Admit
+        )
+}
+
 fn has_pr_label(pr: &StewardPullRequest, expected: &str) -> bool {
     pr.labels
         .iter()
