@@ -2733,6 +2733,16 @@ verdict that positively names infrastructure or another PR counts, and
 `merge_conflict` is never attributable because a conflict is a property of the
 head against its base.
 
+**The attributor runs on the wrapper's trusted PATH, which has no `ghapp`.**
+`ghapp` starts guards with `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:…`
+and the guard's subprocess inherits it, so an attributor that shells out to
+`ghapp` (in `~/.local/bin`) dies with `FileNotFoundError` and exits 1. From the
+guard that reads only as "the attributor exited 1, so it did not rule": a correct
+flake verdict is silently discarded. Read the API through `$GHAPP_REAL_GH` with
+the exported `GH_TOKEN`/`GH_REPO`, and reproduce under
+`env -i HOME=$HOME PATH=<trusted path>`, never in an interactive shell. The
+refusal quotes the attributor's stderr tail.
+
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing
 required check on the removal's merge-group commit must be an Actions job whose
