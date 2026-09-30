@@ -109,6 +109,10 @@ impl ReconcileEnv for LiveEnv<'_> {
     fn alert(&mut self, title: &str, body: &str) -> Result<(), String> {
         GitHubReleaseAuthorityVerifier::new(self.config, self.cwd).upsert_issue(title, body)
     }
+
+    fn local_host_busy(&mut self) -> Result<Option<String>, String> {
+        reconcile::local_install_guard_held(&self.runtime_paths.state_dir)
+    }
 }
 
 /// `shipyard runner fleet-reconcile`: roll the latest published release out to
