@@ -4,8 +4,11 @@
 # Usage (from a checkout of the repository being audited):
 #   skills/ci/scripts/adoption_audit.sh OWNER/REPO [BASE]
 #
-# Prints one row per feature: present / partial / absent / n/a, the evidence
-# behind it, and the recommended next feature. Nothing here writes to GitHub,
+# Prints one row per feature with two separate verdicts:
+#   STATUS  present / partial / absent / n/a / UNKNOWN: is it configured?
+#   PROVEN  yes / no / unmeasured: did it have a non-zero effect in the
+#           sampled window? "present" alone never means "working".
+# plus the evidence behind both and the recommended next feature. Nothing here writes to GitHub,
 # the repository, or Shipyard state. Every probe is paired with a control on
 # the same instrument; when a control fails the row reads UNKNOWN, never absent.
 #
@@ -28,7 +31,8 @@ fi
 api() { local o; if o="$($GH api "$@" 2>/dev/null)"; then printf '%s\n' "$o"; fi; }
 
 rows=()
-row() { rows+=("$1|$2|$3"); }
+# row FEATURE STATUS EVIDENCE [PROVEN]
+row() { rows+=("$1|$2|$3|${4:-}"); }
 
 # ── Controls: prove each instrument can see this repository at all ─────────
 ctl_git=ok
@@ -38,7 +42,7 @@ if ! git rev-parse --verify -q "origin/$BASE" >/dev/null; then
 elif [ "$(git ls-tree --name-only "origin/$BASE" | wc -l | tr -d ' ')" = 0 ]; then
   ctl_git="origin/$BASE has an empty tree"
 fi
-origin_url="$(git remote get-url origin)"
+origin_url="$(git remote get-url origin 2>/dev/null || true)"
 case "$origin_url" in
   *"$REPO"|*"$REPO.git") ;;
   *) ctl_git="cwd origin ($origin_url) is not $REPO; run from a checkout of $REPO" ;;
@@ -59,6 +63,30 @@ if [ "$ctl_git" = ok ]; then
 fi
 has_cfg() { printf '%s\n' "$cfg" | grep -Eq "$1"; }
 tree_has() { git ls-tree -r --name-only "origin/$BASE" | grep -Eq "$1"; }
+
+# ── Sample recent merged PRs once; several rows read these reports ────────
+tier_fast=0; tier_seen=0; reuse=0; refuse=0; sampled=""; landing_ok=0; mg_runs=0; outs=""
+if [ "$ctl_git" = ok ] && [ "$ctl_api" = ok ] && [ "$ctl_cli" = ok ]; then
+  prs="$(api "repos/$REPO/pulls?state=closed&base=$BASE&per_page=30" \
+      --jq '[.[]|select(.merged_at)][].number' 2>/dev/null | head -n "$PR_SAMPLE")"
+  for n in $prs; do
+    out="$(shipyard landing --repo "$REPO" --pr "$n" 2>&1 || true)"
+    sampled="$sampled #$n"
+    # Control: a landing report that never reached its VALIDATION section
+    # measured nothing, so its zero annotations are not evidence of absence.
+    printf '%s\n' "$out" | grep -q '^VALIDATION' && landing_ok=$((landing_ok+1))
+    tier_fast=$((tier_fast + $(printf '%s\n' "$out" | grep -c ': tier fast')))
+    tier_seen=$((tier_seen + $(printf '%s\n' "$out" | grep -cE ': tier (fast|full)')))
+    reuse=$((reuse + $(printf '%s\n' "$out" | grep -c 'reused receipt')))
+    refuse=$((refuse + $(printf '%s\n' "$out" | grep -c 'receipt refused')))
+    mg_runs=$((mg_runs + $(printf '%s\n' "$out" | grep -E '^  merge group ' | grep -vc 'no merge group runs')))
+    outs="$outs
+$out"
+  done
+fi
+# A required context is "reported" when a sampled head's landing report
+# lists a check run for it.
+reported() { printf '%s\n' "$outs" | grep -Fq "    $1: "; }
 
 # ── 1. shipyard pr flow ─────────────────────────────────────────────────────
 if [ "$ctl_git" != ok ]; then
@@ -97,7 +125,12 @@ else
   if [ "$nreq" -gt 0 ] && [ "$declared" = yes ]; then st=present
   elif [ "$nreq" -gt 0 ]; then st=partial
   else st=absent; fi
-  row "required checks" "$st" "$nreq live context(s); [governance] declared=$declared"
+  k=0
+  while IFS= read -r ctx; do [ -n "$ctx" ] && reported "$ctx" && k=$((k+1)); done <<< "$req"
+  if [ "$landing_ok" = 0 ]; then pv=unmeasured
+  elif [ "$nreq" -gt 0 ] && [ "$k" = "$nreq" ]; then pv="yes ($k/$nreq reported on sampled heads)"
+  else pv="no ($k/$nreq reported on sampled heads)"; fi
+  row "required checks" "$st" "$nreq live context(s); [governance] declared=$declared" "$pv"
 fi
 
 # ── 3. version / skill-sync gates wired as a REQUIRED check ────────────────
@@ -107,13 +140,13 @@ else
   wf_ctl="$(git grep -l 'runs-on' "origin/$BASE" -- .github/workflows 2>/dev/null | wc -l | tr -d ' ')"
   gate_wfs="$(git grep -l -E 'skill_sync_check|version_bump_check' "origin/$BASE" -- .github/workflows 2>/dev/null || true)"
   n_gate_wfs="$(printf '%s\n' "$gate_wfs" | sed '/^$/d' | wc -l | tr -d ' ')"
-  required_gate=no
+  required_gate=no; gate_ctx=""
   if [ "$n_gate_wfs" -gt 0 ] && [ "$nreq" -gt 0 ]; then
     while IFS= read -r ctx; do
       [ -z "$ctx" ] && continue
       while IFS= read -r wf; do
         [ -z "$wf" ] && continue
-        if git show "$wf" 2>/dev/null | grep -Fq "name: $ctx"; then required_gate=yes; fi
+        if git show "$wf" 2>/dev/null | grep -Fq "name: $ctx"; then required_gate=yes; gate_ctx="$ctx"; fi
       done <<< "$gate_wfs"
     done <<< "$req"
   fi
@@ -121,7 +154,10 @@ else
   elif [ "$required_gate" = yes ]; then st=present
   elif [ "$n_gate_wfs" -gt 0 ]; then st=partial
   else st=absent; fi
-  row "version/skill-sync gates" "$st" "$n_gate_wfs of $wf_ctl workflow(s) run the gate scripts; required=$required_gate"
+  if [ "$landing_ok" = 0 ] || [ -z "$gate_ctx" ]; then pv=unmeasured
+  elif reported "$gate_ctx"; then pv="yes ('$gate_ctx' reported on sampled heads)"
+  else pv="no ('$gate_ctx' never reported on sampled heads)"; fi
+  row "version/skill-sync gates" "$st" "$n_gate_wfs of $wf_ctl workflow(s) run the gate scripts; required=$required_gate" "$pv"
 fi
 
 # ── 4. merge queue ─────────────────────────────────────────────────────────
@@ -133,7 +169,10 @@ else
     method="$(api "repos/$REPO/rules/branches/$BASE" \
         --jq '.[]|select(.type=="merge_queue")|.parameters.merge_method' 2>/dev/null | head -n1)"
     if [ "$method" = MERGE ]; then st=present; else st=partial; fi
-    row "merge queue" "$st" "merge_queue rule on $BASE, method=$method"
+    if [ "$landing_ok" = 0 ]; then pv=unmeasured
+    elif [ "$mg_runs" -gt 0 ]; then pv="yes ($mg_runs merge-group run(s) on sampled PRs)"
+    else pv="no (0 merge-group runs on sampled PRs)"; fi
+    row "merge queue" "$st" "merge_queue rule on $BASE, method=$method" "$pv"
   else
     row "merge queue" absent "no merge_queue rule on $BASE ($n_rulesets ruleset(s) read)"
   fi
@@ -151,23 +190,6 @@ else
   row "auto-merge (MERGE)" "$st" "allow_auto_merge=$am allow_merge_commit=$mc"
 fi
 
-# ── 6/7. PR-head fast tier + receipt reuse (annotation contract) ───────────
-tier_fast=0; tier_seen=0; reuse=0; refuse=0; sampled=""; landing_ok=0
-if [ "$ctl_api" = ok ] && [ "$ctl_cli" = ok ]; then
-  prs="$(api "repos/$REPO/pulls?state=closed&base=$BASE&per_page=30" \
-      --jq '[.[]|select(.merged_at)][].number' 2>/dev/null | head -n "$PR_SAMPLE")"
-  for n in $prs; do
-    out="$(shipyard landing --repo "$REPO" --pr "$n" 2>&1 || true)"
-    sampled="$sampled #$n"
-    # Control: a landing report that never reached its VALIDATION section
-    # measured nothing, so its zero annotations are not evidence of absence.
-    printf '%s\n' "$out" | grep -q '^VALIDATION' && landing_ok=$((landing_ok+1))
-    tier_fast=$((tier_fast + $(printf '%s\n' "$out" | grep -c ': tier fast')))
-    tier_seen=$((tier_seen + $(printf '%s\n' "$out" | grep -cE ': tier (fast|full)')))
-    reuse=$((reuse + $(printf '%s\n' "$out" | grep -c 'reused receipt')))
-    refuse=$((refuse + $(printf '%s\n' "$out" | grep -c 'receipt refused')))
-  done
-fi
 if [ -z "$sampled" ] || [ "$landing_ok" = 0 ]; then
   row "PR-head fast tier" UNKNOWN "no readable landing report (PRs:${sampled:- none})"
   row "protected receipt reuse" UNKNOWN "no readable landing report (PRs:${sampled:- none})"
@@ -175,11 +197,11 @@ else
   if [ "$tier_fast" -gt 0 ]; then st=present
   elif [ "$tier_seen" -gt 0 ]; then st=partial
   else st=absent; fi
-  row "PR-head fast tier" "$st" "shipyard-test-tier: $tier_fast fast / $tier_seen annotated (PRs$sampled)"
-  if [ "$reuse" -gt 0 ]; then st=present
-  elif [ "$refuse" -gt 0 ]; then st=partial
-  else st=absent; fi
-  row "protected receipt reuse" "$st" "shipyard-receipt-decision: $reuse reuse / $refuse refuse (PRs$sampled)"
+  if [ "$tier_fast" -gt 0 ]; then pv="yes ($tier_fast fast-tier head check(s))"; else pv=no; fi
+  row "PR-head fast tier" "$st" "shipyard-test-tier: $tier_fast fast / $tier_seen annotated (PRs$sampled)" "$pv"
+  if [ $((reuse + refuse)) -gt 0 ]; then st=present; else st=absent; fi
+  if [ "$reuse" -gt 0 ]; then pv="yes ($reuse reuse decision(s))"; else pv="no (0 reuse decisions)"; fi
+  row "protected receipt reuse" "$st" "shipyard-receipt-decision: $reuse reuse / $refuse refuse (PRs$sampled)" "$pv"
 fi
 
 # ── 8. host classes + fleet-update (MACHINE scope, not repository) ─────────
@@ -188,10 +210,14 @@ if [ "$ctl_cli" != ok ]; then
 else
   capj="$(shipyard runner capacity --json 2>/dev/null || true)"
   conf="$(printf '%s' "$capj" | python3 -c 'import sys,json
-try: d=json.load(sys.stdin); print("%s %d" % (str(d.get("configured")).lower(), len(d.get("hosts",[]))))
-except Exception: print("unreadable 0")')"
+try:
+    d=json.load(sys.stdin); h=d.get("hosts",[])
+    print("%s %d %d" % (str(d.get("configured")).lower(), len(h), sum(1 for x in h if x.get("readable"))))
+except Exception: print("unreadable 0 0")')"
+  set -- $conf
+  if [ "${3:-0}" -gt 0 ]; then pv="yes ($3 of $2 host(s) readable)"; else pv="no (0 of ${2:-0} readable)"; fi
   case "$conf" in
-    true*) row "host classes (this machine)" present "runner capacity: configured, ${conf#* } host class(es)" ;;
+    true*) row "host classes (this machine)" present "runner capacity: configured, $2 host class(es)" "$pv" ;;
     false*) row "host classes (this machine)" absent "runner capacity: configured=false" ;;
     *) row "host classes (this machine)" UNKNOWN "runner capacity output unreadable" ;;
   esac
@@ -225,10 +251,14 @@ fi
 # ── Report ──────────────────────────────────────────────────────────────────
 echo "Shipyard adoption audit: $REPO (base $BASE)"
 echo "controls: git=$ctl_git api=$ctl_api cli=$ctl_cli"
-printf '%-28s %-9s %s\n' FEATURE STATUS EVIDENCE
+printf '%-28s %-9s %-40s %s\n' FEATURE STATUS PROVEN EVIDENCE
+unproven=""
 for r in "${rows[@]}"; do
-  IFS='|' read -r f s e <<< "$r"
-  printf '%-28s %-9s %s\n' "$f" "$s" "$e"
+  IFS='|' read -r f s e p <<< "$r"
+  # Nothing configured means nothing to prove.
+  case "$s" in present|partial) : "${p:=unmeasured}" ;; *) p=- ;; esac
+  case "$s:$p" in present:no*|present:unmeasured) unproven="$unproven; $f" ;; esac
+  printf '%-28s %-9s %-40s %s\n' "$f" "$s" "$p" "$e"
 done
 
 # Adoption order: each feature depends on the ones above it.
@@ -244,3 +274,4 @@ for f in "shipyard pr flow" "required checks" "version/skill-sync gates" \
   done
 done
 echo "recommended next: ${next:-nothing in the core set; baseline with shipyard metrics gate-cost}"
+echo "present but not proven: ${unproven#; }"
