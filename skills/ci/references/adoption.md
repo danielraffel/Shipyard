@@ -167,7 +167,7 @@ PR; until they ship, a failing local-lane verdict is not a PR failure
 ### Opt-in targets (`default = false`): not ready, unreleased
 
 **Not ready: not merged or released.** Proposed in Shipyard #655 (branch
-`feat/opt-in-targets`, expected in CLI 0.235.0). Re-check before adopting: the
+`feat/opt-in-targets`, expected in CLI 0.234.0, to be confirmed when it merges). Re-check before adopting: the
 contract below is the PR's, not observed behavior, and it has no effect count
 yet.
 
