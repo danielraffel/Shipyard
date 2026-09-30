@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+pub mod job_name;
 pub mod proxy;
 mod proxy_store;
 
@@ -106,6 +107,56 @@ pub struct MetricsFinding {
     /// Full before/after comparison, when the finding came from one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<proxy::Comparison>,
+    /// What the finding's sample counts count, when it states shares.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denominator: Option<Denominator>,
+    /// Whether the lane holds a required status check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateClass>,
+}
+
+/// The denominator behind a lane's shares. Every share is over job rows, each
+/// judged by that job's own conclusion; a workflow run's conclusion (which an
+/// advisory job elsewhere in the run can turn red) is never used.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Denominator {
+    /// Always `jobs`.
+    pub unit: &'static str,
+    /// Job rows in the earlier window.
+    pub previous_jobs: usize,
+    /// Job rows in the later window.
+    pub current_jobs: usize,
+    /// Earlier-window jobs that finished success or failure: the
+    /// `failure_share` denominator.
+    pub previous_decided: usize,
+    /// Later-window jobs that finished success or failure.
+    pub current_decided: usize,
+    /// Distinct job (check) names in the lane.
+    pub job_names: Vec<String>,
+}
+
+/// Whether a lane gates merges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateClass {
+    /// Holds a required status check.
+    Required,
+    /// Holds only jobs that are not required checks.
+    Advisory,
+    /// No required-check set was supplied.
+    Unclassified,
+}
+
+/// How `metrics summary` groups rows by machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryGroupBy {
+    /// The recorded machine name: an ephemeral runner name when a job was
+    /// imported from GitHub.
+    #[default]
+    Runner,
+    /// The physical host behind the runner (see [`host_group`]).
+    Host,
 }
 
 /// Compact, bounded stewardship scorecard. Fields that the metrics store does
@@ -486,8 +537,22 @@ impl MetricsStore {
         &self,
         project: Option<&str>,
     ) -> Result<Vec<MetricsSummaryRow>, Box<dyn std::error::Error>> {
+        self.summary_grouped(project, SummaryGroupBy::Runner)
+    }
+
+    /// [`Self::summary`], grouping machines by `group_by`.
+    pub fn summary_grouped(
+        &self,
+        project: Option<&str>,
+        group_by: SummaryGroupBy,
+    ) -> Result<Vec<MetricsSummaryRow>, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let rows = load_summary_inputs(&conn, project)?;
+        let mut rows = load_summary_inputs(&conn, project)?;
+        if group_by == SummaryGroupBy::Host {
+            for row in &mut rows {
+                row.host = host_group(&row.host, &row.labels, row.repo.as_deref());
+            }
+        }
         Ok(group_summary(rows))
     }
 
@@ -512,6 +577,19 @@ impl MetricsStore {
         since_days: i64,
         basis: proxy::Basis,
     ) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
+        self.watch_with_required(project, since_days, basis, &[])
+    }
+
+    /// [`Self::watch`], classifying each lane as a required gate or advisory
+    /// against `required` (status-check names). An empty `required` leaves
+    /// every lane `unclassified`.
+    pub fn watch_with_required(
+        &self,
+        project: &str,
+        since_days: i64,
+        basis: proxy::Basis,
+        required: &[String],
+    ) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         let rows = load_summary_inputs(&conn, Some(project))?;
         let wall = watch_findings(rows, since_days);
@@ -523,6 +601,7 @@ impl MetricsStore {
             &samples,
             since_days,
             Utc::now(),
+            required,
         ))
     }
 
@@ -544,9 +623,16 @@ impl MetricsStore {
     }
 
     /// Recommend the fastest healthy lane for each target.
+    ///
+    /// Lanes are keyed by the job's resolved name (an unevaluated `${{ }}`
+    /// name joins the job it evaluates to) and by physical host, not by the
+    /// ephemeral runner, so a gate served by throwaway runners still
+    /// accumulates samples. Only success and failure count; skipped,
+    /// cancelled and unfinished jobs say nothing about a lane's health.
     pub fn advise(&self, project: &str) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
-        let summaries = self.summary(Some(project))?;
-        Ok(advise_findings(&summaries))
+        let conn = self.connect()?;
+        let rows = load_summary_inputs(&conn, Some(project))?;
+        Ok(advise_findings(rows))
     }
 
     /// Compare before/after windows split at `split_days_ago`. The verdict
@@ -849,6 +935,8 @@ struct SummaryInput {
     status: String,
     total_ms: Option<i64>,
     completed_at: Option<DateTime<Utc>>,
+    repo: Option<String>,
+    labels: Vec<String>,
 }
 
 fn upsert_machine(
@@ -1193,7 +1281,9 @@ fn load_summary_inputs(
                 COALESCE(jobs.provider, 'unknown'),
                 jobs.status,
                 jobs.total_ms,
-                jobs.completed_at
+                jobs.completed_at,
+                runs.repo,
+                jobs.labels_json
          FROM jobs
          JOIN runs ON runs.id = jobs.run_id
          LEFT JOIN machines ON machines.id = jobs.machine_id
@@ -1201,6 +1291,7 @@ fn load_summary_inputs(
     )?;
     let rows = stmt.query_map(params![project], |row| {
         let completed_raw: Option<String> = row.get(7)?;
+        let labels_raw: Option<String> = row.get(9)?;
         Ok(SummaryInput {
             project: row.get(0)?,
             target: row.get(1)?,
@@ -1213,9 +1304,83 @@ fn load_summary_inputs(
                 .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc)),
+            repo: row.get(8)?,
+            labels: labels_raw
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+                .unwrap_or_default(),
         })
     })?;
     Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Physical host behind a recorded machine name, for grouping. In order:
+///
+/// 1. a `<anything>-host-<id>` runner label names the host (`<id>`);
+/// 2. a GitHub-hosted runner (`GitHub Actions 1000…`) is `github-hosted`;
+/// 3. a just-in-time runner named `<tag>-<repo>-…` (`m5studio-pulp-gate-01-42746-25`)
+///    is `<tag>`, the machine's `shipyard runner tag`;
+/// 4. a registered runner named `<repo>-<tag>-NN` is `<tag>`;
+/// 5. otherwise the name with trailing numeric and `slotN` segments removed,
+///    which leaves a name that is already a host (`m3`) unchanged.
+#[must_use]
+pub fn host_group(machine: &str, labels: &[String], repo: Option<&str>) -> String {
+    if let Some(id) = labels.iter().find_map(|label| {
+        label
+            .to_ascii_lowercase()
+            .split_once("-host-")
+            .map(|(_, id)| id.to_owned())
+            .filter(|id| !id.is_empty())
+    }) {
+        return id;
+    }
+    let name = machine.trim();
+    if name.is_empty() {
+        return "unknown".to_owned();
+    }
+    if name.starts_with("GitHub Actions") {
+        return "github-hosted".to_owned();
+    }
+    let lower = name.to_ascii_lowercase();
+    if let Some(short) = repo
+        .and_then(|repo| repo.rsplit('/').next())
+        .map(str::to_ascii_lowercase)
+        .filter(|short| !short.is_empty())
+    {
+        if let Some(index) = lower.find(&format!("-{short}-"))
+            && index > 0
+        {
+            return lower[..index].to_owned();
+        }
+        if let Some(rest) = lower.strip_prefix(&format!("{short}-")) {
+            let tag = strip_runner_index(rest);
+            if !tag.is_empty() && tag != rest {
+                return tag;
+            }
+        }
+    }
+    let stripped = strip_runner_index(&lower);
+    if stripped.is_empty() {
+        name.to_owned()
+    } else {
+        stripped
+    }
+}
+
+/// Drop trailing all-digit and `slotN` segments from a runner name.
+fn strip_runner_index(name: &str) -> String {
+    let mut segments: Vec<&str> = name.split('-').collect();
+    while let Some(last) = segments.last() {
+        let slot = last
+            .strip_prefix("slot")
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
+        if slot || (!last.is_empty() && last.chars().all(|c| c.is_ascii_digit())) {
+            segments.pop();
+        } else {
+            break;
+        }
+    }
+    segments.join("-")
 }
 
 fn group_summary(rows: Vec<SummaryInput>) -> Vec<MetricsSummaryRow> {
@@ -1303,6 +1468,8 @@ fn watch_findings(rows: Vec<SummaryInput>, since_days: i64) -> Vec<MetricsFindin
                 recommended_actions: vec!["Keep collecting runner timing samples.".to_owned()],
                 basis: proxy::Basis::WallTime.as_str(),
                 comparison: None,
+                denominator: None,
+                gate: None,
             });
             continue;
         }
@@ -1325,62 +1492,153 @@ fn watch_findings(rows: Vec<SummaryInput>, since_days: i64) -> Vec<MetricsFindin
                 ],
                 basis: proxy::Basis::WallTime.as_str(),
                 comparison: None,
+                denominator: None,
+                gate: None,
             });
         }
     }
     findings
 }
 
-fn advise_findings(summaries: &[MetricsSummaryRow]) -> Vec<MetricsFinding> {
-    let mut by_target: BTreeMap<&str, Vec<&MetricsSummaryRow>> = BTreeMap::new();
-    for row in summaries {
-        by_target.entry(&row.target).or_default().push(row);
+/// Minimum decided (success or failure) jobs before a lane is advisable.
+const ADVISE_MIN_DECIDED: usize = 3;
+/// Failure ceiling for a lane to count as healthy.
+const ADVISE_MAX_FAILURE_RATE: f64 = 0.10;
+
+/// `(backend, host, provider)` of one advise lane.
+type AdviseKey = (String, String, String);
+/// One scored advise lane: key, failure rate, success p50, decided jobs.
+type ScoredLane<'a> = (&'a AdviseKey, f64, Option<i64>, usize);
+
+/// One advise lane: a resolved job name on one physical host.
+#[derive(Debug, Default)]
+struct AdviseLane {
+    successes: usize,
+    failures: usize,
+    success_ms: Vec<i64>,
+}
+
+impl AdviseLane {
+    const fn decided(&self) -> usize {
+        self.successes + self.failures
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn advise_findings(rows: Vec<SummaryInput>) -> Vec<MetricsFinding> {
+    let mut by_target: BTreeMap<String, BTreeMap<AdviseKey, AdviseLane>> = BTreeMap::new();
+    for row in rows {
+        let success = proxy::is_success(&row.status);
+        if !success && !proxy::is_failure(&row.status) {
+            continue;
+        }
+        let target = job_name::canonical(&row.target);
+        let host = host_group(&row.host, &row.labels, row.repo.as_deref());
+        let lane = by_target
+            .entry(target)
+            .or_default()
+            .entry((row.backend, host, row.provider))
+            .or_default();
+        if success {
+            lane.successes += 1;
+            lane.success_ms.extend(row.total_ms);
+        } else {
+            lane.failures += 1;
+        }
     }
     let mut findings = Vec::new();
-    for (target, rows) in by_target {
-        let mut viable = rows
-            .into_iter()
-            .filter(|row| row.count >= 3 && row.failure_rate <= 0.10 && row.p50_ms.is_some())
-            .collect::<Vec<_>>();
-        viable.sort_by_key(|row| row.p50_ms.unwrap_or(i64::MAX));
-        let Some(best) = viable.first() else {
+    for (target, lanes) in by_target {
+        let total: usize = lanes.values().map(AdviseLane::decided).sum();
+        let mut scored: Vec<ScoredLane<'_>> = lanes
+            .iter()
+            .map(|(key, lane)| {
+                let mut timed = lane.success_ms.clone();
+                timed.sort_unstable();
+                (
+                    key,
+                    failure_rate(lane.failures, lane.decided()),
+                    percentile(&timed, 50),
+                    lane.decided(),
+                )
+            })
+            .collect();
+        scored.sort_by_key(|(_, _, p50, _)| p50.unwrap_or(i64::MAX));
+        let viable = scored.iter().find(|(_, rate, p50, decided)| {
+            *decided >= ADVISE_MIN_DECIDED && *rate <= ADVISE_MAX_FAILURE_RATE && p50.is_some()
+        });
+        if let Some(((backend, host, _), rate, p50, decided)) = viable {
+            findings.push(MetricsFinding {
+                severity: "info".to_owned(),
+                lane: target.clone(),
+                signal: "preferred_lane".to_owned(),
+                message: format!(
+                    "Prefer {backend} on {host} for {target}: fastest healthy p50 is {}ms over \
+                     {decided} decided jobs (failure rate {rate:.2}).",
+                    p50.unwrap_or_default(),
+                ),
+                sample_count: *decided,
+                suggested_poll_interval_secs: 600,
+                recommended_actions: vec![
+                    "Keep the profile unchanged unless capacity or fidelity requirements disagree."
+                        .to_owned(),
+                ],
+                basis: proxy::Basis::WallTime.as_str(),
+                comparison: None,
+                denominator: None,
+                gate: None,
+            });
+            continue;
+        }
+        let sampled: Vec<String> = scored
+            .iter()
+            .filter(|(_, _, _, decided)| *decided >= ADVISE_MIN_DECIDED)
+            .map(|((backend, host, _), rate, _, decided)| {
+                format!("{backend}/{host} {:.0}% of {decided}", rate * 100.0)
+            })
+            .collect();
+        if sampled.is_empty() {
             findings.push(MetricsFinding {
                 severity: "watch".to_owned(),
-                lane: target.to_owned(),
+                lane: target,
                 signal: "insufficient_healthy_samples".to_owned(),
-                message:
-                    "No lane has enough healthy samples for a confident placement recommendation."
-                        .to_owned(),
-                sample_count: 0,
+                message: format!(
+                    "No lane has {ADVISE_MIN_DECIDED} finished (success or failure) jobs yet; \
+                     {total} decided across {} lane(s).",
+                    lanes.len()
+                ),
+                sample_count: total,
                 suggested_poll_interval_secs: 600,
                 recommended_actions: vec![
                     "Keep collecting metrics before changing profiles.".to_owned(),
                 ],
                 basis: proxy::Basis::WallTime.as_str(),
                 comparison: None,
+                denominator: None,
+                gate: None,
             });
-            continue;
-        };
-        findings.push(MetricsFinding {
-            severity: "info".to_owned(),
-            lane: target.to_owned(),
-            signal: "preferred_lane".to_owned(),
-            message: format!(
-                "Prefer {} on {} for {target}: fastest healthy p50 is {}ms over {} samples.",
-                best.backend,
-                best.host,
-                best.p50_ms.unwrap_or_default(),
-                best.count
-            ),
-            sample_count: best.count,
-            suggested_poll_interval_secs: 600,
-            recommended_actions: vec![
-                "Keep the profile unchanged unless capacity or fidelity requirements disagree."
-                    .to_owned(),
-            ],
-            basis: proxy::Basis::WallTime.as_str(),
-            comparison: None,
-        });
+        } else {
+            findings.push(MetricsFinding {
+                severity: "watch".to_owned(),
+                lane: target,
+                signal: "no_healthy_lane".to_owned(),
+                message: format!(
+                    "Every sampled lane fails more than {:.0}% of decided jobs ({}); \
+                     {total} decided jobs in all.",
+                    ADVISE_MAX_FAILURE_RATE * 100.0,
+                    sampled.join(", ")
+                ),
+                sample_count: total,
+                suggested_poll_interval_secs: 600,
+                recommended_actions: vec![
+                    "Placement is not the lever: fix the failures before moving the job."
+                        .to_owned(),
+                ],
+                basis: proxy::Basis::WallTime.as_str(),
+                comparison: None,
+                denominator: None,
+                gate: None,
+            });
+        }
     }
     findings
 }
@@ -1435,6 +1693,8 @@ fn compare_findings(rows: Vec<SummaryInput>, split_days_ago: i64) -> Vec<Metrics
             ],
             basis: proxy::Basis::WallTime.as_str(),
             comparison: None,
+            denominator: None,
+            gate: None,
         });
     }
     findings
@@ -1595,6 +1855,9 @@ pub fn github_job_to_record(
         ..MetricRecordInput::default()
     }
 }
+
+#[cfg(test)]
+mod instrument_tests;
 
 #[cfg(test)]
 mod tests {

@@ -65,6 +65,9 @@ pub const WALL_CONTEXT_LABEL: &str = "context (load-dependent)";
 pub struct ProxySample {
     /// Proxy lane key: the job class (target), never the host.
     pub lane: String,
+    /// The job (check) name as the provider reported it. Required-vs-advisory
+    /// classification matches this, not the lane.
+    pub job: String,
     /// Terminal job status.
     pub status: String,
     /// `(repo, pr)` when the job carries pull-request identity.
@@ -150,6 +153,9 @@ pub struct ProxyDelta {
     pub before_sample: usize,
     /// Samples in the later window.
     pub after_sample: usize,
+    /// What `before_sample` and `after_sample` count. Every job-share proxy
+    /// is over job rows (each job's own conclusion), never workflow runs.
+    pub unit: &'static str,
     /// Minimum sample per window.
     pub min_sample: usize,
     /// Which direction is better.
@@ -236,7 +242,7 @@ impl Comparison {
             .filter(|delta| matches!(delta.direction, Direction::Improved | Direction::Regressed))
             .map(|delta| {
                 format!(
-                    "{} {} {}->{} (n={}/{})",
+                    "{} {} {}->{} (n={}/{} {})",
                     delta.name,
                     match delta.direction {
                         Direction::Improved => "improved",
@@ -245,7 +251,8 @@ impl Comparison {
                     fmt_value(delta.before),
                     fmt_value(delta.after),
                     delta.before_sample,
-                    delta.after_sample
+                    delta.after_sample,
+                    delta.unit
                 )
             })
             .collect();
@@ -293,6 +300,7 @@ fn fmt_ms(value: Option<i64>) -> String {
 
 struct Spec {
     name: &'static str,
+    unit: &'static str,
     min_sample: usize,
     better: Better,
     test: Test,
@@ -302,6 +310,7 @@ struct Spec {
 const SPECS: [Spec; 6] = [
     Spec {
         name: "failure_share",
+        unit: "jobs (success+failure)",
         min_sample: 10,
         better: Better::Lower,
         test: Test::Proportion { min_abs: 0.05 },
@@ -309,6 +318,7 @@ const SPECS: [Spec; 6] = [
     },
     Spec {
         name: "cancelled_share",
+        unit: "jobs (completed)",
         min_sample: 10,
         better: Better::Lower,
         test: Test::Proportion { min_abs: 0.05 },
@@ -316,6 +326,7 @@ const SPECS: [Spec; 6] = [
     },
     Spec {
         name: "starvation_share",
+        unit: "jobs (runner assignment known)",
         min_sample: 10,
         better: Better::Lower,
         test: Test::Proportion { min_abs: 0.05 },
@@ -323,6 +334,7 @@ const SPECS: [Spec; 6] = [
     },
     Spec {
         name: "attempts_per_pr",
+        unit: "pull requests",
         min_sample: 5,
         better: Better::Lower,
         test: Test::Relative {
@@ -333,6 +345,7 @@ const SPECS: [Spec; 6] = [
     },
     Spec {
         name: "queue_wait_per_job_ahead_ms",
+        unit: "jobs (queue-timed)",
         min_sample: 10,
         better: Better::Lower,
         test: Test::Relative {
@@ -343,6 +356,7 @@ const SPECS: [Spec; 6] = [
     },
     Spec {
         name: "cache_hit_rate",
+        unit: "jobs (cache-reporting)",
         min_sample: 10,
         better: Better::Higher,
         test: Test::Proportion { min_abs: 0.05 },
@@ -353,18 +367,18 @@ const SPECS: [Spec; 6] = [
 /// Minimum successful-duration samples per window for a wall-time verdict.
 pub const WALL_MIN_SAMPLE: usize = 3;
 
-fn is_success(status: &str) -> bool {
+pub(super) fn is_success(status: &str) -> bool {
     matches!(status, "pass" | "success")
 }
 
-fn is_failure(status: &str) -> bool {
+pub(super) fn is_failure(status: &str) -> bool {
     matches!(
         status,
         "fail" | "failure" | "failed" | "timed_out" | "action_required" | "startup_failure"
     )
 }
 
-fn is_cancelled(status: &str) -> bool {
+pub(super) fn is_cancelled(status: &str) -> bool {
     matches!(status, "cancelled" | "canceled")
 }
 
@@ -599,6 +613,7 @@ pub fn compare(before: &[&ProxySample], after: &[&ProxySample], basis: Basis) ->
             after: a.value,
             before_sample: b.sample,
             after_sample: a.sample,
+            unit: spec.unit,
             min_sample: spec.min_sample,
             better: spec.better,
             direction: direction(spec, b, a),

@@ -34,11 +34,13 @@
 //! as load-dependent context.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::metrics::job_name;
 use crate::validation_signals::{self, GhReader, ReceiptDecision};
 
 pub mod cache;
@@ -198,6 +200,28 @@ pub struct GateCostObservation {
     pub runner_census: Result<RunnerCensus, String>,
     /// How many reads went to GitHub and how many the disk cache answered.
     pub reads: ReadStats,
+    /// Problems found while listing gate runs: a created-window listing that
+    /// an independent event walk contradicted, or a walk that could not run.
+    pub listing_gaps: Vec<TelemetryGap>,
+    /// Per event, runs in which no job was named exactly `gate_job`.
+    pub gate_absent: BTreeMap<String, GateAbsence>,
+}
+
+/// Runs of one event in which no job carried the gate's exact name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GateAbsence {
+    /// Runs with no exactly-named gate job.
+    pub runs: usize,
+    /// Of those, runs whose gate was matched through a job whose reported
+    /// name is an unevaluated expression or matrix placeholder resolving to
+    /// the gate name, and that job never got a runner: GitHub leaves `name:`
+    /// unevaluated for a job cancelled or skipped before it started.
+    pub resolved_unstarted: usize,
+    /// Of those, runs whose matched job ran under its unevaluated name: the
+    /// workflow's gate `name:` itself no longer evaluates to the gate.
+    pub resolved_ran: usize,
+    /// Up to three distinct reported names that resolved to the gate.
+    pub resolved_names: Vec<String>,
 }
 
 /// Duration statistics for one class of gate runs.
@@ -551,6 +575,50 @@ pub fn compute(observation: &GateCostObservation) -> GateCostReport {
                 reuse.no_decision + reuse.unreadable,
                 query.receipt_target
             ),
+        });
+    }
+
+    gaps.extend(observation.listing_gaps.iter().cloned());
+    for (event, absence) in &observation.gate_absent {
+        let total = observation
+            .runs_by_event
+            .get(event)
+            .map_or(0, BTreeSet::len);
+        let mut reason = format!(
+            "{} of {total} `{event}` run(s) have no job named exactly `{}`",
+            absence.runs, query.gate_job
+        );
+        if absence.resolved_unstarted > 0 {
+            let _ = write!(
+                reason,
+                "; {} were cancelled before the gate started, which leaves every job name \
+                 unevaluated, and count as one gate attempt each through the unevaluated name",
+                absence.resolved_unstarted
+            );
+        }
+        if absence.resolved_ran > 0 {
+            let _ = write!(
+                reason,
+                "; {} ran the gate under an unevaluated name, so the workflow's gate `name:` no \
+                 longer evaluates to `{}` and should be made a literal again",
+                absence.resolved_ran, query.gate_job
+            );
+        }
+        let resolved = absence.resolved_unstarted + absence.resolved_ran;
+        if resolved > 0 {
+            let _ = write!(reason, " (names: {})", absence.resolved_names.join(" | "));
+        }
+        if absence.runs > resolved {
+            let _ = write!(
+                reason,
+                "; {} run(s) carry no gate job at all and add no gate minutes (renamed, \
+                 moved to another workflow, or not scheduled)",
+                absence.runs - resolved
+            );
+        }
+        gaps.push(TelemetryGap {
+            signal: "gate_job_name".to_owned(),
+            reason,
         });
     }
 
@@ -997,6 +1065,8 @@ pub fn gather_cached(
     let mut reuse = BTreeMap::new();
     let mut run_meta = BTreeMap::new();
     let mut placement_jobs = Vec::new();
+    let mut listing_gaps = Vec::new();
+    let mut gate_absent: BTreeMap<String, GateAbsence> = BTreeMap::new();
     for event in &query.events {
         let pages = read_pages(
             gh,
@@ -1021,7 +1091,8 @@ pub fn gather_cached(
                  listing cap; narrow the window"
             ));
         }
-        let runs = collect_counted(&pages, "workflow_runs", &format!("`{event}` runs"))?;
+        let mut runs = collect_counted(&pages, "workflow_runs", &format!("`{event}` runs"))?;
+        cross_check_listing(gh, query, event, &mut runs, &mut listing_gaps);
         let entry = runs_by_event.entry(event.clone()).or_default();
         let run_refs: Vec<RunRef> = runs
             .iter()
@@ -1054,17 +1125,44 @@ pub fn gather_cached(
         });
         for result in per_run {
             let (run_id, jobs, outcome) = result?;
+            let exact = jobs
+                .iter()
+                .any(|job| text(job, "name").as_deref() == Some(query.gate_job.as_str()));
+            // No exactly-named gate job: GitHub reported the gate's name
+            // unevaluated. One job per attempt stands for the gate: the one
+            // that got a runner, else the first that was not skipped. The
+            // gate's skipped or cancelled alternates carry the same resolved
+            // name and must not multiply the attempt.
+            let fallback = if exact {
+                BTreeMap::new()
+            } else {
+                resolved_gate_jobs(&jobs, &query.gate_job)
+            };
             for job in &jobs {
                 let runner_name = text(job, "runner_name").filter(|name| !name.trim().is_empty());
                 let labels = job_labels(job);
+                let name = text(job, "name").unwrap_or_default();
                 placement_jobs.push(PlacementSample {
-                    name: text(job, "name").unwrap_or_default(),
+                    name: name.clone(),
                     labels: labels.clone(),
                     runner_assigned: runner_name.is_some(),
                     conclusion: text(job, "conclusion"),
                 });
-                if text(job, "name").as_deref() != Some(query.gate_job.as_str()) {
+                let is_gate = if exact {
+                    name == query.gate_job
+                } else {
+                    job.get("id")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|id| fallback.values().any(|picked| *picked == id))
+                };
+                if !is_gate {
                     continue;
+                }
+                if !exact {
+                    let absence = gate_absent.entry(event.clone()).or_default();
+                    if absence.resolved_names.len() < 3 && !absence.resolved_names.contains(&name) {
+                        absence.resolved_names.push(name.clone());
+                    }
                 }
                 gate_jobs.push(GateJobSample {
                     run_id,
@@ -1078,6 +1176,21 @@ pub fn gather_cached(
                     runner_name,
                     labels,
                 });
+            }
+            if !exact {
+                let ran = jobs.iter().any(|job| {
+                    job.get("id")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|id| fallback.values().any(|picked| *picked == id))
+                        && text(job, "runner_name").is_some_and(|name| !name.trim().is_empty())
+                });
+                let absence = gate_absent.entry(event.clone()).or_default();
+                absence.runs += 1;
+                if ran {
+                    absence.resolved_ran += 1;
+                } else if !fallback.is_empty() {
+                    absence.resolved_unstarted += 1;
+                }
             }
             if let Some(outcome) = outcome {
                 reuse.insert(run_id, outcome);
@@ -1109,7 +1222,145 @@ pub fn gather_cached(
         placement_jobs,
         runner_census,
         reads: cache.stats(),
+        listing_gaps,
+        gate_absent,
     })
+}
+
+/// Per run attempt, the id of the one job that stands for `gate_job` when no
+/// job carries its exact name: among jobs whose unevaluated name resolves to
+/// it and that were not skipped, the first that got a runner, else the first.
+fn resolved_gate_jobs(jobs: &[Value], gate_job: &str) -> BTreeMap<u64, u64> {
+    let mut picked: BTreeMap<u64, (bool, u64)> = BTreeMap::new();
+    for job in jobs {
+        let (Some(id), Some(name)) = (job.get("id").and_then(Value::as_u64), text(job, "name"))
+        else {
+            continue;
+        };
+        if !job_name::matches(gate_job, &name)
+            || text(job, "conclusion").as_deref() == Some("skipped")
+        {
+            continue;
+        }
+        let attempt = job.get("run_attempt").and_then(Value::as_u64).unwrap_or(1);
+        let ran = text(job, "runner_name").is_some_and(|name| !name.trim().is_empty());
+        match picked.get(&attempt) {
+            Some((true, _)) => {}
+            Some((false, _)) if !ran => {}
+            _ => {
+                picked.insert(attempt, (ran, id));
+            }
+        }
+    }
+    picked
+        .into_iter()
+        .map(|(attempt, (_, id))| (attempt, id))
+        .collect()
+}
+
+/// Pages of the unfiltered event listing walked for the cross-check; 1000
+/// runs, the same ceiling as a filtered listing.
+const WALK_MAX_PAGES: u32 = 10;
+
+/// Cross-check a `created=` window listing against the plain event listing,
+/// which GitHub serves newest first without its search backend.
+///
+/// The `created` filter has been observed to answer with a short list whose
+/// own `total_count` agrees with it (11 `pull_request` runs where 624 existed),
+/// which [`collect_counted`] cannot catch. Runs the walk finds in the window
+/// that the filtered listing missed are added to `runs`, and the disagreement
+/// is reported as a gap rather than silently corrected.
+fn cross_check_listing(
+    gh: &GhReader<'_>,
+    query: &GateCostQuery,
+    event: &str,
+    runs: &mut Vec<Value>,
+    gaps: &mut Vec<TelemetryGap>,
+) {
+    let listed: BTreeSet<u64> = runs
+        .iter()
+        .filter_map(|run| run.get("id").and_then(Value::as_u64))
+        .collect();
+    let path = format!(
+        "repos/{}/actions/workflows/{}/runs",
+        query.repo, query.workflow
+    );
+    let mut seen = BTreeSet::new();
+    let mut missed = Vec::new();
+    let mut reached_start = false;
+    for page in 1..=WALK_MAX_PAGES {
+        let args = strings(&[
+            "api",
+            "-X",
+            "GET",
+            &path,
+            "-f",
+            &format!("event={event}"),
+            "-f",
+            "per_page=100",
+            "-f",
+            &format!("page={page}"),
+        ]);
+        let items = match read_json(gh, &args) {
+            Ok(value) => value
+                .get("workflow_runs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) => {
+                gaps.push(TelemetryGap {
+                    signal: "run_listing".to_owned(),
+                    reason: format!(
+                        "`{event}` run listing could not be cross-checked against the event \
+                         walk: {error}"
+                    ),
+                });
+                return;
+            }
+        };
+        let mut oldest = None;
+        for run in &items {
+            let Some(id) = run.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(created) = timestamp(run, "created_at") else {
+                continue;
+            };
+            oldest = Some(oldest.map_or(created, |old: DateTime<Utc>| old.min(created)));
+            if created >= query.from && created < query.to && !listed.contains(&id) {
+                missed.push(run.clone());
+            }
+        }
+        if items.len() < 100 || oldest.is_none_or(|oldest| oldest < query.from) {
+            reached_start = true;
+            break;
+        }
+    }
+    if !missed.is_empty() {
+        gaps.push(TelemetryGap {
+            signal: "run_listing".to_owned(),
+            reason: format!(
+                "the `created` window listing returned {} `{event}` run(s) but the event walk \
+                 found {} more in the window; they are included (GitHub answered the filtered \
+                 listing short without flagging it)",
+                listed.len(),
+                missed.len()
+            ),
+        });
+        runs.extend(missed);
+    }
+    if !reached_start {
+        gaps.push(TelemetryGap {
+            signal: "run_listing".to_owned(),
+            reason: format!(
+                "the `{event}` event walk stopped at {WALK_MAX_PAGES} pages before the window \
+                 start, so a short filtered listing older than that would go unnoticed"
+            ),
+        });
+    }
 }
 
 fn job_labels(job: &Value) -> Vec<String> {
