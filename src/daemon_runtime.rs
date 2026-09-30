@@ -1591,6 +1591,12 @@ fn read_webhook_request_tracked(
     progress.delivery = headers.get("x-github-delivery").cloned();
     progress.event = headers.get("x-github-event").cloned();
 
+    if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return Err("chunked transfer encoding is not supported".to_owned());
+    }
     let length = match headers.get("content-length") {
         None => 0,
         Some(value) => value
@@ -3047,6 +3053,29 @@ mod tests {
         assert_eq!(
             rejection.log_line(),
             "shipyard daemon: rejected webhook delivery guid-truncated (workflow_run) with HTTP 400: connection closed before the body was complete [body 5 of 100 bytes]"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_reader_names_a_chunked_body_instead_of_a_bad_signature() {
+        let (mut client, mut server) = accepted_pair();
+        client
+            .write_all(b"POST /webhook HTTP/1.1\r\nTransfer-Encoding: chunked\r\nX-GitHub-Delivery: guid-chunked\r\nX-GitHub-Event: check_run\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+            .expect("write");
+
+        let Err(rejection) = super::read_webhook_request(&mut server, Duration::from_secs(5))
+        else {
+            panic!("a chunked body must be refused by the reader");
+        };
+
+        assert_eq!(rejection.response.status, 400);
+        assert!(
+            rejection
+                .log_line()
+                .contains("(check_run) with HTTP 400: chunked transfer encoding is not supported"),
+            "{}",
+            rejection.log_line()
         );
     }
 
