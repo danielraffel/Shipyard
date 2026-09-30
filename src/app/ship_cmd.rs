@@ -28,7 +28,9 @@ use crate::diagnostics::{
     select_parser,
 };
 use crate::evidence::EvidenceStore;
-use crate::executor::dispatch::{ExecutorDispatcher, ResolvedTarget, resolve_targets};
+use crate::executor::dispatch::{
+    ExecutorDispatcher, ResolvedTarget, opt_in_target_names, resolve_targets,
+};
 use crate::governance::{GovernanceGh, put_branch_protection, resolve_branch_rules};
 use crate::identity::RuntimeMode;
 use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
@@ -81,6 +83,9 @@ pub(super) struct ShipCommandArgs {
     /// Skip the landability gate for this invocation.
     pub(super) skip_landability: bool,
     pub(super) skip_targets: Vec<String>,
+    /// Opt-in targets (`default = false`) to validate in addition to the
+    /// default set.
+    pub(super) targets: Vec<String>,
     /// Adopt the current head SHA when recorded ship-state drifted (amend /
     /// force-push), clearing prior evidence so the new head re-validates
     /// instead of dead-ending on `ShaDrift`. See Shipyard #346.
@@ -165,7 +170,9 @@ pub(super) fn ship_command<W: Write>(
         maybe_auto_create_base_branch(cwd, &args.base, config, args.gh_command.as_deref());
     }
     let lane_policy = resolve_lane_policy(config, cwd);
-    let prepush_enabled = args.pr.is_none() && prepush_changed_surface::shadow_enabled(config)?;
+    let prepush_enabled = args.pr.is_none()
+        && !targets.is_empty()
+        && prepush_changed_surface::shadow_enabled(config)?;
     let prepush_base = if prepush_enabled {
         match find_pr_for_branch(config, cwd, args.gh_command.as_deref(), &branch) {
             Ok(Some(info)) => Some(info.base),
@@ -311,6 +318,10 @@ pub(super) fn ship_command<W: Write>(
         json_mode,
         stdout,
     )?;
+
+    if targets.is_empty() {
+        return render_required_checks_delegation(config, pr_context.number, json_mode, stdout);
+    }
 
     let metadata_authority_receipt = metadata_authority::observe_and_authorize(
         config,
@@ -514,6 +525,56 @@ pub(super) fn ship_command<W: Write>(
     Ok(render_state.exit_code())
 }
 
+/// Report a ship that validates nothing locally because every configured
+/// target is opt-in.
+///
+/// The pull request is already pushed, open and (unless `--no-arm`) armed for
+/// native auto-merge, so the repository's required checks own the verdict. No
+/// job is queued and no ship-state is written: an evidence-free ship-state
+/// reads as in flight to `watch`, and as an orphan to the resume sweep, which
+/// would report a failure that never happened.
+fn render_required_checks_delegation<W: Write>(
+    config: &LoadedConfig,
+    pr: u64,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let opt_in = opt_in_target_names(&config.data)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+        .into_iter()
+        .collect::<Vec<_>>();
+    if json_mode {
+        write_json_envelope(
+            stdout,
+            "ship",
+            fields([
+                ("pr", Value::from(pr)),
+                ("validation", Value::from("delegated")),
+                ("verdict_owner", Value::from("required-checks")),
+                (
+                    "opt_in_targets",
+                    Value::from(
+                        opt_in
+                            .iter()
+                            .map(|name| Value::from(name.as_str()))
+                            .collect::<Vec<_>>(),
+                    ),
+                ),
+            ]),
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        writeln!(
+            stdout,
+            "No Shipyard targets run by default for PR #{pr}: every configured target is opt-in ({}). \
+             The pull request's required checks decide. Validate locally with --target <name>.",
+            opt_in.join(", ")
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn validate_daemon_ship_submission(
     daemon_owned: bool,
     has_test_merge_override: bool,
@@ -614,14 +675,10 @@ fn prepare_ship_targets<W: Write>(
 ) -> Result<Vec<ResolvedTarget>, CliFailure> {
     let resolved = resolve_targets(config, ValidationMode::Full)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let opt_in =
+        opt_in_target_names(&config.data).map_err(|error| CliFailure::new(1, error.to_string()))?;
     let skipped_targets = skipped_present(&resolved, &args.skip_targets)?;
-    let targets = select_targets(resolved, &args.skip_targets);
-    if targets.is_empty() {
-        return Err(CliFailure::new(
-            2,
-            "No targets remain after --skip-target filtering.",
-        ));
-    }
+    let targets = select_targets(resolved, &opt_in, &args.targets, &args.skip_targets)?;
     if !perform_preflight {
         return Ok(targets);
     }
@@ -668,15 +725,64 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
     CliFailure::new(code, error.to_string())
 }
 
-fn select_targets(resolved: Vec<ResolvedTarget>, skip_targets: &[String]) -> Vec<ResolvedTarget> {
+/// Choose the targets a ship validates.
+///
+/// The default set is every resolved target except the opt-in ones
+/// (`default = false`); `--target` adds opt-in targets back and `--skip-target`
+/// removes targets after that. An empty result is returned only when every
+/// target is opt-in and none was requested: the caller then delegates the
+/// verdict to the pull request's required checks. Emptying a non-empty default
+/// set with `--skip-target` stays an error, as it always was.
+fn select_targets(
+    resolved: Vec<ResolvedTarget>,
+    opt_in: &BTreeSet<String>,
+    requested: &[String],
+    skip_targets: &[String],
+) -> Result<Vec<ResolvedTarget>, CliFailure> {
+    let known = resolved
+        .iter()
+        .map(|target| target.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let requested = requested
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if let Some(missing) = requested.iter().find(|name| !known.contains(*name)) {
+        return Err(CliFailure::new(
+            2,
+            format!("--target names no configured target: {missing}"),
+        ));
+    }
     let skip = skip_targets
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    resolved
+    if let Some(both) = requested.intersection(&skip).next() {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "Target '{both}' is both requested with --target and skipped with --skip-target."
+            ),
+        ));
+    }
+    let base = resolved
+        .into_iter()
+        .filter(|target| {
+            requested.contains(target.name.as_str()) || !opt_in.contains(target.name.as_str())
+        })
+        .collect::<Vec<_>>();
+    let base_was_empty = base.is_empty();
+    let selected = base
         .into_iter()
         .filter(|target| !skip.contains(target.name.as_str()))
-        .collect()
+        .collect::<Vec<_>>();
+    if selected.is_empty() && !base_was_empty {
+        return Err(CliFailure::new(
+            2,
+            "No targets remain after --skip-target filtering.",
+        ));
+    }
+    Ok(selected)
 }
 
 fn skipped_present(
@@ -1094,6 +1200,9 @@ fn fields(items: impl IntoIterator<Item = (&'static str, Value)>) -> BTreeMap<St
 #[cfg(test)]
 #[path = "ship_cmd/command_tests.rs"]
 mod command_tests;
+#[cfg(test)]
+#[path = "ship_cmd/opt_in_target_tests.rs"]
+mod opt_in_target_tests;
 #[cfg(test)]
 #[path = "ship_cmd/provenance_tests.rs"]
 mod provenance_tests;

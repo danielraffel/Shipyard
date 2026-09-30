@@ -336,6 +336,7 @@ writer custody before mutation.
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |
 | Deliberately skip one lane | `shipyard run --skip-target windows` (repeatable; no probe run) |
+| Make a lane opt-in (off unless requested) | `[targets.<name>] default = false`; request it with `shipyard pr --target <name>` / `ship --target` / `run --targets`. With every target opt-in, `pr`/`ship` push, open and arm MERGE, queue nothing, and print `validation: delegated` (the required checks decide). See `docs/targets.md` "Opt-in targets". |
 | Proceed with unreachable lanes (VALIDATION GAP) | `shipyard run --allow-unreachable-targets` (prints a loud warning; exits 3 without the flag) |
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |

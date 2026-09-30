@@ -555,6 +555,9 @@ pub(super) enum Command {
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
+        /// Also validate this opt-in target (`default = false`). Repeatable.
+        #[arg(long = "target", value_name = "NAME")]
+        targets: Vec<String>,
         /// Adopt the current head SHA when recorded ship-state drifted (amend /
         /// force-push), re-validating the new head instead of failing on
         /// SHA drift (Shipyard #346). A head that fast-forwards the recorded
@@ -619,6 +622,9 @@ pub(super) enum Command {
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
+        /// Also validate this opt-in target (`default = false`). Repeatable.
+        #[arg(long = "target", value_name = "NAME")]
+        targets: Vec<String>,
         /// Add a Version-Bump skip trailer for a surface.
         #[arg(long = "skip-bump", value_name = "SURFACE")]
         skip_bump: Vec<String>,

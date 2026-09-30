@@ -396,6 +396,13 @@ PR=FLAGS --control merged-clean` runs the same rules over a past window. The
 daemon job is off unless `[pr_watch] enabled = true`. See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
+A target with `default = false` is opt-in: `pr`, `ship` and `run` leave it out
+unless `--target <name>` (`--targets` for run) or the active profile names it.
+When every target is opt-in, `pr`/`ship` push, open and arm auto-merge but queue
+no job and write no ship-state; the JSON reports `validation: "delegated"`,
+`verdict_owner: "required-checks"`. Do not read the missing ship-state as a
+failure or an orphan. See [`docs/targets.md`](../../docs/targets.md).
+
 Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
 --target <name>` for the shadow-only exact-head selector. Policy must come from
 the authenticated protected base and may contain only reviewed path globs plus

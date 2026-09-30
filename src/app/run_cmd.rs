@@ -10,7 +10,8 @@ use super::daemon_cmd::ensure_execution_daemon;
 use crate::config::LoadedConfig;
 use crate::evidence::EvidenceStore;
 use crate::executor::dispatch::{
-    ExecutorDispatcher, ResolvedBackend, ResolvedTarget, ResolvedValidation, resolve_targets,
+    ExecutorDispatcher, ResolvedBackend, ResolvedTarget, ResolvedValidation, opt_in_target_names,
+    resolve_targets,
 };
 use crate::job::{Priority, ValidationMode};
 use crate::output::write_json_envelope;
@@ -133,12 +134,27 @@ pub(super) fn run_command<W: Write>(
     let mode = args.mode;
     let resolved =
         resolve_targets(config, mode).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let opt_in =
+        opt_in_target_names(&config.data).map_err(|error| CliFailure::new(1, error.to_string()))?;
     let skipped_targets = skipped_present(&resolved, args.targets.as_deref(), &args.skip_targets)?;
-    let mut targets = select_targets(resolved, args.targets.as_deref(), &args.skip_targets)?;
+    let all_opt_in = args.targets.is_none()
+        && resolved
+            .iter()
+            .all(|target| opt_in.contains(target.name.as_str()));
+    let mut targets = select_targets(
+        resolved,
+        args.targets.as_deref(),
+        &opt_in,
+        &args.skip_targets,
+    )?;
     if targets.is_empty() {
         return Err(CliFailure::new(
             2,
-            "No targets remain after --skip-target filtering.",
+            if all_opt_in {
+                "Every configured target is opt-in (default = false); name one with --targets."
+            } else {
+                "No targets remain after --skip-target filtering."
+            },
         ));
     }
     if args.tree_drift == TreeDriftPolicy::Allow {
@@ -343,9 +359,12 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
     CliFailure::new(code, error.to_string())
 }
 
+/// Choose the targets a run validates: the `--targets` list when given,
+/// otherwise every target that is not opt-in, minus `--skip-target`.
 fn select_targets(
     resolved: Vec<ResolvedTarget>,
     requested: Option<&str>,
+    opt_in: &BTreeSet<String>,
     skip_targets: &[String],
 ) -> Result<Vec<ResolvedTarget>, CliFailure> {
     let requested_names = requested.map(parse_target_list);
@@ -365,10 +384,10 @@ fn select_targets(
     Ok(resolved
         .into_iter()
         .filter(|target| {
-            requested_names
-                .as_ref()
-                .is_none_or(|names| names.contains(&target.name))
-                && !skip.contains(target.name.as_str())
+            requested_names.as_ref().map_or_else(
+                || !opt_in.contains(target.name.as_str()),
+                |names| names.contains(&target.name),
+            ) && !skip.contains(target.name.as_str())
         })
         .collect())
 }
@@ -865,6 +884,36 @@ mod tests {
             error.message,
             "skip-target names no configured target: missing"
         );
+    }
+
+    #[test]
+    fn run_command_with_only_opt_in_targets_asks_for_an_explicit_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        seed_repo(&repo);
+        let paths = RuntimePaths::current_with_overrides(
+            RuntimeMode::Isolated,
+            Some(temp.path().join("global")),
+            Some(temp.path().join("state")),
+        );
+        let mut config = loaded_config(temp.path(), &repo);
+        config
+            .data
+            .get_mut("targets")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|targets| targets.get_mut("mac"))
+            .and_then(toml::Value::as_table_mut)
+            .expect("mac target")
+            .insert("default".to_owned(), toml::Value::Boolean(false));
+        let mut stdout = Vec::new();
+
+        let error = run_command(args(false), &config, &repo, &paths, true, &mut stdout)
+            .expect_err("an opt-in-only config validates nothing by default");
+
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("opt-in"));
+        assert!(error.message.contains("--targets"));
+        assert!(!paths.state_dir.join("queue.json").exists());
     }
 
     #[test]
