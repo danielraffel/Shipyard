@@ -31,9 +31,10 @@
 //!    60 files or 30 commits. Advisory only: it is raised only alongside
 //!    another flag on the same pull request, never alone.
 //!
-//! Everything here is read-only on GitHub. The only write anywhere in the
-//! feature is the opt-in sticky pull-request comment in [`comment`], and every
-//! request it could send is a comment endpoint.
+//! Everything here is read-only on GitHub except two opt-in writes: the
+//! sticky pull-request comment in [`comment`] (comment endpoints only) and the
+//! [`handback`]'s `shipyard:needs-agent` label add/remove (label endpoints
+//! only), which also notifies a live owning session without typing into it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,11 +46,14 @@ pub mod digest;
 pub mod fixtures;
 pub mod flags;
 pub mod gather;
+pub mod handback;
 pub mod ledger;
 pub mod replay;
 pub mod scan;
 
-pub use flags::{DigestRoute, Flag, FlagKind, Thresholds, evaluate};
+pub use flags::{
+    DigestRoute, Flag, FlagKind, RepeatFinding, Thresholds, evaluate, repeat_findings,
+};
 pub use gather::{WatchQuery, gather};
 pub use ledger::{Ledger, LedgerEntry};
 pub use replay::{Expectation, ReplayReport, replay};

@@ -402,10 +402,14 @@ pub(super) enum Command {
         /// Defaults to 15. Zero skips placement entirely.
         #[arg(long = "max-job-reads", value_name = "COUNT")]
         max_job_reads: Option<usize>,
-        /// Instead of the repository model, classify one pull request's
-        /// merge-queue state (queued, armed, ejected, never armed, merged)
-        /// from GraphQL queue membership and timeline history, with the
-        /// field each fact came from. One API call. Exit 9 when UNKNOWN.
+        /// Instead of the repository model, report one pull request. The
+        /// first line is the VERDICT to quote (RED / PENDING / GREEN /
+        /// UNKNOWN on the current head's required checks, failing tests,
+        /// REPEAT or shared-failure evidence, queue state), from a bounded
+        /// set of reads whose count is printed. Then its merge-queue state
+        /// (queued, armed, ejected, never armed, merged) from GraphQL queue
+        /// membership and timeline history, with the field each fact came
+        /// from. Exit 9 when either is UNKNOWN.
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },
@@ -1147,6 +1151,7 @@ pub(crate) enum PrWatchCommand {
     Digest(PrWatchDigestArgs),
 }
 
+#[allow(clippy::struct_excessive_bools)] // Independent opt-in write switches.
 #[derive(Debug, Args)]
 pub(crate) struct PrWatchScanArgs {
     /// Owner/repo slug. Defaults to the current checkout's repository.
@@ -1167,6 +1172,14 @@ pub(crate) struct PrWatchScanArgs {
     /// Read every answer live instead of reusing settled answers.
     #[arg(long = "no-cache")]
     pub(crate) no_cache: bool,
+    /// Plan the hand-back (dry run): resolve owners, probe liveness
+    /// read-only, and print the label/notify/inbox deliveries it would make.
+    #[arg(long)]
+    pub(crate) handback: bool,
+    /// Deliver the hand-back through the channels `[pr_watch.handback]`
+    /// enables. Needs `[pr_watch.handback] enabled = true`.
+    #[arg(long = "deliver-handback")]
+    pub(crate) deliver_handback: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1338,7 +1351,8 @@ pub(crate) struct MetricsImportGithubArgs {
     /// Owner/repo slug.
     #[arg(long)]
     pub(crate) repo: String,
-    /// Project key. Defaults to the repo name.
+    /// Project key. Defaults to the repo name; an `owner/name` value is
+    /// stored as the short name plus the repo.
     #[arg(long)]
     pub(crate) project: Option<String>,
     /// Workflow filename or id to list runs for.
@@ -1425,14 +1439,30 @@ pub(crate) struct MetricsTrendArgs {
     pub(crate) basis: MetricsBasis,
 }
 
+/// Staleness reporting shared by `summary`, `watch`, `advise` and `scorecard`.
+#[derive(Debug, Args)]
+pub(crate) struct MetricsFreshnessArgs {
+    /// Age past which the newest imported sample makes the store STALE, for
+    /// example `24h`, `90m`, `2d`. Defaults to `[metrics] stale_after`, else
+    /// 24h.
+    #[arg(long = "stale-after")]
+    pub(crate) stale_after: Option<String>,
+    /// Exit 3 when the store is STALE or has no rows for the project. Without
+    /// it, staleness is reported and the exit code stays 0.
+    #[arg(long = "fail-on-stale")]
+    pub(crate) fail_on_stale: bool,
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct MetricsSummaryArgs {
-    /// Project key.
+    /// Project key: `owner/name` or the short repository name.
     #[arg(long)]
     pub(crate) project: Option<String>,
     /// Machine grouping: `runner` (recorded name) or `host` (physical host).
     #[arg(long = "group-by", value_enum, default_value_t = MetricsGroupBy::Runner)]
     pub(crate) group_by: MetricsGroupBy,
+    #[command(flatten)]
+    pub(crate) freshness: MetricsFreshnessArgs,
 }
 
 /// Machine grouping for `metrics summary`.
@@ -1446,7 +1476,7 @@ pub(crate) enum MetricsGroupBy {
 
 #[derive(Debug, Args)]
 pub(crate) struct MetricsWatchArgs {
-    /// Project key.
+    /// Project key: `owner/name` or the short repository name.
     #[arg(long)]
     pub(crate) project: String,
     /// Recent window, for example `14d`.
@@ -1460,16 +1490,20 @@ pub(crate) struct MetricsWatchArgs {
     /// Verdict basis: load-independent `proxy` (default) or `wall-time`.
     #[arg(long, value_enum, default_value_t = MetricsBasis::Proxy)]
     pub(crate) basis: MetricsBasis,
+    #[command(flatten)]
+    pub(crate) freshness: MetricsFreshnessArgs,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct MetricsAdviseArgs {
-    /// Project key.
+    /// Project key: `owner/name` or the short repository name.
     #[arg(long)]
     pub(crate) project: String,
     /// Profile name used by the caller; included for agent context.
     #[arg(long)]
     pub(crate) profile: Option<String>,
+    #[command(flatten)]
+    pub(crate) freshness: MetricsFreshnessArgs,
 }
 
 #[derive(Debug, Subcommand)]

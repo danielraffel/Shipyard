@@ -210,7 +210,8 @@ happens inside a rollout, never on an idle tick, which still writes nothing.
 | Show all queued jobs | `shipyard queue --json` |
 | Experimental authority schema v5 | No operational command exists. Official builds are v4-only; an explicit source test build may validate the reserved request shape only to return `ExperimentalAuthorityRefused`, with no writer, queue mutation, outcome, backend, execution, or authority. |
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
-| Flag stuck open PRs (repeat test failure, red while armed, repeated ejection, rebase treadmill; split advisory) | `shipyard pr-watch scan --repo <owner/repo> [--post-comments] [--digest]` (read-only dry run by default; `replay --since 7d --expect PR=FLAGS --control merged-clean` simulates a past window; see `docs/pr-watch.md`) |
+| Flag stuck open PRs (repeat test failure, red while armed, repeated ejection, rebase treadmill; split advisory) | `shipyard pr-watch scan --repo <owner/repo> [--post-comments] [--digest]` (read-only dry run by default; `replay --since 7d --expect PR=FLAGS --control merged-clean` simulates a past window; the daemon digest toggle is `[pr_watch.digest] enabled = true`; see `docs/pr-watch.md`) |
+| Hand a red PR back to its owning session (label + `cmux notify` + inbox note, no input injection) | `shipyard pr-watch scan --repo <owner/repo> --handback` (dry run); `--deliver-handback` with `[pr_watch.handback] enabled = true` sends. See `docs/pr-watch.md#hand-back` |
 | Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |
 | Shadow-plan changed-surface tests for an exact PR head | `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n> --target <name>` (base-owned literal tests only; full suite remains authoritative; identity mismatch hard-fails, ambiguity falls back full) |
 | Authorize an exact metadata-only PR without a native worker | Configure trusted machine-global `[metadata_authority]` plus one repository entry containing a narrow path allowlist and exact required hosted checks. `shipyard pr` emits an immutable exact base/head/tree/path/check/policy receipt and queues zero native targets only when every observation agrees; unknown paths, stale/pending checks, SHA drift, or policy ambiguity preserve full validation or refuse execution. Project config cannot activate or widen this tier. |
@@ -334,7 +335,7 @@ writer custody before mutation.
 | Summarize timing per physical host (fold ephemeral runners) | `shipyard metrics summary --project <name> --group-by host --json` |
 | Show one bounded stewardship scorecard | `shipyard metrics scorecard --project <name> --since 30d --json` |
 | Gate-minutes per merged PR, batch fullness, receipt reuse (live, read-only) | `shipyard metrics gate-cost --repo <owner/repo> --workflow <file> --gate-job <job> --since 48h --json` |
-| Ask for agent-readable runner health findings (required gates vs advisory, job denominators) | `shipyard metrics watch --project <name> --since 14d [--required <check>] --json` |
+| Ask for agent-readable runner health findings (required gates vs advisory, job denominators, store freshness) | `shipyard metrics watch --project <owner/repo or name> --since 14d [--required <check>] [--fail-on-stale] --json` |
 | Ask where a job class runs fastest and healthiest | `shipyard metrics advise --project <name> --json` |
 | Compare local vs GitHub runner timing | `shipyard metrics compare --project <name> --baseline github-hosted --candidate macstudio --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
@@ -670,6 +671,16 @@ resolved job name and physical host, counts only success/failure, and says
 failing too often; `insufficient_healthy_samples` now means fewer than 3
 decided jobs. Use `summary --group-by host` when rows came from
 `metrics import github`, whose host column is otherwise the ephemeral runner.
+
+Read `freshness` before any verdict. `summary`, `watch`, `advise` and
+`scorecard` lead with `STALE: last github import <ts> (<age> ago)` (JSON:
+`freshness.status` = `fresh|stale|empty`) when the newest imported sample is
+older than `--stale-after` (default 24h, or `[metrics] stale_after`). A stale
+store turns every window into "insufficient samples"; that is a missing import,
+not a lane problem — run `metrics import github` or have the operator enable
+the daemon's `[metrics.import]` job (machine-global config, default off).
+`--fail-on-stale` exits 3. `--project` accepts `owner/name` or the short name;
+both reach the same rows, and `empty` usually means a mistyped key.
 
 `shipyard metrics gate-cost` is the merge-throughput view and reads GitHub
 live, not the metrics store. Its headline is required-gate wall minutes (PR-head
@@ -2347,6 +2358,17 @@ of the call log); prefer the helper in new code. Linux enforces this and macOS
 does not, so it is invisible locally and usually surfaces first on the coverage
 lane, whose instrumentation widens the window.
 
+**Fork-inherited locks (advisory-lock "released" assertions).** The same
+fork-before-exec window keeps a `flock`/`try_lock_exclusive` lease held after
+the test drops it: a sibling's forked child holds a duplicate of the locked open
+file description until its exec. So an in-binary assertion that a lock is
+acquirable again right after release is racy no matter how the lock is written
+(`global_model_lease` failed ~1 in 10 at `--test-threads=16`). Run such a body
+as an `#[ignore]`d test in a re-exec of the test binary (`--exact <name>
+--ignored --test-threads=1`, and assert the child printed `1 passed` so a
+filter typo cannot pass vacuously); `lease_tests.rs` has the helper. Do not
+"fix" it with a poll-until-acquirable loop, which hides a real leak too.
+
 **Running a different command than CI does.** Before concluding the repo is
 broken, read the workflow's own command and env. `cargo test --lib` aborts on a
 stack overflow that CI never sees, because every lane sets
@@ -2852,6 +2874,19 @@ the same thing alone. Advice needs a fresh signal (under 2 h) and a named fix;
 `shipyard base-health --act` into a recorder (`dry-run`) or an actor (`on`);
 switching it to `on` is an owner decision, taken only after dry-run records
 show it picks the right pull request.
+
+**When reporting a PR's state, quote the VERDICT line.** `shipyard landing
+--pr <n>` opens with one line, e.g. `VERDICT #8933 head fc399ea6: RED — macos
+failed cmake-forge-catalog-install (REPEAT on 2 heads: cc6302b9, fc399ea6);
+other required: 4 green; queue: ejected failed_checks at T, same head`. Quote
+it rather than paraphrasing check states. **Never call a red required check a
+flake, infrastructure, or "not a code failure" while `REPEAT` is shown**: the
+same test already failed on another head or merge group of the same PR. Only
+`also failing on #a,#b — likely main/shared` supports a not-this-PR reading,
+and even then the PR cannot land until it is green. `PENDING` is not "in
+progress, probably fine", `UNKNOWN` is not green, and a `RED — merge group run
+N ... failed` with a green head means the full suite failed where the head ran
+a fast tier. Details: `docs/landing-model.md`.
 
 **Before arming or enqueuing ONE pull request: `shipyard landing --pr <n>`.**
 REST `pulls/<n>.auto_merge` is `null` for every queued PR — GitHub consumes

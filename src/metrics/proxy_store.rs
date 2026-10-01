@@ -24,7 +24,7 @@ pub(super) fn load_samples(
     conn: &Connection,
     project: Option<&str>,
 ) -> Result<Vec<ProxySample>, rusqlite::Error> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(&format!(
         "SELECT COALESCE(jobs.target, jobs.job, 'unknown'), jobs.status,
                 runs.repo, runs.pr, jobs.queued_at, jobs.started_at,
                 jobs.completed_at, jobs.total_ms, jobs.runner_assigned,
@@ -33,11 +33,14 @@ pub(super) fn load_samples(
                    FROM steps WHERE steps.job_id = jobs.id),
                 jobs.job
            FROM jobs JOIN runs ON runs.id = jobs.run_id
-          WHERE (?1 IS NULL OR runs.project = ?1) AND jobs.completed_at IS NOT NULL
+          WHERE {} AND jobs.completed_at IS NOT NULL
           ORDER BY jobs.id",
-    )?;
+        super::project_key::sql_filter("runs.project", "runs.repo")
+    ))?;
+    let key = project.and_then(super::ProjectKey::parse);
+    let (any, short, full) = super::project_key::sql_params(key.as_ref());
     statement
-        .query_map(params![project], |row| {
+        .query_map(params![any, short, full], |row| {
             let repo: Option<String> = row.get(2)?;
             let pr: Option<i64> = row.get(3)?;
             Ok(ProxySample {
