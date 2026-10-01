@@ -1,19 +1,14 @@
 //! Decide whether GitHub-native auto-merge may be armed on one pull request.
 //!
-//! ## Why native auto-merge at all, when Shipyard already enqueues
+//! ## Native auto-merge is the only queue admission
 //!
-//! Shipyard's own admission path (`shipyard auto-merge`, and the steward's
-//! `enqueuePullRequest`) enqueues a head *after* Shipyard has validated it.
-//! That is strictly stronger than native auto-merge — and strictly less
-//! durable, because it only happens while a Shipyard process is alive to do
-//! it. A pull request whose ship lost its merge phase (the session died, the
-//! daemon dropped the job, the run was opened by another route) is then green,
-//! unqueued, and unarmed, and nothing on GitHub's side will ever move it.
-//!
-//! `enablePullRequestAutoMerge` is server-owned: once armed, GitHub itself
-//! enqueues the pull request when its required checks pass, with no local
-//! process involved. Arming it is therefore a *backstop* under Shipyard's
-//! validated enqueue, not a replacement for it.
+//! Shipyard does not enqueue pull requests itself. Its merge path
+//! (`shipyard auto-merge`, `shipyard ship`) arms native auto-merge bound to the
+//! validated head with `expectedHeadOid`, and arm-on-open arms it when the PR
+//! opens. `enablePullRequestAutoMerge` is server-owned: once armed, GitHub
+//! itself enqueues the pull request when its required checks pass, with no
+//! local process involved, so a ship that loses its merge phase (the session
+//! died, the daemon dropped the job) still lands.
 //!
 //! ## Why the merge method is always `MERGE`
 //!
