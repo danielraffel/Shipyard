@@ -202,6 +202,7 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+<<<<<<< HEAD
 ## The merge path arms native auto-merge; it never enqueues
 
 `shipyard auto-merge` / `ship` admit a PR to a merge queue by arming native
@@ -214,6 +215,16 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+=======
+## A missing key is not an empty list
+
+`validation_signals` reads a merge group's check runs page by page. A page
+without a `check_runs` array (an error body, a schema change) used to count as
+zero runs, which reported "no receipt decisions" for a group nobody read. It is
+now an error and the group reads `unreadable`. When adding a GitHub reader,
+treat a missing collection key as an error, never as `unwrap_or_default()`.
+
+>>>>>>> origin/main
 ## Protected-state caches take the writer-domain lease too
 
 `gate_cost::cache::ReadCache` writes under the protected state tree
