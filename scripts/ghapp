@@ -1695,26 +1695,26 @@ if [[ "${1:-}" != "api" || "$ghapp_stderr_open" == 0 ]]; then
     exit "$ghapp_status"
 fi
 
-# For `api`, keep native gh's stdout, stdin and exit code untouched but capture
-# its stderr, so an authorization refusal can say which installation the token
-# was minted for. A 403 from the wrong installation is an identity mismatch,
-# not evidence that the permission is missing.
+# For `api`, keep native gh's stdin and exit code untouched but capture its
+# stderr, so an authorization refusal can say which installation the token was
+# minted for. A 403 from the wrong installation is an identity mismatch, not
+# evidence that the permission is missing.
+#
+# stdout is captured too. On success it is written to stdout unchanged. On
+# failure native gh prints the error body (`{"message":"Not Found",...}`) to
+# stdout, where a caller that reads stdout before its exit code counts the
+# error as data; that body goes to stderr instead, so a failed call's stdout is
+# always empty.
 #
 # gh runs as a child here rather than replacing this shell, so INT/TERM/HUP
 # sent to ghapp (a timeout, a supervisor) are forwarded to it and the capture
 # file is removed on exit. SIGKILL cannot be caught: killing ghapp with -9
 # leaves gh running until it finishes and leaves the capture file behind.
 api_stderr_capture="$(/usr/bin/mktemp /tmp/shipyard-ghapp-api-stderr.XXXXXX)"
-api_stdout_capture=""
-if [[ "$ghapp_sanitize" == 1 ]]; then
-    api_stdout_capture="$(/usr/bin/mktemp /tmp/shipyard-ghapp-stdout.XXXXXX)"
-fi
+api_stdout_capture="$(/usr/bin/mktemp /tmp/shipyard-ghapp-stdout.XXXXXX)"
 api_child=""
 api_cleanup() {
-    /bin/rm -f -- "$api_stderr_capture"
-    if [[ -n "$api_stdout_capture" ]]; then
-        /bin/rm -f -- "$api_stdout_capture"
-    fi
+    /bin/rm -f -- "$api_stderr_capture" "$api_stdout_capture"
 }
 api_forward() {
     if [[ -n "$api_child" ]]; then
@@ -1728,11 +1728,7 @@ trap 'api_forward HUP' HUP
 set +e
 # Explicit stdin: an asynchronous command otherwise reads /dev/null, which
 # would silently empty `--input -` bodies.
-if [[ -n "$api_stdout_capture" ]]; then
-    "$gh_binary" "$@" 0<&0 >"$api_stdout_capture" 2>"$api_stderr_capture" &
-else
-    "$gh_binary" "$@" 0<&0 2>"$api_stderr_capture" &
-fi
+"$gh_binary" "$@" 0<&0 >"$api_stdout_capture" 2>"$api_stderr_capture" &
 api_child=$!
 while :; do
     wait "$api_child"
@@ -1747,8 +1743,16 @@ done
 set -e
 # A reader that went away must not turn gh's own exit code into SIGPIPE.
 trap '' PIPE
-if [[ -n "$api_stdout_capture" ]]; then
-    ghapp_neutralize_file "$api_stdout_capture" || true
+if [[ "$api_status" == 0 ]]; then
+    if [[ "$ghapp_sanitize" == 1 ]]; then
+        ghapp_neutralize_file "$api_stdout_capture" || true
+    else
+        /bin/cat -- "$api_stdout_capture" || true
+    fi
+elif [[ "$ghapp_sanitize" == 1 ]]; then
+    ghapp_neutralize_file "$api_stdout_capture" >&2 2>/dev/null || true
+else
+    /bin/cat -- "$api_stdout_capture" >&2 2>/dev/null || true
 fi
 /bin/cat -- "$api_stderr_capture" >&2 2>/dev/null || true
 if [[ "$api_status" != 0 ]]; then

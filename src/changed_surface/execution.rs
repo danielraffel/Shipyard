@@ -235,10 +235,19 @@ pub fn plan_authoritative_execution(
     if !receipt.exact_head_verified {
         return Err(error("selection receipt is not exact-head verified"));
     }
-    if receipt.policy_digest.as_deref() != Some(&policy_digest(policy)) {
-        return Err(error(
-            "selection receipt policy digest does not match protected-base policy",
-        ));
+    match receipt.policy_digest.as_deref() {
+        None => {
+            return Err(error(format!(
+                "selection receipt carries no policy digest (fallback: {:?})",
+                receipt.fallback_reason
+            )));
+        }
+        Some(digest) if digest != policy_digest(policy) => {
+            return Err(error(
+                "selection receipt policy digest does not match protected-base policy",
+            ));
+        }
+        Some(_) => {}
     }
     if !receipt.shadow_only {
         return Err(error(
@@ -844,6 +853,49 @@ mod tests {
         let mut receipt = fixture_receipt(&policy, &input);
         receipt.selected_tests.push("bad\nname".to_owned());
         assert!(fixture_execution(&receipt, &input, &policy, true).is_err());
+    }
+
+    #[test]
+    fn stale_base_receipt_keeps_the_full_suite_instead_of_a_digest_refusal() {
+        // The shape every production stale-base run had: the PR's recorded
+        // base lags the protected tip, so the planner stops at provenance.
+        let policy = fixture_policy(ExecutionMode::Authoritative);
+        let mut input = fixture_input("src/a.rs");
+        input.protected_ref_sha = "ffffffffffffffffffffffffffffffffffffffff".to_owned();
+        let receipt = fixture_receipt(&policy, &input);
+        assert_eq!(
+            receipt.fallback_reason,
+            Some(crate::changed_surface::FallbackReason::StaleBase)
+        );
+        assert_eq!(receipt.policy_digest, Some(policy_digest(&policy)));
+        assert_eq!(
+            fixture_execution(&receipt, &input, &policy, true).expect("stale base plans full"),
+            ExecutionDisposition::Full {
+                reason: FullExecutionReason::PlannerSelectedFull,
+            }
+        );
+
+        let mut foreign = fixture_policy(ExecutionMode::Authoritative);
+        foreign.full_test_count += 1;
+        let refused = fixture_execution(&receipt, &input, &foreign, true)
+            .expect_err("a different policy stays fail-closed");
+        assert!(refused.0.contains("rederived"), "{refused}");
+    }
+
+    #[test]
+    fn receipt_without_a_policy_digest_names_its_fallback() {
+        // An invalid base policy never yields a digest; the refusal must say
+        // so rather than claim a mismatch against a policy it never bound.
+        let mut policy = fixture_policy(ExecutionMode::Authoritative);
+        policy.full_test_count = 0;
+        let mut input = fixture_input("src/a.rs");
+        input.protected_ref_sha = "ffffffffffffffffffffffffffffffffffffffff".to_owned();
+        let receipt = fixture_receipt(&policy, &input);
+        assert_eq!(receipt.policy_digest, None);
+        let refused = fixture_execution(&receipt, &input, &policy, true)
+            .expect_err("no digest stays fail-closed");
+        assert!(refused.0.contains("carries no policy digest"), "{refused}");
+        assert!(refused.0.contains("StaleBase"), "{refused}");
     }
 
     #[test]

@@ -164,6 +164,24 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+## fleet-reconcile ledger: every attempt says how it ended
+
+`fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
+`failed: <reason>`) for each rollout. Reconcile only ever targets the latest
+release, so a failed older tag is never retried; when a newer tag rolls out,
+every older tag without a verified rollout gets `terminal: "superseded by
+<tag> without a verified rollout (last attempt: ...)"`. Entries written before
+this carry no `last_outcome` and close as "outcome not recorded". The close
+happens inside a rollout, never on an idle tick, which still writes nothing.
+
+## A missing key is not an empty list
+
+`validation_signals` reads a merge group's check runs page by page. A page
+without a `check_runs` array (an error body, a schema change) used to count as
+zero runs, which reported "no receipt decisions" for a group nobody read. It is
+now an error and the group reads `unreadable`. When adding a GitHub reader,
+treat a missing collection key as an error, never as `unwrap_or_default()`.
+
 ## Protected-state caches take the writer-domain lease too
 
 `gate_cost::cache::ReadCache` writes under the protected state tree
@@ -973,6 +991,11 @@ the local socket) and cheap to probe from an agent — use it if
 you want to know whether the user has live mode on before
 deciding whether to rely on webhook-speed updates vs polling
 cadence.
+
+A delivery the daemon refuses (HTTP 400/401/404/405 in the hook's
+delivery log) writes one `rejected webhook delivery <guid>` line with
+its event kind, reason, and body bytes received against Content-Length to
+`daemon/daemon.log`, so a refusal is visible on the host.
 
 **Idle behavior (v0.56.0+):** when no IPC subscriber is attached
 (no `shipyard watch` running, no GUI), the daemon skips the
@@ -2067,6 +2090,17 @@ test names are never interpolated into a regex or shell expression. The
 library contract alone does not activate selection: the queue/orchestration
 layer must still snapshot and substitute the immutable plan before bounded
 results can become authoritative.
+
+A provenance fallback (stale base, merge-base mismatch, incomplete diff) still
+binds the digest of the base policy whenever that policy validates, so it
+promotes to an ordinary full-suite disposition and, under `shadow_compare`,
+reaches the stale-base shadow comparison. `promotion_error` with "policy
+digest does not match" therefore means a genuinely different policy; "carries
+no policy digest" means the base policy itself failed validation. When reading
+`changed-surface-results/**/fallback-*` diagnostics, a `full_fallback` line
+names the planner reason after the colon (for example
+`PlannerSelectedFull: TestTopologyChanged`): that reason, not the planner, is
+usually what keeps a repository at zero reduced selections.
 
 ## Cross-PR evidence reuse
 
