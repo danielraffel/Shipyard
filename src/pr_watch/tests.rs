@@ -1469,7 +1469,8 @@ fn a_digest_table_without_enabled_stays_off_and_warns() {
 
 #[test]
 fn the_documented_daemon_config_parses_and_enables_the_digest() {
-    let doc = include_str!("../../docs/pr-watch.md");
+    // A Windows checkout may give the doc CRLF line endings.
+    let doc = include_str!("../../docs/pr-watch.md").replace("\r\n", "\n");
     let start = doc
         .find("```toml\n[pr_watch]\n")
         .expect("docs/pr-watch.md has the daemon config example");
