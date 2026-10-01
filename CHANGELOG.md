@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02370"></a>
+## [0.237.0] - 2026-09-30
+
+- fix/metrics import staleness ([#657](https://github.com/danielraffel/Shipyard/pull/657))
+
 <a id="v02361"></a>
 ## [0.236.1] - 2026-09-30
 
@@ -1733,6 +1738,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.237.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.237.0
 [0.236.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.236.1
 [0.236.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.236.0
 [0.235.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.235.0
