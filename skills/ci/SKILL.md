@@ -325,7 +325,7 @@ writer custody before mutation.
 | Summarize timing per physical host (fold ephemeral runners) | `shipyard metrics summary --project <name> --group-by host --json` |
 | Show one bounded stewardship scorecard | `shipyard metrics scorecard --project <name> --since 30d --json` |
 | Gate-minutes per merged PR, batch fullness, receipt reuse (live, read-only) | `shipyard metrics gate-cost --repo <owner/repo> --workflow <file> --gate-job <job> --since 48h --json` |
-| Ask for agent-readable runner health findings (required gates vs advisory, job denominators) | `shipyard metrics watch --project <name> --since 14d [--required <check>] --json` |
+| Ask for agent-readable runner health findings (required gates vs advisory, job denominators, store freshness) | `shipyard metrics watch --project <owner/repo or name> --since 14d [--required <check>] [--fail-on-stale] --json` |
 | Ask where a job class runs fastest and healthiest | `shipyard metrics advise --project <name> --json` |
 | Compare local vs GitHub runner timing | `shipyard metrics compare --project <name> --baseline github-hosted --candidate macstudio --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
@@ -661,6 +661,16 @@ resolved job name and physical host, counts only success/failure, and says
 failing too often; `insufficient_healthy_samples` now means fewer than 3
 decided jobs. Use `summary --group-by host` when rows came from
 `metrics import github`, whose host column is otherwise the ephemeral runner.
+
+Read `freshness` before any verdict. `summary`, `watch`, `advise` and
+`scorecard` lead with `STALE: last github import <ts> (<age> ago)` (JSON:
+`freshness.status` = `fresh|stale|empty`) when the newest imported sample is
+older than `--stale-after` (default 24h, or `[metrics] stale_after`). A stale
+store turns every window into "insufficient samples"; that is a missing import,
+not a lane problem — run `metrics import github` or have the operator enable
+the daemon's `[metrics.import]` job (machine-global config, default off).
+`--fail-on-stale` exits 3. `--project` accepts `owner/name` or the short name;
+both reach the same rows, and `empty` usually means a mistyped key.
 
 `shipyard metrics gate-cost` is the merge-throughput view and reads GitHub
 live, not the metrics store. Its headline is required-gate wall minutes (PR-head
