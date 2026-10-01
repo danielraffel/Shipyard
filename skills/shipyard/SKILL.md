@@ -203,6 +203,47 @@ visibility and planning, but Linear failure must never block execution, wake,
 repair routing, queue admission, or merge. Never project provider session IDs,
 credentials, private paths, or raw prompts.
 
+## Governance policy comes from the base, and `apply` needs `--yes`
+
+`shipyard governance status|diff|apply` and `shipyard landability` read
+`.shipyard/config.toml` from `origin/<base>` (`governance.base_branch`, else
+`ship.base_branch`, else `main`), not from the working tree, and print which
+ref they used. A stale checkout used to report its own copy: a branch cut
+before a required context was added would call live protection "drifted" and
+`apply` would have removed the context. A `WARNING: could not read policy
+from ...` line means the fallback to the working tree ran; fetch the base
+before trusting the answer. `governance apply` without `--yes` prints the plan,
+writes nothing and exits 2; status and diff name `apply --yes` only next to
+the field list it would write.
+
+## fleet-reconcile ledger: every attempt says how it ended
+
+`fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
+`failed: <reason>`) for each rollout. Reconcile only ever targets the latest
+release, so a failed older tag is never retried; when a newer tag rolls out,
+every older tag without a verified rollout gets `terminal: "superseded by
+<tag> without a verified rollout (last attempt: ...)"`. Entries written before
+this carry no `last_outcome` and close as "outcome not recorded". The close
+happens inside a rollout, never on an idle tick, which still writes nothing.
+
+## A missing key is not an empty list
+
+`validation_signals` reads a merge group's check runs page by page. A page
+without a `check_runs` array (an error body, a schema change) used to count as
+zero runs, which reported "no receipt decisions" for a group nobody read. It is
+now an error and the group reads `unreadable`. When adding a GitHub reader,
+treat a missing collection key as an error, never as `unwrap_or_default()`.
+
+## Protected-state caches take the writer-domain lease too
+
+`gate_cost::cache::ReadCache` writes under the protected state tree
+(`metrics/gate-cost-cache/`), so creating the directory, storing an entry and
+pruning each hold `writer_domain_lease::acquire_for_protected_path`. Without it,
+a `shipyard metrics gate-cost` run during a Shipyard PR's macOS local lane made
+sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
+cannot be had the write is skipped and the cache stops writing for that run; a
+cold read is always correct. Any new cache in the state tree needs the same.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every
@@ -407,8 +448,23 @@ another flag. It is a dry run by default; `--post-comments` edits one sticky
 comment (comment endpoints only) and `--digest` sends the hourly digest through
 `[pr_watch.digest] command`. `shipyard pr-watch replay --since 7d --expect
 PR=FLAGS --control merged-clean` runs the same rules over a past window. The
-daemon job is off unless `[pr_watch] enabled = true`. See
+daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
+`[pr_watch.digest] enabled = true` (never `[pr_watch] digest = true` beside a
+`[pr_watch.digest]` table: TOML rejects a key that is both, and a table without
+`enabled` stays off with a warning in the `pr_watch_pass` event). See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
+
+`shipyard pr-watch scan --handback` plans the hand-back (dry run): for a PR
+with an owner-actionable flag it resolves the owner (steward handoff record,
+else the PR body's `whence` marker), probes the session read-only with
+`cmux sessions list`, and prints the `shipyard:needs-agent` label change, the
+`cmux notify` on the live session's surface, and the inbox line it would write
+to `~/.local/state/shipyard/inbox/<session>.jsonl` on the owner's host (the
+plugin's SessionStart/UserPromptSubmit hook shows that inbox to the agent once).
+Owners not live for `unowned_after_hours` are marked unowned on the digest line.
+`--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
+daemon delivers when that is on. It never types into a session (no
+`cmux send`), never resumes or starts an agent, and never arms or dequeues.
 
 Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
 --target <name>` for the shadow-only exact-head selector. Policy must come from
@@ -929,6 +985,13 @@ a collection gap, not a regression. Prefer filing issues or changing profiles
 only when `watch`, `advise`, or `compare` reports enough samples and a material
 delta relative to that repo's baseline.
 
+Check freshness first: a leading `STALE: last github import …` line (JSON
+`freshness.status`) means nothing has imported recently, so a low count is the
+missing import, not the lane. Import by hand, or ask the operator to enable the
+daemon's `[metrics.import]` job (off by default; never edit the machine-global
+config from an agent session). `--project` takes `owner/name` or the short
+name interchangeably; `--fail-on-stale` exits 3 on `stale`/`empty`.
+
 Judge CI changes by the proxies, not by wall time. `compare`, `watch`,
 `trend`, and `scorecard` verdicts default to load-independent proxies
 (failure share, cancelled share, starvation share, attempts per PR, queue wait
@@ -971,6 +1034,16 @@ rejects missing, malformed, aliased, or case-confused identities before
 execution, ignores tracked attempts to supply values, and snapshots resolved
 values only under its protected machine state for daemon-owned work. Never use
 this table for credentials or signing material.
+
+## A failed `ghapp api` call has an empty stdout
+
+Native `gh api` prints the error body (`{"message":"Not Found",...}`) on stdout
+and exits non-zero, so `n=$(ghapp api ... --jq ...)` in a script that does not
+check the exit code counted a 404 as one row of data. The wrapper now captures
+`api` stdout and, on a non-zero exit, writes it to stderr instead: a failed
+call's stdout is always empty, a successful call's is unchanged. Check the exit
+code anyway; read the error body from stderr, never from stdout. The fallback
+when the caller closed stderr (`2>&-`) still execs native gh unchanged.
 
 ## GitHub Auth And Quota
 
@@ -2725,7 +2798,10 @@ fix first); any other reason except `invalid_merge_commit` is refused with
 A same-head `failed_checks` refusal can be lifted, but only by the repository,
 never by inference. If the repo declares `[queue.attribution] command = [...]`
 (argv list; a shell string is rejected) in `.shipyard/config.toml`, the guard
-resolves the ejecting `merge_group` run, collects its failing jobs and steps,
+resolves the ejecting `merge_group` run (searched by creation time around the
+removal, `created=<removal-6h>..<removal+5m>`, at most 3 pages of 100 -- never
+"the newest N failed runs", which on a busy queue stopped reaching the ejector
+after about an hour), collects its failing jobs and steps,
 and runs that command with `--repo/--pr/--run-id`. Certifying requires exit 0, a
 JSON object, a `run_id` equal to the run the guard resolved, `implicates_head`
 exactly `false`, and `verdict` of `infrastructure` or `other_pull_request` with
@@ -2746,6 +2822,16 @@ at the same step for an unrelated-to-either-PR cause already on the base. Only a
 verdict that positively names infrastructure or another PR counts, and
 `merge_conflict` is never attributable because a conflict is a property of the
 head against its base.
+
+**The attributor runs on the wrapper's trusted PATH, which has no `ghapp`.**
+`ghapp` starts guards with `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:…`
+and the guard's subprocess inherits it, so an attributor that shells out to
+`ghapp` (in `~/.local/bin`) dies with `FileNotFoundError` and exits 1. From the
+guard that reads only as "the attributor exited 1, so it did not rule": a correct
+flake verdict is silently discarded. Read the API through `$GHAPP_REAL_GH` with
+the exported `GH_TOKEN`/`GH_REPO`, and reproduce under
+`env -i HOME=$HOME PATH=<trusted path>`, never in an interactive shell. The
+refusal quotes the attributor's stderr tail.
 
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing
@@ -3186,6 +3272,15 @@ Namespace is optional and account-dependent. When Namespace is unavailable,
 Shipyard should default to GitHub-hosted Linux/macOS/Windows runners or explicit
 self-hosted GitHub Actions labels. Do not assume `nsc` access, and do not route
 new Shipyard CI to Namespace unless the user explicitly confirms active access.
+
+exe.dev VMs are currently supported through ordinary POSIX SSH targets. Use
+them for disposable or persistent Linux experiments with `shipyard watch local`
+or `shipyard run command`; exe.dev owns VM lifecycle and account capacity in
+this mode. Do not treat an exe.dev VM as a macOS, Windows, GPU, signing, or
+physical-device gate. A first-class lifecycle provider requires explicit
+ownership, TTL, readiness, capacity, and teardown evidence and remains a
+follow-on to a measured SSH pilot.
+
 Do not add hidden repo-variable fallbacks to local/self-hosted macOS runners:
 local runner use should be explicit via workflow-dispatch selector inputs so
 default GitHub-hosted runs cannot be stolen by stale local runner variables.
@@ -3429,6 +3524,17 @@ probing the binary until it runs (`--probe` short-circuit so the probe stays out
 of the call log); prefer the helper in new code. Linux enforces this and macOS
 does not, so it is invisible locally and usually surfaces first on the coverage
 lane, whose instrumentation widens the window.
+
+**Fork-inherited locks (advisory-lock "released" assertions).** The same
+fork-before-exec window keeps a `flock`/`try_lock_exclusive` lease held after
+the test drops it: a sibling's forked child holds a duplicate of the locked open
+file description until its exec. So an in-binary assertion that a lock is
+acquirable again right after release is racy no matter how the lock is written
+(`global_model_lease` failed ~1 in 10 at `--test-threads=16`). Run such a body
+as an `#[ignore]`d test in a re-exec of the test binary (`--exact <name>
+--ignored --test-threads=1`, and assert the child printed `1 passed` so a
+filter typo cannot pass vacuously); `lease_tests.rs` has the helper. Do not
+"fix" it with a poll-until-acquirable loop, which hides a real leak too.
 
 **Running a different command than CI does.** Before concluding the repo is
 broken, read the workflow's own command and env. `cargo test --lib` aborts on a
@@ -3839,7 +3945,26 @@ they are siblings rather than one inside the other.
 | `backlog.rs` | open pull requests counted by `mergeStateStatus` |
 | `gather.rs` | the reads; nothing here mutates |
 | `render.rs` | human and `--json` forms |
-| `pr_state.rs` | `--pr <n>`: queue class plus the `VALIDATION` block (test tier of the head's required checks, merge-group receipt decisions) from `crate::validation_signals` |
+| `pr_state.rs` | `--pr <n>`: the verdict line first, then queue class plus the `VALIDATION` block (test tier of the head's required checks, merge-group receipt decisions) from `crate::validation_signals` |
+| `verdict.rs` | pure: `VerdictFacts` → `LandingVerdict` (RED / PENDING / GREEN / UNKNOWN, repeat and shared evidence, failed merge group on this head, queue suffix) |
+| `verdict_gather.rs` | the bounded reads behind the verdict, through an argv reader so tests replay inline bodies |
+
+**The verdict line is the one line agents quote** (`shipyard landing --pr
+<n>`, first line; JSON `verdict`). When reporting PR state, quote it; never
+call a red required check a flake, infrastructure, or "not a code failure"
+while `REPEAT` is shown. `REPEAT` is PR watch's flag-1 rule, not a second
+definition: `crate::pr_watch::repeat_findings` returns the structured findings
+both surfaces render, and `prs_failing_signature` answers the shared-failure
+test for a single failure. Keep them one rule. Invariants worth protecting:
+required means branch protection's contexts, filtered in the pure layer as
+well as at the read (a failed merge-group run that failed only an advisory job
+is not red); a required-checks response with neither `contexts` nor `checks`
+is UNKNOWN, not "no required checks"; merge groups are found through the PR's
+queue residency windows (an unfiltered `merge_group` listing covers only a few
+hours on a busy repo, because every workflow of a group is its own run); a
+`pull_request` run's `pull_requests` array is often empty, so other PRs'
+runs are attributed through the open-PR head-branch map from the same GraphQL
+read, and the rest are counted as a gap rather than dropped silently.
 
 `src/validation_signals.rs` owns the `shipyard-test-tier` /
 `shipyard-receipt-decision` annotation contract (`docs/validation-signals.md`)

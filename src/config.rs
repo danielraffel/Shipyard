@@ -24,6 +24,33 @@ pub enum LocalOverlaySource {
     WorktreeFallback,
 }
 
+/// Where the tracked project layer of a re-layered [`LoadedConfig`] came from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjectLayerSource {
+    /// Read from the named git ref.
+    GitRef(String),
+    /// The ref could not be read, so the working tree's copy was kept.
+    WorkingTreeFallback {
+        /// The ref that was asked for.
+        git_ref: String,
+        /// Why it could not be used.
+        reason: String,
+    },
+}
+
+impl ProjectLayerSource {
+    /// One line naming where the policy was read from, for human output.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::GitRef(git_ref) => format!("policy read from {git_ref}"),
+            Self::WorkingTreeFallback { git_ref, reason } => format!(
+                "WARNING: could not read policy from {git_ref} ({reason}); using the working tree's copy, which may be stale"
+            ),
+        }
+    }
+}
+
 /// Layered Shipyard configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadedConfig {
@@ -114,6 +141,73 @@ impl LoadedConfig {
             local_dir,
             local_overlay_source,
         })
+    }
+
+    /// Re-layer this configuration with the tracked project file as committed
+    /// at `git_ref` instead of the working tree's copy.
+    ///
+    /// Policy that decides what a protected branch requires must come from
+    /// that branch: a stale or edited checkout otherwise answers with its own
+    /// policy. The machine-global and local overlay layers are kept. When the
+    /// ref or the file cannot be read, the working-tree layering is returned
+    /// unchanged and the source says why, so callers can say so loudly.
+    #[must_use]
+    pub fn with_project_layer_at_ref(
+        &self,
+        mode: RuntimeMode,
+        cwd: &Path,
+        git_ref: &str,
+    ) -> (Self, ProjectLayerSource) {
+        let identity = ProductIdentity::for_mode(mode);
+        let spec = format!(
+            "{git_ref}:{}/config.toml",
+            identity.tracked_project_dir_name
+        );
+        let fallback = |reason: String| {
+            (
+                self.clone(),
+                ProjectLayerSource::WorkingTreeFallback {
+                    git_ref: git_ref.to_owned(),
+                    reason,
+                },
+            )
+        };
+        let output = match Command::new("git")
+            .args(["show", &spec])
+            .current_dir(cwd)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => return fallback(format!("could not run git show {spec}: {error}")),
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.lines().next().unwrap_or("").trim();
+            return fallback(format!("git show {spec} failed: {detail}"));
+        }
+        let project = match String::from_utf8_lossy(&output.stdout).parse::<Table>() {
+            Ok(table) => table,
+            Err(error) => return fallback(format!("{spec} is not valid TOML: {error}")),
+        };
+        let mut data = Table::new();
+        let layered =
+            merge_if_present(&mut data, &self.global_dir.join("config.toml")).and_then(|()| {
+                deep_merge(&mut data, &project);
+                match &self.local_dir {
+                    Some(local_dir) => merge_if_present(&mut data, &local_dir.join("config.toml")),
+                    None => Ok(()),
+                }
+            });
+        if let Err(error) = layered {
+            return fallback(error.to_string());
+        }
+        (
+            Self {
+                data,
+                ..self.clone()
+            },
+            ProjectLayerSource::GitRef(git_ref.to_owned()),
+        )
     }
 
     /// Resolve a dotted key from the merged configuration.
@@ -266,8 +360,67 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{LoadedConfig, LocalOverlaySource};
+    use super::{LoadedConfig, LocalOverlaySource, ProjectLayerSource};
     use crate::identity::RuntimeMode;
+
+    #[test]
+    fn project_layer_at_ref_ignores_a_stale_working_tree() {
+        let sandbox = TempDir::new().expect("tempdir");
+        let repo = sandbox.path().join("repo");
+        let global_dir = sandbox.path().join("global");
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("project dir");
+        std::fs::create_dir_all(&global_dir).expect("global dir");
+        std::fs::write(
+            global_dir.join("config.toml"),
+            "[defaults]\npriority = \"normal\"\n",
+        )
+        .expect("write global");
+        git(&["init", "-q", "-b", "main"], &repo);
+        std::fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[governance]\nrequired_status_checks = [\"a\", \"b\", \"c\"]\n",
+        )
+        .expect("write base config");
+        git(&["add", ".shipyard/config.toml"], &repo);
+        git(&["commit", "-q", "-m", "base policy"], &repo);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"], &repo);
+        // The checkout falls behind: its copy still names one context.
+        std::fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[governance]\nrequired_status_checks = [\"a\"]\n",
+        )
+        .expect("write stale config");
+
+        let working =
+            LoadedConfig::load_from_cwd_with_global_dir(RuntimeMode::Isolated, &repo, global_dir)
+                .expect("load");
+        let checks = |config: &LoadedConfig| {
+            config
+                .get("governance.required_status_checks")
+                .and_then(toml::Value::as_array)
+                .map(Vec::len)
+        };
+        assert_eq!(
+            checks(&working),
+            Some(1),
+            "control: the working tree is stale"
+        );
+
+        let (base, source) =
+            working.with_project_layer_at_ref(RuntimeMode::Isolated, &repo, "origin/main");
+        assert_eq!(source, ProjectLayerSource::GitRef("origin/main".to_owned()));
+        assert_eq!(checks(&base), Some(3));
+        assert_eq!(base.get_str("defaults.priority"), Some("normal"));
+
+        let (fallback, source) =
+            working.with_project_layer_at_ref(RuntimeMode::Isolated, &repo, "origin/absent");
+        assert!(matches!(
+            source,
+            ProjectLayerSource::WorkingTreeFallback { .. }
+        ));
+        assert!(source.describe().starts_with("WARNING"));
+        assert_eq!(checks(&fallback), Some(1));
+    }
 
     #[test]
     fn merges_global_project_and_local_layers() {

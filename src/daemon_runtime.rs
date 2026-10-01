@@ -263,6 +263,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let (pr_watch_tx, pr_watch_rx) = mpsc::channel::<crate::pr_watch::scan::DaemonPass>();
     let mut pr_watch_in_flight = false;
     let mut next_pr_watch_at = Instant::now() + initial_pr_watch_delay();
+    let (metrics_import_tx, metrics_import_rx) =
+        mpsc::channel::<crate::metrics::import_schedule::ImportPass>();
+    let mut metrics_import_in_flight = false;
+    let mut next_metrics_import_at = Instant::now() + initial_metrics_import_delay();
     let mut previous_states = ship_state_map(&ship_dir);
     let mut next_ship_state_scan_at = Instant::now() + SHIP_STATE_SCAN_INTERVAL;
     let mut registration_sync = RegistrationSyncState::default();
@@ -319,6 +323,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             pr_watch_in_flight = false;
             publish_pr_watch_pass(&server, &last_event_at, &pass);
         }
+        while let Ok(pass) = metrics_import_rx.try_recv() {
+            metrics_import_in_flight = false;
+            publish_metrics_import_pass(&server, &last_event_at, &pass);
+        }
         let now = Instant::now();
         let has_subscribers = server.subscriber_count() > 0;
         if should_start_reconcile(has_subscribers, reconcile_in_flight, now, next_reconcile_at) {
@@ -343,6 +351,17 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
                 config.state_dir.clone(),
                 repos.clone(),
                 pr_watch_tx.clone(),
+            );
+        }
+        if should_start_metrics_import(metrics_import_in_flight, now, next_metrics_import_at) {
+            metrics_import_in_flight = true;
+            next_metrics_import_at =
+                now + Duration::from_secs(crate::metrics::import_schedule::CHECK_INTERVAL_SECS);
+            start_metrics_import_worker(
+                config.global_dir.clone(),
+                config.state_dir.clone(),
+                repos.clone(),
+                metrics_import_tx.clone(),
             );
         }
         // Note: we deliberately do NOT push `next_reconcile_at` forward while
@@ -717,6 +736,58 @@ fn publish_pr_watch_pass(
     }
     server.broadcast_event(serde_json::json!({
         "kind": "pr_watch_pass",
+        "payload": pass,
+    }));
+}
+
+/// The first metrics-import check waits one check interval, for the same
+/// reason as PR watch: a restarting daemon adds no GitHub reads to its own
+/// start-up.
+#[cfg(unix)]
+fn initial_metrics_import_delay() -> Duration {
+    Duration::from_secs(crate::metrics::import_schedule::CHECK_INTERVAL_SECS)
+}
+
+/// Never overlap an import pass with itself; never check before the deadline.
+/// The pass decides whether `[metrics.import] enabled` is on and whether each
+/// repository is due, re-reading config each time.
+#[cfg(unix)]
+fn should_start_metrics_import(in_flight: bool, now: Instant, next_at: Instant) -> bool {
+    !in_flight && now >= next_at
+}
+
+#[cfg(unix)]
+fn start_metrics_import_worker(
+    global_dir: PathBuf,
+    state_dir: PathBuf,
+    repos: Vec<String>,
+    sender: mpsc::Sender<crate::metrics::import_schedule::ImportPass>,
+) {
+    thread::spawn(move || {
+        let pass = crate::metrics::import_schedule::daemon_pass(
+            &global_dir,
+            &state_dir,
+            &repos,
+            Utc::now(),
+        );
+        let _ = sender.send(pass);
+    });
+}
+
+#[cfg(unix)]
+fn publish_metrics_import_pass(
+    server: &IpcServer,
+    last_event_at: &Arc<Mutex<Option<f64>>>,
+    pass: &crate::metrics::import_schedule::ImportPass,
+) {
+    if !pass.did_work() {
+        return;
+    }
+    if let Ok(mut last_event_at) = last_event_at.lock() {
+        *last_event_at = Some(daemon_timestamp());
+    }
+    server.broadcast_event(serde_json::json!({
+        "kind": "metrics_import_pass",
         "payload": pass,
     }));
 }
@@ -2293,6 +2364,20 @@ mod tests {
         assert!(!pass.enabled);
         assert!(pass.flags.is_empty() && pass.errors.is_empty());
         assert!(!state.path().join("pr-watch").exists());
+    }
+
+    #[test]
+    fn metrics_import_respects_in_flight_and_deadline() {
+        let now = StdInstant::now();
+        let due = now.checked_sub(StdDuration::from_secs(1)).unwrap();
+        let not_due = now + StdDuration::from_secs(5);
+        assert!(!should_start_metrics_import(true, now, due));
+        assert!(!should_start_metrics_import(false, now, not_due));
+        assert!(should_start_metrics_import(false, now, due));
+        assert_eq!(
+            initial_metrics_import_delay(),
+            StdDuration::from_secs(crate::metrics::import_schedule::CHECK_INTERVAL_SECS)
+        );
     }
 
     #[test]
