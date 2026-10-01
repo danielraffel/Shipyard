@@ -406,7 +406,10 @@ another flag. It is a dry run by default; `--post-comments` edits one sticky
 comment (comment endpoints only) and `--digest` sends the hourly digest through
 `[pr_watch.digest] command`. `shipyard pr-watch replay --since 7d --expect
 PR=FLAGS --control merged-clean` runs the same rules over a past window. The
-daemon job is off unless `[pr_watch] enabled = true`. See
+daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
+`[pr_watch.digest] enabled = true` (never `[pr_watch] digest = true` beside a
+`[pr_watch.digest]` table: TOML rejects a key that is both, and a table without
+`enabled` stays off with a warning in the `pr_watch_pass` event). See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
 `shipyard pr-watch scan --handback` plans the hand-back (dry run): for a PR
@@ -939,6 +942,13 @@ explicitly `unavailable`; never reinterpret them as zero. Low sample counts are
 a collection gap, not a regression. Prefer filing issues or changing profiles
 only when `watch`, `advise`, or `compare` reports enough samples and a material
 delta relative to that repo's baseline.
+
+Check freshness first: a leading `STALE: last github import …` line (JSON
+`freshness.status`) means nothing has imported recently, so a low count is the
+missing import, not the lane. Import by hand, or ask the operator to enable the
+daemon's `[metrics.import]` job (off by default; never edit the machine-global
+config from an agent session). `--project` takes `owner/name` or the short
+name interchangeably; `--fail-on-stale` exits 3 on `stale`/`empty`.
 
 Judge CI changes by the proxies, not by wall time. `compare`, `watch`,
 `trend`, and `scorecard` verdicts default to load-independent proxies

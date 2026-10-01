@@ -198,6 +198,9 @@ pub struct WatchConfig {
     pub thresholds: Thresholds,
     /// `[pr_watch.handback]`.
     pub handback: HandbackConfig,
+    /// Config problems that do not stop a pass but must not pass silently,
+    /// such as a `[pr_watch.digest]` table with no `enabled` key.
+    pub warnings: Vec<String>,
 }
 
 impl Default for WatchConfig {
@@ -216,6 +219,7 @@ impl Default for WatchConfig {
             digest_policy: DigestPolicy::default(),
             thresholds: Thresholds::default(),
             handback: HandbackConfig::default(),
+            warnings: Vec::new(),
         }
     }
 }
@@ -241,18 +245,61 @@ fn boolean(config: &LoadedConfig, key: &str) -> Option<bool> {
     config.get(key).and_then(toml::Value::as_bool)
 }
 
+/// Resolve the daemon digest toggle.
+///
+/// TOML cannot hold `pr_watch.digest` as both a boolean and a table, so the
+/// toggle lives inside the table as `[pr_watch.digest] enabled`. A bare
+/// `[pr_watch] digest = true` (no table) is still honoured. A table without
+/// `enabled`, or a value of the wrong type, resolves to off with a warning
+/// rather than silently reading as `digest = false`.
+fn digest_toggle(config: &LoadedConfig) -> (bool, Option<String>) {
+    match config.get("pr_watch.digest") {
+        None => (false, None),
+        Some(toml::Value::Boolean(enabled)) => (*enabled, None),
+        Some(toml::Value::Table(table)) => match table.get("enabled") {
+            Some(toml::Value::Boolean(enabled)) => (*enabled, None),
+            Some(other) => (
+                false,
+                Some(format!(
+                    "[pr_watch.digest] enabled must be true or false, got {}; digest stays off",
+                    other.type_str()
+                )),
+            ),
+            None => (
+                false,
+                Some(
+                    "[pr_watch.digest] is configured but has no `enabled = true`; \
+                     the daemon digest stays off"
+                        .to_owned(),
+                ),
+            ),
+        },
+        Some(other) => (
+            false,
+            Some(format!(
+                "[pr_watch] digest must be a boolean or a [pr_watch.digest] table, got {}; \
+                 digest stays off",
+                other.type_str()
+            )),
+        ),
+    }
+}
+
 impl WatchConfig {
     /// Read `[pr_watch]`, `[pr_watch.thresholds]` and `[pr_watch.digest]`.
-    /// Every key is optional; `enabled`, `post_comments` and `digest` default
-    /// to `false`.
+    /// Every key is optional; `enabled`, `post_comments` and the digest
+    /// toggle (`[pr_watch.digest] enabled`, or a bare `[pr_watch] digest`
+    /// boolean) default to `false`.
     ///
     /// # Errors
     /// When `lookback` is not a valid window.
     pub fn from_config(config: &LoadedConfig) -> Result<Self, String> {
+        let (digest, digest_warning) = digest_toggle(config);
         let mut out = Self {
             enabled: boolean(config, "pr_watch.enabled").unwrap_or(false),
             post_comments: boolean(config, "pr_watch.post_comments").unwrap_or(false),
-            digest: boolean(config, "pr_watch.digest").unwrap_or(false),
+            digest,
+            warnings: digest_warning.into_iter().collect(),
             repos: strings(config, "pr_watch.repos").unwrap_or_default(),
             handback: HandbackConfig::from_config(config),
             ..Self::default()
@@ -544,6 +591,8 @@ pub struct DaemonPass {
     pub flags: BTreeMap<String, usize>,
     /// Per-repository failures.
     pub errors: Vec<String>,
+    /// Config warnings (for example a digest table that is not enabled).
+    pub warnings: Vec<String>,
 }
 
 /// One daemon pass: re-read machine-global `[pr_watch]` config (so a toggle
@@ -586,6 +635,7 @@ pub fn daemon_pass(
     };
     let mut pass = DaemonPass {
         enabled: true,
+        warnings: watch.warnings.clone(),
         ..DaemonPass::default()
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -627,7 +677,7 @@ pub fn daemon_pass(
         };
         if watch.digest && watch.digest_command.is_empty() {
             pass.errors.push(format!(
-                "{repo}: [pr_watch] digest = true but [pr_watch.digest] command is empty; not sending"
+                "{repo}: the digest is enabled but [pr_watch.digest] command is empty; not sending"
             ));
         }
         // The daemon runs outside any checkout, so it has no repository

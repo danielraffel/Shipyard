@@ -273,7 +273,6 @@ workflow = "build.yml"
 # required_checks = ["macos", ...]   # else branch protection
 lookback = "7d"
 post_comments = false
-digest = false
 comment_author = "shipyard-local[bot]"
 
 [pr_watch.thresholds]    # spec defaults
@@ -282,11 +281,21 @@ failed_groups = 2
 replacements = 3
 
 [pr_watch.digest]
+enabled = true           # daemon digest; off when absent
 command = ["/path/to/python3", "/path/to/harbormaster_digest.py", "--post"]
 interval_minutes = 60
 min_age_minutes = 120
 ```
 
+The digest toggle is `[pr_watch.digest] enabled`. TOML cannot hold
+`pr_watch.digest` as both a boolean and a table, so `digest = true` under
+`[pr_watch]` next to a `[pr_watch.digest]` table is a parse error. A bare
+`[pr_watch] digest = true` with no table is still accepted, but it cannot carry
+the command, so use the table form. A `[pr_watch.digest]` table without
+`enabled` keeps the digest off and every pass reports a warning (in the
+`pr_watch_pass` event's `warnings`, and on stderr for `shipyard pr-watch`).
+This block is parsed by a unit test, so it stays valid TOML.
+
 Each pass publishes a `pr_watch_pass` IPC event with per-repository flag
-counts and errors. The digest needs the command's host (the Harbormaster token
+counts, errors and config warnings. The digest needs the command's host (the Harbormaster token
 lives on one machine); the scan itself is host-agnostic.
