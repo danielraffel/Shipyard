@@ -186,6 +186,7 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+<<<<<<< HEAD
 ## merge-guard is versioned and tested here
 
 `merge-guard` (refuses `pr merge` on a private repo that cannot enforce
@@ -195,6 +196,16 @@ Its source is `scripts/ghapp_merge_guard.sh`, its test
 `scripts/test_ghapp_merge_guard.py` (CI's Python helper tests), and it is a
 managed guard, so `shipyard guards install` places the tested copy and
 `guards status` reports a drifted one.
+=======
+## A missing key is not an empty list
+
+`validation_signals` reads a merge group's check runs page by page. A page
+without a `check_runs` array (an error body, a schema change) used to count as
+zero runs, which reported "no receipt decisions" for a group nobody read. It is
+now an error and the group reads `unreadable`. When adding a GitHub reader,
+treat a missing collection key as an error, never as `unwrap_or_default()`.
+
+>>>>>>> origin/main
 ## Protected-state caches take the writer-domain lease too
 
 `gate_cost::cache::ReadCache` writes under the protected state tree

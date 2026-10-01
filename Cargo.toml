@@ -1,6 +1,10 @@
 [package]
 name = "shipyard"
+<<<<<<< HEAD
 version = "0.241.0"
+=======
+version = "0.238.2"
+>>>>>>> origin/main
 edition = "2024"
 description = "Cross-platform CI coordination for local, SSH, and cloud runners."
 repository = "https://github.com/danielraffel/Shipyard"

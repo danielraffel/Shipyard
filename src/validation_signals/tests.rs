@@ -417,6 +417,29 @@ fn merged_pr_reports_receipt_decisions_from_merge_group_runs_only() {
 }
 
 #[test]
+fn check_runs_page_without_the_array_is_unreadable_not_empty() {
+    let mut routes = merge_group_routes();
+    for route in &mut routes {
+        if route.0 == "commits/mmmm/check-runs" {
+            route.1 = Ok(json!({"message": "Server Error"}));
+        }
+    }
+    let gh = FakeGh::new(routes);
+    let signals = gather_pr(&|args| gh.call(args), "o/r", 5);
+    let group = &signals.merge_groups[0];
+    assert_eq!(group.status, "unreadable", "{}", group.headline());
+    assert!(
+        group
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no check_runs array")),
+        "{:?}",
+        group.detail
+    );
+    assert!(group.receipt_decisions.is_empty());
+}
+
+#[test]
 fn merge_commit_without_merge_group_runs_says_so() {
     let gh = FakeGh::new(vec![
         ("graphql", Ok(pr_body(Some("mmmm"), None))),
