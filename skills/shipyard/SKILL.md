@@ -414,8 +414,23 @@ another flag. It is a dry run by default; `--post-comments` edits one sticky
 comment (comment endpoints only) and `--digest` sends the hourly digest through
 `[pr_watch.digest] command`. `shipyard pr-watch replay --since 7d --expect
 PR=FLAGS --control merged-clean` runs the same rules over a past window. The
-daemon job is off unless `[pr_watch] enabled = true`. See
+daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
+`[pr_watch.digest] enabled = true` (never `[pr_watch] digest = true` beside a
+`[pr_watch.digest]` table: TOML rejects a key that is both, and a table without
+`enabled` stays off with a warning in the `pr_watch_pass` event). See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
+
+`shipyard pr-watch scan --handback` plans the hand-back (dry run): for a PR
+with an owner-actionable flag it resolves the owner (steward handoff record,
+else the PR body's `whence` marker), probes the session read-only with
+`cmux sessions list`, and prints the `shipyard:needs-agent` label change, the
+`cmux notify` on the live session's surface, and the inbox line it would write
+to `~/.local/state/shipyard/inbox/<session>.jsonl` on the owner's host (the
+plugin's SessionStart/UserPromptSubmit hook shows that inbox to the agent once).
+Owners not live for `unowned_after_hours` are marked unowned on the digest line.
+`--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
+daemon delivers when that is on. It never types into a session (no
+`cmux send`), never resumes or starts an agent, and never arms or dequeues.
 
 Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
 --target <name>` for the shadow-only exact-head selector. Policy must come from
@@ -935,6 +950,13 @@ explicitly `unavailable`; never reinterpret them as zero. Low sample counts are
 a collection gap, not a regression. Prefer filing issues or changing profiles
 only when `watch`, `advise`, or `compare` reports enough samples and a material
 delta relative to that repo's baseline.
+
+Check freshness first: a leading `STALE: last github import …` line (JSON
+`freshness.status`) means nothing has imported recently, so a low count is the
+missing import, not the lane. Import by hand, or ask the operator to enable the
+daemon's `[metrics.import]` job (off by default; never edit the machine-global
+config from an agent session). `--project` takes `owner/name` or the short
+name interchangeably; `--fail-on-stale` exits 3 on `stale`/`empty`.
 
 Judge CI changes by the proxies, not by wall time. `compare`, `watch`,
 `trend`, and `scorecard` verdicts default to load-independent proxies
@@ -3450,6 +3472,17 @@ of the call log); prefer the helper in new code. Linux enforces this and macOS
 does not, so it is invisible locally and usually surfaces first on the coverage
 lane, whose instrumentation widens the window.
 
+**Fork-inherited locks (advisory-lock "released" assertions).** The same
+fork-before-exec window keeps a `flock`/`try_lock_exclusive` lease held after
+the test drops it: a sibling's forked child holds a duplicate of the locked open
+file description until its exec. So an in-binary assertion that a lock is
+acquirable again right after release is racy no matter how the lock is written
+(`global_model_lease` failed ~1 in 10 at `--test-threads=16`). Run such a body
+as an `#[ignore]`d test in a re-exec of the test binary (`--exact <name>
+--ignored --test-threads=1`, and assert the child printed `1 passed` so a
+filter typo cannot pass vacuously); `lease_tests.rs` has the helper. Do not
+"fix" it with a poll-until-acquirable loop, which hides a real leak too.
+
 **Running a different command than CI does.** Before concluding the repo is
 broken, read the workflow's own command and env. `cargo test --lib` aborts on a
 stack overflow that CI never sees, because every lane sets
@@ -3859,7 +3892,26 @@ they are siblings rather than one inside the other.
 | `backlog.rs` | open pull requests counted by `mergeStateStatus` |
 | `gather.rs` | the reads; nothing here mutates |
 | `render.rs` | human and `--json` forms |
-| `pr_state.rs` | `--pr <n>`: queue class plus the `VALIDATION` block (test tier of the head's required checks, merge-group receipt decisions) from `crate::validation_signals` |
+| `pr_state.rs` | `--pr <n>`: the verdict line first, then queue class plus the `VALIDATION` block (test tier of the head's required checks, merge-group receipt decisions) from `crate::validation_signals` |
+| `verdict.rs` | pure: `VerdictFacts` → `LandingVerdict` (RED / PENDING / GREEN / UNKNOWN, repeat and shared evidence, failed merge group on this head, queue suffix) |
+| `verdict_gather.rs` | the bounded reads behind the verdict, through an argv reader so tests replay inline bodies |
+
+**The verdict line is the one line agents quote** (`shipyard landing --pr
+<n>`, first line; JSON `verdict`). When reporting PR state, quote it; never
+call a red required check a flake, infrastructure, or "not a code failure"
+while `REPEAT` is shown. `REPEAT` is PR watch's flag-1 rule, not a second
+definition: `crate::pr_watch::repeat_findings` returns the structured findings
+both surfaces render, and `prs_failing_signature` answers the shared-failure
+test for a single failure. Keep them one rule. Invariants worth protecting:
+required means branch protection's contexts, filtered in the pure layer as
+well as at the read (a failed merge-group run that failed only an advisory job
+is not red); a required-checks response with neither `contexts` nor `checks`
+is UNKNOWN, not "no required checks"; merge groups are found through the PR's
+queue residency windows (an unfiltered `merge_group` listing covers only a few
+hours on a busy repo, because every workflow of a group is its own run); a
+`pull_request` run's `pull_requests` array is often empty, so other PRs'
+runs are attributed through the open-PR head-branch map from the same GraphQL
+read, and the rest are counted as a gap rather than dropped silently.
 
 `src/validation_signals.rs` owns the `shipyard-test-tier` /
 `shipyard-receipt-decision` annotation contract (`docs/validation-signals.md`)

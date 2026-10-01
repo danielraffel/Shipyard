@@ -54,9 +54,13 @@ pub mod placement;
 pub mod pr_state;
 pub mod queue;
 pub mod render;
+pub mod verdict;
+pub mod verdict_gather;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verdict_tests;
 
 /// Report generation. A consumer has to be able to tell a report produced by
 /// this build from one produced by a predecessor that lacked a field, because

@@ -49,6 +49,9 @@ pub struct Ledger {
     /// When each shared-failure test was last announced by a digest.
     #[serde(default)]
     pub shared_announced: BTreeMap<String, DateTime<Utc>>,
+    /// Hand-back deliveries, labels and owner observations.
+    #[serde(default)]
+    pub handback: super::handback::HandbackState,
 }
 
 impl Ledger {
@@ -65,6 +68,7 @@ impl Ledger {
             last_digest_at: None,
             digest_claim: None,
             shared_announced: BTreeMap::new(),
+            handback: super::handback::HandbackState::default(),
         }
     }
 

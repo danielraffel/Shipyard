@@ -936,6 +936,7 @@ fn run_scan(post_comments: bool) -> ScanRun {
         post_comments,
         post_digest: false,
         plan_comments: true,
+        handback: super::handback::HandbackMode::Off,
     };
     let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
     let report = super::scan::scan(
@@ -946,6 +947,7 @@ fn run_scan(post_comments: bool) -> ScanRun {
         &crate::gate_cost::ReadCache::disabled(),
         &request,
         now,
+        None,
     )
     .unwrap();
     let reads = reads.into_inner().unwrap();
@@ -1089,6 +1091,7 @@ fn a_daemon_style_scan_without_posting_reads_no_comment_lists() {
         post_comments: false,
         post_digest: false,
         plan_comments: false,
+        handback: super::handback::HandbackMode::Off,
     };
     let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
     let report = super::scan::scan(
@@ -1099,6 +1102,7 @@ fn a_daemon_style_scan_without_posting_reads_no_comment_lists() {
         &crate::gate_cost::ReadCache::disabled(),
         &request,
         now,
+        None,
     )
     .unwrap();
     assert_eq!(kinds(&report.flags, 42), vec![2]);
@@ -1356,4 +1360,147 @@ fn the_configured_attributor_runs_from_the_checkout_with_the_guards_argv() {
     assert_eq!(found.implicated_pr, Some(7));
     // A verdict about another run is not a ruling on this one.
     assert!(command.ask("o/r", 42, 100).is_none());
+}
+
+#[test]
+fn a_planned_handback_rides_the_scan_and_writes_nothing() {
+    struct NoHost;
+    impl super::handback::host::HostRunner for NoHost {
+        fn run(
+            &mut self,
+            invocation: &super::handback::host::Invocation,
+        ) -> Result<String, super::handback::host::RunError> {
+            panic!("no owner, so no host command: {:?}", invocation.argv)
+        }
+        fn append_local_inbox(&mut self, _: &str, _: &str) -> Result<(), String> {
+            panic!("no inbox in a plan")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let reader = |argv: &[String]| fake_github(argv);
+    let writer = |argv: &[String]| -> Result<String, String> { panic!("wrote {argv:?}") };
+    let mut sender = |_: &str| -> Result<(), String> { panic!("no digest") };
+    let request = super::scan::ScanRequest {
+        repo: "o/r".to_owned(),
+        config: super::scan::WatchConfig {
+            lookback: Duration::days(2),
+            ..super::scan::WatchConfig::default()
+        },
+        state_path: dir.path().join("ledger.json"),
+        post_comments: false,
+        post_digest: false,
+        plan_comments: false,
+        handback: super::handback::HandbackMode::Plan,
+    };
+    let mut runner = NoHost;
+    let mut deps = super::handback::Deps {
+        runner: &mut runner,
+        state_dir: dir.path().to_path_buf(),
+        local_names: Vec::new(),
+        local_machine: None,
+    };
+    let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
+    let report = super::scan::scan(
+        &reader,
+        &writer,
+        &mut sender,
+        None,
+        &crate::gate_cost::ReadCache::disabled(),
+        &request,
+        now,
+        Some(&mut deps),
+    )
+    .unwrap();
+    let handback = report.handback.expect("hand-back report");
+    assert_eq!(handback.owners.len(), 1);
+    assert_eq!(handback.owners[0].pr, 42);
+    assert_eq!(handback.owners[0].record.state, "none");
+    assert!(handback.actions.iter().all(|action| !action.sent));
+}
+
+/// Load `body` as the only (machine-global) config layer, as the daemon does.
+fn watch_config_from_toml(body: &str) -> super::scan::WatchConfig {
+    let global = tempfile::tempdir().unwrap();
+    std::fs::write(global.path().join("config.toml"), body).unwrap();
+    let config =
+        crate::config::LoadedConfig::load_machine_global_from_dir(global.path().to_path_buf())
+            .unwrap();
+    super::scan::WatchConfig::from_config(&config).unwrap()
+}
+
+#[test]
+fn a_digest_table_with_enabled_true_turns_the_digest_on() {
+    let watch = watch_config_from_toml(
+        "[pr_watch]\nenabled = true\n\n[pr_watch.digest]\nenabled = true\n\
+         command = [\"deliver\"]\ninterval_minutes = 30\n",
+    );
+    assert!(watch.digest);
+    assert_eq!(watch.digest_command, vec!["deliver".to_owned()]);
+    assert_eq!(watch.digest_policy.interval, Duration::minutes(30));
+    assert!(watch.warnings.is_empty(), "{:?}", watch.warnings);
+}
+
+#[test]
+fn a_bare_digest_boolean_without_a_table_is_still_honoured() {
+    let on = watch_config_from_toml("[pr_watch]\ndigest = true\n");
+    assert!(on.digest);
+    assert!(on.warnings.is_empty());
+    let off = watch_config_from_toml("[pr_watch]\ndigest = false\n");
+    assert!(!off.digest);
+    assert!(off.warnings.is_empty());
+}
+
+#[test]
+fn a_digest_table_without_enabled_stays_off_and_warns() {
+    let watch = watch_config_from_toml("[pr_watch.digest]\ncommand = [\"deliver\"]\n");
+    assert!(!watch.digest);
+    assert_eq!(watch.digest_command, vec!["deliver".to_owned()]);
+    assert_eq!(watch.warnings.len(), 1);
+    assert!(
+        watch.warnings[0].contains("enabled = true"),
+        "{:?}",
+        watch.warnings
+    );
+    // A wrongly typed toggle is also off and loud, never silently false.
+    let typo = watch_config_from_toml("[pr_watch.digest]\nenabled = \"yes\"\n");
+    assert!(!typo.digest);
+    assert_eq!(typo.warnings.len(), 1);
+}
+
+#[test]
+fn the_documented_daemon_config_parses_and_enables_the_digest() {
+    // A Windows checkout may give the doc CRLF line endings.
+    let doc = include_str!("../../docs/pr-watch.md").replace("\r\n", "\n");
+    let start = doc
+        .find("```toml\n[pr_watch]\n")
+        .expect("docs/pr-watch.md has the daemon config example");
+    let body = &doc[start + "```toml\n".len()..];
+    let body = &body[..body.find("```").expect("closing fence")];
+    let watch = watch_config_from_toml(body);
+    assert!(
+        !watch.enabled,
+        "the example documents the job off by default"
+    );
+    assert!(watch.digest, "the example documents the digest enabled");
+    assert!(!watch.digest_command.is_empty());
+    assert_eq!(watch.digest_policy.interval, Duration::minutes(60));
+    assert_eq!(watch.digest_policy.min_age, Duration::minutes(120));
+    assert_eq!(watch.repos, vec!["Generous-Corp/pulp".to_owned()]);
+    assert_eq!(watch.thresholds.red_minutes, 30);
+    assert!(watch.warnings.is_empty(), "{:?}", watch.warnings);
+}
+
+#[test]
+fn a_daemon_pass_carries_config_warnings() {
+    let global = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    // No repositories, so the pass reads nothing but still reports config.
+    std::fs::write(
+        global.path().join("config.toml"),
+        "[pr_watch]\nenabled = true\nrepos = []\n\n[pr_watch.digest]\ncommand = [\"x\"]\n",
+    )
+    .unwrap();
+    let pass = super::scan::daemon_pass(global.path(), state.path(), &[], chrono::Utc::now());
+    assert!(pass.enabled);
+    assert_eq!(pass.warnings.len(), 1, "{:?}", pass.warnings);
 }
