@@ -1013,6 +1013,11 @@ you want to know whether the user has live mode on before
 deciding whether to rely on webhook-speed updates vs polling
 cadence.
 
+A delivery the daemon refuses (HTTP 400/401/404/405 in the hook's
+delivery log) writes one `rejected webhook delivery <guid>` line with
+its event kind, reason, and body bytes received against Content-Length to
+`daemon/daemon.log`, so a refusal is visible on the host.
+
 **Idle behavior (v0.56.0+):** when no IPC subscriber is attached
 (no `shipyard watch` running, no GUI), the daemon skips the
 periodic `gh` reconcile poll. Webhooks still update state in real
