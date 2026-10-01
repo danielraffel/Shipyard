@@ -1,9 +1,31 @@
 ---
 name: ci
-description: Cross-platform CI coordination with Shipyard — validates, ships, manages queue, and runs cloud workflows
+description: Cross-platform CI coordination with Shipyard: validates, ships, manages queue, and runs cloud workflows. Also audits which Shipyard features a repository already has (shipyard pr flow, required checks, version/skill gates, merge queue, fast tier, receipt reuse, host classes, runner governance) and adopts the missing ones in dependency order.
 ---
 
 # CI Operations with Shipyard
+
+## Adopting Shipyard, or checking what a repository already has
+
+Before wiring any CI machinery into a repository (a PR gate, a merge queue, a
+test tier, a receipt, a runner router), run the read-only audit from a checkout
+of that repository:
+
+```sh
+skills/ci/scripts/adoption_audit.sh OWNER/REPO [BASE]
+```
+
+It prints, per feature, whether it is configured (present / partial / absent /
+n/a / UNKNOWN) and, separately, whether it is proven (a non-zero effect on
+recently merged PRs), plus the next feature to adopt. Every probe has a
+control, so an unreadable surface reads UNKNOWN rather than absent. Only
+features a feature-proof audit showed working are recommended; broken or
+unproven ones are listed as "not ready" with the reason, so you can detect
+them without rebuilding or relying on them. Per-feature detect, adopt
+and verify steps, the dependency order, and which parts are still Pulp-only
+live in [references/adoption.md](references/adoption.md). Detect first: the
+costly failure is rebuilding something already wired, or adding a queue before
+the required checks it depends on.
 
 ## Webhook repository identity
 
