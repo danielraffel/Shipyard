@@ -990,8 +990,6 @@ exit 0;
     #[cfg(unix)]
     #[test]
     fn release_asset_download_rejects_overflow_and_command_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
         let fixture = tempfile::tempdir().expect("fixture");
         let should_not_run = fixture.path().join("oversize-command-ran");
         let mut command = Command::new("/bin/sh");
@@ -1040,14 +1038,15 @@ exit 0;
             0
         );
 
+        // Written by a child process so no thread here holds a writable
+        // descriptor a concurrently forked sibling could inherit; that inherited
+        // descriptor is what makes the exec below fail ETXTBSY on Linux.
         let failing = fixture.path().join("failing-download");
-        std::fs::write(
+        crate::test_support::write_executable_script_with_mode(
             &failing,
             "#!/bin/sh\nprintf partial\nprintf download-failed >&2\nexit 17\n",
-        )
-        .expect("script");
-        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o700))
-            .expect("script mode");
+            0o700,
+        );
         let failed_asset = ObservedAsset {
             id: 45,
             name: PLATFORM_ASSET.to_owned(),

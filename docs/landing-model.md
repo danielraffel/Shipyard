@@ -11,7 +11,7 @@ It is read-only. It never merges, enqueues, dispatches or cancels.
 shipyard landing                                   # the origin remote, its default base
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                            # machine-readable
-shipyard landing --pr 123                          # one pull request's queue state
+shipyard landing --pr 123                          # one pull request: VERDICT line, then queue state
 ```
 
 Exit `0` when the mechanism was fully determined, `9` when any headline field
@@ -145,9 +145,68 @@ check-run route does not cover every context.
 
 ## One pull request: `shipyard landing --pr <n>`
 
-With `--pr`, `landing` skips the repository model and classifies one pull
-request's merge-queue state from a single GraphQL read. Every line of output
-names the response field it came from, and the report always opens with:
+With `--pr`, `landing` skips the repository model and reports one pull
+request. Its first line is the **verdict line**, the one line to quote when
+reporting the pull request's state:
+
+```text
+VERDICT #8933 head fc399ea6: RED — macos failed cmake-forge-catalog-install (REPEAT on 2 heads: cc6302b9, fc399ea6); other required: 4 green; queue: ejected failed_checks at 2026-09-29T03:40:00Z, same head
+```
+
+| state | when |
+|---|---|
+| `RED` | a required check's latest attempt on the current head concluded `failure`, `timed_out`, `startup_failure`, `cancelled` or `action_required` (a required commit status: `failure`/`error`); **or** the latest merge group named for the PR, created after the current head was first seen, failed a required job (`merge group run N (named for #n, on this head) failed ...`) — a head green on a fast tier while its full-suite group is red cannot land as it stands |
+| `PENDING` | nothing required is red; a required check is queued, running, or not created on the current head |
+| `GREEN` | every required check passed (`success`, `neutral`, `skipped`) on the current head and no later merge group failed |
+| `UNKNOWN` | the PR, its base's required checks, or the head's check runs could not be read; exit `9`; the line says not to call the PR green, red, or flaky |
+
+- **Required** means branch protection's `required_status_checks` for the
+  PR's base (`contexts` and `checks[].context`), selected by name. Advisory
+  checks and advisory jobs of a merge group never make a verdict red.
+- **Failing tests** come from the failed required job's log through the
+  diagnostics `ctest` parser, normalised to the bare test name (CTest
+  renumbers tests between runs), else the first meaningful `##[error]` line.
+  An unread log says `log unread; failing tests unknown`, never "no test
+  failed".
+- **`REPEAT on K heads`** is PR watch's flag-1 rule: the same normalised
+  failing test on at least two runs of the same required check of this PR
+  (its heads, re-runs, and merge groups named `pr-<n>`). `on K runs` when a
+  lane is a merge group; `on N runs of <head>` when all repeats are re-runs of
+  one head.
+- **`also failing on #a,#b — likely main/shared`** replaces `REPEAT` when the
+  same test on the same check also failed on at least two *other* PRs in the
+  last 24 hours (their `pull_request` runs and the merge groups named for them).
+  The verdict stays `RED` — the head cannot land — but the line no longer
+  implies the PR caused it.
+- **Queue suffix**: `queued pos N`, `armed`, `not armed`, `ejected <reason> at
+  <time>, same head|new head since`, `merged`, `closed`.
+
+Reads are bounded and the count is printed (`(N API calls)`, JSON
+`verdict.api_calls`): one GraphQL read (head, base, queue timeline, open-PR
+head branches), required checks, the head's check runs (plus its commit
+statuses only when a required context has no check run), the head branch's
+`pull_request` runs, check runs of up to 6 earlier failed heads,
+`merge_group` runs created during up to 4 queue residencies, jobs of up to 6
+failed own group runs, up to 8 failed-job logs, and for the shared test two
+listings per failing workflow plus up to 10 other PRs' jobs and logs. Log
+signatures are cached with PR watch's read cache, so a second verdict costs
+fewer calls. Every read that failed or was cut short prints as `gap:` under
+the line; a gap is a stated blind spot, never absence. Pulp #8933 costs about
+28 calls, a green PR about 7.
+
+JSON: `verdict` carries `state`, `line`, `head_sha`, `base`, `required[]`
+(per context: `state`, `source` `check_run|status|none`, `conclusion`,
+`check_run_id`, `failing_tests`, `log_read`, `repeat {tests, lanes, runs}`,
+`shared {tests, other_prs}`), `merge_group {run_id, created_at, failed[]}`,
+`queue`, `unknown_detail`, `gaps`, and `api_calls`.
+
+**When reporting a PR's state, quote the VERDICT line.** Never call a red
+required check a flake, infrastructure, or "not a code failure" while `REPEAT`
+is shown: the same test failed on another head or group of the same PR.
+
+After the verdict, the report classifies the merge-queue state from a single
+GraphQL read. Every line of that section names the response field it came
+from, and it opens with:
 
 > REST pulls/<n>.auto_merge is null for every queued PR (GitHub consumes
 > auto-merge on enqueue) — never read it as 'unarmed'.
