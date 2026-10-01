@@ -466,6 +466,16 @@ Owners not live for `unowned_after_hours` are marked unowned on the digest line.
 daemon delivers when that is on. It never types into a session (no
 `cmux send`), never resumes or starts an agent, and never arms or dequeues.
 
+A target with `default = false` is opt-in: `pr`, `ship` and `run` leave it out
+unless `--target <name>` (`--targets` for run) or the active profile names it.
+When every target is opt-in, `pr`/`ship` push, open and arm auto-merge but queue
+no job and write no ship-state; the JSON reports `validation: "delegated"`,
+`verdict_owner: "required-checks"`. Do not read the missing ship-state as a
+failure or an orphan: `status`, `ship-state list/show`, `landing` and `doctor`
+all print `<name>: opt-in, not run (GitHub required checks decide)` for it, and
+it is never probed, counted in landability, or reported as a validation gap
+unless requested. See [`docs/targets.md`](../../docs/targets.md).
+
 Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
 --target <name>` for the shadow-only exact-head selector. Policy must come from
 the authenticated protected base and may contain only reviewed path globs plus

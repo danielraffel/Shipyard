@@ -612,7 +612,11 @@ pub(super) fn apply_changed_surface_execution(
                             target: &target.name,
                             machine_mode: machine.mode,
                             category: "full_fallback",
-                            diagnostic: bounded_diagnostic(&format!("{reason:?}")),
+                            diagnostic: bounded_diagnostic(&full_fallback_diagnostic(
+                                reason,
+                                observation.receipt.fallback_reason.as_ref(),
+                                observation.receipt.fallback_detail.as_deref(),
+                            )),
                         },
                     )?;
                     continue;
@@ -1023,6 +1027,19 @@ fn persist_activation(path: &Path, receipt: &ActivationReceipt<'_>) -> Result<()
     Ok(())
 }
 
+/// Name the planner's own fallback reason next to the execution reason, so a
+/// full-suite fallback can be attributed to a wide change, a policy edit, or a
+/// provenance failure without re-running the planner.
+fn full_fallback_diagnostic(
+    reason: crate::changed_surface::FullExecutionReason,
+    fallback: Option<&FallbackReason>,
+    detail: Option<&str>,
+) -> String {
+    let fallback = fallback.map_or_else(String::new, |fallback| format!(": {fallback:?}"));
+    let detail = detail.map_or_else(String::new, |detail| format!(" ({detail})"));
+    format!("{reason:?}{fallback}{detail}")
+}
+
 fn persist_fallback_diagnostic(
     path: &Path,
     diagnostic: &FallbackDiagnostic<'_>,
@@ -1166,7 +1183,7 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES, MachineMode,
-        MachinePolicy, bounded_diagnostic, persist_fallback_diagnostic,
+        MachinePolicy, bounded_diagnostic, full_fallback_diagnostic, persist_fallback_diagnostic,
         publish_current_stale_generation, read_current_stale_generation, result_dir,
         selected_resume_block_reason, shell_quote, stale_generation_has_execution_evidence,
         target_declares_changed_surface_selection,
@@ -1177,6 +1194,23 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    #[test]
+    fn full_fallback_diagnostic_names_the_planner_reason() {
+        use crate::changed_surface::{FallbackReason, FullExecutionReason};
+        assert_eq!(
+            full_fallback_diagnostic(FullExecutionReason::ShadowPolicy, None, None),
+            "ShadowPolicy"
+        );
+        assert_eq!(
+            full_fallback_diagnostic(
+                FullExecutionReason::PlannerSelectedFull,
+                Some(&FallbackReason::UnmappedChangedPath),
+                Some("unmapped paths: a/b.rs"),
+            ),
+            "PlannerSelectedFull: UnmappedChangedPath (unmapped paths: a/b.rs)"
+        );
+    }
 
     #[test]
     fn machine_mode_is_default_off_and_ignores_repo_layers() {

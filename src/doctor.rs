@@ -238,7 +238,22 @@ pub fn collect_runner_checks(config: &LoadedConfig) -> Option<BTreeMap<String, D
     let dispatcher = ExecutorDispatcher::new(None);
     let mut rows = BTreeMap::new();
     for target in runner_targets {
-        rows.insert(target.name.clone(), runner_check(&dispatcher, &target));
+        // An opt-in target is never probed: an unreachable one is not a gap
+        // in validation nobody asked for.
+        let row = if crate::opt_in_targets::is_opt_in(&config.data, &target.name) {
+            DoctorEntry {
+                ok: true,
+                version: Some(crate::opt_in_targets::NOT_RUN.to_owned()),
+                detail: Some(
+                    "not probed; GitHub required checks decide unless --target requests it"
+                        .to_owned(),
+                ),
+                error: None,
+            }
+        } else {
+            runner_check(&dispatcher, &target)
+        };
+        rows.insert(target.name.clone(), row);
     }
     Some(rows)
 }
@@ -1603,6 +1618,37 @@ mod tests {
         assert!(!entry.ok);
         assert_eq!(entry.version.as_deref(), Some("misconfigured"));
         assert_eq!(entry.detail.as_deref(), Some("target has no `host` field"));
+    }
+
+    fn runner_config(default_line: &str) -> crate::config::LoadedConfig {
+        crate::config::LoadedConfig {
+            data: format!(
+                "[targets.linux]\nbackend = \"ssh\"\nplatform = \"linux-x64\"\nrepo_path = \"/srv/repo\"\n{default_line}\n"
+            )
+            .parse()
+            .expect("toml"),
+            global_dir: std::path::PathBuf::from("/nonexistent-global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: crate::config::LocalOverlaySource::None,
+        }
+    }
+
+    #[test]
+    fn runner_checks_name_an_opt_in_target_without_probing_it() {
+        let rows = super::collect_runner_checks(&runner_config("default = false")).expect("rows");
+        let entry = &rows["linux"];
+        assert!(
+            entry.ok,
+            "an unrequested opt-in target is not a validation gap"
+        );
+        assert_eq!(entry.version.as_deref(), Some("opt-in, not run"));
+
+        let probed = super::collect_runner_checks(&runner_config("")).expect("rows");
+        assert!(
+            !probed["linux"].ok,
+            "control: the same target probes as misconfigured"
+        );
     }
 
     #[test]

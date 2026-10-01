@@ -400,6 +400,7 @@ writer custody before mutation.
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |
 | Deliberately skip one lane | `shipyard run --skip-target windows` (repeatable; no probe run) |
+| Make a lane opt-in (off unless requested) | `[targets.<name>] default = false`; request it with `shipyard pr --target <name>` / `ship --target` / `run --targets`. With every target opt-in, `pr`/`ship` push, open and arm MERGE, queue nothing, and print `validation: delegated` (the required checks decide). See `docs/targets.md` "Opt-in targets". |
 | Proceed with unreachable lanes (VALIDATION GAP) | `shipyard run --allow-unreachable-targets` (prints a loud warning; exits 3 without the flag) |
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
@@ -2111,6 +2112,17 @@ test names are never interpolated into a regex or shell expression. The
 library contract alone does not activate selection: the queue/orchestration
 layer must still snapshot and substitute the immutable plan before bounded
 results can become authoritative.
+
+A provenance fallback (stale base, merge-base mismatch, incomplete diff) still
+binds the digest of the base policy whenever that policy validates, so it
+promotes to an ordinary full-suite disposition and, under `shadow_compare`,
+reaches the stale-base shadow comparison. `promotion_error` with "policy
+digest does not match" therefore means a genuinely different policy; "carries
+no policy digest" means the base policy itself failed validation. When reading
+`changed-surface-results/**/fallback-*` diagnostics, a `full_fallback` line
+names the planner reason after the colon (for example
+`PlannerSelectedFull: TestTopologyChanged`): that reason, not the planner, is
+usually what keeps a repository at zero reduced selections.
 
 ## Cross-PR evidence reuse
 

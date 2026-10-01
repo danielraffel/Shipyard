@@ -110,7 +110,7 @@ pub(super) fn landing_command<W: Write>(
         }
         return Ok(std::process::ExitCode::SUCCESS);
     }
-    let report = gather::gather(
+    let mut report = gather::gather(
         &actions,
         &GatherOptions {
             repo: &repo,
@@ -122,6 +122,8 @@ pub(super) fn landing_command<W: Write>(
                 .unwrap_or(crate::base_health::DEFAULT_WORKFLOW),
         },
     );
+
+    report.opt_in_targets = crate::opt_in_targets::from_config(&config);
 
     if json {
         render::write_json(stdout, &report)
