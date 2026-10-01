@@ -15,6 +15,23 @@ whatever you want and can have as many as you need.
 | `windows` | windows-x64 | ssh | Windows VM running on your Mac |
 | `cloud-linux` | linux-x64 | cloud | A Namespace runner |
 
+An exe.dev VM is configured as an ordinary POSIX SSH target. This keeps the
+first integration small and preserves Shipyard's existing logs, artifacts, and
+evidence contract:
+
+```toml
+[targets.exe-linux]
+backend = "ssh"
+host = "builder.exe.xyz"
+platform = "linux-x64"
+repo_path = "/home/exedev/work/project"
+```
+
+exe.dev supplies persistent Linux VMs, SSH access, and account-level capacity.
+Shipyard does not create or delete those VMs in this mode. See
+[`docs/exe-dev.md`](./exe-dev.md) for the pilot and the criteria for a future
+lifecycle provider.
+
 You don't need all of these. Use what matches your project — one target
 is fine, six is fine. Add more any time with `shipyard targets add`.
 

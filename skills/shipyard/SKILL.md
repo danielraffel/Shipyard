@@ -202,6 +202,16 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+## Protected-state caches take the writer-domain lease too
+
+`gate_cost::cache::ReadCache` writes under the protected state tree
+(`metrics/gate-cost-cache/`), so creating the directory, storing an entry and
+pruning each hold `writer_domain_lease::acquire_for_protected_path`. Without it,
+a `shipyard metrics gate-cost` run during a Shipyard PR's macOS local lane made
+sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
+cannot be had the write is skipped and the cache stops writing for that run; a
+cold read is always correct. Any new cache in the state tree needs the same.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every
@@ -3230,6 +3240,15 @@ Namespace is optional and account-dependent. When Namespace is unavailable,
 Shipyard should default to GitHub-hosted Linux/macOS/Windows runners or explicit
 self-hosted GitHub Actions labels. Do not assume `nsc` access, and do not route
 new Shipyard CI to Namespace unless the user explicitly confirms active access.
+
+exe.dev VMs are currently supported through ordinary POSIX SSH targets. Use
+them for disposable or persistent Linux experiments with `shipyard watch local`
+or `shipyard run command`; exe.dev owns VM lifecycle and account capacity in
+this mode. Do not treat an exe.dev VM as a macOS, Windows, GPU, signing, or
+physical-device gate. A first-class lifecycle provider requires explicit
+ownership, TTL, readiness, capacity, and teardown evidence and remains a
+follow-on to a measured SSH pilot.
+
 Do not add hidden repo-variable fallbacks to local/self-hosted macOS runners:
 local runner use should be explicit via workflow-dispatch selector inputs so
 default GitHub-hosted runs cannot be stolen by stale local runner variables.
