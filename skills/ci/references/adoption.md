@@ -172,8 +172,7 @@ first as PROVEN.
 ### Opt-in targets (`default = false`): not ready, unreleased
 
 **Not ready: not merged or released.** Proposed in Shipyard #655 (branch
-`feat/opt-in-targets`; expected in CLI 0.239.0, the first release after
-0.238.0 to contain it, to be confirmed when it merges). Re-check before adopting: the
+`feat/opt-in-targets`; it ships in the release that merges #655). Re-check before adopting: the
 contract below is the PR's, not observed behavior, and it has no effect count
 yet.
 
