@@ -18,6 +18,12 @@ use crate::ship_state::{ShipState, ShipStateStore};
 
 /// Name of the state-root sentinel that blocks every merge-queue mutation.
 pub const HOLD_FILE: &str = "merge_queue/HOLD";
+/// Audit action for Shipyard's exact-head native auto-merge arm, the only way
+/// its merge path admits a pull request to a merge queue.
+pub const ARM_ACTION: &str = "arm native auto-merge";
+/// The audit action earlier releases wrote for a direct enqueue. Kept so an
+/// uncertain entry from one of them can still be resolved.
+const LEGACY_ENQUEUE_ACTION: &str = "enqueue pull request";
 const CONTROL_LOCK_FILE: &str = "merge_queue/control.lock";
 const AUDIT_FILE: &str = "merge_queue/mutations.jsonl";
 static CORRELATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -414,7 +420,7 @@ pub fn resolve_uncertainty(
                 .get("action")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            let enqueue = action == "enqueue pull request";
+            let enqueue = action == ARM_ACTION || action == LEGACY_ENQUEUE_ACTION;
             let revocation = matches!(action, "disable native auto-merge" | "dequeue drifted PR");
             let identity_matches = entry.get("repo").and_then(serde_json::Value::as_str)
                 == Some(state.repo.as_str())

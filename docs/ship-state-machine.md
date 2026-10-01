@@ -653,7 +653,12 @@ continuously-active-writer Phase 2 boundary.
   machine until that lifecycle is modeled.
 - **Externals:** the configured `GhClient` reads the live branch merge-queue
   object plus evaluated rules, then performs sparse GraphQL queue/PR polls and
-  calls `enqueuePullRequest(expectedHeadOid: <validated-sha>)`.
+  arms native auto-merge with `enablePullRequestAutoMerge(mergeMethod: MERGE,
+  expectedHeadOid: <validated-sha>)`; GitHub enqueues the PR when its required
+  checks pass. The merge path never calls `enqueuePullRequest` itself
+  (`no_merge_path_enqueues_a_pull_request_directly` pins that). Audit entries
+  use the action `arm native auto-merge`; older `enqueue pull request` entries
+  still resolve.
 - **Rules:** classic branches refuse automatic merge. Queue branches never use
   the REST direct-merge fallback. The exact live head must equal the
   validated SHA atomically on GitHub. `auto-merge` returns exit 3 while queued
@@ -680,7 +685,7 @@ continuously-active-writer Phase 2 boundary.
   enqueue applies the same verdict (its hosted-setup recovery, which carries
   its own infrastructure evidence, does not).
 - **Guard marker:** every queue-mutating `gh` command Shipyard issues itself
-  (the `enqueuePullRequest` arm, the classic `gh pr merge`, the audited
+  (the exact-head native auto-merge arm, the classic `gh pr merge`, the audited
   disable/dequeue revocations, and the merge steward's enqueue) sets
   `SHIPYARD_INTERNAL_QUEUE_MUTATION=1`. When `gh` resolves to the `ghapp`
   wrapper, its queue-removal and queue-arm guards honour that marker instead of

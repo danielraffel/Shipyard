@@ -202,6 +202,19 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+## The merge path arms native auto-merge; it never enqueues
+
+`shipyard auto-merge` / `ship` admit a PR to a merge queue by arming native
+auto-merge on the validated head (`enablePullRequestAutoMerge`, `MERGE`,
+`expectedHeadOid`); GitHub enqueues it when required checks pass. The direct
+`enqueuePullRequest` path was removed after it went unused: m3's audit ledger
+(the only one on the fleet) holds 2,944 direct enqueue attempts, 2,852 of them
+rejected, and none after 2026-09-15 once arm-on-open took over. The test
+`no_merge_path_enqueues_a_pull_request_directly` fails if a direct enqueue
+returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
+`arm native auto-merge`; `merge-queue resolve` still accepts the old
+`enqueue pull request` entries.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every
