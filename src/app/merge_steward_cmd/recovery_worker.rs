@@ -77,19 +77,49 @@ const DISABLED_CODEX_FEATURES: &[&str] = &[
     "workspace_dependencies",
 ];
 
+/// A native `codex` executable for recovery-worker tests: a copy of this test
+/// binary, kept beside it in the build directory.
+///
+/// It lives next to the test executable rather than in TMPDIR because it must
+/// outlive the process that made it (the path sits in a static), so nothing
+/// ever removes a TMPDIR copy: every test run left a 120 MB binary behind, and
+/// a validation host collected hundreds. Beside the executable it is reused
+/// by every later run of the same binary and goes away with the build tree.
 #[cfg(test)]
 fn recovery_test_codex_binary() -> PathBuf {
     static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BINARY
         .get_or_init(|| {
-            let directory = tempfile::Builder::new()
-                .prefix("shipyard-test-codex-")
-                .tempdir()
-                .expect("codex fixture directory")
-                .keep();
+            let executable = std::env::current_exe().expect("test executable");
+            let stem = executable
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("test")
+                .to_owned();
+            let directory = executable
+                .parent()
+                .expect("test executable directory")
+                .join(format!("shipyard-test-codex-{stem}"));
+            std::fs::create_dir_all(&directory).expect("codex fixture directory");
             let path = directory.join(if cfg!(windows) { "codex.exe" } else { "codex" });
-            std::fs::copy(std::env::current_exe().expect("test executable"), &path)
-                .expect("native codex fixture");
+            let source_len = std::fs::metadata(&executable)
+                .expect("test executable")
+                .len();
+            let current = std::fs::metadata(&path).is_ok_and(|existing| {
+                existing.len() == source_len
+                    && std::fs::metadata(&executable)
+                        .and_then(|source| source.modified())
+                        .ok()
+                        .zip(existing.modified().ok())
+                        .is_some_and(|(source, copy)| copy >= source)
+            });
+            if !current {
+                // Copy then rename so a concurrent test process never runs a
+                // half-written fixture.
+                let staging = directory.join(format!(".codex-{}.tmp", std::process::id()));
+                std::fs::copy(&executable, &staging).expect("native codex fixture");
+                std::fs::rename(&staging, &path).expect("publish codex fixture");
+            }
             path
         })
         .clone()

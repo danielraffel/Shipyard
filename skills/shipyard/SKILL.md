@@ -244,6 +244,19 @@ sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
 cannot be had the write is skipped and the cache stops writing for that run; a
 cold read is always correct. Any new cache in the state tree needs the same.
 
+## Local validation TMPDIRs live on the boot volume unless redirected
+
+A daemon-owned local validation gets a fresh `/private/tmp/shipyard-validation-*`
+TMPDIR (`src/executor/local.rs`, `ValidationTempDir`). Its drop restores owner
+rwx on every directory before removing it, because Pulp tests install packs
+read-only and `tempfile::TempDir` silently left those trees behind (one held
+28 GiB on m3). A killed run still leaves its directory; tartci's reclaim pass
+(`scripts/scratch_dirs.py`) removes those after 12 h idle. On a host whose boot
+volume must stay clear, export `SHIPYARD_VALIDATION_TMP_BASE=<absolute dir>` in
+the daemon's environment; a relative or protected base is refused, not
+resolved. Test fixtures that must outlive their process (a path in a static)
+belong beside the test executable, never in a kept TMPDIR directory.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every
