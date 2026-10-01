@@ -119,6 +119,74 @@ pub(super) fn cleanup_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `shipyard cleanup --validation-tmp`: report, then (with --apply) delete,
+/// leftover validation TMPDIRs nothing can still be using.
+pub(super) fn validation_tmp_cleanup<W: Write>(
+    mode: CleanupMode,
+    older_than_hours: u64,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    use crate::executor::validation_tmp::{self, ReclaimPolicy, SystemLiveness};
+    let base = validation_tmp::default_base();
+    let policy = ReclaimPolicy {
+        min_age: std::time::Duration::from_hours(older_than_hours),
+        include_unowned: true,
+    };
+    let candidates =
+        validation_tmp::plan(&base, std::time::SystemTime::now(), policy, &SystemLiveness);
+    let reclaimable: u64 = candidates.iter().map(|candidate| candidate.bytes).sum();
+    let freed = if mode.is_dry_run() {
+        None
+    } else {
+        Some(validation_tmp::apply(&candidates))
+    };
+    let io = |error: std::io::Error| CliFailure::new(1, error.to_string());
+    if json {
+        let mut data = std::collections::BTreeMap::new();
+        data.insert("base".to_owned(), serde_json::json!(base));
+        data.insert(
+            "older_than_hours".to_owned(),
+            serde_json::json!(older_than_hours),
+        );
+        data.insert("candidates".to_owned(), serde_json::json!(candidates));
+        data.insert(
+            "reclaimable_bytes".to_owned(),
+            serde_json::json!(reclaimable),
+        );
+        data.insert("freed_bytes".to_owned(), serde_json::json!(freed));
+        crate::output::write_json_envelope(stdout, "cleanup.validation_tmp", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    #[allow(clippy::cast_precision_loss)] // display only
+    let gib = |bytes: u64| bytes as f64 / f64::from(1_u32 << 30);
+    writeln!(
+        stdout,
+        "validation TMPDIRs under {} older than {older_than_hours}h with no live user: {} ({:.1} GiB)",
+        base.display(),
+        candidates.len(),
+        gib(reclaimable)
+    )
+    .map_err(io)?;
+    for candidate in &candidates {
+        writeln!(
+            stdout,
+            "  {:.2} GiB  {}h  {}  ({})",
+            gib(candidate.bytes),
+            candidate.age_hours,
+            candidate.path.display(),
+            candidate.reason
+        )
+        .map_err(io)?;
+    }
+    match freed {
+        Some(bytes) => writeln!(stdout, "removed {:.1} GiB", gib(bytes)).map_err(io)?,
+        None => writeln!(stdout, "dry run: re-run with --apply to delete").map_err(io)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn pin_log_directory<W: Write>(
     state_dir: &Path,
     job_id: &str,

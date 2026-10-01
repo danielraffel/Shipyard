@@ -81,6 +81,7 @@ use self::changelog_cmd::changelog_command;
 use self::ci_cmd::ci_command;
 use self::cleanup_cmd::{
     CleanupCommandOptions, CleanupMode, CleanupOutput, CleanupScope, cleanup_command,
+    validation_tmp_cleanup,
 };
 use self::cli::{
     Cli, Command, EvidenceCommand, MergeMethod, MergeResult, RunSubcommand, ShipStateCommand,
@@ -843,10 +844,23 @@ fn handle_state_command<W: Write>(
         }
         Command::Queue => queue_command(state_dir, json, stdout),
         Command::Cleanup {
+            validation_tmp: true,
+            dry_run,
+            apply,
+            older_than_hours,
+            ..
+        } => validation_tmp_cleanup(
+            CleanupMode::from_flags(dry_run, apply),
+            older_than_hours,
+            json,
+            stdout,
+        ),
+        Command::Cleanup {
             pin,
             dry_run,
             apply,
             ship_state,
+            ..
         } => cleanup_command(
             state_dir,
             mode,
