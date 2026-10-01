@@ -249,8 +249,12 @@ a deterministic PATH. The daemon retains its state-owned private `TMPDIR`, but
 local validation subprocesses that inherit that protected path receive a fresh
 owner-private directory under the platform's real temporary root. This keeps
 test fixtures ephemeral and outside the production writer domain without
-weakening protected-path classification. Custom locations can be configured
-globally:
+weakening protected-path classification. The directory is removed when the
+run ends, including directories a test left read-only. A host whose boot
+volume must not carry build scratch can set `SHIPYARD_VALIDATION_TMP_BASE` to
+an absolute directory outside Shipyard's state in the daemon's environment;
+the per-run directories are then created there instead. Custom locations can
+be configured globally:
 
 ```toml
 [update]

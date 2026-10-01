@@ -225,6 +225,18 @@ Its source is `scripts/ghapp_merge_guard.sh`, its test
 `scripts/test_ghapp_merge_guard.py` (CI's Python helper tests), and it is a
 managed guard, so `shipyard guards install` places the tested copy and
 `guards status` reports a drifted one.
+## The merge path arms native auto-merge; it never enqueues
+
+`shipyard auto-merge` / `ship` admit a PR to a merge queue by arming native
+auto-merge on the validated head (`enablePullRequestAutoMerge`, `MERGE`,
+`expectedHeadOid`); GitHub enqueues it when required checks pass. The direct
+`enqueuePullRequest` path was removed after it went unused: m3's audit ledger
+(the only one on the fleet) holds 2,944 direct enqueue attempts, 2,852 of them
+rejected, and none after 2026-09-15 once arm-on-open took over. The test
+`no_merge_path_enqueues_a_pull_request_directly` fails if a direct enqueue
+returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
+`arm native auto-merge`; `merge-queue resolve` still accepts the old
+`enqueue pull request` entries.
 ## fleet-reconcile ledger: every attempt says how it ended
 
 `fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
@@ -252,6 +264,19 @@ a `shipyard metrics gate-cost` run during a Shipyard PR's macOS local lane made
 sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
 cannot be had the write is skipped and the cache stops writing for that run; a
 cold read is always correct. Any new cache in the state tree needs the same.
+
+## Local validation TMPDIRs live on the boot volume unless redirected
+
+A daemon-owned local validation gets a fresh `/private/tmp/shipyard-validation-*`
+TMPDIR (`src/executor/local.rs`, `ValidationTempDir`). Its drop restores owner
+rwx on every directory before removing it, because Pulp tests install packs
+read-only and `tempfile::TempDir` silently left those trees behind (one held
+28 GiB on m3). A killed run still leaves its directory; tartci's reclaim pass
+(`scripts/scratch_dirs.py`) removes those after 12 h idle. On a host whose boot
+volume must stay clear, export `SHIPYARD_VALIDATION_TMP_BASE=<absolute dir>` in
+the daemon's environment; a relative or protected base is refused, not
+resolved. Test fixtures that must outlive their process (a path in a static)
+belong beside the test executable, never in a kept TMPDIR directory.
 
 ## First Steps
 

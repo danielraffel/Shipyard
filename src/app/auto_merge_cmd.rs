@@ -627,6 +627,7 @@ fn gh(client: &GhClient, cwd: &Path) -> Result<Command, String> {
 }
 
 use crate::merge_queue::INTERNAL_QUEUE_MUTATION_ENV;
+use crate::merge_queue_control::ARM_ACTION;
 
 /// Mark a queue-mutating `gh` command as Shipyard's own.
 ///
@@ -638,13 +639,20 @@ fn mark_internal_queue_mutation(command: &mut Command) -> &mut Command {
     command.env(INTERNAL_QUEUE_MUTATION_ENV, "1")
 }
 
-fn native_enqueue_command(
+/// Arm GitHub-native auto-merge on the validated head.
+///
+/// Shipyard never enqueues a pull request itself. On a merge-queue branch,
+/// native auto-merge bound to `expectedHeadOid` is what puts the PR in the
+/// queue once its required checks pass, so one mechanism does all queue
+/// admission and the head binding Shipyard validated is kept. `MERGE` keeps
+/// the version-bump marker commit intact (see `crate::auto_arm`).
+fn native_arm_command(
     client: &GhClient,
     cwd: &Path,
     pr_id: &str,
     head_sha: &str,
 ) -> Result<Command, String> {
-    let query = r"mutation($prId:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$prId,expectedHeadOid:$head}){mergeQueueEntry{id}}}";
+    let query = r"mutation($prId:ID!,$head:GitObjectID!){enablePullRequestAutoMerge(input:{pullRequestId:$prId,mergeMethod:MERGE,expectedHeadOid:$head}){pullRequest{id}}}";
     let mut command = gh(client, cwd)?;
     mark_internal_queue_mutation(&mut command).args([
         "api",
@@ -793,12 +801,7 @@ fn merge_pr(
                     global_dir,
                 )?;
                 let guard = MergeQueueMutationGuard::acquire_in_mode(
-                    store,
-                    cwd,
-                    mode,
-                    global_dir,
-                    state,
-                    "enqueue pull request",
+                    store, cwd, mode, global_dir, state, ARM_ACTION,
                 )?;
                 state.merge_queue_attempt_started_at = Some(admission_started_at);
                 state.merge_queue_observed_at = None;
@@ -1569,12 +1572,7 @@ pub(super) fn supervise_merge_queue(
                             return AutoMergeOutcome::MergeFailed { error };
                         }
                         let guard = match MergeQueueMutationGuard::acquire_in_mode(
-                            store,
-                            cwd,
-                            mode,
-                            global_dir,
-                            &state,
-                            "enqueue pull request",
+                            store, cwd, mode, global_dir, &state, ARM_ACTION,
                         ) {
                             Ok(guard) => guard,
                             Err(error) => {
@@ -1677,12 +1675,7 @@ pub(super) fn supervise_merge_queue(
                             return AutoMergeOutcome::MergeFailed { error };
                         }
                         let guard = match MergeQueueMutationGuard::acquire_in_mode(
-                            store,
-                            cwd,
-                            mode,
-                            global_dir,
-                            &state,
-                            "enqueue pull request",
+                            store, cwd, mode, global_dir, &state, ARM_ACTION,
                         ) {
                             Ok(guard) => guard,
                             Err(error) => {
@@ -2057,7 +2050,7 @@ fn arm_native_queue(
     pr_id: &str,
     guard: MergeQueueMutationGuard,
 ) -> Result<MergeQueueMutationGuard, QueueArmError> {
-    let mut command = match native_enqueue_command(client, cwd, pr_id, &state.head_sha) {
+    let mut command = match native_arm_command(client, cwd, pr_id, &state.head_sha) {
         Ok(command) => command,
         Err(error) => {
             return Err(QueueArmError::Rejected {
@@ -2067,13 +2060,13 @@ fn arm_native_queue(
         }
     };
     let output = command.output().map_err(|error| {
-        QueueArmError::Uncertain(format!("failed to enqueue merge-queue PR: {error}"))
+        QueueArmError::Uncertain(format!("failed to arm native auto-merge: {error}"))
     })?;
     if output.status.success() {
         return Ok(guard);
     }
     let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let error = format!("failed to enqueue merge-queue PR: {message}");
+    let error = format!("failed to arm native auto-merge: {message}");
     if definitive_enqueue_rejection(&error) {
         Err(QueueArmError::Rejected {
             error,
@@ -3466,30 +3459,73 @@ mod tests {
     }
 
     #[test]
-    fn native_enqueue_carries_the_internal_queue_mutation_marker() {
+    fn queue_admission_arms_native_auto_merge_on_the_validated_head() {
         let client = GhClient::ambient();
-        let command = native_enqueue_command(
+        let command = native_arm_command(
             &client,
             Path::new("/tmp"),
             "PR_kw",
             "b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
         )
-        .expect("enqueue command");
+        .expect("arm command");
         assert_eq!(
             command_env(&command, INTERNAL_QUEUE_MUTATION_ENV).as_deref(),
             Some("1"),
-            "ghapp's queue-arm guard must recognise Shipyard's own enqueue"
+            "ghapp's queue-arm guard must recognise Shipyard's own arm"
         );
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert!(args.iter().any(|arg| arg.contains("enqueuePullRequest")));
+        let query = args
+            .iter()
+            .find(|arg| arg.starts_with("query="))
+            .expect("query");
+        assert!(query.contains("enablePullRequestAutoMerge"), "{query}");
+        assert!(query.contains("mergeMethod:MERGE"), "{query}");
+        assert!(query.contains("expectedHeadOid:$head"), "{query}");
         assert!(args.iter().any(|arg| arg == "prId=PR_kw"));
         assert!(
             args.iter()
                 .any(|arg| arg == "head=b07b9f1ac9069484e2fa8fdb2319b134c69c3c56")
         );
+    }
+
+    #[test]
+    fn no_merge_path_enqueues_a_pull_request_directly() {
+        // Native auto-merge is the only queue admission. A direct enqueue
+        // mutation reappearing in the ship/merge path would bypass it.
+        let needle = concat!("enqueue", "PullRequest");
+        let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app");
+        let mut sources = vec![
+            app.join("auto_merge_cmd.rs"),
+            app.join("ship_cmd.rs"),
+            app.join("pr_cmd.rs"),
+        ];
+        let mut dirs = vec![app.join("ship_cmd"), app.join("auto_merge_cmd")];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    sources.push(path);
+                }
+            }
+        }
+        // Control: the scan must have read real merge-path sources.
+        assert!(sources.len() > 3, "{sources:?}");
+        for path in &sources {
+            let source = std::fs::read_to_string(path).expect("source");
+            assert!(
+                !source.contains(needle),
+                "{} enqueues a pull request directly",
+                path.display()
+            );
+        }
     }
 
     #[test]
