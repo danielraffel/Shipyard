@@ -179,6 +179,10 @@ pub struct LandingReport {
     /// How many API calls this report actually cost. Reported rather than
     /// estimated: a budget nobody measures is a wish.
     pub api_calls: u32,
+    /// Local Shipyard targets that are opt-in (`default = false`) and so do
+    /// not run on a plain `shipyard pr`. Listed so their silence is not read
+    /// as a broken lane.
+    pub opt_in_targets: Vec<crate::opt_in_targets::OptInTarget>,
 }
 
 impl LandingReport {

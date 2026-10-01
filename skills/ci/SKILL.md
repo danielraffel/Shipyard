@@ -198,6 +198,16 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+## fleet-reconcile ledger: every attempt says how it ended
+
+`fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
+`failed: <reason>`) for each rollout. Reconcile only ever targets the latest
+release, so a failed older tag is never retried; when a newer tag rolls out,
+every older tag without a verified rollout gets `terminal: "superseded by
+<tag> without a verified rollout (last attempt: ...)"`. Entries written before
+this carry no `last_outcome` and close as "outcome not recorded". The close
+happens inside a rollout, never on an idle tick, which still writes nothing.
+
 ## A missing key is not an empty list
 
 `validation_signals` reads a merge group's check runs page by page. A page
@@ -402,6 +412,7 @@ writer custody before mutation.
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |
 | Deliberately skip one lane | `shipyard run --skip-target windows` (repeatable; no probe run) |
+| Make a lane opt-in (off unless requested) | `[targets.<name>] default = false`; request it with `shipyard pr --target <name>` / `ship --target` / `run --targets`. With every target opt-in, `pr`/`ship` push, open and arm MERGE, queue nothing, and print `validation: delegated` (the required checks decide). See `docs/targets.md` "Opt-in targets". |
 | Proceed with unreachable lanes (VALIDATION GAP) | `shipyard run --allow-unreachable-targets` (prints a loud warning; exits 3 without the flag) |
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
@@ -1014,6 +1025,11 @@ the local socket) and cheap to probe from an agent — use it if
 you want to know whether the user has live mode on before
 deciding whether to rely on webhook-speed updates vs polling
 cadence.
+
+A delivery the daemon refuses (HTTP 400/401/404/405 in the hook's
+delivery log) writes one `rejected webhook delivery <guid>` line with
+its event kind, reason, and body bytes received against Content-Length to
+`daemon/daemon.log`, so a refusal is visible on the host.
 
 **Idle behavior (v0.56.0+):** when no IPC subscriber is attached
 (no `shipyard watch` running, no GUI), the daemon skips the
@@ -2108,6 +2124,17 @@ test names are never interpolated into a regex or shell expression. The
 library contract alone does not activate selection: the queue/orchestration
 layer must still snapshot and substitute the immutable plan before bounded
 results can become authoritative.
+
+A provenance fallback (stale base, merge-base mismatch, incomplete diff) still
+binds the digest of the base policy whenever that policy validates, so it
+promotes to an ordinary full-suite disposition and, under `shadow_compare`,
+reaches the stale-base shadow comparison. `promotion_error` with "policy
+digest does not match" therefore means a genuinely different policy; "carries
+no policy digest" means the base policy itself failed validation. When reading
+`changed-surface-results/**/fallback-*` diagnostics, a `full_fallback` line
+names the planner reason after the colon (for example
+`PlannerSelectedFull: TestTopologyChanged`): that reason, not the planner, is
+usually what keeps a repository at zero reduced selections.
 
 ## Cross-PR evidence reuse
 

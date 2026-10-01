@@ -28,7 +28,9 @@ use crate::diagnostics::{
     select_parser,
 };
 use crate::evidence::EvidenceStore;
-use crate::executor::dispatch::{ExecutorDispatcher, ResolvedTarget, resolve_targets};
+use crate::executor::dispatch::{
+    ExecutorDispatcher, ResolvedTarget, opt_in_target_names, resolve_targets,
+};
 use crate::governance::{GovernanceGh, put_branch_protection, resolve_branch_rules};
 use crate::identity::RuntimeMode;
 use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
@@ -81,6 +83,9 @@ pub(super) struct ShipCommandArgs {
     /// Skip the landability gate for this invocation.
     pub(super) skip_landability: bool,
     pub(super) skip_targets: Vec<String>,
+    /// Opt-in targets (`default = false`) to validate in addition to the
+    /// default set.
+    pub(super) targets: Vec<String>,
     /// Adopt the current head SHA when recorded ship-state drifted (amend /
     /// force-push), clearing prior evidence so the new head re-validates
     /// instead of dead-ending on `ShaDrift`. See Shipyard #346.
@@ -166,6 +171,15 @@ pub(super) fn ship_command<W: Write>(
     }
     let lane_policy = resolve_lane_policy(config, cwd);
     let prepush_enabled = args.pr.is_none() && prepush_changed_surface::shadow_enabled(config)?;
+    // The shadow plans and runs nothing, so it chooses its selector policy
+    // from every declared target, opt-in ones included. Restricting it to the
+    // selected set would silence the planner on a repository whose only
+    // policy-bearing target is opt-in.
+    let declared_targets = if prepush_enabled {
+        prepush_policy_targets(config)?
+    } else {
+        Vec::new()
+    };
     let prepush_base = if prepush_enabled {
         match find_pr_for_branch(config, cwd, args.gh_command.as_deref(), &branch) {
             Ok(Some(info)) => Some(info.base),
@@ -189,11 +203,19 @@ pub(super) fn ship_command<W: Write>(
                 &repo,
                 base,
                 &branch,
-                &targets,
+                &declared_targets,
             )
         })?
     } else {
         None
+    };
+    let mut prepush_shadow = match (&prospective_push, prepush_enabled) {
+        (Some(push), _) => PrepushShadow::Planned {
+            target: push.target().to_owned(),
+            receipt_digest: push.receipt_digest().to_owned(),
+        },
+        (None, true) => PrepushShadow::Declined,
+        (None, false) => PrepushShadow::Disabled,
     };
     let pr_context = resolve_pr_context(
         config,
@@ -221,6 +243,7 @@ pub(super) fn ship_command<W: Write>(
         // A pre-push optimization can never prevent or weaken the ordinary
         // downstream full path. Identity/result ambiguity merely declines its
         // future dedupe hint.
+        prepush_shadow = PrepushShadow::Declined;
         if json_mode {
             let _ = crate::writer_domain_lease::write_stderr(format_args!(
                 "warning: pre-push changed-surface receipt not reusable: {}",
@@ -311,6 +334,16 @@ pub(super) fn ship_command<W: Write>(
         json_mode,
         stdout,
     )?;
+
+    if targets.is_empty() {
+        return render_required_checks_delegation(
+            config,
+            pr_context.number,
+            &prepush_shadow,
+            json_mode,
+            stdout,
+        );
+    }
 
     let metadata_authority_receipt = metadata_authority::observe_and_authorize(
         config,
@@ -514,6 +547,114 @@ pub(super) fn ship_command<W: Write>(
     Ok(render_state.exit_code())
 }
 
+/// Targets the pre-push shadow may take its selector policy from: every
+/// declared target, opt-in ones included, never only the selected set.
+fn prepush_policy_targets(config: &LoadedConfig) -> Result<Vec<ResolvedTarget>, CliFailure> {
+    resolve_targets(config, ValidationMode::Full)
+        .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+/// What the pre-push changed-surface shadow did for this ship.
+///
+/// Reported with a delegated ship so "planned, not run" is distinguishable
+/// from "never planned": the shadow plans from the declared targets, opt-in
+/// ones included, even when none of them runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PrepushShadow {
+    /// No trusted shadow mode, or an explicit `--pr` ship.
+    Disabled,
+    /// Enabled, but an observation or verification ambiguity declined it.
+    Declined,
+    /// A prospective selection receipt was written and verified.
+    Planned {
+        target: String,
+        receipt_digest: String,
+    },
+}
+
+impl PrepushShadow {
+    fn line(&self) -> String {
+        match self {
+            Self::Disabled => "pre-push changed-surface shadow: not planned (disabled)".to_owned(),
+            Self::Declined => "pre-push changed-surface shadow: not planned (declined)".to_owned(),
+            Self::Planned {
+                target,
+                receipt_digest,
+            } => format!(
+                "pre-push changed-surface shadow: planned for {target}, not run (receipt {})",
+                receipt_digest.get(..12).unwrap_or(receipt_digest)
+            ),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Disabled => serde_json::json!({"planned": false, "reason": "disabled"}),
+            Self::Declined => serde_json::json!({"planned": false, "reason": "declined"}),
+            Self::Planned {
+                target,
+                receipt_digest,
+            } => serde_json::json!({
+                "planned": true,
+                "target": target,
+                "receipt_digest": receipt_digest,
+            }),
+        }
+    }
+}
+
+/// Report a ship that validates nothing locally because every configured
+/// target is opt-in.
+///
+/// The pull request is already pushed, open and (unless `--no-arm`) armed for
+/// native auto-merge, so the repository's required checks own the verdict. No
+/// job is queued and no ship-state is written: an evidence-free ship-state
+/// reads as in flight to `watch`, and as an orphan to the resume sweep, which
+/// would report a failure that never happened.
+fn render_required_checks_delegation<W: Write>(
+    config: &LoadedConfig,
+    pr: u64,
+    prepush_shadow: &PrepushShadow,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let opt_in = crate::opt_in_targets::from_config(config);
+    if json_mode {
+        write_json_envelope(
+            stdout,
+            "ship",
+            fields([
+                ("pr", Value::from(pr)),
+                ("validation", Value::from("delegated")),
+                (
+                    "verdict_owner",
+                    Value::from(crate::opt_in_targets::VERDICT_OWNER),
+                ),
+                (
+                    "opt_in_targets",
+                    serde_json::to_value(&opt_in)
+                        .map_err(|error| CliFailure::new(1, error.to_string()))?,
+                ),
+                ("prepush_shadow", prepush_shadow.to_json()),
+            ]),
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        writeln!(
+            stdout,
+            "PR #{pr}: no Shipyard target runs by default; validate locally with --target <name>."
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        for target in &opt_in {
+            writeln!(stdout, "  {}", target.line())
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+        writeln!(stdout, "  {}", prepush_shadow.line())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn validate_daemon_ship_submission(
     daemon_owned: bool,
     has_test_merge_override: bool,
@@ -614,14 +755,13 @@ fn prepare_ship_targets<W: Write>(
 ) -> Result<Vec<ResolvedTarget>, CliFailure> {
     let resolved = resolve_targets(config, ValidationMode::Full)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let skipped_targets = skipped_present(&resolved, &args.skip_targets)?;
-    let targets = select_targets(resolved, &args.skip_targets);
-    if targets.is_empty() {
-        return Err(CliFailure::new(
-            2,
-            "No targets remain after --skip-target filtering.",
-        ));
-    }
+    let opt_in =
+        opt_in_target_names(&config.data).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let mut skipped_targets = skipped_present(&resolved, &args.skip_targets)?;
+    // Skipping an opt-in target nobody requested changes nothing, so it is
+    // not reported as a deliberate skip (a validation gap) either.
+    skipped_targets.retain(|name| !opt_in.contains(name) || args.targets.contains(name));
+    let targets = select_targets(resolved, &opt_in, &args.targets, &args.skip_targets)?;
     if !perform_preflight {
         return Ok(targets);
     }
@@ -668,15 +808,64 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
     CliFailure::new(code, error.to_string())
 }
 
-fn select_targets(resolved: Vec<ResolvedTarget>, skip_targets: &[String]) -> Vec<ResolvedTarget> {
+/// Choose the targets a ship validates.
+///
+/// The default set is every resolved target except the opt-in ones
+/// (`default = false`); `--target` adds opt-in targets back and `--skip-target`
+/// removes targets after that. An empty result is returned only when every
+/// target is opt-in and none was requested: the caller then delegates the
+/// verdict to the pull request's required checks. Emptying a non-empty default
+/// set with `--skip-target` stays an error, as it always was.
+fn select_targets(
+    resolved: Vec<ResolvedTarget>,
+    opt_in: &BTreeSet<String>,
+    requested: &[String],
+    skip_targets: &[String],
+) -> Result<Vec<ResolvedTarget>, CliFailure> {
+    let known = resolved
+        .iter()
+        .map(|target| target.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let requested = requested
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if let Some(missing) = requested.iter().find(|name| !known.contains(*name)) {
+        return Err(CliFailure::new(
+            2,
+            format!("--target names no configured target: {missing}"),
+        ));
+    }
     let skip = skip_targets
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    resolved
+    if let Some(both) = requested.intersection(&skip).next() {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "Target '{both}' is both requested with --target and skipped with --skip-target."
+            ),
+        ));
+    }
+    let base = resolved
+        .into_iter()
+        .filter(|target| {
+            requested.contains(target.name.as_str()) || !opt_in.contains(target.name.as_str())
+        })
+        .collect::<Vec<_>>();
+    let base_was_empty = base.is_empty();
+    let selected = base
         .into_iter()
         .filter(|target| !skip.contains(target.name.as_str()))
-        .collect()
+        .collect::<Vec<_>>();
+    if selected.is_empty() && !base_was_empty {
+        return Err(CliFailure::new(
+            2,
+            "No targets remain after --skip-target filtering.",
+        ));
+    }
+    Ok(selected)
 }
 
 fn skipped_present(
@@ -1094,6 +1283,9 @@ fn fields(items: impl IntoIterator<Item = (&'static str, Value)>) -> BTreeMap<St
 #[cfg(test)]
 #[path = "ship_cmd/command_tests.rs"]
 mod command_tests;
+#[cfg(test)]
+#[path = "ship_cmd/opt_in_target_tests.rs"]
+mod opt_in_target_tests;
 #[cfg(test)]
 #[path = "ship_cmd/provenance_tests.rs"]
 mod provenance_tests;

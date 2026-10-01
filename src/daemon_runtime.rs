@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io;
 #[cfg(unix)]
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -1415,6 +1415,11 @@ fn parse_tunnel_enabled(value: Option<&str>) -> bool {
 #[cfg(unix)]
 const WEBHOOK_BODY_LIMIT: usize = 5 * 1024 * 1024;
 #[cfg(unix)]
+const WEBHOOK_HEADER_LIMIT: usize = 64 * 1024;
+/// Upper bound on receiving one whole delivery. GitHub gives up after 10s.
+#[cfg(unix)]
+const WEBHOOK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
 const DELIVERY_DEDUPE_TTL: Duration = Duration::from_mins(5);
 
 #[cfg(unix)]
@@ -1432,15 +1437,25 @@ fn start_webhook_listener(
         while running.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _addr)) => {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                    let response = match read_webhook_request(&mut stream) {
-                        Ok(request) => handle_webhook_request(
-                            &request,
-                            &secret,
-                            &event_sender,
-                            &mut seen_delivery_ids,
-                        ),
-                        Err(response) => response,
+                    let response = match read_webhook_request(&mut stream, WEBHOOK_READ_TIMEOUT) {
+                        Ok(request) => {
+                            let response = handle_webhook_request(
+                                &request,
+                                &secret,
+                                &event_sender,
+                                &mut seen_delivery_ids,
+                            );
+                            if response.status != 200 {
+                                log_rejected_delivery(&WebhookRejection::for_request(
+                                    &request, response,
+                                ));
+                            }
+                            response
+                        }
+                        Err(rejection) => {
+                            log_rejected_delivery(&rejection);
+                            rejection.response
+                        }
                     };
                     let _ = write_http_response(&mut stream, &response);
                 }
@@ -1463,6 +1478,7 @@ struct WebhookRequest {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
 struct HttpResponse {
     status: u16,
     body: &'static str,
@@ -1506,67 +1522,239 @@ impl HttpResponse {
     }
 }
 
+/// How far a delivery got before it was refused; every field lands in the log.
 #[cfg(unix)]
-fn read_webhook_request(stream: &mut TcpStream) -> Result<WebhookRequest, HttpResponse> {
-    let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    if reader
-        .read_line(&mut request_line)
-        .map_err(|_| HttpResponse::bad_request())?
-        == 0
-    {
-        return Err(HttpResponse::bad_request());
-    }
-    let mut parts = request_line.split_whitespace();
-    let Some(method) = parts.next() else {
-        return Err(HttpResponse::bad_request());
-    };
-    let Some(path) = parts.next() else {
-        return Err(HttpResponse::bad_request());
-    };
+#[derive(Debug, Default)]
+struct ReadProgress {
+    /// `X-GitHub-Delivery` GUID, once the headers were read.
+    delivery: Option<String>,
+    /// `X-GitHub-Event` kind, once the headers were read.
+    event: Option<String>,
+    /// Bytes read so far, headers included.
+    received: usize,
+    /// Header block length, once the blank line that ends it was seen.
+    header_bytes: Option<usize>,
+    /// Declared `Content-Length`, once the headers were read.
+    content_length: Option<usize>,
+}
 
+/// A delivery the listener refused, with everything the daemon log records.
+#[cfg(unix)]
+struct WebhookRejection {
+    response: HttpResponse,
+    reason: String,
+    progress: ReadProgress,
+}
+
+#[cfg(unix)]
+impl WebhookRejection {
+    /// A complete request the handler answered with a non-200 status.
+    fn for_request(request: &WebhookRequest, response: HttpResponse) -> Self {
+        let header = |name: &str| request.headers.get(name).cloned();
+        Self {
+            reason: response.body.trim_end().to_owned(),
+            progress: ReadProgress {
+                delivery: header("x-github-delivery"),
+                event: header("x-github-event"),
+                received: request.body.len(),
+                header_bytes: None,
+                content_length: Some(request.body.len()),
+            },
+            response,
+        }
+    }
+
+    fn log_line(&self) -> String {
+        let progress = &self.progress;
+        let bytes = match (progress.header_bytes, progress.content_length) {
+            (Some(header_bytes), Some(length)) => format!(
+                "body {} of {length} bytes",
+                progress.received.saturating_sub(header_bytes).min(length)
+            ),
+            (None, Some(length)) => format!("body {} of {length} bytes", progress.received),
+            _ => format!("{} bytes, headers incomplete", progress.received),
+        };
+        format!(
+            "shipyard daemon: rejected webhook delivery {} ({}) with HTTP {}: {} [{bytes}]",
+            progress.delivery.as_deref().unwrap_or("(unknown)"),
+            progress.event.as_deref().unwrap_or("unknown event"),
+            self.response.status,
+            self.reason,
+        )
+    }
+}
+
+/// One daemon-log line per refused delivery, so a non-200 answer to GitHub is
+/// visible on the host rather than only in the repository's delivery log.
+#[cfg(unix)]
+fn log_rejected_delivery(rejection: &WebhookRejection) {
+    let _ = crate::writer_domain_lease::write_stderr(format_args!("{}", rejection.log_line()));
+}
+
+/// Read one HTTP request, tolerating a request that arrives across many
+/// socket reads (the tunnel forwards headers and body as separate writes).
+///
+/// The stream is forced back to blocking mode first: on macOS and the BSDs an
+/// accepted socket inherits `O_NONBLOCK` from the non-blocking listener, so a
+/// plain read returns `WouldBlock` as soon as the next chunk has not arrived.
+/// The whole request must arrive within `timeout`; the body handed to
+/// signature verification is always exactly `Content-Length` bytes.
+#[cfg(unix)]
+fn read_webhook_request(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> Result<WebhookRequest, Box<WebhookRejection>> {
+    let mut progress = ReadProgress::default();
+    read_webhook_request_tracked(stream, timeout, &mut progress).map_err(|reason| {
+        Box::new(WebhookRejection {
+            response: HttpResponse::bad_request(),
+            reason,
+            progress,
+        })
+    })
+}
+
+#[cfg(unix)]
+fn read_webhook_request_tracked(
+    stream: &mut TcpStream,
+    timeout: Duration,
+    progress: &mut ReadProgress,
+) -> Result<WebhookRequest, String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("socket setup failed: {error}"))?;
+    let deadline = Instant::now() + timeout;
+    let mut buffer = Vec::with_capacity(16 * 1024);
+
+    let header_end = loop {
+        if let Some(end) = find_header_end(&buffer) {
+            break end;
+        }
+        if buffer.len() > WEBHOOK_HEADER_LIMIT {
+            return Err(format!("headers exceed {WEBHOOK_HEADER_LIMIT} bytes"));
+        }
+        let read = read_webhook_chunk(stream, &mut buffer, deadline, timeout, "headers");
+        progress.received = buffer.len();
+        if read? == 0 {
+            return Err("connection closed before the headers ended".to_owned());
+        }
+    };
+    progress.header_bytes = Some(header_end.end);
+
+    let head = std::str::from_utf8(&buffer[..header_end.start])
+        .map_err(|_| "headers are not UTF-8".to_owned())?;
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(path)) = (
+        parts.next().map(str::to_owned),
+        parts.next().map(str::to_owned),
+    ) else {
+        return Err(format!("malformed request line {request_line:?}"));
+    };
     let mut headers = BTreeMap::new();
-    loop {
-        let mut line = String::new();
-        if reader
-            .read_line(&mut line)
-            .map_err(|_| HttpResponse::bad_request())?
-            == 0
-        {
-            return Err(HttpResponse::bad_request());
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
+    for line in lines {
         let Some((name, value)) = line.split_once(':') else {
-            return Err(HttpResponse::bad_request());
+            return Err(format!("malformed header line {line:?}"));
         };
         headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
     }
+    progress.delivery = headers.get("x-github-delivery").cloned();
+    progress.event = headers.get("x-github-event").cloned();
 
-    let length = headers
-        .get("content-length")
-        .map_or(Ok(0), |value| value.parse::<usize>())
-        .map_err(|_| HttpResponse::bad_request())?;
+    if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return Err("chunked transfer encoding is not supported".to_owned());
+    }
+    let length = match headers.get("content-length") {
+        None => 0,
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid Content-Length {value:?}"))?,
+    };
+    progress.content_length = Some(length);
     if length > WEBHOOK_BODY_LIMIT {
-        return Err(HttpResponse::bad_request());
+        return Err(format!(
+            "Content-Length exceeds the {WEBHOOK_BODY_LIMIT}-byte limit"
+        ));
     }
-    let mut body = vec![0_u8; length];
-    if length > 0 {
-        reader
-            .read_exact(&mut body)
-            .map_err(|_| HttpResponse::bad_request())?;
+    let body_start = header_end.end;
+    while buffer.len() < body_start + length {
+        let read = read_webhook_chunk(stream, &mut buffer, deadline, timeout, "body");
+        progress.received = buffer.len();
+        if read? == 0 {
+            return Err("connection closed before the body was complete".to_owned());
+        }
     }
+    buffer.truncate(body_start + length);
+    let body = buffer.split_off(body_start);
 
     Ok(WebhookRequest {
-        method: method.to_owned(),
+        method,
         path: path
             .split_once('?')
-            .map_or(path, |(path, _)| path)
+            .map_or(path.as_str(), |(path, _)| path)
             .to_owned(),
         headers,
         body,
     })
+}
+
+/// Byte range of the blank line that ends the headers (`\r\n\r\n` or `\n\n`).
+#[cfg(unix)]
+fn find_header_end(buffer: &[u8]) -> Option<std::ops::Range<usize>> {
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index..index + 4);
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| index..index + 2);
+    match (crlf, lf) {
+        (Some(crlf), Some(lf)) => Some(if crlf.start < lf.start { crlf } else { lf }),
+        (crlf, lf) => crlf.or(lf),
+    }
+}
+
+/// Append the next chunk from `stream` to `buffer`, waiting no later than
+/// `deadline`. Returns the number of bytes read; zero means the peer closed.
+#[cfg(unix)]
+fn read_webhook_chunk(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    deadline: Instant,
+    timeout: Duration,
+    part: &str,
+) -> Result<usize, String> {
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out after {}ms reading the {part}",
+                timeout.as_millis()
+            ));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| format!("socket setup failed: {error}"))?;
+        match stream.read(&mut chunk) {
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                return Ok(read);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(format!("read error in the {part}: {error}")),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -2779,6 +2967,264 @@ mod tests {
 
         running.store(false, Ordering::Release);
         listener.stop();
+    }
+
+    /// A GitHub `check_run` delivery shaped like the ones the tunnel forwards
+    /// (about 13 KB, the median size of the refused deliveries).
+    #[cfg(unix)]
+    fn check_run_delivery(secret: &str, delivery_id: &str) -> (Vec<u8>, usize) {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "completed",
+            "check_run": {
+                "id": 51_000_000_001_u64,
+                "name": "macos",
+                "head_sha": "a".repeat(40),
+                "status": "completed",
+                "conclusion": "success",
+                "output": {"title": "macos", "summary": "ok", "text": "x".repeat(12 * 1024)},
+                "pull_requests": [{"number": 7700, "head": {"sha": "a".repeat(40)}}],
+            },
+            "repository": {"full_name": "owner/repo", "private": true},
+            "sender": {"login": "github-actions[bot]", "type": "Bot"},
+        }))
+        .expect("payload");
+        let head = format!(
+            "POST /webhook HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: GitHub-Hookshot/319e315\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-GitHub-Delivery: {delivery_id}\r\nX-GitHub-Event: check_run\r\nX-Hub-Signature-256: sha256={}\r\n\r\n",
+            body.len(),
+            hmac_sha256_hex(&body, secret),
+        );
+        let header_bytes = head.len();
+        let mut request = head.into_bytes();
+        request.extend_from_slice(&body);
+        (request, header_bytes)
+    }
+
+    /// Send `request` split at each offset in `splits`, pausing between the
+    /// pieces so each lands in its own read, and return the listener's answer.
+    #[cfg(unix)]
+    fn send_split(port: u16, request: &[u8], splits: &[usize]) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.set_nodelay(true).expect("nodelay");
+        let mut start = 0;
+        for end in splits.iter().copied().chain([request.len()]) {
+            thread::sleep(Duration::from_millis(150));
+            // A server that rejects early closes the socket; keep its response.
+            if stream
+                .write_all(&request[start..end])
+                .and_then(|()| stream.flush())
+                .is_err()
+            {
+                break;
+            }
+            start = end;
+        }
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    #[cfg(unix)]
+    fn assert_split_delivery_accepted(split_at: impl Fn(usize, usize) -> Vec<usize>) {
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let secret = "dev-secret";
+        let listener =
+            super::start_webhook_listener(&running, tx, secret.to_owned()).expect("listener");
+        let (request, header_bytes) = check_run_delivery(secret, "delivery-split");
+
+        let response = send_split(
+            listener.port,
+            &request,
+            &split_at(header_bytes, request.len()),
+        );
+
+        running.store(false, Ordering::Release);
+        listener.stop();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response:?}"
+        );
+        let event = rx.recv_timeout(Duration::from_secs(1)).expect("event");
+        assert_eq!(event["kind"], "check_run");
+        assert_eq!(event["payload"]["pull_request_numbers"][0], 7700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_accepts_delivery_split_inside_the_headers() {
+        assert_split_delivery_accepted(|header_bytes, _| vec![0, 20, header_bytes / 2]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_accepts_delivery_split_between_headers_and_body() {
+        assert_split_delivery_accepted(|header_bytes, _| vec![header_bytes]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_accepts_delivery_split_mid_body() {
+        assert_split_delivery_accepted(|header_bytes, total| {
+            vec![
+                header_bytes + 100,
+                header_bytes + (total - header_bytes) / 2,
+            ]
+        });
+    }
+
+    #[cfg(unix)]
+    fn accepted_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (client, server)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_reader_refuses_a_body_still_short_at_the_deadline() {
+        let (client, mut server) = accepted_pair();
+        let (request, header_bytes) = check_run_delivery("dev-secret", "guid-stalled");
+        let expected = request.len() - header_bytes;
+        // Headers first, then part of the body in a later read, then silence.
+        let writer = thread::spawn(move || {
+            let mut client = client;
+            client.write_all(&request[..header_bytes]).expect("headers");
+            thread::sleep(Duration::from_millis(50));
+            client
+                .write_all(&request[header_bytes..header_bytes + 1000])
+                .expect("body");
+            thread::sleep(Duration::from_millis(600));
+        });
+
+        let started = Instant::now();
+        let Err(rejection) = super::read_webhook_request(&mut server, Duration::from_millis(300))
+        else {
+            panic!("a body short of Content-Length must be refused");
+        };
+        let elapsed = started.elapsed();
+        writer.join().expect("writer");
+
+        assert!(
+            elapsed < Duration::from_millis(550),
+            "deadline not enforced: {elapsed:?}"
+        );
+        assert_eq!(rejection.response.status, 400);
+        let line = rejection.log_line();
+        assert!(line.contains("guid-stalled"), "{line}");
+        assert!(line.contains("(check_run)"), "{line}");
+        assert!(line.contains("timed out"), "{line}");
+        assert!(
+            line.contains(&format!("body 1000 of {expected} bytes")),
+            "{line}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_reader_refuses_a_body_cut_short_by_the_peer() {
+        let (mut client, mut server) = accepted_pair();
+        client
+            .write_all(b"POST /webhook HTTP/1.1\r\nContent-Length: 100\r\nX-GitHub-Delivery: guid-truncated\r\nX-GitHub-Event: workflow_run\r\n\r\nshort")
+            .expect("write");
+        client.shutdown(Shutdown::Write).expect("shutdown");
+
+        let Err(rejection) = super::read_webhook_request(&mut server, Duration::from_secs(5))
+        else {
+            panic!("truncated body must be rejected");
+        };
+
+        assert_eq!(rejection.response.status, 400);
+        assert_eq!(
+            rejection.log_line(),
+            "shipyard daemon: rejected webhook delivery guid-truncated (workflow_run) with HTTP 400: connection closed before the body was complete [body 5 of 100 bytes]"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_reader_names_a_chunked_body_instead_of_a_bad_signature() {
+        let (mut client, mut server) = accepted_pair();
+        client
+            .write_all(b"POST /webhook HTTP/1.1\r\nTransfer-Encoding: chunked\r\nX-GitHub-Delivery: guid-chunked\r\nX-GitHub-Event: check_run\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+            .expect("write");
+
+        let Err(rejection) = super::read_webhook_request(&mut server, Duration::from_secs(5))
+        else {
+            panic!("a chunked body must be refused by the reader");
+        };
+
+        assert_eq!(rejection.response.status, 400);
+        assert!(
+            rejection
+                .log_line()
+                .contains("(check_run) with HTTP 400: chunked transfer encoding is not supported"),
+            "{}",
+            rejection.log_line()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_bad_signature_is_refused_and_logged_with_its_delivery() {
+        let (mut client, mut server) = accepted_pair();
+        let (request, _) = check_run_delivery("the-wrong-secret", "guid-forged");
+        client.write_all(&request).expect("write");
+
+        let request = super::read_webhook_request(&mut server, Duration::from_secs(5))
+            .unwrap_or_else(|rejection| panic!("complete request refused: {}", rejection.reason));
+        let (tx, rx) = mpsc::channel();
+        let response = handle_webhook_request(&request, "dev-secret", &tx, &mut BTreeMap::new());
+
+        assert_eq!(response.status, 401);
+        assert!(rx.try_recv().is_err());
+        let line = WebhookRejection::for_request(&request, response).log_line();
+        assert!(line.contains("guid-forged"), "{line}");
+        assert!(
+            line.contains("(check_run) with HTTP 401: bad signature"),
+            "{line}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn is_nonblocking(stream: &TcpStream) -> bool {
+        let flags = nix::fcntl::fcntl(stream, nix::fcntl::FcntlArg::F_GETFL).expect("F_GETFL");
+        nix::fcntl::OFlag::from_bits_truncate(flags).contains(nix::fcntl::OFlag::O_NONBLOCK)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_reader_waits_in_blocking_mode_on_a_nonblocking_listener() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        let writer = thread::spawn(move || {
+            let mut client = client;
+            thread::sleep(Duration::from_millis(100));
+            client
+                .write_all(b"POST /webhook HTTP/1.1\r\nContent-Length: 2\r\n\r\nok")
+                .expect("write");
+            client
+        });
+
+        let request = super::read_webhook_request(&mut stream, Duration::from_secs(5))
+            .unwrap_or_else(|rejection| panic!("rejected: {}", rejection.reason));
+        drop(writer.join().expect("writer"));
+        assert_eq!(request.body, b"ok");
+        assert!(
+            !is_nonblocking(&stream),
+            "the reader must wait in blocking mode, not spin on WouldBlock"
+        );
     }
 
     #[cfg(unix)]

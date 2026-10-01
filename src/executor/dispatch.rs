@@ -1148,6 +1148,44 @@ pub fn resolve_targets_for_stage(
         .collect()
 }
 
+/// Names of declared targets that are opt-in: `[targets.<name>] default = false`.
+///
+/// An opt-in target is still a declared, fully resolvable target. It is only
+/// left out of the set that `ship`, `pr` and `run` validate when nothing names
+/// it: `--target` / `--targets` on the command line, or the active profile's
+/// `targets` list. An active profile that selects targets is itself an explicit
+/// selection, so this returns an empty set while one is in force.
+///
+/// # Errors
+///
+/// Returns [`DispatchError::MissingTargets`] when the config has no `[targets]`
+/// table, or [`DispatchError::InvalidTargetConfig`] when `default` is present
+/// but not a boolean.
+pub fn opt_in_target_names(
+    data: &Table,
+) -> Result<std::collections::BTreeSet<String>, DispatchError> {
+    let targets = data
+        .get("targets")
+        .and_then(Value::as_table)
+        .ok_or(DispatchError::MissingTargets)?;
+    let mut opt_in = std::collections::BTreeSet::new();
+    for (name, value) in targets {
+        let Some(default) = value.as_table().and_then(|table| table.get("default")) else {
+            continue;
+        };
+        let default = default
+            .as_bool()
+            .ok_or_else(|| invalid_target(name, "`default` must be a boolean".to_owned()))?;
+        if !default {
+            opt_in.insert(name.clone());
+        }
+    }
+    if active_profile_selection(data, None).is_some() {
+        opt_in.clear();
+    }
+    Ok(opt_in)
+}
+
 /// A target selection contributed by the active profile.
 struct ProfileSelection {
     profile: String,

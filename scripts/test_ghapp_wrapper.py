@@ -2355,7 +2355,8 @@ class GhappWrapperTests(unittest.TestCase):
         result = self.run_wrapper("api", "orgs/Generous-Corp/actions/runners")
 
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, "partial-stdout\n")
+        self.assertEqual(result.stdout, "")
+        self.assertIn("partial-stdout", result.stderr)
         self.assertIn(native, result.stderr)
         self.assertIn(
             "ghapp: token was minted for installation covering danielraffel/tartci "
@@ -2526,6 +2527,43 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertEqual(marker.read_text().strip(), "term")
         self.assertFalse(capture.exists(), "capture file must not outlive ghapp")
 
+    def test_failed_api_call_sends_its_error_body_to_stderr(self) -> None:
+        # Native gh prints the error body on stdout; a caller that reads stdout
+        # before the exit code would count `{"message":"Not Found"}` as data.
+        body = '{"message":"Not Found","status":"404"}'
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "[ \"${GH_TOKEN:-}\" = ghs_private_fixture ] || exit 92\n"
+            f"printf '%s\\n' '{body}'\n"
+            "printf 'gh: Not Found (HTTP 404)\\n' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/pulls/999999")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(body, result.stderr)
+        self.assertIn("gh: Not Found (HTTP 404)", result.stderr)
+
+    def test_successful_api_call_keeps_its_body_on_stdout(self) -> None:
+        # Control for the test above: the same fixture shape, exit 0.
+        body = '{"number":7}'
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "[ \"${GH_TOKEN:-}\" = ghs_private_fixture ] || exit 92\n"
+            f"printf '%s\\n' '{body}'\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/pulls/7")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, body + "\n")
+        self.assertNotIn(body, result.stderr)
+
     def test_unrelated_api_failure_is_passed_through_unannotated(self) -> None:
         native = "gh: Bad credentials (HTTP 401)"
         self.fail_gh_with(native, 3)
@@ -2533,7 +2571,10 @@ class GhappWrapperTests(unittest.TestCase):
         result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
 
         self.assertEqual(result.returncode, 3)
-        self.assertEqual(result.stderr.strip(), native)
+        # The failed call's stdout body moves to stderr ahead of gh's own
+        # message; nothing else is added.
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.strip(), f"partial-stdout\n{native}")
 
     def test_non_api_commands_are_not_annotated(self) -> None:
         self.environment["GH_REPO"] = "danielraffel/tartci"

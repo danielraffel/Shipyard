@@ -168,6 +168,7 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         surfaces,
         warnings,
         api_calls,
+        opt_in_targets: Vec::new(),
     }
 }
 

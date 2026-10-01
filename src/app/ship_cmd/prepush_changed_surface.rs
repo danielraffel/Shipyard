@@ -125,6 +125,16 @@ pub(super) struct ProspectivePush {
 }
 
 impl ProspectivePush {
+    /// Target whose protected selector policy produced this receipt.
+    pub(super) fn target(&self) -> &str {
+        &self.receipt.target
+    }
+
+    /// Digest of the persisted receipt.
+    pub(super) fn receipt_digest(&self) -> &str {
+        &self.receipt_digest
+    }
+
     pub(super) fn environment(&self) -> Vec<(OsString, OsString)> {
         let mut environment = vec![
             (

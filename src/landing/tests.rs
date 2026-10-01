@@ -789,3 +789,21 @@ fn every_consulted_surface_appears_in_the_report() {
         "a verdict with no provenance is indistinguishable from a guess"
     );
 }
+
+#[test]
+fn landing_names_opt_in_targets_and_omits_the_section_without_them() {
+    let targets = crate::opt_in_targets::from_table(
+        &"[targets.mac]\nbackend = \"local\"\ndefault = false\n"
+            .parse::<toml::Table>()
+            .expect("config TOML"),
+    );
+    let mut out = Vec::new();
+    crate::landing::render::write_opt_in_targets(&mut out, &targets).expect("render");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.starts_with("LOCAL SHIPYARD TARGETS\n"), "{text}");
+    assert!(text.contains("  mac: opt-in, not run (GitHub required checks decide)"));
+
+    let mut empty = Vec::new();
+    crate::landing::render::write_opt_in_targets(&mut empty, &[]).expect("render");
+    assert!(empty.is_empty());
+}

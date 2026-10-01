@@ -115,6 +115,9 @@ pub(super) struct TagAttempts {
     /// Why the tag is no longer retried.
     #[serde(default)]
     pub(super) terminal: Option<String>,
+    /// How the last attempt ended (`verified`, or `failed: <reason>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) last_outcome: Option<String>,
 }
 
 /// Persisted attempt ledger, keyed by tag.
@@ -333,6 +336,38 @@ pub(super) fn withdraw_attempt(
         }
     }
     write_ledger(state_dir, &ledger)
+}
+
+/// Record how the attempt at `tag` ended, so a ledger entry says whether the
+/// rollout verified or failed instead of only that it was tried.
+pub(super) fn record_outcome(state_dir: &Path, tag: &str, outcome: &str) -> Result<(), String> {
+    update_ledger(state_dir, |ledger| {
+        ledger.tags.entry(tag.to_owned()).or_default().last_outcome = Some(outcome.to_owned());
+    })
+}
+
+/// Close every tag older than `latest` that never reached a verified rollout.
+/// Reconcile only ever targets the latest release, so a failed attempt at an
+/// older tag is never retried; left open it reads as a rollout in progress.
+pub(super) fn retire_superseded(state_dir: &Path, latest: &str) -> Result<(), String> {
+    let Some(latest_version) = parse_version(latest) else {
+        return Ok(());
+    };
+    update_ledger(state_dir, |ledger| {
+        for (tag, entry) in &mut ledger.tags {
+            let older = parse_version(tag).is_some_and(|version| version < latest_version);
+            let verified = entry.last_outcome.as_deref() == Some("verified");
+            if older && !verified && entry.terminal.is_none() {
+                let last = entry
+                    .last_outcome
+                    .as_deref()
+                    .unwrap_or("outcome not recorded");
+                entry.terminal = Some(format!(
+                    "superseded by {latest} without a verified rollout (last attempt: {last})"
+                ));
+            }
+        }
+    })
 }
 
 /// Stop retrying a tag.
@@ -762,8 +797,28 @@ fn rollout<E: ReconcileEnv>(
         }
     };
     report.attempt = Some(attempt);
+    // Rolling out this tag means no older one will be retried: close those
+    // here, where the ledger is being written anyway, so an idle tick still
+    // writes nothing.
+    if let Err(error) = retire_superseded(state_dir, tag) {
+        report
+            .alerts
+            .push(format!("could not close superseded tags: {error}"));
+    }
     let outcome = env.rollout(tag, lagging);
     report.rollout = Some(outcome.clone());
+    let recorded = match &outcome {
+        RolloutOutcome::Verified => Some("verified".to_owned()),
+        RolloutOutcome::Failed { reason } => Some(format!("failed: {reason}")),
+        _ => None,
+    };
+    if let Some(recorded) = recorded
+        && let Err(error) = record_outcome(state_dir, tag, &recorded)
+    {
+        report
+            .alerts
+            .push(format!("could not record the rollout outcome: {error}"));
+    }
     let terminal = match &outcome {
         RolloutOutcome::Verified => return 0,
         RolloutOutcome::Deferred { .. } => {
@@ -1356,6 +1411,47 @@ mod tests {
             read_ledger(temp.path()).expect("ledger").tags["v0.208.0"],
             recorded
         );
+    }
+
+    #[test]
+    fn a_failed_tag_becomes_terminal_once_a_newer_release_supersedes_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let start = Utc::now();
+        let mut env = FakeEnv::new(start, &[("m1", "0.208.0"), ("m5", "0.205.0")], failed());
+        let first = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(first.exit_code, 1);
+        let entry = read_ledger(temp.path()).expect("ledger").tags["v0.208.0"].clone();
+        assert!(
+            entry
+                .last_outcome
+                .as_deref()
+                .is_some_and(|o| o.starts_with("failed: ")),
+            "{entry:?}"
+        );
+        assert!(
+            entry.terminal.is_none(),
+            "still retryable while it is the latest"
+        );
+
+        // A newer release lands and rolls out cleanly: the failed older tag is
+        // never retried again, so it must stop reading as open.
+        env.latest = Ok(release("v0.209.0", 120, start));
+        env.outcome = RolloutOutcome::Verified;
+        env.now = start + chrono::Duration::hours(1);
+        let next = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(next.exit_code, 0, "{:?}", next.decision);
+        let ledger = read_ledger(temp.path()).expect("ledger");
+        let old = &ledger.tags["v0.208.0"];
+        assert!(
+            old.terminal
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("superseded by v0.209.0")
+                    && reason.contains("failed: ")),
+            "{old:?}"
+        );
+        let new = &ledger.tags["v0.209.0"];
+        assert_eq!(new.last_outcome.as_deref(), Some("verified"));
+        assert!(new.terminal.is_none());
     }
 
     #[test]
