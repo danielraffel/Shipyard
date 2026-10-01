@@ -3023,6 +3023,51 @@ mod tests {
         response
     }
 
+    /// Send one whole request and return the answer, or "" if none came back
+    /// within the timeout.
+    #[cfg(unix)]
+    fn send_with_timeout(port: u16, request: &[u8], timeout: Duration) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.set_read_timeout(Some(timeout)).expect("timeout");
+        let _ = stream.write_all(request);
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_keeps_serving_after_logging_a_refusal_while_stderr_is_locked() {
+        // The daemon's dispatcher holds the stderr lock for its whole run.
+        let held = std::io::stderr().lock();
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let secret = "dev-secret";
+        let listener =
+            super::start_webhook_listener(&running, tx, secret.to_owned()).expect("listener");
+        let (forged, _) = check_run_delivery("the-wrong-secret", "guid-forged-first");
+        let (genuine, _) = check_run_delivery(secret, "guid-genuine-second");
+
+        let refused = send_with_timeout(listener.port, &forged, Duration::from_secs(3));
+        let accepted = send_with_timeout(listener.port, &genuine, Duration::from_secs(3));
+        drop(held);
+
+        running.store(false, Ordering::Release);
+        listener.stop();
+        assert!(
+            refused.starts_with("HTTP/1.1 401"),
+            "unexpected: {refused:?}"
+        );
+        assert!(
+            accepted.starts_with("HTTP/1.1 200 OK"),
+            "listener stopped answering after a refusal: {accepted:?}"
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("event")["kind"],
+            "check_run"
+        );
+    }
+
     #[cfg(unix)]
     fn assert_split_delivery_accepted(split_at: impl Fn(usize, usize) -> Vec<usize>) {
         let running = Arc::new(AtomicBool::new(true));
