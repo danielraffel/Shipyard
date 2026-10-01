@@ -338,8 +338,15 @@ fn racing_clear_cannot_pass_record_and_witness_publication() {
     )
     .expect("publish witness");
     drop(publication_lease);
+    // The ordering claim is made above (clear waited while the lease was held)
+    // and below (the final state). How quickly clear then finishes is a
+    // property of the runner's disk, not of the fence: on a loaded Windows
+    // runner the supersede and witness removal it performs after the lease
+    // drops outlasted the former two-second budget. Clear is bounded by its own
+    // lease deadline plus finite store writes, so this ceiling only guards a
+    // genuine hang.
     done_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(Duration::from_secs(120))
         .expect("clear completed")
         .expect("clear result");
     clear.join().expect("clear thread");
