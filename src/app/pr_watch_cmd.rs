@@ -39,6 +39,9 @@ pub(super) fn pr_watch_command<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let watch = WatchConfig::from_config(config)
         .map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, format!("[pr_watch]: {error}")))?;
+    for warning in &watch.warnings {
+        eprintln!("warning: {warning}");
+    }
     match command {
         PrWatchCommand::Scan(args) => {
             scan_command(args, watch, config, cwd, runtime_paths, json, stdout)
