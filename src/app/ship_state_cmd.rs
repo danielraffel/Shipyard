@@ -5,6 +5,7 @@ use chrono::Utc;
 use serde_json::Value;
 
 use crate::identity::RuntimeMode;
+use crate::opt_in_targets::OptInTarget;
 use crate::output::write_json_envelope;
 use crate::reconcile::{
     ReconcileFetchError, fetch_status_check_rollup_with_cwd, reconcile_ship_state,
@@ -63,6 +64,7 @@ fn classify_states(
 fn write_list_json<W: Write>(
     states: &[ShipState],
     findings: &[Option<LivenessFinding>],
+    opt_in: &[OptInTarget],
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut orphaned = Vec::new();
@@ -95,7 +97,27 @@ fn write_list_json<W: Write>(
     data.insert("states".to_owned(), serde_json::to_value(states)?);
     data.insert("orphaned".to_owned(), Value::Array(orphaned));
     data.insert("resolved".to_owned(), Value::Array(resolved));
+    data.insert("opt_in_targets".to_owned(), serde_json::to_value(opt_in)?);
     write_json_envelope(stdout, "ship-state:list", data)
+}
+
+/// Name every opt-in target before the records, so a pull request with no
+/// ship-state reads as "the lane is opt-in" rather than as a lane that broke.
+fn write_opt_in_note<W: Write>(
+    opt_in: &[OptInTarget],
+    stdout: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if opt_in.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        stdout,
+        "Opt-in targets (no ship-state is written for a ship that runs none of them):"
+    )?;
+    for target in opt_in {
+        writeln!(stdout, "  {}", target.line())?;
+    }
+    Ok(())
 }
 
 /// Writes the operator-facing note under one record.
@@ -152,6 +174,7 @@ pub(super) fn ship_state_list<W: Write>(
     store: &ShipStateStore,
     liveness: &LivenessContext<'_>,
     lifecycle_of: PrLifecycleReader<'_>,
+    opt_in: &[OptInTarget],
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -159,8 +182,9 @@ pub(super) fn ship_state_list<W: Write>(
     let now = Utc::now();
     let findings = classify_states(&states, liveness, lifecycle_of, now);
     if json {
-        return write_list_json(&states, &findings, stdout);
+        return write_list_json(&states, &findings, opt_in, stdout);
     }
+    write_opt_in_note(opt_in, stdout)?;
     if states.is_empty() {
         writeln!(stdout, "No active ship state.")?;
         return Ok(());
@@ -202,12 +226,24 @@ pub(super) fn ship_state_show<W: Write>(
     store: &ShipStateStore,
     repository: Option<&str>,
     pr: u64,
+    opt_in: &[OptInTarget],
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(state) = repository.map_or_else(|| store.get(pr), |repo| store.get_scoped(repo, pr))
     else {
-        return Err(format!("No ship state for PR #{pr}").into());
+        if opt_in.is_empty() {
+            return Err(format!("No ship state for PR #{pr}").into());
+        }
+        let lines = opt_in
+            .iter()
+            .map(OptInTarget::line)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "No ship state for PR #{pr}. Expected when no target was requested: {lines}"
+        )
+        .into());
     };
 
     if json {
@@ -515,6 +551,72 @@ mod tests {
         }
     }
 
+    fn mac_opt_in() -> Vec<crate::opt_in_targets::OptInTarget> {
+        crate::opt_in_targets::from_table(
+            &"[targets.mac]\nbackend = \"local\"\ndefault = false\n"
+                .parse::<toml::Table>()
+                .expect("config TOML"),
+        )
+    }
+
+    #[test]
+    fn list_names_opt_in_targets_so_an_empty_store_is_not_a_broken_lane() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let opt_in = mac_opt_in();
+
+        let mut out = Vec::new();
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut unknown_lifecycle(),
+            &opt_in,
+            false,
+            &mut out,
+        )
+        .expect("list should render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("  mac: opt-in, not run (GitHub required checks decide)"),
+            "{text}"
+        );
+        assert!(text.contains("No active ship state."));
+
+        let mut out = Vec::new();
+        ship_state_list(
+            &store,
+            &time_ctx(),
+            &mut unknown_lifecycle(),
+            &opt_in,
+            true,
+            &mut out,
+        )
+        .expect("list should render");
+        let payload: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(payload["opt_in_targets"][0]["name"], "mac");
+        assert_eq!(payload["opt_in_targets"][0]["status"], "opt-in, not run");
+    }
+
+    #[test]
+    fn show_explains_a_missing_state_when_targets_are_opt_in() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let mut out = Vec::new();
+
+        let err = ship_state_show(&store, None, 88, &mac_opt_in(), false, &mut out)
+            .expect_err("missing state");
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("No ship state for PR #88."),
+            "{message}"
+        );
+        assert!(
+            message.contains("mac: opt-in, not run (GitHub required checks decide)"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn list_human_reports_empty_store() {
         let temp = TempDir::new().expect("tempdir");
@@ -525,6 +627,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut unknown_lifecycle(),
+            &[],
             false,
             &mut out,
         )
@@ -551,6 +654,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut unknown_lifecycle(),
+            &[],
             false,
             &mut out,
         )
@@ -582,6 +686,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut unknown_lifecycle(),
+            &[],
             true,
             &mut out,
         )
@@ -614,6 +719,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut unknown_lifecycle(),
+            &[],
             true,
             &mut out,
         )
@@ -641,6 +747,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut unknown_lifecycle(),
+            &[],
             false,
             &mut out,
         )
@@ -675,6 +782,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut fixed_lifecycle(PrLifecycle::Merged, &mut asked),
+            &[],
             false,
             &mut out,
         )
@@ -719,6 +827,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut fixed_lifecycle(PrLifecycle::Open, &mut asked),
+            &[],
             false,
             &mut out,
         )
@@ -756,6 +865,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut unknown_lifecycle(),
+            &[],
             false,
             &mut out,
         )
@@ -794,6 +904,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut fixed_lifecycle(PrLifecycle::Merged, &mut asked),
+            &[],
             true,
             &mut out,
         )
@@ -834,6 +945,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut fixed_lifecycle(PrLifecycle::Closed, &mut asked),
+            &[],
             false,
             &mut out,
         )
@@ -862,6 +974,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut fixed_lifecycle(PrLifecycle::Merged, &mut asked),
+            &[],
             true,
             &mut out,
         )
@@ -905,6 +1018,7 @@ mod tests {
             &store,
             &time_ctx(),
             &mut fixed_lifecycle(PrLifecycle::Merged, &mut asked),
+            &[],
             false,
             &mut out,
         )
@@ -926,7 +1040,7 @@ mod tests {
         store.save(&state).expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_show(&store, None, 7, false, &mut out).expect("show should render");
+        ship_state_show(&store, None, 7, &[], false, &mut out).expect("show should render");
 
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("PR #7  attempt 1"));
@@ -948,7 +1062,7 @@ mod tests {
         store.save(&state).expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_show(&store, None, 12, true, &mut out).expect("show should render");
+        ship_state_show(&store, None, 12, &[], true, &mut out).expect("show should render");
 
         let payload: Value = serde_json::from_slice(&out).expect("json payload");
         assert_eq!(payload["command"], "ship-state:show");
@@ -964,7 +1078,8 @@ mod tests {
         let store = store(&temp);
         let mut out = Vec::new();
 
-        let err = ship_state_show(&store, None, 404, false, &mut out).expect_err("missing state");
+        let err =
+            ship_state_show(&store, None, 404, &[], false, &mut out).expect_err("missing state");
 
         assert_eq!(err.to_string(), "No ship state for PR #404");
         assert!(out.is_empty());
@@ -996,7 +1111,7 @@ mod tests {
             .expect("forge state");
         let mut out = Vec::new();
 
-        ship_state_show(&store, Some("OWNER/FORGE"), 7, true, &mut out).expect("scoped show");
+        ship_state_show(&store, Some("OWNER/FORGE"), 7, &[], true, &mut out).expect("scoped show");
 
         let value: Value = serde_json::from_slice(&out).expect("json");
         assert_eq!(value["repo"], "owner/forge");

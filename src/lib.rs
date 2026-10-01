@@ -154,6 +154,8 @@ pub mod metadata_authority;
 /// Runner and CI timing metrics store and analysis helpers.
 pub mod metrics;
 mod native_executable;
+/// Opt-in targets (`default = false`) as a reported fact on every surface.
+pub mod opt_in_targets;
 /// Structured JSON output helpers.
 pub mod output;
 /// Shadow-only build-once and sharded-test proof invariants.

@@ -498,3 +498,24 @@ fn run(command: &mut Command) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn an_opt_in_target_still_supplies_the_shadow_selector_policy() {
+    let config = "[targets.mac]\nbackend = 'local'\nplatform = 'macos-arm64'\ndefault = false\n\
+                  [targets.mac.changed_surface_selection]\nschema_version = 3\n"
+        .parse::<toml::Table>()
+        .expect("config");
+    let declared = crate::executor::dispatch::resolve_targets_from_table(
+        &config,
+        crate::job::ValidationMode::Full,
+    )
+    .expect("declared targets");
+    let protected = toml::to_string(&config).expect("protected config");
+    // The shadow plans from the declared set, so an opt-in target's policy is
+    // found even though a plain ship selects no target at all.
+    assert_eq!(
+        unique_policy_target(&protected, &declared),
+        Some("mac".to_owned())
+    );
+    assert_eq!(unique_policy_target(&protected, &[]), None);
+}

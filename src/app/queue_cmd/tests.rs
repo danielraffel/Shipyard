@@ -815,3 +815,50 @@ fn logs_json_distinguishes_terminal_without_log_missing_job_and_invalid_target()
     assert_eq!(invalid["observation"], "invalid_target");
     assert_eq!(invalid["terminal"], true);
 }
+
+fn opt_in_status_config(default_line: &str) -> crate::config::LoadedConfig {
+    let data = format!(
+        "[targets.linux]\nbackend = \"ssh\"\nplatform = \"linux-x64\"\nrepo_path = \"/srv/repo\"\n{default_line}\n"
+    )
+    .parse::<toml::Table>()
+    .expect("config TOML");
+    crate::config::LoadedConfig {
+        data,
+        global_dir: PathBuf::from("/nonexistent-global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: crate::config::LocalOverlaySource::None,
+    }
+}
+
+#[test]
+fn status_names_an_opt_in_target_instead_of_probing_it() {
+    let rows = super::target_statuses(&opt_in_status_config("default = false")).expect("rows");
+    let row = &rows["linux"];
+    assert_eq!(row.reachable, None, "an opt-in target is never probed");
+    assert_eq!(row.status, Some("opt-in, not run"));
+    let json = serde_json::to_value(row).expect("json");
+    assert!(json.get("reachable").is_none());
+    assert_eq!(json["verdict_owner"], "required-checks");
+
+    let mut out = Vec::new();
+    super::write_status_human(&mut out, 0, 0, &[], &rows, &[]).expect("render");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains("  linux: opt-in, not run (GitHub required checks decide)"),
+        "{text}"
+    );
+    assert!(!text.contains("reachable="), "{text}");
+}
+
+#[test]
+fn status_still_probes_a_default_target() {
+    let rows = super::target_statuses(&opt_in_status_config("")).expect("rows");
+    let row = &rows["linux"];
+    assert_eq!(
+        row.reachable,
+        Some(false),
+        "a hostless ssh target probes unreachable"
+    );
+    assert_eq!(row.status, None);
+}

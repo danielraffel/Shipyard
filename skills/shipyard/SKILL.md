@@ -61,6 +61,20 @@ reasons, and they need opposite responses:
 the external daemon-health watchdog to clear token caches every five minutes
 against a credential that was working fine.
 
+## A webhook 400 is the receiver, and it is logged
+
+The daemon answers a delivery it cannot read with `400 bad request`. An
+accepted socket inherits `O_NONBLOCK` from the non-blocking listener on macOS,
+so a reader that trusts `set_read_timeout` refuses any delivery the tunnel
+forwards in more than one write (headers and body usually arrive separately).
+`read_webhook_request` therefore switches the stream back to blocking mode and
+reads to the end of the headers, then exactly `Content-Length` bytes, under one
+deadline. Every refused delivery writes one `rejected webhook delivery <guid>
+(<event>) with HTTP <status>: <reason> [body <received> of <Content-Length>
+bytes]` line to `daemon/daemon.log`; match that GUID
+against the repository's hook delivery log. A quiet `daemon.log` is normal on a
+healthy host: registration failures were the only other routine writer.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.
@@ -211,6 +225,16 @@ Its source is `scripts/ghapp_merge_guard.sh`, its test
 `scripts/test_ghapp_merge_guard.py` (CI's Python helper tests), and it is a
 managed guard, so `shipyard guards install` places the tested copy and
 `guards status` reports a drifted one.
+## fleet-reconcile ledger: every attempt says how it ended
+
+`fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
+`failed: <reason>`) for each rollout. Reconcile only ever targets the latest
+release, so a failed older tag is never retried; when a newer tag rolls out,
+every older tag without a verified rollout gets `terminal: "superseded by
+<tag> without a verified rollout (last attempt: ...)"`. Entries written before
+this carry no `last_outcome` and close as "outcome not recorded". The close
+happens inside a rollout, never on an idle tick, which still writes nothing.
+
 ## A missing key is not an empty list
 
 `validation_signals` reads a merge group's check runs page by page. A page
@@ -450,6 +474,16 @@ Owners not live for `unowned_after_hours` are marked unowned on the digest line.
 `--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
 daemon delivers when that is on. It never types into a session (no
 `cmux send`), never resumes or starts an agent, and never arms or dequeues.
+
+A target with `default = false` is opt-in: `pr`, `ship` and `run` leave it out
+unless `--target <name>` (`--targets` for run) or the active profile names it.
+When every target is opt-in, `pr`/`ship` push, open and arm auto-merge but queue
+no job and write no ship-state; the JSON reports `validation: "delegated"`,
+`verdict_owner: "required-checks"`. Do not read the missing ship-state as a
+failure or an orphan: `status`, `ship-state list/show`, `landing` and `doctor`
+all print `<name>: opt-in, not run (GitHub required checks decide)` for it, and
+it is never probed, counted in landability, or reported as a validation gap
+unless requested. See [`docs/targets.md`](../../docs/targets.md).
 
 Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
 --target <name>` for the shadow-only exact-head selector. Policy must come from
@@ -1019,6 +1053,16 @@ rejects missing, malformed, aliased, or case-confused identities before
 execution, ignores tracked attempts to supply values, and snapshots resolved
 values only under its protected machine state for daemon-owned work. Never use
 this table for credentials or signing material.
+
+## A failed `ghapp api` call has an empty stdout
+
+Native `gh api` prints the error body (`{"message":"Not Found",...}`) on stdout
+and exits non-zero, so `n=$(ghapp api ... --jq ...)` in a script that does not
+check the exit code counted a 404 as one row of data. The wrapper now captures
+`api` stdout and, on a non-zero exit, writes it to stderr instead: a failed
+call's stdout is always empty, a successful call's is unchanged. Check the exit
+code anyway; read the error body from stderr, never from stdout. The fallback
+when the caller closed stderr (`2>&-`) still execs native gh unchanged.
 
 ## GitHub Auth And Quota
 

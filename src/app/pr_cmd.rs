@@ -36,6 +36,8 @@ pub(super) struct PrCommandArgs {
     /// The author intends a stacked pull request against a non-default base.
     pub(super) stacked: bool,
     pub(super) skip_targets: Vec<String>,
+    /// Opt-in targets to validate in addition to the default set.
+    pub(super) targets: Vec<String>,
     pub(super) skip_bump: Vec<String>,
     pub(super) bump_reason: Option<String>,
     pub(super) skip_skill_update: Vec<String>,
@@ -325,6 +327,7 @@ pub(super) fn pr_command<W: Write>(
             allow_unreachable_triggers: args.allow_unreachable_triggers.clone(),
             skip_landability: args.skip_landability,
             skip_targets: args.skip_targets,
+            targets: args.targets,
             adopt_head: args.adopt_head,
             steward_handoff,
             invocation: ShipInvocation::PrCommand,
@@ -848,6 +851,7 @@ mod tests {
             skip_landability: false,
             stacked: false,
             skip_targets: Vec::new(),
+            targets: Vec::new(),
             skip_bump: Vec::new(),
             bump_reason: None,
             skip_skill_update: Vec::new(),

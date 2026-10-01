@@ -130,6 +130,81 @@ fallback = [
 This keeps things predictable. You always know exactly what Shipyard will
 do because you configured it.
 
+## Opt-in targets (`default = false`)
+
+A target can be declared but left out of ordinary validation. Set
+`default = false` on it, and `shipyard pr`, `shipyard ship` and `shipyard run`
+skip it unless something names it:
+
+```toml
+[targets.mac]
+backend = "local"
+platform = "macos-arm64"
+default = false   # validated only on request
+```
+
+Name it to validate it:
+
+```sh
+shipyard pr --target mac          # default set plus mac (repeatable)
+shipyard ship --pr 42 --target mac
+shipyard run --targets mac        # run takes an explicit list
+```
+
+An active profile whose `targets` list names the target also selects it; a
+profile selection is explicit, so `default` does not apply while one is in
+force. The recipe, timeouts and overrides of an opt-in target are unchanged,
+and `default` must be a boolean when present.
+
+Use this when a repository's required GitHub checks already decide whether a
+pull request lands and a local lane only duplicates them, but you still want
+that lane one flag away.
+
+**When every target is opt-in**, `shipyard pr` and `shipyard ship` still push
+the branch, open or find the pull request, and arm native auto-merge (unless
+`--no-arm`). They queue no validation job and write no ship-state, because an
+evidence-free ship-state reads as in flight to `watch` and as an orphan to the
+resume sweep. Instead they report that the pull request's required checks own
+the verdict:
+
+```json
+{"command": "ship", "pr": 88, "validation": "delegated",
+ "verdict_owner": "required-checks", "opt_in_targets": ["mac"]}
+```
+
+The pre-push changed-surface shadow (trusted
+`[changed_surface_prepush] mode = "shadow_compare"`) still runs on such a ship:
+it plans and runs nothing, so it takes its selector policy from every declared
+target, opt-in ones included. The delegated output says which happened, as
+`prepush_shadow` (`planned` with the target and receipt digest, or
+`not planned` with `disabled` or `declined`), so "planned, not run" is never
+confused with "not planned".
+
+Wait on the outcome with `shipyard wait pr <n>` or GitHub itself.
+`shipyard run` has nothing to delegate to, so with only opt-in targets and no
+`--targets` it exits 2 and asks for one.
+
+**An opt-in target is reported, never silently absent.** Every surface that
+lists targets or explains a verdict names it with the same line:
+
+```
+mac: opt-in, not run (GitHub required checks decide)
+```
+
+`shipyard status` prints it in place of `reachable=` (JSON: `status`,
+`verdict_owner`, no `reachable`), `shipyard ship-state list` prints it above the
+records (JSON: `opt_in_targets`), `shipyard ship-state show <pr>` names it when
+a PR has no ship-state, `shipyard landing` has a `LOCAL SHIPYARD TARGETS`
+section (JSON: `opt_in_targets`), and `shipyard doctor` shows it as a Runners
+row. Unless it is requested, an opt-in target is never probed, never counted
+as a Shipyard-derived required context in landability, and never reported as a
+deliberate skip or validation gap, including when `--skip-target` names it.
+
+`--skip-target` keeps its meaning: skipping every **default** target is still
+an error (exit 2, "No targets remain after --skip-target filtering."). A
+`--target` that names no configured target, or a name passed to both
+`--target` and `--skip-target`, also exits 2.
+
 ## Prefer a Mac Studio with local fallback
 
 For a two-Mac setup, make the network Mac the primary target and this Mac the

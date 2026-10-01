@@ -614,7 +614,12 @@ pub fn plan_selection(
     let changed_paths = normalized_paths(&input.remote_changed_paths);
     let receipt = base_receipt(input, changed_paths.clone());
     if let Some(reason) = provenance_fallback(input, &changed_paths) {
-        return Ok(fallback(receipt, None, reason, None));
+        // A provenance fallback never consults the selector, but a valid
+        // base policy still governed the decision. Binding its digest lets
+        // promotion tell "same policy, full suite" from a genuinely foreign
+        // policy instead of refusing every stale-base receipt as a mismatch.
+        let policy = validated_policy(policy).ok();
+        return Ok(fallback(receipt, policy.as_ref(), reason, None));
     }
     plan_with_policy(receipt, policy, &changed_paths, input)
 }

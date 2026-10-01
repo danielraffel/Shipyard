@@ -525,6 +525,11 @@ pub fn shipyard_required_contexts(
         let Some(table) = value.as_table() else {
             continue;
         };
+        // An opt-in target is not something Shipyard waits for, so its
+        // workflow is never a Shipyard-derived required context.
+        if crate::opt_in_targets::is_opt_in(&config.data, name) {
+            continue;
+        }
         let platform = table
             .get("platform")
             .and_then(toml::Value::as_str)

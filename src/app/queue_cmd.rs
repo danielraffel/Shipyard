@@ -629,7 +629,16 @@ pub(super) fn queue_command<W: Write>(
 #[derive(serde::Serialize)]
 struct TargetStatusRow {
     backend: String,
-    reachable: bool,
+    /// Absent for an opt-in target: it is never probed, so there is no
+    /// reachability to report, and `false` would read as a broken lane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reachable: Option<bool>,
+    /// `opt-in, not run` for a `default = false` target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'static str>,
+    /// `required-checks` for a `default = false` target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verdict_owner: Option<&'static str>,
 }
 
 fn target_statuses(config: &LoadedConfig) -> Result<BTreeMap<String, TargetStatusRow>, CliFailure> {
@@ -642,11 +651,14 @@ fn target_statuses(config: &LoadedConfig) -> Result<BTreeMap<String, TargetStatu
     Ok(targets
         .into_iter()
         .map(|target| {
+            let opt_in = crate::opt_in_targets::is_opt_in(&config.data, &target.name);
             (
                 target.name.clone(),
                 TargetStatusRow {
                     backend: target.backend_name.clone(),
-                    reachable: dispatcher.probe(&target),
+                    reachable: (!opt_in).then(|| dispatcher.probe(&target)),
+                    status: opt_in.then_some(crate::opt_in_targets::NOT_RUN),
+                    verdict_owner: opt_in.then_some(crate::opt_in_targets::VERDICT_OWNER),
                 },
             )
         })
@@ -671,11 +683,16 @@ fn write_status_human<W: Write>(
     if !targets.is_empty() {
         writeln!(stdout, "Targets").map_err(|error| CliFailure::new(1, error.to_string()))?;
         for (name, info) in targets {
-            writeln!(
-                stdout,
-                "  {name}: {} reachable={}",
-                info.backend, info.reachable
-            )
+            match info.reachable {
+                Some(reachable) => {
+                    writeln!(stdout, "  {name}: {} reachable={reachable}", info.backend)
+                }
+                None => writeln!(
+                    stdout,
+                    "  {name}: {} (GitHub required checks decide)",
+                    crate::opt_in_targets::NOT_RUN
+                ),
+            }
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
     }
