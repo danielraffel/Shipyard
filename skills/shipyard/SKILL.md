@@ -202,6 +202,34 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+## fleet-reconcile ledger: every attempt says how it ended
+
+`fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
+`failed: <reason>`) for each rollout. Reconcile only ever targets the latest
+release, so a failed older tag is never retried; when a newer tag rolls out,
+every older tag without a verified rollout gets `terminal: "superseded by
+<tag> without a verified rollout (last attempt: ...)"`. Entries written before
+this carry no `last_outcome` and close as "outcome not recorded". The close
+happens inside a rollout, never on an idle tick, which still writes nothing.
+
+## A missing key is not an empty list
+
+`validation_signals` reads a merge group's check runs page by page. A page
+without a `check_runs` array (an error body, a schema change) used to count as
+zero runs, which reported "no receipt decisions" for a group nobody read. It is
+now an error and the group reads `unreadable`. When adding a GitHub reader,
+treat a missing collection key as an error, never as `unwrap_or_default()`.
+
+## Protected-state caches take the writer-domain lease too
+
+`gate_cost::cache::ReadCache` writes under the protected state tree
+(`metrics/gate-cost-cache/`), so creating the directory, storing an entry and
+pruning each hold `writer_domain_lease::acquire_for_protected_path`. Without it,
+a `shipyard metrics gate-cost` run during a Shipyard PR's macOS local lane made
+sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
+cannot be had the write is skipped and the cache stops writing for that run; a
+cold read is always correct. Any new cache in the state tree needs the same.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every
