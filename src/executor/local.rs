@@ -614,6 +614,7 @@ impl LocalExecutor {
 
 /// Names a directory to hold validation TMPDIRs instead of the system temp
 /// root, for a host whose boot volume must not carry build scratch.
+#[cfg(unix)]
 const VALIDATION_TMP_BASE_ENV: &str = "SHIPYARD_VALIDATION_TMP_BASE";
 
 /// A validation run's private TMPDIR, removed when the run ends.
