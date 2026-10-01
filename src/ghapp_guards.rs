@@ -1,7 +1,7 @@
 //! Install and audit the `ghapp` wrapper's optional queue guards.
 //!
-//! `scripts/ghapp` runs `queue-removal-guard`, `queue-arm-guard` and
-//! `branch-refresh-guard` from
+//! `scripts/ghapp` runs `queue-removal-guard`, `queue-arm-guard`,
+//! `branch-refresh-guard` and `merge-guard` from
 //! `$SHIPYARD_GHAPP_GUARDS_DIR` (default `~/.config/shipyard/guards`) when they
 //! are present and executable. Nothing else puts them there, so a host keeps
 //! whatever copy somebody placed by hand, possibly months stale. This module
@@ -41,7 +41,7 @@ pub struct ManagedGuard {
 /// Every guard `shipyard guards install` manages, in install order: the arm
 /// and branch-refresh guards import the removal guard's request parser, so the
 /// parser lands first.
-pub const MANAGED_GUARDS: [ManagedGuard; 3] = [
+pub const MANAGED_GUARDS: [ManagedGuard; 4] = [
     ManagedGuard {
         name: "queue-removal-guard",
         source_path: "scripts/ghapp_queue_removal_guard.py",
@@ -56,6 +56,14 @@ pub const MANAGED_GUARDS: [ManagedGuard; 3] = [
         name: "branch-refresh-guard",
         source_path: "scripts/ghapp_branch_refresh_guard.py",
         contents: include_bytes!("../scripts/ghapp_branch_refresh_guard.py"),
+    },
+    // Refuses `pr merge` on a repository that cannot enforce required checks
+    // server-side until its configured checks are green. Standalone: it shares
+    // no parser with the queue guards.
+    ManagedGuard {
+        name: "merge-guard",
+        source_path: "scripts/ghapp_merge_guard.sh",
+        contents: include_bytes!("../scripts/ghapp_merge_guard.sh"),
     },
 ];
 
