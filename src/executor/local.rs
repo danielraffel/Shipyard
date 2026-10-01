@@ -612,24 +612,90 @@ impl LocalExecutor {
     }
 }
 
+/// Names a directory to hold validation TMPDIRs instead of the system temp
+/// root, for a host whose boot volume must not carry build scratch.
+const VALIDATION_TMP_BASE_ENV: &str = "SHIPYARD_VALIDATION_TMP_BASE";
+
+/// A validation run's private TMPDIR, removed when the run ends.
+///
+/// Test suites leave read-only directories behind on purpose (an installed,
+/// immutable pack is `dr-x------`), and `remove_dir_all` cannot unlink entries
+/// inside a directory without write permission. `tempfile::TempDir` swallows
+/// that failure, so every such run left its whole TMPDIR on the boot volume.
+/// Drop first restores owner permissions on every directory in the tree.
+#[cfg_attr(not(unix), allow(dead_code))] // Only Unix isolates a TMPDIR today.
+struct ValidationTempDir(Option<tempfile::TempDir>);
+
+impl ValidationTempDir {
+    #[cfg(all(unix, test))]
+    fn path(&self) -> &Path {
+        self.0
+            .as_ref()
+            .map_or_else(|| Path::new(""), tempfile::TempDir::path)
+    }
+}
+
+impl Drop for ValidationTempDir {
+    fn drop(&mut self) {
+        if let Some(directory) = self.0.take() {
+            make_tree_owner_writable(directory.path());
+            drop(directory);
+        }
+    }
+}
+
+/// Give the owner rwx on every directory under `root` (not following
+/// symlinks), so a recursive removal can unlink what tests made read-only.
+/// Best effort: a directory owned by someone else stays as it is.
+#[cfg(unix)]
+fn make_tree_owner_writable(root: &Path) {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(metadata) = fs::symlink_metadata(&directory) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(mode | 0o700));
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_tree_owner_writable(_root: &Path) {}
+
 #[cfg(unix)]
 fn isolate_protected_inherited_tmpdir(
     environment: &mut BTreeMap<String, String>,
-) -> std::io::Result<Option<tempfile::TempDir>> {
+) -> std::io::Result<Option<ValidationTempDir>> {
     if environment.contains_key("TMPDIR") {
         return Ok(None);
     }
     let Some(inherited_tmpdir) = std::env::var_os("TMPDIR") else {
         return Ok(None);
     };
-    isolate_protected_tmpdir(environment, Path::new(&inherited_tmpdir))
+    let base = std::env::var_os(VALIDATION_TMP_BASE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    isolate_protected_tmpdir(environment, Path::new(&inherited_tmpdir), base.as_deref())
 }
 
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)] // Keep one fallible cross-platform isolation contract.
 fn isolate_protected_inherited_tmpdir(
     _environment: &mut BTreeMap<String, String>,
-) -> std::io::Result<Option<tempfile::TempDir>> {
+) -> std::io::Result<Option<ValidationTempDir>> {
     Ok(None)
 }
 
@@ -637,14 +703,23 @@ fn isolate_protected_inherited_tmpdir(
 fn isolate_protected_tmpdir(
     environment: &mut BTreeMap<String, String>,
     inherited_tmpdir: &Path,
-) -> std::io::Result<Option<tempfile::TempDir>> {
+    configured_base: Option<&Path>,
+) -> std::io::Result<Option<ValidationTempDir>> {
     if !crate::writer_domain_lease::is_current_protected_path(inherited_tmpdir)? {
         return Ok(None);
     }
     #[cfg(target_os = "macos")]
-    let base = Path::new("/private/tmp");
+    let default_base = Path::new("/private/tmp");
     #[cfg(not(target_os = "macos"))]
-    let base = Path::new("/tmp");
+    let default_base = Path::new("/tmp");
+    let base = configured_base.unwrap_or(default_base);
+    if !base.is_absolute() || crate::writer_domain_lease::is_current_protected_path(base)? {
+        return Err(std::io::Error::other(format!(
+            "{VALIDATION_TMP_BASE_ENV}={} must be an absolute path outside Shipyard's \
+             protected state",
+            base.display()
+        )));
+    }
     let metadata = std::fs::symlink_metadata(base)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(std::io::Error::other(format!(
@@ -663,7 +738,7 @@ fn isolate_protected_tmpdir(
         )
     })?;
     environment.insert("TMPDIR".to_owned(), value.to_owned());
-    Ok(Some(temp_dir))
+    Ok(Some(ValidationTempDir(Some(temp_dir))))
 }
 
 fn source_provenance(cwd: &Path) -> Option<(String, String, bool)> {
@@ -943,13 +1018,13 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
-    #[cfg(unix)]
-    use super::isolate_protected_tmpdir;
     use super::{
         ContractConfig, LocalExecutor, LocalTargetConfig, LocalValidationConfig,
         LocalValidationPlan, LocalValidationRequest, StageCommand, TargetStatus, configured_stages,
         plan_validation, prepared_state_enabled, read_log_tail, source_provenance,
     };
+    #[cfg(unix)]
+    use super::{ValidationTempDir, isolate_protected_tmpdir};
     #[cfg(unix)]
     use crate::identity::RuntimeMode;
     #[cfg(unix)]
@@ -970,7 +1045,7 @@ mod tests {
             .state_dir
             .join("daemon/tmp");
         let mut environment = BTreeMap::new();
-        let temp_dir = isolate_protected_tmpdir(&mut environment, &inherited)
+        let temp_dir = isolate_protected_tmpdir(&mut environment, &inherited, None)
             .expect("isolation")
             .expect("protected inherited root");
         let isolated = Path::new(environment.get("TMPDIR").expect("isolated TMPDIR"));
@@ -1015,6 +1090,62 @@ mod tests {
                 "{test_name} must pass in the isolated root"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_tmpdir_drop_removes_trees_tests_left_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let holder = tempfile::tempdir().expect("holder");
+        let inner = tempfile::Builder::new()
+            .prefix("shipyard-validation-")
+            .tempdir_in(holder.path())
+            .expect("validation dir");
+        let root = inner.path().to_path_buf();
+        // The shape a Pulp test leaves: an installed pack locked read-only.
+        let pack = root.join("pulp-fetch-install-1-2").join("2ae42d8a");
+        std::fs::create_dir_all(&pack).expect("pack dir");
+        std::fs::write(pack.join("ui.js"), "export const ui = 5;").expect("pack file");
+        std::fs::set_permissions(pack.join("ui.js"), std::fs::Permissions::from_mode(0o400))
+            .expect("lock file");
+        std::fs::set_permissions(&pack, std::fs::Permissions::from_mode(0o500)).expect("lock dir");
+        let sealed = root.join("sealed");
+        std::fs::create_dir_all(sealed.join("inner")).expect("sealed dir");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000))
+            .expect("seal dir");
+
+        drop(ValidationTempDir(Some(inner)));
+
+        assert!(
+            !root.exists(),
+            "a validation TMPDIR holding read-only directories must still be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_validation_tmp_base_holds_the_isolated_tmpdir() {
+        let inherited = RuntimePaths::current(RuntimeMode::Shipyard)
+            .state_dir
+            .join("daemon/tmp");
+        let base = tempfile::tempdir().expect("scratch base");
+        let mut environment = BTreeMap::new();
+        let temp_dir = isolate_protected_tmpdir(&mut environment, &inherited, Some(base.path()))
+            .expect("isolation")
+            .expect("protected inherited root");
+        let isolated = Path::new(environment.get("TMPDIR").expect("isolated TMPDIR"));
+        assert_eq!(isolated, temp_dir.path());
+        assert_eq!(isolated.parent(), Some(base.path()));
+        drop(temp_dir);
+        assert!(!isolated.exists());
+
+        let mut environment = BTreeMap::new();
+        assert!(
+            isolate_protected_tmpdir(&mut environment, &inherited, Some(Path::new("relative")))
+                .is_err(),
+            "a relative scratch base must be refused, not resolved against the cwd"
+        );
+        assert!(!environment.contains_key("TMPDIR"));
     }
 
     #[test]
