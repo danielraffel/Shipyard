@@ -2348,6 +2348,17 @@ of the call log); prefer the helper in new code. Linux enforces this and macOS
 does not, so it is invisible locally and usually surfaces first on the coverage
 lane, whose instrumentation widens the window.
 
+**Fork-inherited locks (advisory-lock "released" assertions).** The same
+fork-before-exec window keeps a `flock`/`try_lock_exclusive` lease held after
+the test drops it: a sibling's forked child holds a duplicate of the locked open
+file description until its exec. So an in-binary assertion that a lock is
+acquirable again right after release is racy no matter how the lock is written
+(`global_model_lease` failed ~1 in 10 at `--test-threads=16`). Run such a body
+as an `#[ignore]`d test in a re-exec of the test binary (`--exact <name>
+--ignored --test-threads=1`, and assert the child printed `1 passed` so a
+filter typo cannot pass vacuously); `lease_tests.rs` has the helper. Do not
+"fix" it with a poll-until-acquirable loop, which hides a real leak too.
+
 **Running a different command than CI does.** Before concluding the repo is
 broken, read the workflow's own command and env. `cargo test --lib` aborts on a
 stack overflow that CI never sees, because every lane sets
