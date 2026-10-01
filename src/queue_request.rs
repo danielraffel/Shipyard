@@ -3722,8 +3722,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn provenance_validate_bounds_a_git_probe_that_never_returns() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo");
@@ -3756,9 +3754,12 @@ mod tests {
 
         // A probe that blocks like a Git child parked on an unanswered macOS
         // privacy prompt: it never exits on its own.
+        // Written by a child process: a writable descriptor held here could be
+        // inherited by a sibling test's fork, and Linux then refuses the exec
+        // with ETXTBSY. That spawn failure reads as an unreadable checkout,
+        // not a timeout, which is exactly the misreport this test guards.
         let hung_git = temp.path().join("hung-git");
-        std::fs::write(&hung_git, "#!/bin/sh\nexec sleep 30\n").expect("hung git");
-        std::fs::set_permissions(&hung_git, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::write_executable_script(&hung_git, "#!/bin/sh\nexec sleep 30\n");
         super::GIT_PROBE_OVERRIDE.with(|cell| {
             *cell.borrow_mut() = Some((hung_git, Duration::from_millis(300)));
         });
