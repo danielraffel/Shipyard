@@ -892,11 +892,19 @@ fn annotated_group_check_runs(
             gh,
             &format!("repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"),
         )?;
+        // A body without `check_runs` is an error page or a changed schema,
+        // not an empty listing: reading it as zero runs would report "no
+        // receipt decisions" for a merge group nobody looked at.
         let runs = body
             .get("check_runs")
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                format!(
+                    "check-runs page {page} for {} has no check_runs array",
+                    short(sha)
+                )
+            })?;
         let listed = runs.len();
         candidates.extend(runs.into_iter().filter(|run| {
             let in_group = run
