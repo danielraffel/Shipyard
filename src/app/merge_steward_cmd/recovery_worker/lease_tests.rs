@@ -1,8 +1,56 @@
 use super::witness::remove_recovery_witness;
 use super::*;
 
+const LEASE_TESTS: &str = "app::merge_steward_cmd::recovery_worker::lease_tests::";
+
+/// Run an `#[ignore]`d lease-test body alone in a fresh copy of this binary.
+///
+/// The global model lease is an advisory lock on an open file description, and
+/// "released" means every duplicate of that description is closed. In the
+/// shared test binary, any sibling test that spawns a process forks first and
+/// execs second; the forked child holds a duplicate of every descriptor —
+/// `O_CLOEXEC` closes them at exec, not at fork — until its exec runs. A sibling
+/// fork that lands while a lease is held therefore keeps it held after this
+/// test drops it, and a "now acquirable again" assertion fails for a reason
+/// that has nothing to do with the lease. That is a property of the test
+/// harness, not of the lease: production capacity is released as soon as the
+/// unrelated child execs.
+///
+/// A dedicated single-test process has no sibling threads that spawn, so the
+/// only holders of the lease are the ones the body creates itself. The body is
+/// then deterministic rather than merely likely to pass.
+fn run_lease_body_in_isolated_process(body: &str) {
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            &format!("{LEASE_TESTS}{body}"),
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("isolated lease body");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "isolated lease body {body} failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // A misspelled filter exits 0 having run nothing; insist the body ran.
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "isolated lease body {body} did not run exactly once:\n{stdout}"
+    );
+}
+
 #[test]
 fn global_model_lease_allows_only_one_process_owner() {
+    run_lease_body_in_isolated_process("global_model_lease_allows_only_one_process_owner_body");
+}
+
+#[test]
+#[ignore = "isolated body for global_model_lease_allows_only_one_process_owner"]
+fn global_model_lease_allows_only_one_process_owner_body() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("global-model.lock");
     let first = acquire_global_model_lease(&path)
@@ -23,6 +71,14 @@ fn global_model_lease_allows_only_one_process_owner() {
 
 #[test]
 fn model_child_retains_global_lease_after_parent_guard_drops() {
+    run_lease_body_in_isolated_process(
+        "model_child_retains_global_lease_after_parent_guard_drops_body",
+    );
+}
+
+#[test]
+#[ignore = "isolated body for model_child_retains_global_lease_after_parent_guard_drops"]
+fn model_child_retains_global_lease_after_parent_guard_drops_body() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("global-model.lock");
     let ready = temp.path().join("child-ready");
@@ -36,7 +92,7 @@ fn model_child_retains_global_lease_after_parent_guard_drops() {
     let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args([
             "--exact",
-            "app::merge_steward_cmd::recovery_worker::lease_tests::global_model_lease_child_helper",
+            &format!("{LEASE_TESTS}global_model_lease_child_helper"),
             "--ignored",
             "--nocapture",
         ])
@@ -47,8 +103,12 @@ fn model_child_retains_global_lease_after_parent_guard_drops() {
         .stderr(Stdio::null())
         .spawn()
         .expect("lease-retaining child");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !ready.exists() && Instant::now() < deadline {
+    // Wait on the child itself rather than a wall-clock budget: starting a
+    // second copy of this test binary on a saturated runner can take longer
+    // than any short deadline, while a child that exits without marking ready
+    // fails at once. The ceiling only guards a child that is alive but wedged.
+    let hang_guard = Instant::now() + Duration::from_secs(120);
+    while !ready.exists() && matches!(child.try_wait(), Ok(None)) && Instant::now() < hang_guard {
         thread::sleep(Duration::from_millis(10));
     }
     if !ready.exists() {
@@ -75,7 +135,7 @@ fn model_child_retains_global_lease_after_parent_guard_drops() {
 }
 
 #[test]
-#[ignore = "subprocess helper for model_child_retains_global_lease_after_parent_guard_drops"]
+#[ignore = "subprocess helper for model_child_retains_global_lease_after_parent_guard_drops_body"]
 fn global_model_lease_child_helper() {
     let ready = std::env::var_os("SHIPYARD_MODEL_LEASE_READY")
         .map(PathBuf::from)
@@ -89,8 +149,10 @@ fn global_model_lease_child_helper() {
         .expect("read request");
     assert_eq!(request, r#"{"bounded":"request"}"#);
     fs::write(&ready, b"ready").expect("ready marker");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !release.exists() && Instant::now() < deadline {
+    // The parent writes the release marker or kills this child; the ceiling
+    // only bounds an orphan whose parent died between the two.
+    let hang_guard = Instant::now() + Duration::from_secs(120);
+    while !release.exists() && Instant::now() < hang_guard {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(release.exists(), "parent did not release lease child");
