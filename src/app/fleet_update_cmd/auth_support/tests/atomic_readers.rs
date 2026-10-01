@@ -426,12 +426,30 @@ fn assert_all_readers_valid(results: &[Result<String, String>]) {
     }
 }
 
-fn wait_for_path(path: &Path, description: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Wait for `path`, a marker the still-running `producer` publishes.
+///
+/// The question a latch answers is "did the producer reach this point", and
+/// the producer's liveness answers it: while it runs, the marker may still
+/// come; once it has exited without publishing, it never will. A short
+/// wall-clock deadline answered a different question — "was the host idle" —
+/// and failed on saturated runners whose transaction scripts legitimately took
+/// longer than ten seconds to reach the latch. The panic then dropped the
+/// fixture while the transaction was still running, so its later "No such
+/// file" errors were a consequence, not the cause. The ceiling below is only a
+/// hang guard for a producer that is alive but wedged.
+fn wait_for_path(path: &Path, description: &str, mut producer_running: impl FnMut() -> bool) {
+    let hang_guard = Instant::now() + Duration::from_secs(300);
     while !path.exists() {
+        if !producer_running() {
+            assert!(
+                path.exists(),
+                "producer exited without publishing {description}"
+            );
+            return;
+        }
         assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {description}"
+            Instant::now() < hang_guard,
+            "producer still running but never published {description}"
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -450,7 +468,7 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
     legacy_wrapper = legacy_wrapper.replacen("fi\ncache_dir=", latch, 1);
     ReaderFixture::write_executable(&fixture.wrapper, legacy_wrapper.as_bytes());
 
-    let old_reader = Command::new(&fixture.wrapper)
+    let mut old_reader = Command::new(&fixture.wrapper)
         .args(["auth", "status", "--repo", "danielraffel/Shipyard"])
         .env_clear()
         .env("HOME", fixture.root.path())
@@ -462,7 +480,9 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("old reader");
-    wait_for_path(&old_entered, "old reader latch");
+    wait_for_path(&old_entered, "old reader latch", || {
+        matches!(old_reader.try_wait(), Ok(None))
+    });
 
     let anchor_selected = fixture.root.path().join("anchor-selected");
     let transaction_release = fixture.root.path().join("transaction.release");
@@ -485,7 +505,9 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
             .status()
             .expect("latched transaction")
     });
-    wait_for_path(&anchor_selected, "anchor selector publication");
+    wait_for_path(&anchor_selected, "anchor selector publication", || {
+        !transaction.is_finished()
+    });
 
     assert!(
         !fixture.wrapper.is_symlink(),
@@ -549,8 +571,12 @@ fn first_migration_fences_a_reader_that_appears_after_the_initial_observation() 
         .expect("late reader identity");
     let late_pid = late_reader.id();
     let release_observed = observed.clone();
+    let transaction_running = Arc::new(AtomicBool::new(true));
+    let observer_transaction_running = Arc::clone(&transaction_running);
     let late_reader_wait = thread::spawn(move || {
-        wait_for_path(&release_observed, "late reader observation");
+        wait_for_path(&release_observed, "late reader observation", || {
+            observer_transaction_running.load(Ordering::Acquire)
+        });
         thread::sleep(Duration::from_millis(250));
         std::fs::write(&release, b"release\n").expect("release late reader");
         late_reader.wait_with_output().expect("late reader").status
@@ -564,7 +590,9 @@ fn first_migration_fences_a_reader_that_appears_after_the_initial_observation() 
     );
     let script = script.replacen(observation, &delayed_observation, 1);
     let started = Instant::now();
-    assert!(fixture.run_script(&script).success());
+    let transaction = fixture.run_script(&script);
+    transaction_running.store(false, Ordering::Release);
+    assert!(transaction.success());
     assert!(
         started.elapsed() >= Duration::from_secs(1),
         "late reader was not retained in the finite cohort"

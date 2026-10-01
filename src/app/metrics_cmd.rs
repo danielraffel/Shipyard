@@ -8,21 +8,31 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::app::cli::{
-    MetricsCommand, MetricsGroupBy, MetricsImportCommand, MetricsImportGithubArgs,
-    MetricsImportTartciArgs, MetricsRecordArgs,
+    MetricsCommand, MetricsFreshnessArgs, MetricsGroupBy, MetricsImportCommand,
+    MetricsImportGithubArgs, MetricsImportTartciArgs, MetricsRecordArgs,
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
+use crate::metrics::freshness::{
+    DEFAULT_STALE_AFTER_HOURS, Freshness, FreshnessStatus, parse_stale_after,
+};
+use crate::metrics::github_import::{self, GithubImportRequest};
+#[cfg(test)]
+use crate::metrics::github_import::{
+    github_jobs_api_path, github_runs_api_path, workflow_run_single_pr,
+};
 use crate::metrics::proxy::{Basis, ProxyValue, WALL_CONTEXT_LABEL};
 use crate::metrics::{
-    GateClass, GitHubRunJob, MetricRecordInput, MetricsFinding, MetricsJobRow, MetricsStore,
-    MetricsSummaryRow, StewardshipScorecard, SummaryGroupBy, github_job_to_record,
-    parse_duration_ms,
+    GateClass, MetricRecordInput, MetricsFinding, MetricsJobRow, MetricsStore, MetricsSummaryRow,
+    StewardshipScorecard, SummaryGroupBy, parse_duration_ms,
 };
 use crate::output::write_pretty_json;
 
 const GITHUB_METRICS_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Exit code for `--fail-on-stale` when the store is STALE or EMPTY.
+pub(super) const METRICS_EXIT_STALE: u8 = 3;
 
 #[derive(Debug, Serialize)]
 struct MetricsRecordOutput {
@@ -56,6 +66,7 @@ struct MetricsSummaryOutput {
     database: String,
     group_by: SummaryGroupBy,
     rows: Vec<MetricsSummaryRow>,
+    freshness: Freshness,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,7 +76,93 @@ struct MetricsFindingsOutput {
     profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     required: Option<RequiredChecks>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<Freshness>,
     findings: Vec<MetricsFinding>,
+}
+
+/// `scorecard --json`: the scorecard's own keys plus `freshness`.
+#[derive(Debug, Serialize)]
+struct MetricsScorecardOutput<'a> {
+    #[serde(flatten)]
+    scorecard: &'a StewardshipScorecard,
+    freshness: &'a Freshness,
+}
+
+/// `--stale-after` wins; otherwise `[metrics] stale_after`; otherwise 24h.
+fn resolve_stale_after(
+    flag: Option<&str>,
+    config_cwd: Option<(RuntimeMode, &Path)>,
+) -> Result<chrono::Duration, CliFailure> {
+    let configured = || {
+        config_cwd
+            .and_then(|(mode, cwd)| LoadedConfig::load_from_cwd(mode, cwd).ok())
+            .and_then(|config| config.get_str("metrics.stale_after").map(str::to_owned))
+    };
+    match flag.map(str::to_owned).or_else(configured) {
+        Some(text) => {
+            parse_stale_after(&text).map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, error))
+        }
+        None => Ok(chrono::Duration::hours(DEFAULT_STALE_AFTER_HOURS)),
+    }
+}
+
+fn freshness_for(
+    store: &MetricsStore,
+    project: Option<&str>,
+    args: &MetricsFreshnessArgs,
+    config_cwd: Option<(RuntimeMode, &Path)>,
+) -> Result<Freshness, CliFailure> {
+    let threshold = resolve_stale_after(args.stale_after.as_deref(), config_cwd)?;
+    store
+        .freshness(project, threshold, Utc::now())
+        .map_err(|error| CliFailure::new(1, format!("metrics freshness failed: {error}")))
+}
+
+/// Lead a stale verdict with a finding saying so, and stop "insufficient
+/// sample" findings from blaming lanes for a missing import.
+fn annotate_findings(findings: &mut Vec<MetricsFinding>, freshness: &Freshness) {
+    if !freshness.is_degraded() {
+        return;
+    }
+    for finding in findings.iter_mut() {
+        if finding.signal.starts_with("insufficient") {
+            finding.message = format!(
+                "{} The store is {}: the shortage is likely the missing import, not the lane.",
+                finding.message,
+                freshness.status.as_str().to_ascii_uppercase()
+            );
+        }
+    }
+    findings.insert(
+        0,
+        MetricsFinding {
+            severity: freshness.status.as_str().to_owned(),
+            lane: "*".to_owned(),
+            signal: format!("{}_data", freshness.status.as_str()),
+            message: freshness.message.clone(),
+            sample_count: freshness.sources.iter().map(|source| source.samples).sum(),
+            suggested_poll_interval_secs: 600,
+            recommended_actions: vec![
+                "Run `shipyard metrics import github --repo <owner/repo>` now.".to_owned(),
+                "Enable the daemon's scheduled import: [metrics.import] enabled = true in the \
+                 machine-global config."
+                    .to_owned(),
+            ],
+            basis: "freshness",
+            comparison: None,
+            denominator: None,
+            gate: None,
+        },
+    );
+}
+
+fn stale_exit(freshness: &Freshness, fail_on_stale: bool) -> std::process::ExitCode {
+    if fail_on_stale && freshness.status != FreshnessStatus::Fresh {
+        std::process::ExitCode::from(METRICS_EXIT_STALE)
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
 }
 
 /// The required status checks `watch` classified lanes against, and where
@@ -189,7 +286,11 @@ pub(super) fn metrics_command<W: Write>(
             let rows = store
                 .summary_grouped(args.project.as_deref(), group_by)
                 .map_err(|error| CliFailure::new(1, format!("metrics summary failed: {error}")))?;
-            write_summary(stdout, json_output, store.path(), group_by, rows)?;
+            let freshness =
+                freshness_for(&store, args.project.as_deref(), &args.freshness, config_cwd)?;
+            let exit = stale_exit(&freshness, args.freshness.fail_on_stale);
+            write_summary(stdout, json_output, store.path(), group_by, rows, freshness)?;
+            return Ok(exit);
         }
         MetricsCommand::Slowest(args) => {
             let rows = store
@@ -214,14 +315,17 @@ pub(super) fn metrics_command<W: Write>(
                 json_output,
                 store.path(),
                 (args.project, None),
-                None,
+                (None, None),
                 findings,
             )?;
         }
         MetricsCommand::Watch(args) => {
             let since_days = parse_days(&args.since)?;
             let required = resolve_required(args.required, config_cwd);
-            let findings = store
+            let freshness =
+                freshness_for(&store, Some(&args.project), &args.freshness, config_cwd)?;
+            let exit = stale_exit(&freshness, args.freshness.fail_on_stale);
+            let mut findings = store
                 .watch_with_required(
                     &args.project,
                     since_days,
@@ -229,27 +333,34 @@ pub(super) fn metrics_command<W: Write>(
                     &required.checks,
                 )
                 .map_err(|error| CliFailure::new(1, format!("metrics watch failed: {error}")))?;
+            annotate_findings(&mut findings, &freshness);
             write_findings(
                 stdout,
                 json_output,
                 store.path(),
                 (args.project, None),
-                Some(required),
+                (Some(required), Some(freshness)),
                 findings,
             )?;
+            return Ok(exit);
         }
         MetricsCommand::Advise(args) => {
-            let findings = store
+            let freshness =
+                freshness_for(&store, Some(&args.project), &args.freshness, config_cwd)?;
+            let exit = stale_exit(&freshness, args.freshness.fail_on_stale);
+            let mut findings = store
                 .advise(&args.project)
                 .map_err(|error| CliFailure::new(1, format!("metrics advise failed: {error}")))?;
+            annotate_findings(&mut findings, &freshness);
             write_findings(
                 stdout,
                 json_output,
                 store.path(),
                 (args.project, args.profile),
-                None,
+                (None, Some(freshness)),
                 findings,
             )?;
+            return Ok(exit);
         }
         MetricsCommand::Scorecard(args) => {
             let since_days = parse_days(&args.since)?;
@@ -258,8 +369,20 @@ pub(super) fn metrics_command<W: Write>(
                 .map_err(|error| {
                     CliFailure::new(1, format!("metrics scorecard failed: {error}"))
                 })?;
-            write_output(stdout, json_output, &scorecard, || {
-                let mut text = scorecard_proxy_lines(&scorecard);
+            let freshness =
+                freshness_for(&store, Some(&args.project), &args.freshness, config_cwd)?;
+            let exit = stale_exit(&freshness, args.freshness.fail_on_stale);
+            let output = MetricsScorecardOutput {
+                scorecard: &scorecard,
+                freshness: &freshness,
+            };
+            write_output(stdout, json_output, &output, || {
+                let mut text = if freshness.is_degraded() {
+                    format!("{}\n", freshness.message)
+                } else {
+                    String::new()
+                };
+                text.push_str(&scorecard_proxy_lines(&scorecard));
                 let coverage = format!(
                     "{}: {} jobs, {:.2} worker-minutes, {} PRs over {}d; worker-minutes coverage={} ({}); PR coverage={} ({}); submit-to-receipt={} ({}); model-tokens={} ({})",
                     scorecard.project,
@@ -279,6 +402,7 @@ pub(super) fn metrics_command<W: Write>(
                 text.push_str(&coverage);
                 text
             })?;
+            return Ok(exit);
         }
         MetricsCommand::GateCost(_) => {
             return Err(CliFailure::new(
@@ -388,85 +512,17 @@ fn import_github(
     store: &MetricsStore,
     args: &MetricsImportGithubArgs,
 ) -> Result<usize, CliFailure> {
-    let mut run_args = vec![
-        "api".to_owned(),
-        "-X".to_owned(),
-        "GET".to_owned(),
-        github_runs_api_path(&args.repo, args.workflow.as_deref()),
-        "-f".to_owned(),
-        format!("per_page={}", args.limit),
-    ];
-    if let Some(branch) = &args.branch {
-        run_args.push("-f".to_owned());
-        run_args.push(format!("branch={branch}"));
-    }
-    let runs = gh_json(&run_args)?;
-    let run_ids = runs
-        .get("workflow_runs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|run| {
-            let run_id = run.get("id").and_then(Value::as_i64)?;
-            let pr = workflow_run_single_pr(run);
-            Some((run_id, pr))
-        })
-        .collect::<Vec<_>>();
-    let project = args.project.clone().unwrap_or_else(|| {
-        args.repo
-            .rsplit('/')
-            .next()
-            .unwrap_or(&args.repo)
-            .to_owned()
-    });
-    let mut imported = 0;
-    for (run_id, pr) in run_ids {
-        let jobs = gh_json(&[
-            "api".to_owned(),
-            "-X".to_owned(),
-            "GET".to_owned(),
-            github_jobs_api_path(&args.repo, run_id),
-            "-f".to_owned(),
-            "per_page=100".to_owned(),
-        ])?;
-        let Some(job_values) = jobs.get("jobs").and_then(Value::as_array) else {
-            continue;
-        };
-        for value in job_values {
-            let mut job: GitHubRunJob = serde_json::from_value(value.clone())
-                .map_err(|error| CliFailure::new(1, format!("GitHub job parse failed: {error}")))?;
-            job.run_id.get_or_insert(run_id);
-            if job.completed_at.is_none() {
-                continue;
-            }
-            let input =
-                github_job_to_record(&args.repo, args.workflow.as_deref(), &project, pr, &job);
-            store.record_terminal_observation(&input).map_err(|error| {
-                CliFailure::new(1, format!("GitHub metrics record failed: {error}"))
-            })?;
-            imported += 1;
-        }
-    }
-    Ok(imported)
-}
-
-fn workflow_run_single_pr(run: &Value) -> Option<i64> {
-    let pull_requests = run.get("pull_requests")?.as_array()?;
-    let [pull_request] = pull_requests.as_slice() else {
-        return None;
+    let request = GithubImportRequest {
+        repo: args.repo.clone(),
+        project: args.project.clone(),
+        workflow: args.workflow.clone(),
+        branch: args.branch.clone(),
+        limit: args.limit,
     };
-    pull_request.get("number").and_then(Value::as_i64)
-}
-
-fn github_runs_api_path(repo: &str, workflow: Option<&str>) -> String {
-    workflow.map_or_else(
-        || format!("/repos/{repo}/actions/runs"),
-        |workflow| format!("/repos/{repo}/actions/workflows/{workflow}/runs"),
-    )
-}
-
-fn github_jobs_api_path(repo: &str, run_id: i64) -> String {
-    format!("/repos/{repo}/actions/runs/{run_id}/jobs")
+    let mut gh = |argv: &[String]| gh_json(argv);
+    github_import::import_github(store, &request, &mut gh, &|message| {
+        CliFailure::new(1, message)
+    })
 }
 
 fn gh_json(args: &[String]) -> Result<Value, CliFailure> {
@@ -545,6 +601,7 @@ fn write_summary<W: Write>(
     db_path: &Path,
     group_by: SummaryGroupBy,
     rows: Vec<MetricsSummaryRow>,
+    freshness: Freshness,
 ) -> Result<(), CliFailure> {
     if json_output {
         return write_output(
@@ -554,9 +611,13 @@ fn write_summary<W: Write>(
                 database: db_path.display().to_string(),
                 group_by,
                 rows,
+                freshness,
             },
             String::new,
         );
+    }
+    if freshness.is_degraded() {
+        writeln!(stdout, "{}", freshness.message).map_err(io_error)?;
     }
     let machine = match group_by {
         SummaryGroupBy::Runner => "runner",
@@ -591,7 +652,7 @@ fn write_findings<W: Write>(
     json_output: bool,
     db_path: &Path,
     (project, profile): (String, Option<String>),
-    required: Option<RequiredChecks>,
+    (required, freshness): (Option<RequiredChecks>, Option<Freshness>),
     findings: Vec<MetricsFinding>,
 ) -> Result<(), CliFailure> {
     if json_output {
@@ -603,10 +664,17 @@ fn write_findings<W: Write>(
                 project,
                 profile,
                 required,
+                freshness,
                 findings,
             },
             String::new,
         );
+    }
+    if let Some(freshness) = freshness
+        .as_ref()
+        .filter(|freshness| freshness.is_degraded())
+    {
+        writeln!(stdout, "{}", freshness.message).map_err(io_error)?;
     }
     if let Some(required) = &required {
         if required.checks.is_empty() {
@@ -626,6 +694,11 @@ fn write_findings<W: Write>(
             .map_err(io_error)?;
         }
     }
+    // The banner above already carries the freshness finding.
+    let findings: Vec<MetricsFinding> = findings
+        .into_iter()
+        .filter(|finding| finding.basis != "freshness")
+        .collect();
     if findings.is_empty() {
         writeln!(stdout, "No material findings.").map_err(io_error)?;
         return Ok(());
@@ -764,6 +837,13 @@ fn _json_debug(value: &impl Serialize) -> Value {
 mod tests {
     use super::*;
 
+    fn no_freshness_flags() -> MetricsFreshnessArgs {
+        MetricsFreshnessArgs {
+            stale_after: None,
+            fail_on_stale: false,
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn github_metrics_observation_times_out_escaped_helper() {
@@ -826,6 +906,7 @@ mod tests {
                 since: "14d".to_owned(),
                 required: Vec::new(),
                 basis: crate::app::cli::MetricsBasis::Proxy,
+                freshness: no_freshness_flags(),
             },
         ));
         for key in [
@@ -871,6 +952,7 @@ mod tests {
                 since: "14d".to_owned(),
                 required: Vec::new(),
                 basis: crate::app::cli::MetricsBasis::Proxy,
+                freshness: no_freshness_flags(),
             }),
             temp.path(),
             None,
@@ -880,7 +962,15 @@ mod tests {
         .expect("scorecard command");
         let output = String::from_utf8(output).expect("UTF-8 output");
 
-        let first = output.lines().next().unwrap_or_default();
+        let mut lines = output.lines();
+        assert!(
+            lines
+                .next()
+                .unwrap_or_default()
+                .starts_with("EMPTY: no metrics rows for project shipyard"),
+            "an empty store must say so first: {output}"
+        );
+        let first = lines.next().unwrap_or_default();
         assert!(
             first.contains("insufficient_sample (basis proxy"),
             "proxy verdict must lead: {output}"
@@ -923,6 +1013,11 @@ mod tests {
                     since: "7d".to_owned(),
                     required,
                     basis: crate::app::cli::MetricsBasis::Proxy,
+                    // The fixture's newest row is two days old.
+                    freshness: MetricsFreshnessArgs {
+                        stale_after: Some("30d".to_owned()),
+                        fail_on_stale: false,
+                    },
                 }),
                 temp.path(),
                 None,
@@ -961,5 +1056,122 @@ mod tests {
         assert_eq!(json["findings"][0]["gate"], "required");
         assert_eq!(json["findings"][0]["denominator"]["unit"], "jobs");
         assert_eq!(json["findings"][0]["denominator"]["current_decided"], 12);
+    }
+
+    /// A store written before slugs were accepted (`project = "pulp"`,
+    /// `repo = "Generous-Corp/pulp"`) whose last GitHub import is three days
+    /// old: every verdict command must find it by slug and call it STALE.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn stale_legacy_store_is_found_by_slug_and_reported_stale() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let completed = Utc::now() - chrono::Duration::days(3);
+        let conn = rusqlite::Connection::open(store.path()).expect("db");
+        conn.execute(
+            "INSERT INTO runs (ts, project, repo, status) VALUES (?1, 'pulp', 'Generous-Corp/pulp', 'success')",
+            [completed.to_rfc3339()],
+        )
+        .expect("run");
+        conn.execute(
+            "INSERT INTO jobs (run_id, job, target, backend, provider, completed_at, total_ms, status, external_id)
+             VALUES (1, 'macos', 'macos', 'local', 'self-hosted', ?1, 60000, 'success', 'github:1/1/1')",
+            [completed.to_rfc3339()],
+        )
+        .expect("job");
+        conn.execute(
+            "INSERT INTO steps (job_id, step, duration_ms, status) VALUES (1, 'github_job', 60000, 'success')",
+            [],
+        )
+        .expect("step");
+        drop(conn);
+
+        let run = |command: MetricsCommand, json: bool| {
+            let mut output = Vec::new();
+            let exit =
+                metrics_command(command, temp.path(), None, json, &mut output).expect("command");
+            (exit, String::from_utf8(output).expect("utf-8"))
+        };
+        let watch = |fail_on_stale: bool| {
+            MetricsCommand::Watch(crate::app::cli::MetricsWatchArgs {
+                project: "Generous-Corp/pulp".to_owned(),
+                since: "14d".to_owned(),
+                required: Vec::new(),
+                basis: crate::app::cli::MetricsBasis::WallTime,
+                freshness: MetricsFreshnessArgs {
+                    stale_after: None,
+                    fail_on_stale,
+                },
+            })
+        };
+
+        let (exit, text) = run(watch(false), false);
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert!(
+            text.starts_with("STALE: last github import "),
+            "stale must lead: {text}"
+        );
+        assert!(
+            text.contains("(3d ago; threshold 1d) for project Generous-Corp/pulp"),
+            "{text}"
+        );
+        assert!(
+            text.contains("insufficient_samples")
+                && text.contains("the missing import, not the lane"),
+            "{text}"
+        );
+
+        let (_, json) = run(watch(false), true);
+        let json: Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(json["freshness"]["status"], "stale");
+        assert_eq!(json["freshness"]["stale_sources"][0], "github");
+        assert_eq!(json["findings"][0]["signal"], "stale_data");
+
+        let (exit, _) = run(watch(true), false);
+        assert_eq!(exit, std::process::ExitCode::from(METRICS_EXIT_STALE));
+
+        let (_, advise) = run(
+            MetricsCommand::Advise(crate::app::cli::MetricsAdviseArgs {
+                project: "Generous-Corp/pulp".to_owned(),
+                profile: None,
+                freshness: no_freshness_flags(),
+            }),
+            true,
+        );
+        let advise: Value = serde_json::from_str(&advise).expect("json");
+        assert_eq!(advise["freshness"]["status"], "stale");
+
+        let (_, summary) = run(
+            MetricsCommand::Summary(crate::app::cli::MetricsSummaryArgs {
+                project: Some("Generous-Corp/pulp".to_owned()),
+                group_by: MetricsGroupBy::Runner,
+                freshness: no_freshness_flags(),
+            }),
+            true,
+        );
+        let summary: Value = serde_json::from_str(&summary).expect("json");
+        assert_eq!(
+            summary["rows"].as_array().map(Vec::len),
+            Some(1),
+            "slug must find the pulp row"
+        );
+        assert_eq!(summary["freshness"]["status"], "stale");
+
+        // A generous threshold turns the same store fresh, and exit 0.
+        let (exit, text) = run(
+            MetricsCommand::Watch(crate::app::cli::MetricsWatchArgs {
+                project: "pulp".to_owned(),
+                since: "14d".to_owned(),
+                required: Vec::new(),
+                basis: crate::app::cli::MetricsBasis::WallTime,
+                freshness: MetricsFreshnessArgs {
+                    stale_after: Some("7d".to_owned()),
+                    fail_on_stale: true,
+                },
+            }),
+            false,
+        );
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert!(!text.contains("STALE"), "{text}");
     }
 }

@@ -162,6 +162,33 @@ runs:
 <command...> --repo <owner/name> --pr <number> --run-id <id>
 ```
 
+The run is searched by creation time, `created=<removal-6h>..<removal+5m>`,
+100 per page and at most 3 pages, never by recency. Every workflow of every
+failed group is its own run, so on `Generous-Corp/pulp` "the latest 20 failed
+runs" covered about an hour, and a certified ejection (`pulp#9048`) could not be
+re-admitted once that hour passed. A window with nothing matching, or busier
+than the read cap, refuses and says which.
+
+### The attributor's environment
+
+The command runs from the repository root with its output captured and a
+120-second timeout, inside the guard's environment rather than the operator's
+shell:
+
+- `PATH` is the wrapper's trusted system path
+  (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`). `ghapp`
+  itself, usually installed under `~/.local/bin`, is **not** on it, and neither
+  is a shell function or alias. An attributor that shells out to a bare `ghapp`
+  fails with "not found" here even though the same command works interactively.
+- `GHAPP_REAL_GH` names the real `gh` binary, `GH_TOKEN` holds the App token
+  the wrapper minted for the command being guarded, and `GH_REPO` is bound to
+  the pull request's repository. `"$GHAPP_REAL_GH" api ...` makes a read under
+  the same identity the guard used.
+
+A non-zero exit, or a verdict that is not JSON, refuses with the last few lines
+of the attributor's stderr (control characters removed) in the message, so a
+crash is diagnosable from the refusal alone.
+
 ### What certifies, and what does not
 
 The attributor must print one JSON object on stdout:

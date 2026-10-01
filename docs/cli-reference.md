@@ -42,7 +42,12 @@ shipyard dependency pulp verify           # fresh, cache-bypassing CI verificati
 shipyard landing                             # merge queue, strict, enqueue, check placement, backlog, base tip health (HEALTHY/RED/PENDING/UNPROVEN from the tip's merge_group required jobs)
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                      # machine-readable; exit 9 when any headline field is UNKNOWN
-shipyard landing --pr 123                    # one PR: queued / armed_not_queued / ejected / never_armed / merged, with sources;
+shipyard landing --pr 123                    # one PR. First line: the VERDICT to quote, RED / PENDING / GREEN / UNKNOWN on the
+                                             #   current head's required checks (branch protection), failing tests from the job log,
+                                             #   REPEAT on K heads (same test on >=2 runs of the PR) or "also failing on #a,#b —
+                                             #   likely main/shared", a failed merge group on this head, and the queue suffix;
+                                             #   `gap:` lines and the API-call count follow. JSON: `verdict`. Exit 9 when UNKNOWN.
+                                             # Then queued / armed_not_queued / ejected / never_armed / merged, with sources;
                                              #   plus VALIDATION: head test tier (fast / full / unknown) and merge-group receipt decisions
 
 # Is the base red? (reads the repo's own base-poison-signal/v1 annotation)
@@ -68,6 +73,7 @@ shipyard queue-observe         # one read-only queue/PR snapshot; emit on change
 shipyard --json queue-observe --follow  # adaptive delta-only NDJSON monitor
 shipyard pr-watch scan --repo Generous-Corp/pulp  # read-only flags for stuck open PRs (dry run; --post-comments / --digest opt in)
 shipyard pr-watch replay --repo Generous-Corp/pulp --since 7d --expect 8933=1,3 --control merged-clean  # offline simulation
+shipyard pr-watch scan --repo Generous-Corp/pulp --handback  # plan the hand-back to owning sessions (dry run; --deliver-handback sends)
 shipyard watch                 # live-tail an in-flight ship
 shipyard watch local --target linux-vm --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'
 shipyard queue                 # show all jobs with priorities
@@ -89,6 +95,7 @@ shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
 shipyard metrics slowest --project pulp --limit 20
 shipyard metrics watch --project pulp --since 14d --json
+shipyard metrics watch --project Generous-Corp/pulp --fail-on-stale   # exit 3 when the store is STALE or empty
 shipyard metrics watch --project pulp --since 7d --required macos   # override [governance] required_status_checks
 shipyard metrics advise --project pulp --profile normal --json
 shipyard metrics compare --project pulp --lane windows-arm64 --before 7d --after 7d --json
@@ -111,7 +118,7 @@ shipyard ci profile plan normal-local-fast --repo OWNER/REPO --json
 # Governance
 shipyard governance status     # declared vs live drift
 shipyard governance diff       # dry-run apply
-shipyard governance apply      # bring live state in line with config
+shipyard governance apply --yes  # write live state to match config (without --yes: preview only)
 shipyard governance export     # snapshot to TOML
 shipyard governance use <name> # switch profile (solo / multi / custom)
 
@@ -409,6 +416,69 @@ use as `unavailable` until those values have durable source telemetry; it never
 infers them from job duration. Human output is available by default; `--json`
 returns structured rows, findings, or the scorecard for plugins, MCP tools, and
 monitoring agents.
+
+### Project keys
+
+`--project` accepts either the GitHub slug (`Generous-Corp/pulp`) or the short
+repository name (`pulp`), case-insensitively, on every metrics query.
+`metrics import github` has always stored the short name as the project and the
+slug in the row's `repo`; a slug lookup now finds those rows. A slug also
+matches rows stored under the slug itself, and a short name matches rows under
+any `<owner>/<name>`. A slug never matches a short-keyed row whose recorded
+`repo` names a different owner, so two forks sharing a name stay apart. Writes
+normalise going forward: a slug passed to `metrics record --project`,
+`metrics import github --project`, or a tartci record is stored as the short
+name plus `repo`. Existing rows are never rewritten.
+
+### Freshness (`STALE`)
+
+The store only changes when something imports into it. `summary`, `watch`,
+`advise`, and `scorecard` therefore report how old their data is before any
+verdict: a leading `STALE: last github import <ts> (<age> ago; threshold 24h)`
+line in human output, and a `freshness` object in `--json` (`status` =
+`fresh` | `stale` | `empty`, `newest_sample_at`, `threshold_secs`,
+`stale_sources`, and per-source `sources[]`). `watch` and `advise` also lead
+their findings with a `stale_data` / `empty_data` finding, and append to every
+`insufficient_*` finding that the shortage is likely the missing import, not
+the lane.
+
+Rows are attributed to a source: `github` (written by `metrics import
+github`) or `recorded` (`metrics record`, `run command`, tartci, governed
+builds). The store is `stale` when any imported source is older than the
+threshold — a fresh locally recorded row does not hide a dead import — or,
+when a project has no imported source, when its newest row is. `empty` means
+no row matches the project, which is also what a mistyped key looks like.
+
+The threshold is `--stale-after <N>[s|m|h|d]`, else `[metrics] stale_after`,
+else `24h`. Exit codes: `0` whether fresh or stale (staleness is reported, not
+failed); `3` with `--fail-on-stale` when the status is `stale` or `empty`; `5`
+for an invalid `--stale-after`.
+
+### Scheduled GitHub import (`[metrics.import]`)
+
+The Shipyard daemon can run `metrics import github` on a cadence. It is off by
+default and reads the machine-global config (`~/Library/Application
+Support/shipyard/config.toml` on macOS), re-read on every check so a toggle
+needs no daemon restart:
+
+```toml
+[metrics.import]
+enabled = true                 # default false: nothing is read or written
+interval_minutes = 60          # per-repository cadence, minimum 5
+repos = ["Generous-Corp/pulp"] # default: the repositories the daemon serves
+workflow = "build.yml"         # optional; every workflow when unset
+limit = 20                     # recent runs per pass, 1-100
+```
+
+The daemon checks every 5 minutes (first check 5 minutes after start) and
+imports a repository only when its last attempt is at least `interval_minutes`
+old. Attempts, successes, counts, and the last error are kept in
+`$SHIPYARD_STATE_DIR/metrics/import-schedule.json`; a failed attempt waits a
+full interval before retrying. Each pass runs on its own thread through the
+daemon's configured GitHub client (`GH_REPO` scoped), one read for the run list
+plus one per run, each bounded at 30 s; a pass that imported or failed is
+broadcast as a `metrics_import_pass` daemon event. Editing the machine-global
+config is an operator step: do it deliberately, not from an agent session.
 
 ### Proxy-first verdicts
 

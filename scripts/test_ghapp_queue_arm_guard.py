@@ -599,7 +599,9 @@ class BatchAttributionTests(unittest.TestCase):
         os.chdir(self.root)
         self.addCleanup(os.chdir, cwd)
 
-    def declare(self, verdict: Any, *, exit_code: int = 0, command: Any = None) -> None:
+    def declare(
+        self, verdict: Any, *, exit_code: int = 0, command: Any = None, stderr: str = ""
+    ) -> None:
         """Write a `.shipyard/config.toml` declaring a stub attributor."""
         (self.root / ".shipyard").mkdir(parents=True, exist_ok=True)
         script = self.root / "attribute.py"
@@ -608,6 +610,7 @@ class BatchAttributionTests(unittest.TestCase):
             "import sys, pathlib\n"
             f"pathlib.Path({str(self.root / 'argv')!r}).write_text(' '.join(sys.argv[1:]))\n"
             f"sys.stdout.write({body!r})\n"
+            f"sys.stderr.write({stderr!r})\n"
             f"raise SystemExit({exit_code})\n",
             encoding="utf-8",
         )
@@ -790,6 +793,28 @@ class BatchAttributionTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn("Push a fix first", message)
 
+    def test_a_crashed_attributor_s_stderr_tail_reaches_the_refusal(self) -> None:
+        """A bare "exited 1" hid a FileNotFoundError for `ghapp` off the guard's PATH."""
+        traceback = (
+            "Traceback (most recent call last):\n"
+            + "".join(f'  File "attribute.py", line {n}, in frame\n' for n in range(20))
+            + "\x1b[31mFileNotFoundError: [Errno 2] No such file or directory: 'ghapp'\x1b[0m\n"
+        )
+        self.declare("", exit_code=1, stderr=traceback)
+        code, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertEqual(code, 1)
+        self.assertIn("The attributor exited 1", message)
+        self.assertIn("No such file or directory: 'ghapp'", message)
+        # A tail, not the whole traceback, and no terminal escapes.
+        self.assertNotIn("line 0,", message)
+        self.assertNotIn("\x1b", message)
+
+    def test_a_silent_failure_adds_no_stderr_clause(self) -> None:
+        self.declare("", exit_code=1)
+        _, message, _ = self.run_guard([fixture(self.INCIDENT), *self.batch_reads()])
+        self.assertIn("The attributor exited 1", message)
+        self.assertNotIn("Attributor stderr", message)
+
     def test_an_unresolvable_ejecting_batch_refuses(self) -> None:
         self.declare(self.certifies())
         empty = {"total_count": 0, "workflow_runs": []}
@@ -886,6 +911,146 @@ class BatchAttributionTests(unittest.TestCase):
         self.assertEqual(code, 0, message)
         # No compare call was needed at all.
         self.assertTrue(all("compare" not in "".join(call) for call in calls), calls)
+
+    # -- the ejecting run is found by time, not by recency ------------------
+
+    REMOVED_AT = "2026-09-25T04:12:51Z"
+
+    def ejecting_run(self) -> dict[str, Any]:
+        listing = fixture("merge_group_failed_runs_listing.json")
+        return next(run for run in listing["workflow_runs"] if run["id"] == self.RUN_ID)
+
+    @staticmethod
+    def decoy(index: int, created_at: str) -> dict[str, Any]:
+        return {
+            "id": 40000000000 + index,
+            "name": "Build and Test",
+            "event": "merge_group",
+            "conclusion": "failure",
+            "head_branch": f"gh-readonly-queue/main/pr-{9100 + index}-{index:040x}",
+            "head_sha": f"{index + 1:040x}",
+            "created_at": created_at,
+            "html_url": f"https://github.com/Generous-Corp/pulp/actions/runs/{40000000000 + index}",
+        }
+
+    def run_guard_against(self, pool: list[dict[str, Any]]) -> tuple[int, str, list[list[str]]]:
+        """Run the guard against a fake that honours the listing's query string.
+
+        The run listing is served like GitHub serves it: newest first, filtered
+        by `created=A..B` (inclusive) when given, sliced by `per_page`/`page`.
+        A fake that ignored `per_page` would hide exactly the recency bug.
+        """
+        calls: list[list[str]] = []
+        jobs = fixture("merge_group_run_real_infra_and_build.json")["jobs"]
+
+        def fake_gh(arguments: list[str]) -> Any:
+            calls.append(arguments)
+            joined = " ".join(arguments)
+            if "graphql" in joined:
+                return fixture(self.INCIDENT)
+            if f"/actions/runs/{self.RUN_ID}/jobs" in joined:
+                return jobs
+            if "/compare/" in joined:
+                return {"status": "behind"}
+            if "/actions/runs?" in joined:
+                query = dict(
+                    part.split("=", 1) for part in arguments[1].split("?", 1)[1].split("&")
+                )
+                runs = sorted(pool, key=lambda run: run["created_at"], reverse=True)
+                if "created" in query:
+                    low, high = query["created"].split("..")
+                    runs = [run for run in runs if low <= run["created_at"] <= high]
+                size = int(query.get("per_page", 30))
+                page = int(query.get("page", 1))
+                return {
+                    "total_count": len(runs),
+                    "workflow_runs": runs[(page - 1) * size : page * size],
+                }
+            raise AssertionError(f"unexpected gh call {arguments}")
+
+        stderr = io.StringIO()
+        env = {"GH_REPO": "Generous-Corp/pulp", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(guard, "run_real_gh", side_effect=fake_gh),
+            mock.patch.object(
+                guard.PARSER, "current_repo_identity", return_value=("Generous-Corp", "pulp")
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = guard.main(["pr", "merge", "8811", "--auto"])
+        return code, stderr.getvalue(), calls
+
+    @staticmethod
+    def listing_calls(calls: list[list[str]]) -> list[str]:
+        return [call[1] for call in calls if len(call) > 1 and "/actions/runs?" in call[1]]
+
+    def test_an_ejecting_run_behind_many_later_failures_is_still_found(self) -> None:
+        """Guard run hours after the removal: the queue kept failing meanwhile.
+
+        On a busy queue each workflow of each failed group is its own run, so
+        more than a page of newer failures lands between the ejection and the
+        re-enqueue. Pulp#9048 was refused this way about an hour after its
+        ejection.
+        """
+        later = [self.decoy(i, "2026-09-25T09:%02d:00Z" % i) for i in range(40)]
+        self.declare(self.certifies())
+        code, message, calls = self.run_guard_against([*later, self.ejecting_run()])
+        self.assertEqual(code, 0, message)
+        self.assertIn("batch attributor certified", message)
+        listings = self.listing_calls(calls)
+        self.assertEqual(len(listings), 1)
+        self.assertIn("created=2026-09-24T22:12:51Z..2026-09-25T04:17:51Z", listings[0])
+        self.assertIn("event=merge_group&status=failure", listings[0])
+        # The jobs read is unchanged: the resolved run, one large page.
+        self.assertTrue(
+            any(f"runs/{self.RUN_ID}/jobs?per_page=100" in call[1] for call in calls), calls
+        )
+
+    def test_a_run_named_for_this_pr_is_found_on_a_later_page(self) -> None:
+        """More in-window failures than one page: the named run is on page 2."""
+        busier = [
+            self.decoy(i, "2026-09-25T04:%02d:%02dZ" % (7 + i // 60, i % 60)) for i in range(150)
+        ]
+        self.assertTrue(all(run["created_at"] <= self.REMOVED_AT for run in busier))  # control
+        self.declare(self.certifies())
+        code, message, calls = self.run_guard_against([*busier, self.ejecting_run()])
+        self.assertEqual(code, 0, message)
+        listings = self.listing_calls(calls)
+        self.assertEqual(len(listings), 2)
+        self.assertIn("&page=2", listings[1])
+        # Found by its queue branch name, so no ancestry probe was spent.
+        self.assertTrue(all("compare" not in "".join(call) for call in calls), calls)
+
+    def test_nothing_in_the_window_refuses(self) -> None:
+        """A run from before the window cannot be the ejector, named or not."""
+        stale = copy.deepcopy(self.ejecting_run())
+        stale["created_at"] = "2026-09-24T20:00:00Z"
+        later = [self.decoy(i, "2026-09-25T09:%02d:00Z" % i) for i in range(5)]
+        self.declare(self.certifies())
+        code, message, calls = self.run_guard_against([stale, *later])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot be identified", message)
+        self.assertIn("created 2026-09-24T22:12:51Z..2026-09-25T04:17:51Z", message)
+        self.assertIn("Push a fix first", message)
+        self.assertFalse((self.root / "argv").exists())
+
+    def test_the_listing_read_cap_is_respected(self) -> None:
+        """A window busier than the cap refuses rather than reading forever."""
+        cap = guard.MERGE_GROUP_RUN_MAX_PAGES * guard.MERGE_GROUP_RUN_PAGE
+        # Every decoy is inside the window and newer than the ejecting run.
+        crowd = [
+            self.decoy(i, "2026-09-25T04:%02d:%02dZ" % (7 + i % 5, i % 60))
+            for i in range(cap + 50)
+        ]
+        self.declare(self.certifies())
+        code, message, calls = self.run_guard_against([*crowd, self.ejecting_run()])
+        self.assertEqual(code, 1)
+        self.assertIn("read cap reached", message)
+        self.assertEqual(len(self.listing_calls(calls)), guard.MERGE_GROUP_RUN_MAX_PAGES)
+        probes = [call for call in calls if "compare" in "".join(call)]
+        self.assertEqual(len(probes), guard.MERGE_GROUP_ANCESTRY_PROBES)
+        self.assertFalse((self.root / "argv").exists())
 
     def test_jobs_are_read_without_gh_paginate(self) -> None:
         """`gh api --paginate` concatenates one object per page, which is not JSON."""
