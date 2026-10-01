@@ -155,6 +155,14 @@ the verdict:
  "verdict_owner": "required-checks", "opt_in_targets": ["mac"]}
 ```
 
+The pre-push changed-surface shadow (trusted
+`[changed_surface_prepush] mode = "shadow_compare"`) still runs on such a ship:
+it plans and runs nothing, so it takes its selector policy from every declared
+target, opt-in ones included. The delegated output says which happened, as
+`prepush_shadow` (`planned` with the target and receipt digest, or
+`not planned` with `disabled` or `declined`), so "planned, not run" is never
+confused with "not planned".
+
 Wait on the outcome with `shipyard wait pr <n>` or GitHub itself.
 `shipyard run` has nothing to delegate to, so with only opt-in targets and no
 `--targets` it exits 2 and asks for one.

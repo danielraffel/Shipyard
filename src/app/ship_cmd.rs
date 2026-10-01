@@ -170,9 +170,16 @@ pub(super) fn ship_command<W: Write>(
         maybe_auto_create_base_branch(cwd, &args.base, config, args.gh_command.as_deref());
     }
     let lane_policy = resolve_lane_policy(config, cwd);
-    let prepush_enabled = args.pr.is_none()
-        && !targets.is_empty()
-        && prepush_changed_surface::shadow_enabled(config)?;
+    let prepush_enabled = args.pr.is_none() && prepush_changed_surface::shadow_enabled(config)?;
+    // The shadow plans and runs nothing, so it chooses its selector policy
+    // from every declared target, opt-in ones included. Restricting it to the
+    // selected set would silence the planner on a repository whose only
+    // policy-bearing target is opt-in.
+    let declared_targets = if prepush_enabled {
+        prepush_policy_targets(config)?
+    } else {
+        Vec::new()
+    };
     let prepush_base = if prepush_enabled {
         match find_pr_for_branch(config, cwd, args.gh_command.as_deref(), &branch) {
             Ok(Some(info)) => Some(info.base),
@@ -196,11 +203,19 @@ pub(super) fn ship_command<W: Write>(
                 &repo,
                 base,
                 &branch,
-                &targets,
+                &declared_targets,
             )
         })?
     } else {
         None
+    };
+    let mut prepush_shadow = match (&prospective_push, prepush_enabled) {
+        (Some(push), _) => PrepushShadow::Planned {
+            target: push.target().to_owned(),
+            receipt_digest: push.receipt_digest().to_owned(),
+        },
+        (None, true) => PrepushShadow::Declined,
+        (None, false) => PrepushShadow::Disabled,
     };
     let pr_context = resolve_pr_context(
         config,
@@ -228,6 +243,7 @@ pub(super) fn ship_command<W: Write>(
         // A pre-push optimization can never prevent or weaken the ordinary
         // downstream full path. Identity/result ambiguity merely declines its
         // future dedupe hint.
+        prepush_shadow = PrepushShadow::Declined;
         if json_mode {
             let _ = crate::writer_domain_lease::write_stderr(format_args!(
                 "warning: pre-push changed-surface receipt not reusable: {}",
@@ -320,7 +336,13 @@ pub(super) fn ship_command<W: Write>(
     )?;
 
     if targets.is_empty() {
-        return render_required_checks_delegation(config, pr_context.number, json_mode, stdout);
+        return render_required_checks_delegation(
+            config,
+            pr_context.number,
+            &prepush_shadow,
+            json_mode,
+            stdout,
+        );
     }
 
     let metadata_authority_receipt = metadata_authority::observe_and_authorize(
@@ -525,6 +547,62 @@ pub(super) fn ship_command<W: Write>(
     Ok(render_state.exit_code())
 }
 
+/// Targets the pre-push shadow may take its selector policy from: every
+/// declared target, opt-in ones included, never only the selected set.
+fn prepush_policy_targets(config: &LoadedConfig) -> Result<Vec<ResolvedTarget>, CliFailure> {
+    resolve_targets(config, ValidationMode::Full)
+        .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+/// What the pre-push changed-surface shadow did for this ship.
+///
+/// Reported with a delegated ship so "planned, not run" is distinguishable
+/// from "never planned": the shadow plans from the declared targets, opt-in
+/// ones included, even when none of them runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PrepushShadow {
+    /// No trusted shadow mode, or an explicit `--pr` ship.
+    Disabled,
+    /// Enabled, but an observation or verification ambiguity declined it.
+    Declined,
+    /// A prospective selection receipt was written and verified.
+    Planned {
+        target: String,
+        receipt_digest: String,
+    },
+}
+
+impl PrepushShadow {
+    fn line(&self) -> String {
+        match self {
+            Self::Disabled => "pre-push changed-surface shadow: not planned (disabled)".to_owned(),
+            Self::Declined => "pre-push changed-surface shadow: not planned (declined)".to_owned(),
+            Self::Planned {
+                target,
+                receipt_digest,
+            } => format!(
+                "pre-push changed-surface shadow: planned for {target}, not run (receipt {})",
+                receipt_digest.get(..12).unwrap_or(receipt_digest)
+            ),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Disabled => serde_json::json!({"planned": false, "reason": "disabled"}),
+            Self::Declined => serde_json::json!({"planned": false, "reason": "declined"}),
+            Self::Planned {
+                target,
+                receipt_digest,
+            } => serde_json::json!({
+                "planned": true,
+                "target": target,
+                "receipt_digest": receipt_digest,
+            }),
+        }
+    }
+}
+
 /// Report a ship that validates nothing locally because every configured
 /// target is opt-in.
 ///
@@ -536,6 +614,7 @@ pub(super) fn ship_command<W: Write>(
 fn render_required_checks_delegation<W: Write>(
     config: &LoadedConfig,
     pr: u64,
+    prepush_shadow: &PrepushShadow,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -556,6 +635,7 @@ fn render_required_checks_delegation<W: Write>(
                     serde_json::to_value(&opt_in)
                         .map_err(|error| CliFailure::new(1, error.to_string()))?,
                 ),
+                ("prepush_shadow", prepush_shadow.to_json()),
             ]),
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -569,6 +649,8 @@ fn render_required_checks_delegation<W: Write>(
             writeln!(stdout, "  {}", target.line())
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
+        writeln!(stdout, "  {}", prepush_shadow.line())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(ExitCode::SUCCESS)
 }

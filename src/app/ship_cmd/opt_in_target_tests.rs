@@ -394,6 +394,7 @@ fn delegated_human_output_names_each_opt_in_target() {
     super::render_required_checks_delegation(
         &config_from(std::path::Path::new("/nonexistent"), OPT_IN_MAC),
         88,
+        &super::PrepushShadow::Disabled,
         false,
         &mut out,
     )
@@ -403,4 +404,103 @@ fn delegated_human_output_names_each_opt_in_target() {
         text.contains("  mac: opt-in, not run (GitHub required checks decide)"),
         "{text}"
     );
+}
+
+#[cfg(unix)]
+fn delegated_prepush_shadow(shadow_on: bool) -> serde_json::Value {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let remote = temp.path().join("remote.git");
+    seed_repo_with_local_origin(&repo, &remote);
+    let gh = temp.path().join("gh");
+    fake_gh(
+        &gh,
+        &format!(
+            r#"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  head=$(git -C "{}" rev-parse HEAD)
+  echo '[{{"number":88,"url":"https://github.com/o/r/pull/88","title":"Existing PR","state":"OPEN","headRefName":"feature/test","headRefOid":"'"$head"'","baseRefName":"main"}}]'
+  exit 0
+fi
+echo "unexpected gh args: $@" >&2
+exit 2
+"#,
+            repo.display()
+        ),
+    );
+    std::fs::create_dir_all(temp.path().join("global")).expect("global dir");
+    if shadow_on {
+        std::fs::write(
+            temp.path().join("global").join("config.toml"),
+            "[changed_surface_prepush]\nmode = 'shadow_compare'\n",
+        )
+        .expect("trusted config");
+    }
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let mut stdout = Vec::new();
+    let code = ship_command(
+        ship_args(None, Some(gh)),
+        &config_from(temp.path(), OPT_IN_MAC),
+        &repo,
+        &paths,
+        true,
+        &mut stdout,
+    )
+    .expect("ship command");
+    assert_eq!(
+        code,
+        ExitCode::SUCCESS,
+        "{}",
+        String::from_utf8_lossy(&stdout)
+    );
+    assert!(!paths.state_dir.join("queue.json").exists());
+    let output: serde_json::Value = serde_json::from_slice(&stdout).expect("json");
+    assert_eq!(output["validation"], "delegated");
+    output["prepush_shadow"].clone()
+}
+
+#[test]
+#[cfg(unix)]
+fn delegated_ship_still_attempts_the_prepush_shadow() {
+    // The fixture origin is a local path, so the shadow is attempted and then
+    // declines at observation; "declined" proves it was not gated off.
+    assert_eq!(
+        delegated_prepush_shadow(true),
+        serde_json::json!({"planned": false, "reason": "declined"})
+    );
+    // Control: with no trusted shadow mode it is reported as disabled.
+    assert_eq!(
+        delegated_prepush_shadow(false),
+        serde_json::json!({"planned": false, "reason": "disabled"})
+    );
+}
+
+#[test]
+fn prepush_shadow_lines_distinguish_planned_from_not_planned() {
+    let planned = super::PrepushShadow::Planned {
+        target: "mac".to_owned(),
+        receipt_digest: "0123456789abcdef".to_owned(),
+    };
+    assert_eq!(
+        planned.line(),
+        "pre-push changed-surface shadow: planned for mac, not run (receipt 0123456789ab)"
+    );
+    assert_eq!(planned.to_json()["planned"], true);
+    assert!(
+        super::PrepushShadow::Declined
+            .line()
+            .contains("not planned (declined)")
+    );
+}
+
+#[test]
+fn prepush_policy_targets_include_opt_in_targets() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let targets = super::prepush_policy_targets(&config_from(temp.path(), OPT_IN_MAC))
+        .expect("declared targets");
+    assert_eq!(names(&targets), vec!["mac"]);
 }
