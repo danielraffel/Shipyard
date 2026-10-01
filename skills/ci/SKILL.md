@@ -1,9 +1,31 @@
 ---
 name: ci
-description: Cross-platform CI coordination with Shipyard — validates, ships, manages queue, and runs cloud workflows
+description: Cross-platform CI coordination with Shipyard: validates, ships, manages queue, and runs cloud workflows. Also audits which Shipyard features a repository already has (shipyard pr flow, required checks, version/skill gates, merge queue, fast tier, receipt reuse, host classes, runner governance) and adopts the missing ones in dependency order.
 ---
 
 # CI Operations with Shipyard
+
+## Adopting Shipyard, or checking what a repository already has
+
+Before wiring any CI machinery into a repository (a PR gate, a merge queue, a
+test tier, a receipt, a runner router), run the read-only audit from a checkout
+of that repository:
+
+```sh
+skills/ci/scripts/adoption_audit.sh OWNER/REPO [BASE]
+```
+
+It prints, per feature, whether it is configured (present / partial / absent /
+n/a / UNKNOWN) and, separately, whether it is proven (a non-zero effect on
+recently merged PRs), plus the next feature to adopt. Every probe has a
+control, so an unreadable surface reads UNKNOWN rather than absent. Only
+features a feature-proof audit showed working are recommended; broken or
+unproven ones are listed as "not ready" with the reason, so you can detect
+them without rebuilding or relying on them. Per-feature detect, adopt
+and verify steps, the dependency order, and which parts are still Pulp-only
+live in [references/adoption.md](references/adoption.md). Detect first: the
+costly failure is rebuilding something already wired, or adding a queue before
+the required checks it depends on.
 
 ## Webhook repository identity
 
@@ -176,6 +198,15 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+## Protected-state caches take the writer-domain lease too
+
+`gate_cost::cache::ReadCache` writes under the protected state tree
+(`metrics/gate-cost-cache/`), so creating the directory, storing an entry and
+pruning each hold `writer_domain_lease::acquire_for_protected_path`. Without it,
+a `shipyard metrics gate-cost` run during a Shipyard PR's macOS local lane made
+sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
+cannot be had the write is skipped and the cache stops writing for that run; a
+cold read is always correct. Any new cache in the state tree needs the same.
 
 ## Quick reference
 

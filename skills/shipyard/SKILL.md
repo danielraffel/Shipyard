@@ -214,6 +214,15 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+## Protected-state caches take the writer-domain lease too
+
+`gate_cost::cache::ReadCache` writes under the protected state tree
+(`metrics/gate-cost-cache/`), so creating the directory, storing an entry and
+pruning each hold `writer_domain_lease::acquire_for_protected_path`. Without it,
+a `shipyard metrics gate-cost` run during a Shipyard PR's macOS local lane made
+sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
+cannot be had the write is skipped and the cache stops writing for that run; a
+cold read is always correct. Any new cache in the state tree needs the same.
 
 ## First Steps
 
