@@ -16,10 +16,12 @@ timeout_secs = 1800
 
 The target can be used with `shipyard watch local` for a streamed workload or
 `shipyard run command` for a bounded command and evidence bundle. The latter
-records the exact source SHA, remote host, command, exit code, duration, log
-excerpt, and copied artifact hashes. SSH identity and options can be supplied
-through the normal target fields; credentials must remain in the user's SSH
-configuration or Shipyard's secret-file mechanism.
+records the caller-provided source SHA, remote host, command, exit code,
+duration, log excerpt, and copied artifact metadata. Verify the remote
+checkout head and compute final executable, artifact, and log hashes separately
+when provenance matters. SSH identity and options can be supplied through the
+normal target fields; credentials must remain in the user's SSH configuration
+or Shipyard's secret-file mechanism.
 
 ## Pilot status
 
@@ -44,12 +46,23 @@ target for Pulp experiments and remote build/test work. It does not replace
 native macOS, Windows, Apple GPU/audio, signing, or other physical-machine
 gates.
 
+A follow-up exact-head Pulp Linux experiment independently verified the remote
+checkout at `49d4de57ebc7a501878f5f574264b4bff8540de3`. The governed
+`pulp-cli` build completed on a 2-vCPU VM after dependency setup; a same-VM
+warm rebuild completed in 0.23 seconds with an identical executable hash. A
+GitHub-hosted Ubuntu/GCC core-library control at the same head also passed in
+about 11m51s. These results support optional SSH use and cache reuse on a
+retained VM, but do not establish VM cost savings or justify automatic
+provider lifecycle management.
+
 ## Follow-on plan
 
-1. Run one bounded Pulp Linux workload twice on the VM and once on the local
-   control target. Record queue/start/command/teardown time separately and
-   bind the result to exact source, executable, artifact, and log hashes.
-2. If persistent caches measurably help, add a typed `provider = "exe.dev"`
+1. Keep the existing SSH path optional and user-managed. A retained VM may be
+   useful for trusted repeated Linux work, but each experiment must record
+   setup, command, cache, disk, transfer, and teardown evidence within the
+   trial allocation.
+2. If future fresh-VM and cost measurements justify lifecycle management, add
+   a typed `provider = "exe.dev"`
    lifecycle adapter. It should create or reuse by job ID, wait for SSH
    readiness, enforce CPU/RAM/disk admission, apply a bounded TTL, and delete
    only resources it owns.
