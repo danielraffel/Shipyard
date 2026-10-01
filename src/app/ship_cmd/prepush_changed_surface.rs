@@ -18,10 +18,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::super::CliFailure;
-use super::super::changed_surface_cmd::{ChangedSurfacePlanArgs, observe_changed_surface_plan};
+use super::super::changed_surface_cmd::{
+    ChangedSurfacePlanArgs, observe_changed_surface_plan, read_base_file,
+};
 use crate::changed_surface::{
     ChangedSurfacePolicy, ExactHeadInput, ObservationStatus, PlannedSuite, ProtectedRefStatus,
-    SelectionReceipt, plan_selection, policy_digest, policy_from_toml,
+    SelectionReceipt, plan_selection, policy_digest, policy_from_base,
 };
 use crate::config::LoadedConfig;
 use crate::executor::dispatch::ResolvedTarget;
@@ -281,7 +283,9 @@ fn observe_prospective(
         ],
     )?;
     let target = unique_policy_target(&protected_config, targets)?;
-    let policy = policy_from_toml(&protected_config, &target);
+    let policy = policy_from_base(&protected_config, &target, |path| {
+        read_base_file(cwd, &branch.commit.sha, path)
+    });
     let authenticated_policy = policy.as_ref().ok()?;
     let (hook_path, hook_sha256) =
         observe_hook_implementation(cwd, &branch.commit.sha, authenticated_policy)?;
@@ -798,8 +802,10 @@ fn verify_hook_implementation(cwd: &Path, prospective: &ProspectivePush) -> Resu
         ],
     )
     .ok_or_else(|| CliFailure::new(1, "re-read protected hook policy"))?;
-    let policy = policy_from_toml(&protected_config, &prospective.receipt.target)
-        .map_err(|error| CliFailure::new(1, format!("re-read protected hook policy: {error}")))?;
+    let policy = policy_from_base(&protected_config, &prospective.receipt.target, |path| {
+        read_base_file(cwd, &prospective.receipt.protected_base_sha, path)
+    })
+    .map_err(|error| CliFailure::new(1, format!("re-read protected hook policy: {error}")))?;
     let (path, digest) =
         observe_hook_implementation(cwd, &prospective.receipt.protected_base_sha, &policy)
             .ok_or_else(|| {
