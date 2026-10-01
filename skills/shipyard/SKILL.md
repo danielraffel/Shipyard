@@ -3220,6 +3220,15 @@ Namespace is optional and account-dependent. When Namespace is unavailable,
 Shipyard should default to GitHub-hosted Linux/macOS/Windows runners or explicit
 self-hosted GitHub Actions labels. Do not assume `nsc` access, and do not route
 new Shipyard CI to Namespace unless the user explicitly confirms active access.
+
+exe.dev VMs are currently supported through ordinary POSIX SSH targets. Use
+them for disposable or persistent Linux experiments with `shipyard watch local`
+or `shipyard run command`; exe.dev owns VM lifecycle and account capacity in
+this mode. Do not treat an exe.dev VM as a macOS, Windows, GPU, signing, or
+physical-device gate. A first-class lifecycle provider requires explicit
+ownership, TTL, readiness, capacity, and teardown evidence and remains a
+follow-on to a measured SSH pilot.
+
 Do not add hidden repo-variable fallbacks to local/self-hosted macOS runners:
 local runner use should be explicit via workflow-dispatch selector inputs so
 default GitHub-hosted runs cannot be stolen by stale local runner variables.
