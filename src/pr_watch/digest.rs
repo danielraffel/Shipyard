@@ -109,6 +109,48 @@ pub struct DigestFlag {
     pub count: usize,
     /// Their kinds, highest severity first.
     pub kinds: Vec<String>,
+    /// Hand-back owner observation, when the hand-back ran. `unowned` marks
+    /// tier 2: the owner has not been live for the configured time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<DigestOwner>,
+}
+
+/// The owner of a digest line's pull request, as the hand-back last saw it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigestOwner {
+    /// `live`, `dead`, `unknown`, `unreachable`, or `none`.
+    pub state: String,
+    /// Not live for at least `unowned_after_hours`.
+    pub unowned: bool,
+    /// Agent, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Host as stamped, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Session id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Resume hint for a person (never run by Shipyard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    /// Worktree path, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+fn digest_owner(ledger: &Ledger, pr: u64) -> Option<DigestOwner> {
+    let record = ledger.handback.owners.get(&pr)?;
+    let owner = record.owner.as_ref();
+    Some(DigestOwner {
+        state: record.state.clone(),
+        unowned: record.unowned,
+        agent: owner.map(|o| o.agent.clone()),
+        host: owner.and_then(|o| o.host.clone()),
+        session: owner.map(|o| o.session.clone()),
+        resume: owner.and_then(|o| o.resume.clone()),
+        path: owner.and_then(|o| o.path.clone()),
+    })
 }
 
 /// One test failing across pull requests.
@@ -253,6 +295,7 @@ pub fn payload(
                     .iter()
                     .map(|entry| entry.kind.as_str().to_owned())
                     .collect(),
+                owner: digest_owner(ledger, *pr),
             })
         })
         .collect();

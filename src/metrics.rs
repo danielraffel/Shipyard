@@ -1,6 +1,10 @@
 #![allow(missing_docs)]
 
+pub mod freshness;
+pub mod github_import;
+pub mod import_schedule;
 pub mod job_name;
+pub mod project_key;
 pub mod proxy;
 mod proxy_store;
 
@@ -12,6 +16,8 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub use project_key::ProjectKey;
 
 /// Durable Shipyard metrics store backed by `SQLite`.
 #[derive(Debug)]
@@ -328,6 +334,14 @@ impl MetricsStore {
     ) -> Result<i64, Box<dyn std::error::Error>> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let conn = self.connect()?;
+        let (project, repo) =
+            project_key::normalize_for_write(&input.project, input.repo.as_deref());
+        let normalized = MetricRecordInput {
+            project,
+            repo,
+            ..input.clone()
+        };
+        let input = &normalized;
         let completed_at = input.completed_at.unwrap_or_else(Utc::now);
         let started_at = input
             .started_at
@@ -474,12 +488,16 @@ impl MetricsStore {
         let ts = value_str(value, "completed_at")
             .or_else(|| value_str(value, "started_at"))
             .map_or_else(|| Utc::now().to_rfc3339(), str::to_owned);
+        let (project, repo) = project_key::normalize_for_write(
+            value_str(value, "project").unwrap_or("unknown"),
+            value_str(value, "repo"),
+        );
         let run_id = insert_run(
             &conn,
             &RunInsert {
                 ts,
-                project: value_str(value, "project").unwrap_or("unknown").to_owned(),
-                repo: value_str(value, "repo").map(str::to_owned),
+                project,
+                repo,
                 branch: value_str(value, "branch").map(str::to_owned),
                 sha: value_str(value, "sha").map(str::to_owned),
                 pr: value_i64(value, "pr"),
@@ -814,15 +832,18 @@ fn load_scorecard_samples(
     project: &str,
     cutoff: &str,
 ) -> Result<Vec<ScorecardSample>, rusqlite::Error> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(&format!(
         "SELECT job.status, job.total_ms, job.queue_ms, run.repo, run.pr
            FROM jobs job JOIN runs run ON run.id = job.run_id
-          WHERE run.project = ?1 AND job.completed_at IS NOT NULL
-            AND julianday(job.completed_at) >= julianday(?2)
+          WHERE {} AND job.completed_at IS NOT NULL
+            AND julianday(job.completed_at) >= julianday(?4)
           ORDER BY job.id",
-    )?;
+        project_key::sql_filter("run.project", "run.repo")
+    ))?;
+    let key = ProjectKey::parse(project);
+    let (any, short, full) = project_key::sql_params(key.as_ref());
     statement
-        .query_map(params![project, cutoff], |row| {
+        .query_map(params![any, short, full, cutoff], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -839,17 +860,20 @@ fn load_scorecard_cache_samples(
     project: &str,
     cutoff: &str,
 ) -> Result<Vec<bool>, rusqlite::Error> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(&format!(
         "SELECT step.cache_hit
            FROM steps step
            JOIN jobs job ON job.id = step.job_id
            JOIN runs run ON run.id = job.run_id
-          WHERE run.project = ?1 AND job.completed_at IS NOT NULL
-            AND julianday(job.completed_at) >= julianday(?2)
+          WHERE {} AND job.completed_at IS NOT NULL
+            AND julianday(job.completed_at) >= julianday(?4)
             AND step.cache_hit IS NOT NULL",
-    )?;
+        project_key::sql_filter("run.project", "run.repo")
+    ))?;
+    let key = ProjectKey::parse(project);
+    let (any, short, full) = project_key::sql_params(key.as_ref());
     statement
-        .query_map(params![project, cutoff], |row| row.get(0))?
+        .query_map(params![any, short, full, cutoff], |row| row.get(0))?
         .collect()
 }
 
@@ -1241,16 +1265,19 @@ fn load_jobs(
     conn: &Connection,
     project: Option<&str>,
 ) -> Result<Vec<MetricsJobRow>, Box<dyn std::error::Error>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT runs.project, runs.repo, runs.workflow, jobs.job, jobs.target, jobs.backend,
                 jobs.provider, machines.name, jobs.status, jobs.total_ms, jobs.completed_at,
                 jobs.external_id
          FROM jobs
          JOIN runs ON runs.id = jobs.run_id
          LEFT JOIN machines ON machines.id = jobs.machine_id
-         WHERE (?1 IS NULL OR runs.project = ?1)",
-    )?;
-    let rows = stmt.query_map(params![project], |row| {
+         WHERE {}",
+        project_key::sql_filter("runs.project", "runs.repo")
+    ))?;
+    let key = project.and_then(ProjectKey::parse);
+    let (any, short, full) = project_key::sql_params(key.as_ref());
+    let rows = stmt.query_map(params![any, short, full], |row| {
         Ok(MetricsJobRow {
             project: row.get(0)?,
             repo: row.get(1)?,
@@ -1273,7 +1300,7 @@ fn load_summary_inputs(
     conn: &Connection,
     project: Option<&str>,
 ) -> Result<Vec<SummaryInput>, Box<dyn std::error::Error>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT runs.project,
                 COALESCE(jobs.target, jobs.job, 'unknown'),
                 COALESCE(jobs.backend, 'unknown'),
@@ -1287,9 +1314,12 @@ fn load_summary_inputs(
          FROM jobs
          JOIN runs ON runs.id = jobs.run_id
          LEFT JOIN machines ON machines.id = jobs.machine_id
-         WHERE (?1 IS NULL OR runs.project = ?1)",
-    )?;
-    let rows = stmt.query_map(params![project], |row| {
+         WHERE {}",
+        project_key::sql_filter("runs.project", "runs.repo")
+    ))?;
+    let key = project.and_then(ProjectKey::parse);
+    let (any, short, full) = project_key::sql_params(key.as_ref());
+    let rows = stmt.query_map(params![any, short, full], |row| {
         let completed_raw: Option<String> = row.get(7)?;
         let labels_raw: Option<String> = row.get(9)?;
         Ok(SummaryInput {
@@ -1980,6 +2010,32 @@ mod tests {
         let rows = store.list(Some("pulp"), 10).expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].provider.as_deref(), Some("tart-macos"));
+    }
+
+    #[test]
+    fn a_slug_project_is_stored_as_the_short_key_plus_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        store
+            .record(&MetricRecordInput {
+                project: "Generous-Corp/pulp".to_owned(),
+                job: "macos".to_owned(),
+                duration_ms: 1,
+                status: "success".to_owned(),
+                ..MetricRecordInput::default()
+            })
+            .unwrap();
+        let rows = store.list(None, 10).unwrap();
+        assert_eq!(rows[0].project, "pulp");
+        assert_eq!(rows[0].repo.as_deref(), Some("Generous-Corp/pulp"));
+        assert_eq!(store.list(Some("pulp"), 10).unwrap().len(), 1);
+        assert_eq!(store.list(Some("generous-corp/pulp"), 10).unwrap().len(), 1);
+        assert!(
+            store
+                .list(Some("someone-else/pulp"), 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

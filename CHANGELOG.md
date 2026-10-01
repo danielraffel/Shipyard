@@ -3,6 +3,38 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02380"></a>
+## [0.238.0] - 2026-09-30
+
+- fix/test flakes ([#665](https://github.com/danielraffel/Shipyard/pull/665))
+
+<a id="v02370"></a>
+## [0.237.0] - 2026-09-30
+
+- fix/metrics import staleness ([#657](https://github.com/danielraffel/Shipyard/pull/657))
+
+<a id="v02361"></a>
+## [0.236.1] - 2026-09-30
+
+- fix/pr watch digest toggle ([#664](https://github.com/danielraffel/Shipyard/pull/664))
+
+<a id="v02360"></a>
+## [0.236.0] - 2026-09-30
+
+- feature/landing verdict line ([#661](https://github.com/danielraffel/Shipyard/pull/661))
+
+<a id="v02350"></a>
+## [0.235.0] - 2026-09-30
+
+- feature/pr watch handback ([#660](https://github.com/danielraffel/Shipyard/pull/660))
+
+<a id="v02340"></a>
+## [0.234.0] - 2026-09-30
+
+- fix/governance policy from base ([#658](https://github.com/danielraffel/Shipyard/pull/658))
+- fix/guard ejecting batch window ([#650](https://github.com/danielraffel/Shipyard/pull/650))
+- fix/guard attributor env ([#649](https://github.com/danielraffel/Shipyard/pull/649))
+
 <a id="v02330"></a>
 ## [0.233.0] - 2026-09-30
 
@@ -1711,6 +1743,12 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.238.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.238.0
+[0.237.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.237.0
+[0.236.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.236.1
+[0.236.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.236.0
+[0.235.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.235.0
+[0.234.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.234.0
 [0.233.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.233.0
 [0.232.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.232.1
 [0.232.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.232.0

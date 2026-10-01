@@ -216,18 +216,40 @@ fn completed_by(check: &CheckFact, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
     check.completed_at.filter(|completed| *completed <= at)
 }
 
-/// Flag 1: one flag per (pull request, required check), listing every
-/// failing test that repeated on that check.
-#[allow(clippy::too_many_lines)]
-fn repeat_test_failure(
+/// One failing test (or error signature) that repeated on a required check of
+/// one pull request: the structured form of flag 1, shared with the landing
+/// verdict so both surfaces call the same failure a repeat.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatFinding {
+    /// Required check (job) name.
+    pub check: String,
+    /// Normalised failing test name or error signature.
+    pub signature: String,
+    /// Distinct failing runs (check-run ids) that carried it.
+    pub runs: usize,
+    /// Where it failed: short head SHAs, or `merge group <run id>`, in
+    /// first-seen order.
+    pub lanes: Vec<String>,
+    /// Other pull requests whose same check failed with the same signature
+    /// inside the pre-existing window.
+    pub other_prs: BTreeSet<u64>,
+    /// Whether [`RepeatFinding::other_prs`] reaches the pre-existing
+    /// threshold, making this a main/shared failure rather than the pull
+    /// request's own.
+    pub shared: bool,
+}
+
+/// Every repeated failing signature of `pr` at `at`, on required checks whose
+/// latest settled outcome is still red, ordered by check then signature.
+#[must_use]
+pub fn repeat_findings(
     history: &RepoHistory,
     failures: &BTreeMap<u64, Vec<FailureRecord<'_>>>,
-    pr: &PrHistory,
-    head: &str,
+    pr: u64,
     at: DateTime<Utc>,
     thresholds: &Thresholds,
-) -> Vec<Flag> {
-    let Some(own) = failures.get(&pr.number) else {
+) -> Vec<RepeatFinding> {
+    let Some(own) = failures.get(&pr) else {
         return Vec::new();
     };
     // check -> signature -> the settled failing runs that carried it.
@@ -245,76 +267,98 @@ fn repeat_test_failure(
                 .push(record);
         }
     }
-    if by_check.is_empty() {
-        return Vec::new();
-    }
-    let mut flags = Vec::new();
+    let mut findings = Vec::new();
     for (name, signatures) in by_check {
-        if !still_red(history, pr.number, name, at) {
+        if !still_red(history, pr, name, at) {
             continue;
         }
-        // (signature, runs, lanes, other PRs) for every repeated signature.
-        let mut own_code = Vec::new();
-        let mut pre_existing = Vec::new();
-        let mut lanes: Vec<String> = Vec::new();
         for (signature, records) in signatures {
             let runs: BTreeSet<u64> = records.iter().map(|record| record.check.id).collect();
             if runs.len() < thresholds.repeat_failures {
                 continue;
             }
+            let mut lanes: Vec<String> = Vec::new();
             for record in &records {
                 if !lanes.contains(&record.lane) {
                     lanes.push(record.lane.clone());
                 }
             }
-            let others = other_prs_failing(failures, pr.number, name, signature, at, thresholds);
-            if others.len() >= thresholds.pre_existing_other_prs {
-                pre_existing.push((signature, runs.len(), others));
-            } else {
-                own_code.push((signature, runs.len()));
+            let other_prs = other_prs_failing(failures, pr, name, signature, at, thresholds);
+            let shared = other_prs.len() >= thresholds.pre_existing_other_prs;
+            findings.push(RepeatFinding {
+                check: name.to_owned(),
+                signature: signature.to_owned(),
+                runs: runs.len(),
+                lanes,
+                other_prs,
+                shared,
+            });
+        }
+    }
+    findings
+}
+
+/// Flag 1: one flag per (pull request, required check), listing every
+/// failing test that repeated on that check.
+fn repeat_test_failure(
+    history: &RepoHistory,
+    failures: &BTreeMap<u64, Vec<FailureRecord<'_>>>,
+    pr: &PrHistory,
+    head: &str,
+    at: DateTime<Utc>,
+    thresholds: &Thresholds,
+) -> Vec<Flag> {
+    let findings = repeat_findings(history, failures, pr.number, at, thresholds);
+    let mut by_check: BTreeMap<&str, Vec<&RepeatFinding>> = BTreeMap::new();
+    for finding in &findings {
+        by_check
+            .entry(finding.check.as_str())
+            .or_default()
+            .push(finding);
+    }
+    let mut flags = Vec::new();
+    for (name, found) in by_check {
+        let mut lanes: Vec<String> = Vec::new();
+        for finding in &found {
+            for lane in &finding.lanes {
+                if !lanes.contains(lane) {
+                    lanes.push(lane.clone());
+                }
             }
         }
-        if own_code.is_empty() && pre_existing.is_empty() {
-            continue;
-        }
+        let own_code: Vec<&&RepeatFinding> = found.iter().filter(|f| !f.shared).collect();
+        let pre_existing: Vec<&&RepeatFinding> = found.iter().filter(|f| f.shared).collect();
         let shared = own_code.is_empty();
+        let mut related: BTreeSet<u64> = BTreeSet::new();
+        for finding in &pre_existing {
+            related.extend(&finding.other_prs);
+        }
         let (shared_tests, related_prs): (Vec<String>, Vec<u64>) = if shared {
-            let mut related: BTreeSet<u64> = BTreeSet::new();
-            for (_, _, prs) in &pre_existing {
-                related.extend(prs);
-            }
             (
-                pre_existing
-                    .iter()
-                    .map(|(signature, _, _)| (*signature).to_owned())
-                    .collect(),
-                related.into_iter().collect(),
+                pre_existing.iter().map(|f| f.signature.clone()).collect(),
+                related.iter().copied().collect(),
             )
         } else {
             (Vec::new(), Vec::new())
         };
         let (verdict, mut evidence) = if shared {
-            let mut others: BTreeSet<u64> = BTreeSet::new();
-            for (_, _, prs) in &pre_existing {
-                others.extend(prs);
-            }
             let tests = pre_existing
                 .iter()
-                .map(|(signature, runs, _)| format!("`{signature}` ({runs} runs)"))
+                .map(|f| format!("`{}` ({} runs)", f.signature, f.runs))
                 .collect();
             (
                 "failing on main/pre-existing",
                 format!(
                     "`{name}` failed {} repeatedly, but the same test(s) also failed on {} in the last {}h",
                     listed(tests),
-                    listed(others.iter().map(|pr| format!("#{pr}")).collect()),
+                    listed(related.iter().map(|pr| format!("#{pr}")).collect()),
                     thresholds.pre_existing_window_hours
                 ),
             )
         } else {
             let tests = own_code
                 .iter()
-                .map(|(signature, runs)| format!("`{signature}` ({runs} runs)"))
+                .map(|f| format!("`{}` ({} runs)", f.signature, f.runs))
                 .collect();
             let mut text = format!("`{name}` failed {} repeatedly", listed(tests));
             if !pre_existing.is_empty() {
@@ -358,6 +402,21 @@ fn still_red(history: &RepoHistory, pr: u64, name: &str, at: DateTime<Utc>) -> b
         .filter_map(|record| completed_by(record.check, at).map(|time| (time, record)))
         .max_by_key(|(time, record)| (*time, record.check.id))
         .is_some_and(|(_, record)| record.check.failed())
+}
+
+/// Other pull requests whose required `name` check failed with `signature`
+/// inside the pre-existing window before `at`: the flag-1 shared-failure test,
+/// for callers that hold a single failure rather than a repeat.
+#[must_use]
+pub fn prs_failing_signature(
+    failures: &BTreeMap<u64, Vec<FailureRecord<'_>>>,
+    pr: u64,
+    name: &str,
+    signature: &str,
+    at: DateTime<Utc>,
+    thresholds: &Thresholds,
+) -> BTreeSet<u64> {
+    other_prs_failing(failures, pr, name, signature, at, thresholds)
 }
 
 /// Other pull requests whose `name` check failed with `signature` within the
