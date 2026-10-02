@@ -1231,7 +1231,27 @@ impl GhOutput {
     }
 }
 
+/// Run one `gh` command. A credential GitHub rejects with HTTP 401 is
+/// dropped from the token cache and the command retried once with a fresh
+/// mint; a second rejection is returned as it is.
 fn run_gh(
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> Result<GhOutput, RegistrarError> {
+    let output = run_gh_once(client, cwd, gh_binary, args, stdin)?;
+    if output.status == 0 || !crate::gh::is_rejected_credential(&output.combined_output()) {
+        return Ok(output);
+    }
+    client
+        .forget_cached_token(cwd)
+        .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))?;
+    run_gh_once(client, cwd, gh_binary, args, stdin)
+}
+
+fn run_gh_once(
     client: &GhClient,
     cwd: &Path,
     gh_binary: Option<&Path>,
@@ -1341,6 +1361,71 @@ mod tests {
         let registrar = Registrar::new(temp.path());
         assert_eq!(registrar.all().get("generous-corp/pulp"), Some(&17));
         assert!(!registrar.all().contains_key("Generous-Corp/PuLp"));
+    }
+
+    /// GitHub rejects the first minted token (as it would a revoked one) and
+    /// accepts the next: the command is retried once with a fresh mint.
+    #[cfg(unix)]
+    #[test]
+    fn a_rejected_cached_token_is_reminted_once_and_a_second_rejection_surfaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mints = temp.path().join("mints");
+        let helper = temp.path().join("token-helper");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf x >> '{mints}'\nn=$(wc -c < '{mints}' | tr -d ' ')\nprintf '{{\"token\":\"ghs_mint_%s\",\"expires_at\":\"2099-01-01T00:00:00Z\"}}\\n' \"$n\"\n",
+                mints = mints.display()
+            ),
+        )
+        .expect("helper");
+        let mut permissions = fs::metadata(&helper).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        fs::set_permissions(&helper, permissions).expect("chmod");
+        // `sh api ...`: only the second mint is accepted.
+        fs::write(
+            temp.path().join("api"),
+            "#!/bin/sh\nif [ \"$GH_TOKEN\" = ghs_mint_2 ]; then printf ok; else printf 'gh: Bad credentials (HTTP 401)\\n' >&2; exit 1; fi\n",
+        )
+        .expect("gh stub");
+        let config = crate::config::LoadedConfig {
+            data: format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [\"{}\", \"{{repo_slug}}\"]\n",
+                helper.display()
+            )
+            .parse::<toml::Table>()
+            .expect("toml"),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: crate::config::LocalOverlaySource::None,
+        };
+        let client = crate::gh::GhClient::from_loaded_config(&config)
+            .expect("client")
+            .with_repo_override("owner/rejected")
+            .expect("repo");
+        let sh = PathBuf::from("/bin/sh");
+
+        let first = super::run_gh(&client, temp.path(), Some(&sh), &["api"], None).expect("run");
+        assert_eq!(first.status, 0, "{first:?}");
+        assert_eq!(first.stdout, "ok");
+        assert_eq!(fs::read_to_string(&mints).expect("mints"), "xx");
+
+        // Cached ghs_mint_2 is accepted with no further mint.
+        let again = super::run_gh(&client, temp.path(), Some(&sh), &["api"], None).expect("run");
+        assert_eq!(again.status, 0);
+        assert_eq!(fs::read_to_string(&mints).expect("mints"), "xx");
+
+        // Every token rejected: exactly one retry, then the failure surfaces.
+        fs::write(
+            temp.path().join("api"),
+            "#!/bin/sh\nprintf 'gh: Bad credentials (HTTP 401)\\n' >&2; exit 1\n",
+        )
+        .expect("gh stub");
+        let rejected = super::run_gh(&client, temp.path(), Some(&sh), &["api"], None).expect("run");
+        assert_ne!(rejected.status, 0);
+        assert!(rejected.stderr.contains("HTTP 401"));
+        assert_eq!(fs::read_to_string(&mints).expect("mints"), "xxx");
     }
 
     #[cfg(unix)]

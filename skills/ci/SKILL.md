@@ -1105,7 +1105,9 @@ delivery log) writes one `rejected webhook delivery <guid>` line with
 its event kind, reason, and body bytes received against Content-Length to
 `daemon/daemon.log`, so a refusal is visible on the host. If every delivery in the hook's log is HTTP 502
 while the daemon still shows LISTEN, the listener thread is wedged: run
-`sample <daemon pid>` and look for it parked on a lock. A `shipyard wait` that
+`sample <daemon pid>` and look for it parked on a lock. `shipyard daemon
+status --json` reports `gh_token_cache` mints and hits: mints near the number
+of repositories, not the number of API calls, means token reuse is working. A `shipyard wait` that
 reports `fallback_used: true` with the daemon running means the daemon
 dropped its subscription; since daemon subscribers lag rather than being
 evicted, the wait should instead see `{"type":"lagged"}` and re-snapshot.

@@ -120,6 +120,19 @@ than closing it. Keep
 `subscriber_survives_a_webhook_burst_while_draining_a_full_replay_slowly` and
 `daemon_lagged_notice_triggers_an_immediate_re_snapshot` passing.
 
+## App installation tokens are cached per process, in memory
+
+`token_command` tokens (the `ghapp token` App installation tokens) are cached
+in one process-wide map keyed by the expanded helper argv, so a daemon that
+builds a fresh `GhClient` per call mints once per repository per hour instead
+of once per API call (20 listings: 20 mints became 1 on m3). Nothing is
+written to disk and `TokenResolution`'s `Debug` redacts the token. A cached
+token is replaced 5 minutes before its `expires_at` (never later), and a
+token inside that window is used once but not cached. An HTTP 401 from GitHub
+in the registrar and wait paths drops the cache entry and retries once with a
+fresh mint; a second 401 surfaces. `daemon status` reports
+`gh_token_cache.mints` and `.hits`.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.
