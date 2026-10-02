@@ -313,6 +313,7 @@ fn observe_prospective(
         base_tracked_paths,
         base_tracked_paths_status: ObservationStatus::Complete,
         secondary_proofs: Vec::new(),
+        merge_base_plan: None,
     };
     let selection = plan_selection(&input, policy.clone()).ok()?;
     if !selection_is_transportable(&selection) {

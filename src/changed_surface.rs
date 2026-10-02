@@ -188,6 +188,18 @@ pub struct ExactHeadInput {
     pub base_tracked_paths_status: ObservationStatus,
     /// Exact-head target evidence available to satisfy typed secondary legs.
     pub secondary_proofs: Vec<SecondaryProof>,
+    /// Set when the head sits on an older commit of the protected branch than
+    /// the PR's recorded base: the plan then runs against that merge base
+    /// (its policy, tree and inventory) instead of refusing.
+    pub merge_base_plan: Option<MergeBasePlan>,
+}
+
+/// A plan against the head's merge base, which the recorded base descends from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeBasePlan {
+    /// Digest of the recorded base's selector policy, when it parsed. Promotion
+    /// to authoritative execution requires it to equal the merge base's.
+    pub recorded_base_policy_digest: Option<String>,
 }
 
 /// Exact-head target evidence offered for a typed secondary validation leg.
@@ -408,6 +420,13 @@ pub struct SelectionReceipt {
     /// rederived by the merge-authoritative exact-head planner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shadow_context_digest: Option<String>,
+    /// The merge base the plan ran against when it is older than the
+    /// recorded base (`pr_base_sha`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_base_sha: Option<String>,
+    /// The recorded base's selector policy digest for such a plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_base_policy_digest: Option<String>,
     /// Digest of the selector policy loaded from the authenticated base.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_digest: Option<String>,
@@ -450,6 +469,17 @@ pub struct SelectionReceipt {
     pub fallback_detail: Option<String>,
     /// Planner elapsed time, populated by the command boundary.
     pub elapsed_ms: u64,
+}
+
+impl SelectionReceipt {
+    /// Base the selection was computed against: the head's merge base when
+    /// the head is behind its recorded base, otherwise the recorded base.
+    #[must_use]
+    pub fn planned_base(&self) -> &str {
+        self.planned_base_sha
+            .as_deref()
+            .unwrap_or(&self.pr_base_sha)
+    }
 }
 
 /// Parse and validate a base-owned selector declaration from tracked TOML.
@@ -1075,7 +1105,11 @@ fn provenance_fallback(input: &ExactHeadInput, changed_paths: &[String]) -> Opti
     {
         return Some(FallbackReason::MergeBaseMismatch);
     }
-    if input.local_merge_base_sha != input.pr_base_sha {
+    // A head behind its recorded base plans against its own merge base; the
+    // observation proves that merge base is an ancestor of the recorded one.
+    // Any other disagreement, including a claimed merge-base plan whose merge
+    // base equals the recorded base, refuses.
+    if (input.local_merge_base_sha != input.pr_base_sha) != input.merge_base_plan.is_some() {
         return Some(FallbackReason::BasePolicyMismatch);
     }
     if input.remote_changed_paths_status == ObservationStatus::Incomplete
@@ -1397,6 +1431,14 @@ fn base_receipt(input: &ExactHeadInput, changed_paths: Vec<String>) -> Selection
         tree_sha: input.remote_tree_sha.clone(),
         changed_paths_digest: digest_lines(&changed_paths),
         shadow_context_digest: None,
+        planned_base_sha: input
+            .merge_base_plan
+            .as_ref()
+            .map(|_| input.local_merge_base_sha.clone()),
+        recorded_base_policy_digest: input
+            .merge_base_plan
+            .as_ref()
+            .and_then(|plan| plan.recorded_base_policy_digest.clone()),
         policy_digest: None,
         build_type: None,
         build_flags: Vec::new(),
@@ -1599,6 +1641,7 @@ mod tests {
             ],
             base_tracked_paths_status: ObservationStatus::Complete,
             secondary_proofs: Vec::new(),
+            merge_base_plan: None,
         }
     }
 
@@ -1936,6 +1979,63 @@ mod tests {
                 "accepted families file {file:?}"
             );
         }
+    }
+
+    fn behind(paths: &[&str]) -> ExactHeadInput {
+        // The head sits on B; the PR's recorded base (and protected tip) is C.
+        let mut input = input(paths);
+        input.pr_base_sha = C.to_owned();
+        input.protected_ref_sha = C.to_owned();
+        input.merge_base_plan = Some(MergeBasePlan {
+            recorded_base_policy_digest: Some("f".repeat(64)),
+        });
+        input
+    }
+
+    #[test]
+    fn a_head_behind_its_recorded_base_plans_against_its_merge_base() {
+        let receipt = plan_selection(&behind(&["src/audio/a.rs"]), Ok(policy())).expect("receipt");
+        assert_eq!(receipt.planned_suite, PlannedSuite::Bounded);
+        assert_eq!(receipt.fallback_reason, None);
+        assert_eq!(
+            receipt.planned_base_sha.as_deref(),
+            Some(input(&[]).local_merge_base_sha.as_str())
+        );
+        assert_eq!(receipt.recorded_base_policy_digest, Some("f".repeat(64)));
+        assert_eq!(receipt.pr_base_sha, C);
+
+        // Without the merge-base plan the same shape still refuses.
+        let mut unproven = behind(&["src/audio/a.rs"]);
+        unproven.merge_base_plan = None;
+        let refused = plan_selection(&unproven, Ok(policy())).expect("receipt");
+        assert_eq!(
+            refused.fallback_reason,
+            Some(FallbackReason::BasePolicyMismatch)
+        );
+    }
+
+    #[test]
+    fn a_claimed_merge_base_plan_on_an_up_to_date_head_refuses() {
+        let mut claimed = input(&["src/audio/a.rs"]);
+        claimed.merge_base_plan = Some(MergeBasePlan {
+            recorded_base_policy_digest: None,
+        });
+        let receipt = plan_selection(&claimed, Ok(policy())).expect("receipt");
+        assert_eq!(
+            receipt.fallback_reason,
+            Some(FallbackReason::BasePolicyMismatch)
+        );
+    }
+
+    #[test]
+    fn a_merge_base_plan_that_touches_policy_still_selects_full() {
+        let receipt = plan_selection(&behind(&["schema/changed-surface.json"]), Ok(policy()))
+            .expect("receipt");
+        assert_eq!(receipt.planned_suite, PlannedSuite::Full);
+        assert_eq!(
+            receipt.fallback_reason,
+            Some(FallbackReason::SelectorPolicyChanged)
+        );
     }
 
     #[test]
