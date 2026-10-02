@@ -186,6 +186,15 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+## merge-guard is versioned and tested here
+
+`merge-guard` (refuses `pr merge` on a private repo that cannot enforce
+required checks until its configured checks pass, and `--auto` there) used to
+exist only as a hand-placed host file with a host-local test script no CI ran.
+Its source is `scripts/ghapp_merge_guard.sh`, its test
+`scripts/test_ghapp_merge_guard.py` (CI's Python helper tests), and it is a
+managed guard, so `shipyard guards install` places the tested copy and
+`guards status` reports a drifted one.
 ## The merge path arms native auto-merge; it never enqueues
 
 `shipyard auto-merge` / `ship` admit a PR to a merge queue by arming native
@@ -1040,7 +1049,9 @@ cadence.
 A delivery the daemon refuses (HTTP 400/401/404/405 in the hook's
 delivery log) writes one `rejected webhook delivery <guid>` line with
 its event kind, reason, and body bytes received against Content-Length to
-`daemon/daemon.log`, so a refusal is visible on the host.
+`daemon/daemon.log`, so a refusal is visible on the host. If every delivery in the hook's log is HTTP 502
+while the daemon still shows LISTEN, the listener thread is wedged: run
+`sample <daemon pid>` and look for it parked on a lock.
 
 **Idle behavior (v0.56.0+):** when no IPC subscriber is attached
 (no `shipyard watch` running, no GUI), the daemon skips the
@@ -2072,6 +2083,11 @@ hard-fails before writing a receipt when local HEAD/tree does not match the PR;
 after that boundary, missing/malformed policy, stale or mismatched base
 provenance, incomplete/mismatched diffs, unmapped paths, and head-side
 policy/schema/test-topology changes force a full-suite receipt.
+
+Generated families may live in `families_file = ".shipyard/<name>.toml"`
+(only `[[families]]` tables), read from the authenticated base commit and
+appended to inline families; editing that file selects the full suite, and a
+merge conflict in it is resolved by regenerating it.
 
 The command is shadow-only. Its receipt is queryable telemetry, not passing
 target evidence, and the configured full validation command must still run.

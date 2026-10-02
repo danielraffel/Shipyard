@@ -75,6 +75,19 @@ bytes]` line to `daemon/daemon.log`; match that GUID
 against the repository's hook delivery log. A quiet `daemon.log` is normal on a
 healthy host: registration failures were the only other routine writer.
 
+## Never take the std stderr lock off the main thread
+
+`app::run` holds `io::stdout().lock()` and `io::stderr().lock()` for the whole
+command, so in a long-running command such as `daemon run` any other thread that
+locks stderr (including `eprintln!`) blocks forever. A webhook listener that
+logged its first refused delivery that way stopped accepting connections, and
+GitHub recorded HTTP 502 for every later delivery. `app::run` now passes unlocked
+handles, `writer_domain_lease::write_stderr` writes through a duplicate of the
+stderr descriptor, and the webhook listener hands refusal lines to a logger
+thread with `try_send`, dropping and counting a line rather than ever waiting.
+Keep `run_never_holds_the_process_stdio_locks_for_the_command` and the
+`webhook_listener_keeps_serving_*` tests passing.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.
@@ -216,6 +229,15 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+## merge-guard is versioned and tested here
+
+`merge-guard` (refuses `pr merge` on a private repo that cannot enforce
+required checks until its configured checks pass, and `--auto` there) used to
+exist only as a hand-placed host file with a host-local test script no CI ran.
+Its source is `scripts/ghapp_merge_guard.sh`, its test
+`scripts/test_ghapp_merge_guard.py` (CI's Python helper tests), and it is a
+managed guard, so `shipyard guards install` places the tested copy and
+`guards status` reports a drifted one.
 ## The merge path arms native auto-merge; it never enqueues
 
 `shipyard auto-merge` / `ship` admit a PR to a merge queue by arming native
