@@ -1755,7 +1755,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn delivery_page_cursor_is_read_from_the_next_link_only() {
         let raw = "HTTP/2.0 200 OK\r\nLink: <https://api.github.com/repositories/1/hooks/2/deliveries?per_page=100&cursor=v1_3845977271640784898>; rel=\"next\"\r\nX-Other: 1\r\n\r\n[{\"id\":1}]";
@@ -1771,6 +1770,7 @@ mod tests {
         assert_eq!(super::next_page_cursor(headers), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn unregister_without_gh_removes_local_state() {
         let temp = tempfile::tempdir().expect("tempdir");
