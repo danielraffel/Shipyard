@@ -97,8 +97,13 @@ default; `--apply` deletes and drops matching `registrations.json` records).
 It prunes only this host's hooks on repositories its running daemon does not
 advertise, and peer hooks whose endpoint has answered nothing but gateway
 failures (502/503/504 or no connection) either for 24h, or at least five
-times on a host name that is no longer a tailnet node. A peer answering
-400/401/404 is alive and is never pruned. Each host can only judge its own
+times on a host name that is no longer a tailnet node. Only fleet hosts
+(this host's tailnet domain) are ever judged: a daemon-shaped receiver
+anywhere else is kept however long it fails. A peer answering 400/401/404 is
+alive and is never pruned. A pruned host's daemon re-creates its hook at its
+next start or reverify pass, because a 404 on the recorded hook drops the
+binding and registers afresh. The advertised set is only trusted from a
+running daemon on the same Shipyard version as the command. Each host can only judge its own
 hooks as unadvertised, so run it on every daemon host.
 
 ## A config PATCH replaces; it does not merge

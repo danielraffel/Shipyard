@@ -83,6 +83,7 @@ struct RegistrationRow {
 struct PruneReport {
     identity: HostIdentity,
     advertised: Option<BTreeSet<String>>,
+    advertised_untrusted: Option<String>,
     apply: bool,
     hooks: Vec<HookRow>,
     registrations: Vec<RegistrationRow>,
@@ -114,7 +115,10 @@ pub(super) fn daemon_prune_webhooks<W: Write>(
         HostIdentity::Known(name) => Some(name.clone()),
         HostIdentity::Unreadable { .. } => None,
     };
-    let advertised = advertised_repos(&runtime_paths.state_dir);
+    let (advertised, advertised_untrusted) = match advertised_repos(&runtime_paths.state_dir) {
+        Ok(repos) => (Some(repos), None),
+        Err(reason) => (None, Some(reason)),
+    };
     let tailnet_nodes = crate::tunnel::probe_tailnet_node_names();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut registrar = Registrar::new_with_context(mode, &runtime_paths.state_dir, &cwd);
@@ -157,6 +161,7 @@ pub(super) fn daemon_prune_webhooks<W: Write>(
     let mut report = PruneReport {
         identity,
         advertised,
+        advertised_untrusted,
         apply,
         hooks,
         registrations,
@@ -178,21 +183,35 @@ pub(super) fn daemon_prune_webhooks<W: Write>(
     })
 }
 
-/// Repositories the running daemon advertises; `None` when no daemon answered.
-fn advertised_repos(state_dir: &std::path::Path) -> Option<BTreeSet<String>> {
-    let status = read_daemon_status(state_dir)?;
-    let repos = status.get("configured_repos")?.as_array()?;
-    Some(
-        normalize_repos(
-            repos
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect(),
-        )
-        .into_iter()
-        .collect(),
+/// Repositories the running daemon advertises, or why that set is not
+/// trusted: no daemon answered, or it runs a different Shipyard version than
+/// this command, so its status may describe a configuration since changed.
+fn advertised_repos(state_dir: &std::path::Path) -> Result<BTreeSet<String>, String> {
+    let status =
+        read_daemon_status(state_dir).ok_or_else(|| "no running daemon answered".to_owned())?;
+    let running = status
+        .get("shipyard_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if running != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "running daemon is {running}, this command is {}; refresh the daemon first",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    let repos = status
+        .get("configured_repos")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "daemon status carried no configured_repos".to_owned())?;
+    Ok(normalize_repos(
+        repos
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
     )
+    .into_iter()
+    .collect())
 }
 
 fn classify_repo_hooks(
@@ -361,6 +380,10 @@ fn render_json<W: Write>(
                 .as_ref()
                 .map_or(Value::Null, |repos| json!(repos)),
         ),
+        (
+            "advertised_untrusted".to_owned(),
+            json!(report.advertised_untrusted),
+        ),
         ("hooks".to_owned(), Value::Array(hooks)),
         ("registrations".to_owned(), Value::Array(registrations)),
         ("unreadable".to_owned(), Value::Array(unreadable)),
@@ -385,7 +408,12 @@ fn render_text<W: Write>(
         "host identity: {}\nadvertised: {}\nmode: {}",
         identity_text(&report.identity),
         report.advertised.as_ref().map_or_else(
-            || "unknown (no running daemon answered)".to_owned(),
+            || {
+                format!(
+                    "not trusted ({}); this host's own hooks are left undecided",
+                    report.advertised_untrusted.as_deref().unwrap_or("unknown")
+                )
+            },
             |repos| repos.iter().cloned().collect::<Vec<_>>().join(", ")
         ),
         if report.apply {
@@ -472,6 +500,7 @@ mod tests {
         let report = PruneReport {
             identity: HostIdentity::Known("me.ts.net".to_owned()),
             advertised: None,
+            advertised_untrusted: Some("no running daemon answered".to_owned()),
             apply: false,
             hooks,
             registrations,

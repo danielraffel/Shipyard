@@ -144,14 +144,20 @@ pub struct HostContext<'a> {
     pub tailnet_nodes: Option<&'a BTreeSet<String>>,
 }
 
-/// True when `host` is on the same tailnet as `this_host` (shares its domain
-/// after the first label) but is not a node of it.
+/// True when `host` is a fleet daemon host: on this host's tailnet, sharing
+/// its domain after the first label. Only fleet hosts can be judged; any other
+/// receiver belongs to someone else, however daemon-shaped it looks.
+fn is_fleet_host(host: &str, this_host: &str) -> bool {
+    let suffix = |name: &str| name.split_once('.').map(|(_, rest)| rest.to_owned());
+    suffix(this_host).is_some() && suffix(host) == suffix(this_host)
+}
+
+/// True when `host` is a fleet host name that is no longer a tailnet node.
 fn is_retired_tailnet_host(host: &str, context: &HostContext<'_>) -> bool {
     let (Some(this_host), Some(nodes)) = (context.this_host, context.tailnet_nodes) else {
         return false;
     };
-    let suffix = |name: &str| name.split_once('.').map(|(_, rest)| rest.to_owned());
-    suffix(this_host).is_some() && suffix(host) == suffix(this_host) && !nodes.contains(host)
+    is_fleet_host(host, this_host) && !nodes.contains(host)
 }
 
 /// Decide one hook.
@@ -183,6 +189,16 @@ pub fn classify_hook(
         };
     }
 
+    let Some(this_host) = this_host else {
+        return Verdict::Undecided(
+            "this host's tailnet identity is unreadable, so no peer can be judged".to_owned(),
+        );
+    };
+    if !is_fleet_host(host, this_host) {
+        return Verdict::Keep(
+            "not a host on this tailnet; only fleet daemon hooks are ever pruned".to_owned(),
+        );
+    }
     let Some(deliveries) = &hook.deliveries else {
         return Verdict::Undecided("peer hook whose deliveries could not be read".to_owned());
     };
@@ -549,14 +565,14 @@ mod tests {
             classify_hook("o/r", &offline, &context, &EVENTS),
             Verdict::Undecided(_)
         ));
-        // A host on another domain is not judged by this tailnet's roster.
+        // A host on another domain is not a fleet host, so it is kept.
         let elsewhere = hook(
             "https://old-name.other.ts.net/webhook",
             Some(failures(5, 2, 502)),
         );
         assert!(matches!(
             classify_hook("o/r", &elsewhere, &context, &EVENTS),
-            Verdict::Undecided(_)
+            Verdict::Keep(_)
         ));
         // Too few failures still decides nothing.
         let thin = hook(
@@ -565,6 +581,53 @@ mod tests {
         );
         assert!(matches!(
             classify_hook("o/r", &thin, &context, &EVENTS),
+            Verdict::Undecided(_)
+        ));
+    }
+
+    #[test]
+    fn a_receiver_outside_this_tailnet_is_never_pruned_however_dead() {
+        // Daemon-shaped URL and events, 48h of gateway failures, but not a
+        // fleet host: someone else's receiver.
+        let foreign = hook(
+            "https://hooks.example.com/webhook",
+            Some(failures(100, 0, 502)),
+        );
+        let mut long = failures(100, 0, 502);
+        for (index, delivery) in long.iter_mut().enumerate() {
+            delivery.delivered_at = at(i64::try_from(index).expect("index") / 2);
+        }
+        let foreign_long = hook("https://hooks.example.com/webhook", Some(long));
+        for candidate in [&foreign, &foreign_long] {
+            assert!(
+                matches!(
+                    classify_hook("o/r", candidate, &ctx(None), &EVENTS),
+                    Verdict::Keep(_)
+                ),
+                "{candidate:?}"
+            );
+        }
+        let span = foreign_long
+            .deliveries
+            .as_ref()
+            .map(|deliveries| {
+                (deliveries[0].delivered_at - deliveries[deliveries.len() - 1].delivered_at)
+                    .num_hours()
+            })
+            .expect("span");
+        assert!(
+            span >= 48,
+            "the control window must exceed the threshold: {span}h"
+        );
+        // Without a readable identity, no peer can be judged at all.
+        let unknown = HostContext::default();
+        assert!(matches!(
+            classify_hook(
+                "o/r",
+                &hook("https://gone.ts.net/webhook", Some(failures(30, 2, 502))),
+                &unknown,
+                &EVENTS
+            ),
             Verdict::Undecided(_)
         ));
     }

@@ -1420,6 +1420,43 @@ mod tests {
         assert!(third_args.contains("repos/owner/repo/hooks/4242"));
     }
 
+    /// A hook deleted on GitHub while its daemon was down (for example by
+    /// `daemon prune-webhooks`) is re-created at the next registration pass,
+    /// which runs at start and on every reverify cycle.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_hook_deleted_on_github_is_recreated() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = temp.path().join("daemon");
+        fs::create_dir_all(&daemon_dir).expect("daemon dir");
+        fs::write(
+            daemon_dir.join("registrations.json"),
+            r#"[{"repo":"owner/repo","hook_id":9999}]"#,
+        )
+        .expect("seed registrations");
+        let gh = write_gh_stub(temp.path(), GhStubMode::RecordedHookPruned);
+        let mut registrar = stub_registrar(temp.path());
+        assert_eq!(registrar.all().get("owner/repo"), Some(&9999));
+
+        let hook_id = registrar
+            .ensure_registered_with_gh(
+                "owner/repo",
+                "https://shipyard.example/webhook",
+                "secret",
+                &gh,
+            )
+            .expect("re-create");
+
+        assert_eq!(hook_id, 4242);
+        assert!(read_log(temp.path(), "args-1").contains("-X PATCH"));
+        assert!(read_log(temp.path(), "args-1").contains("hooks/9999"));
+        assert!(read_log(temp.path(), "args-3").contains("-X POST"));
+        assert_eq!(
+            stub_registrar(temp.path()).all().get("owner/repo"),
+            Some(&4242)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn mixed_case_alias_reuses_and_unregisters_canonical_registration() {
@@ -1805,6 +1842,9 @@ mod tests {
         PatchDropsSecret,
         /// The App installation lacks `repository_hooks`.
         AppPermissionDenied,
+        /// The recorded hook was deleted on GitHub (pruned while the daemon
+        /// was down): its PATCH answers 404.
+        RecordedHookPruned,
     }
 
     #[cfg(unix)]
@@ -1827,6 +1867,7 @@ mod tests {
             | GhStubMode::Unauthorized
             | GhStubMode::PatchDropsSecret
             | GhStubMode::AppPermissionDenied
+            | GhStubMode::RecordedHookPruned
             | GhStubMode::AnonRateLimit => "{\"id\":4242}",
         };
         let delete_branch = match mode {
@@ -1844,6 +1885,7 @@ mod tests {
             | GhStubMode::Unauthorized
             | GhStubMode::PatchDropsSecret
             | GhStubMode::AppPermissionDenied
+            | GhStubMode::RecordedHookPruned
             | GhStubMode::AnonRateLimit => "  *\" -X DELETE \"*) exit 0 ;;",
         };
         let create_branch = match mode {
@@ -1867,6 +1909,7 @@ mod tests {
             | GhStubMode::WrongUrl
             | GhStubMode::Delete404
             | GhStubMode::PatchDropsSecret
+            | GhStubMode::RecordedHookPruned
             | GhStubMode::MissingId => {
                 format!("  *\" -X POST \"*) printf '%s\\n' '{create_response}' ;;")
             }
@@ -1921,6 +1964,7 @@ esac
     fn patch_branch_for(mode: GhStubMode) -> &'static str {
         match mode {
             GhStubMode::AdoptPatchFails => "printf 'patch failed\\n' >&2; exit 1 ;;",
+            GhStubMode::RecordedHookPruned => "printf 'gh: Not Found (HTTP 404)\\n' >&2; exit 1 ;;",
             GhStubMode::AdoptPatchIncomplete => {
                 "printf '%s\\n' '{\"active\":true,\"events\":[\"push\"],\"config\":{\"url\":\"https://example.test/webhook\"}}' ;;"
             }
