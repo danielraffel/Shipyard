@@ -120,7 +120,7 @@ use self::run_cmd::{
 use self::runner_cmd::runner_command;
 use self::ship_cmd::{ShipCommandArgs, ship_command};
 use self::ship_state_cmd::{
-    ship_state_discard, ship_state_list, ship_state_reconcile, ship_state_show,
+    ship_state_discard, ship_state_list, ship_state_prune, ship_state_reconcile, ship_state_show,
 };
 use self::targets_cmd::targets_command;
 use self::update_cmd::update_command;
@@ -1336,9 +1336,10 @@ fn handle_ship_state_variant<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    let Command::ShipState { command } = *command else {
+    let Command::ShipState { command } = command else {
         unreachable!("ship-state variant required")
     };
+    let command = command.clone();
     let store = ShipStateStore::new(state_dir.join("ship"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     handle_ship_state_command(command, &store, mode, cwd, state_dir, json, stdout)
@@ -1496,9 +1497,25 @@ fn handle_ship_state_command<W: Write>(
             ship_state_show(store, repository.as_deref(), pr, &opt_in, json, stdout)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
-        ShipStateCommand::Discard { pr } => {
-            let repository = self::branch_cmd::detect_repo_from_remote(cwd, None);
-            ship_state_discard(store, repository.as_deref(), pr, json, stdout)
+        ShipStateCommand::Discard { pr, repo } => {
+            ship_state_discard(store, repo.as_deref(), pr, json, stdout)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+        ShipStateCommand::Prune { apply } => {
+            let gh_client = crate::gh::GhClient::from_cwd(mode, cwd).ok();
+            let mut lifecycle_of = |repo: &str, pr: u64| {
+                crate::ship_liveness::PrLifecycle::from_gh_state(
+                    crate::gh::pr_lifecycle_state(gh_client.as_ref(), repo, pr, cwd, None)
+                        .as_deref(),
+                )
+            };
+            let registrar = crate::registrar::Registrar::new_with_context(mode, state_dir, cwd);
+            let mut resolve = |repo: &str| {
+                let mut anonymous = crate::repo_slug::anonymous_probe;
+                let mut authenticated = |slug: &str| registrar.probe_repo_name(slug);
+                crate::repo_slug::resolve(repo, &mut [&mut anonymous, &mut authenticated])
+            };
+            ship_state_prune(store, &mut resolve, &mut lifecycle_of, apply, json, stdout)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Reconcile { pr, all } => {
