@@ -54,6 +54,16 @@ jobs:
               --config scripts/versioning.json \
               --mode=report
 
+      - name: Version ahead of live main
+        # Judge the PR head against main as it is now, not its merge base:
+        # two PRs cut from one main otherwise both pass with the same version.
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin main
+          python3 scripts/version_ahead_of_main.py check \
+              --head-ref "${{ github.event.pull_request.head.sha }}" \
+              --main-ref origin/main
+
       - name: Doc-sync check
         run: |
           python3 scripts/doc_sync_check.py \
