@@ -133,6 +133,25 @@ in the registrar and wait paths drops the cache entry and retries once with a
 fresh mint; a second 401 surfaces. `daemon status` reports
 `gh_token_cache.mints` and `.hits`.
 
+## A healthy local funnel is not a reachable daemon
+
+`tailscale funnel status` naming the daemon's port proves only the local half.
+The public relays can reset the TLS handshake for one host's name while every
+other host works, and GitHub then records each delivery as `500 ... EOF`.
+The daemon now requests `GET /ingress-probe/<nonce>` from itself through every
+relay address its funnel host resolves to (public DNS over HTTPS), on the
+first tunnel verification and every tenth after (about five minutes). A TLS
+failure, empty reply, refused connection, or 502-504 counts as failing; DNS,
+timeouts, or a missing `curl` are inconclusive and never act. Two failing
+probes in a row make the supervisor treat the tunnel as lost and re-apply the
+funnel, at most six times per failing episode with backoff (1m, 5m, 15m, then
+hourly); after that it only reports. The first reachable probe resets the
+budget. The check and any re-apply run on the tunnel supervisor's thread,
+never the listener's. `daemon status` prints `public ingress: ok` or
+`FAILING (...)`, `shipyard doctor` shows `daemon-public-ingress` as degraded,
+`daemon reconcile` raises an `endpoint_unreachable` alarm, and daemon.log
+records each transition and re-apply.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.

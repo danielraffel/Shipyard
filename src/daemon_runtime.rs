@@ -241,6 +241,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         Arc::clone(&execution_error),
         Arc::clone(&last_event_at),
         Arc::clone(&tunnel_runtime.snapshot),
+        Arc::clone(&tunnel_runtime.ingress),
         Arc::clone(&canary_capabilities),
     );
     let mut server = IpcServer::new(daemon_dir.join("daemon.sock"), status_provider)
@@ -463,6 +464,7 @@ fn daemon_status_provider(
     execution_error: Arc<Mutex<Option<String>>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
     tunnel_snapshot: Arc<Mutex<TunnelSnapshot>>,
+    tunnel_ingress: crate::tunnel::IngressReport,
     capabilities: Arc<Mutex<Vec<String>>>,
 ) -> impl Fn() -> IpcState + Send + Sync + 'static {
     move || {
@@ -473,6 +475,11 @@ fn daemon_status_provider(
             tunnel_backend: tunnel.backend,
             tunnel_url: tunnel.url,
             tunnel_verified_at: tunnel.verified_at,
+            tunnel_public_ingress: tunnel_ingress.lock().ok().and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(crate::tunnel_ingress::IngressStatus::to_json)
+            }),
             subscribers: 0,
             last_event_at: last_event_at.lock().ok().and_then(|guard| *guard),
             registered_repos: registration.published_repos(),
@@ -1320,6 +1327,8 @@ fn daemon_tunnel_config(url_override: Option<String>) -> TunnelSnapshot {
 #[cfg(unix)]
 struct TunnelRuntime {
     snapshot: Arc<Mutex<TunnelSnapshot>>,
+    /// Last public-ingress self-check; empty until the first probe.
+    ingress: crate::tunnel::IngressReport,
     webhook: Option<LocalWebhookListener>,
     webhook_secret: Option<String>,
     supervisor: Option<thread::JoinHandle<()>>,
@@ -1330,6 +1339,7 @@ impl TunnelRuntime {
     fn inactive(snapshot: Arc<Mutex<TunnelSnapshot>>) -> Self {
         Self {
             snapshot,
+            ingress: crate::tunnel::IngressReport::default(),
             webhook: None,
             webhook_secret: None,
             supervisor: None,
@@ -1382,10 +1392,16 @@ fn start_tunnel_runtime(
 
     let secret = load_or_create_webhook_secret(state_dir)?;
     let webhook = start_webhook_listener(running, event_sender, secret.clone())?;
-    let supervisor =
-        spawn_tailscale_tunnel_supervisor(Arc::clone(running), Arc::clone(&snapshot), webhook.port);
+    let ingress = crate::tunnel::IngressReport::default();
+    let supervisor = spawn_tailscale_tunnel_supervisor(
+        Arc::clone(running),
+        Arc::clone(&snapshot),
+        Arc::clone(&ingress),
+        webhook.port,
+    );
     Ok(TunnelRuntime {
         snapshot,
+        ingress,
         webhook: Some(webhook),
         webhook_secret: Some(secret),
         supervisor: Some(supervisor),
@@ -1450,21 +1466,35 @@ fn start_webhook_listener_with_log(
         while running.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _addr)) => {
-                    let (response, rejection) =
-                        match read_webhook_request(&mut stream, WEBHOOK_READ_TIMEOUT) {
-                            Ok(request) => {
-                                let response = handle_webhook_request(
-                                    &request,
-                                    &secret,
-                                    &event_sender,
-                                    &mut seen_delivery_ids,
-                                );
-                                let rejection = (response.status != 200)
-                                    .then(|| WebhookRejection::for_request(&request, response));
-                                (response, rejection)
-                            }
-                            Err(rejection) => (rejection.response, Some(*rejection)),
-                        };
+                    let (response, rejection) = match read_webhook_request(
+                        &mut stream,
+                        WEBHOOK_READ_TIMEOUT,
+                    ) {
+                        Ok(request) if ingress_probe_nonce(&request).is_some() => {
+                            // The daemon's own public-ingress self-check:
+                            // echo the nonce, log nothing.
+                            let nonce = ingress_probe_nonce(&request).unwrap_or_default();
+                            let _ = stream.set_write_timeout(Some(WEBHOOK_READ_TIMEOUT));
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{nonce}",
+                                nonce.len()
+                            );
+                            continue;
+                        }
+                        Ok(request) => {
+                            let response = handle_webhook_request(
+                                &request,
+                                &secret,
+                                &event_sender,
+                                &mut seen_delivery_ids,
+                            );
+                            let rejection = (response.status != 200)
+                                .then(|| WebhookRejection::for_request(&request, response));
+                            (response, rejection)
+                        }
+                        Err(rejection) => (rejection.response, Some(*rejection)),
+                    };
                     // Answer first; the log line never delays or blocks the
                     // accept loop (it is queued, or dropped and counted).
                     answer_delivery(&mut stream, &response);
@@ -1872,6 +1902,19 @@ fn answer_delivery(stream: &mut TcpStream, response: &HttpResponse) {
     let _ = write_http_response(stream, response);
 }
 
+/// The nonce of a public-ingress self-check request: `GET` on
+/// [`crate::tunnel_ingress::INGRESS_PROBE_PATH`] followed by 1-32 hex digits.
+#[cfg(unix)]
+fn ingress_probe_nonce(request: &WebhookRequest) -> Option<&str> {
+    let nonce = request
+        .path
+        .strip_prefix(crate::tunnel_ingress::INGRESS_PROBE_PATH)?;
+    (request.method == "GET"
+        && (1..=32).contains(&nonce.len())
+        && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(nonce)
+}
+
 #[cfg(unix)]
 fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> std::io::Result<()> {
     let status_text = match response.status {
@@ -1923,10 +1966,11 @@ fn load_or_create_webhook_secret(state_dir: &Path) -> Result<String, DaemonRunEr
 fn spawn_tailscale_tunnel_supervisor(
     running: Arc<AtomicBool>,
     snapshot: Arc<Mutex<TunnelSnapshot>>,
+    ingress: crate::tunnel::IngressReport,
     local_port: u16,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut backend = TailscaleFunnelBackend::default();
+        let mut backend = TailscaleFunnelBackend::with_ingress_report(ingress);
         let policy = TunnelSupervisorPolicy::default();
         let mut state = TunnelSupervisorState::default();
         supervise_tunnel(
@@ -2761,6 +2805,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(TunnelSnapshot::inactive())),
+            crate::tunnel::IngressReport::default(),
             Arc::new(Mutex::new(Vec::new())),
         );
 
@@ -3206,6 +3251,94 @@ mod tests {
             lines.iter().any(|line| line.contains("forged-last")
                 && line.contains("earlier refusal lines dropped")),
             "the drop count must ride on a later line: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_echoes_an_ingress_probe_nonce_and_nothing_else() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let (line_tx, line_rx) = mpsc::channel::<String>();
+        let log = super::DeliveryLog::spawn(8, move |line| {
+            let _ = line_tx.send(line.to_owned());
+        });
+        let listener =
+            super::start_webhook_listener_with_log(&running, tx, "dev-secret".to_owned(), log)
+                .expect("listener");
+        let get = |path: &str| {
+            send_with_timeout(
+                listener.port,
+                format!("GET {path} HTTP/1.1\r\nHost: m3.example.ts.net\r\n\r\n").as_bytes(),
+                Duration::from_secs(3),
+            )
+        };
+
+        let echoed = get("/ingress-probe/5f3a9c");
+        let not_hex = get("/ingress-probe/not-a-nonce");
+        let too_long = get(&format!("/ingress-probe/{}", "a".repeat(33)));
+        running.store(false, Ordering::Release);
+        listener.stop();
+
+        assert!(echoed.starts_with("HTTP/1.1 200 OK"), "{echoed:?}");
+        assert!(echoed.ends_with("\r\n\r\n5f3a9c"), "{echoed:?}");
+        for refused in [&not_hex, &too_long] {
+            assert!(refused.starts_with("HTTP/1.1 405"), "{refused:?}");
+        }
+        assert!(rx.try_recv().is_err(), "a probe is not a webhook event");
+        let lines = line_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            2,
+            "only the two malformed probes are logged: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn slow_failing_probe(_host: &str, _nonce: &str) -> crate::tunnel_ingress::IngressVerdict {
+        thread::sleep(Duration::from_secs(2));
+        crate::tunnel_ingress::IngressVerdict::Failing(
+            "TLS handshake failed at the relay".to_owned(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_answers_within_a_second_while_a_self_check_is_in_flight() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = mpsc::channel();
+        let listener =
+            super::start_webhook_listener(&running, tx, "dev-secret".to_owned()).expect("listener");
+        // The self-check runs where the tunnel supervisor runs: its own thread.
+        let report = crate::tunnel::IngressReport::default();
+        let mut check = crate::tunnel_ingress::IngressCheck::reporting_to(Arc::clone(&report));
+        check.set_public_url("https://m3.example.ts.net");
+        check.probe = slow_failing_probe;
+        let in_flight = thread::spawn(move || check.verify(1.0));
+        thread::sleep(Duration::from_millis(100));
+
+        let (forged, _) = check_run_delivery("the-wrong-secret", "during-self-check");
+        let started = Instant::now();
+        let answer = send_with_timeout(listener.port, &forged, Duration::from_secs(3));
+        let elapsed = started.elapsed();
+        let still_probing = !in_flight.is_finished();
+        in_flight.join().expect("self-check");
+        running.store(false, Ordering::Release);
+        listener.stop();
+
+        assert!(still_probing, "the control must overlap the self-check");
+        assert!(answer.starts_with("HTTP/1.1 401"), "{answer:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "listener waited {elapsed:?}"
+        );
+        assert_eq!(
+            report
+                .lock()
+                .expect("report")
+                .as_ref()
+                .map(|status| status.verdict.state()),
+            Some("failing")
         );
     }
 
