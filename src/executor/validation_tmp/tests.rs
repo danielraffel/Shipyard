@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use super::{Liveness, ReclaimPolicy, apply, owner_path, plan};
+use super::{Liveness, ReclaimPolicy, owner_path, plan};
 
 struct Fake {
     alive: Vec<u32>,
@@ -112,6 +112,8 @@ fn the_automatic_policy_never_touches_unowned_directories() {
 #[test]
 fn apply_removes_read_only_trees_and_their_owner_files() {
     use std::os::unix::fs::PermissionsExt;
+
+    use super::apply;
     let temp = tempfile::tempdir().expect("temp");
     let dir = make(temp.path(), "shipyard-validation-locked", Some(4_000_003));
     fs::set_permissions(dir.join("build"), fs::Permissions::from_mode(0o500)).expect("lock");
