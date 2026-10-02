@@ -344,6 +344,18 @@ pub(super) enum Command {
         /// Also prune aged ship-state files.
         #[arg(long = "ship-state")]
         ship_state: bool,
+        /// Instead, reclaim leftover `shipyard-validation-*` TMPDIRs whose run is
+        /// gone (its owner process exited, or, for a directory with no owner
+        /// file, no live process uses it as TMPDIR). Dry run unless --apply.
+        #[arg(long = "validation-tmp", conflicts_with_all = ["pin", "ship_state"])]
+        validation_tmp: bool,
+        /// With --validation-tmp: keep anything changed more recently than this.
+        #[arg(
+            long = "older-than-hours",
+            default_value_t = 6,
+            requires = "validation_tmp"
+        )]
+        older_than_hours: u64,
     },
     /// List, add, remove, and test validation targets.
     Targets {

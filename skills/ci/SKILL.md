@@ -235,6 +235,17 @@ sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
 cannot be had the write is skipped and the cache stops writing for that run; a
 cold read is always correct. Any new cache in the state tree needs the same.
 
+## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
+
+A killed validation run cannot run the Drop that removes its
+`shipyard-validation-*` TMPDIR; on m3 57 of them held 37.5 GiB of the boot
+volume on 2026-10-01 and broke a release build with ENOSPC. Each TMPDIR now has
+a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
+6h whose owner is gone; `shipyard cleanup --validation-tmp [--apply]
+[--older-than-hours N]` also handles dirs without an owner file, keeping any that
+a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
+everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
+
 ## Quick reference
 
 | Task | Command |

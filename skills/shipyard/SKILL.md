@@ -291,6 +291,17 @@ the daemon's environment; a relative or protected base is refused, not
 resolved. Test fixtures that must outlive their process (a path in a static)
 belong beside the test executable, never in a kept TMPDIR directory.
 
+## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
+
+A killed validation run cannot run the Drop that removes its
+`shipyard-validation-*` TMPDIR; on m3 57 of them held 37.5 GiB of the boot
+volume on 2026-10-01 and broke a release build with ENOSPC. Each TMPDIR now has
+a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
+6h whose owner is gone; `shipyard cleanup --validation-tmp [--apply]
+[--older-than-hours N]` also handles dirs without an owner file, keeping any that
+a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
+everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every

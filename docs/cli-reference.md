@@ -107,6 +107,8 @@ shipyard bump <id> high        # reprioritize a pending job
 shipyard cancel <id>           # cancel a job
 shipyard cleanup               # explain retention/compression actions (dry-run)
 shipyard cleanup --apply       # apply log retention and prune artifacts
+shipyard cleanup --validation-tmp           # report leftover validation TMPDIRs (GiB, why reclaimable)
+shipyard cleanup --validation-tmp --apply   # delete them (owner gone or unused, older than 6h)
 
 # Profiles & config
 shipyard config profiles       # list defined profiles

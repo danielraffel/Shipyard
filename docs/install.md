@@ -253,8 +253,16 @@ weakening protected-path classification. The directory is removed when the
 run ends, including directories a test left read-only. A host whose boot
 volume must not carry build scratch can set `SHIPYARD_VALIDATION_TMP_BASE` to
 an absolute directory outside Shipyard's state in the daemon's environment;
-the per-run directories are then created there instead. Custom locations can
-be configured globally:
+the per-run directories are then created there instead.
+
+A run that is killed (SIGKILL, a supervisor timeout, a reboot) cannot remove
+its directory, so each one has a sibling `<dir>.owner` file naming the run's
+process. Every new run first removes directories older than six hours whose
+owner process is gone. Directories from builds that predate owner files are
+reclaimed by `shipyard cleanup --validation-tmp` (a dry run that reports GiB
+per directory; add `--apply` to delete, `--older-than-hours N` to change the
+six-hour floor), which also keeps any directory a live process still uses as
+its `TMPDIR`. Custom locations can be configured globally:
 
 ```toml
 [update]
