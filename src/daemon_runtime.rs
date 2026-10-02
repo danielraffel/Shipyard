@@ -1623,6 +1623,8 @@ struct DeliveryLog {
 impl DeliveryLog {
     /// `write` returns whether the line reached the log. Lines it could not
     /// write are counted, and the count rides on the next line that does.
+    /// That count is separate from the listener's queue-full drop count in
+    /// [`DeliveryLog::record`]; one landed line can carry both.
     fn spawn(capacity: usize, write: impl Fn(&str) -> bool + Send + 'static) -> Self {
         let (sender, receiver) = mpsc::sync_channel::<String>(capacity);
         thread::spawn(move || {
