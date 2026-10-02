@@ -1467,7 +1467,7 @@ fn start_webhook_listener_with_log(
                         };
                     // Answer first; the log line never delays or blocks the
                     // accept loop (it is queued, or dropped and counted).
-                    let _ = write_http_response(&mut stream, &response);
+                    answer_delivery(&mut stream, &response);
                     drop(stream);
                     if let Some(rejection) = rejection {
                         log.record(rejection.log_line());
@@ -1862,6 +1862,14 @@ fn should_accept_delivery(
     }
     seen_delivery_ids.insert(delivery_id.to_owned(), now);
     true
+}
+
+/// Send the listener's answer without letting a peer that stops reading
+/// (a zero receive window) hold the accept loop past the read deadline.
+#[cfg(unix)]
+fn answer_delivery(stream: &mut TcpStream, response: &HttpResponse) {
+    let _ = stream.set_write_timeout(Some(WEBHOOK_READ_TIMEOUT));
+    let _ = write_http_response(stream, response);
 }
 
 #[cfg(unix)]
@@ -3104,6 +3112,22 @@ mod tests {
             refused,
             send_with_timeout(port, &genuine, Duration::from_secs(3)),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_answer_is_bounded_by_a_write_timeout() {
+        let (mut client, mut server) = accepted_pair();
+        super::answer_delivery(&mut server, &HttpResponse::ok());
+
+        assert_eq!(
+            server.write_timeout().expect("write timeout"),
+            Some(WEBHOOK_READ_TIMEOUT)
+        );
+        let mut response = String::new();
+        drop(server);
+        client.read_to_string(&mut response).expect("response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
     }
 
     #[cfg(unix)]

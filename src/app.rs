@@ -1690,7 +1690,8 @@ mod tests {
 
     #[test]
     fn run_never_holds_the_process_stdio_locks_for_the_command() {
-        let source = include_str!("app.rs");
+        // A Windows checkout may carry CRLF line endings.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
         let start = source.find("pub fn run() -> ExitCode {").expect("run");
         let body = &source[start..start + source[start..].find("\n}\n").expect("end of run")];
         assert!(
