@@ -2064,6 +2064,11 @@ after that boundary, missing/malformed policy, stale or mismatched base
 provenance, incomplete/mismatched diffs, unmapped paths, and head-side
 policy/schema/test-topology changes force a full-suite receipt.
 
+Generated families may live in `families_file = ".shipyard/<name>.toml"`
+(only `[[families]]` tables), read from the authenticated base commit and
+appended to inline families; editing that file selects the full suite, and a
+merge conflict in it is resolved by regenerating it.
+
 The command is shadow-only. Its receipt is queryable telemetry, not passing
 target evidence, and the configured full validation command must still run.
 Every eligible bounded candidate includes the nonempty mandatory baseline and

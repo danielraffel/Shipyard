@@ -453,11 +453,33 @@ pub struct SelectionReceipt {
 }
 
 /// Parse and validate a base-owned selector declaration from tracked TOML.
+///
+/// A declaration that names a `families_file` cannot be read this way; use
+/// [`policy_from_base`] with a reader bound to the same authenticated commit.
 pub fn policy_from_toml(contents: &str, target: &str) -> Result<ChangedSurfacePolicy, String> {
+    policy_from_base(contents, target, |path| {
+        Err(format!(
+            "families_file {path:?} needs a reader bound to the authenticated base"
+        ))
+    })
+}
+
+/// Parse and validate a base-owned selector declaration, reading an optional
+/// `families_file` through `read_base_file`, which must return that file's
+/// bytes at the same authenticated commit as `contents`.
+///
+/// The file holds only `[[families]]` tables. They are appended to any inline
+/// families, and the file's path joins `policy_paths`, so a change to it
+/// selects the full suite exactly like a change to the config itself.
+pub fn policy_from_base(
+    contents: &str,
+    target: &str,
+    read_base_file: impl Fn(&str) -> Result<String, String>,
+) -> Result<ChangedSurfacePolicy, String> {
     let root = contents
         .parse::<toml::Table>()
         .map_err(|error| format!("parse base config: {error}"))?;
-    let value = root
+    let mut value = root
         .get("targets")
         .and_then(toml::Value::as_table)
         .and_then(|targets| targets.get(target))
@@ -469,6 +491,9 @@ pub fn policy_from_toml(contents: &str, target: &str) -> Result<ChangedSurfacePo
                 "authenticated base has no [targets.{target}.changed_surface_selection] declaration"
             )
         })?;
+    if let Some(table) = value.as_table_mut() {
+        merge_families_file(table, read_base_file)?;
+    }
     let mut policy: ChangedSurfacePolicy = value
         .try_into()
         .map_err(|error| format!("invalid selector declaration: {error}"))?;
@@ -476,6 +501,66 @@ pub fn policy_from_toml(contents: &str, target: &str) -> Result<ChangedSurfacePo
     validate_secondary_targets(&root, target, &policy)?;
     policy.secondary_contract_digests = secondary_contract_digests(&root, &policy)?;
     Ok(policy)
+}
+
+/// Top-level shape of a `families_file`: families and nothing else.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FamiliesFile {
+    families: Vec<toml::Value>,
+}
+
+fn merge_families_file(
+    selection: &mut toml::Table,
+    read_base_file: impl Fn(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    let Some(value) = selection.remove("families_file") else {
+        return Ok(());
+    };
+    let path = value
+        .as_str()
+        .ok_or_else(|| "families_file must be a string".to_owned())?
+        .to_owned();
+    if !valid_families_file_path(&path) {
+        return Err(format!(
+            "families_file {path:?} must be a relative .toml path under .shipyard/"
+        ));
+    }
+    let contents = read_base_file(&path)?;
+    let file: FamiliesFile = toml::from_str(&contents)
+        .map_err(|error| format!("invalid families_file {path:?}: {error}"))?;
+    if file.families.is_empty() {
+        return Err(format!("families_file {path:?} declares no families"));
+    }
+    let families = selection
+        .entry("families")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| "families must be an array of tables".to_owned())?;
+    families.extend(file.families);
+    let policy_paths = selection
+        .entry("policy_paths")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| "policy_paths must be an array".to_owned())?;
+    if !policy_paths
+        .iter()
+        .any(|entry| entry.as_str() == Some(path.as_str()))
+    {
+        policy_paths.push(toml::Value::String(path));
+    }
+    Ok(())
+}
+
+fn valid_families_file_path(path: &str) -> bool {
+    path.starts_with(".shipyard/")
+        && std::path::Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && !path.contains('\\')
 }
 
 fn secondary_contract_digests(
@@ -1734,6 +1819,123 @@ mod tests {
         let decoded: ChangedSurfacePolicy = toml::from_str(&encoded).expect("decode policy");
         assert_eq!(decoded.ios_compile_skip_safe_paths, vec!["docs/**"]);
         assert_ne!(policy_digest(&original), policy_digest(&decoded));
+    }
+
+    const FAMILIES_CONFIG: &str = r#"
+        [targets.mac]
+        validation_build_type = "debug"
+
+        [targets.mac.changed_surface_selection]
+        schema_version = 1
+        full_test_count = 100
+        build_type = "debug"
+        baseline_tests = ["smoke boots"]
+        test_topology_paths = ["tests/**"]
+        families_file = ".shipyard/changed-surface-families.toml"
+
+        [[targets.mac.changed_surface_selection.families]]
+        name = "audio"
+        paths = ["src/audio/**"]
+        tests = ["audio alpha"]
+        supported_build_types = ["debug"]
+    "#;
+
+    const FAMILIES_FILE: &str = r#"
+        [[families]]
+        name = "registry"
+        paths = ["src/registry/**"]
+        tests = ["registry one"]
+        supported_build_types = ["debug"]
+    "#;
+
+    fn base_reader(file: &'static str) -> impl Fn(&str) -> Result<String, String> {
+        move |path: &str| {
+            if path == ".shipyard/changed-surface-families.toml" {
+                Ok(file.to_owned())
+            } else {
+                Err(format!("{path} is not in the authenticated base"))
+            }
+        }
+    }
+
+    #[test]
+    fn families_file_appends_families_and_becomes_a_policy_path() {
+        let policy =
+            policy_from_base(FAMILIES_CONFIG, "mac", base_reader(FAMILIES_FILE)).expect("policy");
+        let names = policy
+            .families
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["audio", "registry"]);
+        assert!(
+            policy
+                .policy_paths
+                .contains(&".shipyard/changed-surface-families.toml".to_owned())
+        );
+
+        let mut changed_file = input(&[".shipyard/changed-surface-families.toml"]);
+        changed_file
+            .base_tracked_paths
+            .push(".shipyard/changed-surface-families.toml".to_owned());
+        let receipt = plan_selection(&changed_file, Ok(policy.clone())).expect("receipt");
+        assert_eq!(
+            receipt.fallback_reason,
+            Some(FallbackReason::SelectorPolicyChanged)
+        );
+
+        let file_family =
+            plan_selection(&input(&["src/registry/a.rs"]), Ok(policy)).expect("receipt");
+        assert_eq!(file_family.planned_suite, PlannedSuite::Bounded);
+        assert!(
+            file_family
+                .selected_tests
+                .contains(&"registry one".to_owned())
+        );
+    }
+
+    #[test]
+    fn families_file_changes_the_policy_digest() {
+        let first =
+            policy_from_base(FAMILIES_CONFIG, "mac", base_reader(FAMILIES_FILE)).expect("policy");
+        let edited = FAMILIES_FILE.replace("registry one", "registry two");
+        let edited: &'static str = Box::leak(edited.into_boxed_str());
+        let second = policy_from_base(FAMILIES_CONFIG, "mac", base_reader(edited)).expect("policy");
+        assert_ne!(policy_digest(&first), policy_digest(&second));
+    }
+
+    #[test]
+    fn families_file_fails_closed() {
+        // Without a reader bound to the authenticated base the file cannot be read.
+        assert!(policy_from_toml(FAMILIES_CONFIG, "mac").is_err());
+        // The base does not hold the file.
+        assert!(policy_from_base(FAMILIES_CONFIG, "mac", |_| Err("missing".to_owned())).is_err());
+        for path in [
+            "../families.toml",
+            "/etc/families.toml",
+            ".shipyard/../x.toml",
+            "tools/families.toml",
+            ".shipyard/families.json",
+            ".shipyard//families.toml",
+        ] {
+            let config = FAMILIES_CONFIG.replace(".shipyard/changed-surface-families.toml", path);
+            assert!(
+                policy_from_base(&config, "mac", |_| Ok(FAMILIES_FILE.to_owned())).is_err(),
+                "accepted families_file {path:?}"
+            );
+        }
+        for file in [
+            "families = []",
+            "schema_version = 1\n[[families]]\nname = \"x\"\npaths = [\"x/**\"]\ntests = [\"x\"]\nsupported_build_types = [\"debug\"]",
+            "[[families]]\nname = \"x\"\npaths = [\"x/**\"]\ntests = [\"x\"]\nsupported_build_types = [\"debug\"]\nunknown = 1",
+            "[[families]]\nname = \"audio\"\npaths = [\"x/**\"]\ntests = [\"x\"]\nsupported_build_types = [\"debug\"]",
+        ] {
+            let file: &'static str = Box::leak(file.to_owned().into_boxed_str());
+            assert!(
+                policy_from_base(FAMILIES_CONFIG, "mac", base_reader(file)).is_err(),
+                "accepted families file {file:?}"
+            );
+        }
     }
 
     #[test]
