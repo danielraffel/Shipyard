@@ -792,6 +792,57 @@ def _process_start(pid: int, *, deadline: Optional[float] = None) -> Optional[st
     return value or None
 
 
+# Every foreign writer-domain holder this guardian saw, with what it was. The
+# failure string stays exactly as recovery parses it; these name the process
+# so a short-lived writer that is gone by the time anyone looks is still
+# identifiable from the receipt.
+_FOREIGN_WRITERS: list[dict[str, object]] = []
+FOREIGN_WRITER_DESCRIBE_TIMEOUT = 2.0
+
+
+def _describe_processes(pids: tuple[int, ...]) -> list[dict[str, object]]:
+    """Best-effort pid, parent, start time and command line for each pid."""
+    described: list[dict[str, object]] = []
+    for pid in pids:
+        entry: dict[str, object] = {"pid": pid}
+        try:
+            result = subprocess.run(
+                ["/bin/ps", "-p", str(pid), "-o", "ppid=,lstart=,command="],
+                capture_output=True,
+                text=True,
+                timeout=FOREIGN_WRITER_DESCRIBE_TIMEOUT,
+                check=False,
+            )
+            line = result.stdout.strip()
+            if line:
+                ppid, _, rest = line.partition(" ")
+                # `lstart` is five whitespace-separated fields.
+                fields = rest.split(None, 5)
+                entry["ppid"] = int(ppid) if ppid.isdigit() else ppid
+                entry["start_time"] = " ".join(fields[:5])
+                entry["command"] = fields[5] if len(fields) > 5 else ""
+            else:
+                entry["command"] = None
+                entry["note"] = "process exited before it could be described"
+        except (OSError, subprocess.TimeoutExpired) as error:
+            entry["command"] = None
+            entry["note"] = f"{type(error).__name__}: {error}"
+        described.append(entry)
+    return described
+
+
+def _record_foreign_writers(pids: tuple[int, ...]) -> None:
+    described = _describe_processes(pids)
+    _FOREIGN_WRITERS.extend(described)
+    for entry in described:
+        print(
+            "guardian: foreign writer-domain holder "
+            f"pid={entry['pid']} ppid={entry.get('ppid')} "
+            f"started={entry.get('start_time')} command={entry.get('command')!r}",
+            file=sys.stderr,
+        )
+
+
 def _lock_holders(
     path: Path,
     *,
@@ -994,6 +1045,7 @@ def _wait_for_idle_writer_domain(
             continuous_production_ownership = False
         foreign_holders = tuple(pid for pid in holders if pid != production_pid)
         if foreign_holders:
+            _record_foreign_writers(foreign_holders)
             raise GuardianError(
                 "foreign process entered the production writer domain: "
                 f"{foreign_holders!r}"
@@ -3170,6 +3222,7 @@ class Guardian:
                         else None
                     ),
                     "fleet_install_guard_held": self.fleet_install_guard_held,
+                    "foreign_writers": list(_FOREIGN_WRITERS),
                 }
             # This receipt is recovery authority for the narrow crash window
             # between publication and launchd accepting the self-unload.

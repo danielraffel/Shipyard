@@ -240,6 +240,19 @@ sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
 cannot be had the write is skipped and the cache stops writing for that run; a
 cold read is always correct. Any new cache in the state tree needs the same.
 
+## A foreign writer-domain holder is named in the guardian receipt
+
+Sandbox E2E fails with `foreign process entered the production writer domain:
+(<pid>,)` when any process other than the production daemon has
+`.sandbox-writer-domain.lock` open during the guardian's idle wait. Only a
+process that takes (or probes) the writer lease opens that file, so this is a
+leased writer or a manual lock probe running at the wrong moment, not an
+unleased write. The pid is usually gone by the time anyone looks, so the
+guardian now records each foreign holder's pid, ppid, start time and command
+line in the receipt (`foreign_writers`, printed by the workflow on failure)
+and on stderr. The failure string itself is unchanged because retained-lease
+recovery parses it. Do not run `flock`/`lsof` probes against that lock on a
+host while a sandbox canary is running: the probe itself is a foreign holder.
 ## Release publication waits for attestation
 
 `release.yml` keeps the release a draft until the macOS DMG is attested:
