@@ -1334,3 +1334,129 @@ fn git(cwd: &Path, args: &[&str]) {
         .expect("git");
     assert!(status.success(), "git command failed: {args:?}");
 }
+
+/// A helper that counts its runs and prints a token expiring `ttl_secs` out.
+#[cfg(unix)]
+fn counting_helper(temp: &TempDir, name: &str, ttl_secs: i64) -> (PathBuf, PathBuf) {
+    let helper = temp.path().join(name);
+    let count = temp.path().join(format!("{name}-count"));
+    let expires = (Utc::now() + chrono::Duration::seconds(ttl_secs)).to_rfc3339();
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf '{{\"token\":\"ghs_minted_secret\",\"expires_at\":\"{expires}\"}}\\n'\n",
+            count.display(),
+        ),
+    );
+    (helper, count)
+}
+
+#[cfg(unix)]
+fn command_config(helper: &Path) -> LoadedConfig {
+    config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}", "{{repo_slug}}"]
+            "#,
+        helper.display()
+    ))
+}
+
+#[cfg(unix)]
+#[test]
+fn separately_built_clients_share_one_minted_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let (helper, count) = counting_helper(&temp, "shared-helper", 3600);
+    let config = command_config(&helper);
+    // The daemon builds a fresh client for nearly every call.
+    for _ in 0..5 {
+        let client = GhClient::from_loaded_config(&config)
+            .expect("client")
+            .with_repo_override("owner/shared")
+            .expect("repo");
+        let token = client
+            .resolve_token(temp.path())
+            .expect("token")
+            .expect("configured token");
+        assert_eq!(token.token, "ghs_minted_secret");
+    }
+    assert_eq!(std::fs::read_to_string(count).expect("count"), "x");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_token_inside_five_minutes_of_expiry_is_used_but_never_cached() {
+    let temp = TempDir::new().expect("tempdir");
+    let (helper, count) = counting_helper(&temp, "near-expiry-helper", 240);
+    let client = GhClient::from_loaded_config(&command_config(&helper))
+        .expect("client")
+        .with_repo_override("owner/near")
+        .expect("repo");
+    for _ in 0..2 {
+        assert!(client.resolve_token(temp.path()).expect("token").is_some());
+    }
+    assert_eq!(std::fs::read_to_string(count).expect("count"), "xx");
+}
+
+#[test]
+fn cached_tokens_refresh_five_minutes_before_expiry_and_never_later() {
+    let expires_at = Utc::now() + chrono::Duration::hours(1);
+    let token = |valid_until| TokenResolution {
+        token: "ghs_x".to_owned(),
+        kind: None,
+        installation_id: None,
+        expires_at: Some(expires_at),
+        valid_until: Some(valid_until),
+    };
+    // The configured 60s skew would allow use until 59 minutes; the cache stops at 55.
+    assert_eq!(
+        cache_valid_until(&token(expires_at - chrono::Duration::seconds(60))),
+        Some(expires_at - chrono::Duration::seconds(300))
+    );
+    // A stricter configured refresh point is kept.
+    let early = expires_at - chrono::Duration::minutes(20);
+    assert_eq!(cache_valid_until(&token(early)), Some(early));
+    // Nothing is ever cached past expires_at, even with a long configured TTL.
+    let late = token(expires_at + chrono::Duration::hours(1));
+    assert!(cache_valid_until(&late).expect("bound") < expires_at);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_forgotten_token_is_minted_again() {
+    let temp = TempDir::new().expect("tempdir");
+    let (helper, count) = counting_helper(&temp, "forget-helper", 3600);
+    let client = GhClient::from_loaded_config(&command_config(&helper))
+        .expect("client")
+        .with_repo_override("owner/forget")
+        .expect("repo");
+    client.resolve_token(temp.path()).expect("first");
+    client.resolve_token(temp.path()).expect("cached");
+    client.forget_cached_token(temp.path()).expect("forget");
+    client.resolve_token(temp.path()).expect("re-minted");
+    assert_eq!(std::fs::read_to_string(count).expect("count"), "xx");
+}
+
+#[test]
+fn token_material_never_appears_in_debug_output() {
+    let token = TokenResolution {
+        token: "ghs_never_print_me".to_owned(),
+        kind: Some("github-app-installation".to_owned()),
+        installation_id: Some(7),
+        expires_at: None,
+        valid_until: Some(Utc::now()),
+    };
+    let cached = CachedToken {
+        valid_until: Utc::now(),
+        token: token.clone(),
+    };
+    for rendered in [
+        format!("{token:?}"),
+        format!("{cached:?}"),
+        format!("{:?}", Some(token.clone())),
+    ] {
+        assert!(!rendered.contains("ghs_never_print_me"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+}

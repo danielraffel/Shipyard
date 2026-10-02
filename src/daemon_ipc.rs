@@ -790,6 +790,14 @@ fn removed_actionable_wake_producer_status() -> Value {
     })
 }
 
+/// App-token mints against cache hits since the daemon started: the proxy
+/// for how many API calls paid for a fresh installation token.
+#[cfg(unix)]
+fn gh_token_cache_status() -> Value {
+    let stats = crate::gh::token_cache_stats();
+    json!({"mints": stats.mints, "hits": stats.hits})
+}
+
 #[cfg(unix)]
 fn status_frame(state: &IpcState) -> Value {
     json!({
@@ -811,6 +819,7 @@ fn status_frame(state: &IpcState) -> Value {
         "last_error": state.last_error,
         "shipyard_version": env!("CARGO_PKG_VERSION"),
         "protocol": IPC_PROTOCOL_VERSION,
+        "gh_token_cache": gh_token_cache_status(),
     })
 }
 
@@ -988,6 +997,17 @@ mod tests {
             rate_limit: None,
             last_error: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_frame_reports_app_token_mints_against_cache_hits() {
+        let frame = super::status_frame(&dummy_state());
+        let cache = &frame["gh_token_cache"];
+        assert!(cache["mints"].is_u64(), "{frame}");
+        assert!(cache["hits"].is_u64(), "{frame}");
+        // Counters only, never token material.
+        assert_eq!(cache.as_object().map(serde_json::Map::len), Some(2));
     }
 
     #[cfg(unix)]

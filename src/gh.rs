@@ -13,7 +13,8 @@ use std::fmt::{Debug, Formatter};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -28,6 +29,51 @@ const GH_TOKEN_ENV: &str = "GH_TOKEN";
 const PR_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Timeout for one batched repository-wide pull-request listing.
 const PR_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Minted command-helper tokens, keyed by the expanded helper argv (which
+/// names the App and the repository). One map per process, in memory only:
+/// a daemon that builds a fresh client per call still reuses a token until it
+/// is near expiry instead of re-minting for every API call. Never written to
+/// disk and never logged.
+type TokenCache = Arc<Mutex<HashMap<Vec<String>, CachedToken>>>;
+
+static SHARED_TOKEN_CACHE: LazyLock<TokenCache> = LazyLock::new(TokenCache::default);
+static TOKEN_MINTS: AtomicU64 = AtomicU64::new(0);
+static TOKEN_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// A cached token is replaced this long before its `expires_at`, whatever
+/// the configured refresh skew, so a command never starts with a token about
+/// to lapse mid-call.
+const CACHE_REFRESH_LEAD_SECONDS: i64 = 300;
+
+/// Process-wide command-helper token counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TokenCacheStats {
+    /// Helper invocations (fresh mints).
+    pub mints: u64,
+    /// Resolutions served from the cache.
+    pub hits: u64,
+}
+
+/// Command-helper mints and cache hits since this process started.
+#[must_use]
+pub fn token_cache_stats() -> TokenCacheStats {
+    TokenCacheStats {
+        mints: TOKEN_MINTS.load(Ordering::Relaxed),
+        hits: TOKEN_CACHE_HITS.load(Ordering::Relaxed),
+    }
+}
+
+/// True when `gh` output says GitHub rejected the credential itself (HTTP
+/// 401), as opposed to a permission refusal (403) or any other failure. Only
+/// this case is worth one fresh mint: a cached token GitHub no longer accepts.
+#[must_use]
+pub fn is_rejected_credential(output: &str) -> bool {
+    let lowered = output.to_ascii_lowercase();
+    lowered.contains("http 401")
+        || lowered.contains("401 unauthorized")
+        || lowered.contains("bad credentials")
+}
 
 /// Auth-aware GitHub CLI command factory.
 #[derive(Clone)]
@@ -423,7 +469,7 @@ impl GhClient {
     fn new(auth: GhAuthConfig) -> Self {
         Self {
             auth,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::clone(&SHARED_TOKEN_CACHE),
             pinned_token: None,
             repo_hint: None,
             repo_override: None,
@@ -491,8 +537,10 @@ impl GhClient {
         )?;
         let now = Utc::now();
         if let Some(cached) = self.cached_token(&expanded, now)? {
+            TOKEN_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
+        TOKEN_MINTS.fetch_add(1, Ordering::Relaxed);
 
         let (program, args) = expanded
             .split_first()
@@ -543,18 +591,42 @@ impl GhClient {
             .map(|cached| cached.token.clone()))
     }
 
+    /// Drop the cached token this client would use in `cwd`, so the next
+    /// command mints afresh. For a token GitHub has rejected (HTTP 401)
+    /// before its recorded expiry.
+    pub fn forget_cached_token(&self, cwd: &Path) -> Result<(), GhPrepareError> {
+        let GhAuthSource::Command { token_command, .. } = &self.auth.source else {
+            return Ok(());
+        };
+        let expanded = expand_token_command(
+            token_command,
+            cwd,
+            self.repo_hint.as_ref(),
+            self.repo_override.as_ref(),
+        )?;
+        self.cache
+            .lock()
+            .map_err(|_| GhPrepareError::TokenCachePoisoned)?
+            .remove(&expanded);
+        Ok(())
+    }
+
     fn store_cached_token(
         &self,
         key: Vec<String>,
         token: &TokenResolution,
         now: DateTime<Utc>,
     ) -> Result<(), GhPrepareError> {
-        let Some(valid_until) = token.valid_until else {
-            return Ok(());
-        };
-        if valid_until <= now {
+        if token
+            .valid_until
+            .is_some_and(|valid_until| valid_until <= now)
+        {
             return Err(GhPrepareError::TokenExpired);
         }
+        // Too close to expiry to reuse: use it for this command, cache nothing.
+        let Some(valid_until) = cache_valid_until(token).filter(|until| *until > now) else {
+            return Ok(());
+        };
         let mut cache = self
             .cache
             .lock()
@@ -721,7 +793,7 @@ fn helper_failure_is_transient(stderr: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct TokenResolution {
     token: String,
     kind: Option<String>,
@@ -730,10 +802,33 @@ struct TokenResolution {
     valid_until: Option<DateTime<Utc>>,
 }
 
+/// Token material never reaches a `{:?}`: only its shape does.
+impl Debug for TokenResolution {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResolution")
+            .field("token", &"<redacted>")
+            .field("kind", &self.kind)
+            .field("installation_id", &self.installation_id)
+            .field("expires_at", &self.expires_at)
+            .field("valid_until", &self.valid_until)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CachedToken {
     token: TokenResolution,
     valid_until: DateTime<Utc>,
+}
+
+/// How long a minted token may be served from the cache: until its own
+/// refresh point, and never later than [`CACHE_REFRESH_LEAD_SECONDS`] before
+/// GitHub's `expires_at`. `None` means it is not cached at all.
+fn cache_valid_until(token: &TokenResolution) -> Option<DateTime<Utc>> {
+    let valid_until = token.valid_until?;
+    Some(token.expires_at.map_or(valid_until, |expires_at| {
+        valid_until.min(expires_at - chrono::Duration::seconds(CACHE_REFRESH_LEAD_SECONDS))
+    }))
 }
 
 impl CachedToken {

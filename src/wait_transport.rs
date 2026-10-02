@@ -1071,7 +1071,26 @@ impl std::fmt::Display for SnapshotCommandTimeout {
 
 impl std::error::Error for SnapshotCommandTimeout {}
 
+/// Run one snapshot `gh` command, retrying once with a fresh mint when
+/// GitHub rejects the cached credential with HTTP 401.
 fn run_gh_output(
+    client: &GhClient,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Output> {
+    let started = Instant::now();
+    let output = run_gh_output_once(client, args, cwd, timeout)?;
+    if output.status.success()
+        || !crate::gh::is_rejected_credential(&String::from_utf8_lossy(&output.stderr))
+    {
+        return Ok(output);
+    }
+    client.forget_cached_token(cwd)?;
+    run_gh_output_once(client, args, cwd, timeout.saturating_sub(started.elapsed()))
+}
+
+fn run_gh_output_once(
     client: &GhClient,
     args: &[&str],
     cwd: &Path,
