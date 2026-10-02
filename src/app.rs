@@ -74,7 +74,9 @@ mod watch_local_cmd;
 use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
 use self::branch_cmd::branch_command;
-use self::changed_surface_cmd::{ChangedSurfacePlanArgs, changed_surface_plan_command};
+use self::changed_surface_cmd::{
+    ChangedSurfacePlanArgs, changed_surface_plan_command, changed_surface_plan_record_command,
+};
 use self::changed_surface_trial_cmd::{
     ChangedSurfaceTrialStatusArgs, changed_surface_trial_status_command,
 };
@@ -580,13 +582,29 @@ where
                 stdout,
             );
         }
-        Command::ChangedSurfacePlan { target, pr, repo } => {
+        Command::ChangedSurfacePlan {
+            target,
+            pr,
+            repo,
+            record,
+        } => {
             let config = LoadedConfig::load_from_cwd_with_global_dir(
                 cli.mode.into(),
                 &cwd,
                 runtime_paths.global_dir.clone(),
             )
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            .map_err(|error| CliFailure::new(1, error.to_string()));
+            if let Some(record_dir) = record {
+                return changed_surface_plan_record_command(
+                    &ChangedSurfacePlanArgs { target, pr, repo },
+                    config,
+                    &cwd,
+                    &runtime_paths.state_dir,
+                    &record_dir,
+                    stdout,
+                );
+            }
+            let config = config?;
             return changed_surface_plan_command(
                 &ChangedSurfacePlanArgs { target, pr, repo },
                 &config,
