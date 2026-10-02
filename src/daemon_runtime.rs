@@ -1428,6 +1428,19 @@ fn start_webhook_listener(
     event_sender: mpsc::Sender<Value>,
     secret: String,
 ) -> Result<LocalWebhookListener, DaemonRunError> {
+    let log = DeliveryLog::spawn(DELIVERY_LOG_CAPACITY, |line| {
+        let _ = crate::writer_domain_lease::write_stderr(format_args!("{line}"));
+    });
+    start_webhook_listener_with_log(running, event_sender, secret, log)
+}
+
+#[cfg(unix)]
+fn start_webhook_listener_with_log(
+    running: &Arc<AtomicBool>,
+    event_sender: mpsc::Sender<Value>,
+    secret: String,
+    mut log: DeliveryLog,
+) -> Result<LocalWebhookListener, DaemonRunError> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
@@ -1437,27 +1450,28 @@ fn start_webhook_listener(
         while running.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _addr)) => {
-                    let response = match read_webhook_request(&mut stream, WEBHOOK_READ_TIMEOUT) {
-                        Ok(request) => {
-                            let response = handle_webhook_request(
-                                &request,
-                                &secret,
-                                &event_sender,
-                                &mut seen_delivery_ids,
-                            );
-                            if response.status != 200 {
-                                log_rejected_delivery(&WebhookRejection::for_request(
-                                    &request, response,
-                                ));
+                    let (response, rejection) =
+                        match read_webhook_request(&mut stream, WEBHOOK_READ_TIMEOUT) {
+                            Ok(request) => {
+                                let response = handle_webhook_request(
+                                    &request,
+                                    &secret,
+                                    &event_sender,
+                                    &mut seen_delivery_ids,
+                                );
+                                let rejection = (response.status != 200)
+                                    .then(|| WebhookRejection::for_request(&request, response));
+                                (response, rejection)
                             }
-                            response
-                        }
-                        Err(rejection) => {
-                            log_rejected_delivery(&rejection);
-                            rejection.response
-                        }
-                    };
-                    let _ = write_http_response(&mut stream, &response);
+                            Err(rejection) => (rejection.response, Some(*rejection)),
+                        };
+                    // Answer first; the log line never delays or blocks the
+                    // accept loop (it is queued, or dropped and counted).
+                    answer_delivery(&mut stream, &response);
+                    drop(stream);
+                    if let Some(rejection) = rejection {
+                        log.record(rejection.log_line());
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -1584,11 +1598,50 @@ impl WebhookRejection {
     }
 }
 
+/// Queued refused-delivery lines the listener may hold before dropping.
+#[cfg(unix)]
+const DELIVERY_LOG_CAPACITY: usize = 256;
+
 /// One daemon-log line per refused delivery, so a non-200 answer to GitHub is
 /// visible on the host rather than only in the repository's delivery log.
+///
+/// Lines are written by a dedicated thread. The listener only ever does a
+/// non-blocking hand-off: when the queue is full, or the writer is gone, the
+/// line is dropped and counted, and the count rides on the next line that
+/// gets through. Logging therefore cannot stall the accept loop, whatever the
+/// writer blocks on.
 #[cfg(unix)]
-fn log_rejected_delivery(rejection: &WebhookRejection) {
-    let _ = crate::writer_domain_lease::write_stderr(format_args!("{}", rejection.log_line()));
+struct DeliveryLog {
+    sender: mpsc::SyncSender<String>,
+    dropped: u64,
+}
+
+#[cfg(unix)]
+impl DeliveryLog {
+    fn spawn(capacity: usize, write: impl Fn(&str) + Send + 'static) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<String>(capacity);
+        thread::spawn(move || {
+            for line in receiver {
+                write(&line);
+            }
+        });
+        Self { sender, dropped: 0 }
+    }
+
+    fn record(&mut self, line: String) {
+        let line = if self.dropped == 0 {
+            line
+        } else {
+            format!(
+                "{line} ({} earlier refusal lines dropped: log writer backed up)",
+                self.dropped
+            )
+        };
+        match self.sender.try_send(line) {
+            Ok(()) => self.dropped = 0,
+            Err(_) => self.dropped += 1,
+        }
+    }
 }
 
 /// Read one HTTP request, tolerating a request that arrives across many
@@ -1809,6 +1862,14 @@ fn should_accept_delivery(
     }
     seen_delivery_ids.insert(delivery_id.to_owned(), now);
     true
+}
+
+/// Send the listener's answer without letting a peer that stops reading
+/// (a zero receive window) hold the accept loop past the read deadline.
+#[cfg(unix)]
+fn answer_delivery(stream: &mut TcpStream, response: &HttpResponse) {
+    let _ = stream.set_write_timeout(Some(WEBHOOK_READ_TIMEOUT));
+    let _ = write_http_response(stream, response);
 }
 
 #[cfg(unix)]
@@ -3021,6 +3082,131 @@ mod tests {
         let mut response = String::new();
         let _ = stream.read_to_string(&mut response);
         response
+    }
+
+    /// Send one whole request and return the answer, or "" if none came back
+    /// within the timeout.
+    #[cfg(unix)]
+    fn send_with_timeout(port: u16, request: &[u8], timeout: Duration) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.set_read_timeout(Some(timeout)).expect("timeout");
+        let _ = stream.write_all(request);
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    /// Send `count` forged deliveries then one genuine one, returning the
+    /// forged answers and the genuine answer.
+    #[cfg(unix)]
+    fn forged_then_genuine(port: u16, secret: &str, count: usize) -> (Vec<String>, String) {
+        let refused = (0..count)
+            .map(|index| {
+                let (forged, _) =
+                    check_run_delivery("the-wrong-secret", &format!("forged-{index}"));
+                send_with_timeout(port, &forged, Duration::from_secs(3))
+            })
+            .collect();
+        let (genuine, _) = check_run_delivery(secret, "genuine");
+        (
+            refused,
+            send_with_timeout(port, &genuine, Duration::from_secs(3)),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_answer_is_bounded_by_a_write_timeout() {
+        let (mut client, mut server) = accepted_pair();
+        super::answer_delivery(&mut server, &HttpResponse::ok());
+
+        assert_eq!(
+            server.write_timeout().expect("write timeout"),
+            Some(WEBHOOK_READ_TIMEOUT)
+        );
+        let mut response = String::new();
+        drop(server);
+        client.read_to_string(&mut response).expect("response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_keeps_serving_while_the_dispatch_thread_holds_stdio() {
+        // The shape the CLI dispatcher once had: the thread that runs the
+        // command holds both stdio locks for its whole life, while the
+        // production listener logs every refusal through `write_stderr`.
+        let held_stdout = std::io::stdout().lock();
+        let held_stderr = std::io::stderr().lock();
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let secret = "dev-secret";
+        let listener =
+            super::start_webhook_listener(&running, tx, secret.to_owned()).expect("listener");
+
+        let (refused, accepted) = forged_then_genuine(listener.port, secret, 3);
+        drop(held_stderr);
+        drop(held_stdout);
+
+        running.store(false, Ordering::Release);
+        listener.stop();
+        for answer in &refused {
+            assert!(answer.starts_with("HTTP/1.1 401"), "unexpected: {answer:?}");
+        }
+        assert!(
+            accepted.starts_with("HTTP/1.1 200 OK"),
+            "listener stopped answering after a refusal: {accepted:?}"
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("event")["kind"],
+            "check_run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_keeps_serving_when_the_log_writer_never_returns() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (line_tx, line_rx) = mpsc::channel::<String>();
+        // The writer blocks on its first line until released.
+        let log = super::DeliveryLog::spawn(1, move |line| {
+            let _ = release_rx.lock().expect("release").recv();
+            let _ = line_tx.send(line.to_owned());
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let secret = "dev-secret";
+        let listener = super::start_webhook_listener_with_log(&running, tx, secret.to_owned(), log)
+            .expect("listener");
+
+        let (refused, accepted) = forged_then_genuine(listener.port, secret, 5);
+        // One more refusal after the writer frees up carries the drop count.
+        drop(release_tx);
+        thread::sleep(Duration::from_millis(200));
+        let (last_forged, _) = check_run_delivery("the-wrong-secret", "forged-last");
+        let last = send_with_timeout(listener.port, &last_forged, Duration::from_secs(3));
+
+        running.store(false, Ordering::Release);
+        listener.stop();
+        assert_eq!(refused.len(), 5);
+        for answer in refused.iter().chain([&last]) {
+            assert!(answer.starts_with("HTTP/1.1 401"), "unexpected: {answer:?}");
+        }
+        assert!(
+            accepted.starts_with("HTTP/1.1 200 OK"),
+            "a stuck log writer stalled the listener: {accepted:?}"
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("event")["kind"],
+            "check_run"
+        );
+        let lines: Vec<String> = line_rx.iter().collect();
+        assert!(
+            lines.iter().any(|line| line.contains("forged-last")
+                && line.contains("earlier refusal lines dropped")),
+            "the drop count must ride on a later line: {lines:?}"
+        );
     }
 
     #[cfg(unix)]

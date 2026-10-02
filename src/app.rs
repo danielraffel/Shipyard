@@ -81,6 +81,7 @@ use self::changelog_cmd::changelog_command;
 use self::ci_cmd::ci_command;
 use self::cleanup_cmd::{
     CleanupCommandOptions, CleanupMode, CleanupOutput, CleanupScope, cleanup_command,
+    validation_tmp_cleanup,
 };
 use self::cli::{
     Cli, Command, EvidenceCommand, MergeMethod, MergeResult, RunSubcommand, ShipStateCommand,
@@ -181,9 +182,11 @@ pub(super) const WAIT_EXIT_UNSUPPORTED: u8 = 7;
 #[must_use]
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    let mut stdout = std::io::stdout().lock();
-    let mut stderr = std::io::stderr().lock();
-    run_with(cli, &mut stdout, &mut stderr)
+    // Unlocked handles: each write takes the process lock only for itself.
+    // Holding `lock()` here for the whole command would block, forever, any
+    // worker thread of a long-running command (`daemon run`) that writes to
+    // stdout or stderr.
+    run_with(cli, &mut std::io::stdout(), &mut std::io::stderr())
 }
 
 fn run_with<W: Write, E: Write>(cli: Cli, stdout: &mut W, stderr: &mut E) -> ExitCode {
@@ -843,10 +846,23 @@ fn handle_state_command<W: Write>(
         }
         Command::Queue => queue_command(state_dir, json, stdout),
         Command::Cleanup {
+            validation_tmp: true,
+            dry_run,
+            apply,
+            older_than_hours,
+            ..
+        } => validation_tmp_cleanup(
+            CleanupMode::from_flags(dry_run, apply),
+            older_than_hours,
+            json,
+            stdout,
+        ),
+        Command::Cleanup {
             pin,
             dry_run,
             apply,
             ship_state,
+            ..
         } => cleanup_command(
             state_dir,
             mode,
@@ -1684,6 +1700,18 @@ mod tests {
             ),
         )
         .expect("watch config");
+    }
+
+    #[test]
+    fn run_never_holds_the_process_stdio_locks_for_the_command() {
+        // A Windows checkout may carry CRLF line endings.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let start = source.find("pub fn run() -> ExitCode {").expect("run");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("end of run")];
+        assert!(
+            !body.contains(".lock()"),
+            "a command-long stdio lock blocks every worker thread that logs:\n{body}"
+        );
     }
 
     #[test]

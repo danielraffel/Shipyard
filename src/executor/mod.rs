@@ -20,3 +20,5 @@ pub mod ssh;
 pub mod ssh_windows;
 /// Shared subprocess streaming helpers for validation executors.
 pub mod streaming;
+/// Ownership and reclamation of validation TMPDIRs.
+pub mod validation_tmp;
