@@ -75,6 +75,19 @@ bytes]` line to `daemon/daemon.log`; match that GUID
 against the repository's hook delivery log. A quiet `daemon.log` is normal on a
 healthy host: registration failures were the only other routine writer.
 
+## Never take the std stderr lock off the main thread
+
+`app::run` holds `io::stdout().lock()` and `io::stderr().lock()` for the whole
+command, so in a long-running command such as `daemon run` any other thread that
+locks stderr (including `eprintln!`) blocks forever. A webhook listener that
+logged its first refused delivery that way stopped accepting connections, and
+GitHub recorded HTTP 502 for every later delivery. `app::run` now passes unlocked
+handles, `writer_domain_lease::write_stderr` writes through a duplicate of the
+stderr descriptor, and the webhook listener hands refusal lines to a logger
+thread with `try_send`, dropping and counting a line rather than ever waiting.
+Keep `run_never_holds_the_process_stdio_locks_for_the_command` and the
+`webhook_listener_keeps_serving_*` tests passing.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.

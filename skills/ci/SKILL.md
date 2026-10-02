@@ -1029,7 +1029,9 @@ cadence.
 A delivery the daemon refuses (HTTP 400/401/404/405 in the hook's
 delivery log) writes one `rejected webhook delivery <guid>` line with
 its event kind, reason, and body bytes received against Content-Length to
-`daemon/daemon.log`, so a refusal is visible on the host.
+`daemon/daemon.log`, so a refusal is visible on the host. If every delivery in the hook's log is HTTP 502
+while the daemon still shows LISTEN, the listener thread is wedged: run
+`sample <daemon pid>` and look for it parked on a lock.
 
 **Idle behavior (v0.56.0+):** when no IPC subscriber is attached
 (no `shipyard watch` running, no GUI), the daemon skips the
