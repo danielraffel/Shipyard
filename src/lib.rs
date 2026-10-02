@@ -275,6 +275,7 @@ pub mod watch;
 /// GitHub webhook signature validation and event decoding.
 pub mod webhook;
 
+pub mod webhook_prune;
 pub mod webhook_reconcile;
 pub(crate) mod worker_process_custody;
 /// Fail-closed policy for automated workflow-run cancellation.

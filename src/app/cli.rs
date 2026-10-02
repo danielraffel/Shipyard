@@ -2148,6 +2148,23 @@ pub(super) enum DaemonCommand {
         #[arg(long = "repo")]
         repos: Vec<String>,
     },
+    /// List Shipyard webhooks that no live advertising daemon owns, and the
+    /// stale local registrations that point at them. Deletes them with
+    /// `--apply`; a dry run is the default.
+    ///
+    /// Prunable: this host's hook on a repository the running daemon does not
+    /// advertise, and a peer's hook whose endpoint has answered only gateway
+    /// failures for at least a day. Exits 1 when a repository could not be
+    /// read or a deletion failed.
+    #[command(name = "prune-webhooks")]
+    PruneWebhooks {
+        /// Repo(s) to scan. Defaults to the advertised and recorded repositories.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Delete the prunable hooks and drop the stale registrations.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Manage the macOS launchd launcher that gives the daemon a stable
     /// privacy identity across updates.
     Launcher {
