@@ -131,8 +131,13 @@ first tunnel verification and every tenth after (about five minutes). A TLS
 failure, empty reply, refused connection, or 502-504 counts as failing; DNS,
 timeouts, or a missing `curl` are inconclusive and never act. Two failing
 probes in a row make the supervisor treat the tunnel as lost and re-apply the
-funnel. `daemon status` prints `public ingress: ok` or `FAILING (...)`, and
-`daemon reconcile` raises an `endpoint_unreachable` alarm while it fails.
+funnel, at most six times per failing episode with backoff (1m, 5m, 15m, then
+hourly); after that it only reports. The first reachable probe resets the
+budget. The check and any re-apply run on the tunnel supervisor's thread,
+never the listener's. `daemon status` prints `public ingress: ok` or
+`FAILING (...)`, `shipyard doctor` shows `daemon-public-ingress` as degraded,
+`daemon reconcile` raises an `endpoint_unreachable` alarm, and daemon.log
+records each transition and re-apply.
 
 ## A config PATCH replaces; it does not merge
 

@@ -28,6 +28,16 @@ pub const INGRESS_FAILURES_BEFORE_LOST: u32 = 2;
 /// Probe on every this-many tunnel verifications (30s apart: five minutes).
 pub const INGRESS_PROBE_EVERY_VERIFIES: u32 = 10;
 
+/// Minimum wait after each funnel re-apply before another may be forced, in
+/// seconds. The last entry is the cap; [`INGRESS_MAX_REAPPLIES`] bounds the
+/// count. A relay that never heals is re-applied a handful of times, then
+/// only reported.
+pub const INGRESS_REAPPLY_BACKOFF_SECS: [f64; 6] = [60.0, 300.0, 900.0, 3600.0, 3600.0, 3600.0];
+
+/// Funnel re-applies forced per failing episode; a reachable probe resets it.
+#[allow(clippy::cast_possible_truncation)] // A six-entry table.
+pub const INGRESS_MAX_REAPPLIES: u32 = INGRESS_REAPPLY_BACKOFF_SECS.len() as u32;
+
 const DNS_OVER_HTTPS_URL: &str = "https://1.1.1.1/dns-query";
 const CURL_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -70,6 +80,10 @@ pub struct IngressStatus {
     pub checked_at: f64,
     /// Failing probes in a row.
     pub consecutive_failures: u32,
+    /// Funnel re-applies forced in the current failing episode.
+    pub reapplies: u32,
+    /// Earliest time another re-apply may be forced, when one is pending.
+    pub next_reapply_at: Option<f64>,
 }
 
 impl IngressStatus {
@@ -81,6 +95,12 @@ impl IngressStatus {
             "detail": self.verdict.detail(),
             "checked_at": self.checked_at,
             "consecutive_failures": self.consecutive_failures,
+            "self_heal": {
+                "reapplies": self.reapplies,
+                "max_reapplies": INGRESS_MAX_REAPPLIES,
+                "next_reapply_at": self.next_reapply_at,
+                "exhausted": self.reapplies >= INGRESS_MAX_REAPPLIES,
+            },
         })
     }
 }
@@ -163,11 +183,13 @@ pub fn relay_addresses_from_doh(raw: &str) -> Vec<String> {
     addresses
 }
 
-/// Decides when failing probes mean the tunnel is lost.
+/// Decides when failing probes mean the tunnel should be re-applied.
 #[derive(Clone, Debug, Default)]
 pub struct IngressMonitor {
     verifies: u32,
     consecutive_failures: u32,
+    reapplies: u32,
+    next_reapply_at: Option<f64>,
 }
 
 impl IngressMonitor {
@@ -178,28 +200,155 @@ impl IngressMonitor {
         due
     }
 
-    /// Record a probe; returns the status to publish and whether the tunnel
-    /// should be treated as lost (and so re-applied). Inconclusive probes
-    /// neither count nor reset the failure run.
+    /// Record a probe; returns the status to publish and whether the funnel
+    /// should be torn down and re-applied now.
+    ///
+    /// A re-apply needs [`INGRESS_FAILURES_BEFORE_LOST`] failing probes in a
+    /// row, the backoff since the previous re-apply to have elapsed, and fewer
+    /// than [`INGRESS_MAX_REAPPLIES`] re-applies in this episode. Otherwise
+    /// the failure is only reported. Inconclusive probes neither count nor
+    /// reset; a reachable probe ends the episode.
     pub fn observe(&mut self, verdict: IngressVerdict, checked_at: f64) -> (IngressStatus, bool) {
         match verdict {
-            IngressVerdict::Reachable => self.consecutive_failures = 0,
+            IngressVerdict::Reachable => {
+                self.consecutive_failures = 0;
+                self.reapplies = 0;
+                self.next_reapply_at = None;
+            }
             IngressVerdict::Failing(_) => self.consecutive_failures += 1,
             IngressVerdict::Inconclusive(_) => {}
         }
-        let lost = self.consecutive_failures >= INGRESS_FAILURES_BEFORE_LOST;
-        let status = IngressStatus {
-            verdict,
-            checked_at,
-            consecutive_failures: self.consecutive_failures,
-        };
-        if lost {
-            // The tunnel is about to be re-applied; the next run starts fresh.
+        let reapply = self.consecutive_failures >= INGRESS_FAILURES_BEFORE_LOST
+            && self.reapplies < INGRESS_MAX_REAPPLIES
+            && self.next_reapply_at.is_none_or(|at| checked_at >= at);
+        let status_failures = self.consecutive_failures;
+        if reapply {
+            let backoff = INGRESS_REAPPLY_BACKOFF_SECS[usize::try_from(self.reapplies)
+                .unwrap_or(usize::MAX)
+                .min(INGRESS_REAPPLY_BACKOFF_SECS.len() - 1)];
+            self.reapplies += 1;
+            self.next_reapply_at = Some(checked_at + backoff);
+            // The funnel is about to be re-applied; probe straight after it.
             self.consecutive_failures = 0;
             self.verifies = 0;
         }
-        (status, lost)
+        let status = IngressStatus {
+            verdict,
+            checked_at,
+            consecutive_failures: status_failures,
+            reapplies: self.reapplies,
+            next_reapply_at: self.next_reapply_at,
+        };
+        (status, reapply)
     }
+}
+
+/// Shared slot for the last public-ingress probe, read by `daemon status`.
+pub type IngressReport = std::sync::Arc<std::sync::Mutex<Option<IngressStatus>>>;
+
+/// The periodic self-check a tunnel backend runs from its `verify`, on the
+/// tunnel supervisor's own thread: never on the webhook listener's.
+#[derive(Clone, Debug)]
+pub struct IngressCheck {
+    /// Funnel host name, known once the tunnel is up.
+    pub(crate) public_host: Option<String>,
+    monitor: IngressMonitor,
+    report: Option<IngressReport>,
+    pub(crate) probe: fn(&str, &str) -> IngressVerdict,
+    last_state: Option<&'static str>,
+}
+
+impl Default for IngressCheck {
+    fn default() -> Self {
+        Self {
+            public_host: None,
+            monitor: IngressMonitor::default(),
+            report: None,
+            probe: probe_public_ingress,
+            last_state: None,
+        }
+    }
+}
+
+impl IngressCheck {
+    /// A check that publishes each probe result to `report`.
+    #[must_use]
+    pub fn reporting_to(report: IngressReport) -> Self {
+        Self {
+            report: Some(report),
+            ..Self::default()
+        }
+    }
+
+    /// Record the public URL the tunnel came up on.
+    pub fn set_public_url(&mut self, public_url: &str) {
+        self.public_host = public_url
+            .strip_prefix("https://")
+            .map(|host| host.trim_end_matches('/').to_owned());
+    }
+
+    /// Probe when due. Returns false when the funnel should be re-applied;
+    /// every probe result, including a failure that only gets reported, is
+    /// published to the report.
+    pub fn verify(&mut self, now: f64) -> bool {
+        let Some(host) = self.public_host.clone() else {
+            return true;
+        };
+        if !self.monitor.probe_due() {
+            return true;
+        }
+        let nonce = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        );
+        let verdict = (self.probe)(&host, &nonce);
+        let (status, reapply) = self.monitor.observe(verdict, now);
+        if let Some(line) = transition_line(self.last_state, &status, reapply) {
+            let _ = crate::writer_domain_lease::write_stderr(format_args!("{line}"));
+        }
+        self.last_state = Some(status.verdict.state());
+        if let Some(report) = &self.report
+            && let Ok(mut slot) = report.lock()
+        {
+            *slot = Some(status);
+        }
+        !reapply
+    }
+}
+
+/// The daemon-log line for a probe that changed the picture: the state moved,
+/// or the funnel is about to be re-applied. Repeats of the same state stay
+/// quiet; `daemon status` carries the current reading.
+#[must_use]
+pub fn transition_line(
+    previous: Option<&'static str>,
+    status: &IngressStatus,
+    reapply: bool,
+) -> Option<String> {
+    let state = status.verdict.state();
+    if reapply {
+        return Some(format!(
+            "shipyard daemon: public ingress failing ({}); re-applying the funnel (attempt {} of {INGRESS_MAX_REAPPLIES})",
+            status.verdict.detail(),
+            status.reapplies
+        ));
+    }
+    if previous == Some(state) {
+        return None;
+    }
+    Some(match state {
+        "ok" => "shipyard daemon: public ingress reachable".to_owned(),
+        "failing" => format!(
+            "shipyard daemon: public ingress failing ({}); GitHub cannot reach this daemon, waits fall back to polling",
+            status.verdict.detail()
+        ),
+        other => format!(
+            "shipyard daemon: public ingress check {other} ({})",
+            status.verdict.detail()
+        ),
+    })
 }
 
 /// Probe `host` through every public relay it resolves to.
@@ -359,28 +508,97 @@ mod tests {
     }
 
     #[test]
-    fn two_failing_probes_in_a_row_lose_the_tunnel_and_unknowns_do_not() {
+    fn two_failing_probes_in_a_row_reapply_and_unknowns_do_not_count() {
         let mut monitor = IngressMonitor::default();
         let failing = || IngressVerdict::Failing("TLS".to_owned());
         let unknown = || IngressVerdict::Inconclusive("probe timed out".to_owned());
 
         assert!(!monitor.observe(failing(), 1.0).1);
         // An inconclusive probe neither counts nor clears the run.
-        let (status, lost) = monitor.observe(unknown(), 2.0);
-        assert!(!lost);
+        let (status, reapply) = monitor.observe(unknown(), 2.0);
+        assert!(!reapply);
         assert_eq!(status.consecutive_failures, 1);
-        let (status, lost) = monitor.observe(failing(), 3.0);
-        assert!(lost);
+        let (status, reapply) = monitor.observe(failing(), 3.0);
+        assert!(reapply);
         assert_eq!(status.consecutive_failures, 2);
         assert_eq!(status.to_json()["state"], "failing");
-        // After a re-apply the run starts again, and a reachable probe resets it.
-        assert!(!monitor.observe(failing(), 4.0).1);
-        assert!(!monitor.observe(IngressVerdict::Reachable, 5.0).1);
-        assert!(!monitor.observe(failing(), 6.0).1);
-        // Unknowns alone never lose the tunnel.
+        assert_eq!(status.to_json()["self_heal"]["reapplies"], 1);
+        // Unknowns alone never re-apply.
+        let mut quiet = IngressMonitor::default();
         for at in 0..10 {
-            assert!(!monitor.observe(unknown(), f64::from(at)).1);
+            assert!(!quiet.observe(unknown(), f64::from(at)).1);
         }
+    }
+
+    #[test]
+    fn reapplies_back_off_cap_and_then_only_report() {
+        let mut monitor = IngressMonitor::default();
+        let failing = || IngressVerdict::Failing("TLS".to_owned());
+        // Probe every 30s for two days of a relay that never heals.
+        let mut reapply_times = Vec::new();
+        let mut last = None;
+        for tick in 0..5760 {
+            let now = f64::from(tick) * 30.0;
+            let (status, reapply) = monitor.observe(failing(), now);
+            if reapply {
+                reapply_times.push(now);
+            }
+            last = Some(status);
+        }
+        assert_eq!(
+            u32::try_from(reapply_times.len()).expect("count"),
+            INGRESS_MAX_REAPPLIES,
+            "re-applies must stop at the cap: {reapply_times:?}"
+        );
+        let gaps = reapply_times
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        for (gap, backoff) in gaps.iter().zip(INGRESS_REAPPLY_BACKOFF_SECS) {
+            assert!(
+                *gap >= backoff,
+                "gap {gap} under backoff {backoff}: {gaps:?}"
+            );
+        }
+        assert!(
+            gaps.windows(2).all(|pair| pair[1] >= pair[0]),
+            "gaps must grow: {gaps:?}"
+        );
+        let last = last.expect("status").to_json();
+        assert_eq!(
+            last["state"], "failing",
+            "a capped self-heal still reports failing"
+        );
+        assert_eq!(last["self_heal"]["exhausted"], true);
+
+        // The first reachable probe ends the episode and restores the budget.
+        let (status, _) = monitor.observe(IngressVerdict::Reachable, 200_000.0);
+        assert_eq!(status.to_json()["self_heal"]["reapplies"], 0);
+        assert!(!monitor.observe(failing(), 200_030.0).1);
+        assert!(monitor.observe(failing(), 200_060.0).1);
+    }
+
+    #[test]
+    fn transitions_and_reapplies_are_logged_and_repeats_are_not() {
+        let mut monitor = IngressMonitor::default();
+        let failing = || IngressVerdict::Failing("TLS handshake failed at the relay".to_owned());
+        let (first, reapply) = monitor.observe(failing(), 1.0);
+        let line = transition_line(Some("ok"), &first, reapply).expect("ok to failing");
+        assert!(line.contains("public ingress failing (TLS"), "{line}");
+        let (second, reapply) = monitor.observe(failing(), 2.0);
+        let line = transition_line(Some("failing"), &second, reapply).expect("re-apply");
+        assert!(
+            line.contains("re-applying the funnel (attempt 1 of 6)"),
+            "{line}"
+        );
+        let (third, reapply) = monitor.observe(failing(), 3.0);
+        assert!(!reapply);
+        assert_eq!(transition_line(Some("failing"), &third, reapply), None);
+        let (healed, _) = monitor.observe(IngressVerdict::Reachable, 4.0);
+        assert_eq!(
+            transition_line(Some("failing"), &healed, false).as_deref(),
+            Some("shipyard daemon: public ingress reachable")
+        );
     }
 
     #[test]

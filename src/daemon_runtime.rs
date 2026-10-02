@@ -3295,6 +3295,54 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn slow_failing_probe(_host: &str, _nonce: &str) -> crate::tunnel_ingress::IngressVerdict {
+        thread::sleep(Duration::from_secs(2));
+        crate::tunnel_ingress::IngressVerdict::Failing(
+            "TLS handshake failed at the relay".to_owned(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_answers_within_a_second_while_a_self_check_is_in_flight() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = mpsc::channel();
+        let listener =
+            super::start_webhook_listener(&running, tx, "dev-secret".to_owned()).expect("listener");
+        // The self-check runs where the tunnel supervisor runs: its own thread.
+        let report = crate::tunnel::IngressReport::default();
+        let mut check = crate::tunnel_ingress::IngressCheck::reporting_to(Arc::clone(&report));
+        check.set_public_url("https://m3.example.ts.net");
+        check.probe = slow_failing_probe;
+        let in_flight = thread::spawn(move || check.verify(1.0));
+        thread::sleep(Duration::from_millis(100));
+
+        let (forged, _) = check_run_delivery("the-wrong-secret", "during-self-check");
+        let started = Instant::now();
+        let answer = send_with_timeout(listener.port, &forged, Duration::from_secs(3));
+        let elapsed = started.elapsed();
+        let still_probing = !in_flight.is_finished();
+        in_flight.join().expect("self-check");
+        running.store(false, Ordering::Release);
+        listener.stop();
+
+        assert!(still_probing, "the control must overlap the self-check");
+        assert!(answer.starts_with("HTTP/1.1 401"), "{answer:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "listener waited {elapsed:?}"
+        );
+        assert_eq!(
+            report
+                .lock()
+                .expect("report")
+                .as_ref()
+                .map(|status| status.verdict.state()),
+            Some("failing")
+        );
+    }
+
+    #[cfg(unix)]
     fn assert_split_delivery_accepted(split_at: impl Fn(usize, usize) -> Vec<usize>) {
         let running = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
