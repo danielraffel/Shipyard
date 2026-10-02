@@ -164,7 +164,39 @@ jobs:
           cd release
           sha256sum -- * > checksums.sha256
 
-      - name: Attest non-macOS release assets
+      # Sigstore (fulcio/rekor) has transient TLS and 5xx failures. An attestation
+      # is required before any host will install the release, so retry with
+      # backoff instead of failing the release on one bad handshake. A
+      # deterministic failure fails all three attempts and the job.
+      - name: Attest non-macOS release assets (attempt 1)
+        id: attest_nonmac_1
+        continue-on-error: true
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release/shipyard-linux-*
+            release/shipyard-windows-*.exe
+            release/shipyard-workstream-provider-linux-*
+            release/shipyard-workstream-provider-windows-*.exe
+      - name: Back off before retrying attestation
+        if: steps.attest_nonmac_1.outcome == 'failure'
+        run: sleep 30
+      - name: Attest non-macOS release assets (attempt 2)
+        id: attest_nonmac_2
+        if: steps.attest_nonmac_1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release/shipyard-linux-*
+            release/shipyard-windows-*.exe
+            release/shipyard-workstream-provider-linux-*
+            release/shipyard-workstream-provider-windows-*.exe
+      - name: Back off before the last attestation attempt
+        if: steps.attest_nonmac_2.outcome == 'failure'
+        run: sleep 90
+      - name: Attest non-macOS release assets (attempt 3)
+        if: steps.attest_nonmac_2.outcome == 'failure'
         uses: actions/attest@v4
         with:
           subject-path: |
@@ -251,16 +283,55 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Upload only: the release stays a draft until the DMG is attested
+          # (next steps), so no host can install a published, unattested build.
           scripts/release-macos-local.sh \
             --repo "${{ github.repository }}" \
             --tag "${{ github.ref_name }}" \
             --upload \
+            --defer-publish \
             --ci-mode
 
-      - name: Attest signed and notarized macOS release asset
+      # Sigstore (fulcio/rekor) has transient TLS and 5xx failures. An attestation
+      # is required before any host will install the release, so retry with
+      # backoff instead of failing the release on one bad handshake. A
+      # deterministic failure fails all three attempts and the job.
+      - name: Attest signed and notarized macOS release asset (attempt 1)
+        id: attest_macos_1
+        continue-on-error: true
         uses: actions/attest@v4
         with:
           subject-path: dist/release/${{ github.ref_name }}/shipyard-macos-arm64.dmg
+      - name: Back off before retrying attestation
+        if: steps.attest_macos_1.outcome == 'failure'
+        run: sleep 30
+      - name: Attest signed and notarized macOS release asset (attempt 2)
+        id: attest_macos_2
+        if: steps.attest_macos_1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/release/${{ github.ref_name }}/shipyard-macos-arm64.dmg
+      - name: Back off before the last attestation attempt
+        if: steps.attest_macos_2.outcome == 'failure'
+        run: sleep 90
+      - name: Attest signed and notarized macOS release asset (attempt 3)
+        if: steps.attest_macos_2.outcome == 'failure'
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/release/${{ github.ref_name }}/shipyard-macos-arm64.dmg
+
+      - name: Publish the attested release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release-macos-local.sh \
+            --repo "${{ github.repository }}" \
+            --tag "${{ github.ref_name }}" \
+            --publish-only \
+            --ci-mode
 
       - name: Restore user keychains and delete ephemeral signing keychain
         if: always()
