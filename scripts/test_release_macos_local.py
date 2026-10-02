@@ -5,7 +5,7 @@ import os
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -248,6 +248,45 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         self.assertTrue(any("--draft=false" in command for command in flattened))
         self.assertTrue(any(command.startswith("curl -fsSL") for command in flattened))
         self.assertTrue(any(command.startswith("bash ") for command in flattened))
+
+    def _main_with(self, argv: list[str], runner: FakeRunner) -> mock.MagicMock:
+        with (
+            mock.patch.object(release_macos_local, "CommandRunner", return_value=runner),
+            mock.patch.object(release_macos_local, "check_unattended_auth", return_value="api-key") as auth,
+            mock.patch.object(release_macos_local, "load_release_environment"),
+            mock.patch.object(release_macos_local, "package_signed_dmg", return_value=Path("x.dmg")) as package,
+            mock.patch.object(release_macos_local, "upload_artifact_and_checksums") as upload,
+            redirect_stdout(StringIO()),
+            redirect_stderr(StringIO()),
+        ):
+            self.assertEqual(release_macos_local.main(argv), 0)
+        return mock.MagicMock(auth=auth, package=package, upload=upload)
+
+    def test_defer_publish_uploads_but_leaves_the_release_a_draft(self) -> None:
+        # CI attests the uploaded DMG between this step and publication, so a
+        # host can never see a published release that has no attestation.
+        runner = FakeRunner(assets=complete_release_assets())
+        calls = self._main_with(
+            ["--tag", "v0.1.0", "--upload", "--defer-publish", "--ci-mode"], runner
+        )
+        calls.upload.assert_called_once()
+        flattened = [" ".join(command) for command in runner.commands]
+        self.assertFalse(any("--draft=false" in command for command in flattened), flattened)
+        self.assertTrue(runner.draft)
+
+    def test_defer_publish_redrafts_a_release_that_is_already_public(self) -> None:
+        runner = FakeRunner(assets=complete_release_assets(), draft=False)
+        self._main_with(["--tag", "v0.1.0", "--upload", "--defer-publish", "--ci-mode"], runner)
+        self.assertTrue(runner.draft)
+
+    def test_publish_only_publishes_without_building_or_signing(self) -> None:
+        runner = FakeRunner(assets=complete_release_assets())
+        calls = self._main_with(["--tag", "v0.1.0", "--publish-only", "--ci-mode"], runner)
+        calls.auth.assert_not_called()
+        calls.package.assert_not_called()
+        calls.upload.assert_not_called()
+        flattened = [" ".join(command) for command in runner.commands]
+        self.assertTrue(any("--draft=false" in command for command in flattened), flattened)
 
     def test_publish_reverts_draft_when_install_e2e_fails(self) -> None:
         class FailingInstallRunner(FakeRunner):

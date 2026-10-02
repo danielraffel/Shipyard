@@ -371,6 +371,14 @@ def merge_release_checksum(
     return checksums
 
 
+def keep_draft(config: ReleaseConfig, runner: CommandRunner) -> None:
+    """Make sure the release is a draft, so nothing can install it yet."""
+    if not release_is_draft(config, runner):
+        runner.run(
+            ["gh", "release", "edit", "--repo", config.repo, config.tag, "--draft=true"]
+        )
+
+
 def publish_if_ready(config: ReleaseConfig, runner: CommandRunner) -> str:
     expected_assets = expected_release_assets(config.artifact_prefix)
     assets = set(release_asset_names(config, runner))
@@ -680,6 +688,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "publication still requires mounted-DMG and public install E2E proof"
         ),
     )
+    publish = parser.add_mutually_exclusive_group()
+    publish.add_argument(
+        "--defer-publish",
+        action="store_true",
+        help=(
+            "With --upload: attach the DMG and checksums but leave the release a "
+            "draft, so CI can attest the uploaded DMG before anyone can install it"
+        ),
+    )
+    publish.add_argument(
+        "--publish-only",
+        action="store_true",
+        help=(
+            "Do not build or sign: publish an already-uploaded draft release "
+            "after its assets and checksums check out and its install E2E passes"
+        ),
+    )
     parser.add_argument("--skip-build", action="store_true", help="Use an existing --binary instead of building")
     parser.add_argument("--binary", type=Path, help="Existing shipyard binary to package")
     parser.add_argument(
@@ -724,19 +749,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     runner = CommandRunner()
     args = parse_args(argv or sys.argv[1:])
-    load_release_environment(resolve_environment_files(args.env_file or []))
-    require_arm64(args.arch)
-    mode = check_unattended_auth()
-    if args.check_auth:
-        print(f"unattended release authentication ready: notarization={mode}")
-        return 0
+    if args.defer_publish and not args.upload:
+        raise SystemExit("--defer-publish only applies with --upload")
+    if not args.publish_only:
+        load_release_environment(resolve_environment_files(args.env_file or []))
+        require_arm64(args.arch)
+        mode = check_unattended_auth()
+        if args.check_auth:
+            print(f"unattended release authentication ready: notarization={mode}")
+            return 0
     tag = resolve_tag(args.tag, runner)
     config = ReleaseConfig(
         tag=tag,
         repo=args.repo,
         artifact_prefix=args.artifact_prefix,
         dist_dir=args.dist_dir,
-        upload=args.upload,
+        upload=args.upload or args.publish_only,
         ci_mode=args.ci_mode,
         skip_build=args.skip_build,
         binary=args.binary,
@@ -744,12 +772,17 @@ def main(argv: list[str] | None = None) -> int:
         companion_binary=args.companion_binary,
         rollback_tag=args.rollback_tag,
     )
-    dmg = package_signed_dmg(config)
-    if not config.upload:
-        print(f"signed + notarized DMG ready: {dmg}")
-        print(f"rerun with --upload to attach it to {config.repo} {config.tag}")
-        return 0
-    upload_artifact_and_checksums(config, dmg, runner)
+    if not args.publish_only:
+        dmg = package_signed_dmg(config)
+        if not config.upload:
+            print(f"signed + notarized DMG ready: {dmg}")
+            print(f"rerun with --upload to attach it to {config.repo} {config.tag}")
+            return 0
+        upload_artifact_and_checksums(config, dmg, runner)
+        if args.defer_publish:
+            keep_draft(config, runner)
+            print(f"release outcome: deferred ({config.tag} stays a draft until published)")
+            return 0
     outcome = publish_if_ready(config, runner)
     print(f"release outcome: {outcome}")
     if outcome in ("published", "already-public"):
