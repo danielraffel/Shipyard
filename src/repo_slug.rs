@@ -110,7 +110,12 @@ pub fn parse_anonymous_probe(stdout: &str) -> SlugProbe {
             SlugProbe::Found,
         ),
         "404" => SlugProbe::NotFound,
-        other => SlugProbe::Unreadable(format!("HTTP {other}")),
+        // GitHub's own message is what tells an exhausted anonymous rate limit
+        // apart from any other refusal, so it travels with the status.
+        other => SlugProbe::Unreadable(match message(body) {
+            Some(message) => format!("HTTP {other}: {message}"),
+            None => format!("HTTP {other}"),
+        }),
     }
 }
 
@@ -134,6 +139,15 @@ pub fn anonymous_probe(slug: &str) -> SlugProbe {
         Ok(output) => parse_anonymous_probe(&String::from_utf8_lossy(&output.stdout)),
         Err(error) => SlugProbe::Unreadable(format!("curl could not run: {error}")),
     }
+}
+
+/// `message` from a GitHub error body.
+fn message(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("message")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// `full_name` from a `repos/{slug}` JSON body.
@@ -238,7 +252,11 @@ mod tests {
         );
         assert!(matches!(
             parse_anonymous_probe("{\"message\":\"rate limited\"}\n403"),
-            SlugProbe::Unreadable(reason) if reason == "HTTP 403"
+            SlugProbe::Unreadable(reason) if reason == "HTTP 403: rate limited"
+        ));
+        assert!(matches!(
+            parse_anonymous_probe("<html>bad gateway</html>\n502"),
+            SlugProbe::Unreadable(reason) if reason == "HTTP 502"
         ));
         assert!(matches!(
             parse_anonymous_probe(""),

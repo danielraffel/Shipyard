@@ -293,6 +293,12 @@ follows a renamed repository (danielraffel/pulp is Generous-Corp/pulp now),
 and archives only MERGED or CLOSED ones; unreadable means keep.
 `ship-state discard <pr>` now refuses when two repositories share the PR
 number (spectr #80 and agent-workstream #80); pass `--repo`.
+A kept row says why its rename check failed, e.g. `unreadable (rename check:
+HTTP 403: API rate limit exceeded ...)`. The rename is found only by the
+anonymous probe, because the App token 404s on the old name, so on a host whose
+anonymous budget is spent every record under a renamed repository stays
+unreadable until the limit resets. Re-run the dry run then; it is not a sign the
+PRs are gone.
 
 ## Quick reference
 

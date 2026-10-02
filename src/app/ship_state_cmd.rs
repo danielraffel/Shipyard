@@ -367,6 +367,9 @@ pub(super) struct PruneRow {
     /// The name GitHub reports now, when the record names a renamed repository.
     pub(super) resolved_repo: Option<String>,
     pub(super) lifecycle: PrLifecycle,
+    /// Why the rename check could not rescue an unreadable record, so a kept
+    /// row says whether GitHub refused, rate-limited, or never knew the name.
+    pub(super) rename_check: Option<String>,
 }
 
 impl PruneRow {
@@ -395,23 +398,29 @@ pub(super) fn plan_prune(
     resolve: &mut dyn FnMut(&str) -> SlugResolution,
     lifecycle_of: PrLifecycleReader<'_>,
 ) -> Vec<PruneRow> {
-    let mut renamed: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut renamed: BTreeMap<String, Result<String, Option<String>>> = BTreeMap::new();
     states
         .iter()
         .map(|state| {
             let mut lifecycle = lifecycle_of(&state.repo, state.pr);
             let mut resolved_repo = None;
+            let mut rename_check = None;
             if lifecycle == PrLifecycle::Unknown {
-                let to = renamed
+                let resolution = renamed
                     .entry(state.repo.to_ascii_lowercase())
                     .or_insert_with(|| match resolve(&state.repo) {
-                        SlugResolution::Renamed { to } => Some(to),
-                        _ => None,
+                        SlugResolution::Renamed { to } => Ok(to),
+                        SlugResolution::Canonical => Err(None),
+                        SlugResolution::NotFound => Err(Some("repository not found".to_owned())),
+                        SlugResolution::Unknown { reason } => Err(Some(reason)),
                     })
                     .clone();
-                if let Some(to) = to {
-                    lifecycle = lifecycle_of(&to, state.pr);
-                    resolved_repo = Some(to);
+                match resolution {
+                    Ok(to) => {
+                        lifecycle = lifecycle_of(&to, state.pr);
+                        resolved_repo = Some(to);
+                    }
+                    Err(reason) => rename_check = reason,
                 }
             }
             PruneRow {
@@ -419,6 +428,7 @@ pub(super) fn plan_prune(
                 pr: state.pr,
                 resolved_repo,
                 lifecycle,
+                rename_check,
             }
         })
         .collect()
@@ -460,6 +470,7 @@ pub(super) fn ship_state_prune<W: Write>(
                             "pr": row.pr,
                             "resolved_repo": row.resolved_repo,
                             "state": row.lifecycle_name(),
+                            "rename_check": row.rename_check,
                             "archive": row.archivable(),
                         })
                     })
@@ -476,9 +487,13 @@ pub(super) fn ship_state_prune<W: Write>(
                 .resolved_repo
                 .as_ref()
                 .map_or_else(String::new, |to| format!(" (now {to})"));
+            let why = row
+                .rename_check
+                .as_ref()
+                .map_or_else(String::new, |reason| format!(" (rename check: {reason})"));
             writeln!(
                 stdout,
-                "{} {}#{}{}  {}",
+                "{} {}#{}{}  {}{}",
                 if row.archivable() {
                     "archive"
                 } else {
@@ -487,7 +502,8 @@ pub(super) fn ship_state_prune<W: Write>(
                 row.repo,
                 row.pr,
                 name,
-                row.lifecycle_name()
+                row.lifecycle_name(),
+                why
             )?;
         }
         if apply {
@@ -1396,6 +1412,45 @@ mod tests {
             .expect("renamed row");
         assert_eq!(renamed["resolved_repo"], "neworg/renamed");
         assert_eq!(renamed["state"], "merged");
+    }
+
+    #[test]
+    fn prune_names_why_an_unreadable_record_could_not_be_renamed() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        prune_fixture(&store);
+        let mut resolve = |repo: &str| {
+            if repo == "olduser/renamed" {
+                SlugResolution::Unknown {
+                    reason: "HTTP 403: API rate limit exceeded".to_owned(),
+                }
+            } else {
+                prune_resolve(repo)
+            }
+        };
+        let mut out = Vec::new();
+
+        ship_state_prune(
+            &store,
+            &mut resolve,
+            &mut prune_lifecycle,
+            false,
+            false,
+            &mut out,
+        )
+        .expect("dry run");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(
+                "keep    olduser/renamed#5  unreadable (rename check: HTTP 403: API rate limit exceeded)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("archive owner/merged#1  merged\n"),
+            "a readable record carries no rename note: {text}"
+        );
     }
 
     #[test]
