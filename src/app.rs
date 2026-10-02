@@ -27,6 +27,7 @@ mod cloud_read_cmd;
 mod command_evidence_cmd;
 mod config_cmd;
 mod daemon_cmd;
+mod daemon_prune_cmd;
 mod dependency_cmd;
 mod doctor_cmd;
 mod execution_worker_cmd;

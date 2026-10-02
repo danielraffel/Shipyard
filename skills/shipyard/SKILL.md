@@ -88,6 +88,19 @@ thread with `try_send`, dropping and counting a line rather than ever waiting.
 Keep `run_never_holds_the_process_stdio_locks_for_the_command` and the
 `webhook_listener_keeps_serving_*` tests passing.
 
+## Stale webhooks: `shipyard daemon prune-webhooks`
+
+Hooks outlive their daemon when a host is renamed or retired, when a daemon
+stops advertising a repository, or when a clean-shutdown delete fails. Do not
+delete them by hand: run `shipyard daemon prune-webhooks` (a dry run by
+default; `--apply` deletes and drops matching `registrations.json` records).
+It prunes only this host's hooks on repositories its running daemon does not
+advertise, and peer hooks whose endpoint has answered nothing but gateway
+failures (502/503/504 or no connection) either for 24h, or at least five
+times on a host name that is no longer a tailnet node. A peer answering
+400/401/404 is alive and is never pruned. Each host can only judge its own
+hooks as unadvertised, so run it on every daemon host.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.

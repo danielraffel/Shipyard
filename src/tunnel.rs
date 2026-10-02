@@ -508,6 +508,42 @@ pub fn decode_tailscale_status(raw_json: &[u8], binary_path: Option<PathBuf>) ->
     }
 }
 
+/// Every node name on this tailnet, this host included, trailing dots
+/// stripped. A node that is offline is still listed; only a removed or renamed
+/// node is absent. `None` when the status could not be read or carried no
+/// readable name at all.
+#[must_use]
+pub fn decode_tailnet_node_names(raw_json: &[u8]) -> Option<std::collections::BTreeSet<String>> {
+    let value = serde_json::from_slice::<Value>(raw_json).ok()?;
+    let self_name = value.get("Self").and_then(|entry| entry.get("DNSName"));
+    let peer_names = value
+        .get("Peer")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|peers| peers.values())
+        .filter_map(|peer| peer.get("DNSName"));
+    let names = self_name
+        .into_iter()
+        .chain(peer_names)
+        .filter_map(Value::as_str)
+        .map(|name| name.trim().trim_end_matches('.').to_owned())
+        .filter(|name| !name.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    (!names.is_empty()).then_some(names)
+}
+
+/// Read the tailnet's node names through the installed Tailscale CLI.
+#[must_use]
+pub fn probe_tailnet_node_names() -> Option<std::collections::BTreeSet<String>> {
+    let candidates = TAILSCALE_CANDIDATE_BINARIES
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let binary = resolve_tailscale_binary_from(&candidates)?;
+    let output = run_tailscale(&binary, &["status", "--json"], TAILSCALE_STATUS_TIMEOUT).ok()?;
+    decode_tailnet_node_names(output.output.as_bytes())
+}
+
 /// Probe the installed Tailscale CLI once.
 #[must_use]
 pub fn probe_tailscale() -> TailscaleStatus {
@@ -866,6 +902,25 @@ mod tests {
             dns_name: Some("node.tailnet.ts.net.".to_owned()),
             funnel_permitted: false,
         }
+    }
+
+    #[test]
+    fn tailnet_node_names_include_offline_peers_and_self() {
+        let raw = br#"{
+            "Self": {"DNSName": "me.tail.ts.net."},
+            "Peer": {
+                "a": {"DNSName": "peer.tail.ts.net.", "Online": false},
+                "b": {"DNSName": ""},
+                "c": {"HostName": "no-dns"}
+            }
+        }"#;
+        let names = super::decode_tailnet_node_names(raw).expect("names");
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["me.tail.ts.net".to_owned(), "peer.tail.ts.net".to_owned()]
+        );
+        assert_eq!(super::decode_tailnet_node_names(b"{}"), None);
+        assert_eq!(super::decode_tailnet_node_names(b"not json"), None);
     }
 
     #[test]
