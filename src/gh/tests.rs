@@ -10,14 +10,12 @@ use tempfile::TempDir;
 use super::*;
 use crate::config::LocalOverlaySource;
 
+/// Fixture scripts are exec'd straight after being written, so they go through
+/// the suite-wide writer that never holds a writable descriptor a sibling
+/// thread's fork could inherit (Linux refuses that exec with `ETXTBSY`).
 #[cfg(unix)]
 fn write_executable(path: &Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, contents).expect("write script");
-    let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).expect("chmod script");
+    crate::test_support::write_executable_script(path, contents);
 }
 
 fn config_from_toml(input: &str) -> LoadedConfig {
@@ -100,7 +98,10 @@ fn rejects_empty_command_auth_config() {
 fn bounded_command_preparation_times_out_token_helper() {
     let temp = TempDir::new().expect("temp");
     let helper = temp.path().join("token-helper");
-    write_executable(&helper, "#!/bin/sh\nsleep 5\nprintf token\n");
+    // The helper outlives any plausible scheduling delay, so finishing well
+    // inside its own lifetime proves the budget cut it off rather than the
+    // helper exiting on its own. `exec` makes the killed process the sleeper.
+    write_executable(&helper, "#!/bin/sh\nexec sleep 60\n");
     let config = config_from_toml(&format!(
         r#"
             [github.auth]
@@ -120,8 +121,15 @@ fn bounded_command_preparation_times_out_token_helper() {
             Duration::from_millis(20),
         )
         .expect_err("helper timeout");
-    assert!(matches!(error, GhPrepareError::HelperTimedOut { .. }));
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        matches!(error, GhPrepareError::HelperTimedOut { .. }),
+        "expected HelperTimedOut, got {error:?}"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "a 20 ms budget waited {elapsed:?} on a 60 s helper"
+    );
 }
 
 #[cfg(unix)]
