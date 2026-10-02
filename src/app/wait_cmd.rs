@@ -868,7 +868,7 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, ExitCode};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::Value;
 
@@ -1574,6 +1574,14 @@ artifacts = [
         assert!(missing["observed"]["passed"].is_null());
     }
 
+    /// How long the updater leaves the job pending, so the waiter's first
+    /// read sees `pending`.
+    const TRANSITION_DELAY: Duration = Duration::from_millis(25);
+    /// A ceiling, not a duration: the wait returns as soon as the job
+    /// completes. One second was too tight for a loaded hosted Windows runner,
+    /// where the updater's two durable queue writes landed after the deadline.
+    const TRANSITION_TIMEOUT_SECONDS: f64 = 30.0;
+
     #[test]
     fn wait_job_observes_durable_pending_to_completed_transition() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1582,7 +1590,7 @@ artifacts = [
         let state_dir = temp.path().to_path_buf();
         let job_id = pending.id.clone();
         let updater = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(25));
+            thread::sleep(TRANSITION_DELAY);
             let mut queue = Queue::new(&state_dir).expect("updater queue");
             let pending = queue.get(&job_id).expect("get").expect("job");
             let running = pending
@@ -1601,9 +1609,22 @@ artifacts = [
         });
 
         let mut out = Vec::new();
-        let code = wait_job(temp.path(), true, &mut out, &pending.id, true, 1.0, 0.01)
-            .expect("transition observed");
+        let started = Instant::now();
+        let code = wait_job(
+            temp.path(),
+            true,
+            &mut out,
+            &pending.id,
+            true,
+            TRANSITION_TIMEOUT_SECONDS,
+            0.01,
+        )
+        .expect("transition observed");
+        let waited = started.elapsed();
         updater.join().expect("updater");
+        // The wait returns at the transition, so the generous ceiling costs
+        // nothing when the runner is fast.
+        assert!(waited < Duration::from_secs(20), "waited {waited:?}");
 
         assert_eq!(code, ExitCode::SUCCESS);
         let payload: Value = serde_json::from_slice(&out).expect("json");
