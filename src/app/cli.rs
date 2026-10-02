@@ -2089,7 +2089,7 @@ pub(super) enum RunnerCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub(super) enum ShipStateCommand {
     /// List active in-flight ship states.
     List,
@@ -2102,6 +2102,19 @@ pub(super) enum ShipStateCommand {
     Discard {
         /// Pull request number.
         pr: u64,
+        /// Repository whose record to archive. Required when more than one
+        /// repository has a record for this PR number.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Archive every record whose PR GitHub reports merged or closed.
+    ///
+    /// Dry run unless --apply. A record whose PR cannot be read (including
+    /// under the name a renamed repository has now) is kept.
+    Prune {
+        /// Archive the listed records.
+        #[arg(long)]
+        apply: bool,
     },
     /// Re-fetch GitHub check state and heal stale dispatched runs.
     Reconcile {

@@ -76,8 +76,14 @@ start fresh.
 ```sh
 shipyard ship-state list        # one line per active PR
 shipyard ship-state show <pr>   # full dump for one PR
-shipyard ship-state discard <pr>  # archive and move on
+shipyard ship-state discard <pr> [--repo OWNER/REPO]  # archive and move on
+shipyard ship-state prune [--apply]  # archive every record whose PR merged or closed
 ```
+
+`discard` refuses a bare PR number that more than one repository has a
+record for; pass `--repo`. `prune` asks GitHub about every active record
+(dry run unless `--apply`), follows a renamed repository to the name GitHub
+reports now, and keeps any record whose PR it cannot read.
 
 `list` is the fastest way to spot abandoned ships — e.g., a PR you
 worked on last week whose state never got archived because the
