@@ -235,6 +235,15 @@ sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
 cannot be had the write is skipped and the cache stops writing for that run; a
 cold read is always correct. Any new cache in the state tree needs the same.
 
+## Release publication waits for attestation
+
+`release.yml` keeps the release a draft until the macOS DMG is attested:
+`release-macos-local.sh --upload --defer-publish`, then three
+`actions/attest` attempts (30 s, then 90 s backoff), then `--publish-only`.
+v0.245.0 published with no attestation after one transient Sigstore TLS error,
+and every host's fleet-update refused it ("no acceptable build-provenance
+attestation"). If a release is stuck as a draft, rerun the failed
+`sign-and-upload-macos` job; do not publish it by hand without an attestation.
 ## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
 
 A killed validation run cannot run the Drop that removes its
@@ -245,6 +254,16 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 [--older-than-hours N]` also handles dirs without an owner file, keeping any that
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
+
+## A PR's version must be ahead of live main, not just its merge base
+
+Shipyard main has no merge queue and no up-to-date rule, so two PRs cut from
+one main used to pass the bump gate with the same next version and both
+merge (#677 and #680 both landed as 0.245.0; #680 shipped untagged). The
+"Version ahead of live main" step in version-skill-check compares the PR head
+with a fresh `origin/main`, and `version-ahead-sweep.yml` re-judges every open
+PR on each push to main, posting `shipyard/version-ahead-of-main`. A red
+status there means: merge main and bump past it before merging.
 
 ## Quick reference
 
