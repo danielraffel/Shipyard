@@ -126,6 +126,20 @@ than closing it. Keep
 `subscriber_survives_a_webhook_burst_while_draining_a_full_replay_slowly` and
 `daemon_lagged_notice_triggers_an_immediate_re_snapshot` passing.
 
+## The writer-domain lease, for tools outside Shipyard
+
+Any tool that writes under a protected root (`~/.local/bin`, Shipyard's state
+and config dirs) while a Sandbox E2E audit may run must take the shared
+writer-domain lease, or the audit fails with "sandbox wrote outside its
+isolated HOME/PATH". Simplest: wrap the write in
+`shipyard writer-domain-exec --path <protected path> -- <command>`; exit 75
+means an audit holds the domain, so defer and retry. Natively: in Shipyard's
+state dir (`~/Library/Application Support/shipyard/` on macOS), flock
+`.sandbox-writer-domain.turnstile.lock` exclusive, flock
+`.sandbox-writer-domain.lock` shared, release the turnstile, write, then
+release the shared lock; poll non-blocking for at most 30s and skip the write
+on timeout. Hold the shared lock only around the write itself.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.
