@@ -122,6 +122,9 @@ pub struct IpcState {
     pub tunnel_url: Option<String>,
     /// Verification timestamp.
     pub tunnel_verified_at: Option<f64>,
+    /// Last public-ingress self-check (`state`, `detail`, `checked_at`,
+    /// `consecutive_failures`), when one has run.
+    pub tunnel_public_ingress: Option<Value>,
     /// Connected subscriber count.
     pub subscribers: usize,
     /// Last event timestamp.
@@ -795,6 +798,7 @@ fn status_frame(state: &IpcState) -> Value {
             "backend": state.tunnel_backend,
             "url": state.tunnel_url,
             "verified_at": state.tunnel_verified_at,
+            "public_ingress": state.tunnel_public_ingress,
         },
         "subscribers": state.subscribers,
         "last_event_at": state.last_event_at,
@@ -975,6 +979,7 @@ mod tests {
             tunnel_backend: "tailscale".to_owned(),
             tunnel_url: Some("https://example.ts.net".to_owned()),
             tunnel_verified_at: None,
+            tunnel_public_ingress: None,
             subscribers: 0,
             last_event_at: None,
             registered_repos: vec!["org/repo".to_owned()],
@@ -983,6 +988,21 @@ mod tests {
             rate_limit: None,
             last_error: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_frame_carries_the_public_ingress_check() {
+        let mut state = dummy_state();
+        assert_eq!(
+            super::status_frame(&state)["tunnel"]["public_ingress"],
+            Value::Null
+        );
+        state.tunnel_public_ingress = Some(json!({"state": "failing", "detail": "TLS"}));
+        assert_eq!(
+            super::status_frame(&state)["tunnel"]["public_ingress"]["state"],
+            "failing"
+        );
     }
 
     #[cfg(unix)]

@@ -177,6 +177,11 @@ fn collect_report_with_github_auth(
     if let Some(entry) = check_daemon_watched_repos(mode, state_dir) {
         core.insert("daemon-repos".to_owned(), entry);
     }
+    if let Some(entry) = crate::daemon_ipc::read_daemon_status(state_dir)
+        .and_then(|status| daemon_public_ingress_entry(&status))
+    {
+        core.insert("daemon-public-ingress".to_owned(), entry);
+    }
     let ready = ["git", "ssh", "rich-bundle"]
         .iter()
         .all(|name| core.get(*name).is_some_and(|entry| entry.ok))
@@ -1118,6 +1123,52 @@ fn ghapp_generation_entry(cli_version: &str, generation_version: Option<&str>) -
     }
 }
 
+/// The running daemon's public-ingress self-check. A failing check means
+/// GitHub cannot deliver webhooks to this host, so waits fall back to polling;
+/// that is degraded, never silent. Advisory for readiness: the host still
+/// works through polling. `None` for a daemon that has not run the check.
+fn daemon_public_ingress_entry(status: &serde_json::Value) -> Option<DoctorEntry> {
+    let ingress = status.get("tunnel")?.get("public_ingress")?.as_object()?;
+    let state = ingress.get("state")?.as_str()?;
+    let detail = ingress
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    Some(match state {
+        "failing" => {
+            let heal = ingress.get("self_heal");
+            let attempts = heal
+                .and_then(|heal| heal.get("reapplies"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let exhausted = heal
+                .and_then(|heal| heal.get("exhausted"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            DoctorEntry {
+                ok: false,
+                version: Some("degraded: GitHub cannot reach this daemon".to_owned()),
+                detail: Some(format!(
+                    "{detail}. Funnel re-applied {attempts} time(s){}; waits fall back to polling until a check succeeds.",
+                    if exhausted {
+                        ", self-heal exhausted: re-apply the funnel by hand"
+                    } else {
+                        ""
+                    }
+                )),
+                error: None,
+            }
+        }
+        "ok" => DoctorEntry::ok("public ingress reachable"),
+        other => DoctorEntry {
+            ok: true,
+            version: Some(format!("public ingress check {other}")),
+            detail: (!detail.is_empty()).then(|| detail.to_owned()),
+            error: None,
+        },
+    })
+}
+
 fn check_daemon_watched_repos(mode: RuntimeMode, state_dir: &Path) -> Option<DoctorEntry> {
     let status = crate::daemon_ipc::read_daemon_status(state_dir)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1415,6 +1466,30 @@ mod tests {
                 expires_at: None,
             }),
         )
+    }
+
+    #[test]
+    fn doctor_reports_a_failing_public_ingress_as_degraded() {
+        let failing = serde_json::json!({"tunnel": {"public_ingress": {
+            "state": "failing",
+            "detail": "208.111.34.11: TLS handshake failed at the relay",
+            "self_heal": {"reapplies": 6, "exhausted": true},
+        }}});
+        let entry = super::daemon_public_ingress_entry(&failing).expect("entry");
+        assert!(!entry.ok);
+        assert_eq!(
+            entry.version.as_deref(),
+            Some("degraded: GitHub cannot reach this daemon")
+        );
+        let detail = entry.detail.expect("detail");
+        assert!(detail.contains("TLS handshake failed"), "{detail}");
+        assert!(detail.contains("self-heal exhausted"), "{detail}");
+
+        let ok = serde_json::json!({"tunnel": {"public_ingress": {"state": "ok", "detail": ""}}});
+        assert!(super::daemon_public_ingress_entry(&ok).expect("entry").ok);
+        // A daemon without the check yields no row rather than a false pass.
+        let old = serde_json::json!({"tunnel": {"backend": "tailscale"}});
+        assert!(super::daemon_public_ingress_entry(&old).is_none());
     }
 
     #[test]
