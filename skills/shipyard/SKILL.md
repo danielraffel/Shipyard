@@ -88,6 +88,12 @@ thread with `try_send`, dropping and counting a line rather than ever waiting.
 Keep `run_never_holds_the_process_stdio_locks_for_the_command` and the
 `webhook_listener_keeps_serving_*` tests passing.
 
+A quiet `daemon.log` during a Sandbox E2E run is expected: the sandbox audit
+holds the writer-domain lock exclusively, so `write_stderr` waits up to 30s
+for its shared lease and then gives up. The webhook listener never waits on
+that (lines go to a logger thread), and a line the logger could not write is
+counted onto the next one as "earlier refusal lines lost".
+
 ## Stale webhooks: `shipyard daemon prune-webhooks`
 
 Hooks outlive their daemon when a host is renamed or retired, when a daemon
@@ -132,6 +138,20 @@ token inside that window is used once but not cached. An HTTP 401 from GitHub
 in the registrar and wait paths drops the cache entry and retries once with a
 fresh mint; a second 401 surfaces. `daemon status` reports
 `gh_token_cache.mints` and `.hits`.
+
+## The writer-domain lease, for tools outside Shipyard
+
+Any tool that writes under a protected root (`~/.local/bin`, Shipyard's state
+and config dirs) while a Sandbox E2E audit may run must take the shared
+writer-domain lease, or the audit fails with "sandbox wrote outside its
+isolated HOME/PATH". Simplest: wrap the write in
+`shipyard writer-domain-exec --path <protected path> -- <command>`; exit 75
+means an audit holds the domain, so defer and retry. Natively: in Shipyard's
+state dir (`~/Library/Application Support/shipyard/` on macOS), flock
+`.sandbox-writer-domain.turnstile.lock` exclusive, flock
+`.sandbox-writer-domain.lock` shared, release the turnstile, write, then
+release the shared lock; poll non-blocking for at most 30s and skip the write
+on timeout. Hold the shared lock only around the write itself.
 
 ## A healthy local funnel is not a reachable daemon
 
