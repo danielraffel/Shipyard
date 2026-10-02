@@ -334,6 +334,17 @@ with a fresh `origin/main`, and `version-ahead-sweep.yml` re-judges every open
 PR on each push to main, posting `shipyard/version-ahead-of-main`. A red
 status there means: merge main and bump past it before merging.
 
+## Stale ship-state records: `discard --repo` and `prune`
+
+The daemon archives a record when its PR's `pull_request.closed` webhook
+arrives, but only on a host whose daemon receives webhooks for that
+repository, so other hosts accumulate merged records. `shipyard ship-state
+prune` (dry run; `--apply` to archive) asks GitHub about every active record,
+follows a renamed repository (danielraffel/pulp is Generous-Corp/pulp now),
+and archives only MERGED or CLOSED ones; unreadable means keep.
+`ship-state discard <pr>` now refuses when two repositories share the PR
+number (spectr #80 and agent-workstream #80); pass `--repo`.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every

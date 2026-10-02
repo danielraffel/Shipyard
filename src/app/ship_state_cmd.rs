@@ -10,6 +10,7 @@ use crate::output::write_json_envelope;
 use crate::reconcile::{
     ReconcileFetchError, fetch_status_check_rollup_with_cwd, reconcile_ship_state,
 };
+use crate::repo_slug::SlugResolution;
 use crate::ship_liveness::{LivenessContext, LivenessFinding, PrLifecycle, reconcile_finding};
 use crate::ship_state::{ShipState, ShipStateStore};
 
@@ -310,14 +311,41 @@ pub(super) fn ship_state_discard<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(state) = repository.map_or_else(|| store.get(pr), |repo| store.get_scoped(repo, pr))
-    else {
-        return Err(format!("No ship state for PR #{pr}").into());
+    let state = if let Some(repo) = repository {
+        store
+            .get_scoped(repo, pr)
+            .ok_or_else(|| format!("No ship state for {repo}#{pr}"))?
+    } else {
+        // A PR number alone names one record only while no other repository
+        // has a record with the same number; archiving the wrong one would
+        // forget live work.
+        let mut candidates: Vec<ShipState> = store
+            .list_active()
+            .into_iter()
+            .filter(|state| state.pr == pr)
+            .collect();
+        match candidates.len() {
+            0 => return Err(format!("No ship state for PR #{pr}").into()),
+            1 => candidates.remove(0),
+            _ => {
+                let repos = candidates
+                    .iter()
+                    .map(|state| state.repo.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "PR #{pr} has ship state in more than one repository ({repos}); \
+                     pass --repo OWNER/REPO"
+                )
+                .into());
+            }
+        }
     };
     let archived = store.archive_scoped(&state.repo, pr)?;
     if json {
         let mut data = BTreeMap::new();
         data.insert("pr".to_owned(), Value::from(pr));
+        data.insert("repo".to_owned(), Value::from(state.repo.clone()));
         data.insert(
             "archived_to".to_owned(),
             archived.map_or(Value::Null, |path| {
@@ -326,9 +354,166 @@ pub(super) fn ship_state_discard<W: Write>(
         );
         write_json_envelope(stdout, "ship-state:discard", data)?;
     } else {
-        writeln!(stdout, "Archived ship state for PR #{pr}.")?;
+        writeln!(stdout, "Archived ship state for {}#{pr}.", state.repo)?;
     }
     Ok(())
+}
+
+/// What `ship-state prune` decided for one record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PruneRow {
+    pub(super) repo: String,
+    pub(super) pr: u64,
+    /// The name GitHub reports now, when the record names a renamed repository.
+    pub(super) resolved_repo: Option<String>,
+    pub(super) lifecycle: PrLifecycle,
+}
+
+impl PruneRow {
+    fn archivable(&self) -> bool {
+        matches!(self.lifecycle, PrLifecycle::Merged | PrLifecycle::Closed)
+    }
+
+    fn lifecycle_name(&self) -> &'static str {
+        match self.lifecycle {
+            PrLifecycle::Open => "open",
+            PrLifecycle::Merged => "merged",
+            PrLifecycle::Closed => "closed",
+            PrLifecycle::Unknown => "unreadable",
+        }
+    }
+}
+
+/// Decide, for every active record, whether its PR is merged or closed.
+///
+/// A record's repository may have been renamed since it was written
+/// (`danielraffel/pulp` is now `Generous-Corp/pulp`). When its PR cannot be
+/// read under the recorded name, the name GitHub reports now is tried. A PR
+/// that still cannot be read is kept.
+pub(super) fn plan_prune(
+    states: &[ShipState],
+    resolve: &mut dyn FnMut(&str) -> SlugResolution,
+    lifecycle_of: PrLifecycleReader<'_>,
+) -> Vec<PruneRow> {
+    let mut renamed: BTreeMap<String, Option<String>> = BTreeMap::new();
+    states
+        .iter()
+        .map(|state| {
+            let mut lifecycle = lifecycle_of(&state.repo, state.pr);
+            let mut resolved_repo = None;
+            if lifecycle == PrLifecycle::Unknown {
+                let to = renamed
+                    .entry(state.repo.to_ascii_lowercase())
+                    .or_insert_with(|| match resolve(&state.repo) {
+                        SlugResolution::Renamed { to } => Some(to),
+                        _ => None,
+                    })
+                    .clone();
+                if let Some(to) = to {
+                    lifecycle = lifecycle_of(&to, state.pr);
+                    resolved_repo = Some(to);
+                }
+            }
+            PruneRow {
+                repo: state.repo.clone(),
+                pr: state.pr,
+                resolved_repo,
+                lifecycle,
+            }
+        })
+        .collect()
+}
+
+/// `ship-state prune`: archive every record whose PR GitHub reports merged or
+/// closed. Dry run unless `apply`.
+pub(super) fn ship_state_prune<W: Write>(
+    store: &ShipStateStore,
+    resolve: &mut dyn FnMut(&str) -> SlugResolution,
+    lifecycle_of: PrLifecycleReader<'_>,
+    apply: bool,
+    json: bool,
+    stdout: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let states = store.list_active();
+    let rows = plan_prune(&states, resolve, lifecycle_of);
+    let mut archived = Vec::new();
+    let mut failures = Vec::new();
+    if apply {
+        for row in rows.iter().filter(|row| row.archivable()) {
+            match store.archive_scoped(&row.repo, row.pr) {
+                Ok(_) => archived.push((row.repo.clone(), row.pr)),
+                Err(error) => failures.push(format!("{}#{}: {error}", row.repo, row.pr)),
+            }
+        }
+    }
+    let archivable = rows.iter().filter(|row| row.archivable()).count();
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("apply".to_owned(), Value::from(apply));
+        data.insert(
+            "records".to_owned(),
+            Value::Array(
+                rows.iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "repo": row.repo,
+                            "pr": row.pr,
+                            "resolved_repo": row.resolved_repo,
+                            "state": row.lifecycle_name(),
+                            "archive": row.archivable(),
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        data.insert("archivable".to_owned(), Value::from(archivable));
+        data.insert("archived".to_owned(), Value::from(archived.len()));
+        data.insert("failures".to_owned(), serde_json::json!(failures));
+        write_json_envelope(stdout, "ship-state:prune", data)?;
+    } else {
+        for row in &rows {
+            let name = row
+                .resolved_repo
+                .as_ref()
+                .map_or_else(String::new, |to| format!(" (now {to})"));
+            writeln!(
+                stdout,
+                "{} {}#{}{}  {}",
+                if row.archivable() {
+                    "archive"
+                } else {
+                    "keep   "
+                },
+                row.repo,
+                row.pr,
+                name,
+                row.lifecycle_name()
+            )?;
+        }
+        if apply {
+            writeln!(
+                stdout,
+                "archived {} of {} record(s); kept {}",
+                archived.len(),
+                rows.len(),
+                rows.len() - archived.len()
+            )?;
+        } else {
+            writeln!(
+                stdout,
+                "dry run: {archivable} of {} record(s) would be archived; re-run with --apply",
+                rows.len()
+            )?;
+        }
+        for failure in &failures {
+            writeln!(stdout, "  archive failed: {failure}")?;
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} record(s) could not be archived", failures.len()).into())
+    }
 }
 
 pub(super) fn ship_state_reconcile<W: Write>(
@@ -484,9 +669,10 @@ mod tests {
 
     use super::{
         MAX_PR_LIFECYCLE_LOOKUPS, abbreviate_sha, ship_state_discard, ship_state_list,
-        ship_state_reconcile_with, ship_state_show,
+        ship_state_prune, ship_state_reconcile_with, ship_state_show,
     };
     use crate::reconcile::ReconcileFetchError;
+    use crate::repo_slug::SlugResolution;
     use crate::ship_liveness::{DEFAULT_ORPHAN_STALE_MINUTES, LivenessContext, PrLifecycle};
     use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
 
@@ -1085,6 +1271,133 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    fn two_repos_with_pr(store: &ShipStateStore, pr: u64) {
+        for repo in ["owner/spectr", "owner/agent-workstream"] {
+            store
+                .save(&ShipState::new(pr, repo, "b", "main", "s", "policy"))
+                .expect("state");
+        }
+    }
+
+    #[test]
+    fn discard_refuses_a_pr_number_two_repositories_share() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        two_repos_with_pr(&store, 80);
+        let mut out = Vec::new();
+
+        let error = ship_state_discard(&store, None, 80, true, &mut out)
+            .expect_err("ambiguous discard must refuse");
+
+        let message = error.to_string();
+        assert!(message.contains("--repo"), "{message}");
+        assert!(message.contains("owner/spectr") && message.contains("owner/agent-workstream"));
+        assert_eq!(store.list_active().len(), 2, "nothing may be archived");
+    }
+
+    #[test]
+    fn discard_with_repo_archives_only_that_repositorys_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        two_repos_with_pr(&store, 80);
+        let mut out = Vec::new();
+
+        ship_state_discard(&store, Some("owner/spectr"), 80, true, &mut out).expect("discard");
+
+        let remaining = store.list_active();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].repo, "owner/agent-workstream");
+    }
+
+    fn prune_fixture(store: &ShipStateStore) {
+        for (pr, repo) in [
+            (1, "owner/merged"),
+            (2, "owner/closed"),
+            (3, "owner/open"),
+            (4, "owner/unreadable"),
+            (5, "olduser/renamed"),
+        ] {
+            store
+                .save(&ShipState::new(pr, repo, "b", "main", "s", "policy"))
+                .expect("state");
+        }
+    }
+
+    fn prune_lifecycle(repo: &str, _pr: u64) -> PrLifecycle {
+        match repo {
+            "owner/merged" | "neworg/renamed" => PrLifecycle::Merged,
+            "owner/closed" => PrLifecycle::Closed,
+            "owner/open" => PrLifecycle::Open,
+            _ => PrLifecycle::Unknown,
+        }
+    }
+
+    fn prune_resolve(repo: &str) -> SlugResolution {
+        if repo == "olduser/renamed" {
+            SlugResolution::Renamed {
+                to: "neworg/renamed".to_owned(),
+            }
+        } else {
+            SlugResolution::Unknown {
+                reason: "offline".to_owned(),
+            }
+        }
+    }
+
+    #[test]
+    fn prune_dry_run_lists_without_archiving() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        prune_fixture(&store);
+        let mut out = Vec::new();
+
+        ship_state_prune(
+            &store,
+            &mut prune_resolve,
+            &mut prune_lifecycle,
+            false,
+            true,
+            &mut out,
+        )
+        .expect("dry run");
+
+        let payload: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(payload["archivable"], 3);
+        assert_eq!(payload["archived"], 0);
+        assert_eq!(store.list_active().len(), 5, "a dry run archives nothing");
+    }
+
+    #[test]
+    fn prune_apply_archives_only_merged_or_closed_including_renamed_repos() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        prune_fixture(&store);
+        let mut out = Vec::new();
+
+        ship_state_prune(
+            &store,
+            &mut prune_resolve,
+            &mut prune_lifecycle,
+            true,
+            true,
+            &mut out,
+        )
+        .expect("apply");
+
+        let mut kept: Vec<String> = store.list_active().into_iter().map(|s| s.repo).collect();
+        kept.sort();
+        assert_eq!(kept, ["owner/open", "owner/unreadable"]);
+        let payload: Value = serde_json::from_slice(&out).expect("json");
+        let renamed = payload["records"]
+            .as_array()
+            .expect("records")
+            .iter()
+            .find(|row| row["repo"] == "olduser/renamed")
+            .expect("renamed row");
+        assert_eq!(renamed["resolved_repo"], "neworg/renamed");
+        assert_eq!(renamed["state"], "merged");
+    }
+
     #[test]
     fn show_scoped_selects_current_repository_when_pr_numbers_collide() {
         let temp = TempDir::new().expect("tempdir");
@@ -1158,7 +1471,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
-            "Archived ship state for PR #34.\n"
+            "Archived ship state for danielraffel/pulp#34.\n"
         );
         assert!(store.get(34).is_none());
     }

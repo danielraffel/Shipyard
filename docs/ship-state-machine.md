@@ -322,7 +322,8 @@ slipped through anyway is `shipyard runner steward --arm-unqueued`.
 | `shipyard auto-merge`       | `ShipStateStore.get_scoped(repo, pr)` + `gh pr view` fallback when state is absent | `archive_scoped(repo, pr)` on success; no writes on failure. `_pr_is_merged` only runs on the no-state branch. |
 | `shipyard ship-state list`  | `list_active()` across all repository namespaces; human output includes `repo` beside each PR | None |
 | `shipyard ship-state show`  | `get_scoped(checkout_repo, pr)`; unscoped fallback only when the PR number is unambiguous | None |
-| `shipyard ship-state discard` | `get_scoped(checkout_repo, pr)` (accepts any state, not only MERGED) | `archive_scoped(repo, pr)` (manual tombstone) |
+| `shipyard ship-state discard` | `get_scoped(--repo, pr)`, or the only record with that PR number; refuses when several repositories share it (accepts any state, not only MERGED) | `archive_scoped(repo, pr)` (manual tombstone) |
+| `shipyard ship-state prune` | `list_active()`, then each record's PR lifecycle from GitHub, retried under the repository's current name when it was renamed | With `--apply`, `archive_scoped(repo, pr)` for MERGED or CLOSED only; open or unreadable records are kept |
 | `shipyard cleanup --ship-state` | `prune(active_days=14, archive_days=30, closed_prs=...)` | Queries each active state's recorded repository and deletes aged-out active state only for the matching closed `(repo, PR)`, plus aged archives. Unlinks are unguarded — a failure raises. |
 | `shipyard runner recovery-worker` | Durable steward recovery requests plus the live exact PR head; trusted machine-global `[merge_steward.recovery_worker]` only | Without `--apply`, no writes and no model launch. With `--apply`, claims at most one request by default and persists a bounded terminal escalation/failure receipt; it never writes ship state or GitHub/queue/merge/release state. |
 
