@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 import sys
@@ -80,7 +81,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         dist_dir = package_release.DEFAULT_DIST_DIR.relative_to(ROOT).as_posix()
         self.assertIn("attestations: write", text)
         self.assertIn("id-token: write", text)
-        self.assertEqual(text.count("uses: actions/attest@v4"), 2)
+        # Two subjects, three bounded attempts each.
+        self.assertEqual(text.count("uses: actions/attest@v4"), 6)
         self.assertIn("release/shipyard-linux-*", text)
         self.assertIn("release/shipyard-windows-*.exe", text)
         self.assertIn("release/shipyard-workstream-provider-linux-*", text)
@@ -89,6 +91,51 @@ class ReleaseWorkflowTests(unittest.TestCase):
             f"{dist_dir}/${{{{ github.ref_name }}}}/shipyard-macos-arm64.dmg",
             text,
         )
+
+    def _steps(self, job: str) -> list[str]:
+        """The text of each step in `job`, in order (no YAML dependency)."""
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        start = text.index(f"\n  {job}:\n")
+        following = re.search(r"\n  [A-Za-z0-9_-]+:\n", text[start + 1 :])
+        body = text[start : start + 1 + following.start()] if following else text[start:]
+        return re.split(r"\n      - ", body)[1:]
+
+    def test_attestation_retries_only_after_a_failed_attempt(self) -> None:
+        for job, prefix in (
+            ("release", "attest_nonmac"),
+            ("sign-and-upload-macos", "attest_macos"),
+        ):
+            with self.subTest(job=job):
+                attests = [
+                    step for step in self._steps(job)
+                    if "uses: actions/attest@v4" in step
+                ]
+                self.assertEqual(len(attests), 3)
+                first, second, third = attests
+                self.assertNotIn("if:", first)
+                self.assertIn("continue-on-error: true", first)
+                self.assertIn(f"if: steps.{prefix}_1.outcome == 'failure'", second)
+                self.assertIn("continue-on-error: true", second)
+                self.assertIn(f"if: steps.{prefix}_2.outcome == 'failure'", third)
+                # The last attempt must be able to fail the job.
+                self.assertNotIn("continue-on-error", third)
+
+    def test_macos_release_is_published_only_after_attestation(self) -> None:
+        steps = self._steps("sign-and-upload-macos")
+        upload = next(step for step in steps if "upload macOS DMG" in step)
+        self.assertIn("--defer-publish", upload)
+        self.assertNotIn("--publish-only", upload)
+        publish_index = next(
+            index for index, step in enumerate(steps)
+            if step.startswith("name: Publish the attested release")
+        )
+        self.assertIn("--publish-only", steps[publish_index])
+        self.assertNotIn("if:", steps[publish_index])
+        last_attest = max(
+            index for index, step in enumerate(steps)
+            if "uses: actions/attest@v4" in step
+        )
+        self.assertGreater(publish_index, last_attest)
 
     def test_auto_release_workflow_supports_doctor_release_chain(self) -> None:
         text = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")
