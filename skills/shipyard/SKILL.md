@@ -88,6 +88,20 @@ thread with `try_send`, dropping and counting a line rather than ever waiting.
 Keep `run_never_holds_the_process_stdio_locks_for_the_command` and the
 `webhook_listener_keeps_serving_*` tests passing.
 
+## Daemon IPC subscribers lag; they are never evicted for being slow
+
+An accepted Unix socket inherits `O_NONBLOCK` from the non-blocking IPC
+listener on macOS, exactly as the webhook TCP socket does, so the accept loop
+puts every client back in blocking mode. Without that, the per-client writer
+hit `WouldBlock` on the first full socket buffer and dropped the subscriber,
+and every `shipyard wait` silently fell back to polling. A subscriber whose
+queue is full is now marked lagged: its events are dropped, one
+`{"type":"lagged"}` frame goes out when there is room, and the wait client
+re-snapshots on it. Replies to a client's own requests wait for room rather
+than closing it. Keep
+`subscriber_survives_a_webhook_burst_while_draining_a_full_replay_slowly` and
+`daemon_lagged_notice_triggers_an_immediate_re_snapshot` passing.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.

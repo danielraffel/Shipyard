@@ -231,6 +231,9 @@ impl DaemonConnection {
                         Some("event") if event_filter(&message) => {
                             return DaemonEventOutcome::Event(message);
                         }
+                        // The daemon dropped events for this client; one of
+                        // them may have been ours, so re-snapshot now.
+                        Some("lagged") => return DaemonEventOutcome::Event(message),
                         Some("goodbye") => return DaemonEventOutcome::Disconnect,
                         _ => {}
                     }
@@ -1620,6 +1623,68 @@ mod tests {
         assert_eq!(outcome.transport, "daemon");
         assert_eq!(outcome.events_received, 1);
         assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_lagged_notice_triggers_an_immediate_re_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state);
+        server.start().expect("start");
+
+        let lagged_sent = Arc::new(AtomicBool::new(false));
+        let lagged_seen_by_snapshot = Arc::clone(&lagged_sent);
+        let waiter = std::thread::spawn(move || {
+            wait_for_condition_with_timeout(
+                |snapshot| {
+                    Ok(TruthResult {
+                        matched: snapshot
+                            .and_then(|snapshot| snapshot.get("status"))
+                            .and_then(Value::as_str)
+                            == Some("completed"),
+                        observed: std::collections::BTreeMap::new(),
+                    })
+                },
+                move |_| {
+                    Ok(Some(json!({
+                        "status": if lagged_seen_by_snapshot.load(Ordering::SeqCst) {
+                            "completed"
+                        } else {
+                            "pending"
+                        }
+                    })))
+                },
+                // No event ever matches: only the lagged notice can wake it,
+                // and the poll interval is far beyond the timeout.
+                |_| false,
+                3.0,
+                60.0,
+                false,
+                &socket_path,
+            )
+            .expect("wait")
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.subscriber_count() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        lagged_sent.store(true, Ordering::SeqCst);
+        // An event too large to frame is owed to every subscriber as `lagged`.
+        server.broadcast_event(json!({
+            "payload": "x".repeat(crate::daemon_ipc::MAX_IPC_OUTBOUND_FRAME_BYTES),
+        }));
+
+        let outcome = waiter.join().expect("join");
+        server.stop().expect("stop");
+
+        assert!(
+            outcome.matched,
+            "lagged notice did not trigger a re-snapshot"
+        );
+        assert_eq!(outcome.transport, "daemon");
+        assert!(!outcome.fallback_used);
     }
 
     #[cfg(unix)]
