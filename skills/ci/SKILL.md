@@ -2140,6 +2140,12 @@ Generated families may live in `families_file = ".shipyard/<name>.toml"`
 appended to inline families; editing that file selects the full suite, and a
 merge conflict in it is resolved by regenerating it.
 
+A head behind its recorded base (merge base a strict ancestor of `pr_base_sha`)
+is planned against that merge base rather than refused with
+`base_policy_mismatch`; the receipt carries `planned_base_sha`, and authoritative
+promotion requires the merge base's and recorded base's policy digests to match
+(`merge_base_policy_diverged` otherwise, shadow only).
+
 The command is shadow-only. Its receipt is queryable telemetry, not passing
 target evidence, and the configured full validation command must still run.
 Every eligible bounded candidate includes the nonempty mandatory baseline and

@@ -339,6 +339,7 @@ pub(super) fn apply_changed_surface_execution(
             };
             let would_activate =
                 machine.permits_authoritative(repo, &target.name, &plan.policy_digest)
+                    && merge_base_promotion_refusal(machine.mode, &observation.receipt).is_none()
                     && (plan.stage != "build_and_test" || validation.stages.contains_key("build"));
             if let Some(reason) =
                 selected_resume_block_reason(&plan.stage, resume_from, would_activate)
@@ -645,6 +646,25 @@ pub(super) fn apply_changed_surface_execution(
             };
             (plan, None, None)
         };
+        if let Some(reason) = stale_receipt
+            .is_none()
+            .then(|| merge_base_promotion_refusal(machine.mode, &observation.receipt))
+            .flatten()
+        {
+            persist_fallback_diagnostic(
+                &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
+                &FallbackDiagnostic {
+                    schema_version: 1,
+                    repository: repo,
+                    pull_request: pr,
+                    target: &target.name,
+                    machine_mode: machine.mode,
+                    category: "merge_base_policy_diverged",
+                    diagnostic: reason,
+                },
+            )?;
+            continue;
+        }
         if !machine.permits_authoritative(repo, &target.name, &plan.policy_digest) {
             persist_fallback_diagnostic(
                 &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
@@ -1040,6 +1060,28 @@ fn full_fallback_diagnostic(
     format!("{reason:?}{fallback}{detail}")
 }
 
+/// Authoritative execution of a plan made against the head's merge base,
+/// rather than the PR's recorded base, requires the two bases to carry the
+/// same selector policy; otherwise the plan may only run as a shadow.
+fn merge_base_promotion_refusal(
+    mode: MachineMode,
+    receipt: &crate::changed_surface::SelectionReceipt,
+) -> Option<String> {
+    if mode != MachineMode::Authoritative || receipt.planned_base_sha.is_none() {
+        return None;
+    }
+    match (&receipt.recorded_base_policy_digest, &receipt.policy_digest) {
+        (Some(recorded), Some(planned)) if recorded == planned => None,
+        (recorded, planned) => Some(format!(
+            "planned at merge base {} whose selector policy {} differs from the recorded base's {}; \
+             the plan may run only as a shadow",
+            receipt.planned_base_sha.as_deref().unwrap_or("?"),
+            planned.as_deref().unwrap_or("(none)"),
+            recorded.as_deref().unwrap_or("(unparsed)"),
+        )),
+    }
+}
+
 fn persist_fallback_diagnostic(
     path: &Path,
     diagnostic: &FallbackDiagnostic<'_>,
@@ -1209,6 +1251,72 @@ mod tests {
                 Some("unmapped paths: a/b.rs"),
             ),
             "PlannerSelectedFull: UnmappedChangedPath (unmapped paths: a/b.rs)"
+        );
+    }
+
+    #[test]
+    fn a_merge_base_plan_is_promoted_only_when_both_bases_share_a_policy() {
+        use super::merge_base_promotion_refusal;
+        let receipt = |planned: Option<&str>, recorded: Option<&str>, policy: &str| {
+            let mut value = serde_json::json!({
+                "schema_version": 1, "exact_head_verified": true, "shadow_only": true,
+                "repository": "o/r", "pull_request": 1, "target": "mac", "protected_ref": "main",
+                "pr_base_sha": "c".repeat(40), "protected_ref_sha": "c".repeat(40),
+                "merge_base_sha": "b".repeat(40), "head_sha": "a".repeat(40),
+                "tree_sha": "d".repeat(40), "changed_paths_digest": "e".repeat(64),
+                "policy_digest": policy, "build_flags": [], "changed_paths": [],
+                "selected_families": [], "selected_tests": [], "selected_build_targets": [],
+                "baseline_tests": [], "family_coverage": {}, "secondary_proofs": [],
+                "planned_suite": "bounded", "selection_tier": "affected",
+                "authoritative_suite": "full",
+                "outcomes": {"planner": "planned", "authoritative_execution": "x"},
+                "elapsed_ms": 0
+            });
+            if let Some(planned) = planned {
+                value["planned_base_sha"] = planned.into();
+            }
+            if let Some(recorded) = recorded {
+                value["recorded_base_policy_digest"] = recorded.into();
+            }
+            serde_json::from_value::<crate::changed_surface::SelectionReceipt>(value)
+                .expect("receipt")
+        };
+        let b = "b".repeat(40);
+        let same = "1".repeat(64);
+        let other = "2".repeat(64);
+        // The control: a merge base whose policy differs refuses promotion.
+        assert!(
+            merge_base_promotion_refusal(
+                MachineMode::Authoritative,
+                &receipt(Some(&b), Some(&other), &same)
+            )
+            .is_some()
+        );
+        assert!(
+            merge_base_promotion_refusal(
+                MachineMode::Authoritative,
+                &receipt(Some(&b), None, &same)
+            )
+            .is_some()
+        );
+        assert!(
+            merge_base_promotion_refusal(
+                MachineMode::Authoritative,
+                &receipt(Some(&b), Some(&same), &same)
+            )
+            .is_none()
+        );
+        // Shadow comparison still runs, and an up-to-date plan is unaffected.
+        assert!(
+            merge_base_promotion_refusal(
+                MachineMode::ShadowCompare,
+                &receipt(Some(&b), Some(&other), &same)
+            )
+            .is_none()
+        );
+        assert!(
+            merge_base_promotion_refusal(MachineMode::Authoritative, &receipt(None, None, &same))
+                .is_none()
         );
     }
 

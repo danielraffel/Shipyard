@@ -932,6 +932,8 @@ mod tests {
             tree_sha: receipt.integration_tree_sha.clone().unwrap(),
             changed_paths_digest: receipt.integration_changed_paths_digest.clone(),
             shadow_context_digest: Some(context_digest.clone()),
+            planned_base_sha: None,
+            recorded_base_policy_digest: None,
             policy_digest: receipt.live_policy_digest.clone(),
             build_type: None,
             build_flags: Vec::new(),

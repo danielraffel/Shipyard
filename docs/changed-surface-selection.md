@@ -198,6 +198,19 @@ the stable reason when:
 - the head modifies `.shipyard/config.toml`, another declared policy/schema
   path, or declared test-topology path.
 
+A head that sits on an older commit of the protected branch than the PR's
+recorded base (its merge base is a strict ancestor of that base, which the
+observation proves with `git merge-base --is-ancestor`) is planned against that
+merge base instead of refusing with `base_policy_mismatch`: the lane tests the
+head tree, so the merge base's policy, tracked tree and changed paths
+(`merge_base..head`) are the consistent ones. The receipt records
+`planned_base_sha` and the recorded base's `recorded_base_policy_digest`.
+Every other rule still applies, so a head that edits a policy or topology path
+selects the full suite. Authoritative execution of such a plan additionally
+requires the two policy digests to be equal; otherwise the plan runs only as a
+shadow comparison and the run records `merge_base_policy_diverged`. Any other
+merge-base disagreement still refuses.
+
 `stale_base` remains one of those authoritative full-suite reasons. In trusted
 machine mode `shadow_compare`, Shipyard additionally computes a strictly
 shadow-only stale-base assessment. It reads both old and live base policies,
