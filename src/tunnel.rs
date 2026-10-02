@@ -13,6 +13,8 @@ use std::time::Duration;
 use serde_json::Value;
 use wait_timeout::ChildExt;
 
+use crate::tunnel_ingress::IngressCheck;
+
 const FUNNEL_CAP_KEYS: [&str; 2] = ["https://tailscale.com/cap/funnel", "funnel"];
 const TAILSCALE_CANDIDATE_BINARIES: [&str; 4] = [
     "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
@@ -569,14 +571,26 @@ fn tailscale_not_ready(binary_path: Option<PathBuf>) -> TailscaleStatus {
     }
 }
 
+pub use crate::tunnel_ingress::IngressReport;
+
 /// Tailscale Funnel backend used by the daemon supervisor.
 #[derive(Clone, Debug, Default)]
 pub struct TailscaleFunnelBackend {
     binary: Option<PathBuf>,
     configured_port: Option<u16>,
+    ingress: IngressCheck,
 }
 
 impl TailscaleFunnelBackend {
+    /// A backend that publishes its public-ingress probe results to `report`.
+    #[must_use]
+    pub fn with_ingress_report(report: IngressReport) -> Self {
+        Self {
+            ingress: IngressCheck::reporting_to(report),
+            ..Self::default()
+        }
+    }
+
     fn verify_configured(&mut self, local_port: u16) -> Result<bool, TunnelError> {
         let Some(binary) = self.binary.clone() else {
             return Ok(false);
@@ -633,6 +647,7 @@ impl TunnelBackend for TailscaleFunnelBackend {
             }
             if self.verify_configured(local_port)? {
                 self.configured_port = Some(local_port);
+                self.ingress.set_public_url(&public_url);
                 return Ok(TunnelInfo {
                     public_url,
                     backend: self.name().to_owned(),
@@ -651,7 +666,13 @@ impl TunnelBackend for TailscaleFunnelBackend {
     }
 
     fn verify(&mut self, local_port: u16) -> Result<bool, TunnelError> {
-        self.verify_configured(local_port)
+        if !self.verify_configured(local_port)? {
+            return Ok(false);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+        Ok(self.ingress.verify(now))
     }
 
     fn stop(&mut self) -> Result<(), TunnelError> {
@@ -902,6 +923,55 @@ mod tests {
             dns_name: Some("node.tailnet.ts.net.".to_owned()),
             funnel_permitted: false,
         }
+    }
+
+    fn relay_rejects_this_host(_host: &str, _nonce: &str) -> crate::tunnel_ingress::IngressVerdict {
+        crate::tunnel_ingress::IngressVerdict::Failing(
+            "TLS handshake failed at the relay".to_owned(),
+        )
+    }
+
+    fn relay_reaches_this_host(_host: &str, _nonce: &str) -> crate::tunnel_ingress::IngressVerdict {
+        crate::tunnel_ingress::IngressVerdict::Reachable
+    }
+
+    #[test]
+    fn a_relay_that_cannot_reach_this_host_loses_the_tunnel_on_the_second_failing_probe() {
+        let report: super::IngressReport = std::sync::Arc::default();
+        let mut backend = super::TailscaleFunnelBackend::with_ingress_report(report.clone());
+        backend.ingress.public_host = Some("m3.example.ts.net".to_owned());
+        backend.ingress.probe = relay_rejects_this_host;
+
+        // First verification probes and fails once; the next nine do not probe.
+        let kept = (0..10)
+            .map(|tick| backend.ingress.verify(f64::from(tick)))
+            .collect::<Vec<_>>();
+        assert!(kept.iter().all(|kept| *kept), "{kept:?}");
+        let first = report.lock().expect("report").clone().expect("first probe");
+        assert_eq!(first.to_json()["state"], "failing");
+        assert_eq!(first.consecutive_failures, 1);
+
+        // The tenth verification probes again: two failures in a row, lost.
+        assert!(!backend.ingress.verify(10.0));
+        let second = report
+            .lock()
+            .expect("report")
+            .clone()
+            .expect("second probe");
+        assert_eq!(second.consecutive_failures, 2);
+        assert!((second.checked_at - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_reachable_or_unknown_host_never_loses_the_tunnel() {
+        let mut backend = super::TailscaleFunnelBackend::default();
+        backend.ingress.public_host = Some("m5.example.ts.net".to_owned());
+        backend.ingress.probe = relay_reaches_this_host;
+        assert!((0..50).all(|tick| backend.ingress.verify(f64::from(tick))));
+        // Before the tunnel is up there is no host to probe.
+        let mut idle = super::TailscaleFunnelBackend::default();
+        idle.ingress.probe = relay_rejects_this_host;
+        assert!((0..50).all(|tick| idle.ingress.verify(f64::from(tick))));
     }
 
     #[test]
@@ -1180,6 +1250,108 @@ mod tests {
             snapshots.last().expect("final snapshot").backend,
             "inactive"
         );
+    }
+
+    /// Probe script for the self-heal test: two failing probes, then healthy.
+    static SELF_HEAL_SCRIPT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn relay_fails_twice_then_heals(
+        _host: &str,
+        _nonce: &str,
+    ) -> crate::tunnel_ingress::IngressVerdict {
+        match SELF_HEAL_SCRIPT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 | 1 => crate::tunnel_ingress::IngressVerdict::Failing(
+                "TLS handshake failed at the relay".to_owned(),
+            ),
+            _ => crate::tunnel_ingress::IngressVerdict::Reachable,
+        }
+    }
+
+    /// A backend whose bring-up always works and whose verification is the
+    /// real public-ingress check, driven by a scripted probe.
+    struct SelfHealBackend {
+        ingress: crate::tunnel_ingress::IngressCheck,
+        report: super::IngressReport,
+        starts: usize,
+        now: f64,
+        states: Vec<String>,
+    }
+
+    impl TunnelBackend for SelfHealBackend {
+        fn name(&self) -> &'static str {
+            "tailscale"
+        }
+
+        fn start(&mut self, _local_port: u16) -> Result<TunnelInfo, TunnelError> {
+            self.starts += 1;
+            self.ingress.set_public_url("https://m3.example.ts.net");
+            Ok(ok_info())
+        }
+
+        fn verify(&mut self, _local_port: u16) -> Result<bool, TunnelError> {
+            self.now += 30.0;
+            let keep = self.ingress.verify(self.now);
+            let state = self
+                .report
+                .lock()
+                .expect("report")
+                .as_ref()
+                .map(|status| status.verdict.state().to_owned())
+                .unwrap_or_default();
+            self.states.push(state);
+            Ok(keep)
+        }
+
+        fn stop(&mut self) -> Result<(), TunnelError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failing_self_checks_reapply_the_funnel_and_report_degraded_until_one_succeeds() {
+        let report: super::IngressReport = std::sync::Arc::default();
+        let mut ingress = crate::tunnel_ingress::IngressCheck::reporting_to(report.clone());
+        ingress.probe = relay_fails_twice_then_heals;
+        let mut backend = SelfHealBackend {
+            ingress,
+            report,
+            starts: 0,
+            now: 0.0,
+            states: Vec::new(),
+        };
+        let policy = TunnelSupervisorPolicy::new(vec![Duration::ZERO], Duration::ZERO);
+        let mut state = TunnelSupervisorState::default();
+        let sleeps = Cell::new(0);
+
+        supervise_tunnel(
+            &mut backend,
+            12_345,
+            &policy,
+            &mut state,
+            TunnelSupervisorHooks::new(
+                || sleeps.get() >= 40,
+                |_| sleeps.set(sleeps.get() + 1),
+                || 42.0,
+                |_| {},
+            ),
+        );
+
+        // The second failing probe made the supervisor re-apply the funnel.
+        assert_eq!(backend.starts, 2, "states: {:?}", backend.states);
+        let first_ok = backend
+            .states
+            .iter()
+            .position(|state| state == "ok")
+            .expect("the relay healed");
+        assert!(
+            backend.states[..first_ok]
+                .iter()
+                .all(|state| state == "failing"),
+            "status must read failing from the first failed probe until one succeeds: {:?}",
+            backend.states
+        );
+        assert!(backend.states[first_ok..].iter().all(|state| state == "ok"));
     }
 
     #[test]
