@@ -13,6 +13,8 @@ use std::time::Duration;
 use serde_json::Value;
 use wait_timeout::ChildExt;
 
+use crate::tunnel_ingress::{IngressMonitor, IngressStatus, IngressVerdict, probe_public_ingress};
+
 const FUNNEL_CAP_KEYS: [&str; 2] = ["https://tailscale.com/cap/funnel", "funnel"];
 const TAILSCALE_CANDIDATE_BINARIES: [&str; 4] = [
     "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
@@ -569,14 +571,70 @@ fn tailscale_not_ready(binary_path: Option<PathBuf>) -> TailscaleStatus {
     }
 }
 
+/// Shared slot for the last public-ingress probe, read by `daemon status`.
+pub type IngressReport = std::sync::Arc<std::sync::Mutex<Option<IngressStatus>>>;
+
 /// Tailscale Funnel backend used by the daemon supervisor.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TailscaleFunnelBackend {
     binary: Option<PathBuf>,
     configured_port: Option<u16>,
+    /// Funnel host name, known once the tunnel is up.
+    public_host: Option<String>,
+    ingress: IngressMonitor,
+    ingress_report: Option<IngressReport>,
+    probe: fn(&str, &str) -> IngressVerdict,
+}
+
+impl Default for TailscaleFunnelBackend {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            configured_port: None,
+            public_host: None,
+            ingress: IngressMonitor::default(),
+            ingress_report: None,
+            probe: probe_public_ingress,
+        }
+    }
 }
 
 impl TailscaleFunnelBackend {
+    /// A backend that publishes its public-ingress probe results to `report`.
+    #[must_use]
+    pub fn with_ingress_report(report: IngressReport) -> Self {
+        Self {
+            ingress_report: Some(report),
+            ..Self::default()
+        }
+    }
+
+    /// Run the periodic public-ingress probe. Returns false when the public
+    /// relays have failed to reach this host often enough that the tunnel
+    /// should be torn down and re-applied.
+    fn verify_ingress(&mut self, now: f64) -> bool {
+        let Some(host) = self.public_host.clone() else {
+            return true;
+        };
+        if !self.ingress.probe_due() {
+            return true;
+        }
+        let nonce = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        );
+        let verdict = (self.probe)(&host, &nonce);
+        let (status, lost) = self.ingress.observe(verdict, now);
+        if let Some(report) = &self.ingress_report
+            && let Ok(mut slot) = report.lock()
+        {
+            *slot = Some(status);
+        }
+        !lost
+    }
+
     fn verify_configured(&mut self, local_port: u16) -> Result<bool, TunnelError> {
         let Some(binary) = self.binary.clone() else {
             return Ok(false);
@@ -633,6 +691,9 @@ impl TunnelBackend for TailscaleFunnelBackend {
             }
             if self.verify_configured(local_port)? {
                 self.configured_port = Some(local_port);
+                self.public_host = public_url
+                    .strip_prefix("https://")
+                    .map(|host| host.trim_end_matches('/').to_owned());
                 return Ok(TunnelInfo {
                     public_url,
                     backend: self.name().to_owned(),
@@ -651,7 +712,13 @@ impl TunnelBackend for TailscaleFunnelBackend {
     }
 
     fn verify(&mut self, local_port: u16) -> Result<bool, TunnelError> {
-        self.verify_configured(local_port)
+        if !self.verify_configured(local_port)? {
+            return Ok(false);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+        Ok(self.verify_ingress(now))
     }
 
     fn stop(&mut self) -> Result<(), TunnelError> {
@@ -902,6 +969,59 @@ mod tests {
             dns_name: Some("node.tailnet.ts.net.".to_owned()),
             funnel_permitted: false,
         }
+    }
+
+    fn relay_rejects_this_host(_host: &str, _nonce: &str) -> crate::tunnel_ingress::IngressVerdict {
+        crate::tunnel_ingress::IngressVerdict::Failing(
+            "TLS handshake failed at the relay".to_owned(),
+        )
+    }
+
+    fn relay_reaches_this_host(_host: &str, _nonce: &str) -> crate::tunnel_ingress::IngressVerdict {
+        crate::tunnel_ingress::IngressVerdict::Reachable
+    }
+
+    #[test]
+    fn a_relay_that_cannot_reach_this_host_loses_the_tunnel_on_the_second_failing_probe() {
+        let report: super::IngressReport = std::sync::Arc::default();
+        let mut backend = super::TailscaleFunnelBackend::with_ingress_report(report.clone());
+        backend.public_host = Some("m3.example.ts.net".to_owned());
+        backend.probe = relay_rejects_this_host;
+
+        // First verification probes and fails once; the next nine do not probe.
+        let kept = (0..10)
+            .map(|tick| backend.verify_ingress(f64::from(tick)))
+            .collect::<Vec<_>>();
+        assert!(kept.iter().all(|kept| *kept), "{kept:?}");
+        let first = report.lock().expect("report").clone().expect("first probe");
+        assert_eq!(first.to_json()["state"], "failing");
+        assert_eq!(first.consecutive_failures, 1);
+
+        // The tenth verification probes again: two failures in a row, lost.
+        assert!(!backend.verify_ingress(10.0));
+        let second = report
+            .lock()
+            .expect("report")
+            .clone()
+            .expect("second probe");
+        assert_eq!(second.consecutive_failures, 2);
+        assert!((second.checked_at - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_reachable_or_unknown_host_never_loses_the_tunnel() {
+        let mut backend = super::TailscaleFunnelBackend {
+            public_host: Some("m5.example.ts.net".to_owned()),
+            probe: relay_reaches_this_host,
+            ..super::TailscaleFunnelBackend::default()
+        };
+        assert!((0..50).all(|tick| backend.verify_ingress(f64::from(tick))));
+        // Before the tunnel is up there is no host to probe.
+        let mut idle = super::TailscaleFunnelBackend {
+            probe: relay_rejects_this_host,
+            ..super::TailscaleFunnelBackend::default()
+        };
+        assert!((0..50).all(|tick| idle.verify_ingress(f64::from(tick))));
     }
 
     #[test]

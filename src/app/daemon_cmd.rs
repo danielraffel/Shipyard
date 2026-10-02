@@ -475,6 +475,7 @@ fn daemon_reconcile<W: Write>(
     // name and every hook it registers will inherit the staleness — so the
     // disagreement is reported before any repository is consulted.
     let mut preflight = daemon_url_findings(&runtime_paths.state_dir, &identity);
+    preflight.extend(public_ingress_findings(&runtime_paths.state_dir));
 
     if repos.is_empty() {
         preflight.push(Finding::new(
@@ -995,12 +996,87 @@ fn render_daemon_status<W: Write>(
         stdout,
         "daemon running · tunnel={backend} · {url}\nsubscribers={subscribers} · advertises={repos_text}"
     )?;
+    if let Some(line) = public_ingress_line(tunnel.get("public_ingress")) {
+        writeln!(stdout, "{line}")?;
+    }
     Ok(())
+}
+
+/// One status line for the daemon's last public-ingress self-check.
+fn public_ingress_line(ingress: Option<&Value>) -> Option<String> {
+    let ingress = ingress?.as_object()?;
+    let state = ingress.get("state").and_then(Value::as_str)?;
+    let detail = ingress
+        .get("detail")
+        .and_then(Value::as_str)
+        .filter(|detail| !detail.is_empty());
+    Some(match (state, detail) {
+        ("ok", _) => "public ingress: ok".to_owned(),
+        ("failing", detail) => format!(
+            "public ingress: FAILING ({}); GitHub cannot reach this daemon, waits fall back to polling",
+            detail.unwrap_or("no detail")
+        ),
+        (other, detail) => format!(
+            "public ingress: {other} ({})",
+            detail.unwrap_or("no detail")
+        ),
+    })
+}
+
+/// A daemon whose own public-ingress self-check is failing receives no
+/// webhooks, whatever GitHub's hook configuration says.
+fn public_ingress_findings(state_dir: &Path) -> Vec<Finding> {
+    let Some(status) = read_daemon_status(state_dir) else {
+        return Vec::new();
+    };
+    let ingress = status
+        .get("tunnel")
+        .and_then(|tunnel| tunnel.get("public_ingress"));
+    if ingress
+        .and_then(|ingress| ingress.get("state"))
+        .and_then(Value::as_str)
+        != Some("failing")
+    {
+        return Vec::new();
+    }
+    vec![Finding::new(
+        FindingCode::EndpointUnreachable,
+        Severity::Alarm,
+        public_ingress_line(ingress).unwrap_or_default(),
+        "The public relays cannot reach this host's tunnel. The daemon re-applies \
+         its funnel after two failing checks; if it stays failing, toggle the \
+         funnel or check the node's Funnel state in the Tailscale admin console."
+            .to_owned(),
+    )]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::url_names_host;
+    use super::{public_ingress_line, url_names_host};
+
+    #[test]
+    fn public_ingress_line_names_a_failing_check_and_its_reason() {
+        let failing = serde_json::json!({
+            "state": "failing",
+            "detail": "208.111.34.11: TLS handshake failed at the relay",
+            "checked_at": 1.0,
+            "consecutive_failures": 1,
+        });
+        let line = public_ingress_line(Some(&failing)).expect("line");
+        assert!(
+            line.starts_with("public ingress: FAILING (208.111.34.11: TLS"),
+            "{line}"
+        );
+        assert!(line.contains("waits fall back to polling"), "{line}");
+        let ok = serde_json::json!({"state": "ok", "detail": ""});
+        assert_eq!(
+            public_ingress_line(Some(&ok)).as_deref(),
+            Some("public ingress: ok")
+        );
+        // An older daemon reports no ingress check at all; say nothing.
+        assert_eq!(public_ingress_line(None), None);
+        assert_eq!(public_ingress_line(Some(&serde_json::Value::Null)), None);
+    }
 
     /// The daemon's advertised URL is compared against this host's identity to
     /// catch a daemon serving a stale name. A false MATCH is the dangerous

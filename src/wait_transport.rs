@@ -1202,6 +1202,7 @@ mod tests {
             tunnel_backend: "tailscale".to_owned(),
             tunnel_url: None,
             tunnel_verified_at: None,
+            tunnel_public_ingress: None,
             subscribers: 0,
             last_event_at: None,
             registered_repos: Vec::new(),

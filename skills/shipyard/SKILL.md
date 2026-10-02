@@ -120,6 +120,20 @@ than closing it. Keep
 `subscriber_survives_a_webhook_burst_while_draining_a_full_replay_slowly` and
 `daemon_lagged_notice_triggers_an_immediate_re_snapshot` passing.
 
+## A healthy local funnel is not a reachable daemon
+
+`tailscale funnel status` naming the daemon's port proves only the local half.
+The public relays can reset the TLS handshake for one host's name while every
+other host works, and GitHub then records each delivery as `500 ... EOF`.
+The daemon now requests `GET /ingress-probe/<nonce>` from itself through every
+relay address its funnel host resolves to (public DNS over HTTPS), on the
+first tunnel verification and every tenth after (about five minutes). A TLS
+failure, empty reply, refused connection, or 502-504 counts as failing; DNS,
+timeouts, or a missing `curl` are inconclusive and never act. Two failing
+probes in a row make the supervisor treat the tunnel as lost and re-apply the
+funnel. `daemon status` prints `public ingress: ok` or `FAILING (...)`, and
+`daemon reconcile` raises an `endpoint_unreachable` alarm while it fails.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.

@@ -258,6 +258,7 @@ mod terminal_delivery_authority;
 pub mod tree_drift;
 /// Tunnel readiness, Tailscale probe decoding, and supervisor retry policy.
 pub mod tunnel;
+pub mod tunnel_ingress;
 /// Fail-closed policy primitives for contributor-controlled review requests.
 pub mod untrusted;
 /// Test-tier and receipt-decision annotations published by CI jobs.
