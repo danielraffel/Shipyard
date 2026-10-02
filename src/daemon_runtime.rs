@@ -1428,8 +1428,11 @@ fn start_webhook_listener(
     event_sender: mpsc::Sender<Value>,
     secret: String,
 ) -> Result<LocalWebhookListener, DaemonRunError> {
+    // `write_stderr` waits for the shared writer-domain lease, which an
+    // exclusive sandbox audit can hold for minutes; it gives up after its
+    // timeout, and the failed line is counted rather than lost silently.
     let log = DeliveryLog::spawn(DELIVERY_LOG_CAPACITY, |line| {
-        let _ = crate::writer_domain_lease::write_stderr(format_args!("{line}"));
+        crate::writer_domain_lease::write_stderr(format_args!("{line}")).is_ok()
     });
     start_webhook_listener_with_log(running, event_sender, secret, log)
 }
@@ -1618,11 +1621,25 @@ struct DeliveryLog {
 
 #[cfg(unix)]
 impl DeliveryLog {
-    fn spawn(capacity: usize, write: impl Fn(&str) + Send + 'static) -> Self {
+    /// `write` returns whether the line reached the log. Lines it could not
+    /// write are counted, and the count rides on the next line that does.
+    fn spawn(capacity: usize, write: impl Fn(&str) -> bool + Send + 'static) -> Self {
         let (sender, receiver) = mpsc::sync_channel::<String>(capacity);
         thread::spawn(move || {
+            let mut unwritten = 0_u64;
             for line in receiver {
-                write(&line);
+                let line = if unwritten == 0 {
+                    line
+                } else {
+                    format!(
+                        "{line} ({unwritten} earlier refusal lines lost: the daemon log was not writable)"
+                    )
+                };
+                if write(&line) {
+                    unwritten = 0;
+                } else {
+                    unwritten += 1;
+                }
             }
         });
         Self { sender, dropped: 0 }
@@ -3172,7 +3189,7 @@ mod tests {
         // The writer blocks on its first line until released.
         let log = super::DeliveryLog::spawn(1, move |line| {
             let _ = release_rx.lock().expect("release").recv();
-            let _ = line_tx.send(line.to_owned());
+            line_tx.send(line.to_owned()).is_ok()
         });
         let running = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
@@ -3206,6 +3223,71 @@ mod tests {
             lines.iter().any(|line| line.contains("forged-last")
                 && line.contains("earlier refusal lines dropped")),
             "the drop count must ride on a later line: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_log_counts_lines_its_writer_could_not_write() {
+        let (line_tx, line_rx) = mpsc::channel::<String>();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_attempts = Arc::clone(&attempts);
+        let mut log = super::DeliveryLog::spawn(8, move |line| {
+            // The first two writes fail, as a lease timeout would.
+            if writer_attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                return false;
+            }
+            line_tx.send(line.to_owned()).is_ok()
+        });
+        for name in ["first", "second", "third"] {
+            log.record(format!("refused {name}"));
+        }
+        let line = line_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("third line");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            line,
+            "refused third (2 earlier refusal lines lost: the daemon log was not writable)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_answers_within_a_second_while_the_log_lease_is_held() {
+        use fs2::FileExt;
+
+        // A sandbox audit holds the writer-domain lock exclusively; the log
+        // writer then blocks taking it shared, exactly as `write_stderr` does.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("writer-domain.lock");
+        let audit = std::fs::File::create(&lock_path).expect("lock file");
+        audit.lock_exclusive().expect("hold exclusively");
+        let writer_lock_path = lock_path.clone();
+        let log = super::DeliveryLog::spawn(1, move |_line| {
+            let file = std::fs::File::open(&writer_lock_path).expect("open lock");
+            file.lock_shared().is_ok()
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = mpsc::channel();
+        let listener =
+            super::start_webhook_listener_with_log(&running, tx, "dev-secret".to_owned(), log)
+                .expect("listener");
+
+        let mut slowest = Duration::ZERO;
+        for index in 0..5 {
+            let (forged, _) = check_run_delivery("the-wrong-secret", &format!("held-{index}"));
+            let started = Instant::now();
+            let answer = send_with_timeout(listener.port, &forged, Duration::from_secs(3));
+            slowest = slowest.max(started.elapsed());
+            assert!(answer.starts_with("HTTP/1.1 401"), "unexpected: {answer:?}");
+        }
+        FileExt::unlock(&audit).expect("release");
+        running.store(false, Ordering::Release);
+        listener.stop();
+        assert!(
+            slowest < Duration::from_secs(1),
+            "a held log lease delayed the listener: {slowest:?}"
         );
     }
 
