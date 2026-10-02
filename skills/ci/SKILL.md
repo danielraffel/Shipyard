@@ -244,6 +244,16 @@ v0.245.0 published with no attestation after one transient Sigstore TLS error,
 and every host's fleet-update refused it ("no acceptable build-provenance
 attestation"). If a release is stuck as a draft, rerun the failed
 `sign-and-upload-macos` job; do not publish it by hand without an attestation.
+## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
+
+A killed validation run cannot run the Drop that removes its
+`shipyard-validation-*` TMPDIR; on m3 57 of them held 37.5 GiB of the boot
+volume on 2026-10-01 and broke a release build with ENOSPC. Each TMPDIR now has
+a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
+6h whose owner is gone; `shipyard cleanup --validation-tmp [--apply]
+[--older-than-hours N]` also handles dirs without an owner file, keeping any that
+a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
+everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
 ## Quick reference
 

@@ -614,8 +614,7 @@ impl LocalExecutor {
 
 /// Names a directory to hold validation TMPDIRs instead of the system temp
 /// root, for a host whose boot volume must not carry build scratch.
-#[cfg(unix)]
-const VALIDATION_TMP_BASE_ENV: &str = "SHIPYARD_VALIDATION_TMP_BASE";
+pub(super) const VALIDATION_TMP_BASE_ENV: &str = "SHIPYARD_VALIDATION_TMP_BASE";
 
 /// A validation run's private TMPDIR, removed when the run ends.
 ///
@@ -639,8 +638,10 @@ impl ValidationTempDir {
 impl Drop for ValidationTempDir {
     fn drop(&mut self) {
         if let Some(directory) = self.0.take() {
-            make_tree_owner_writable(directory.path());
+            let path = directory.path().to_path_buf();
+            make_tree_owner_writable(&path);
             drop(directory);
+            super::validation_tmp::remove_owner(&path);
         }
     }
 }
@@ -649,7 +650,7 @@ impl Drop for ValidationTempDir {
 /// symlinks), so a recursive removal can unlink what tests made read-only.
 /// Best effort: a directory owned by someone else stays as it is.
 #[cfg(unix)]
-fn make_tree_owner_writable(root: &Path) {
+pub(super) fn make_tree_owner_writable(root: &Path) {
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         let Ok(metadata) = fs::symlink_metadata(&directory) else {
@@ -674,7 +675,7 @@ fn make_tree_owner_writable(root: &Path) {
 }
 
 #[cfg(not(unix))]
-fn make_tree_owner_writable(_root: &Path) {}
+pub(super) fn make_tree_owner_writable(_root: &Path) {}
 
 #[cfg(unix)]
 fn isolate_protected_inherited_tmpdir(
@@ -728,10 +729,16 @@ fn isolate_protected_tmpdir(
             base.display()
         )));
     }
+    // A run killed before its Drop leaves its tree behind; the next run on
+    // this base removes those whose owner process is gone.
+    super::validation_tmp::sweep_dead_owners(base);
     let temp_dir = tempfile::Builder::new()
-        .prefix("shipyard-validation-")
+        .prefix(super::validation_tmp::PREFIX)
         .tempdir_in(base)?;
     std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    // Without an owner file the directory is only reclaimable by the explicit
+    // cleanup command, so a failed write is not fatal.
+    let _ = super::validation_tmp::write_owner(temp_dir.path());
     let value = temp_dir.path().to_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1147,6 +1154,48 @@ mod tests {
             "a relative scratch base must be refused, not resolved against the cwd"
         );
         assert!(!environment.contains_key("TMPDIR"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_runs_tree_is_swept_by_the_next_run_and_owner_files_track_the_run() {
+        use crate::executor::validation_tmp::owner_path;
+        let inherited = RuntimePaths::current(RuntimeMode::Shipyard)
+            .state_dir
+            .join("daemon/tmp");
+        let base = tempfile::tempdir().expect("scratch base");
+
+        // What a SIGKILLed run leaves: its tree, and an owner file naming a
+        // process that no longer exists, last touched hours ago.
+        let mut exited = Command::new("true").spawn().expect("spawn");
+        let dead_pid = exited.id();
+        exited.wait().expect("reap");
+        let killed = base.path().join("shipyard-validation-killed");
+        std::fs::create_dir_all(killed.join("build")).expect("killed tree");
+        std::fs::write(owner_path(&killed), format!("{dead_pid}\n")).expect("owner");
+        let hours_ago = std::time::SystemTime::now() - std::time::Duration::from_hours(7);
+        std::fs::File::open(&killed)
+            .expect("open dir")
+            .set_modified(hours_ago)
+            .expect("age dir");
+
+        let mut environment = BTreeMap::new();
+        let temp_dir = isolate_protected_tmpdir(&mut environment, &inherited, Some(base.path()))
+            .expect("isolation")
+            .expect("protected inherited root");
+        assert!(!killed.exists(), "the dead owner's tree must be swept");
+        assert!(!owner_path(&killed).exists());
+        let isolated = temp_dir.path().to_path_buf();
+        assert_eq!(
+            std::fs::read_to_string(owner_path(&isolated)).expect("own owner file"),
+            format!("{}\n", std::process::id())
+        );
+        drop(temp_dir);
+        assert!(!isolated.exists());
+        assert!(
+            !owner_path(&isolated).exists(),
+            "drop must remove the owner file"
+        );
     }
 
     #[test]
