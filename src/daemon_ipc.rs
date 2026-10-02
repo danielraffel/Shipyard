@@ -991,7 +991,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[cfg(unix)]
     #[test]
     fn status_frame_carries_the_public_ingress_check() {
         let mut state = dummy_state();
@@ -1006,6 +1005,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn status_frame_keeps_removed_lane_keys_as_constants() {
         let frame = super::status_frame(&dummy_state());
