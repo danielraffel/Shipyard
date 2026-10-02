@@ -17,7 +17,7 @@ use super::CliFailure;
 use crate::changed_surface::{
     BuildType, ChangedSurfacePolicy, ExactHeadInput, ObservationStatus, PlannedSuite,
     ProtectedRefStatus, SecondaryProof, SelectionReceipt, StaleBaseShadowInput,
-    StaleBaseShadowReceipt, plan_selection, plan_stale_base_shadow, policy_from_toml,
+    StaleBaseShadowReceipt, plan_selection, plan_stale_base_shadow, policy_from_base,
 };
 use crate::config::LoadedConfig;
 use crate::evidence::EvidenceStore;
@@ -70,7 +70,11 @@ pub(crate) fn observe_stale_base_shadow(
     );
     let live_policy = live_config
         .map_err(|error| error.message)
-        .and_then(|contents| policy_from_toml(&contents, &exact.target));
+        .and_then(|contents| {
+            policy_from_base(&contents, &exact.target, |path| {
+                read_base_file(cwd, &exact.protected_ref_sha, path)
+            })
+        });
     let (protected_base_delta_paths, protected_base_delta_complete) = git_nul_paths(
         cwd,
         &[
@@ -401,7 +405,11 @@ pub(crate) fn observe_changed_surface_plan(
     );
     let policy = protected_config
         .map_err(|error| error.message)
-        .and_then(|contents| policy_from_toml(&contents, &args.target));
+        .and_then(|contents| {
+            policy_from_base(&contents, &args.target, |path| {
+                read_base_file(cwd, &pull.base.sha, path)
+            })
+        });
     let (base_tracked_paths, base_tracked_paths_complete) =
         git_nul_paths(cwd, &["ls-tree", "-r", "--name-only", "-z", &pull.base.sha])
             .map_or((Vec::new(), false), |paths| (paths, true));
@@ -650,6 +658,17 @@ fn git_required(cwd: &Path, args: &[&str], context: &str) -> Result<String, CliF
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// A tracked file's bytes at an authenticated commit, for a selector
+/// declaration's `families_file`.
+pub(crate) fn read_base_file(cwd: &Path, sha: &str, path: &str) -> Result<String, String> {
+    git_required(
+        cwd,
+        &["show", &format!("{sha}:{path}")],
+        "read selector families_file from authenticated base",
+    )
+    .map_err(|error| error.message)
+}
+
 fn git_optional(cwd: &Path, args: &[&str]) -> Option<String> {
     git_required(cwd, args, "git provenance query").ok()
 }
@@ -791,6 +810,35 @@ mod tests {
             previous_filename: Some("schema/selector.json".to_owned()),
         }]);
         assert_eq!(paths, ["schema/selector.json", "docs/new.md"]);
+    }
+
+    #[test]
+    fn families_file_is_read_from_the_authenticated_commit_not_the_checkout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Shipyard Test"]);
+        git(&["config", "user.email", "shipyard@example.invalid"]);
+        fs::create_dir_all(temp.path().join(".shipyard")).expect("dir");
+        let path = temp.path().join(".shipyard/families.toml");
+        fs::write(&path, "base\n").expect("base");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        fs::write(&path, "working tree\n").expect("edit");
+        assert_eq!(
+            super::read_base_file(temp.path(), &base, ".shipyard/families.toml").expect("read"),
+            "base"
+        );
+        assert!(super::read_base_file(temp.path(), &base, ".shipyard/absent.toml").is_err());
     }
 
     #[test]

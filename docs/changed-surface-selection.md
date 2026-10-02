@@ -132,6 +132,17 @@ represents a concrete validation execution. Evidence from an explicit or
 warm-pool stage resume is also rejected; the required target must run its full
 declared validation contract.
 
+A repository that generates its families can keep them out of the
+hand-edited config. `families_file = ".shipyard/<name>.toml"` names a tracked
+file that holds only `[[families]]` tables, read from the same authenticated
+commit as the config (never from the checkout). Its families are appended to
+any inline ones and validated together, so a duplicate name across the two is
+rejected, and the file's path joins `policy_paths`: a pull request that edits
+it selects the full suite like one that edits the config. The path must be a
+relative `.toml` path under `.shipyard/` with no `.` or `..` component; an
+unreadable, empty or malformed file fails the declaration closed. Both files
+feed the policy digest.
+
 ## Planning an exact PR head
 
 Run from a clean checkout at the published PR head:

@@ -138,10 +138,25 @@ pub(crate) fn acquire_for_protected_stdio() -> io::Result<Option<ProductionWrite
 /// Append one complete diagnostic to stderr while respecting a detached
 /// protected-log marker. Callers intentionally ignore failures: writing after
 /// an exclusive audit wins would contaminate evidence, so silence is safer.
+///
+/// The line goes to a duplicate of the stderr descriptor rather than through
+/// `io::stderr().lock()`. A command that holds the process stderr lock for its
+/// whole run (the detached daemon's dispatcher does) would otherwise block
+/// every other thread that logs, forever: a worker thread that called this
+/// once would never return. The buffered line is written in one flush.
 pub(crate) fn write_stderr(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
     let lease = acquire_for_protected_stdio();
-    let mut stderr = io::stderr().lock();
+    let mut stderr = io::BufWriter::new(unlocked_stderr()?);
     write_diagnostic_with_lease(arguments, lease, &mut stderr)
+}
+
+/// A handle on the process stderr that does not take Rust's stderr lock.
+fn unlocked_stderr() -> io::Result<File> {
+    #[cfg(unix)]
+    let owned = std::os::fd::AsFd::as_fd(&io::stderr()).try_clone_to_owned()?;
+    #[cfg(windows)]
+    let owned = std::os::windows::io::AsHandle::as_handle(&io::stderr()).try_clone_to_owned()?;
+    Ok(File::from(owned))
 }
 
 fn write_diagnostic_with_lease<T>(
@@ -428,6 +443,24 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[test]
+    fn write_stderr_returns_while_another_thread_holds_the_stderr_lock() {
+        let held = io::stderr().lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let result = write_stderr(format_args!("write_stderr lock-independence probe"));
+            let _ = done_tx.send(result.is_ok());
+        });
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        assert_eq!(
+            finished,
+            Ok(true),
+            "write_stderr must not wait on a stderr lock held by another thread"
+        );
+    }
 
     #[test]
     fn absolute_protected_path_never_resolves_process_cwd() {
