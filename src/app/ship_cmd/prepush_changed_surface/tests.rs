@@ -73,6 +73,7 @@ fn input(pull_request: u64) -> ExactHeadInput {
         base_tracked_paths: vec!["src/dsp.cpp".to_owned()],
         base_tracked_paths_status: ObservationStatus::Complete,
         secondary_proofs: Vec::new(),
+        merge_base_plan: None,
     }
 }
 

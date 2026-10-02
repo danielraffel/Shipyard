@@ -151,7 +151,8 @@ pub struct AuthoritativeExecutionPlan {
     pub pull_request: u64,
     /// Target whose protected-base policy authorized selection.
     pub target: String,
-    /// Exact protected base SHA.
+    /// Exact base the selection was planned against: the protected base, or
+    /// the head's merge base when the head is behind its recorded base.
     pub base_sha: String,
     /// Exact PR head SHA.
     pub head_sha: String,
@@ -370,7 +371,7 @@ fn bounded_execution_plan(
         repository: &receipt.repository,
         pull_request: receipt.pull_request,
         target: &receipt.target,
-        base_sha: &receipt.pr_base_sha,
+        base_sha: receipt.planned_base(),
         head_sha: &receipt.head_sha,
         tree_sha: &receipt.tree_sha,
         policy_digest,
@@ -416,7 +417,7 @@ fn bounded_execution_plan(
             repository: receipt.repository.clone(),
             pull_request: receipt.pull_request,
             target: receipt.target.clone(),
-            base_sha: receipt.pr_base_sha.clone(),
+            base_sha: receipt.planned_base().to_owned(),
             head_sha: receipt.head_sha.clone(),
             tree_sha: receipt.tree_sha.clone(),
             policy_digest: receipt
@@ -557,6 +558,7 @@ mod tests {
             ],
             base_tracked_paths_status: ObservationStatus::Complete,
             secondary_proofs: Vec::new(),
+            merge_base_plan: None,
         }
     }
 
@@ -896,6 +898,40 @@ mod tests {
             .expect_err("no digest stays fail-closed");
         assert!(refused.0.contains("carries no policy digest"), "{refused}");
         assert!(refused.0.contains("StaleBase"), "{refused}");
+    }
+
+    #[test]
+    fn a_merge_base_plan_rederives_and_promotes_like_an_up_to_date_one() {
+        let policy = fixture_policy(ExecutionMode::Authoritative);
+        let mut input = fixture_input("src/a.rs");
+        let recorded = "ffffffffffffffffffffffffffffffffffffffff";
+        input.pr_base_sha = recorded.to_owned();
+        input.protected_ref_sha = recorded.to_owned();
+        input.merge_base_plan = Some(crate::changed_surface::MergeBasePlan {
+            recorded_base_policy_digest: Some(policy_digest(&policy)),
+        });
+        let receipt = fixture_receipt(&policy, &input);
+        assert_eq!(receipt.planned_base_sha.as_deref(), Some(BASE));
+        let ExecutionDisposition::Bounded(plan) =
+            fixture_execution(&receipt, &input, &policy, true).expect("bounded")
+        else {
+            panic!("expected a bounded plan");
+        };
+        // The adapter projects the base the selection was planned against;
+        // the recorded tip is not an ancestor-equal merge base of this head.
+        assert_eq!(plan.base_sha, BASE);
+        let payload: serde_json::Value = plan
+            .command
+            .split_whitespace()
+            .filter_map(|word| URL_SAFE_NO_PAD.decode(word).ok())
+            .find_map(|bytes| serde_json::from_slice(&bytes).ok())
+            .expect("payload in command");
+        assert_eq!(payload["base_sha"], BASE);
+
+        // A receipt claiming a merge-base plan the input does not carry is stale.
+        let mut forged = receipt;
+        forged.planned_base_sha = None;
+        assert!(fixture_execution(&forged, &input, &policy, true).is_err());
     }
 
     #[test]

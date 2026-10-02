@@ -15,9 +15,10 @@ use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use crate::changed_surface::{
-    BuildType, ChangedSurfacePolicy, ExactHeadInput, ObservationStatus, PlannedSuite,
-    ProtectedRefStatus, SecondaryProof, SelectionReceipt, StaleBaseShadowInput,
-    StaleBaseShadowReceipt, plan_selection, plan_stale_base_shadow, policy_from_base,
+    BuildType, ChangedSurfacePolicy, ExactHeadInput, MergeBasePlan, ObservationStatus,
+    PlannedSuite, ProtectedRefStatus, SecondaryProof, SelectionReceipt, StaleBaseShadowInput,
+    StaleBaseShadowReceipt, plan_selection, plan_stale_base_shadow, policy_digest,
+    policy_from_base,
 };
 use crate::config::LoadedConfig;
 use crate::evidence::EvidenceStore;
@@ -394,24 +395,42 @@ pub(crate) fn observe_changed_surface_plan(
                 .map_or((Vec::new(), false), |paths| (paths, true))
             },
         );
-    let protected_config = git_required(
-        cwd,
-        &["show", &format!("{}:.shipyard/config.toml", pull.base.sha)],
-        "read selector policy from authenticated base",
-    );
-    let workflow_digest = protected_config.as_ref().map_or_else(
-        |_| String::new(),
-        |contents| format!("{:x}", Sha256::digest(contents.as_bytes())),
-    );
-    let policy = protected_config
-        .map_err(|error| error.message)
-        .and_then(|contents| {
+    // A head that sits on an older commit of the protected branch than the
+    // PR's recorded base is planned against that merge base: the lane tests
+    // the head tree, so its own base's policy, tree and inventory are the only
+    // consistent ones. The recorded base's policy digest is kept so promotion
+    // can require the two to agree.
+    let planning_base =
+        merge_base_behind_recorded(cwd, local_merge_base.as_deref(), &pull.base.sha);
+    let policy_base = planning_base
+        .clone()
+        .unwrap_or_else(|| pull.base.sha.clone());
+    let read_policy = |base: &str| {
+        let config = git_required(
+            cwd,
+            &["show", &format!("{base}:.shipyard/config.toml")],
+            "read selector policy from authenticated base",
+        );
+        let digest = config.as_ref().map_or_else(
+            |_| String::new(),
+            |contents| format!("{:x}", Sha256::digest(contents.as_bytes())),
+        );
+        let policy = config.map_err(|error| error.message).and_then(|contents| {
             policy_from_base(&contents, &args.target, |path| {
-                read_base_file(cwd, &pull.base.sha, path)
+                read_base_file(cwd, base, path)
             })
         });
+        (policy, digest)
+    };
+    let (policy, workflow_digest) = read_policy(&policy_base);
+    let merge_base_plan = planning_base.as_ref().map(|_| MergeBasePlan {
+        recorded_base_policy_digest: read_policy(&pull.base.sha)
+            .0
+            .ok()
+            .map(|recorded| policy_digest(&recorded)),
+    });
     let (base_tracked_paths, base_tracked_paths_complete) =
-        git_nul_paths(cwd, &["ls-tree", "-r", "--name-only", "-z", &pull.base.sha])
+        git_nul_paths(cwd, &["ls-tree", "-r", "--name-only", "-z", &policy_base])
             .map_or((Vec::new(), false), |paths| (paths, true));
     let secondary_proofs = collect_secondary_proofs(
         policy.as_ref().ok(),
@@ -469,6 +488,7 @@ pub(crate) fn observe_changed_surface_plan(
             ObservationStatus::Incomplete
         },
         secondary_proofs,
+        merge_base_plan,
     };
     let mut receipt = plan_selection(&input, policy.clone())
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -658,6 +678,24 @@ fn git_required(cwd: &Path, args: &[&str], context: &str) -> Result<String, CliF
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// The head's merge base when it is a strict ancestor of the PR's recorded
+/// base: the head sits on an older commit of the protected branch.
+pub(crate) fn merge_base_behind_recorded(
+    cwd: &Path,
+    merge_base: Option<&str>,
+    recorded_base: &str,
+) -> Option<String> {
+    merge_base
+        .filter(|merge_base| {
+            *merge_base != recorded_base
+                && git_status_success(
+                    cwd,
+                    &["merge-base", "--is-ancestor", merge_base, recorded_base],
+                )
+        })
+        .map(ToOwned::to_owned)
+}
+
 /// A tracked file's bytes at an authenticated commit, for a selector
 /// declaration's `families_file`.
 pub(crate) fn read_base_file(cwd: &Path, sha: &str, path: &str) -> Result<String, String> {
@@ -810,6 +848,47 @@ mod tests {
             previous_filename: Some("schema/selector.json".to_owned()),
         }]);
         assert_eq!(paths, ["schema/selector.json", "docs/new.md"]);
+    }
+
+    #[test]
+    fn only_a_merge_base_strictly_behind_the_recorded_base_is_planned_against() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Shipyard Test"]);
+        git(&["config", "user.email", "shipyard@example.invalid"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "old base"]);
+        let old_base = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "recorded base"]);
+        let recorded = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "-b", "side", &old_base]);
+        git(&["commit", "-q", "--allow-empty", "-m", "unrelated"]);
+        let side = git(&["rev-parse", "HEAD"]);
+        let cwd = temp.path();
+        assert_eq!(
+            super::merge_base_behind_recorded(cwd, Some(&old_base), &recorded),
+            Some(old_base.clone())
+        );
+        assert_eq!(
+            super::merge_base_behind_recorded(cwd, Some(&recorded), &recorded),
+            None
+        );
+        assert_eq!(
+            super::merge_base_behind_recorded(cwd, Some(&side), &recorded),
+            None
+        );
+        assert_eq!(
+            super::merge_base_behind_recorded(cwd, None, &recorded),
+            None
+        );
     }
 
     #[test]
