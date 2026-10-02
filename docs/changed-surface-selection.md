@@ -176,6 +176,27 @@ reports `planned_suite: blocked` and exits nonzero. It does not fall back to a
 known-incompatible full Debug suite. This preserves the independent Release
 installed-SDK proof instead of weakening or treating it as advisory history.
 
+### Recording a shadow plan from CI
+
+`--record <dir>` plans the same exact head but writes a record under
+`<dir>/<repo>/<pr>/<head>/<target>.json` instead of the state directory, so a
+CI job can plan every PR and upload the directory as an artifact without
+touching any host's ship state. The record is an envelope:
+
+- `origin: shadow_plan_step` and `shadow_only: true`. These plans can never
+  execute, so proxies such as executed-bounded plans divide by lane plans,
+  never by these.
+- `outcome`: `planned`, or `planner_error` when the plan could not be made
+  (config, GitHub, or git failure). A planner error is a labelled outcome
+  written to `<dir>/<repo>/<pr>/planner-error-<target>.json`, not a missing
+  record.
+- `planned_suite`, `planner_reason` (the receipt's `fallback_reason`, absent
+  for a bounded plan), `elapsed_ms`, and the full `receipt`.
+
+Every planner outcome, including `blocked`, exits zero. A planner error still
+exits nonzero after its record is written, so the calling step should not
+block on it (`continue-on-error`).
+
 ## Failure and fallback boundary
 
 These conditions hard-fail and write no receipt:

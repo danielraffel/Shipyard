@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-use chrono::Utc;
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -501,6 +501,156 @@ pub(crate) fn observe_changed_surface_plan(
     })
 }
 
+/// Schema of a shadow-plan record written by `changed-surface-plan --record`.
+pub(crate) const SHADOW_PLAN_RECORD_SCHEMA_VERSION: u32 = 1;
+/// Origin stamped on every shadow-plan record. Proxies separate these plans,
+/// which can never execute, from lane plans that could activate.
+pub(crate) const SHADOW_PLAN_RECORD_ORIGIN: &str = "shadow_plan_step";
+
+/// One shadow-plan observation, successful or not. A failed observation is
+/// itself a labelled outcome (`planner_error`), never a missing record.
+#[derive(Debug, Serialize)]
+pub(crate) struct ShadowPlanRecord {
+    pub(crate) schema_version: u32,
+    pub(crate) origin: &'static str,
+    pub(crate) shadow_only: bool,
+    pub(crate) recorded_at: DateTime<Utc>,
+    pub(crate) repository: String,
+    pub(crate) pull_request: u64,
+    pub(crate) target: String,
+    pub(crate) head_sha: Option<String>,
+    pub(crate) outcome: &'static str,
+    pub(crate) planned_suite: Option<PlannedSuite>,
+    pub(crate) planner_reason: Option<String>,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) receipt: Option<SelectionReceipt>,
+    pub(crate) error: Option<String>,
+}
+
+impl ShadowPlanRecord {
+    fn new(repository: String, pull_request: u64, target: String) -> Self {
+        Self {
+            schema_version: SHADOW_PLAN_RECORD_SCHEMA_VERSION,
+            origin: SHADOW_PLAN_RECORD_ORIGIN,
+            shadow_only: true,
+            recorded_at: Utc::now(),
+            repository,
+            pull_request,
+            target,
+            head_sha: None,
+            outcome: "planner_error",
+            planned_suite: None,
+            planner_reason: Some("planner_error".to_owned()),
+            elapsed_ms: 0,
+            receipt: None,
+            error: None,
+        }
+    }
+
+    pub(crate) fn planned(receipt: SelectionReceipt) -> Self {
+        let mut record = Self::new(
+            receipt.repository.clone(),
+            receipt.pull_request,
+            receipt.target.clone(),
+        );
+        record.head_sha = Some(receipt.head_sha.clone());
+        record.outcome = "planned";
+        record.planned_suite = Some(receipt.planned_suite);
+        record.planner_reason = receipt.fallback_reason.as_ref().map(|reason| {
+            serde_json::to_value(reason)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("{reason:?}"))
+        });
+        record.elapsed_ms = receipt.elapsed_ms;
+        record.receipt = Some(receipt);
+        record
+    }
+
+    pub(crate) fn planner_error(
+        repository: Option<&str>,
+        pull_request: u64,
+        target: &str,
+        error: &str,
+    ) -> Self {
+        let mut record = Self::new(
+            repository.unwrap_or("unknown").to_owned(),
+            pull_request,
+            target.to_owned(),
+        );
+        record.error = Some(error.to_owned());
+        record
+    }
+
+    /// `<dir>/<repo>/<pr>/<head>/<target>.json`, or
+    /// `<dir>/<repo>/<pr>/planner-error-<target>.json` when no head was bound.
+    pub(crate) fn path(&self, record_dir: &Path) -> PathBuf {
+        let pr_dir = record_dir
+            .join(percent_encode_component(&self.repository))
+            .join(self.pull_request.to_string());
+        let target = percent_encode_component(&self.target);
+        match &self.head_sha {
+            Some(head) => pr_dir.join(head).join(format!("{target}.json")),
+            None => pr_dir.join(format!("planner-error-{target}.json")),
+        }
+    }
+
+    pub(crate) fn write(&self, record_dir: &Path) -> Result<PathBuf, CliFailure> {
+        let path = self.path(record_dir);
+        let parent = path
+            .parent()
+            .ok_or_else(|| CliFailure::new(1, "shadow-plan record path has no parent"))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            CliFailure::new(1, format!("create shadow-plan record directory: {error}"))
+        })?;
+        let payload = serde_json::to_vec_pretty(self).map_err(|error| {
+            CliFailure::new(1, format!("serialize shadow-plan record: {error}"))
+        })?;
+        fs::write(&path, [payload.as_slice(), b"\n"].concat())
+            .map_err(|error| CliFailure::new(1, format!("write shadow-plan record: {error}")))?;
+        Ok(path)
+    }
+}
+
+/// `changed-surface-plan --record <dir>`: plan in shadow and write a record,
+/// leaving the host's ship state untouched. Every planner outcome, including
+/// a blocked one, succeeds; a planner failure writes a `planner_error` record
+/// and still fails, so a broken instrument stays visible to the caller.
+pub(super) fn changed_surface_plan_record_command<W: Write>(
+    args: &ChangedSurfacePlanArgs,
+    config: Result<LoadedConfig, CliFailure>,
+    cwd: &Path,
+    state_dir: &Path,
+    record_dir: &Path,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let observed =
+        config.and_then(|config| observe_changed_surface_plan(args, &config, cwd, state_dir));
+    let (record, failure) = match observed {
+        Ok(observation) => (ShadowPlanRecord::planned(observation.receipt), None),
+        Err(failure) => (
+            ShadowPlanRecord::planner_error(
+                args.repo.as_deref(),
+                args.pr,
+                &args.target,
+                &failure.message,
+            ),
+            Some(failure),
+        ),
+    };
+    let path = record.write(record_dir)?;
+    let label = record
+        .planner_reason
+        .as_deref()
+        .unwrap_or(match record.planned_suite {
+            Some(PlannedSuite::Bounded) => "bounded",
+            _ => "unlabelled",
+        });
+    writeln!(stdout, "Shadow plan recorded ({label}): {}", path.display())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    failure.map_or(Ok(ExitCode::SUCCESS), Err)
+}
+
 fn collect_secondary_proofs(
     policy: Option<&ChangedSurfacePolicy>,
     state_dir: &Path,
@@ -813,6 +963,83 @@ mod tests {
     use super::*;
     use crate::changed_surface::TestFamily;
     use crate::evidence::EvidenceRecord;
+
+    fn recorded_receipt(fallback_reason: Option<&str>, planned_suite: &str) -> SelectionReceipt {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 3, "exact_head_verified": true, "shadow_only": true,
+            "repository": "Generous-Corp/pulp", "pull_request": 9262, "target": "mac",
+            "protected_ref": "main", "pr_base_sha": "b".repeat(40),
+            "protected_ref_sha": "b".repeat(40), "merge_base_sha": "b".repeat(40),
+            "head_sha": "a".repeat(40), "tree_sha": "c".repeat(40),
+            "changed_paths_digest": "d".repeat(64), "build_flags": [], "changed_paths": [],
+            "selected_families": [], "selected_tests": [], "selected_build_targets": [],
+            "baseline_tests": [], "family_coverage": {}, "secondary_proofs": [],
+            "planned_suite": planned_suite, "selection_tier": "full",
+            "authoritative_suite": "full",
+            "outcomes": {"planner": "planned",
+                         "authoritative_execution": "not_observed_by_shadow_planner"},
+            "selected_count": null, "full_count": null,
+            "fallback_reason": fallback_reason, "elapsed_ms": 412,
+        }))
+        .expect("receipt fixture")
+    }
+
+    #[test]
+    fn a_shadow_plan_record_carries_its_origin_and_the_planner_reason() {
+        let record =
+            ShadowPlanRecord::planned(recorded_receipt(Some("base_policy_mismatch"), "full"));
+        let value = serde_json::to_value(&record).expect("record json");
+        assert_eq!(value["origin"], "shadow_plan_step");
+        assert_eq!(value["shadow_only"], true);
+        assert_eq!(value["outcome"], "planned");
+        assert_eq!(value["planner_reason"], "base_policy_mismatch");
+        assert_eq!(value["planned_suite"], "full");
+        assert_eq!(value["elapsed_ms"], 412);
+        assert_eq!(value["receipt"]["head_sha"], "a".repeat(40));
+        assert_eq!(
+            record.path(Path::new("/records")),
+            Path::new("/records/Generous-Corp%2Fpulp/9262")
+                .join("a".repeat(40))
+                .join("mac.json")
+        );
+
+        let bounded = ShadowPlanRecord::planned(recorded_receipt(None, "bounded"));
+        assert_eq!(bounded.planner_reason, None);
+        assert_eq!(bounded.planned_suite, Some(PlannedSuite::Bounded));
+    }
+
+    #[test]
+    fn a_planner_failure_is_recorded_as_planner_error_and_still_fails() {
+        let records = tempfile::tempdir().expect("records");
+        let state = tempfile::tempdir().expect("state");
+        let mut stdout = Vec::new();
+        let failure = changed_surface_plan_record_command(
+            &ChangedSurfacePlanArgs {
+                target: "mac".to_owned(),
+                pr: 9262,
+                repo: Some("Generous-Corp/pulp".to_owned()),
+            },
+            Err(CliFailure::new(1, "config: no .shipyard/config.toml")),
+            records.path(),
+            state.path(),
+            records.path(),
+            &mut stdout,
+        )
+        .expect_err("a planner failure stays visible");
+        assert_eq!(failure.message, "config: no .shipyard/config.toml");
+        let path = records
+            .path()
+            .join("Generous-Corp%2Fpulp/9262/planner-error-mac.json");
+        let value: Value =
+            serde_json::from_slice(&fs::read(&path).expect("planner_error record")).expect("json");
+        assert_eq!(value["outcome"], "planner_error");
+        assert_eq!(value["planner_reason"], "planner_error");
+        assert_eq!(value["shadow_only"], true);
+        assert_eq!(value["error"], "config: no .shipyard/config.toml");
+        // Recording never writes the host's ship state.
+        assert_eq!(fs::read_dir(state.path()).expect("state").count(), 0);
+        assert!(String::from_utf8_lossy(&stdout).contains("planner_error"));
+    }
 
     #[test]
     fn branch_ref_is_encoded_as_one_api_path_component() {

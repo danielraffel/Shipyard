@@ -297,6 +297,11 @@ pub(super) enum Command {
         /// Owner/repo slug. Defaults to the current checkout's repository.
         #[arg(long)]
         repo: Option<String>,
+        /// Write a shadow-only plan record under this directory instead of
+        /// the host's ship state. A planner failure is recorded as
+        /// `planner_error`; see docs/changed-surface-selection.md.
+        #[arg(long, value_name = "DIR")]
+        record: Option<PathBuf>,
     },
     /// Verify one exact-head changed-surface shadow-comparison trial.
     #[command(name = "changed-surface-trial-status")]

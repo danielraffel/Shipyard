@@ -2152,6 +2152,10 @@ is planned against that merge base rather than refused with
 promotion requires the merge base's and recorded base's policy digests to match
 (`merge_base_policy_diverged` otherwise, shadow only).
 
+`changed-surface-plan --record <dir>` writes an `origin: shadow_plan_step`
+record for CI artifacts instead of state; a failed plan is recorded as
+`planner_error` and still exits nonzero, so run it non-blocking.
+
 The command is shadow-only. Its receipt is queryable telemetry, not passing
 target evidence, and the configured full validation command must still run.
 Every eligible bounded candidate includes the nonempty mandatory baseline and
