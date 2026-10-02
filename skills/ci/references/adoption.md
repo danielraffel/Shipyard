@@ -169,12 +169,15 @@ PR; until they ship, a failing local-lane verdict is not a PR failure
 (`shipyard ship-state list`; Pulp: 83 in 7 days). The audit script reports the
 first as PROVEN.
 
-### Opt-in targets (`default = false`): not ready, unreleased
+### Opt-in targets (`default = false`): not ready, released but unmeasured
 
-**Not ready: not merged or released.** Proposed in Shipyard #655 (branch
-`feat/opt-in-targets`; it ships in the release that merges #655). Re-check before adopting: the
-contract below is the PR's, not observed behavior, and it has no effect count
-yet.
+**Not ready: released, effect not yet measured.** Shipped in Shipyard
+v0.242.0 (minimum version). The first consumer adoption, Pulp's
+`[targets.mac]`, is open but not merged. On its first live `shipyard pr`, the
+target printed `opt-in, not run (GitHub required checks decide)` and the PR
+still opened, which shows the mechanism, not the effect. Move this to WORKING
+once local-lane runs per merged PR for an opted-out target reach 0 over a
+real window of merged PRs.
 
 - **Gives:** `[targets.<name>] default = false` in `.shipyard/config.toml`
   keeps a target declared but out of `shipyard pr`, `shipyard ship` and
@@ -190,18 +193,18 @@ yet.
   `ship-state list` / `show`, `landing` and `doctor` (and `pulp status` in
   Pulp), so a skipped lane never reads as a missing or failed one.
 - **Adopt when:** GitHub required checks already decide landing and the local
-  lane only duplicates them. Pulp plans it for `[targets.mac]`, whose local
+  lane only duplicates them. Pulp is adopting it for `[targets.mac]`, whose local
   lane failed 64 of 64 runs in 7 days at 42.3 host-hours.
 - **Detect:** `git show origin/main:.shipyard/config.toml | grep -n 'default *= *false'`
   (control: the same file lists `[targets.` headers), and `shipyard --version`
-  at or above the release containing #655. `shipyard pr --json` then shows
+  at or above 0.242.0. `shipyard pr --json` then shows
   `"validation":"delegated"`, and `shipyard status` prints the "opt-in, not
   run" line for the target.
-- **Verify, once released:** local-lane host-hours and ship jobs queued per
-  merged PR should drop to zero for the opted-out target, while merged PRs
-  keep landing through required checks (the auto-merge proxy above stays at
-  its level). Full contract: `docs/targets.md`, "Opt-in targets
-  (`default = false`)", once #655 lands.
+- **Verify:** local-lane runs (ship jobs queued) per merged PR for the
+  opted-out target, which should be 0, while merged PRs keep landing through
+  required checks (the auto-merge proxy above stays at its level). Full
+  contract: [targets.md](../../../docs/targets.md), "Opt-in targets
+  (`default = false`)".
 
 ## 2. Required checks: WORKING (GitHub)
 
@@ -518,5 +521,5 @@ audit.
 | batch attribution | `[queue.attribution] command = [...]` (Pulp's attributor is Pulp-only) | not measured by the audit |
 | one retry after a network ejection | `[queue.environment_requeue] enabled = true` | not measured by the audit |
 | daemon-driven waits | `shipyard daemon status`; `shipyard wait` | BROKEN in part: 38% and 66% of webhook deliveries rejected on two hosts, 0 daemon events to waiters. `shipyard wait` still works by polling (first answer 18 to 30 s) |
-| opt-in targets | `default = false` under `[targets.<name>]` | unreleased (Shipyard #655); see section 1 |
+| opt-in targets | `default = false` under `[targets.<name>]`; Shipyard >= 0.242.0 | released, effect not yet measured; see section 1 |
 | version pin | `tools/shipyard.toml`; `shipyard pin show` | Pulp's pin (v0.143.0) is read only by two dead workflows |
