@@ -291,6 +291,16 @@ the daemon's environment; a relative or protected base is refused, not
 resolved. Test fixtures that must outlive their process (a path in a static)
 belong beside the test executable, never in a kept TMPDIR directory.
 
+## Release publication waits for attestation
+
+`release.yml` keeps the release a draft until the macOS DMG is attested:
+`release-macos-local.sh --upload --defer-publish`, then three
+`actions/attest` attempts (30 s, then 90 s backoff), then `--publish-only`.
+v0.245.0 published with no attestation after one transient Sigstore TLS error,
+and every host's fleet-update refused it ("no acceptable build-provenance
+attestation"). If a release is stuck as a draft, rerun the failed
+`sign-and-upload-macos` job; do not publish it by hand without an attestation.
+
 ## First Steps
 
 Schema v5 experimental-authority support is not an operational feature. Every

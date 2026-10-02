@@ -235,6 +235,16 @@ sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
 cannot be had the write is skipped and the cache stops writing for that run; a
 cold read is always correct. Any new cache in the state tree needs the same.
 
+## Release publication waits for attestation
+
+`release.yml` keeps the release a draft until the macOS DMG is attested:
+`release-macos-local.sh --upload --defer-publish`, then three
+`actions/attest` attempts (30 s, then 90 s backoff), then `--publish-only`.
+v0.245.0 published with no attestation after one transient Sigstore TLS error,
+and every host's fleet-update refused it ("no acceptable build-provenance
+attestation"). If a release is stuck as a draft, rerun the failed
+`sign-and-upload-macos` job; do not publish it by hand without an attestation.
+
 ## Quick reference
 
 | Task | Command |
