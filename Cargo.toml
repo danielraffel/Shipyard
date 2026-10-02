@@ -1,6 +1,6 @@
 [package]
 name = "shipyard"
-version = "0.245.0"
+version = "0.244.0"
 edition = "2024"
 description = "Cross-platform CI coordination for local, SSH, and cloud runners."
 repository = "https://github.com/danielraffel/Shipyard"
@@ -63,6 +63,10 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# New in clippy 1.99 (pedantic): it flags `assert!(x.is_empty())`, which is
+# idiomatic in tests and appears in 371 of them. Its suggested replacement,
+# `assert_eq!(x, [] as [T; 0])`, needs a spelled-out type per site.
+assert_is_empty = "allow"
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02440"></a>
+## [0.244.0] - 2026-10-01
+
+- fix/clippy assert is empty ([#679](https://github.com/danielraffel/Shipyard/pull/679))
+- refactor/arm native auto merge not enqueue ([#672](https://github.com/danielraffel/Shipyard/pull/672))
+
 <a id="v02430"></a>
 ## [0.243.0] - 2026-10-01
 
@@ -1780,6 +1786,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.244.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.244.0
 [0.243.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.243.0
 [0.242.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.242.0
 [0.240.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.240.0
