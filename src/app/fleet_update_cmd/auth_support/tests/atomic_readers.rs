@@ -324,6 +324,23 @@ impl ReaderFixture {
             .expect("auth transaction")
     }
 
+    /// Run the current release's transaction and fail with its traced tail.
+    ///
+    /// The plain runner discards which step of a `set -e` script refused, so a
+    /// setup failure would otherwise report only that the script exited non-zero.
+    fn install_current_release(&self) {
+        let output = self.run_script_traced(&self.transaction_script());
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let lines: Vec<&str> = stderr.lines().collect();
+            let tail = lines[lines.len().saturating_sub(80)..].join("\n");
+            panic!(
+                "install transaction failed with {}; last traced lines:\n{tail}",
+                output.status
+            );
+        }
+    }
+
     fn run_script_traced(&self, script: &str) -> std::process::Output {
         Command::new("/bin/bash")
             .args(["-c", &format!("set -Eeuox pipefail\n{script}")])
@@ -649,7 +666,7 @@ fn real_wrapper_readers_remain_valid_during_first_generation_migration() {
 fn real_wrapper_readers_remain_valid_during_generation_upgrade() {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
-    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    fixture.install_current_release();
     let public_wrapper_inode = std::fs::metadata(&fixture.wrapper)
         .expect("public wrapper metadata")
         .ino();
@@ -700,7 +717,7 @@ fn real_wrapper_readers_remain_valid_during_generation_upgrade() {
 fn changed_generation_wrapper_preserves_stable_public_trampoline_and_probe_receipt() {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
-    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    fixture.install_current_release();
     let public_inode = std::fs::metadata(&fixture.wrapper)
         .expect("public wrapper metadata")
         .ino();
@@ -710,7 +727,7 @@ fn changed_generation_wrapper_preserves_stable_public_trampoline_and_probe_recei
 
     fixture.update_wrapper_body("release-wrapper-body-two");
     let expected_wrapper_digest = fixture.authority.auth_wrapper.sha256.clone();
-    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    fixture.install_current_release();
 
     assert_eq!(
         std::fs::metadata(&fixture.wrapper)
@@ -757,7 +774,7 @@ fn changed_generation_wrapper_preserves_stable_public_trampoline_and_probe_recei
 fn guardless_v1_generation_is_anchored_before_public_guard_upgrade() {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
-    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    fixture.install_current_release();
     fixture.downgrade_selected_generation_to_guardless_v1();
     let legacy = fixture.read_once().expect("legacy generation read");
     fixture.update_release("guardless-v1-successor");
@@ -781,7 +798,7 @@ fn guardless_v1_generation_is_anchored_before_public_guard_upgrade() {
 fn guardless_v1_generation_rollback_restores_guard_before_selector() {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
-    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    fixture.install_current_release();
     fixture.downgrade_selected_generation_to_guardless_v1();
     let legacy = fixture.read_once().expect("legacy generation read");
     let public_wrapper_inode = std::fs::metadata(&fixture.wrapper)
@@ -814,7 +831,7 @@ fn guardless_v1_generation_rollback_restores_guard_before_selector() {
 fn sigkill_after_generation_publish_preserves_reader_and_recovers_atomically() {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
-    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    fixture.install_current_release();
     let first = fixture.read_once().expect("first generation");
     fixture.update_release("release-after-sigkill");
 
@@ -886,7 +903,7 @@ fn release_without_authenticated_selector_capability_refuses_before_publication(
 fn rollback_intent_survives_sigkill_before_first_restore() {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
-    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    fixture.install_current_release();
     let original_selector =
         std::fs::read_link(fixture.wrapper.with_extension("shipyard-generation"))
             .expect("original selector");
@@ -1140,7 +1157,7 @@ fn rollback_sigkill_checkpoint_matrix_never_exposes_mixed_generation() {
 fn rollback_cleanup_is_restart_safe_after_backup_removal_begins() {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
-    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    fixture.install_current_release();
     fixture.update_release("rollback-cleanup");
     let script = fixture.transaction_script();
     let probe = "\"$auth_binary\" --mode \"$auth_mode\" --global-dir \"$auth_global_dir\" auth helper-argv --wrapper \"$auth_wrapper\" --repo \"$auth_probe_repo\" >/dev/null\n";
@@ -1165,7 +1182,7 @@ fn rollback_cleanup_is_restart_safe_after_backup_removal_begins() {
 fn run_rollback_sigkill_checkpoint(name: &str, target: &str) {
     let mut fixture = ReaderFixture::new();
     fixture.install_direct_legacy_reader();
-    assert!(fixture.run_script(&fixture.transaction_script()).success());
+    fixture.install_current_release();
     let original = fixture.read_once().expect("original generation");
     fixture.update_release(&format!("rollback-{name}"));
     let script = fixture.transaction_script();

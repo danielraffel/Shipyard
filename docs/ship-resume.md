@@ -83,7 +83,10 @@ shipyard ship-state prune [--apply]  # archive every record whose PR merged or c
 `discard` refuses a bare PR number that more than one repository has a
 record for; pass `--repo`. `prune` asks GitHub about every active record
 (dry run unless `--apply`), follows a renamed repository to the name GitHub
-reports now, and keeps any record whose PR it cannot read.
+reports now, and keeps any record whose PR it cannot read. A kept record
+whose rename check failed names the reason, such as an exhausted anonymous
+GitHub rate limit, in text as `(rename check: ...)` and in JSON as
+`rename_check`.
 
 `list` is the fastest way to spot abandoned ships — e.g., a PR you
 worked on last week whose state never got archived because the
