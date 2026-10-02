@@ -1094,7 +1094,10 @@ delivery log) writes one `rejected webhook delivery <guid>` line with
 its event kind, reason, and body bytes received against Content-Length to
 `daemon/daemon.log`, so a refusal is visible on the host. If every delivery in the hook's log is HTTP 502
 while the daemon still shows LISTEN, the listener thread is wedged: run
-`sample <daemon pid>` and look for it parked on a lock.
+`sample <daemon pid>` and look for it parked on a lock. A `shipyard wait` that
+reports `fallback_used: true` with the daemon running means the daemon
+dropped its subscription; since daemon subscribers lag rather than being
+evicted, the wait should instead see `{"type":"lagged"}` and re-snapshot.
 
 **Idle behavior (v0.56.0+):** when no IPC subscriber is attached
 (no `shipyard watch` running, no GUI), the daemon skips the
