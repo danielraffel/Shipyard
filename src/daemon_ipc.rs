@@ -32,8 +32,18 @@ pub const RING_BUFFER_SIZE: usize = 100;
 pub const MAX_SUBSCRIBERS: usize = 64;
 /// Maximum number of concurrent IPC clients, including short status requests.
 pub const MAX_IPC_CLIENTS: usize = 128;
-/// Per-client outbound frame capacity before the daemon closes a slow client.
-pub const CLIENT_WRITER_QUEUE_CAPACITY: usize = RING_BUFFER_SIZE + 16;
+/// Per-client outbound frame capacity. A subscriber whose queue is full is
+/// not closed: the daemon drops further events for it, marks it lagged, and
+/// sends one `lagged` frame once there is room, so the client re-snapshots.
+/// The ring replay alone fills [`RING_BUFFER_SIZE`] slots on subscribe, so the
+/// headroom above it is what absorbs a webhook burst while the client drains.
+/// Frames are shared `Arc`s, so the capacity costs pointers, not payloads.
+pub const CLIENT_WRITER_QUEUE_CAPACITY: usize = RING_BUFFER_SIZE + 1024;
+/// How long the writer may wait on a client that is not reading before it
+/// gives up. Wait clients pause reading while they fetch an authoritative
+/// GitHub snapshot, which can take tens of seconds.
+#[cfg(unix)]
+pub const CLIENT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum bytes accepted for one newline-delimited client request.
 pub const MAX_IPC_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum serialized bytes retained for one outbound IPC frame.
@@ -142,6 +152,40 @@ type ShipStateListProvider = Arc<dyn Fn() -> Vec<Value> + Send + Sync>;
 struct Subscriber {
     sender: SyncSender<Arc<[u8]>>,
     shutdown: Arc<UnixStream>,
+    /// Events were dropped for this subscriber; a `lagged` frame is owed.
+    lagged: bool,
+}
+
+#[cfg(unix)]
+impl Subscriber {
+    /// Queue `frame` without blocking. Returns false when the client is gone.
+    /// A full queue drops the frame and marks the subscriber lagged; the
+    /// `lagged` notice goes out ahead of the next frame that fits.
+    /// `None` stands for an event that could not be framed: it is owed as a
+    /// `lagged` notice straight away.
+    fn offer(&mut self, frame: Option<&Arc<[u8]>>) -> bool {
+        if frame.is_none() {
+            self.lagged = true;
+        }
+        if self.lagged {
+            match self.sender.try_send(lagged_frame()) {
+                Ok(()) => self.lagged = false,
+                Err(TrySendError::Full(_)) => return true,
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        let Some(frame) = frame else {
+            return true;
+        };
+        match self.sender.try_send(Arc::clone(frame)) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.lagged = true;
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -263,6 +307,14 @@ impl IpcServer {
             while running.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // On macOS and the BSDs an accepted socket inherits
+                        // O_NONBLOCK from the non-blocking listener. Left that
+                        // way, the writer's first full socket buffer returns
+                        // WouldBlock and drops the subscriber, and the read
+                        // and write timeouts below never apply.
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         let Ok(shutdown) = stream.try_clone() else {
                             continue;
                         };
@@ -332,37 +384,27 @@ impl IpcServer {
     }
 
     /// Broadcast an event to connected subscribers and append it to the ring buffer.
+    ///
+    /// Never blocks and never closes a live subscriber: one that cannot take
+    /// the frame is marked lagged instead (see [`Subscriber::offer`]). An event
+    /// too large to frame is not retained or sent; every subscriber is marked
+    /// lagged so it re-snapshots rather than missing the change silently.
     pub fn broadcast_event(&self, event: Value) {
         let frame = encode_json_line(event_frame(event));
         let mut shared = self.shared.lock().expect("shared lock");
-        let Some(frame) = frame else {
-            let error = encoded_error_frame(
-                IPC_ERROR_RESPONSE_TOO_LARGE,
-                "daemon IPC event exceeds 65536 serialized bytes",
-                false,
-            );
-            for (_, subscriber) in std::mem::take(&mut shared.subscribers) {
-                if subscriber.sender.try_send(error.clone()).is_ok() {
-                    let _ = subscriber.shutdown.shutdown(Shutdown::Read);
-                } else {
-                    let _ = subscriber.shutdown.shutdown(Shutdown::Both);
-                }
+        if let Some(frame) = &frame {
+            shared.ring.push_back(Arc::clone(frame));
+            while shared.ring.len() > RING_BUFFER_SIZE {
+                let _ = shared.ring.pop_front();
             }
-            return;
-        };
-        shared.ring.push_back(frame.clone());
-        while shared.ring.len() > RING_BUFFER_SIZE {
-            let _ = shared.ring.pop_front();
         }
 
-        let evicted = shared
+        let gone = shared
             .subscribers
-            .iter()
-            .filter_map(|(id, subscriber)| {
-                subscriber.sender.try_send(frame.clone()).err().map(|_| *id)
-            })
+            .iter_mut()
+            .filter_map(|(id, subscriber)| (!subscriber.offer(frame.as_ref())).then_some(*id))
             .collect::<Vec<_>>();
-        for id in evicted {
+        for id in gone {
             if let Some(subscriber) = shared.subscribers.remove(&id) {
                 let _ = subscriber.shutdown.shutdown(Shutdown::Both);
             }
@@ -453,7 +495,7 @@ fn handle_client(
     let (sender, receiver) = mpsc::sync_channel(CLIENT_WRITER_QUEUE_CAPACITY);
     let writer_stream = stream.try_clone().ok();
     let writer_thread = writer_stream.map(|writer_stream| {
-        let _ = writer_stream.set_write_timeout(Some(Duration::from_millis(250)));
+        let _ = writer_stream.set_write_timeout(Some(CLIENT_WRITE_STALL_TIMEOUT));
         thread::spawn(move || writer_loop(writer_stream, receiver))
     });
     if !send_json(
@@ -602,29 +644,32 @@ fn register_subscriber(
         Subscriber {
             sender: sender.clone(),
             shutdown,
+            lagged: false,
         },
     );
     Ok(id)
 }
 
+/// Queue a reply to one of the client's own requests. Unlike broadcast
+/// events, a reply is never dropped: this waits for queue room, which is
+/// bounded by the writer giving up after [`CLIENT_WRITE_STALL_TIMEOUT`] (it
+/// then drops the receiver and the send fails).
 #[cfg(unix)]
 fn send_json(sender: &SyncSender<Arc<[u8]>>, shutdown: Option<&UnixStream>, value: Value) -> bool {
     let Some(frame) = encode_json_line(value) else {
-        if enqueue_writer(
-            sender,
-            encoded_error_frame(
+        if sender
+            .send(encoded_error_frame(
                 IPC_ERROR_RESPONSE_TOO_LARGE,
                 "daemon IPC response exceeds 65536 serialized bytes",
                 false,
-            ),
-        )
-        .is_err()
+            ))
+            .is_err()
         {
             close_stream(shutdown);
         }
         return false;
     };
-    if enqueue_writer(sender, frame).is_ok() {
+    if sender.send(frame).is_ok() {
         true
     } else {
         close_stream(shutdown);
@@ -682,6 +727,13 @@ fn encode_json_line(value: Value) -> Option<Arc<[u8]>> {
 #[cfg(unix)]
 fn encoded_error_frame(code: &str, message: &str, retryable: bool) -> Arc<[u8]> {
     encode_json_line(error_frame(code, message, retryable)).expect("small IPC error frame")
+}
+
+/// Tells a subscriber that events were dropped for it and it should take a
+/// fresh authoritative snapshot.
+#[cfg(unix)]
+fn lagged_frame() -> Arc<[u8]> {
+    Arc::from(&b"{\"type\":\"lagged\"}\n"[..])
 }
 
 #[cfg(unix)]
@@ -1066,6 +1118,7 @@ mod tests {
                 Subscriber {
                     sender: sender.clone(),
                     shutdown: std::sync::Arc::new(shutdown.try_clone().expect("clone shutdown")),
+                    lagged: false,
                 },
             );
         }
@@ -1131,34 +1184,121 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn full_subscriber_queue_evicts_and_closes_the_client() {
+    fn full_subscriber_queue_marks_lagged_and_keeps_the_client() {
         let socket_path = short_socket_path();
         let server = IpcServer::new(socket_path, dummy_state);
-        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender
             .try_send(super::encode_json_line(json!({"type":"occupied"})).expect("frame"))
             .expect("fill queue");
-        let (shutdown, mut peer) = UnixStream::pair().expect("socket pair");
-        peer.set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("read timeout");
+        let (shutdown, _peer) = UnixStream::pair().expect("socket pair");
         server.shared.lock().expect("shared").subscribers.insert(
             7,
             Subscriber {
                 sender,
                 shutdown: std::sync::Arc::new(shutdown),
+                lagged: false,
             },
         );
 
-        server.broadcast_event(json!({"kind":"workflow_run"}));
+        server.broadcast_event(json!({"kind":"workflow_run","payload":{"id":1}}));
+        assert_eq!(server.subscriber_count(), 1, "a full queue must not evict");
+        assert!(server.shared.lock().expect("shared").subscribers[&7].lagged);
 
-        assert_eq!(server.subscriber_count(), 0);
-        let mut byte = [0_u8; 1];
-        assert_eq!(std::io::Read::read(&mut peer, &mut byte).expect("read"), 0);
+        let _occupied = receiver.recv().expect("occupied");
+        server.broadcast_event(json!({"kind":"workflow_run","payload":{"id":2}}));
+        let notice = receiver.try_recv().expect("lagged notice");
+        assert_eq!(notice.as_ref(), b"{\"type\":\"lagged\"}\n");
+        assert_eq!(server.subscriber_count(), 1);
     }
 
     #[cfg(unix)]
     #[test]
-    fn oversized_event_is_not_retained_and_closes_subscriber_with_typed_error() {
+    fn subscriber_survives_a_webhook_burst_while_draining_a_full_replay_slowly() {
+        let socket_path = short_socket_path();
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state);
+        server.start().expect("start");
+        for id in 0..super::RING_BUFFER_SIZE {
+            server.broadcast_event(json!({"kind":"workflow_job","payload":{"id":id}}));
+        }
+
+        let mut stream = UnixStream::connect(socket_path).expect("connect");
+        stream
+            .write_all(b"{\"type\":\"subscribe\"}\n")
+            .expect("subscribe");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.subscriber_count() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A burst far larger than the queue while the client is not reading,
+        // held for longer than any short writer timeout.
+        for id in 0..3_000 {
+            server.broadcast_event(json!({
+                "kind": "workflow_job",
+                "payload": {"id": id, "padding": "x".repeat(256)},
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(1_500));
+        let subscribed_after_burst = server.subscriber_count();
+
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("read timeout");
+        let mut reader = BufReader::new(stream);
+        let (mut lagged, mut marker, mut closed, mut marker_sent) = (0, false, false, false);
+        let mut line = String::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker && Instant::now() < deadline {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(_) => {
+                    let frame: Value = serde_json::from_str(line.trim()).expect("json");
+                    match frame["type"].as_str() {
+                        Some("lagged") => lagged += 1,
+                        Some("goodbye" | "error") => closed = true,
+                        _ => marker |= frame["payload"]["marker"] == "after-burst",
+                    }
+                }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    // Drained: the next webhook carries the owed lagged notice.
+                    if !marker_sent {
+                        server.broadcast_event(
+                            json!({"kind":"workflow_run","payload":{"marker":"after-burst"}}),
+                        );
+                        marker_sent = true;
+                    }
+                }
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        let subscribed_at_end = server.subscriber_count();
+        server.stop().expect("stop");
+
+        assert_eq!(
+            subscribed_after_burst, 1,
+            "the burst evicted the subscriber"
+        );
+        assert!(
+            !closed,
+            "the daemon closed a subscriber that was still reading"
+        );
+        assert!(marker, "the event after the burst never arrived");
+        assert_eq!(lagged, 1, "exactly one lagged notice per overflow");
+        assert_eq!(subscribed_at_end, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_event_is_not_retained_and_tells_subscribers_they_lagged() {
         let socket_path = short_socket_path();
         let mut server = IpcServer::new(socket_path.clone(), dummy_state);
         server.start().expect("start");
@@ -1178,14 +1318,15 @@ mod tests {
         server.broadcast_event(json!({
             "payload": "x".repeat(super::MAX_IPC_OUTBOUND_FRAME_BYTES),
         }));
+        server.broadcast_event(json!({"kind":"workflow_run","payload":{"id":1}}));
         let lines = client.join().expect("join");
 
         assert_eq!(lines[0]["type"], "hello");
-        assert_eq!(lines[1]["type"], "error");
-        assert_eq!(lines[1]["code"], "ipc_response_frame_too_large");
-        assert_eq!(lines[1]["retryable"], false);
-        assert_eq!(lines[2]["type"], "goodbye");
-        assert!(server.shared.lock().expect("shared").ring.is_empty());
+        assert_eq!(lines[1]["type"], "lagged");
+        assert_eq!(lines[2]["type"], "event");
+        // The event after the notice arrived, so the subscription survived.
+        assert_eq!(lines[2]["payload"]["id"], 1);
+        assert_eq!(server.shared.lock().expect("shared").ring.len(), 1);
         server.stop().expect("stop");
     }
 
