@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import contextlib
 import fcntl
+import io
 import json
 import os
 import subprocess
@@ -1496,6 +1497,48 @@ class GuardianLifecycleTests(unittest.TestCase):
                     guardian.GuardianError, "retained the writer-domain lock"
                 ):
                     guardian._wait_for_idle_writer_domain(path, 4242, timeout=10.0)
+
+    def test_a_foreign_holder_is_named_in_the_receipt_record(self) -> None:
+        # The pid is usually gone by the time anyone reads the failure, so the
+        # guardian records what the process was when it saw it.
+        marker = f"foreign-writer-marker-{os.getpid()}"
+        child = subprocess.Popen(
+            ["/bin/sh", "-c", f"sleep 30; : {marker}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        guardian._FOREIGN_WRITERS.clear()
+        self.addCleanup(guardian._FOREIGN_WRITERS.clear)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lock"
+            path.touch()
+            with (
+                mock.patch.object(
+                    guardian, "_lock_holders", return_value=(4242, child.pid)
+                ),
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                self.assertRaisesRegex(
+                    guardian.GuardianError,
+                    rf"^foreign process entered the production writer domain: \({child.pid},\)$",
+                ),
+            ):
+                guardian._wait_for_idle_writer_domain(path, 4242, timeout=1.0)
+        self.assertEqual(len(guardian._FOREIGN_WRITERS), 1)
+        recorded = guardian._FOREIGN_WRITERS[0]
+        self.assertEqual(recorded["pid"], child.pid)
+        self.assertEqual(recorded["ppid"], os.getpid())
+        self.assertIn(marker, str(recorded["command"]))
+        self.assertIn(marker, stderr.getvalue())
+
+    def test_an_exited_foreign_holder_is_recorded_as_gone(self) -> None:
+        exited = subprocess.Popen(["/usr/bin/true"])
+        exited.wait()
+        described = guardian._describe_processes((exited.pid,))
+        self.assertEqual(described[0]["pid"], exited.pid)
+        self.assertIsNone(described[0]["command"])
+        self.assertIn("exited", str(described[0]["note"]))
 
     def test_finalize_wait_rejects_a_foreign_holder_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
