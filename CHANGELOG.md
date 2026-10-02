@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02610"></a>
+## [0.261.0] - 2026-10-02
+
+- fix/delivery log counts failed writes ([#691](https://github.com/danielraffel/Shipyard/pull/691))
+
 <a id="v02600"></a>
 ## [0.260.0] - 2026-10-02
 
@@ -1863,6 +1868,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.261.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.261.0
 [0.260.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.260.0
 [0.259.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.259.0
 [0.258.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.258.0
