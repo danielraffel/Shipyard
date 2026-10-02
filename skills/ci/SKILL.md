@@ -57,7 +57,12 @@ Before calling a daemon healthy, compare the two sides:
 ```sh
 shipyard daemon reconcile            # 0 in sync · 1 warn · 2 alarm · 3 blocked on a human
 shipyard daemon reconcile --json     # same verdict, machine-readable findings
+shipyard daemon prune-webhooks       # dry run: hooks no live advertising daemon owns
+shipyard daemon prune-webhooks --apply   # delete them and drop stale registrations
 ```
+
+Run `prune-webhooks` on each daemon host: only a host's own running daemon
+knows which repositories it advertises.
 
 Exit 3 means a GitHub App permission (`repository_hooks: write`) is missing and
 only a human can grant it, in the App's settings. Do not answer it by

@@ -424,6 +424,63 @@ impl Registrar {
         Ok(())
     }
 
+    /// Every webhook GitHub holds for `repo`, through the configured credential.
+    pub fn list_repo_hooks(&self, repo: &str) -> Result<Vec<serde_json::Value>, RegistrarError> {
+        let repo = canonical_repo(repo);
+        let client = self.configured_gh_client(&repo)?;
+        list_hooks(&client, &self.cwd, None, &repo)
+    }
+
+    /// One page of a hook's deliveries, newest first, plus the cursor for the
+    /// next (older) page when GitHub reports one.
+    pub fn list_hook_deliveries_page(
+        &self,
+        repo: &str,
+        hook_id: u64,
+        per_page: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), RegistrarError> {
+        let repo = canonical_repo(repo);
+        let client = self.configured_gh_client(&repo)?;
+        let cursor = cursor.map_or_else(String::new, |cursor| format!("&cursor={cursor}"));
+        let output = run_gh(
+            &client,
+            &self.cwd,
+            None,
+            &[
+                "api",
+                "-i",
+                "-H",
+                "Accept: application/vnd.github+json",
+                &format!("repos/{repo}/hooks/{hook_id}/deliveries?per_page={per_page}{cursor}"),
+            ],
+            None,
+        )?;
+        if output.status != 0 {
+            return Err(classify_gh_failure("deliveries", output.combined_output()));
+        }
+        let (headers, body) = split_http_response(&output.stdout);
+        Ok((
+            serde_json::from_str::<Vec<serde_json::Value>>(body)?,
+            next_page_cursor(headers),
+        ))
+    }
+
+    /// Delete any hook on `repo` by id. A hook already gone counts as deleted.
+    pub fn delete_repo_hook(&self, repo: &str, hook_id: u64) -> Result<(), RegistrarError> {
+        let repo = canonical_repo(repo);
+        let client = self.configured_gh_client(&repo)?;
+        delete_hook(&client, &self.cwd, None, &repo, hook_id)
+    }
+
+    /// Drop the local record for `repo` without touching GitHub.
+    pub fn forget(&mut self, repo: &str) -> Result<(), RegistrarError> {
+        if self.by_repo.remove(&canonical_repo(repo)).is_some() {
+            self.save()?;
+        }
+        Ok(())
+    }
+
     /// Read the webhook state GitHub ACTUALLY holds for `repo`.
     ///
     /// This is the observed half of the reconcile. It deliberately does not
@@ -680,6 +737,30 @@ fn create_hook(
         .get("id")
         .and_then(serde_json::Value::as_u64)
         .ok_or(RegistrarError::MissingHookId(output.stdout))
+}
+
+/// Split `gh api -i` output into its header block and body.
+fn split_http_response(raw: &str) -> (&str, &str) {
+    let raw = raw.trim_start();
+    raw.split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .unwrap_or(("", raw))
+}
+
+/// The `cursor` of the `rel="next"` link, when the response has one.
+fn next_page_cursor(headers: &str) -> Option<String> {
+    headers
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("link:"))?
+        .split(',')
+        .find(|link| link.contains("rel=\"next\""))
+        .and_then(|link| link.split("cursor=").nth(1))
+        .map(|rest| {
+            rest.chars()
+                .take_while(|character| !matches!(character, '&' | '>' | ';'))
+                .collect::<String>()
+        })
+        .filter(|cursor| !cursor.is_empty())
 }
 
 fn list_matching_hooks(
@@ -1339,6 +1420,43 @@ mod tests {
         assert!(third_args.contains("repos/owner/repo/hooks/4242"));
     }
 
+    /// A hook deleted on GitHub while its daemon was down (for example by
+    /// `daemon prune-webhooks`) is re-created at the next registration pass,
+    /// which runs at start and on every reverify cycle.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_hook_deleted_on_github_is_recreated() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = temp.path().join("daemon");
+        fs::create_dir_all(&daemon_dir).expect("daemon dir");
+        fs::write(
+            daemon_dir.join("registrations.json"),
+            r#"[{"repo":"owner/repo","hook_id":9999}]"#,
+        )
+        .expect("seed registrations");
+        let gh = write_gh_stub(temp.path(), GhStubMode::RecordedHookPruned);
+        let mut registrar = stub_registrar(temp.path());
+        assert_eq!(registrar.all().get("owner/repo"), Some(&9999));
+
+        let hook_id = registrar
+            .ensure_registered_with_gh(
+                "owner/repo",
+                "https://shipyard.example/webhook",
+                "secret",
+                &gh,
+            )
+            .expect("re-create");
+
+        assert_eq!(hook_id, 4242);
+        assert!(read_log(temp.path(), "args-1").contains("-X PATCH"));
+        assert!(read_log(temp.path(), "args-1").contains("hooks/9999"));
+        assert!(read_log(temp.path(), "args-3").contains("-X POST"));
+        assert_eq!(
+            stub_registrar(temp.path()).all().get("owner/repo"),
+            Some(&4242)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn mixed_case_alias_reuses_and_unregisters_canonical_registration() {
@@ -1674,6 +1792,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn delivery_page_cursor_is_read_from_the_next_link_only() {
+        let raw = "HTTP/2.0 200 OK\r\nLink: <https://api.github.com/repositories/1/hooks/2/deliveries?per_page=100&cursor=v1_3845977271640784898>; rel=\"next\"\r\nX-Other: 1\r\n\r\n[{\"id\":1}]";
+        let (headers, body) = super::split_http_response(raw);
+        assert_eq!(body, "[{\"id\":1}]");
+        assert_eq!(
+            super::next_page_cursor(headers).as_deref(),
+            Some("v1_3845977271640784898")
+        );
+        let last = "HTTP/2.0 200 OK\nLink: <https://x/deliveries?cursor=v1_9>; rel=\"prev\"\n\n[]";
+        let (headers, body) = super::split_http_response(last);
+        assert_eq!(body, "[]");
+        assert_eq!(super::next_page_cursor(headers), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn unregister_without_gh_removes_local_state() {
@@ -1709,6 +1842,9 @@ mod tests {
         PatchDropsSecret,
         /// The App installation lacks `repository_hooks`.
         AppPermissionDenied,
+        /// The recorded hook was deleted on GitHub (pruned while the daemon
+        /// was down): its PATCH answers 404.
+        RecordedHookPruned,
     }
 
     #[cfg(unix)]
@@ -1731,6 +1867,7 @@ mod tests {
             | GhStubMode::Unauthorized
             | GhStubMode::PatchDropsSecret
             | GhStubMode::AppPermissionDenied
+            | GhStubMode::RecordedHookPruned
             | GhStubMode::AnonRateLimit => "{\"id\":4242}",
         };
         let delete_branch = match mode {
@@ -1748,6 +1885,7 @@ mod tests {
             | GhStubMode::Unauthorized
             | GhStubMode::PatchDropsSecret
             | GhStubMode::AppPermissionDenied
+            | GhStubMode::RecordedHookPruned
             | GhStubMode::AnonRateLimit => "  *\" -X DELETE \"*) exit 0 ;;",
         };
         let create_branch = match mode {
@@ -1771,6 +1909,7 @@ mod tests {
             | GhStubMode::WrongUrl
             | GhStubMode::Delete404
             | GhStubMode::PatchDropsSecret
+            | GhStubMode::RecordedHookPruned
             | GhStubMode::MissingId => {
                 format!("  *\" -X POST \"*) printf '%s\\n' '{create_response}' ;;")
             }
@@ -1825,6 +1964,7 @@ esac
     fn patch_branch_for(mode: GhStubMode) -> &'static str {
         match mode {
             GhStubMode::AdoptPatchFails => "printf 'patch failed\\n' >&2; exit 1 ;;",
+            GhStubMode::RecordedHookPruned => "printf 'gh: Not Found (HTTP 404)\\n' >&2; exit 1 ;;",
             GhStubMode::AdoptPatchIncomplete => {
                 "printf '%s\\n' '{\"active\":true,\"events\":[\"push\"],\"config\":{\"url\":\"https://example.test/webhook\"}}' ;;"
             }

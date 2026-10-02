@@ -177,6 +177,16 @@ pub(super) fn daemon_command<W: Write>(
         DaemonCommand::Reconcile { repos } => {
             daemon_reconcile(mode, runtime_paths, json, stdout, &repos)
         }
+        DaemonCommand::PruneWebhooks { repos, apply } => {
+            super::daemon_prune_cmd::daemon_prune_webhooks(
+                mode,
+                runtime_paths,
+                json,
+                stdout,
+                &repos,
+                apply,
+            )
+        }
         DaemonCommand::Launcher { command } => daemon_launcher_command(
             command,
             mode,

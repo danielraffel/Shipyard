@@ -88,6 +88,24 @@ thread with `try_send`, dropping and counting a line rather than ever waiting.
 Keep `run_never_holds_the_process_stdio_locks_for_the_command` and the
 `webhook_listener_keeps_serving_*` tests passing.
 
+## Stale webhooks: `shipyard daemon prune-webhooks`
+
+Hooks outlive their daemon when a host is renamed or retired, when a daemon
+stops advertising a repository, or when a clean-shutdown delete fails. Do not
+delete them by hand: run `shipyard daemon prune-webhooks` (a dry run by
+default; `--apply` deletes and drops matching `registrations.json` records).
+It prunes only this host's hooks on repositories its running daemon does not
+advertise, and peer hooks whose endpoint has answered nothing but gateway
+failures (502/503/504 or no connection) either for 24h, or at least five
+times on a host name that is no longer a tailnet node. Only fleet hosts
+(this host's tailnet domain) are ever judged: a daemon-shaped receiver
+anywhere else is kept however long it fails. A peer answering 400/401/404 is
+alive and is never pruned. A pruned host's daemon re-creates its hook at its
+next start or reverify pass, because a 404 on the recorded hook drops the
+binding and registers afresh. The advertised set is only trusted from a
+running daemon on the same Shipyard version as the command. Each host can only judge its own
+hooks as unadvertised, so run it on every daemon host.
+
 ## Daemon IPC subscribers lag; they are never evicted for being slow
 
 An accepted Unix socket inherits `O_NONBLOCK` from the non-blocking IPC
