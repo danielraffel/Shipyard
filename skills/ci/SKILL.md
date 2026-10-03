@@ -2161,6 +2161,13 @@ is planned against that merge base rather than refused with
 promotion requires the merge base's and recorded base's policy digests to match
 (`merge_base_policy_diverged` otherwise, shadow only).
 
+A trial is also `ready` with reason `matched_fail` when both legs failed but
+the failure sets match: Shipyard recomputes S ⊆ F, every full failure inside
+the selection also failed there, and every full failure outside it is on the
+receipt's `lane_red_allowlist` with an unexpired entry (a fixed red cannot keep
+hiding a new failure under its name); `allowlisted_failure_count` must equal how
+many it absorbed. It is never reported as `matched_pass`.
+
 `changed-surface-plan --record <dir>` writes an `origin: shadow_plan_step`
 record for CI artifacts instead of state; a failed plan is recorded as
 `planner_error` and still exits nonzero, so run it non-blocking.

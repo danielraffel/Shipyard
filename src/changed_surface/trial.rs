@@ -246,7 +246,37 @@ struct ResultReceipt {
     full_authoritative: bool,
     comparison_verdict: String,
     graduation_eligible: bool,
+    /// Literal selected test names, in selection order (`matched_fail` only).
+    #[serde(default)]
+    selected_tests: Option<Vec<String>>,
+    /// Tests that failed in the selected leg (`matched_fail` only).
+    #[serde(default)]
+    selected_failures: Option<Vec<String>>,
+    /// Tests that failed in the full suite (`matched_fail` only).
+    #[serde(default)]
+    full_failures: Option<Vec<String>>,
+    /// The protected base's named lane-only reds a full-suite failure outside
+    /// the selection may be (`matched_fail` only).
+    #[serde(default)]
+    lane_red_allowlist: Option<Vec<String>>,
+    /// Each allowlisted name's expiry date (`YYYY-MM-DD`, UTC); a red is not
+    /// allowlisted after its expiry, so a fixed test cannot keep hiding a new
+    /// failure under its name.
+    #[serde(default)]
+    lane_red_allowlist_expires: Option<std::collections::BTreeMap<String, String>>,
+    /// How many full-suite failures outside the selection the allowlist absorbed.
+    #[serde(default)]
+    allowlisted_failure_count: Option<usize>,
+    /// When the adapter wrote the receipt; an allowlist expiry is judged then.
+    #[serde(default)]
+    recorded_at_unix_ns: Option<u64>,
 }
+
+/// The failure-set verdict: both legs failed, the selected leg failed nothing
+/// the full suite passed, saw every failure inside its selection, and every
+/// full-suite failure outside the selection is a named lane-only red. Weaker
+/// than `matched_pass`, which also proves the full suite green.
+const MATCHED_FAIL: &str = "matched_fail";
 
 /// Return the machine-global directory for one exact trial identity.
 ///
@@ -308,6 +338,7 @@ pub fn evaluate_trial(
         return reject(status, None, "ambiguous_shadow_results");
     }
 
+    let mut verdict = String::new();
     for result_file in results {
         let Ok(result) = serde_json::from_slice::<ResultReceipt>(result_file.bytes) else {
             return reject(status, Some(result_file.name), "malformed_shadow_result");
@@ -317,9 +348,10 @@ pub fn evaluate_trial(
         }
         status.result_receipt = Some(result_file.name.to_owned());
         status.timing = timing(&activation.plan, &result);
+        verdict = result.comparison_verdict;
     }
     status.state = TrialState::Ready;
-    "matched_pass".clone_into(&mut status.reason);
+    status.reason = verdict;
     status
 }
 
@@ -702,8 +734,13 @@ fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), 
     if !result.full_authoritative {
         return Err("full_suite_not_authoritative");
     }
-    if result.selected_returncode != 0
-        || result.full_returncode != Some(0)
+    let matched_fail = result.comparison_verdict == MATCHED_FAIL;
+    let tests_ok = if matched_fail {
+        result.selected_returncode != 0 && result.full_returncode.is_some_and(|code| code != 0)
+    } else {
+        result.selected_returncode == 0 && result.full_returncode == Some(0)
+    };
+    if !tests_ok
         || match plan.schema_version {
             1 => {
                 result.selected_build_returncode.is_some() || result.full_build_returncode.is_some()
@@ -717,11 +754,81 @@ fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), 
     {
         return Err("shadow_result_nonzero_returncode");
     }
-    if result.comparison_verdict != "matched_pass" || !result.graduation_eligible {
+    if !result.graduation_eligible {
+        return Err("shadow_result_not_matched_pass");
+    }
+    if matched_fail {
+        validate_matched_fail(plan, result)?;
+    } else if result.comparison_verdict != "matched_pass" {
         return Err("shadow_result_not_matched_pass");
     }
     if plan.schema_version == 2 && timing(plan, result).is_none() {
         return Err("invalid_shadow_result_timing");
+    }
+    Ok(())
+}
+
+/// Recompute the `matched_fail` rule from the receipt's named sets rather than
+/// trusting the adapter's label. The selection must hash to the plan's
+/// selected-tests digest, so the sets are about the plan that ran.
+fn validate_matched_fail(
+    plan: &ActivationPlan,
+    result: &ResultReceipt,
+) -> Result<(), &'static str> {
+    let (Some(selected), Some(failed_selected), Some(failed_full), Some(allowlist)) = (
+        result.selected_tests.as_deref(),
+        result.selected_failures.as_deref(),
+        result.full_failures.as_deref(),
+        result.lane_red_allowlist.as_deref(),
+    ) else {
+        return Err("matched_fail_sets_missing");
+    };
+    let mut literal = Vec::new();
+    for test in selected {
+        literal.extend_from_slice(test.as_bytes());
+        literal.push(b'\n');
+    }
+    if selected.is_empty() || sha256(&literal) != plan.selected_tests_digest {
+        return Err("matched_fail_selection_not_the_plan");
+    }
+    let selection: std::collections::BTreeSet<&str> = selected.iter().map(String::as_str).collect();
+    let in_selected: std::collections::BTreeSet<&str> =
+        failed_selected.iter().map(String::as_str).collect();
+    let in_full: std::collections::BTreeSet<&str> =
+        failed_full.iter().map(String::as_str).collect();
+    let allowed: std::collections::BTreeSet<&str> = allowlist.iter().map(String::as_str).collect();
+    if in_selected.is_empty() || in_full.is_empty() {
+        return Err("matched_fail_without_failures");
+    }
+    if !in_selected.is_subset(&in_full) {
+        return Err("matched_fail_selected_only_failure");
+    }
+    let recorded = result
+        .recorded_at_unix_ns
+        .and_then(|ns| i64::try_from(ns / 1_000_000_000).ok())
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .map(|at| at.format("%Y-%m-%d").to_string())
+        .ok_or("matched_fail_without_recorded_time")?;
+    let expires = result.lane_red_allowlist_expires.as_ref();
+    let mut absorbed = 0;
+    for failure in &in_full {
+        if selection.contains(failure) {
+            if !in_selected.contains(failure) {
+                return Err("matched_fail_missed_full_failure");
+            }
+        } else if !allowed.contains(failure) {
+            return Err("matched_fail_unlisted_failure_outside_selection");
+        } else {
+            match expires.and_then(|dates| dates.get(*failure)) {
+                Some(date) if date.len() == 10 && date.as_str() >= recorded.as_str() => {
+                    absorbed += 1;
+                }
+                _ => return Err("matched_fail_allowlist_entry_expired"),
+            }
+        }
+    }
+    if result.allowlisted_failure_count != Some(absorbed) {
+        return Err("matched_fail_allowlisted_count_mismatch");
     }
     Ok(())
 }
@@ -978,6 +1085,117 @@ mod tests {
         let missing_result = evaluate(Some(&activation), &[]);
         assert_eq!(missing_result.state, TrialState::Collecting);
         assert_eq!(missing_result.reason, "waiting_for_shadow_result");
+    }
+
+    /// A plan selecting `smoke` and `core`, whose full suite also failed the
+    /// lane-only red `pch-wiring` outside the selection.
+    fn matched_fail() -> (Value, Value) {
+        let selected = ["smoke", "core"];
+        let digest = sha256(b"smoke\ncore\n");
+        let mut activation = activation();
+        activation["plan"]["selected_tests_digest"] = Value::String(digest.clone());
+        let mut result = result();
+        result["selected_tests_digest"] = Value::String(digest);
+        result["selected_returncode"] = json!(8);
+        result["full_returncode"] = json!(8);
+        result["comparison_verdict"] = json!("matched_fail");
+        result["selected_tests"] = json!(selected);
+        result["selected_failures"] = json!(["core"]);
+        result["full_failures"] = json!(["core", "pch-wiring"]);
+        result["lane_red_allowlist"] = json!(["pch-wiring", "visual-deps"]);
+        result["lane_red_allowlist_expires"] =
+            json!({"pch-wiring": "2026-10-17", "visual-deps": "2026-10-17"});
+        result["allowlisted_failure_count"] = json!(1);
+        // 2026-10-03T12:00:00Z
+        result["recorded_at_unix_ns"] = json!(1_791_028_800_000_000_000_u64);
+        (activation, result)
+    }
+
+    #[test]
+    fn matched_fail_is_ready_under_its_own_name() {
+        let (activation, result) = matched_fail();
+        let status = evaluate(Some(&activation), &[result]);
+        assert_eq!(status.state, TrialState::Ready, "{status:?}");
+        assert_eq!(status.reason, "matched_fail");
+    }
+
+    #[test]
+    fn matched_fail_is_recomputed_not_trusted() {
+        type Case = (&'static str, fn(&mut Value), &'static str);
+        let cases: [Case; 11] = [
+            (
+                "an allowlist entry that expired before the receipt",
+                |r| r["lane_red_allowlist_expires"]["pch-wiring"] = json!("2026-10-02"),
+                "matched_fail_allowlist_entry_expired",
+            ),
+            (
+                "an allowlisted name with no expiry",
+                |r| {
+                    r["lane_red_allowlist_expires"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("pch-wiring");
+                },
+                "matched_fail_allowlist_entry_expired",
+            ),
+            (
+                "a count that is not what the allowlist absorbed",
+                |r| r["allowlisted_failure_count"] = json!(0),
+                "matched_fail_allowlisted_count_mismatch",
+            ),
+            (
+                "selected-only failure",
+                |r| r["selected_failures"] = json!(["core", "smoke"]),
+                "matched_fail_selected_only_failure",
+            ),
+            (
+                "a selected test failed only in the full suite",
+                |r| r["full_failures"] = json!(["core", "smoke", "pch-wiring"]),
+                "matched_fail_missed_full_failure",
+            ),
+            (
+                "an unlisted failure outside the selection",
+                |r| r["full_failures"] = json!(["core", "new-regression"]),
+                "matched_fail_unlisted_failure_outside_selection",
+            ),
+            (
+                "sets absent",
+                |r| {
+                    r.as_object_mut().unwrap().remove("full_failures");
+                },
+                "matched_fail_sets_missing",
+            ),
+            (
+                "a selection that is not the plan's",
+                |r| r["selected_tests"] = json!(["smoke", "other"]),
+                "matched_fail_selection_not_the_plan",
+            ),
+            (
+                "no failure at all",
+                |r| {
+                    r["selected_failures"] = json!([]);
+                    r["full_failures"] = json!([]);
+                },
+                "matched_fail_without_failures",
+            ),
+            (
+                "a build that failed",
+                |r| r["full_build_returncode"] = json!(2),
+                "shadow_result_nonzero_returncode",
+            ),
+            (
+                "a passing selected leg labelled matched_fail",
+                |r| r["selected_returncode"] = json!(0),
+                "shadow_result_nonzero_returncode",
+            ),
+        ];
+        for (label, mutate, reason) in cases {
+            let (activation, mut result) = matched_fail();
+            mutate(&mut result);
+            let status = evaluate(Some(&activation), &[result]);
+            assert_eq!(status.state, TrialState::Rejected, "{label}: {status:?}");
+            assert_eq!(status.reason, reason, "{label}");
+        }
     }
 
     #[test]
