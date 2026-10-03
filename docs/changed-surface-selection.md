@@ -345,8 +345,9 @@ The command is read-only and reports one stable state under `trial.state`:
 - `ready` (exit 0): exactly one result matches the activation's repository,
   PR, target, base/head/tree, execution payload, policy, selection,
   validation-contract, workflow, selected-test, and selected-build-target
-  identities; the selected and full return codes are zero; the full suite is
-  explicitly authoritative; and the comparison verdict is `matched_pass`;
+  identities; the full suite is explicitly authoritative; and either the
+  verdict is `matched_pass` with both return codes zero, or it is
+  `matched_fail` (below). `trial.reason` names which;
 - `terminal` (exit 0 for `blocked` or `full_required`, exit 1 for
   `invalidated`): stale-base planning safely ended with an immutable typed
   receipt instead of waiting indefinitely for an activation that should never
@@ -355,6 +356,20 @@ The command is read-only and reports one stable state under `trial.state`:
   identity/digest-inconsistent, or ambiguous. More than one append-only result
   for the exact identity is intentionally ambiguous even if the files are
   byte-equivalent.
+
+`matched_fail` is the failure-set verdict for a lane whose full suite is not
+green. Both test legs failed and both builds succeeded, and Shipyard recomputes
+the rule from the receipt's named sets rather than trusting the label: the
+`selected_tests` names must hash to the plan's selected-tests digest; every
+selected-leg failure also failed in the full suite; every full-suite failure
+inside the selection also failed in the selected leg; and every full-suite
+failure outside the selection is in `lane_red_allowlist`, the protected base's
+named lane-only reds. It proves the bounded leg reproduced every failure it
+could observe and invented none, not that the full suite was green, so it is
+reported as `matched_fail` and never as `matched_pass`. The adapter must read
+the allowlist from the protected base and keep that file, with the adapter
+itself, among its policy paths so a PR that edits either selects the full
+suite.
 
 For a build-and-test plan, `trial.timing` preserves the verified input-check,
 selected-build, selected-test, incremental-full-build, estimated-total-full-
