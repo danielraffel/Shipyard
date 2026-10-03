@@ -1112,7 +1112,8 @@ GitHub records `500 ... EOF` while the listener answers locally, read
 `public ingress:` in `shipyard daemon status`: the public relay, not the
 daemon, is refusing the host. `shipyard daemon status --json` reports
 `gh_token_cache` mints and hits: mints near the number of repositories, not
-the number of API calls, means token reuse is working. A `shipyard wait` that
+the number of API calls, means token reuse is working. Slugs are matched case-insensitively throughout (cache
+keys and wait filters), so `owner/Repo` and `owner/repo` are one repository. A `shipyard wait` that
 reports `fallback_used: true` with the daemon running means the daemon
 dropped its subscription; since daemon subscribers lag rather than being
 evicted, the wait should instead see `{"type":"lagged"}` and re-snapshot.
