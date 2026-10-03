@@ -259,6 +259,17 @@ struct ResultReceipt {
     /// the selection may be (`matched_fail` only).
     #[serde(default)]
     lane_red_allowlist: Option<Vec<String>>,
+    /// Each allowlisted name's expiry date (`YYYY-MM-DD`, UTC); a red is not
+    /// allowlisted after its expiry, so a fixed test cannot keep hiding a new
+    /// failure under its name.
+    #[serde(default)]
+    lane_red_allowlist_expires: Option<std::collections::BTreeMap<String, String>>,
+    /// How many full-suite failures outside the selection the allowlist absorbed.
+    #[serde(default)]
+    allowlisted_failure_count: Option<usize>,
+    /// When the adapter wrote the receipt; an allowlist expiry is judged then.
+    #[serde(default)]
+    recorded_at_unix_ns: Option<u64>,
 }
 
 /// The failure-set verdict: both legs failed, the selected leg failed nothing
@@ -792,6 +803,14 @@ fn validate_matched_fail(
     if !in_selected.is_subset(&in_full) {
         return Err("matched_fail_selected_only_failure");
     }
+    let recorded = result
+        .recorded_at_unix_ns
+        .and_then(|ns| i64::try_from(ns / 1_000_000_000).ok())
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .map(|at| at.format("%Y-%m-%d").to_string())
+        .ok_or("matched_fail_without_recorded_time")?;
+    let expires = result.lane_red_allowlist_expires.as_ref();
+    let mut absorbed = 0;
     for failure in &in_full {
         if selection.contains(failure) {
             if !in_selected.contains(failure) {
@@ -799,7 +818,17 @@ fn validate_matched_fail(
             }
         } else if !allowed.contains(failure) {
             return Err("matched_fail_unlisted_failure_outside_selection");
+        } else {
+            match expires.and_then(|dates| dates.get(*failure)) {
+                Some(date) if date.len() == 10 && date.as_str() >= recorded.as_str() => {
+                    absorbed += 1;
+                }
+                _ => return Err("matched_fail_allowlist_entry_expired"),
+            }
         }
+    }
+    if result.allowlisted_failure_count != Some(absorbed) {
+        return Err("matched_fail_allowlisted_count_mismatch");
     }
     Ok(())
 }
@@ -1074,6 +1103,11 @@ mod tests {
         result["selected_failures"] = json!(["core"]);
         result["full_failures"] = json!(["core", "pch-wiring"]);
         result["lane_red_allowlist"] = json!(["pch-wiring", "visual-deps"]);
+        result["lane_red_allowlist_expires"] =
+            json!({"pch-wiring": "2026-10-17", "visual-deps": "2026-10-17"});
+        result["allowlisted_failure_count"] = json!(1);
+        // 2026-10-03T12:00:00Z
+        result["recorded_at_unix_ns"] = json!(1_791_028_800_000_000_000_u64);
         (activation, result)
     }
 
@@ -1088,7 +1122,27 @@ mod tests {
     #[test]
     fn matched_fail_is_recomputed_not_trusted() {
         type Case = (&'static str, fn(&mut Value), &'static str);
-        let cases: [Case; 8] = [
+        let cases: [Case; 11] = [
+            (
+                "an allowlist entry that expired before the receipt",
+                |r| r["lane_red_allowlist_expires"]["pch-wiring"] = json!("2026-10-02"),
+                "matched_fail_allowlist_entry_expired",
+            ),
+            (
+                "an allowlisted name with no expiry",
+                |r| {
+                    r["lane_red_allowlist_expires"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("pch-wiring");
+                },
+                "matched_fail_allowlist_entry_expired",
+            ),
+            (
+                "a count that is not what the allowlist absorbed",
+                |r| r["allowlisted_failure_count"] = json!(0),
+                "matched_fail_allowlisted_count_mismatch",
+            ),
             (
                 "selected-only failure",
                 |r| r["selected_failures"] = json!(["core", "smoke"]),

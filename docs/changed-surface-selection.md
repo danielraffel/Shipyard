@@ -364,7 +364,11 @@ the rule from the receipt's named sets rather than trusting the label: the
 selected-leg failure also failed in the full suite; every full-suite failure
 inside the selection also failed in the selected leg; and every full-suite
 failure outside the selection is in `lane_red_allowlist`, the protected base's
-named lane-only reds. It proves the bounded leg reproduced every failure it
+named lane-only reds, with an entry in `lane_red_allowlist_expires` that had not
+expired on the receipt's recorded date (so a fixed test cannot keep hiding a new
+failure under its name); and `allowlisted_failure_count` equals the number of
+those failures the allowlist absorbed, which reports how much of a graduation
+rested on it. It proves the bounded leg reproduced every failure it
 could observe and invented none, not that the full suite was green, so it is
 reported as `matched_fail` and never as `matched_pass`. The adapter must read
 the allowlist from the protected base and keep that file, with the adapter
