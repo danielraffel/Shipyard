@@ -137,7 +137,11 @@ token is replaced 5 minutes before its `expires_at` (never later), and a
 token inside that window is used once but not cached. An HTTP 401 from GitHub
 in the registrar and wait paths drops the cache entry and retries once with a
 fresh mint; a second 401 surfaces. `daemon status` reports
-`gh_token_cache.mints` and `.hits`.
+`gh_token_cache.mints` and `.hits`. Repository slugs are case-insensitive on GitHub:
+the cache key lowercases the slug (the helper still receives the caller's
+spelling), and `shipyard wait` event filters compare the payload's
+`owner/Repo` case-insensitively, so a lowercased remote still wakes on its
+webhook events.
 
 ## The writer-domain lease, for tools outside Shipyard
 

@@ -948,12 +948,12 @@ pub fn pr_event_filter(pr_number: u64, repo: &str) -> impl Fn(&Value) -> bool {
                             .iter()
                             .any(|number| number.as_u64() == Some(pr_number))
                     })
-                    || payload_repo(payload) == Some(repo.as_str())
+                    || payload_is_repo(payload, &repo)
             }
-            "workflow_run" => payload_repo(payload) == Some(repo.as_str()),
+            "workflow_run" => payload_is_repo(payload, &repo),
             "reconcile_healed" => {
                 payload.get("pr").and_then(Value::as_u64) == Some(pr_number)
-                    && payload_repo(payload) == Some(repo.as_str())
+                    && payload_is_repo(payload, &repo)
             }
             _ => false,
         }
@@ -974,7 +974,7 @@ pub fn run_event_filter(run_id: &str, repo: &str) -> impl Fn(&Value) -> bool {
         match kind {
             "workflow_run" => {
                 value_matches_text(payload.get("run_id"), &run_id)
-                    && payload_repo(payload) == Some(repo.as_str())
+                    && payload_is_repo(payload, &repo)
             }
             "workflow_job" => value_matches_text(payload.get("run_id"), &run_id),
             _ => false,
@@ -995,7 +995,7 @@ pub fn release_event_filter(tag: &str, repo: &str) -> impl Fn(&Value) -> bool {
         };
         kind == "release"
             && payload.get("tag_name").and_then(Value::as_str) == Some(tag.as_str())
-            && payload_repo(payload) == Some(repo.as_str())
+            && payload_is_repo(payload, &repo)
     }
 }
 
@@ -1174,6 +1174,14 @@ fn payload_repo(payload: &serde_json::Map<String, Value>) -> Option<&str> {
     payload.get("repo").and_then(Value::as_str)
 }
 
+/// GitHub repository slugs are case-insensitive. Webhook payloads carry the
+/// canonical spelling (`owner/Repo`) while a waiter's repository may come from
+/// a lowercased remote or `--repo`, so an exact comparison silently drops
+/// every matching event and the wait falls back to polling.
+fn payload_is_repo(payload: &serde_json::Map<String, Value>, repo: &str) -> bool {
+    payload_repo(payload).is_some_and(|candidate| candidate.eq_ignore_ascii_case(repo))
+}
+
 fn value_matches_text(value: Option<&Value>, expected: &str) -> bool {
     value.is_some_and(|value| match value {
         Value::String(text) => text == expected,
@@ -1230,6 +1238,24 @@ mod tests {
             rate_limit: None,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn event_filters_match_repository_slugs_case_insensitively() {
+        let pr_event = serde_json::json!({
+            "kind": "workflow_run",
+            "payload": {"repo": "danielraffel/Shipyard", "run_id": 7},
+        });
+        assert!(pr_event_filter(42, "danielraffel/shipyard")(&pr_event));
+        assert!(run_event_filter("7", "danielraffel/shipyard")(&pr_event));
+        let release = serde_json::json!({
+            "kind": "release",
+            "payload": {"repo": "Generous-Corp/pulp", "tag_name": "v1"},
+        });
+        assert!(release_event_filter("v1", "generous-corp/pulp")(&release));
+        // Control: a different repository still never matches.
+        assert!(!run_event_filter("7", "danielraffel/whence")(&pr_event));
+        assert!(!release_event_filter("v1", "generous-corp/forge")(&release));
     }
 
     #[test]

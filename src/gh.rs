@@ -535,8 +535,14 @@ impl GhClient {
             self.repo_hint.as_ref(),
             self.repo_override.as_ref(),
         )?;
+        let key = token_cache_key(
+            token_command,
+            cwd,
+            self.repo_hint.as_ref(),
+            self.repo_override.as_ref(),
+        )?;
         let now = Utc::now();
-        if let Some(cached) = self.cached_token(&expanded, now)? {
+        if let Some(cached) = self.cached_token(&key, now)? {
             TOKEN_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
@@ -572,7 +578,7 @@ impl GhClient {
             cache_ttl_seconds,
             self.auth.refresh_skew_seconds,
         )?;
-        self.store_cached_token(expanded, &token, now)?;
+        self.store_cached_token(key, &token, now)?;
         Ok(token)
     }
 
@@ -598,7 +604,7 @@ impl GhClient {
         let GhAuthSource::Command { token_command, .. } = &self.auth.source else {
             return Ok(());
         };
-        let expanded = expand_token_command(
+        let key = token_cache_key(
             token_command,
             cwd,
             self.repo_hint.as_ref(),
@@ -607,7 +613,7 @@ impl GhClient {
         self.cache
             .lock()
             .map_err(|_| GhPrepareError::TokenCachePoisoned)?
-            .remove(&expanded);
+            .remove(&key);
         Ok(())
     }
 
@@ -954,6 +960,35 @@ fn inferred_token_kind(token: &str) -> Option<String> {
     token
         .starts_with("ghs_")
         .then(|| "github-app-installation".to_owned())
+}
+
+/// The token-cache key for an expanded helper argv. Repository slugs are
+/// case-insensitive on GitHub, so `owner/Repo` and `owner/repo` name one
+/// installation and must share one cached token rather than minting twice.
+fn token_cache_key(
+    args: &[String],
+    cwd: &Path,
+    repo_hint: Option<&RepoIdentity>,
+    repo_override: Option<&RepoIdentity>,
+) -> Result<Vec<String>, GhPrepareError> {
+    let lower = |identity: Option<&RepoIdentity>| {
+        identity.map(|identity| RepoIdentity {
+            slug: identity.slug.to_ascii_lowercase(),
+            owner: identity.owner.to_ascii_lowercase(),
+            name: identity.name.to_ascii_lowercase(),
+        })
+    };
+    let hint = lower(repo_hint);
+    let override_ = lower(repo_override);
+    let mut key = expand_token_command(args, cwd, hint.as_ref(), override_.as_ref())?;
+    // A slug taken from the checkout's remote is not lowered above: lower
+    // every argument that carried a repository placeholder.
+    for (arg, template) in key.iter_mut().zip(args) {
+        if needs_repo_placeholder(template) {
+            *arg = arg.to_ascii_lowercase();
+        }
+    }
+    Ok(key)
 }
 
 fn expand_token_command(

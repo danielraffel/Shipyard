@@ -1460,3 +1460,45 @@ fn token_material_never_appears_in_debug_output() {
         assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn repository_slugs_differing_only_in_case_share_one_minted_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let helper = temp.path().join("case-helper");
+    let calls = temp.path().join("case-calls");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nprintf '{{\"token\":\"ghs_case\",\"expires_at\":\"2099-01-01T00:00:00Z\"}}\\n'\n",
+            calls.display(),
+        ),
+    );
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}", "{{repo_slug}}"]
+            "#,
+        helper.display()
+    ));
+    for slug in ["Owner/CaseRepo", "owner/caserepo", "OWNER/CASEREPO"] {
+        let client = GhClient::from_loaded_config(&config)
+            .expect("client")
+            .with_repo_override(slug)
+            .expect("repo");
+        assert_eq!(
+            client
+                .resolve_token(temp.path())
+                .expect("token")
+                .expect("configured token")
+                .token,
+            "ghs_case"
+        );
+    }
+    // One mint, and the helper saw the caller's own spelling.
+    assert_eq!(
+        std::fs::read_to_string(calls).expect("calls"),
+        "Owner/CaseRepo\n"
+    );
+}
