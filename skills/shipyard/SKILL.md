@@ -106,7 +106,9 @@ failures (502/503/504 or no connection) either for 24h, or at least five
 times on a host name that is no longer a tailnet node. Only fleet hosts
 (this host's tailnet domain) are ever judged: a daemon-shaped receiver
 anywhere else is kept however long it fails. A peer answering 400/401/404 is
-alive and is never pruned. A pruned host's daemon re-creates its hook at its
+alive and is never pruned. GitHub's own `500 ... giving up after 1
+attempt(s): ... EOF` record means no daemon answered (a relay that will not
+hand the connection over) and counts as unreachable, not as a refusal. A pruned host's daemon re-creates its hook at its
 next start or reverify pass, because a 404 on the recorded hook drops the
 binding and registers afresh. The advertised set is only trusted from a
 running daemon on the same Shipyard version as the command. Each host can only judge its own

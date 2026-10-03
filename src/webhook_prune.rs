@@ -633,6 +633,30 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_github_gave_up_on_with_eof_for_a_day_is_pruned() {
+        let records = (0..30)
+            .map(|index| {
+                serde_json::json!({
+                    "delivered_at": at(index).to_rfc3339(),
+                    "status_code": 500,
+                    "status": "POST https://gone.ts.net/webhook giving up after 1 attempt(s): Post \"https://gone.ts.net/webhook\": EOF",
+                })
+            })
+            .collect::<Vec<_>>();
+        let dead = hook(
+            "https://gone.ts.net/webhook",
+            Some(delivery_facts(&records)),
+        );
+        assert_eq!(
+            classify_hook("o/r", &dead, &ctx(None), &EVENTS),
+            Verdict::Prune(PruneReason::DeadTarget {
+                failures: 30,
+                span_hours: 29,
+            })
+        );
+    }
+
+    #[test]
     fn registrations_drop_unadvertised_repos_and_vanished_hooks_only() {
         let registrations = BTreeMap::from([
             ("o/kept".to_owned(), 1),
