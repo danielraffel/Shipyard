@@ -234,6 +234,8 @@ pub mod repo_variable;
 pub mod required_check_policy;
 /// Cloud→local macOS reroute decision logic (#316 Part C).
 pub mod reroute;
+/// Host-local store of the reuse records local validation runs write.
+pub mod reuse_record_store;
 /// Self-hosted runner provisioning (register/list/remove) pure logic.
 pub mod runner_provision;
 /// Self-hosted runner watchdog detection logic.

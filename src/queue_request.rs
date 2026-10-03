@@ -1410,6 +1410,9 @@ pub struct QueuedLocalValidation {
     /// Resolved trusted values snapshotted for daemon-owned execution.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Repository whose host-local reuse-record store each run writes to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_record_repository: Option<String>,
     /// Exact stale-integration checkout custody restored by the daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration_cleanup:
@@ -1426,6 +1429,7 @@ impl From<&LocalValidationConfig> for QueuedLocalValidation {
             allow_tree_drift: validation.allow_tree_drift,
             machine_environment: validation.machine_environment.clone(),
             environment: validation.environment.clone(),
+            reuse_record_repository: validation.reuse_record_repository.clone(),
             integration_cleanup: validation
                 .integration_cleanup
                 .as_ref()
@@ -1823,6 +1827,7 @@ fn restore_validation(
                 allow_tree_drift: validation.allow_tree_drift,
                 machine_environment: validation.machine_environment.clone(),
                 environment: validation.environment.clone(),
+                reuse_record_repository: validation.reuse_record_repository.clone(),
                 integration_cleanup: validation
                     .integration_cleanup
                     .as_ref()
@@ -3926,6 +3931,7 @@ mod tests {
                     "PULP_SDK_DIR".to_owned(),
                     "/machine/pulp-sdk".to_owned(),
                 )]),
+                reuse_record_repository: Some("owner/repo".to_owned()),
                 integration_cleanup: None,
             }),
             failure_parser: Some("auto".to_owned()),
