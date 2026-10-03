@@ -187,7 +187,14 @@ impl DeliveryOutcome {
             || lowered.contains("timeout")
             || lowered.contains("could not resolve")
             || lowered.contains("failed to connect")
-            || lowered.contains("no route");
+            || lowered.contains("no route")
+            // GitHub's own give-up record when the connection closed with no
+            // HTTP response (a relay reset, a tunnel that will not hand
+            // over): status 500, text `POST <url> giving up after 1
+            // attempt(s): Post "<url>": EOF`. No daemon answered.
+            || lowered.contains("giving up after")
+            || lowered.ends_with(": eof")
+            || lowered.contains("\": eof");
         if status_code == 0 || unreachable_text {
             return Self::Unreachable {
                 detail: if status_text.trim().is_empty() {
@@ -974,6 +981,28 @@ mod tests {
         assert!(!DeliveryOutcome::classify(0, "").reached_endpoint());
         // Control: a plain 502 FROM the endpoint is a refusal, not a rename.
         assert!(DeliveryOutcome::classify(502, "Bad Gateway").reached_endpoint());
+    }
+
+    #[test]
+    fn github_give_up_on_eof_is_unreachable_not_a_daemon_answer() {
+        // Verbatim from GitHub's delivery log for m3's hook while the public
+        // relay reset the TLS handshake (2026-10-02/03).
+        let eof = DeliveryOutcome::classify(
+            500,
+            "POST https://m3studio.taile2001.ts.net/webhook giving up after 1 attempt(s): Post \"https://m3studio.taile2001.ts.net/webhook\": EOF",
+        );
+        assert!(
+            matches!(eof, DeliveryOutcome::Unreachable { .. }),
+            "{eof:?}"
+        );
+        assert!(!eof.reached_endpoint());
+        // Control: a 500 a daemon actually sent is still a refusal.
+        assert_eq!(
+            DeliveryOutcome::classify(500, "Invalid HTTP Response: 500"),
+            DeliveryOutcome::Rejected { status_code: 500 }
+        );
+        // Words that merely contain "eof" are not an EOF.
+        assert!(DeliveryOutcome::classify(500, "geofence rejected").reached_endpoint());
     }
 
     #[test]
