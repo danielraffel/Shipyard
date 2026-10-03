@@ -34,9 +34,30 @@ fn record(store: &Path, commit: &str, job: &Value, age_secs: u64) -> PathBuf {
     path
 }
 
-fn identity(job: &Value) -> (Option<String>, Option<String>) {
-    let get = |key: &str| job.get(key).and_then(Value::as_str).map(str::to_owned);
-    (get("toolchain"), get("platform"))
+/// Reads `platform`/`toolchain` from `job.json`; a record is unusable when
+/// it says so; commits starting `good` are merged.
+struct Criteria;
+
+impl BaseCriteria for Criteria {
+    fn platform(&self, job: &Value) -> Option<String> {
+        job.get("platform")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+    fn toolchain(&self, job: &Value) -> Option<String> {
+        job.get("toolchain")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+    fn unusable(&self, record: &StoredRecord) -> Option<String> {
+        record
+            .job
+            .get("unusable")
+            .map(|_| "marked unusable".to_owned())
+    }
+    fn merged(&self, commit: &str) -> bool {
+        commit.starts_with("good")
+    }
 }
 
 #[test]
@@ -87,64 +108,125 @@ fn the_store_keeps_only_the_newest_records() {
 }
 
 #[test]
-fn the_base_must_have_a_known_equal_identity_and_a_merged_commit() {
+fn the_base_must_have_a_stated_equal_identity_a_usable_record_and_a_merged_commit() {
     let store = tempfile::tempdir().expect("store");
-    let want = ("clang-1 sdk-27", "macos-arm64");
+    let (platform, toolchain) = ("macos-arm64", "clang-1 sdk-27");
+    let job = |p: Option<&str>, t: Option<&str>| {
+        let mut job = serde_json::Map::new();
+        if let Some(p) = p {
+            job.insert("platform".to_owned(), json!(p));
+        }
+        if let Some(t) = t {
+            job.insert("toolchain".to_owned(), json!(t));
+        }
+        Value::Object(job)
+    };
+    // Newest first: each of these is refused for one reason.
+    record(store.path(), "good-a", &job(None, Some(toolchain)), 0);
+    // Another OS with the same toolchain string: platform is read first.
     record(
         store.path(),
-        "unknown",
-        &json!({"toolchain": "clang-1 sdk-27"}),
-        0,
-    );
-    record(
-        store.path(),
-        "other",
-        &json!({"toolchain": "clang-2 sdk-27", "platform": "macos-arm64"}),
+        "good-b",
+        &job(Some("linux-x86_64"), Some(toolchain)),
         10,
     );
     record(
         store.path(),
-        "unmerged",
-        &json!({"toolchain": want.0, "platform": want.1}),
+        "good-c",
+        &job(Some(platform), Some("unknown")),
         20,
     );
     record(
         store.path(),
-        "good-new",
-        &json!({"toolchain": want.0, "platform": want.1}),
+        "good-d",
+        &job(Some(platform), Some("clang-2 sdk-27")),
         30,
+    );
+    let mut unusable = job(Some(platform), Some(toolchain));
+    unusable["unusable"] = json!(true);
+    record(store.path(), "good-e", &unusable, 40);
+    record(
+        store.path(),
+        "unmerged",
+        &job(Some(platform), Some(toolchain)),
+        50,
+    );
+    record(
+        store.path(),
+        "good-new",
+        &job(Some(platform), Some(toolchain)),
+        60,
     );
     record(
         store.path(),
         "good-old",
-        &json!({"toolchain": want.0, "platform": want.1}),
-        40,
+        &job(Some(platform), Some(toolchain)),
+        70,
     );
 
-    let chosen = select_base(store.path(), want, identity, |commit| {
-        commit.starts_with("good")
-    })
-    .expect("a base");
+    let chosen = select_base(store.path(), platform, toolchain, &Criteria).expect("a base");
     assert_eq!(chosen.commit, "good-new", "the newest qualifying record");
 
-    let none = select_base(store.path(), want, identity, |_| false).expect_err("none merged");
+    let none = select_base(store.path(), platform, "clang-9", &Criteria).expect_err("none match");
     assert_eq!(
         none,
-        NoBase::NoneQualify {
-            unknown_identity: 1,
-            other_identity: 1,
-            not_merged: 3
-        }
+        NoBase::NoneQualify(Refusals {
+            unknown_platform: 1,
+            other_platform: 1,
+            unknown_toolchain: 1,
+            other_toolchain: 5,
+            unusable: 0,
+            not_merged: 0,
+        })
     );
+    let NoBase::NoneQualify(refused) =
+        select_base(store.path(), platform, toolchain, &NoneMerged).expect_err("none merged")
+    else {
+        panic!("expected refusals");
+    };
+    assert_eq!((refused.unusable, refused.not_merged), (1, 3));
+}
+
+struct NoneMerged;
+
+impl BaseCriteria for NoneMerged {
+    fn platform(&self, job: &Value) -> Option<String> {
+        Criteria.platform(job)
+    }
+    fn toolchain(&self, job: &Value) -> Option<String> {
+        Criteria.toolchain(job)
+    }
+    fn unusable(&self, record: &StoredRecord) -> Option<String> {
+        Criteria.unusable(record)
+    }
+    fn merged(&self, _: &str) -> bool {
+        false
+    }
 }
 
 #[test]
 fn an_empty_store_says_so() {
     let store = tempfile::tempdir().expect("store");
     assert_eq!(
-        select_base(store.path(), ("t", "p"), identity, |_| true),
+        select_base(store.path(), "p", "t", &Criteria),
         Err(NoBase::Empty)
     );
+}
+
+#[test]
+fn a_cancelled_runs_pending_directory_is_swept_later() {
+    let store = tempfile::tempdir().expect("store");
+    let old = create_pending(store.path(), "aaa", now()).expect("pending");
+    let day_ago = SystemTime::now() - (PENDING_MAX_AGE + Duration::from_secs(60));
+    fs::File::open(&old)
+        .and_then(|f| f.set_modified(day_ago))
+        .expect("age it");
+    let fresh = create_pending(store.path(), "bbb", now()).expect("pending");
+    assert!(
+        !old.exists(),
+        "a run that never reached filing is cleaned up"
+    );
+    assert!(fresh.exists(), "a run in progress is left alone");
 }
 
 #[test]

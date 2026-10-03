@@ -12,9 +12,11 @@
 //! returned for the run log. The store keeps the newest [`KEEP`] records.
 //!
 //! [`select_base`] picks the record a plan compares against: the newest one
-//! whose toolchain and platform are known and equal the plan's, and whose commit
-//! is an ancestor of the plan's protected base. A record from a commit that is
-//! not yet merged is never chosen: the code that wrote it is unreviewed.
+//! whose platform and toolchain are stated and equal the plan's, that passes
+//! the record format's own usability rules, and whose commit is an ancestor of
+//! the plan's protected base. A record from a commit that is not yet merged is
+//! never chosen: the code that wrote it is unreviewed. A pending directory a
+//! cancelled run left behind is swept after [`PENDING_MAX_AGE`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,6 +30,27 @@ pub const RECORD_DIR_ENV: &str = "SHIPYARD_REUSE_RECORD_DIR";
 pub const KEEP: usize = 40;
 /// The file a record must hold to be filed.
 pub const JOB_FILE: &str = "job.json";
+/// A pending directory older than this belongs to a run that never reached
+/// filing (cancelled, or its process killed) and is removed.
+pub const PENDING_MAX_AGE: std::time::Duration = std::time::Duration::from_hours(24);
+
+/// Remove pending directories older than `max_age`.
+fn sweep_pending(pending: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = fs::read_dir(pending) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
 
 /// Where one repository's records live under Shipyard's state directory.
 #[must_use]
@@ -45,6 +68,7 @@ pub fn store_dir(state_dir: &Path, repository: &str) -> PathBuf {
 pub fn create_pending(store: &Path, commit: &str, now: DateTime<Utc>) -> std::io::Result<PathBuf> {
     let pending = store.join("pending");
     fs::create_dir_all(&pending)?;
+    sweep_pending(&pending, PENDING_MAX_AGE);
     let dir = pending.join(format!(
         "{commit}-{}-{}",
         now.timestamp_nanos_opt().unwrap_or_default(),
@@ -166,65 +190,88 @@ pub fn prune(store: &Path, keep: usize) -> std::io::Result<()> {
 }
 
 /// Why no record was chosen.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Refusals {
+    /// The record does not state its platform (arch and OS family).
+    pub unknown_platform: usize,
+    /// Its platform differs from the plan's.
+    pub other_platform: usize,
+    /// It does not state its toolchain, or states it as unknown.
+    pub unknown_toolchain: usize,
+    /// Its toolchain differs from the plan's.
+    pub other_toolchain: usize,
+    /// It fails the record format's own usability rules.
+    pub unusable: usize,
+    /// Its commit is not an ancestor of the protected base.
+    pub not_merged: usize,
+}
+
+/// Why no record was chosen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NoBase {
     /// The store holds no record at all.
     Empty,
-    /// Records exist, none qualifies; the count of each refusal.
-    NoneQualify {
-        /// Toolchain or platform unknown on the record.
-        unknown_identity: usize,
-        /// Known, but differs from the plan's.
-        other_identity: usize,
-        /// Matching, but its commit is not an ancestor of the protected base.
-        not_merged: usize,
-    },
+    /// Records exist and none qualifies.
+    NoneQualify(Refusals),
 }
 
-/// Choose the plan's base record.
-///
-/// `identity` reads a record's `(toolchain, platform)` from its `job.json`,
-/// `None` for either when the record does not state it; `want` is the plan's
-/// own. `merged(commit)` says whether `commit` is an ancestor of the protected
-/// base. The newest record passing all three wins.
+/// What a plan requires of its base record. The record format belongs to the
+/// project, so it says how to read a record; the store decides the order.
+pub trait BaseCriteria {
+    /// The record's platform (architecture and OS family), `None` when unstated.
+    fn platform(&self, job: &Value) -> Option<String>;
+    /// The record's toolchain identity, `None` when any part of it is unstated
+    /// or unknown.
+    fn toolchain(&self, job: &Value) -> Option<String>;
+    /// Why the record cannot be keyed against (for example, its link-member or
+    /// object-dependency record is marked unusable), `None` when it can.
+    fn unusable(&self, record: &StoredRecord) -> Option<String>;
+    /// Whether `commit` is an ancestor of the plan's protected base.
+    fn merged(&self, commit: &str) -> bool;
+}
+
+/// A stated value: neither empty nor the literal `unknown`.
+fn stated(value: Option<String>) -> Option<String> {
+    value.filter(|v| {
+        let v = v.trim();
+        !v.is_empty() && !v.eq_ignore_ascii_case("unknown")
+    })
+}
+
+/// Choose the plan's base record: the newest one whose platform, then
+/// toolchain, are stated and equal `want_platform` and `want_toolchain`, that
+/// passes the format's usability rules, and whose commit is merged. Platform
+/// is checked first, since a record from another OS or architecture can carry
+/// a plausible-looking toolchain.
 ///
 /// # Errors
 ///
 /// [`NoBase`] saying why nothing qualified.
-pub fn select_base<I, M>(
+pub fn select_base<C: BaseCriteria>(
     store: &Path,
-    want: (&str, &str),
-    identity: I,
-    merged: M,
-) -> Result<StoredRecord, NoBase>
-where
-    I: Fn(&Value) -> (Option<String>, Option<String>),
-    M: Fn(&str) -> bool,
-{
+    want_platform: &str,
+    want_toolchain: &str,
+    criteria: &C,
+) -> Result<StoredRecord, NoBase> {
     let records = list(store);
     if records.is_empty() {
         return Err(NoBase::Empty);
     }
-    let (mut unknown_identity, mut other_identity, mut not_merged) = (0, 0, 0);
+    let mut refused = Refusals::default();
     for record in records {
-        match identity(&record.job) {
-            (Some(toolchain), Some(platform)) => {
-                if (toolchain.as_str(), platform.as_str()) != want {
-                    other_identity += 1;
-                } else if !merged(&record.commit) {
-                    not_merged += 1;
-                } else {
-                    return Ok(record);
-                }
-            }
-            _ => unknown_identity += 1,
+        match stated(criteria.platform(&record.job)) {
+            None => refused.unknown_platform += 1,
+            Some(platform) if platform != want_platform => refused.other_platform += 1,
+            Some(_) => match stated(criteria.toolchain(&record.job)) {
+                None => refused.unknown_toolchain += 1,
+                Some(toolchain) if toolchain != want_toolchain => refused.other_toolchain += 1,
+                Some(_) if criteria.unusable(&record).is_some() => refused.unusable += 1,
+                Some(_) if !criteria.merged(&record.commit) => refused.not_merged += 1,
+                Some(_) => return Ok(record),
+            },
         }
     }
-    Err(NoBase::NoneQualify {
-        unknown_identity,
-        other_identity,
-        not_merged,
-    })
+    Err(NoBase::NoneQualify(refused))
 }
 
 #[cfg(test)]

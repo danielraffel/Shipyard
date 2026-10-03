@@ -464,12 +464,17 @@ run log ends with one `=== reuse-record: ... ===` line saying which. The store
 keeps the newest 40 records.
 
 `reuse_record_store::select_base` chooses the record a plan compares against:
-the newest one whose toolchain and platform are both stated and equal the
-plan's, and whose commit is an ancestor of the plan's protected base. A record
-from a commit that has not merged is never chosen, since the code that wrote it
-is unreviewed; a record that does not state its toolchain or platform is never
-chosen either. When nothing qualifies the caller learns how many records were
-refused for each reason.
+the newest one whose platform (architecture and OS family), then toolchain, are
+stated and equal the plan's, that passes the record format's own usability
+rules, and whose commit is an ancestor of the plan's protected base. Platform
+is checked first because a record from another OS or architecture can carry a
+plausible-looking toolchain string. An empty or `unknown` value is unstated,
+and an unstated platform or toolchain is a refusal, never a match. A record
+from a commit that has not merged is never chosen, since the code that wrote
+it is unreviewed. The project supplies how to read its records through the
+`BaseCriteria` trait; when nothing qualifies the caller gets a count per
+refusal reason. A pending directory left by a run that never reached filing (a
+cancelled run, or a killed process) is removed after a day.
 
 The lane's stages run the pull request's own code as the host user, so they can
 also write into the store directly. The merged-commit rule limits which records

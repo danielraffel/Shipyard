@@ -788,9 +788,11 @@ build plus the warm incremental remainder before reporting savings or speedup.
 `<state>/reuse-records/OWNER__REPO/` only if a parsing `job.json` was written;
 the run log's last `=== reuse-record: ... ===` line says kept or why not. A
 recorder failure never changes the run's verdict, so read that line rather than
-the exit code to know whether a record exists. `select_base` refuses a record
-from an unmerged commit and one that does not state its toolchain and platform:
-an "unknown" toolchain is a refusal, never a match.
+the exit code to know whether a record exists. `select_base` checks platform
+before toolchain (a record from another OS can carry a plausible toolchain
+string), refuses an unmerged commit, a record the format marks unusable, and
+one that states its platform or toolchain as empty or `unknown`: unknown is a
+refusal, never a match.
 The command is evidence inspection only: it never changes machine mode,
 accepted policy digests, queue state, or merge readiness.
 
