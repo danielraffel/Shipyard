@@ -1110,7 +1110,8 @@ stops growing while a Sandbox E2E job runs on the host is the audit holding
 the writer domain, not a hang; lost lines are counted onto the next one. If
 GitHub records `500 ... EOF` while the listener answers locally, read
 `public ingress:` in `shipyard daemon status`: the public relay, not the
-daemon, is refusing the host. `shipyard daemon status --json` reports
+daemon, is refusing the host. `shipyard daemon reconcile` reports those
+EOF records as unreachable, not as a rejecting endpoint. `shipyard daemon status --json` reports
 `gh_token_cache` mints and hits: mints near the number of repositories, not
 the number of API calls, means token reuse is working. Slugs are matched case-insensitively throughout (cache
 keys and wait filters), so `owner/Repo` and `owner/repo` are one repository. A `shipyard wait` that
