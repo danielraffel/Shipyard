@@ -780,6 +780,17 @@ and fails closed on ambiguous files, identity/digest drift, nonzero results, or
 invalid timing. For schema-v3 build-and-test trials, its selected total includes
 receipt verification and it reconstructs the full-build estimate from selected
 build plus the warm incremental remainder before reporting savings or speedup.
+
+### Reuse records from the local lane stay on the host
+
+`reuse_record = true` on a local validation exports a fresh
+`SHIPYARD_REUSE_RECORD_DIR` to the stages and files it afterwards under
+`<state>/reuse-records/OWNER__REPO/` only if a parsing `job.json` was written;
+the run log's last `=== reuse-record: ... ===` line says kept or why not. A
+recorder failure never changes the run's verdict, so read that line rather than
+the exit code to know whether a record exists. `select_base` refuses a record
+from an unmerged commit and one that does not state its toolchain and platform:
+an "unknown" toolchain is a refusal, never a match.
 The command is evidence inspection only: it never changes machine mode,
 accepted policy digests, queue state, or merge readiness.
 

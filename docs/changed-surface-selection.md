@@ -444,3 +444,35 @@ queue integration: it may eventually suppress the redundant downstream
 selected shadow half, never the downstream full validation. There is no cross-
 invocation artifact reuse, selected build-target substitution, or authoritative
 activation in this slice.
+
+## Host-local reuse records
+
+A plan that keys executables against an earlier build needs that build's
+reuse record (link members, object dependencies, codemodel, verdicts), and the
+record must come from a run on the same toolchain. The local lane has no GitHub
+credentials, so it neither publishes nor fetches artifacts: its records stay on
+the host.
+
+A local target opts in with `reuse_record = true` in its validation table,
+which needs `[project].repository` as an exact `OWNER/REPO` slug (configuration
+fails otherwise). Each run of an opted-in target then gets a fresh, owner-only
+directory exported to its stages as `SHIPYARD_REUSE_RECORD_DIR`; the project's
+own recorder writes there. After the stages finish, whatever their verdict, the
+directory is filed under `<state>/reuse-records/OWNER__REPO/records/<commit>/<run>`
+when it holds a non-empty `job.json` that parses, and removed otherwise. The
+run log ends with one `=== reuse-record: ... ===` line saying which. The store
+keeps the newest 40 records.
+
+`reuse_record_store::select_base` chooses the record a plan compares against:
+the newest one whose toolchain and platform are both stated and equal the
+plan's, and whose commit is an ancestor of the plan's protected base. A record
+from a commit that has not merged is never chosen, since the code that wrote it
+is unreviewed; a record that does not state its toolchain or platform is never
+chosen either. When nothing qualifies the caller learns how many records were
+refused for each reason.
+
+The lane's stages run the pull request's own code as the host user, so they can
+also write into the store directly. The merged-commit rule limits which records
+a plan trusts, but a record's bytes are only as trustworthy as the lane; that is
+why live reuse runs only in a non-required lane, with a sampled re-run behind
+it.
