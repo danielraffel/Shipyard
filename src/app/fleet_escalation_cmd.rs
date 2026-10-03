@@ -58,53 +58,15 @@ pub fn fetch_tracking_issues(
     actions: &GitHubActions,
     repo: &str,
 ) -> Result<Vec<TrackingIssue>, GitHubError> {
-    let raw = actions.run_gh(&[
-        "api".to_owned(),
-        "--paginate".to_owned(),
-        format!("repos/{repo}/issues?state=open&per_page=100"),
-        "--jq".to_owned(),
-        ".[]".to_owned(),
-    ])?;
-
-    let mut issues = Vec::new();
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        // The issues endpoint returns pull requests too. A PR carrying our
-        // marker would be a very odd thing to close as "recovered".
-        if value.get("pull_request").is_some() {
-            continue;
-        }
-        let body = value
-            .get("body")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let Some(key) = parse_marker(body) else {
-            continue;
-        };
-        let Some(number) = value.get("number").and_then(Value::as_u64) else {
-            continue;
-        };
-        issues.push(TrackingIssue {
-            number,
-            key,
-            body: body.to_owned(),
-        });
-    }
-    Ok(issues)
-}
-
-/// Extract the subject key from a body's marker, if it carries one.
-fn parse_marker(body: &str) -> Option<String> {
-    let start = body.find(MARKER_PREFIX)? + MARKER_PREFIX.len();
-    let rest = &body[start..];
-    let end = rest.find("-->")?;
-    let key = rest[..end].trim();
-    if key.is_empty() {
-        return None;
-    }
-    Some(key.to_owned())
+    let raw = actions.run_gh(&crate::marked_issue::list_open_args(repo))?;
+    Ok(crate::marked_issue::parse(&raw, MARKER_PREFIX)
+        .into_iter()
+        .map(|issue| TrackingIssue {
+            number: issue.number,
+            key: issue.key,
+            body: issue.body,
+        })
+        .collect())
 }
 
 /// Carry out one escalation action.

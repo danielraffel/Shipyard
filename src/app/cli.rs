@@ -285,6 +285,15 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: Box<PrWatchCommand>,
     },
+    /// Read the live test-reuse kill switch, or turn it off and file the
+    /// tracking issue. Only the exact value `live` lets a changed-surface plan
+    /// skip work; anything else, including unset or unreadable, is shadow.
+    #[command(name = "reuse")]
+    Reuse {
+        /// Reuse subcommand.
+        #[command(subcommand)]
+        command: Box<ReuseCommand>,
+    },
     /// Plan a fail-closed exact-head changed-surface test selection in shadow mode.
     #[command(name = "changed-surface-plan")]
     ChangedSurfacePlan {
@@ -1158,6 +1167,43 @@ pub(crate) struct MetricsGateCostArgs {
     /// runs.
     #[arg(long)]
     pub(crate) no_cache: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ReuseCommand {
+    /// Read the switch variable and report whether plans would act (`live`)
+    /// or only record (`shadow`), and why.
+    Switch(ReuseSwitchArgs),
+    /// Set the switch variable to `off` and open or update its tracking issue.
+    /// Dry run unless `--apply`; a reason the issue already records is not
+    /// added again.
+    Trip(ReuseTripArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReuseSwitchArgs {
+    /// Owner/repo slug. Defaults to the current checkout's repository.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// The repository variable that holds the switch.
+    #[arg(long)]
+    pub(crate) variable: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReuseTripArgs {
+    /// Owner/repo slug. Defaults to the current checkout's repository.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// The repository variable that holds the switch.
+    #[arg(long)]
+    pub(crate) variable: String,
+    /// Why the switch is being turned off; recorded in the tracking issue.
+    #[arg(long)]
+    pub(crate) reason: String,
+    /// Send the writes. Without it nothing is changed.
+    #[arg(long)]
+    pub(crate) apply: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3521,6 +3567,33 @@ mod tests {
         assert!(
             Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "1",])
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn reuse_trip_is_a_dry_run_unless_applied_and_requires_a_reason() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["shipyard", "reuse", "trip", "--variable", "PULP_REUSE_LIVE"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let cli = parse(&["--reason", "sampled re-run failed"]).expect("trip");
+        let Command::Reuse { command } = cli.command else {
+            panic!("expected reuse");
+        };
+        let super::ReuseCommand::Trip(args) = *command else {
+            panic!("expected trip");
+        };
+        assert!(!args.apply, "a trip sends nothing unless --apply is given");
+        assert_eq!(args.variable, "PULP_REUSE_LIVE");
+        assert!(parse(&[]).is_err(), "a trip must say why");
+        let cli = parse(&["--reason", "r", "--apply"]).expect("applied trip");
+        assert!(
+            matches!(cli.command, Command::Reuse { command } if matches!(*command, super::ReuseCommand::Trip(ref a) if a.apply))
+        );
+        assert!(
+            Cli::try_parse_from(["shipyard", "reuse", "switch"]).is_err(),
+            "the variable is named, never defaulted"
         );
     }
 

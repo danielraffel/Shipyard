@@ -781,6 +781,21 @@ invalid timing. For schema-v3 build-and-test trials, its selected total includes
 receipt verification and it reconstructs the full-build estimate from selected
 build plus the warm incremental remainder before reporting savings or speedup.
 
+### Live test reuse is shadow unless one variable reads exactly `live`
+
+Skipping an executable's build and tests because its source key equals the
+planned base's is gated by a repository variable whose name comes from the
+protected-base configuration. Only the exact value `live`, read fresh, acts;
+`off`, unset, `LIVE`, an unreadable variable and a stale or future-stamped read
+are all shadow (`changed_surface::live_switch::SwitchReading`). Never create the
+variable to "enable shadow": absent already is shadow. `shipyard reuse trip
+--apply` writes `off` before touching the issue, so a failed issue call still
+leaves reuse off, and an unreadable variable is written `off` rather than
+skipped. It refuses when the open issues cannot be listed, since acting then
+risks a duplicate. Run it from the host or scheduled job that observed the
+failure: a PR workflow can read the repo's secrets, so a trip it performs is
+not evidence of anything.
+
 ### Reuse records from the local lane stay on the host
 
 `reuse_record = true` on a local validation exports a fresh
