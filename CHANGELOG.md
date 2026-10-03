@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02660"></a>
+## [0.266.0] - 2026-10-03
+
+- feat/reuse live switch ([#702](https://github.com/danielraffel/Shipyard/pull/702))
+
 <a id="v02650"></a>
 ## [0.265.0] - 2026-10-03
 
@@ -1888,6 +1893,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.266.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.266.0
 [0.265.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.265.0
 [0.264.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.264.0
 [0.263.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.263.0
