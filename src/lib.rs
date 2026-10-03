@@ -143,6 +143,8 @@ pub mod lane_policy;
 /// Bounded log rotation, terminal classification, and retention primitives.
 pub mod log_retention;
 /// Merge-queue enqueue / poll / eviction supervision engine.
+/// Open issues a subsystem owns, found by a body marker.
+pub mod marked_issue;
 pub mod merge_queue;
 /// Fleet authority, serialization, hold, and audit controls for queue writes.
 pub mod merge_queue_control;
@@ -226,6 +228,8 @@ pub mod recovery_worker;
 pub mod registrar;
 /// Canonical identity of a watched repository after a rename or transfer.
 pub mod repo_slug;
+/// Read and write one GitHub Actions repository variable.
+pub mod repo_variable;
 /// Shared parsing for classic and ruleset required-check policies.
 pub mod required_check_policy;
 /// Cloud→local macOS reroute decision logic (#316 Part C).

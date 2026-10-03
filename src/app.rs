@@ -57,6 +57,7 @@ mod queue_observer_cmd;
 mod release_bot_cmd;
 mod reroute_cmd;
 mod rescue_cmd;
+mod reuse_cmd;
 mod run_cmd;
 mod runner_cmd;
 mod runner_kill_cmd;
@@ -582,6 +583,15 @@ where
                 stdout,
             );
         }
+        Command::Reuse { command } => {
+            let config = LoadedConfig::load_from_cwd_with_global_dir(
+                cli.mode.into(),
+                &cwd,
+                runtime_paths.global_dir.clone(),
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            return reuse_cmd::reuse_command(*command, &config, &cwd, cli.json, stdout);
+        }
         Command::ChangedSurfacePlan {
             target,
             pr,
@@ -753,6 +763,7 @@ fn handle_operational_variant<W: Write>(
         | Command::QueueHold { .. }
         | Command::QueueObserve { .. }
         | Command::PrWatch { .. }
+        | Command::Reuse { .. }
         | Command::ChangedSurfacePlan { .. }
         | Command::ChangedSurfaceTrialStatus { .. }
         | Command::ParallelProofCanary { .. }
