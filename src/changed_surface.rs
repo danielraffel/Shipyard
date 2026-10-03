@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 mod execution;
 pub(crate) mod integration_checkout;
+pub mod live_switch;
 mod stale_base;
 pub mod trial;
 pub use execution::{

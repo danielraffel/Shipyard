@@ -26,6 +26,7 @@ use serde_json::Value;
 use super::CliFailure;
 use crate::cloud::GitHubActions;
 use crate::output::{SCHEMA_VERSION, write_json_envelope};
+use crate::repo_variable::{is_not_found, write_args as variable_write_args};
 use crate::runner_provision::ApiLabel;
 
 const FLEET_OBSERVATION_TIMEOUT: StdDuration = StdDuration::from_secs(20);
@@ -609,23 +610,6 @@ fn apply_decision_with_timeout(
             Ok("cleared".to_owned())
         }
     }
-}
-
-fn variable_write_args(method: &str, path: &str, variable: &str, value: &str) -> Vec<String> {
-    vec![
-        "api".to_owned(),
-        "--method".to_owned(),
-        method.to_owned(),
-        path.to_owned(),
-        "--raw-field".to_owned(),
-        format!("name={variable}"),
-        "--raw-field".to_owned(),
-        format!("value={value}"),
-    ]
-}
-
-fn is_not_found(error: &str) -> bool {
-    error.contains("HTTP 404") || error.contains("Not Found (HTTP 404)")
 }
 
 #[allow(clippy::too_many_arguments)]

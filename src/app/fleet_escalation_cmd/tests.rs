@@ -309,9 +309,18 @@ fn negative_control_an_unreadable_list_errors_rather_than_reading_empty() {
 fn a_marker_round_trips() {
     let key = "host=macpro lane=PULP_AUTO_LINUX_RUNS_ON_JSON";
     let body = format!("{}\n\nrest", marker_for(key));
-    assert_eq!(parse_marker(&body).as_deref(), Some(key));
-    assert_eq!(parse_marker("no marker"), None);
-    assert_eq!(parse_marker("<!-- shipyard-fleet-subject:  -->"), None);
+    assert_eq!(
+        crate::marked_issue::marker_key(&body, MARKER_PREFIX).as_deref(),
+        Some(key)
+    );
+    assert_eq!(
+        crate::marked_issue::marker_key("no marker", MARKER_PREFIX),
+        None
+    );
+    assert_eq!(
+        crate::marked_issue::marker_key("<!-- shipyard-fleet-subject:  -->", MARKER_PREFIX),
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------

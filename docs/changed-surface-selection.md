@@ -444,3 +444,37 @@ queue integration: it may eventually suppress the redundant downstream
 selected shadow half, never the downstream full validation. There is no cross-
 invocation artifact reuse, selected build-target substitution, or authoritative
 activation in this slice.
+
+## Live-reuse kill switch
+
+A plan that skips building and testing an executable because nothing it is
+built from changed acts only while a repository variable reads exactly
+`live`. Every other state is shadow, where the plan is recorded and nothing is
+skipped: `off`, an unset variable, any other value (including `LIVE`), a
+variable that could not be read, and a read older than the plan's freshness
+bound or stamped in the future. No setup is needed for the safe default; the
+variable does not have to exist.
+
+```bash
+shipyard reuse switch --variable PULP_REUSE_LIVE           # live or shadow, and why
+shipyard reuse trip --variable PULP_REUSE_LIVE --reason "sampled re-run failed: <test>"          # dry run
+shipyard reuse trip --variable PULP_REUSE_LIVE --reason "sampled re-run failed: <test>" --apply
+```
+
+`--repo OWNER/REPO` overrides the checkout's repository. The variable's name is
+always given explicitly; nothing defaults it.
+
+A trip runs on the host that observed the problem, never from a pull request's
+workflow. It writes `off` first, because turning live reuse off is the action
+that protects, then opens one tracking issue (found again by the body marker
+`<!-- shipyard-reuse-trip: OWNER/REPO:VARIABLE -->`, so a retitled issue is not
+duplicated) or appends the new reason to it. A reason the issue already
+records is not added twice, and a switch that already reads `off` is not
+rewritten, so repeating a trip is harmless. Anything other than a clean `off`,
+including an unreadable variable, is written `off`. If the open issues cannot
+be listed the trip refuses rather than risk a duplicate; if the variable write
+fails the issue is still filed and the command exits non-zero naming the
+failure.
+
+`crate::changed_surface::live_switch` holds the policy (`SwitchReading`,
+`plan_trip`) as pure functions; `shipyard reuse` is its `gh` half.
