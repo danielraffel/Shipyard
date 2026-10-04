@@ -170,17 +170,16 @@ impl ExecutableReusePolicy {
                 self.build_dir
             ));
         }
-        if self.platform_probe.first().is_none_or(String::is_empty) {
-            return Err("executable_reuse.platform_probe must name a command".to_owned());
+        if !isolated_python(&self.platform_probe) {
+            return Err(
+                "executable_reuse.platform_probe must run a Python interpreter with -I".to_owned(),
+            );
         }
-        if self.rederive.is_empty()
-            || self
-                .rederive
-                .iter()
-                .any(|command| command.first().is_none_or(String::is_empty))
+        if self.rederive.is_empty() || !self.rederive.iter().all(|command| isolated_python(command))
         {
             return Err(
-                "executable_reuse.rederive must list commands, each naming a program".to_owned(),
+                "executable_reuse.rederive must list commands, each running a Python interpreter with -I"
+                    .to_owned(),
             );
         }
         if !(1..=100).contains(&self.sample_percent) {
@@ -191,6 +190,21 @@ impl ExecutableReusePolicy {
         }
         Ok(())
     }
+}
+
+/// Whether `command` runs a Python interpreter (`python`, `python3` or
+/// `python3.N`, by name or path) in isolated mode (`-I`), so the base key
+/// code runs without the user's site packages, `PYTHON*` variables or the
+/// script directory on its import path.
+fn isolated_python(command: &[String]) -> bool {
+    let [program, flag, ..] = command else {
+        return false;
+    };
+    let name = program.rsplit('/').next().unwrap_or(program);
+    let versioned = name
+        .strip_prefix("python3.")
+        .is_some_and(|minor| !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()));
+    (name == "python" || name == "python3" || versioned) && flag == "-I"
 }
 
 /// A repository-relative path with no glob, no backslash and no `.`/`..` or
@@ -677,8 +691,12 @@ mod tests {
             derivation_paths: vec!["tools/ci/executable_keys.py".to_owned()],
             sample_percent: DEFAULT_SAMPLE_PERCENT,
             build_dir: "build".to_owned(),
-            platform_probe: vec!["python3".to_owned(), "probe.py".to_owned()],
-            rederive: vec![vec!["python3".to_owned(), "keys.py".to_owned()]],
+            platform_probe: vec!["python3".to_owned(), "-I".to_owned(), "probe.py".to_owned()],
+            rederive: vec![vec![
+                "python3".to_owned(),
+                "-I".to_owned(),
+                "keys.py".to_owned(),
+            ]],
             base_record: rules(),
         }
     }
@@ -804,12 +822,38 @@ mod tests {
             };
             assert!(policy.validate().unwrap_err().contains("platform_probe"));
         }
-        for bad in [Vec::new(), vec![Vec::new()], vec![vec![String::new()]]] {
+        let argv = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        for bad in [
+            Vec::new(),
+            vec![Vec::new()],
+            vec![argv(&["python3", "keys.py"])],
+            vec![argv(&["sh", "-I", "keys.sh"])],
+            vec![argv(&["python3", "-I", "a.py"]), argv(&["python3", "b.py"])],
+        ] {
             let policy = ExecutableReusePolicy {
                 rederive: bad,
                 ..valid()
             };
             assert!(policy.validate().unwrap_err().contains("rederive"));
+        }
+        for good in [
+            argv(&["python3", "-I", "k.py"]),
+            argv(&["/usr/bin/python3", "-I", "k.py"]),
+            argv(&["python3.12", "-I", "k.py"]),
+        ] {
+            let policy = ExecutableReusePolicy {
+                platform_probe: good.clone(),
+                rederive: vec![good],
+                ..valid()
+            };
+            assert_eq!(policy.validate(), Ok(()));
+        }
+        for bad in [argv(&["python3.x", "-I"]), argv(&["mypython3", "-I"])] {
+            let policy = ExecutableReusePolicy {
+                platform_probe: bad,
+                ..valid()
+            };
+            assert!(policy.validate().unwrap_err().contains("platform_probe"));
         }
         assert_eq!(valid().validate(), Ok(()));
     }

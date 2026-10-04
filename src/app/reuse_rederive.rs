@@ -649,16 +649,19 @@ where
         let Ok(results) = named_files(&trial_dir, "result-") else {
             continue;
         };
-        let [(name, bytes)] = results.as_slice() else {
+        let [(_, bytes)] = results.as_slice() else {
             continue;
         };
         let receipt = format!("{REDERIVATION_RECEIPT_PREFIX}{}.json", sha256_hex(bytes));
         if trial_dir.join(receipt).exists() {
             continue;
         }
-        let filed = fs::metadata(trial_dir.join(name))
-            .and_then(|meta| meta.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
+        // The adapter's own record time, not a filesystem timestamp: two
+        // results filed within one mtime tick must still order newest first.
+        let recorded = serde_json::from_slice::<Value>(bytes)
+            .ok()
+            .and_then(|result| result.get("recorded_at_unix_ns").and_then(Value::as_u64))
+            .unwrap_or(0);
         let identity = TrialIdentity {
             repository: plan.repository,
             pull_request: plan.pull_request,
@@ -666,14 +669,14 @@ where
             head_sha: plan.head_sha,
         };
         if result_directory(state_dir, &identity) == trial_dir {
-            pending.push((filed, identity));
+            pending.push((recorded, trial_dir, identity));
         }
     }
-    pending.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    pending.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     pending
         .into_iter()
         .take(cap)
-        .map(|(_, identity)| {
+        .map(|(_, _, identity)| {
             let outcome = rederive_trial(state_dir, &identity, ProducedBy::Sweep, gh);
             (identity, outcome)
         })
@@ -710,12 +713,19 @@ fn trial_dirs(root: &Path) -> Vec<PathBuf> {
     level
 }
 
+/// The only environment a base-declared command inherits.
+const COMMAND_ENV: [&str; 4] = ["PATH", "HOME", "TMPDIR", "LANG"];
+/// How much of a failing command's stderr its error keeps.
+const STDERR_TAIL: usize = 300;
+
 /// Run one base-declared command from the materialized derivation code with a
-/// bounded wait and bounded output, returning its stdout.
+/// bounded wait, bounded output and only [`COMMAND_ENV`] from this process's
+/// environment, returning its stdout.
 ///
 /// # Errors
 ///
-/// Why it could not run, timed out, failed, or printed too much.
+/// Why it could not run, timed out, failed (with the end of its stderr), or
+/// printed too much.
 pub(crate) fn run_base_command(
     command: &[String],
     code_dir: &Path,
@@ -724,22 +734,43 @@ pub(crate) fn run_base_command(
     let (program, args) = command
         .split_first()
         .ok_or_else(|| format!("{what} names no command"))?;
-    let mut child = Command::new(program)
+    let mut child = Command::new(program);
+    child
         .args(args)
         .current_dir(code_dir)
+        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped());
+    for name in COMMAND_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            child.env(name, value);
+        }
+    }
+    let mut child = child
         .spawn()
         .map_err(|error| format!("cannot start {what}: {error}"))?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(MAX_COMMAND_OUTPUT + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
+    let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(stream) = stream {
+                let _ = stream.take(MAX_COMMAND_OUTPUT + 1).read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|err| Box::new(err) as Box<dyn std::io::Read + Send>),
+    );
     let status = match child.wait_timeout(COMMAND_TIMEOUT) {
         Ok(Some(status)) => status,
         Ok(None) => {
@@ -755,12 +786,16 @@ pub(crate) fn run_base_command(
             return Err(format!("cannot wait for {what}: {error}"));
         }
     };
-    let bytes = reader
+    let bytes = stdout
         .join()
-        .map_err(|_| format!("{what}'s reader panicked"))?
-        .map_err(|error| format!("cannot read {what}: {error}"))?;
+        .map_err(|_| format!("{what}'s reader panicked"))?;
+    let errors = stderr.join().unwrap_or_default();
     if !status.success() {
-        return Err(format!("{what} failed ({status})"));
+        let tail = &errors[errors.len().saturating_sub(STDERR_TAIL)..];
+        return Err(format!(
+            "{what} failed ({status}): {}",
+            String::from_utf8_lossy(tail).trim()
+        ));
     }
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_COMMAND_OUTPUT {
         return Err(format!("{what} printed too much"));
@@ -869,10 +904,10 @@ test_topology_paths = ["tests/**"]
 
 [targets.mac.changed_surface_selection.executable_reuse]
 switch_variable = "PULP_REUSE_LIVE"
-derivation_paths = ["rederive.sh"]
+derivation_paths = ["rederive.py"]
 build_dir = "build"
-platform_probe = ["sh", "probe.sh"]
-rederive = [["sh", "rederive.sh", "{result_dir}", "{out_dir}", "{base_record_run_id}"]]
+platform_probe = ["python3", "-I", "probe.py"]
+rederive = [["python3", "-I", "rederive.py", "{result_dir}", "{out_dir}", "{base_record_run_id}"]]
 
 [targets.mac.changed_surface_selection.executable_reuse.base_record]
 platform = "/platform"
@@ -886,7 +921,9 @@ supported_build_types = ["debug"]
 "#;
 
     /// A faithful re-derivation: the host writes what the runner wrote.
-    const FAITHFUL: &str = "cp \"$1/executable-keys.json\" \"$1/selection.json\" \"$2/\"\n";
+    const FAITHFUL: &str = "import shutil, sys\n\
+        for name in ('executable-keys.json', 'selection.json'):\n\
+        \x20   shutil.copy(sys.argv[1] + '/' + name, sys.argv[2])\n";
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -918,7 +955,7 @@ supported_build_types = ["debug"]
         let state = root.path().join("state");
         fs::create_dir_all(repo.join(".shipyard")).expect("repo");
         fs::write(repo.join(".shipyard/config.toml"), CONFIG).expect("config");
-        fs::write(repo.join("rederive.sh"), script).expect("script");
+        fs::write(repo.join("rederive.py"), script).expect("script");
         git(&repo, &["init", "-q"]);
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-qm", "base"]);
@@ -1031,10 +1068,18 @@ supported_build_types = ["debug"]
             fs::write(dir.join(name), &bytes).expect("input");
             derived.insert(key.into(), json!(sha256_hex(bytes.as_bytes())));
         }
-        let mut result = json!({"executable_reuse": {"derived": derived}});
+        let mut result = json!({
+            "recorded_at_unix_ns": recorded_at(head),
+            "executable_reuse": {"derived": derived},
+        });
         edit(&mut result);
         fs::write(dir.join("result-1.json"), result.to_string()).expect("result");
         identity
+    }
+
+    /// A distinct adapter record time per fixture head (`h1` < `h2` < ...).
+    fn recorded_at(head: &str) -> u64 {
+        1_000 + head.trim_start_matches('h').parse::<u64>().unwrap_or(0)
     }
 
     type Calls = RefCell<Vec<Vec<String>>>;
@@ -1118,7 +1163,9 @@ supported_build_types = ["debug"]
     #[test]
     fn a_host_rederivation_that_disagrees_is_refused_and_counted_once_per_result() {
         let fixture = fixture(
-            "printf '{\"other\": 1}\\n' > \"$2/selection.json\"\ncp \"$1/executable-keys.json\" \"$2/\"\n",
+            "import shutil, sys\n\
+             open(sys.argv[2] + '/selection.json', 'w').write('{\"other\": 1}\\n')\n\
+             shutil.copy(sys.argv[1] + '/executable-keys.json', sys.argv[2])\n",
         );
         let calls = Calls::default();
         let first = keyed_run(&fixture, "h1", |_| {});
@@ -1235,8 +1282,10 @@ supported_build_types = ["debug"]
     #[test]
     fn the_sweep_picks_up_runs_without_a_verdict_and_names_itself() {
         let fixture = fixture(FAITHFUL);
-        let older = keyed_run(&fixture, "h1", |_| {});
+        // Filed newest first, so the filesystem's order contradicts the
+        // adapter's record times: only the record time can order these.
         let newer = keyed_run(&fixture, "h2", |_| {});
+        let older = keyed_run(&fixture, "h1", |_| {});
         let gh = |_: &Path, _: &[String]| Err("offline".to_owned());
         let swept = sweep(&fixture.state, 1, &gh);
         assert_eq!(swept.len(), 1, "capped");
@@ -1249,6 +1298,23 @@ supported_build_types = ["debug"]
         let written: Value = serde_json::from_slice(&receipt[0].1).expect("json");
         assert_eq!(written["produced_by"], "sweep");
         assert!(sweep(&fixture.state, 8, &gh).is_empty());
+    }
+
+    #[test]
+    fn the_sweep_breaks_a_record_time_tie_by_path() {
+        let fixture = fixture(FAITHFUL);
+        let a = keyed_run(&fixture, "h1", |_| {});
+        let b = keyed_run(&fixture, "h1x", |result| {
+            result["recorded_at_unix_ns"] = json!(recorded_at("h1"));
+        });
+        let gh = |_: &Path, _: &[String]| Err("offline".to_owned());
+        let first = sweep(&fixture.state, 1, &gh).remove(0).0;
+        let want = if result_directory(&fixture.state, &a) < result_directory(&fixture.state, &b) {
+            a
+        } else {
+            b
+        };
+        assert_eq!(first, want, "equal record times order by trial directory");
     }
 
     #[test]
@@ -1266,6 +1332,57 @@ supported_build_types = ["debug"]
             record_refusal(state.path(), "other/repo", "h1", "r1", "why").expect("count"),
             1,
             "counted per repository"
+        );
+    }
+
+    #[test]
+    fn a_base_command_sees_only_the_allowed_environment_and_reports_its_stderr() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = |code: &str| {
+            run_base_command(
+                &[
+                    "python3".to_owned(),
+                    "-I".to_owned(),
+                    "-c".to_owned(),
+                    code.to_owned(),
+                ],
+                dir.path(),
+                "the probe",
+            )
+        };
+        let outside: Vec<String> = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| !COMMAND_ENV.contains(&name.as_str()))
+            .collect();
+        assert!(
+            !outside.is_empty(),
+            "control: this process has other variables"
+        );
+        let seen = run("import os, json; print(json.dumps(sorted(os.environ)))").expect("run");
+        let names: Vec<String> = serde_json::from_slice(&seen).expect("json");
+        for name in &outside {
+            // The interpreter may set a locale variable itself; nothing else
+            // from this process may reach the command.
+            assert!(
+                !names.contains(name) || name.starts_with("LC_") || name.starts_with("__CF"),
+                "{name} leaked"
+            );
+        }
+        assert!(
+            names.contains(&"PATH".to_owned()),
+            "control: PATH is passed"
+        );
+
+        let long = "x".repeat(500);
+        let error = run(&format!(
+            "import sys; sys.stderr.write('{long}TAIL'); sys.exit(3)"
+        ))
+        .expect_err("fails");
+        assert!(error.ends_with("TAIL"), "{error}");
+        assert!(
+            error.len() < 400,
+            "only the stderr tail is kept: {}",
+            error.len()
         );
     }
 }
