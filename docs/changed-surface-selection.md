@@ -478,3 +478,43 @@ failure.
 
 `crate::changed_surface::live_switch` holds the policy (`SwitchReading`,
 `plan_trip`) as pure functions; `shipyard reuse` is its `gh` half.
+
+## Host-local reuse records
+
+A plan that keys executables against an earlier build needs that build's
+reuse record (link members, object dependencies, codemodel, verdicts), and the
+record must come from a run on the same toolchain. The local lane has no GitHub
+credentials, so it neither publishes nor fetches artifacts: its records stay on
+the host.
+
+A local target opts in with `reuse_record = true` in its validation table,
+which needs `[project].repository` as an exact `OWNER/REPO` slug (configuration
+fails otherwise). Each run of an opted-in target then gets a fresh, owner-only
+directory exported to its stages as `SHIPYARD_REUSE_RECORD_DIR`; the project's
+own recorder writes there. After the stages finish, whatever their verdict, the
+directory is filed under `<state>/reuse-records/OWNER__REPO/records/<commit>/<run>`
+when it holds a non-empty `job.json` that parses, and removed otherwise. The
+run log ends with one `=== reuse-record: ... ===` line saying which. The store
+keeps the newest 40 records.
+
+`reuse_record_store::select_base` chooses the record a plan compares against:
+the newest one whose platform (architecture and OS family), then toolchain, are
+stated and equal the plan's, that passes the record format's own usability
+rules, and whose commit is an ancestor of the plan's protected base. Platform
+is checked first because a record from another OS or architecture can carry a
+plausible-looking toolchain string. An empty or `unknown` value is unstated,
+and an unstated platform or toolchain is a refusal, never a match. A record
+from a commit that has not merged is never chosen, since the code that wrote
+it is unreviewed. "Merged" means the commit is an ancestor of the protected
+base, which holds for a pull request's own commits only when it lands with a
+merge commit; a squash or rebase landing rewrites them, so their records are
+never chosen. The project supplies how to read its records through the
+`BaseCriteria` trait; when nothing qualifies the caller gets a count per
+refusal reason. A pending directory left by a run that never reached filing (a
+cancelled run, or a killed process) is removed after a day.
+
+The lane's stages run the pull request's own code as the host user, so they can
+also write into the store directly. The merged-commit rule limits which records
+a plan trusts, but a record's bytes are only as trustworthy as the lane; that is
+why live reuse runs only in a non-required lane, with a sampled re-run behind
+it.

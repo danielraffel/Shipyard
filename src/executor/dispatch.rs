@@ -434,10 +434,14 @@ impl ExecutorDispatcher {
         prepared_state_store: Option<PreparedStateStore>,
         state_dir: &std::path::Path,
     ) -> Self {
-        Self::new_with_host_pool_store(
+        let mut dispatcher = Self::new_with_host_pool_store(
             prepared_state_store,
             Some(HostPoolLeaseStore::new(default_lease_path(state_dir))),
-        )
+        );
+        dispatcher.local = dispatcher
+            .local
+            .with_reuse_record_root(state_dir.to_path_buf());
+        dispatcher
     }
 
     /// Construct a dispatcher with state-backed leases and configured log retention.
@@ -1274,7 +1278,13 @@ fn resolve_backend_target(
     backend_name: &str,
 ) -> Result<ResolvedTarget, DispatchError> {
     match backend_name {
-        "local" => resolved_local(name, platform, table, validation_table),
+        "local" => resolved_local(
+            name,
+            platform,
+            table,
+            validation_table,
+            project_repository(data),
+        ),
         "ssh" => resolved_ssh(name, platform, backend_name, table, validation_table),
         "ssh-windows" => resolved_windows(name, platform, backend_name, table, validation_table),
         "cloud" => resolved_cloud(data, name, platform, table),
@@ -1286,13 +1296,44 @@ fn resolve_backend_target(
     }
 }
 
+/// `[project].repository` when it is an exact `OWNER/REPO` slug.
+fn project_repository(data: &Table) -> Option<&str> {
+    data.get("project")
+        .and_then(Value::as_table)
+        .and_then(|project| project.get("repository"))
+        .and_then(Value::as_str)
+        .filter(|slug| valid_repository_slug(slug))
+}
+
+/// The repository whose host-local reuse-record store this target's runs
+/// write to, when its validation sets `reuse_record = true`.
+fn reuse_record_repository(
+    name: &str,
+    validation_table: &Table,
+    repository: Option<&str>,
+) -> Result<Option<String>, DispatchError> {
+    if !bool_value(validation_table, "reuse_record").unwrap_or(false) {
+        return Ok(None);
+    }
+    repository.map(|slug| Some(slug.to_owned())).ok_or_else(|| {
+        DispatchError::InvalidValidationConfig {
+            target: name.to_owned(),
+            reason: "reuse_record = true needs [project].repository as an exact OWNER/REPO slug, \
+                     which names the host-local record store"
+                .to_owned(),
+        }
+    })
+}
+
 fn resolved_local(
     name: &str,
     platform: &str,
     table: &Table,
     validation_table: &Table,
+    repository: Option<&str>,
 ) -> Result<ResolvedTarget, DispatchError> {
     let contract = parse_contract(name, validation_table.get("contract"))?;
+    let reuse_record_repository = reuse_record_repository(name, validation_table, repository)?;
     let machine_environment = strict_string_array(validation_table, "machine_environment", name)?;
     let target = LocalTargetConfig {
         name: name.to_owned(),
@@ -1308,6 +1349,7 @@ fn resolved_local(
         allow_tree_drift: bool_value(validation_table, "_allow_tree_drift").unwrap_or(false),
         machine_environment,
         environment: BTreeMap::new(),
+        reuse_record_repository,
         integration_cleanup: None,
     };
     Ok(ResolvedTarget {
@@ -1481,7 +1523,16 @@ fn resolved_host_pool(
     let members = pool
         .members
         .iter()
-        .map(|member| resolved_host_pool_member(name, platform, table, validation_table, member))
+        .map(|member| {
+            resolved_host_pool_member(
+                name,
+                platform,
+                table,
+                validation_table,
+                member,
+                project_repository(data),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ResolvedTarget {
         name: name.to_owned(),
@@ -1509,6 +1560,7 @@ fn resolved_host_pool_member(
     table: &Table,
     validation_table: &Table,
     member: &HostPoolMemberConfig,
+    repository: Option<&str>,
 ) -> Result<ResolvedHostPoolMember, DispatchError> {
     let mut member_table = table.clone();
     member_table.remove("fallback");
@@ -1537,7 +1589,7 @@ fn resolved_host_pool_member(
     }
 
     let target = match member.backend_type.as_str() {
-        "local" => resolved_local(name, platform, &member_table, validation_table)?,
+        "local" => resolved_local(name, platform, &member_table, validation_table, repository)?,
         "ssh" => resolved_ssh(name, platform, "ssh", &member_table, validation_table)?,
         backend => {
             return Err(invalid_target(
@@ -2618,6 +2670,38 @@ backend = "local"
         }
         escaped.push('"');
         escaped
+    }
+
+    #[test]
+    fn reuse_record_names_the_projects_store_and_needs_a_repository() {
+        let lane = |project: &str, opt_in: &str| {
+            table(&format!(
+                "{project}\n[validation]\ntest = \"true\"\n{opt_in}\n\
+                 [targets.mac]\nbackend = \"local\"\nplatform = \"macos-arm64\"\n"
+            ))
+        };
+        let repository =
+            |config: &Table| match resolve_targets_from_table(config, ValidationMode::Full)
+                .expect("targets")
+                .remove(0)
+                .validation
+            {
+                ResolvedValidation::Local(validation) => validation.reuse_record_repository,
+                other => panic!("expected local validation, got {other:?}"),
+            };
+        let project = "[project]\nrepository = \"owner/repo\"";
+        assert_eq!(repository(&lane(project, "")), None, "off unless asked for");
+        assert_eq!(
+            repository(&lane(project, "reuse_record = true")).as_deref(),
+            Some("owner/repo")
+        );
+        let error =
+            resolve_targets_from_table(&lane("", "reuse_record = true"), ValidationMode::Full)
+                .expect_err("no repository");
+        assert!(
+            matches!(&error, DispatchError::InvalidValidationConfig { reason, .. } if reason.contains("[project].repository")),
+            "{error:?}"
+        );
     }
 
     #[test]

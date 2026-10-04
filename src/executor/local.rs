@@ -185,6 +185,9 @@ pub struct LocalValidationConfig {
     pub machine_environment: Vec<String>,
     /// Resolved trusted environment values applied to every validation stage.
     pub environment: BTreeMap<String, String>,
+    /// Repository whose host-local reuse-record store each run writes to
+    /// (`reuse_record = true`); `None` records nothing.
+    pub reuse_record_repository: Option<String>,
     /// Exact isolated integration checkout removed after terminal validation.
     pub(crate) integration_cleanup:
         Option<Box<crate::changed_surface::integration_checkout::IntegrationCheckout>>,
@@ -233,6 +236,7 @@ impl LocalValidationRequest<'_> {
 pub struct LocalExecutor {
     prepared_state_store: Option<PreparedStateStore>,
     rotated_segments: usize,
+    reuse_record_root: Option<PathBuf>,
 }
 
 impl Default for LocalExecutor {
@@ -248,6 +252,7 @@ impl LocalExecutor {
         Self {
             prepared_state_store,
             rotated_segments: crate::log_retention::LogRetentionPolicy::default().rotated_segments,
+            reuse_record_root: None,
         }
     }
 
@@ -255,6 +260,14 @@ impl LocalExecutor {
     #[must_use]
     pub fn with_rotated_segments(mut self, rotated_segments: usize) -> Self {
         self.rotated_segments = rotated_segments;
+        self
+    }
+
+    /// Store each opted-in run's reuse record under this state directory
+    /// (see [`crate::reuse_record_store`]).
+    #[must_use]
+    pub fn with_reuse_record_root(mut self, state_dir: PathBuf) -> Self {
+        self.reuse_record_root = Some(state_dir);
         self
     }
 
@@ -285,6 +298,7 @@ impl LocalExecutor {
                 return io_error_result(&context, &error.to_string());
             }
         };
+        let reuse_record = self.open_reuse_record(&request, &mut environment);
         let context = LocalRunContext {
             target: &request.target,
             environment: &environment,
@@ -336,6 +350,7 @@ impl LocalExecutor {
                 Some(start_time.elapsed().as_secs_f64()),
             ),
         };
+        Self::file_reuse_record(reuse_record, &request.sha, context.log_path);
         if let Some((head, tree, clean)) = source {
             result.source_head_sha = Some(head);
             result.source_tree_sha = Some(tree);
@@ -384,6 +399,54 @@ impl LocalExecutor {
             Ok(result) => single_result(context, contract, result),
             Err(error) => streaming_error_result(context, error),
         }
+    }
+
+    /// The run's pending record directory, exported to the stages as
+    /// [`crate::reuse_record_store::RECORD_DIR_ENV`], when this target
+    /// records and the run has a commit to file it under.
+    fn open_reuse_record(
+        &self,
+        request: &LocalValidationRequest<'_>,
+        environment: &mut BTreeMap<String, String>,
+    ) -> Result<Option<(PathBuf, PathBuf)>, String> {
+        let (Some(root), Some(repository)) = (
+            self.reuse_record_root.as_deref(),
+            request.validation.reuse_record_repository.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        if request.sha.is_empty() {
+            return Err("reuse-record: the run has no commit, so nothing is recorded".to_owned());
+        }
+        let store = crate::reuse_record_store::store_dir(root, repository);
+        let pending = crate::reuse_record_store::create_pending(&store, &request.sha, Utc::now())
+            .map_err(|error| format!("reuse-record: no pending directory: {error}"))?;
+        environment.insert(
+            crate::reuse_record_store::RECORD_DIR_ENV.to_owned(),
+            pending.to_string_lossy().into_owned(),
+        );
+        Ok(Some((store, pending)))
+    }
+
+    /// File the run's record and note the outcome in the run log. The stages
+    /// truncate the log when they start, so the note goes after them; a
+    /// recording problem never changes the verdict.
+    fn file_reuse_record(
+        opened: Result<Option<(PathBuf, PathBuf)>, String>,
+        sha: &str,
+        log_path: &Path,
+    ) {
+        use crate::reuse_record_store::{Filed, file};
+        let line = match opened {
+            Ok(None) => return,
+            Err(note) => note,
+            Ok(Some((store, pending))) => match file(&store, &pending, sha) {
+                Ok(Filed::Kept(path)) => format!("reuse-record: kept {}", path.display()),
+                Ok(Filed::Discarded(why)) => format!("reuse-record: not kept: {why}"),
+                Err(error) => format!("reuse-record: filing failed: {error}"),
+            },
+        };
+        let _ = append_log(log_path, &format!("=== {line} ===\n"));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1346,6 +1409,55 @@ mod tests {
         request.branch = "test-branch".to_owned();
         request.target = target();
         request
+    }
+
+    // The stages are POSIX shell; Windows runs stages through its own shell.
+    #[cfg(unix)]
+    #[test]
+    fn an_opted_in_run_files_the_record_its_stages_write() {
+        let repo = tempfile::tempdir().expect("repo");
+        init_git_repo(repo.path());
+        let state = tempfile::tempdir().expect("state");
+        let store = crate::reuse_record_store::store_dir(state.path(), "owner/repo");
+        let executor = LocalExecutor::default().with_reuse_record_root(state.path().to_path_buf());
+        let run = |name: &str, test: &str, repository: Option<&str>| {
+            let validation = LocalValidationConfig {
+                stages: BTreeMap::from([("test".to_owned(), test.to_owned())]),
+                reuse_record_repository: repository.map(str::to_owned),
+                ..LocalValidationConfig::default()
+            };
+            let mut req = request(repo.path().join(format!("{name}.log")), validation);
+            req.target.cwd = Some(repo.path().to_path_buf());
+            let _result = executor.validate(req);
+            std::fs::read_to_string(repo.path().join(format!("{name}.log"))).expect("log")
+        };
+
+        // A failing run still files what it recorded: the record is evidence
+        // whichever way the tests went.
+        let log = run(
+            "writes",
+            r#"printf '{"job":1}' > "$SHIPYARD_REUSE_RECORD_DIR/job.json"; exit 3"#,
+            Some("owner/repo"),
+        );
+        assert!(log.contains("reuse-record: kept"), "{log}");
+        let records = crate::reuse_record_store::list(&store);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].commit, "abc1234");
+
+        let log = run("silent", "true", Some("owner/repo"));
+        assert!(log.contains("reuse-record: not kept: no job.json"), "{log}");
+        assert_eq!(crate::reuse_record_store::list(&store).len(), 1);
+
+        // Without the opt-in the stages see no directory and nothing is noted.
+        let log = run(
+            "off",
+            r#"test -z "${SHIPYARD_REUSE_RECORD_DIR:-}" || exit 9; echo clean"#,
+            None,
+        );
+        assert!(
+            log.contains("clean") && !log.contains("reuse-record"),
+            "{log}"
+        );
     }
 
     #[test]

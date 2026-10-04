@@ -795,6 +795,19 @@ skipped. It refuses when the open issues cannot be listed, since acting then
 risks a duplicate. Run it from the host or scheduled job that observed the
 failure: a PR workflow can read the repo's secrets, so a trip it performs is
 not evidence of anything.
+
+### Reuse records from the local lane stay on the host
+
+`reuse_record = true` on a local validation exports a fresh
+`SHIPYARD_REUSE_RECORD_DIR` to the stages and files it afterwards under
+`<state>/reuse-records/OWNER__REPO/` only if a parsing `job.json` was written;
+the run log's last `=== reuse-record: ... ===` line says kept or why not. A
+recorder failure never changes the run's verdict, so read that line rather than
+the exit code to know whether a record exists. `select_base` checks platform
+before toolchain (a record from another OS can carry a plausible toolchain
+string), refuses an unmerged commit, a record the format marks unusable, and
+one that states its platform or toolchain as empty or `unknown`: unknown is a
+refusal, never a match.
 The command is evidence inspection only: it never changes machine mode,
 accepted policy digests, queue state, or merge readiness.
 
