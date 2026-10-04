@@ -169,6 +169,12 @@ jobs:
           PLIST
           plutil -lint "$guardian_plist"
           launchctl bootstrap "gui/$(id -u)" "$guardian_plist"
+          # RunAtLoad alone is a speculative launch, which launchd may defer
+          # indefinitely on a busy host (`launchctl print` then shows
+          # `runs = 0` and `pended nondemand spawn = speculative`). Kickstart
+          # turns it into an on-demand spawn now; on a guardian already
+          # running it does nothing.
+          launchctl kickstart "gui/$(id -u)/$guardian_label"
           # This outer observer must not expire before the guardian's bounded
           # pre-ready protocol. A corrected holder probe alone may consume 30s;
           # transition classification, legacy compatibility, retained-lease
@@ -486,3 +492,10 @@ jobs:
             /tmp/sye2e-${{ github.run_id }}-${{ github.run_attempt }}/**
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Remove this run's sandbox guardian from launchd
+        # A run that fails before the guardian's own self-bootout would leave
+        # its job loaded in the runner's GUI domain for good.
+        if: always() && runner.os == 'macOS'
+        run: |
+          launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
