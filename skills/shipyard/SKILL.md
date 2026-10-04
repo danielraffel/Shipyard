@@ -831,6 +831,10 @@ paths write it before merge readiness, the daemon sweeps missed ones at start,
 and `shipyard reuse rederive --pr N --target T --head SHA` (or
 `rederive-sweep`) does it by hand. Never delete `refusals.json` to "reset" a
 host: the second refusal there is what turns live reuse off.
+Separately, one sampled failure, one false skip or one would-skip executable
+rebuilt to different bytes trips the switch at once (`trip_reasons` and
+`key_blind_candidates` on the receipt); a null field is no information, not a
+pass and not a trip.
 The command is evidence inspection only: it never changes machine mode,
 accepted policy digests, queue state, or merge readiness.
 
