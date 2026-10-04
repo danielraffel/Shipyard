@@ -1411,6 +1411,8 @@ mod tests {
         request
     }
 
+    // The stages are POSIX shell; Windows runs stages through its own shell.
+    #[cfg(unix)]
     #[test]
     fn an_opted_in_run_files_the_record_its_stages_write() {
         let repo = tempfile::tempdir().expect("repo");

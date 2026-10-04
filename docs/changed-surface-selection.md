@@ -505,7 +505,10 @@ is checked first because a record from another OS or architecture can carry a
 plausible-looking toolchain string. An empty or `unknown` value is unstated,
 and an unstated platform or toolchain is a refusal, never a match. A record
 from a commit that has not merged is never chosen, since the code that wrote
-it is unreviewed. The project supplies how to read its records through the
+it is unreviewed. "Merged" means the commit is an ancestor of the protected
+base, which holds for a pull request's own commits only when it lands with a
+merge commit; a squash or rebase landing rewrites them, so their records are
+never chosen. The project supplies how to read its records through the
 `BaseCriteria` trait; when nothing qualifies the caller gets a count per
 refusal reason. A pending directory left by a run that never reached filing (a
 cancelled run, or a killed process) is removed after a day.

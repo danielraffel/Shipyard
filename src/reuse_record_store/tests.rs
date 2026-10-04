@@ -28,10 +28,29 @@ fn record(store: &Path, commit: &str, job: &Value, age_secs: u64) -> PathBuf {
         panic!("expected a kept record");
     };
     let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 - age_secs);
-    fs::File::open(&path)
-        .and_then(|f| f.set_modified(mtime))
-        .expect("set mtime");
+    set_dir_modified(&path, mtime);
     path
+}
+
+/// Set a directory's modification time. Windows only allows that through a
+/// handle opened for `FILE_WRITE_ATTRIBUTES` with backup semantics (a plain
+/// `File::open` of a directory is refused there with "Access is denied").
+fn set_dir_modified(dir: &Path, mtime: SystemTime) {
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+    };
+    #[cfg(not(windows))]
+    let handle = fs::File::open(dir);
+    handle
+        .and_then(|f| f.set_modified(mtime))
+        .expect("set directory mtime");
 }
 
 /// Reads `platform`/`toolchain` from `job.json`; a record is unusable when
@@ -67,6 +86,7 @@ fn a_run_without_a_parsing_job_file_is_discarded() {
         (None, "no job.json"),
         (Some(""), "empty"),
         (Some("{not json"), "does not parse"),
+        (Some("42"), "not a JSON object"),
     ] {
         let pending = create_pending(store.path(), "aaa", now()).expect("pending");
         if let Some(contents) = contents {
@@ -218,9 +238,7 @@ fn a_cancelled_runs_pending_directory_is_swept_later() {
     let store = tempfile::tempdir().expect("store");
     let old = create_pending(store.path(), "aaa", now()).expect("pending");
     let day_ago = SystemTime::now() - (PENDING_MAX_AGE + Duration::from_secs(60));
-    fs::File::open(&old)
-        .and_then(|f| f.set_modified(day_ago))
-        .expect("age it");
+    set_dir_modified(&old, day_ago);
     let fresh = create_pending(store.path(), "bbb", now()).expect("pending");
     assert!(
         !old.exists(),

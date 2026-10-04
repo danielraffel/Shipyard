@@ -102,9 +102,11 @@ pub fn file(store: &Path, pending: &Path, commit: &str) -> std::io::Result<Filed
     let verdict = match fs::read(&job) {
         Err(_) => Some(format!("no {JOB_FILE} was written")),
         Ok(bytes) if bytes.is_empty() => Some(format!("{JOB_FILE} is empty")),
-        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
-            .err()
-            .map(|error| format!("{JOB_FILE} does not parse: {error}")),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(_)) => None,
+            Ok(_) => Some(format!("{JOB_FILE} is not a JSON object")),
+            Err(error) => Some(format!("{JOB_FILE} does not parse: {error}")),
+        },
     };
     if let Some(reason) = verdict {
         let _ = fs::remove_dir_all(pending);
