@@ -608,6 +608,18 @@ run unchanged and a categorized diagnostic (`executable_reuse_no_store`,
 the trial directory. Nothing in this section skips any work; the switch
 variable governs only a future live mode.
 
+A keyed plan binds the host's candidate records at ship time, so the same
+head re-shipped after a record is filed, or first shipped before any base
+existed, plans a different activation than the one already stored for it.
+That never fails the ship: Shipyard writes an `activation_conflict`
+diagnostic (both payload digests and the fields that differ: candidates,
+seed, disposition and the like, with `status: "unkeyed:
+activation_conflict"`), leaves the stored activation as it is, and runs the
+target's configured stages unkeyed. Trial status lists those diagnostics as
+`activation_conflicts`. The unkeyed run writes no result, so the host
+re-derivation has nothing to judge for it and never counts it as a refusal.
+An activation that changes when neither side is keyed is still refused.
+
 ### Host re-derivation
 
 The runner leaves its inputs (`ctest-listing.json`, `toolchain.json`,
