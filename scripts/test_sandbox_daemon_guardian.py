@@ -2959,6 +2959,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                     "deferred": 0,
                     "skipped": 1,
                     "errors": [],
+                    "warnings": [],
                 },
             )
             self.assertEqual(run.call_count, 2)
@@ -3038,8 +3039,9 @@ class GuardianLifecycleTests(unittest.TestCase):
             self.assertEqual(recovery["attempted"], 0)
             self.assertEqual(recovery["removed"], 0)
             self.assertEqual(recovery["skipped"], 1)
-            self.assertEqual(len(recovery["errors"]), 1)
-            self.assertIn("current terminal cleanup receipt", recovery["errors"][0])
+            self.assertEqual(recovery["errors"], [])
+            self.assertEqual(len(recovery["warnings"]), 1)
+            self.assertIn("current terminal cleanup receipt", recovery["warnings"][0])
             run.assert_called_once()
 
     def test_report_mode_rejects_present_null_terminal_schema_field(self) -> None:
@@ -3061,8 +3063,9 @@ class GuardianLifecycleTests(unittest.TestCase):
 
             self.assertEqual(recovery["legacy_reported"], 0)
             self.assertEqual(recovery["removed"], 0)
-            self.assertEqual(len(recovery["errors"]), 1)
-            self.assertIn("current terminal cleanup receipt", recovery["errors"][0])
+            self.assertEqual(recovery["errors"], [])
+            self.assertEqual(len(recovery["warnings"]), 1)
+            self.assertIn("current terminal cleanup receipt", recovery["warnings"][0])
 
     def test_next_run_skips_active_or_unreceipted_launchd_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3086,7 +3089,10 @@ class GuardianLifecycleTests(unittest.TestCase):
             self.assertEqual(recovery["eligible"], 0)
             self.assertEqual(recovery["removed"], 0)
             self.assertEqual(recovery["skipped"], 2)
-            self.assertEqual(len(recovery["errors"]), 2)
+            # Another run's still-active guardian and an unreceipted leftover
+            # say nothing about this run: they are reported, not failed on.
+            self.assertEqual(recovery["errors"], [])
+            self.assertEqual(len(recovery["warnings"]), 2)
             run.assert_called_once()
 
     def test_next_run_treats_reused_pid_as_old_guardian_gone(self) -> None:
@@ -3139,6 +3145,9 @@ class GuardianLifecycleTests(unittest.TestCase):
             self.assertEqual(recovery["deferred"], 2)
             self.assertEqual(recovery["skipped"], 4)
             self.assertEqual(run.call_count, 5)
+            # A removal that was attempted and failed is still an error.
+            self.assertEqual(len(recovery["errors"]), 4)
+            self.assertEqual(recovery["warnings"], [])
 
     def test_preserved_production_allows_worker_turnover_after_capacity_release(
         self,
