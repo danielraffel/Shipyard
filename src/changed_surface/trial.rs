@@ -156,9 +156,14 @@ pub struct KeyedShadowSummary {
     /// failed and no test ran.
     pub full_returncode: Option<i32>,
     /// The configured full build's own verdict.
-    pub full_build_returncode: i32,
-    /// The host re-derivation's verdict on this result.
+    pub full_build_returncode: Option<i32>,
+    /// The host re-derivation's verdict on this result (`pending` until it
+    /// runs).
     pub rederivation: String,
+    /// Why a keyed bounded run's keyed block could not be counted. It never
+    /// changes the bounded verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 /// File-name prefix of a host re-derivation receipt in a trial directory.
@@ -846,16 +851,15 @@ fn record_keyed(
     let Ok(result) = serde_json::from_slice::<ResultReceipt>(file.bytes) else {
         return reject(status, Some(file.name), "malformed_shadow_result");
     };
+    if disposition == super::KEYED_BOUNDED_SHADOW {
+        return record_keyed_bounded(status, plan, &disposition, file, &result, rederivations);
+    }
     let mut summary = match validate_keyed_result(plan, &disposition, &result) {
         Ok(summary) => summary,
         Err(reason) => return reject(status, Some(file.name), reason),
     };
-    let bounded = disposition == super::KEYED_BOUNDED_SHADOW;
-    if bounded && let Err(reason) = validate_result(plan, &result) {
-        return reject(status, Some(file.name), reason);
-    }
     status.result_receipt = Some(file.name.to_owned());
-    let rederivation = match rederivation_verdict(file.bytes, rederivations) {
+    summary.rederivation = match rederivation_verdict(file.bytes, rederivations) {
         Ok(Some(verdict)) => verdict,
         Ok(None) => {
             "waiting_for_host_rederivation".clone_into(&mut status.reason);
@@ -863,15 +867,48 @@ fn record_keyed(
         }
         Err(reason) => return reject(status, Some(file.name), reason),
     };
-    summary.rederivation = rederivation;
-    if bounded {
-        status.state = TrialState::Ready;
-        status.timing = timing(plan, &result);
-        status.reason = result.comparison_verdict;
-    } else {
-        status.state = TrialState::KeyedShadowRecorded;
-        status.reason = disposition;
+    status.state = TrialState::KeyedShadowRecorded;
+    status.reason = disposition;
+    status.keyed = Some(summary);
+    status
+}
+
+/// A keyed bounded run is judged by the ordinary bounded rules alone. Its
+/// keyed block and host re-derivation are reported beside the verdict and
+/// never feed it: a broken block or a refused re-derivation does not block
+/// `ready`, and a clean one does not grant it.
+fn record_keyed_bounded(
+    mut status: TrialStatus,
+    plan: &ActivationPlan,
+    disposition: &str,
+    file: &ReceiptFile<'_>,
+    result: &ResultReceipt,
+    rederivations: &[ReceiptFile<'_>],
+) -> TrialStatus {
+    if let Err(reason) = validate_result(plan, result) {
+        return reject(status, Some(file.name), reason);
     }
+    let mut summary = validate_keyed_result(plan, disposition, result).unwrap_or_else(|reason| {
+        KeyedShadowSummary {
+            disposition: disposition.to_owned(),
+            would_skip_count: None,
+            false_skip_count: None,
+            false_skips: None,
+            full_returncode: result.full_returncode,
+            full_build_returncode: result.full_build_returncode,
+            rederivation: String::new(),
+            problem: Some(reason.to_owned()),
+        }
+    });
+    summary.rederivation = match rederivation_verdict(file.bytes, rederivations) {
+        Ok(Some(verdict)) => verdict,
+        Ok(None) => "pending".to_owned(),
+        Err(reason) => reason.to_owned(),
+    };
+    status.state = TrialState::Ready;
+    status.result_receipt = Some(file.name.to_owned());
+    status.timing = timing(plan, result);
+    status.reason.clone_from(&result.comparison_verdict);
     status.keyed = Some(summary);
     status
 }
@@ -1001,8 +1038,9 @@ fn validate_keyed_result(
         false_skip_count,
         false_skips,
         full_returncode: result.full_returncode,
-        full_build_returncode,
+        full_build_returncode: Some(full_build_returncode),
         rederivation: String::new(),
+        problem: None,
     })
 }
 
@@ -1788,7 +1826,7 @@ mod tests {
         let keyed = status.keyed.expect("summary");
         assert_eq!(
             (keyed.full_build_returncode, keyed.full_returncode),
-            (2, None)
+            (Some(2), None)
         );
     }
 
@@ -1883,20 +1921,46 @@ mod tests {
         assert_eq!(status.state, TrialState::Ready, "{}", status.reason);
         assert_eq!(status.reason, "matched_pass");
         assert!(status.timing.is_some());
-        assert_eq!(status.keyed.expect("summary").would_skip_count, Some(1));
+        let keyed = status.keyed.expect("summary");
+        assert_eq!(keyed.would_skip_count, Some(1));
+        assert_eq!(keyed.rederivation, "match");
+        assert_eq!(keyed.problem, None);
+    }
 
+    #[test]
+    fn the_keyed_block_never_feeds_a_bounded_verdict() {
+        // A clean keyed block does not grant readiness to a failing run.
         let (activation, mut failing) = keyed_bounded();
         failing["selected_returncode"] = json!(1);
         let status = evaluate_keyed(&activation, &failing);
         assert_eq!(status.state, TrialState::Rejected);
         assert_eq!(status.reason, "shadow_result_nonzero_returncode");
 
-        let (activation, mut unlabelled) = keyed_bounded();
-        unlabelled["selected_execution_disposition"] = Value::Null;
+        // A broken keyed block does not block a passing one.
+        let (activation, mut broken) = keyed_bounded();
+        broken["selected_execution_disposition"] = Value::Null;
+        let status = evaluate_keyed(&activation, &broken);
+        assert_eq!(status.state, TrialState::Ready, "{}", status.reason);
         assert_eq!(
-            evaluate_keyed(&activation, &unlabelled).reason,
-            "keyed_result_disposition_mismatch"
+            status.keyed.expect("summary").problem.as_deref(),
+            Some("keyed_result_disposition_mismatch")
         );
+
+        // Nor does a refused or missing host re-derivation.
+        let (activation, result) = keyed_bounded();
+        let refused = evaluate_with(
+            Some(&activation),
+            std::slice::from_ref(&result),
+            &[rederived(&result, "refuse")],
+        );
+        assert_eq!(refused.state, TrialState::Ready, "{}", refused.reason);
+        assert_eq!(
+            refused.keyed.expect("summary").rederivation,
+            "host_rederivation_mismatch"
+        );
+        let pending = evaluate(Some(&activation), std::slice::from_ref(&result));
+        assert_eq!(pending.state, TrialState::Ready, "{}", pending.reason);
+        assert_eq!(pending.keyed.expect("summary").rederivation, "pending");
     }
 
     #[test]

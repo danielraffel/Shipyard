@@ -30,6 +30,8 @@ use crate::changed_surface::{KEYED_BOUNDED_SHADOW, KEYED_FULL_SHADOW, policy_fro
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_COMMAND_OUTPUT: u64 = 1024 * 1024;
 const ACTIVATION_RECEIPT: &str = "activation-shadow_compare.json";
+/// The key code's marker for a build-dir string that matched no registration.
+const INVENTORY_UNMATCHED: &str = "inventory_unmatched";
 /// Refusals on one host that turn live reuse off.
 const TRIP_AFTER_REFUSALS: usize = 2;
 /// The runner's copied inputs, each with the `derived` field holding its
@@ -100,9 +102,11 @@ struct RederivationRecord<'a> {
     reason: &'a str,
     diagnostics: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
-    picked_run_id: Option<&'a str>,
+    keyed_record_run_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    picked_record_sha256: Option<&'a str>,
+    keyed_record_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toolchain_matched: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_output_dir: Option<&'a str>,
     produced_by: ProducedBy,
@@ -121,6 +125,9 @@ struct Verdict {
     host_output_dir: Option<PathBuf>,
     /// The base policy's switch variable, once the policy was read.
     switch_variable: Option<String>,
+    /// Whether the record keyed against was the lane's toolchain match
+    /// (`false`: the first candidate, keyed for its refusal reason).
+    toolchain_matched: Option<bool>,
 }
 
 impl Verdict {
@@ -132,6 +139,7 @@ impl Verdict {
             pick: None,
             host_output_dir: None,
             switch_variable: None,
+            toolchain_matched: None,
         }
     }
 
@@ -143,6 +151,7 @@ impl Verdict {
             pick: None,
             host_output_dir: None,
             switch_variable: None,
+            toolchain_matched: None,
         }
     }
 
@@ -246,11 +255,12 @@ where
         verdict: verdict.kind,
         reason: &verdict.reason,
         diagnostics: &verdict.diagnostics,
-        picked_run_id: verdict.pick.as_ref().map(|pick| pick.run_id.as_str()),
-        picked_record_sha256: verdict
+        keyed_record_run_id: verdict.pick.as_ref().map(|pick| pick.run_id.as_str()),
+        keyed_record_sha256: verdict
             .pick
             .as_ref()
             .map(|pick| pick.record_sha256.as_str()),
+        toolchain_matched: verdict.toolchain_matched,
         host_output_dir: host_output_dir.as_deref(),
         produced_by,
         refusal_count,
@@ -363,22 +373,9 @@ fn judge_run(
     let Some(derived) = derived else {
         return Ok(Verdict::not_derived("the run derived no keys"));
     };
-    let text = |key: &str| derived.get(key).and_then(Value::as_str);
-    let (Some(run_id), Some(record_sha)) = (text("base_record_run_id"), text("base_record_sha256"))
-    else {
-        return Ok(Verdict::not_derived(
-            "no bound candidate matched the lane's toolchain",
-        ));
-    };
-    let Some(pick) = binding
-        .candidates
-        .iter()
-        .find(|candidate| candidate.run_id == run_id && candidate.record_sha256 == record_sha)
-        .cloned()
-    else {
-        return Ok(Verdict::refuse(format!(
-            "the run keyed against {run_id}, which is not in the bound candidate set"
-        )));
+    let (pick, toolchain_matched) = match resolve_pick(derived, binding) {
+        Ok(pick) => pick,
+        Err(verdict) => return Ok(*verdict),
     };
     match record_digest(Path::new(&pick.record_path)) {
         Ok(digest) if digest == pick.record_sha256 => {}
@@ -443,7 +440,44 @@ fn judge_run(
             );
         }
     }
-    Ok(compare_outputs(&inputs, &out)?.after(pick, out))
+    let mut verdict = compare_outputs(&inputs, &out)?;
+    verdict.toolchain_matched = Some(toolchain_matched);
+    Ok(verdict.after(pick, out))
+}
+
+/// The record the runner keyed against and whether it was the lane's
+/// toolchain match. The runner keys against its pick; with no toolchain match
+/// it keys against the first candidate (every executable then reads as
+/// another toolchain); with no candidate it keys against nothing at all.
+fn resolve_pick(
+    derived: &Value,
+    binding: &ExecutableReuseBinding,
+) -> Result<(BaseCandidate, bool), Box<Verdict>> {
+    let text = |key: &str| derived.get(key).and_then(Value::as_str);
+    match (text("base_record_run_id"), text("base_record_sha256")) {
+        (None, None) => binding
+            .candidates
+            .first()
+            .map(|first| (first.clone(), false))
+            .ok_or_else(|| {
+                Box::new(Verdict::not_derived(
+                    "no candidate was bound, so every executable is unrecorded",
+                ))
+            }),
+        (Some(run_id), Some(record_sha)) => binding
+            .candidates
+            .iter()
+            .find(|candidate| candidate.run_id == run_id && candidate.record_sha256 == record_sha)
+            .map(|pick| (pick.clone(), true))
+            .ok_or_else(|| {
+                Box::new(Verdict::refuse(format!(
+                    "the run keyed against {run_id}, which is not in the bound candidate set"
+                )))
+            }),
+        _ => Err(Box::new(Verdict::refuse(
+            "the result names a pick's run id or digest but not both",
+        ))),
+    }
 }
 
 /// Copy the runner's inputs read-only for the host run, each checked against
@@ -481,28 +515,36 @@ fn compare_outputs(inputs: &Path, out: &Path) -> Result<Verdict, String> {
     };
     let runner_manifest = read(inputs, "executable-keys.json")?.unwrap_or_default();
     let runner_selection = read(inputs, "selection.json")?.unwrap_or_default();
-    Ok(
-        match compare_rederivation(
-            &runner_manifest,
-            &host_manifest,
-            &runner_selection,
-            &host_selection,
-        ) {
-            Rederivation::Match => Verdict {
-                kind: "match",
-                reason: "the host re-derived the same manifest and selection".to_owned(),
-                ..Verdict::refuse("")
-            },
-            Rederivation::MatchWithDiagnostics(fields) => Verdict {
-                kind: "match_with_diagnostics",
-                reason: "the selections match; the manifests differ only in run-specific fields"
-                    .to_owned(),
-                diagnostics: fields,
-                ..Verdict::refuse("")
-            },
-            Rederivation::Refuse(reason) => Verdict::refuse(reason),
+    let mut verdict = match compare_rederivation(
+        &runner_manifest,
+        &host_manifest,
+        &runner_selection,
+        &host_selection,
+    ) {
+        Rederivation::Match => Verdict {
+            kind: "match",
+            reason: "the host re-derived the same manifest and selection".to_owned(),
+            ..Verdict::refuse("")
         },
-    )
+        Rederivation::MatchWithDiagnostics(fields) => Verdict {
+            kind: "match_with_diagnostics",
+            reason: "the selections match; the manifests differ only in run-specific fields"
+                .to_owned(),
+            diagnostics: fields,
+            ..Verdict::refuse("")
+        },
+        Rederivation::Refuse(reason) => Verdict::refuse(reason),
+    };
+    // A build-dir spelling that matched no test registration keys every
+    // executable as always-run on both sides alike: a configuration error to
+    // report, never a refusal to count.
+    if String::from_utf8_lossy(&host_manifest).contains(INVENTORY_UNMATCHED) {
+        verdict.diagnostics.push(format!(
+            "{INVENTORY_UNMATCHED}: the build_dir string matched no test registration; \
+             check the policy's build_dir"
+        ));
+    }
+    Ok(verdict)
 }
 
 /// Count a refusal for this host, once per (head, result), and return the
@@ -923,6 +965,20 @@ supported_build_types = ["debug"]
     /// Lay out one keyed run for `head` and return its identity; `edit`
     /// changes the result before it is written.
     fn keyed_run(fixture: &Fixture, head: &str, edit: impl Fn(&mut Value)) -> TrialIdentity {
+        keyed_run_with(
+            fixture,
+            head,
+            std::slice::from_ref(&fixture.candidate),
+            edit,
+        )
+    }
+
+    fn keyed_run_with(
+        fixture: &Fixture,
+        head: &str,
+        candidates: &[BaseCandidate],
+        edit: impl Fn(&mut Value),
+    ) -> TrialIdentity {
         let identity = TrialIdentity {
             repository: "owner/repo".to_owned(),
             pull_request: 7,
@@ -932,7 +988,7 @@ supported_build_types = ["debug"]
         let dir = result_directory(&fixture.state, &identity);
         fs::create_dir_all(&dir).expect("trial dir");
         let binding = ExecutableReuseBinding {
-            candidates: vec![fixture.candidate.clone()],
+            candidates: candidates.to_vec(),
             rules_digest: "r".repeat(64),
             derivation_code_dir: "/unused".to_owned(),
             derivation_code_sha256: fixture.code.digest.clone(),
@@ -1013,7 +1069,11 @@ supported_build_types = ["debug"]
             serde_json::from_slice(&fs::read(dir.join(receipt)).expect("receipt")).expect("json");
         assert_eq!(written["schema_version"], 1);
         assert_eq!(written["produced_by"], "completion");
-        assert_eq!(written["picked_run_id"], json!(fixture.candidate.run_id));
+        assert_eq!(
+            written["keyed_record_run_id"],
+            json!(fixture.candidate.run_id)
+        );
+        assert_eq!(written["toolchain_matched"], json!(true));
         assert_eq!(
             written["result_receipt_sha256"],
             json!(sha256_hex(
@@ -1083,7 +1143,7 @@ supported_build_types = ["debug"]
     }
 
     #[test]
-    fn a_run_that_derived_nothing_or_matched_no_candidate_is_not_derived() {
+    fn a_run_that_derived_nothing_is_not_derived() {
         let fixture = fixture(FAITHFUL);
         let calls = Calls::default();
         let nothing = keyed_run(&fixture, "h1", |result| {
@@ -1093,12 +1153,82 @@ supported_build_types = ["debug"]
             verdict(&rederive(&fixture, &nothing, &calls)),
             "not_derived"
         );
-        let unpicked = keyed_run(&fixture, "h2", |result| {
+    }
+
+    #[test]
+    fn with_no_toolchain_match_the_host_keys_against_the_first_candidate() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let unpicked = keyed_run(&fixture, "h1", |result| {
             result["executable_reuse"]["derived"]["base_record_run_id"] = Value::Null;
+            result["executable_reuse"]["derived"]["base_record_sha256"] = Value::Null;
         });
+        let outcome = rederive(&fixture, &unpicked, &calls);
+        assert_eq!(verdict(&outcome), "match", "{outcome:?}");
+        let dir = result_directory(&fixture.state, &unpicked);
+        let receipt = named_files(&dir, REDERIVATION_RECEIPT_PREFIX).expect("receipts");
+        let written: Value = serde_json::from_slice(&receipt[0].1).expect("json");
         assert_eq!(
-            verdict(&rederive(&fixture, &unpicked, &calls)),
-            "not_derived"
+            written["keyed_record_run_id"],
+            json!(fixture.candidate.run_id)
+        );
+        assert_eq!(written["toolchain_matched"], json!(false));
+
+        let half = keyed_run(&fixture, "h2", |result| {
+            result["executable_reuse"]["derived"]["base_record_sha256"] = Value::Null;
+        });
+        assert_eq!(verdict(&rederive(&fixture, &half, &calls)), "refuse");
+    }
+
+    #[test]
+    fn with_no_candidate_bound_there_is_nothing_to_rederive() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run_with(&fixture, "h1", &[], |result| {
+            result["executable_reuse"]["derived"]["base_record_run_id"] = Value::Null;
+            result["executable_reuse"]["derived"]["base_record_sha256"] = Value::Null;
+        });
+        let outcome = rederive(&fixture, &identity, &calls);
+        assert_eq!(verdict(&outcome), "not_derived", "{outcome:?}");
+        assert!(
+            !fixture
+                .state
+                .join("executable-reuse/refusals.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn an_unmatched_build_dir_is_reported_not_refused() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |_| {});
+        let dir = result_directory(&fixture.state, &identity);
+        // The runner's manifest says the build_dir matched no registration;
+        // the host derives the same from the same inputs.
+        let manifest = "{\"inventory\": \"inventory_unmatched\"}\n";
+        fs::write(dir.join("executable-keys.json"), manifest).expect("manifest");
+        let mut result: Value =
+            serde_json::from_slice(&fs::read(dir.join("result-1.json")).expect("result"))
+                .expect("json");
+        result["executable_reuse"]["derived"]["key_manifest_sha256"] =
+            json!(sha256_hex(manifest.as_bytes()));
+        fs::write(dir.join("result-1.json"), result.to_string()).expect("result");
+        let outcome = rederive(&fixture, &identity, &calls);
+        assert_eq!(verdict(&outcome), "match", "{outcome:?}");
+        let receipt = named_files(&dir, REDERIVATION_RECEIPT_PREFIX).expect("receipts");
+        let written: Value = serde_json::from_slice(&receipt[0].1).expect("json");
+        assert!(
+            written["diagnostics"][0]
+                .as_str()
+                .is_some_and(|line| line.starts_with("inventory_unmatched")),
+            "{written}"
+        );
+        assert!(
+            !fixture
+                .state
+                .join("executable-reuse/refusals.json")
+                .exists()
         );
     }
 
