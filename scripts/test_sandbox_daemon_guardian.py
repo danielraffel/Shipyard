@@ -3624,5 +3624,32 @@ class GuardianLifecycleTests(unittest.TestCase):
         )
 
 
+    def test_workflow_spawns_the_guardian_on_demand_after_bootstrap(self) -> None:
+        # RunAtLoad is a speculative launch that launchd can defer forever on a
+        # busy host; the guardian then never starts and the ready wait expires.
+        workflow = (
+            Path(__file__).parent.parent / ".github/workflows/sandbox-e2e.yml"
+        ).read_text(encoding="utf-8")
+        bootstrap = workflow.index('launchctl bootstrap "gui/$(id -u)" "$guardian_plist"')
+        kickstart = workflow.index('launchctl kickstart "gui/$(id -u)/$guardian_label"')
+        ready_wait = workflow.index("deadline=$((SECONDS + guardian_ready_timeout_seconds))")
+        self.assertLess(bootstrap, kickstart)
+        self.assertLess(kickstart, ready_wait)
+
+    def test_workflow_always_removes_its_guardian_from_launchd(self) -> None:
+        workflow = (
+            Path(__file__).parent.parent / ".github/workflows/sandbox-e2e.yml"
+        ).read_text(encoding="utf-8")
+        start = workflow.index("- name: Remove this run's sandbox guardian from launchd")
+        end = workflow.find("\n      - name:", start)
+        step = workflow[start : end if end != -1 else len(workflow)]
+        self.assertIn("if: always() && runner.os == 'macOS'", step)
+        self.assertIn(
+            'launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.'
+            '${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"',
+            step,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
