@@ -3125,7 +3125,9 @@ into `ship` passes through — so `shipyard pr`, a bare `ship`, and
 opts out. A repository whose base sets `[auto_merge]
 arm_requires_head_approval = true` arms only an approved head on every arming
 path (`ship`, the validated arm, the steward backstop); `--arm` overrides it
-and names who did. See `crate::head_approval`. This matters because Shipyard's own admission path enqueues only
+and names who did. See `crate::head_approval`. Its count of queue removals per
+head reads only the last 100 timeline events, so a very busy pull request can
+under-count; that errs lenient (an approval is still required), never strict. This matters because Shipyard's own admission path enqueues only
 after it has validated a head, which happens only while a Shipyard process is
 alive; native auto-merge is server-owned, so a pull request whose ship lost its
 merge phase still lands instead of sitting green, unqueued and unarmed. Arming
