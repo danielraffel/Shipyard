@@ -37,7 +37,10 @@
 //! The merge queue records why it removed each entry. After
 //! [`EJECTION_CAP`] removals of the same head, the head is not armed again
 //! until it carries an approval newer than the last removal. A new head starts
-//! its own count.
+//! its own count. Removals are read from the merge-queue query's
+//! `timelineItems(last:100)` window, so a head with more than 100 later events
+//! can be under-counted; that errs lenient, because an approval is still
+//! required.
 
 use chrono::{DateTime, Utc};
 use regex::Regex;

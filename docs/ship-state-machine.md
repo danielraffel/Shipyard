@@ -279,6 +279,11 @@ document:
   `APPROVED` review whose commit is the head from a non-bot account, or a
   `reviewed:<sha>` comment from a login in `[auto_merge] reviewer_logins`. A
   head the queue removed twice needs an approval newer than its last removal.
+  Removals are counted from the pull request's last 100 timeline events (the
+  merge-queue query's `timelineItems(last:100)` window), so on a head with more
+  than 100 later events older removals fall outside it and the count can be
+  low. That errs lenient: an approval is still required either way, only the
+  newer-than-the-last-removal requirement can be missed.
   The same check guards T5's validated arm and the steward's `--arm-unqueued`
   backstop. `--arm` arms past it and names who did.
 

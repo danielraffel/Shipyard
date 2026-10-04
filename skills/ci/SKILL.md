@@ -170,6 +170,9 @@ would approve itself. Without an approval the line reads
 holds for the validated arm after a ship passes and for
 `runner steward --arm-unqueued`. A head the queue removed twice also needs an
 approval newer than its last removal; the line lists each removal's reason.
+Removals are counted from the last 100 timeline events only, so a very busy pull
+request can under-count them; that errs lenient (an approval is still required),
+never strict.
 `--arm` arms past the check on purpose and the line names who armed it. Rebasing
 an approved pull request produces a new head with no approval, so it stays
 disarmed until it is approved again.
