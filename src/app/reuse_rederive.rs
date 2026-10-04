@@ -112,6 +112,10 @@ struct RederivationRecord<'a> {
     produced_by: ProducedBy,
     #[serde(skip_serializing_if = "Option::is_none")]
     refusal_count: Option<usize>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    trip_reasons: &'a [String],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    key_blind_candidates: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     tripped: Option<&'a str>,
 }
@@ -218,31 +222,24 @@ where
         .join("rederive")
         .join(&result_sha);
     let verdict = judge(state_dir, &trial_dir, &plan, &context, result_bytes, &work)?;
-    let (refusal_count, tripped) = if verdict.kind == "refuse" {
-        let count = record_refusal(
-            state_dir,
-            &context.repository,
-            &plan.head_sha,
-            &result_sha,
-            &verdict.reason,
-        )?;
-        let tripped = if count >= TRIP_AFTER_REFUSALS {
-            let checkout = Path::new(&context.checkout);
-            Some(trip(
-                &|args: &[String]| gh(checkout, args),
-                &context.repository,
-                verdict.switch_variable.as_deref(),
-                &plan.head_sha,
-                &verdict.reason,
-                count,
-            ))
-        } else {
-            None
-        };
-        (Some(count), tripped)
-    } else {
-        (None, None)
-    };
+    let TripDecision {
+        signals,
+        candidates,
+        refusal_count,
+        tripped,
+    } = decide_trip(
+        state_dir,
+        &JudgedRun {
+            plan: &plan,
+            context: &context,
+            result_bytes,
+            result_sha: &result_sha,
+            work: &work,
+        },
+        &verdict,
+        gh,
+    )?;
+    let diagnostics = receipt_diagnostics(&verdict, result_bytes);
     let host_output_dir = verdict
         .host_output_dir
         .as_ref()
@@ -254,7 +251,7 @@ where
         head_sha: &plan.head_sha,
         verdict: verdict.kind,
         reason: &verdict.reason,
-        diagnostics: &verdict.diagnostics,
+        diagnostics: &diagnostics,
         keyed_record_run_id: verdict.pick.as_ref().map(|pick| pick.run_id.as_str()),
         keyed_record_sha256: verdict
             .pick
@@ -264,6 +261,8 @@ where
         host_output_dir: host_output_dir.as_deref(),
         produced_by,
         refusal_count,
+        trip_reasons: &signals,
+        key_blind_candidates: &candidates,
         tripped: tripped.as_deref(),
     };
     write_new(&trial_dir.join(&receipt_name), &record)?;
@@ -271,6 +270,129 @@ where
         receipt: receipt_name,
         verdict: verdict.kind.to_owned(),
         reason: verdict.reason,
+        tripped,
+    })
+}
+
+/// The verdict's diagnostics plus the closure modules the run could not
+/// compare, which are reported and never tripped on.
+fn receipt_diagnostics(verdict: &Verdict, result_bytes: &[u8]) -> Vec<String> {
+    let mut diagnostics = verdict.diagnostics.clone();
+    if let Some(unchecked) = serde_json::from_slice::<Value>(result_bytes)
+        .ok()
+        .as_ref()
+        .and_then(|result| result.pointer("/executable_reuse/derived/unreached_unchecked_modules"))
+        .and_then(Value::as_array)
+        .filter(|modules| !modules.is_empty())
+    {
+        let names: Vec<String> = unchecked
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        diagnostics.push(format!(
+            "unreached_unchecked_modules ({}): closure modules with no recorded hash, so their bytes were not compared: {}",
+            names.len(),
+            listed(&names)
+        ));
+    }
+    diagnostics
+}
+
+/// One keyed run's verified identity and evidence.
+struct JudgedRun<'a> {
+    plan: &'a ActivationPlan,
+    context: &'a KeyedRunContext,
+    result_bytes: &'a [u8],
+    result_sha: &'a str,
+    work: &'a Path,
+}
+
+/// What a re-derivation did to the switch.
+struct TripDecision {
+    /// What the verified result reported that live reuse would have got wrong.
+    signals: Vec<String>,
+    /// Executables whose key was equal while live reuse would have got them
+    /// wrong: candidates for the key-blind list.
+    candidates: Vec<String>,
+    /// Refusals counted on this host, when this one was a refusal.
+    refusal_count: Option<usize>,
+    /// What tripping the switch did, when it was tripped.
+    tripped: Option<String>,
+}
+
+/// Read the trip signals from evidence the host did not refuse, count a
+/// refusal, and trip the switch on the second refusal or on any signal.
+fn decide_trip<F>(
+    state_dir: &Path,
+    run: &JudgedRun<'_>,
+    verdict: &Verdict,
+    gh: &F,
+) -> Result<TripDecision, String>
+where
+    F: Fn(&Path, &[String]) -> Result<String, String> + ?Sized,
+{
+    let JudgedRun {
+        plan,
+        context,
+        result_bytes,
+        result_sha,
+        work,
+    } = *run;
+    let checkout = Path::new(&context.checkout);
+    let gh_here = |args: &[String]| gh(checkout, args);
+    // Only evidence the host did not refuse is read for trip reasons.
+    let result = (verdict.kind != "refuse")
+        .then(|| serde_json::from_slice::<Value>(result_bytes).ok())
+        .flatten();
+    let signals = result.as_ref().map(trip_reasons).unwrap_or_default();
+    let manifest = read_optional(&work.join("inputs").join("executable-keys.json"))
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let candidates = result
+        .as_ref()
+        .map(|result| key_blind_candidates(result, manifest.as_ref()))
+        .unwrap_or_default();
+    let (refusal_count, tripped) = if verdict.kind == "refuse" {
+        let count = record_refusal(
+            state_dir,
+            &context.repository,
+            &plan.head_sha,
+            result_sha,
+            &verdict.reason,
+        )?;
+        let tripped = (count >= TRIP_AFTER_REFUSALS).then(|| {
+            trip(
+                &gh_here,
+                &context.repository,
+                verdict.switch_variable.as_deref(),
+                &format!(
+                    "host re-derivation refused {count} keyed runs on this host; latest at {}: {}",
+                    plan.head_sha, verdict.reason
+                ),
+            )
+        });
+        (Some(count), tripped)
+    } else if signals.is_empty() {
+        (None, None)
+    } else {
+        let tripped = trip(
+            &gh_here,
+            &context.repository,
+            verdict.switch_variable.as_deref(),
+            &format!(
+                "keyed run at {} reported what live reuse would have got wrong: {}",
+                plan.head_sha,
+                signals.join("; ")
+            ),
+        );
+        (None, Some(tripped))
+    };
+    Ok(TripDecision {
+        signals,
+        candidates,
+        refusal_count,
         tripped,
     })
 }
@@ -589,34 +711,107 @@ fn record_refusal(
 /// Turn live reuse off (the switch first, then the issue) and say what
 /// happened; a failed trip is recorded, not raised, so the refusal still
 /// lands.
-fn trip<F>(
-    gh: &F,
-    repository: &str,
-    variable: Option<&str>,
-    head_sha: &str,
-    reason: &str,
-    count: usize,
-) -> String
+fn trip<F>(gh: &F, repository: &str, variable: Option<&str>, why: &str) -> String
 where
     F: Fn(&[String]) -> Result<String, String> + ?Sized,
 {
     let Some(variable) = variable else {
         return "not tripped: the refusal came before the base policy was read".to_owned();
     };
-    let why = format!(
-        "host re-derivation refused {count} keyed runs on this host; latest at {head_sha}: {reason}"
-    );
-    match crate::changed_surface::live_switch::trip(
-        gh,
-        repository,
-        variable,
-        &why,
-        Utc::now(),
-        true,
-    ) {
+    match crate::changed_surface::live_switch::trip(gh, repository, variable, why, Utc::now(), true)
+    {
         Ok(outcome) => format!("{variable}: {}; {}", outcome.variable, outcome.issue),
         Err(error) => format!("trip of {variable} failed: {error}"),
     }
+}
+
+/// How many names a trip reason lists before it says how many more.
+const SIGNAL_NAMES: usize = 5;
+
+/// The first [`SIGNAL_NAMES`] names and how many more there are.
+fn listed(names: &[String]) -> String {
+    let shown = names.iter().take(SIGNAL_NAMES).cloned().collect::<Vec<_>>();
+    match names.len().saturating_sub(SIGNAL_NAMES) {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
+}
+
+/// The executables whose key was equal while live reuse would have got
+/// them wrong: those registering a sampled failure or a false skip (read
+/// from the verified manifest), and those rebuilt to different bytes. Each is
+/// a candidate for the project's key-blind list.
+fn key_blind_candidates(result: &Value, manifest: Option<&Value>) -> Vec<String> {
+    let strings = |value: Option<&Value>| -> std::collections::BTreeSet<String> {
+        value
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut failed = strings(result.pointer("/executable_reuse/sampled_failures"));
+    failed.extend(strings(result.pointer("/executable_reuse/false_skips")));
+    let mut candidates = strings(result.pointer("/executable_reuse/derived/unreached_changed"));
+    if let Some(executables) = manifest
+        .and_then(|manifest| manifest.get("executables"))
+        .and_then(Value::as_object)
+    {
+        for (artifact, entry) in executables {
+            if strings(entry.get("registrations"))
+                .iter()
+                .any(|test| failed.contains(test))
+            {
+                candidates.insert(artifact.clone());
+            }
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+/// What a keyed result reports that live reuse would have got wrong, each
+/// of which turns live reuse off at once: a sampled would-skip executable's
+/// test failed, a would-skip test failed in the full run, or an executable
+/// the key called unchanged was rebuilt to different bytes.
+fn trip_reasons(result: &Value) -> Vec<String> {
+    let names = |pointer: &str| -> Vec<String> {
+        result
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut signals = Vec::new();
+    for (pointer, what) in [
+        (
+            "/executable_reuse/sampled_failures",
+            "sampled would-skip tests failed",
+        ),
+        (
+            "/executable_reuse/false_skips",
+            "would-skip tests failed in the full run",
+        ),
+        (
+            "/executable_reuse/derived/unreached_changed",
+            "executables keyed unchanged were rebuilt to different bytes",
+        ),
+    ] {
+        let found = names(pointer);
+        if !found.is_empty() {
+            signals.push(format!("{what} ({}): {}", found.len(), listed(&found)));
+        }
+    }
+    signals
 }
 
 /// Re-derive, newest first and at most `cap`, the keyed runs on this host
@@ -1384,5 +1579,186 @@ supported_build_types = ["debug"]
             "only the stderr tail is kept: {}",
             error.len()
         );
+    }
+
+    fn written_receipt(fixture: &Fixture, identity: &TrialIdentity) -> Value {
+        let dir = result_directory(&fixture.state, identity);
+        let receipt = named_files(&dir, REDERIVATION_RECEIPT_PREFIX).expect("receipts");
+        serde_json::from_slice(&receipt[0].1).expect("json")
+    }
+
+    #[test]
+    fn what_live_reuse_would_have_got_wrong_trips_at_once() {
+        type Edit = fn(&mut Value);
+        let cases: [(&str, Edit, &str); 3] = [
+            (
+                "h1",
+                |r| r["executable_reuse"]["sampled_failures"] = json!(["s1"]),
+                "sampled would-skip tests failed (1): s1",
+            ),
+            (
+                "h2",
+                |r| r["executable_reuse"]["false_skips"] = json!(["f1", "f2"]),
+                "would-skip tests failed in the full run (2): f1, f2",
+            ),
+            (
+                "h3",
+                |r| r["executable_reuse"]["derived"]["unreached_changed"] = json!(["test/x"]),
+                "executables keyed unchanged were rebuilt to different bytes (1): test/x",
+            ),
+        ];
+        let fixture = fixture(FAITHFUL);
+        for (head, edit, signal) in cases {
+            let calls = Calls::default();
+            let identity = keyed_run(&fixture, head, edit);
+            let outcome = rederive(&fixture, &identity, &calls);
+            assert_eq!(verdict(&outcome), "match", "{head}: {outcome:?}");
+            let Outcome::Recorded { tripped, .. } = outcome else {
+                unreachable!()
+            };
+            assert!(
+                tripped.is_some_and(|trip| trip.contains("PULP_REUSE_LIVE")),
+                "{head}: one signal trips without waiting for a second"
+            );
+            assert!(!calls.borrow().is_empty(), "{head}: the trip reached gh");
+            assert_eq!(
+                written_receipt(&fixture, &identity)["trip_reasons"],
+                json!([signal])
+            );
+        }
+        assert!(
+            !fixture
+                .state
+                .join("executable-reuse/refusals.json")
+                .exists(),
+            "a trip signal is not a refusal"
+        );
+    }
+
+    #[test]
+    fn a_clean_keyed_run_trips_nothing() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |result| {
+            result["executable_reuse"]["sampled_failures"] = json!([]);
+            result["executable_reuse"]["false_skips"] = json!([]);
+            result["executable_reuse"]["derived"]["unreached_changed"] = json!([]);
+        });
+        let Outcome::Recorded { tripped, .. } = rederive(&fixture, &identity, &calls) else {
+            panic!("recorded");
+        };
+        assert!(tripped.is_none());
+        assert!(calls.borrow().is_empty());
+        assert!(
+            written_receipt(&fixture, &identity)
+                .get("trip_reasons")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn signals_in_refused_evidence_are_not_read() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |result| {
+            result["executable_reuse"]["sampled_failures"] = json!(["s1"]);
+            result["executable_reuse"]["derived"]["base_record_run_id"] = json!("elsewhere");
+        });
+        let Outcome::Recorded {
+            verdict, tripped, ..
+        } = rederive(&fixture, &identity, &calls)
+        else {
+            panic!("recorded");
+        };
+        assert_eq!(verdict, "refuse");
+        assert!(tripped.is_none(), "a first refusal does not trip");
+        assert!(
+            written_receipt(&fixture, &identity)
+                .get("trip_reasons")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_trip_reason_lists_five_names_and_counts_the_rest() {
+        let result = json!({"executable_reuse": {
+            "sampled_failures": ["a", "b", "c", "d", "e", "f", "g"]}});
+        assert_eq!(
+            trip_reasons(&result),
+            ["sampled would-skip tests failed (7): a, b, c, d, e and 2 more"]
+        );
+        assert!(trip_reasons(&json!({"executable_reuse": {"sampled_failures": null}})).is_empty());
+    }
+
+    /// Replace a keyed run's manifest and restate its hash in the result.
+    fn with_manifest(fixture: &Fixture, identity: &TrialIdentity, manifest: &Value) {
+        let dir = result_directory(&fixture.state, identity);
+        let bytes = serde_json::to_vec(manifest).expect("manifest");
+        fs::write(dir.join("executable-keys.json"), &bytes).expect("write");
+        let mut result: Value =
+            serde_json::from_slice(&fs::read(dir.join("result-1.json")).expect("result"))
+                .expect("json");
+        result["executable_reuse"]["derived"]["key_manifest_sha256"] = json!(sha256_hex(&bytes));
+        fs::write(dir.join("result-1.json"), result.to_string()).expect("result");
+    }
+
+    #[test]
+    fn the_executables_live_reuse_got_wrong_are_named_for_the_key_blind_list() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |result| {
+            result["executable_reuse"]["false_skips"] = json!(["t1"]);
+            result["executable_reuse"]["sampled_failures"] = json!(["t3"]);
+            result["executable_reuse"]["derived"]["unreached_changed"] = json!(["test/d"]);
+        });
+        with_manifest(
+            &fixture,
+            &identity,
+            &json!({"executables": {
+                "test/a": {"registrations": ["t1"]},
+                "test/b": {"registrations": ["t2"]},
+                "test/c": {"registrations": ["t3", "t4"]}}}),
+        );
+        let outcome = rederive(&fixture, &identity, &calls);
+        assert_eq!(verdict(&outcome), "match", "{outcome:?}");
+        assert_eq!(
+            written_receipt(&fixture, &identity)["key_blind_candidates"],
+            json!(["test/a", "test/c", "test/d"])
+        );
+    }
+
+    #[test]
+    fn closure_modules_without_a_hash_are_reported_not_tripped() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |result| {
+            result["executable_reuse"]["derived"]["unreached_changed"] = json!([]);
+            result["executable_reuse"]["derived"]["unreached_unchecked_modules"] =
+                json!(["lib/m1.dylib", "lib/m2.dylib"]);
+        });
+        let Outcome::Recorded { tripped, .. } = rederive(&fixture, &identity, &calls) else {
+            panic!("recorded");
+        };
+        assert!(tripped.is_none());
+        let receipt = written_receipt(&fixture, &identity);
+        assert!(
+            receipt["diagnostics"]
+                .as_array()
+                .expect("diagnostics")
+                .iter()
+                .any(|line| line
+                    .as_str()
+                    .is_some_and(|line| line.starts_with("unreached_unchecked_modules (2)"))),
+            "{receipt}"
+        );
+    }
+
+    #[test]
+    fn without_a_manifest_only_rebuilt_executables_are_candidates() {
+        let result = json!({"executable_reuse": {
+            "false_skips": ["t1"],
+            "derived": {"unreached_changed": ["test/x"]}}});
+        assert_eq!(key_blind_candidates(&result, None), ["test/x"]);
+        assert!(key_blind_candidates(&json!({}), None).is_empty());
     }
 }

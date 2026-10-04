@@ -643,7 +643,30 @@ it just before merge readiness is decided; its verdict never changes a shadow
 run's merge. A result is re-derived at most once. Each refusal is counted per
 host and repository, once per (head, result), in
 `<state>/executable-reuse/refusals.json`; the second one turns live reuse off
-(the switch first, then the tracking issue). When a completion path does not
+(the switch first, then the tracking issue).
+
+A result the host did not refuse is also read for what live reuse would have
+got wrong, and any one of these turns live reuse off at once, with the same
+switch-then-issue trip:
+
+- `executable_reuse.sampled_failures`: a test of a sampled would-skip
+  executable failed in the full run;
+- `executable_reuse.false_skips`: a would-skip test that was not sampled
+  failed in the full run;
+- `executable_reuse.derived.unreached_changed`: an executable (or a closure
+  module it loads) whose key was equal was rebuilt to different bytes than the
+  picked base record's recorded hash.
+
+The receipt lists them as `trip_reasons`, and names the executables involved
+as `key_blind_candidates` (those registering a failed test, by the verified
+manifest, and those rebuilt to different bytes), for the project's key-blind
+list. A null field is no information and never trips, and so are
+`not_derived`, `toolchain_matched: false` and `inventory_unmatched`. Closure
+modules the run could not compare (`unreached_unchecked_modules`) become a
+receipt diagnostic. A receipt with `trip_reasons` is evidence against
+promoting reuse: it ends any run of clean keyed results.
+
+When a completion path does not
 record a verdict (a crash, a restart), the daemon re-derives the newest eight
 such runs when it starts, and an operator can run either step:
 
