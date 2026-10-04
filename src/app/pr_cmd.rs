@@ -51,7 +51,7 @@ pub(super) struct PrCommandArgs {
     pub(super) python_command: Option<PathBuf>,
     /// Arm GitHub-native auto-merge on the pull request once `ship` knows it.
     /// Cleared by `--no-arm`.
-    pub(super) arm_auto_merge: bool,
+    pub(super) arm_auto_merge: super::cli::ArmRequest,
     /// Sibling branches whose own commits are carried onto this branch first.
     pub(super) fold: Vec<String>,
     /// Forwarded to `ship`: text appended to the pull request body once.
@@ -861,7 +861,7 @@ mod tests {
             context_url: None,
             steward_handoff_preference: StewardHandoffPreference::ProjectDefault,
             python_command: None,
-            arm_auto_merge: false,
+            arm_auto_merge: crate::app::cli::ArmRequest::Off,
             fold: Vec::new(),
             body_append: None,
         }

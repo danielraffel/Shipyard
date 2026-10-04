@@ -98,8 +98,8 @@ pub(super) struct ShipCommandArgs {
     pub(super) foreground: bool,
     /// Arm GitHub-native auto-merge once the pull request is known, so a green
     /// pull request cannot sit unqueued because nothing armed it. `--no-arm`
-    /// clears it.
-    pub(super) arm_auto_merge: bool,
+    /// clears it; `--arm` arms past the repository's head-approval policy.
+    pub(super) arm_auto_merge: super::cli::ArmRequest,
     /// Text (or `@file` contents) added to the pull request body once, after
     /// the attribution line and before the provenance block.
     pub(super) body_append: Option<String>,
@@ -306,9 +306,9 @@ pub(super) fn ship_command<W: Write>(
     // passes through, so `shipyard pr`, a bare `ship`, and `ship --pr` all get
     // it. Never fatal: a refusal is usually the arm guard agreeing there is
     // nothing to arm. See `auto_arm`'s module docs.
-    if args.arm_auto_merge && !repo.is_empty() {
+    if !repo.is_empty() {
         let arm_actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
-        let outcome = auto_arm::arm_native_auto_merge(
+        let outcome = auto_arm::arm_for_request(
             &|gh_args: &[String]| {
                 arm_actions
                     .run_gh(gh_args)
@@ -320,8 +320,11 @@ pub(super) fn ship_command<W: Write>(
                 .get(crate::environment_requeue::CONFIG_KEY)
                 .and_then(toml::Value::as_bool)
                 == Some(true),
+            args.arm_auto_merge,
         );
-        report_arm_outcome(&outcome, json_mode, stdout)?;
+        if let Some(outcome) = outcome {
+            report_arm_outcome(&outcome, json_mode, stdout)?;
+        }
     }
     let steward_handoff = apply_requested_steward_handoff(
         args.steward_handoff.as_ref(),

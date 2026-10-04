@@ -1030,7 +1030,7 @@ fn handle_ship_variant<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let arm_auto_merge = command.arm_auto_merge().unwrap_or(true);
+    let arm_auto_merge = command.arm_auto_merge().unwrap_or(cli::ArmRequest::Default);
     let Command::Ship {
         pr,
         base,
@@ -1048,6 +1048,7 @@ fn handle_ship_variant<W: Write>(
         adopt_head,
         foreground,
         no_arm: _,
+        arm: _,
         body_append,
     } = command
     else {
@@ -1102,7 +1103,7 @@ fn handle_pr_variant<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let arm_auto_merge = command.arm_auto_merge().unwrap_or(true);
+    let arm_auto_merge = command.arm_auto_merge().unwrap_or(cli::ArmRequest::Default);
     let Command::Pr {
         base,
         apply_bumps,
@@ -1124,6 +1125,7 @@ fn handle_pr_variant<W: Write>(
         context_url,
         no_steward_handoff,
         no_arm: _,
+        arm: _,
         fold,
         body_append,
     } = command

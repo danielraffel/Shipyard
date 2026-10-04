@@ -143,7 +143,7 @@ pub(super) fn apply_native_arm_backstop(
     let mut unhealthy = false;
     let mut results = Vec::new();
     for pr in candidates {
-        let result = consider_candidate(actions, &observation.repo, pr, apply);
+        let result = consider_candidate(actions, &observation.repo, &observation.base, pr, apply);
         unhealthy |= result.error.is_some();
         results.push(result);
     }
@@ -190,13 +190,14 @@ fn select_candidates<'a>(
 fn consider_candidate(
     actions: &GitHubActions,
     repo: &str,
+    base: &str,
     pr: &ObservedPr,
     apply: bool,
 ) -> NativeArmResult {
     let number = pr.fact.number;
     let head_sha = pr.fact.head_sha.clone();
-    let state = match read_queue_state(actions, repo, number) {
-        Ok(value) => explain_pr_queue_state(&value).state,
+    let queue = match read_queue_state(actions, repo, number) {
+        Ok(value) => value,
         Err(detail) => {
             // An unreadable state is not an unarmed state. This is reported as
             // an error rather than a skip: the pass could not do its job.
@@ -214,7 +215,33 @@ fn consider_candidate(
         }
     };
 
-    match decide_from_queue_state(&state, pr.fact.draft) {
+    let state = explain_pr_queue_state(&queue).state;
+    let verdict = match decide_from_queue_state(&state, pr.fact.draft) {
+        ArmVerdict::Arm => {
+            let run_gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+            match crate::head_approval::evaluate(&run_gh, repo, number, &head_sha, base, &queue) {
+                Ok(gate) if gate.allows() => ArmVerdict::Arm,
+                Ok(gate) => ArmVerdict::Skip(ArmSkip::HeadNotApproved {
+                    detail: gate.explain(),
+                }),
+                Err(detail) => {
+                    return NativeArmResult {
+                        number,
+                        head_sha,
+                        outcome: "skipped".to_owned(),
+                        skip: Some(ArmSkip::Unknown {
+                            detail: detail.clone(),
+                        }),
+                        error: Some(format!(
+                            "PR #{number} head approval unreadable; refusing to arm blind: {detail}"
+                        )),
+                    };
+                }
+            }
+        }
+        skip @ ArmVerdict::Skip(_) => skip,
+    };
+    match verdict {
         ArmVerdict::Skip(skip) => NativeArmResult {
             number,
             head_sha,

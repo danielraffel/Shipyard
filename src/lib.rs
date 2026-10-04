@@ -115,6 +115,8 @@ pub mod gh;
 pub mod ghapp_guards;
 /// Branch governance profiles and GitHub branch-protection helpers.
 pub mod governance;
+/// Arm native auto-merge only on a head a reviewer approved.
+pub mod head_approval;
 /// Optional host-health pre-dispatch gate (reads the `host_vitals` signal).
 pub mod host_health;
 /// Local host-pool configuration and lease state.

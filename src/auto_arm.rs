@@ -107,6 +107,12 @@ pub enum ArmSkip {
     },
     /// The repository does not allow native auto-merge at all.
     NativeAutoMergeDisabled,
+    /// The repository arms only approved heads, and this head has no
+    /// approval it accepts ([`crate::head_approval`]).
+    HeadNotApproved {
+        /// The gate's own explanation.
+        detail: String,
+    },
     /// The state could not be determined. Never treated as "unarmed".
     Unknown {
         /// What was missing or malformed.
@@ -145,6 +151,7 @@ impl ArmSkip {
             Self::NativeAutoMergeDisabled => {
                 "the repository does not allow native auto-merge".to_owned()
             }
+            Self::HeadNotApproved { detail } => detail.clone(),
             Self::Unknown { detail } => format!(
                 "its merge-queue state could not be determined ({detail}); refusing to arm blind"
             ),

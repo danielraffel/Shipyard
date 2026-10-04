@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use super::{ArmOutcome, arm_native_auto_merge};
+use super::{ArmOutcome, arm_for_request, arm_native_auto_merge};
 
 /// A scripted `gh` that records every argv it was handed.
 struct FakeGh {
@@ -10,7 +10,13 @@ struct FakeGh {
 }
 
 impl FakeGh {
-    fn new(routes: Vec<(&'static str, Result<String, String>)>) -> Self {
+    /// A repository with no `.shipyard/config.toml` on its base answers 404,
+    /// so head approval is not required unless a test scripts the file.
+    fn new(mut routes: Vec<(&'static str, Result<String, String>)>) -> Self {
+        routes.push((
+            "contents/.shipyard/config.toml",
+            Err("gh: Not Found (HTTP 404)".to_owned()),
+        ));
         Self {
             routes,
             calls: RefCell::new(Vec::new()),
@@ -38,7 +44,7 @@ impl FakeGh {
 }
 
 fn pr_view(node_id: &str, draft: bool) -> String {
-    format!(r#"{{"id":"{node_id}","isDraft":{draft}}}"#)
+    format!(r#"{{"id":"{node_id}","isDraft":{draft},"baseRefName":"main"}}"#)
 }
 
 /// A `PR_QUEUE_STATE_QUERY` response for an open, never-armed pull request.
@@ -73,7 +79,7 @@ fn arm_accepted() -> String {
 }
 
 fn run(gh: &FakeGh) -> ArmOutcome {
-    arm_native_auto_merge(&|args| gh.run(args), "owner/repo", 7, false)
+    arm_native_auto_merge(&|args| gh.run(args), "owner/repo", 7, false, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +280,7 @@ fn a_multi_line_diagnostic_is_collapsed_to_one_line() {
 #[test]
 fn a_repo_without_owner_and_name_arms_nothing() {
     let gh = FakeGh::new(vec![("pr view", Ok(pr_view("PR_node", false)))]);
-    let outcome = arm_native_auto_merge(&|args| gh.run(args), "not-a-slug", 7, false);
+    let outcome = arm_native_auto_merge(&|args| gh.run(args), "not-a-slug", 7, false, None);
     assert!(!outcome.armed);
     assert!(outcome.line.contains("could not be read"));
     assert!(!gh.called("enablePullRequestAutoMerge"));
@@ -334,4 +340,192 @@ fn a_repository_without_auto_merge_reads_as_nothing_to_do() {
         outcome.line
     );
     assert!(outcome.line.contains("does not allow native auto-merge"));
+}
+
+// ---------------------------------------------------------------------------
+// Head approval
+// ---------------------------------------------------------------------------
+
+use crate::head_approval::tests::{PR_9438_HEADS, pr_9438_bot_comments, pr_9438_queue};
+
+const REQUIRES_APPROVAL: &str =
+    "[auto_merge]\narm_requires_head_approval = true\nreviewer_logins = [\"danielraffel\"]\n";
+
+fn jsonl(records: &[serde_json::Value]) -> String {
+    records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One arm attempt on #9438 after a rebase to `head`, as `shipyard pr` makes
+/// it, on a repository that arms only approved heads. Returns the outcome and
+/// how many arm mutations were sent.
+fn ship_9438_head(
+    head: &str,
+    comments: &[serde_json::Value],
+    override_by: Option<&str>,
+) -> (ArmOutcome, usize) {
+    let gh = FakeGh::new(vec![
+        ("pr view", Ok(pr_view("PR_9438", false))),
+        ("isInMergeQueue", Ok(pr_9438_queue(head).to_string())),
+        (
+            "contents/.shipyard/config.toml",
+            Ok(REQUIRES_APPROVAL.to_owned()),
+        ),
+        ("pulls/9438/reviews", Ok(String::new())),
+        ("issues/9438/comments", Ok(jsonl(comments))),
+        ("enablePullRequestAutoMerge", Ok(arm_accepted())),
+    ]);
+    let outcome = arm_native_auto_merge(
+        &|args| gh.run(args),
+        "Generous-Corp/pulp",
+        9438,
+        false,
+        override_by,
+    );
+    let arms = gh
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.contains("enablePullRequestAutoMerge"))
+        .count();
+    (outcome, arms)
+}
+
+/// Negative control: #9438 was re-armed after every rebase. Replayed with the
+/// policy on, no rebased head is armed, and each result says why.
+#[test]
+fn replaying_9438_leaves_the_pr_disarmed_after_every_rebase() {
+    let comments = pr_9438_bot_comments();
+    let mut arms = 0;
+    for head in PR_9438_HEADS {
+        let (outcome, sent) = ship_9438_head(head, &comments, None);
+        arms += sent;
+        assert!(!outcome.armed, "{head}: {}", outcome.line);
+        assert!(
+            outcome.line.contains("carries no approval") && outcome.line.contains(&head[..12]),
+            "{}",
+            outcome.line
+        );
+    }
+    assert_eq!(arms, 0);
+}
+
+/// Positive control: the same sequence with a listed reviewer's marker for
+/// the last rebased head arms exactly once, on that head.
+#[test]
+fn replaying_9438_with_a_marker_for_the_rebased_head_arms_exactly_once() {
+    let mut comments = pr_9438_bot_comments();
+    comments.push(serde_json::json!({"login": "danielraffel", "type": "User",
+        "at": "2026-10-04T04:45:00Z", "body": format!("reviewed:{}", PR_9438_HEADS[6])}));
+    let mut armed_heads = Vec::new();
+    let mut arms = 0;
+    for head in PR_9438_HEADS {
+        let (outcome, sent) = ship_9438_head(head, &comments, None);
+        arms += sent;
+        if outcome.armed {
+            armed_heads.push(*head);
+        }
+    }
+    assert_eq!(arms, 1);
+    assert_eq!(armed_heads, vec![PR_9438_HEADS[6]]);
+}
+
+/// `--arm` arms an unapproved head on purpose, and the result says who did.
+#[test]
+fn an_explicit_arm_overrides_the_policy_and_names_who_armed() {
+    let (outcome, arms) = ship_9438_head(
+        PR_9438_HEADS[0],
+        &pr_9438_bot_comments(),
+        Some("operator@studio"),
+    );
+    assert!(outcome.armed, "{}", outcome.line);
+    assert_eq!(arms, 1);
+    assert!(
+        outcome
+            .line
+            .contains("explicit `--arm` from operator@studio"),
+        "{}",
+        outcome.line
+    );
+}
+
+/// An unreadable policy is not an absent one.
+#[test]
+fn an_unreadable_approval_policy_arms_nothing() {
+    let gh = FakeGh::new(vec![
+        ("pr view", Ok(pr_view("PR_node", false))),
+        ("isInMergeQueue", Ok(never_armed_state())),
+        (
+            "contents/.shipyard/config.toml",
+            Err("HTTP 502: Bad Gateway".to_owned()),
+        ),
+        ("enablePullRequestAutoMerge", Ok(arm_accepted())),
+    ]);
+    let outcome = run(&gh);
+    assert!(!outcome.armed, "{}", outcome.line);
+    assert!(
+        outcome.line.contains("refusing to arm blind"),
+        "{}",
+        outcome.line
+    );
+    assert!(!gh.called("enablePullRequestAutoMerge"));
+}
+
+/// The policy is read from the pull request's base branch, which a head
+/// cannot change.
+#[test]
+fn the_approval_policy_is_read_from_the_base_branch() {
+    let gh = FakeGh::new(vec![
+        ("pr view", Ok(pr_view("PR_node", false))),
+        ("isInMergeQueue", Ok(never_armed_state())),
+        ("enablePullRequestAutoMerge", Ok(arm_accepted())),
+    ]);
+    assert!(run(&gh).armed);
+    assert!(gh.called("repos/owner/repo/contents/.shipyard/config.toml?ref=main"));
+    assert!(gh.called("baseRefName"));
+}
+
+/// What each invocation asks for reaches the arm: `--no-arm` sends nothing,
+/// the default is refused on an unapproved head, and `--arm` arms it and
+/// names who did.
+#[test]
+fn each_arm_request_reaches_the_arm_as_asked() {
+    use crate::app::cli::ArmRequest;
+    let gh = |head: &str| {
+        FakeGh::new(vec![
+            ("pr view", Ok(pr_view("PR_9438", false))),
+            ("isInMergeQueue", Ok(pr_9438_queue(head).to_string())),
+            (
+                "contents/.shipyard/config.toml",
+                Ok(REQUIRES_APPROVAL.to_owned()),
+            ),
+            ("pulls/9438/reviews", Ok(String::new())),
+            ("issues/9438/comments", Ok(String::new())),
+            ("enablePullRequestAutoMerge", Ok(arm_accepted())),
+        ])
+    };
+    let head = PR_9438_HEADS[0];
+
+    let off = gh(head);
+    assert!(arm_for_request(&|a| off.run(a), "o/r", 9438, false, ArmRequest::Off).is_none());
+    assert_eq!(off.call_count(), 0);
+
+    let default = gh(head);
+    let outcome = arm_for_request(&|a| default.run(a), "o/r", 9438, false, ArmRequest::Default)
+        .expect("attempted");
+    assert!(!outcome.armed, "{}", outcome.line);
+
+    let forced = gh(head);
+    let outcome = arm_for_request(&|a| forced.run(a), "o/r", 9438, false, ArmRequest::Override)
+        .expect("attempted");
+    assert!(outcome.armed, "{}", outcome.line);
+    assert!(
+        outcome.line.contains("explicit `--arm` from "),
+        "{}",
+        outcome.line
+    );
+    assert!(outcome.line.contains('@'), "{}", outcome.line);
 }
