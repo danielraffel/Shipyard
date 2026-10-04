@@ -608,6 +608,20 @@ run unchanged and a categorized diagnostic (`executable_reuse_no_store`,
 the trial directory. Nothing in this section skips any work; the switch
 variable governs only a future live mode.
 
+To see what a keyed plan on this host would bind right now:
+
+```bash
+shipyard --json reuse records --target mac            # against origin/main
+shipyard --json reuse records --target mac --base <ref>
+```
+
+It reads the base's policy, runs the base's platform probe and lists the
+candidate records exactly as the ship path binds them (`bindable`,
+`candidates`), or names why none qualifies (`no_base`, with the refusal
+counts). Nothing is built or recorded. It is the daily measure of "hosts
+holding a bindable record for current main", and its own control: a host with
+no merged, clean, usable record reads 0.
+
 ### Host re-derivation
 
 The runner leaves its inputs (`ctest-listing.json`, `toolchain.json`,

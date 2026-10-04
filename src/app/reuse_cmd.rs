@@ -13,7 +13,8 @@ use serde_json::Value;
 
 use super::CliFailure;
 use super::cli::{
-    ReuseCommand, ReuseRederiveArgs, ReuseRederiveSweepArgs, ReuseSwitchArgs, ReuseTripArgs,
+    ReuseCommand, ReuseRecordsArgs, ReuseRederiveArgs, ReuseRederiveSweepArgs, ReuseSwitchArgs,
+    ReuseTripArgs,
 };
 use super::reuse_rederive::{ProducedBy, rederive_trial, sweep};
 use crate::changed_surface::live_switch::{self, SwitchMode};
@@ -44,6 +45,7 @@ pub(super) fn reuse_command<W: Write>(
             json,
             stdout,
         ),
+        ReuseCommand::Records(args) => records(&args, cwd, state_dir, json, stdout),
         ReuseCommand::RederiveSweep(args) => rederive_sweep(
             &|_: &Path, args: &[String]| gh(args),
             &args,
@@ -52,6 +54,48 @@ pub(super) fn reuse_command<W: Write>(
             stdout,
         ),
     }
+}
+
+fn records<W: Write>(
+    args: &ReuseRecordsArgs,
+    cwd: &Path,
+    state_dir: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let found = super::ship_cmd::executable_reuse_plan::bindable_records(
+        cwd,
+        state_dir,
+        &args.base,
+        &args.target,
+    )
+    .map_err(|error| CliFailure::new(1, error))?;
+    let human = match &found.no_base {
+        Some(why) => format!(
+            "{} {} at {}: 0 bindable records ({why})",
+            found.repository, found.target, found.base_sha
+        ),
+        None => format!(
+            "{} {} at {}: {} bindable record(s): {}",
+            found.repository,
+            found.target,
+            found.base_sha,
+            found.bindable,
+            found
+                .candidates
+                .iter()
+                .map(|candidate| candidate.run_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let mut data = BTreeMap::new();
+    data.insert(
+        "records".to_owned(),
+        serde_json::to_value(&found).map_err(|error| CliFailure::new(1, error.to_string()))?,
+    );
+    emit(stdout, json, "reuse.records", data, &human)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn rederive<F, W>(

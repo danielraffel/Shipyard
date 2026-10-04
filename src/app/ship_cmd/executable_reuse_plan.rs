@@ -99,8 +99,97 @@ pub(super) fn plan_keyed(request: &KeyRequest<'_>) -> Keyed {
     }
 }
 
+/// What this host's store holds for a keyed plan against `base`: the
+/// candidate records the ship path would bind, or why none qualifies.
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct BindableRecords {
+    pub(crate) repository: String,
+    pub(crate) target: String,
+    pub(crate) base_sha: String,
+    pub(crate) bindable: usize,
+    pub(crate) candidates: Vec<crate::changed_surface::executable_reuse::BaseCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) no_base: Option<String>,
+}
+
+/// List the records a keyed plan against `base` would bind on this host,
+/// through the same base policy, platform probe, store and rules as the ship
+/// path. Read-only apart from materializing the base's derivation code.
+///
+/// # Errors
+///
+/// The base policy cannot be read, does not declare executable reuse for
+/// `target`, or binding failed.
+pub(crate) fn bindable_records(
+    cwd: &Path,
+    state_dir: &Path,
+    base: &str,
+    target: &str,
+) -> Result<BindableRecords, String> {
+    let base_sha = String::from_utf8(git_bytes(
+        cwd,
+        &["rev-parse", &format!("{base}^{{commit}}")],
+    )?)
+    .map_err(|_| "the base commit is not UTF-8".to_owned())?
+    .trim()
+    .to_owned();
+    let read_text = |path: &str| {
+        git_bytes(cwd, &["show", &format!("{base_sha}:{path}")]).and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map(|text| text.trim().to_owned())
+                .map_err(|_| format!("{path} is not UTF-8"))
+        })
+    };
+    let config = read_text(".shipyard/config.toml")?;
+    let repository = config
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| {
+            table
+                .get("project")
+                .and_then(|project| project.get("repository"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| "the base configuration names no [project].repository".to_owned())?;
+    let policy = crate::changed_surface::policy_from_base(&config, target, read_text)?;
+    let reuse = policy
+        .executable_reuse
+        .as_ref()
+        .ok_or_else(|| format!("target {target} declares no executable_reuse at {base_sha}"))?;
+    let store = crate::reuse_record_store::store_dir(state_dir, &repository);
+    let derivation_root = state_dir.join("executable-reuse").join("derivation");
+    let policy_digest = crate::changed_surface::policy_digest(&policy);
+    let build_dir = cwd.join(&reuse.build_dir);
+    let bound = bind(
+        reuse,
+        &BindRequest {
+            store: &store,
+            derivation_root: &derivation_root,
+            head_sha: &base_sha,
+            policy_digest: &policy_digest,
+            build_dir: &reuse.build_dir,
+        },
+        |path| git_bytes(cwd, &["show", &format!("{base_sha}:{path}")]),
+        |code_dir| probe_platform(reuse, code_dir, &build_dir),
+        |commit| merged_into(cwd, commit, &base_sha),
+    )?;
+    let (candidates, no_base) = match bound {
+        Binding::Bound(binding) => (binding.candidates, None),
+        Binding::NoBase(why) => (Vec::new(), Some(why)),
+    };
+    Ok(BindableRecords {
+        repository,
+        target: target.to_owned(),
+        base_sha,
+        bindable: candidates.len(),
+        candidates,
+        no_base,
+    })
+}
+
 /// Whether a record's commit is in the planned base's history.
-fn merged_into(cwd: &Path, commit: &str, base: &str) -> bool {
+pub(crate) fn merged_into(cwd: &Path, commit: &str, base: &str) -> bool {
     Command::new("git")
         .args(["merge-base", "--is-ancestor", commit, base])
         .current_dir(cwd)
@@ -112,7 +201,7 @@ fn merged_into(cwd: &Path, commit: &str, base: &str) -> bool {
 
 /// Run the base's platform probe from the materialized derivation code and
 /// read its output through the record's platform pointer.
-fn probe_platform(
+pub(crate) fn probe_platform(
     reuse: &ExecutableReusePolicy,
     code_dir: &Path,
     build_dir: &Path,
@@ -262,5 +351,108 @@ mod tests {
             "0000000000000000000000000000000000000000",
             "HEAD"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_measure_reads_zero_until_a_merged_record_is_filed_then_one() {
+        use crate::reuse_record_store::{create_pending, file, store_dir};
+        let root = tempfile::tempdir().expect("root");
+        let repo = root.path().join("repo");
+        let state = root.path().join("state");
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("repo");
+        std::fs::write(
+            repo.join(".shipyard/config.toml"),
+            r#"
+[project]
+repository = "Owner/Repo"
+
+[targets.mac]
+validation_build_type = "debug"
+
+[targets.mac.changed_surface_selection]
+schema_version = 1
+full_test_count = 10
+build_type = "debug"
+baseline_tests = ["smoke"]
+test_topology_paths = ["tests/**"]
+
+[targets.mac.changed_surface_selection.executable_reuse]
+switch_variable = "REUSE_LIVE"
+derivation_paths = ["probe.py"]
+build_dir = "build"
+platform_probe = ["python3", "-I", "probe.py"]
+rederive = [["python3", "-I", "probe.py"]]
+
+[targets.mac.changed_surface_selection.executable_reuse.base_record]
+platform = "/platform"
+toolchain = "/toolchain/digest"
+require = [{ pointer = "/dirty", equals = false }]
+
+[[targets.mac.changed_surface_selection.families]]
+name = "core"
+paths = ["src/**"]
+tests = ["smoke"]
+supported_build_types = ["debug"]
+"#,
+        )
+        .expect("config");
+        std::fs::write(
+            repo.join("probe.py"),
+            "print('{\"platform\": \"darwin-arm64\"}')\n",
+        )
+        .expect("probe");
+        let git = |args: &[&str]| -> String {
+            let output = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "{args:?}");
+            String::from_utf8(output.stdout)
+                .expect("utf8")
+                .trim()
+                .to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+
+        let empty = bindable_records(&repo, &state, "main", "mac").expect("measure");
+        assert_eq!(empty.bindable, 0, "today's truth before any record");
+        assert!(empty.no_base.is_some());
+
+        let store = store_dir(&state, "Owner/Repo");
+        let put = |commit: &str, dirty: bool| {
+            let pending = create_pending(&store, commit, chrono::Utc::now()).expect("pending");
+            std::fs::write(
+                pending.join("job.json"),
+                serde_json::json!({"platform": "darwin-arm64",
+                    "toolchain": {"digest": "t"}, "dirty": dirty})
+                .to_string(),
+            )
+            .expect("job");
+            file(&store, &pending, commit).expect("file");
+        };
+        put(&"9".repeat(40), false);
+        let unmerged = bindable_records(&repo, &state, "main", "mac").expect("measure");
+        assert_eq!(
+            unmerged.bindable, 0,
+            "a commit not on the base never counts"
+        );
+        put(&base, true);
+        let dirty = bindable_records(&repo, &state, "main", "mac").expect("measure");
+        assert_eq!(
+            dirty.bindable, 0,
+            "a record failing the policy never counts"
+        );
+        put(&base, false);
+        let one = bindable_records(&repo, &state, "main", "mac").expect("measure");
+        assert_eq!(one.bindable, 1, "{one:?}");
+        assert_eq!(one.candidates[0].commit, base);
+        assert_eq!(one.base_sha, base);
+        assert_eq!(one.repository, "Owner/Repo");
     }
 }

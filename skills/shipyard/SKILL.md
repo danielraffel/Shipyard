@@ -838,6 +838,9 @@ Separately, one sampled failure, one false skip or one would-skip executable
 rebuilt to different bytes trips the switch at once (`trip_reasons` and
 `key_blind_candidates` on the receipt); a null field is no information, not a
 pass and not a trip.
+`shipyard --json reuse records --target <t>` answers "could a keyed plan bind
+anything on this host right now?" with the same rules the ship path uses; read
+its `no_base` refusal counts before assuming the store is empty.
 The command is evidence inspection only: it never changes machine mode,
 accepted policy digests, queue state, or merge readiness.
 
