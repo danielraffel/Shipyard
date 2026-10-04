@@ -575,7 +575,8 @@ path:
    content-addressed directory under `<state>/executable-reuse/derivation`,
    re-verifying any directory it reuses;
 2. runs `platform_probe` from that directory, with `{build_dir}` replaced by
-   the lane's absolute build directory, and reads only the platform from it;
+   the lane's absolute build directory, and reads only the platform from it
+   (the probe must succeed on a build directory that was never configured);
 3. binds a candidate set: up to eight records from the target's host-local
    store, newest first, each stating that platform and some toolchain, passing
    `require`, and from a commit that is an ancestor of the planned base, each
@@ -588,13 +589,18 @@ path:
 The toolchain is not compared here. Only the lane, after it configures this
 head, knows the toolchain it builds with: it picks the first candidate whose
 toolchain equals its own and names its pick in the result. When none does,
-nothing is keyed and every test runs.
+it keys against the first candidate, so every executable reads as built by
+another toolchain and runs; when no candidate was bound, every executable is
+unrecorded and runs.
 
 A full plan becomes `keyed_full_shadow`: the adapter runs the configured build
 and full test commands exactly, with their own verdict, and reports which tests
 reuse would have skipped and which of those failed (`false_skips`). A bounded
 plan becomes `keyed_bounded_shadow`, keeps its selection exactly, and is judged
-by the ordinary `matched_pass` / `matched_fail` rules plus the keyed block.
+by the ordinary `matched_pass` / `matched_fail` rules alone: its keyed block
+and re-derivation are reported in `trial.keyed` and never feed the verdict, so
+a broken block or a refused re-derivation does not block `ready` and a clean
+one does not grant it.
 When no record qualifies, or binding or planning fails, the configured stages
 run unchanged and a categorized diagnostic (`executable_reuse_no_store`,
 `executable_reuse_no_base`, `executable_reuse_bind_error`,
@@ -611,23 +617,28 @@ result's `executable_reuse.derived`. After the run, Shipyard:
 
 1. checks the activation's payload digest against the payload it kept, and the
    base policy's digest against the plan's;
-2. refuses a pick that is not in the bound candidate set, or a picked record
-   whose content no longer has its bound digest;
+2. takes the record the run keyed against: its named pick, which must be in
+   the bound candidate set, or the first candidate when it names none; it
+   records `not_derived` when nothing was derived or no candidate was bound,
+   and refuses a record whose content no longer has its bound digest;
 3. re-reads the key code from the base and requires the bound digest, then
    re-verifies the materialized directory;
 4. copies the five files read-only into `<state>/executable-reuse/rederive/`,
    each checked against its stated hash;
 5. runs each `rederive` command from the derivation directory under the
-   placeholders `{source_root}`, `{base_sha}` (the pick's commit), `{head_sha}`,
+   placeholders `{source_root}`, `{base_sha}` (that record's commit), `{head_sha}`,
    `{base_record_dir}`, `{base_record_run_id}`, `{result_dir}` (the read-only
    copies), `{build_dir}`, `{out_dir}`, `{sample_seed}` and `{sample_percent}`;
 6. compares the host's manifest and selection with the runner's: the selection
    must match byte for byte, and the manifests may differ only in run-specific
-   producer fields and `unknown:` nonces.
+   producer fields and `unknown:` nonces. A manifest that reports
+   `inventory_unmatched` (a `build_dir` string that matched no test
+   registration) adds a diagnostic naming the configuration error; it is not
+   a refusal.
 
 It writes one `rederivation-<result sha256>.json` (`match`,
-`match_with_diagnostics`, `not_derived` or `refuse`, with the reason, the pick
-and who produced it) into the trial directory. Both ship completion paths run
+`match_with_diagnostics`, `not_derived` or `refuse`, with the reason, the
+record keyed against, whether it was the toolchain match, and who produced it) into the trial directory. Both ship completion paths run
 it just before merge readiness is decided; its verdict never changes a shadow
 run's merge. A result is re-derived at most once. Each refusal is counted per
 host and repository, once per (head, result), in
